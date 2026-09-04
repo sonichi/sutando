@@ -80,6 +80,31 @@ class ContractCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_requeueable_backend_mints_its_own_resend_epoch(self):
+        """Pin the coupling, not the spelling (per sonichi on #3853).
+
+        `_resend_epoch` falls back to 0 for a backend without `resend_epoch`,
+        and 0 keeps the idempotency key at `id#0` — so the provider dedupes an
+        operator re-send against the very attempt that parked the item, while
+        the operator reads `result: requeued`. A bare `hasattr` assertion would
+        fail today for a reason that is not a defect: the one backend lacking
+        the method is also the one `outbox` cannot see, so no epoch is ever
+        minted on it. What must hold is the COUPLING — reachable by outbox
+        implies mints an epoch — which is inert now and fires the day a second
+        backend gains an outbox-backed store.
+        """
+        root = Path(self.tmp.name)
+        self.backend.publish(ITEM, b"x")
+        reachable = any(r.get("item_id") == ITEM for r in outbox.list_items(root))
+        if not reachable:
+            self.skipTest("outbox cannot reach this backend's items, so it "
+                          "mints no epoch — the exposure is unreachable here")
+        self.assertTrue(
+            callable(getattr(self.backend, "resend_epoch", None)),
+            "outbox can requeue this backend's items, so it must mint a resend "
+            "epoch; without one the key stays id#0 and the re-send is deduped "
+            "against the parked attempt")
+
     def test_capabilities_are_declared_not_sniffed(self):
         self.assertIsInstance(self.backend.capabilities, BackendCapabilities)
 

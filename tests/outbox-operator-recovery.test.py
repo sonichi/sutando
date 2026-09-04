@@ -348,11 +348,20 @@ class CliRenderingAndErrorPaths(unittest.TestCase):
             rc = outbox_cli.main(argv)
         return rc, out.getvalue(), err.getvalue()
 
-    def test_list_empty_says_so_rather_than_printing_nothing(self):
+    def test_list_empty_names_the_root_it_read(self):
+        """An absent root and an empty one both list nothing, so the count
+        alone cannot tell an operator which they hit (sonichi on #3853)."""
         with TemporaryDirectory() as td:
             rc, out, _ = self._capture(["--root", td, "list"])
             self.assertEqual(rc, 0)
-            self.assertIn("(no items)", out)
+            self.assertIn("(no items", out)
+            self.assertIn(td, out, "the empty listing must name the root it read")
+            absent = str(Path(td) / "nope")
+            rc2, out2, _ = self._capture(["--root", absent, "list"])
+            self.assertEqual(rc2, 0)
+            self.assertIn(absent, out2)
+            self.assertNotEqual(out, out2,
+                                "absent and empty roots must be distinguishable")
 
     def test_list_renders_status_attempts_epoch_and_reason(self):
         with TemporaryDirectory() as td:

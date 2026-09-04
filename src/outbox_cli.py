@@ -44,13 +44,15 @@ def _login_name() -> Optional[str]:
         return None
 
 
-def _emit(obj, as_json: bool) -> None:
+def _emit(obj, as_json: bool, where=None) -> None:
     if as_json:
         print(json.dumps(obj, sort_keys=True, default=str))
         return
     if isinstance(obj, list):
         if not obj:
-            print("(no items)")
+            # Name the root: an absent root and an empty one both list nothing,
+            # and "(no items)" alone cannot tell an operator which they hit.
+            print(f"(no items in {where})" if where is not None else "(no items)")
             return
         for rec in obj:
             print(f"{rec.get('status','?'):<10} "
@@ -64,7 +66,7 @@ def _emit(obj, as_json: bool) -> None:
 
 
 def cmd_list(args) -> int:
-    _emit(outbox.list_items(args.root, args.status), args.json)
+    _emit(outbox.list_items(args.root, args.status), args.json, where=args.root)
     return 0
 
 
