@@ -355,6 +355,94 @@ class EveryBindingFormIsModelled(unittest.TestCase):
             "    return Path(d['w'])\n"), "ignores")
 
 
+class BindingsOutsideTheBody(unittest.TestCase):
+    """Round 7: the taint pass walked the FUNCTION BODY only, and the alias
+    collector kept a private rule that never learned the new binding forms.
+    qingyun-wu's three controls all read 'ignores' at 757e2c90; the fourth is
+    the same class, found by asking what else binds a name before the body."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_a_module_scope_binding_is_a_taint_source(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "RAW = os.getenv('SUTANDO_WORKSPACE')\n"
+            "def resolve_workspace():\n"
+            "    return Path(RAW)\n"), "honours")
+
+    def test_a_default_argument_is_a_binding(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace(raw=os.environ.get('SUTANDO_WORKSPACE')):\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_an_annotated_module_alias_is_still_an_alias(self):
+        """The alias collector now shares _bind_sites with the taint pass, so a
+        form one side learns cannot be missing from the other."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "env: object = os.environ\n"
+            "def resolve_workspace():\n"
+            "    return Path(env['SUTANDO_WORKSPACE'])\n"), "honours")
+
+    def test_a_caller_supplied_parameter_is_unknown(self):
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace(base):\n"
+            "    return Path(base)\n"), "unknown")
+
+    def test_a_starargs_parameter_is_unknown_too(self):
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace(*parts, **kw):\n"
+            "    return Path(parts[0])\n"), "unknown")
+
+    def test_a_keyword_only_default_is_analysed(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace(*, raw=os.getenv('SUTANDO_WORKSPACE')):\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_a_name_bound_nowhere_is_unknown(self):
+        """The backstop: 'no binding this analysis resolved' is unknown, not
+        clean. Without it every future scope gap defaults to a clean bill."""
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(NOWHERE)\n"), "unknown")
+
+    def test_a_module_constant_stays_clean(self):
+        """Negative control: module scope became a taint SOURCE, not a taint."""
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "DEFAULT = '/configured'\n"
+            "def resolve_workspace():\n"
+            "    return Path(DEFAULT)\n"), "ignores")
+
+    def test_a_clean_default_argument_stays_clean(self):
+        """Negative control: a default is analysed, and analysed means clean."""
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace(raw='/configured'):\n"
+            "    return Path(raw)\n"), "ignores")
+
+    def test_the_probe_reports_it_too_not_only_the_verdict(self):
+        """qingyun ran both levels: a verdict that never reaches the probe's
+        detail is a fix nobody sees."""
+        ws = Path(tempfile.mkdtemp())
+        _vendor(ws, "import os\nfrom pathlib import Path\n"
+                    "RAW = os.getenv('SUTANDO_WORKSPACE')\n"
+                    "def resolve_workspace():\n"
+                    "    return Path(RAW)\n")
+        r = hc.check_vendored_resolver_env(workspace_dir=ws)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("still honour", r["detail"])
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

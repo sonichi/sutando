@@ -9239,6 +9239,7 @@ _REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
 # Callees whose result cannot smuggle an env read past the analysis: pure
 # constructors over arguments this pass already walks.
 _RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
+_BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
 
 
 def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
@@ -9277,11 +9278,24 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     if fn is None:
         return "unknown", "no resolve_workspace() to analyse"
 
-    # Names bound to the environ mapping itself (env = os.environ), so a .get on
-    # the alias is the same read as a .get on os.environ.
-    aliases = {t.id for n in ast.walk(tree)
-               if isinstance(n, ast.Assign) and _dots(n.value).endswith("environ")
-               for t in n.targets if isinstance(t, ast.Name)}
+    # env = os.environ: a .get on the alias is the same read. Collected through
+    # the same binding model the taint pass uses, so the two cannot drift.
+    aliases = {nm for tgt, val in _bind_sites(tree)
+               for nm, v in _binding_pairs(tgt, val)
+               if _dots(v).endswith("environ")}
+
+    # Module scope is where a name can be bound once and read by every function
+    # below it, and a body-scoped walk cannot see any of it.
+    mod_binds = [pair for tgt, val in _bind_sites(tree, walker=_walk_outside_functions)
+                 for pair in _binding_pairs(tgt, val)]
+    imported = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                imported.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                imported.add(al.asname or al.name)
 
     def _keyed(node) -> bool:
         return _const_str(node) == _REMOVED_WS_ENV
@@ -9355,9 +9369,16 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         if node.name in seen:
             return None                          # recursion guard
         seen = seen | {node.name}
-        binds = [pair for tgt, val in _bind_sites(node)
-                 for pair in _binding_pairs(tgt, val)]
-        tainted, murky, changed = set(), {}, True
+        binds = list(mod_binds) + [pair for tgt, val in _bind_sites(node)
+                                   for pair in _binding_pairs(tgt, val)]
+        tainted, murky = set(), {}
+        for nm, dflt in _param_binds(node):
+            if dflt is None:                 # caller-supplied: unprovable, so unknown
+                murky.setdefault(nm, f"the caller-supplied parameter {nm}")
+            else:
+                binds.append((nm, dflt))
+        bound = {nm for nm, _ in binds} | set(murky)
+        changed = True
         while changed:                           # two fixpoints, one walk
             changed = False
             for name, val in binds:
@@ -9395,7 +9416,11 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                         return sub, (f"{node.name}() delegates to {d}(), which is "
                                      f"{sub}")
             bad = (unresolved_call(n.value) or murky_env_read(n.value)
-                   or next((murky[x] for x in names if x in murky), None))
+                   or next((murky[x] for x in names if x in murky), None)
+                   or next((f"the unbound name {x}" for x in names
+                            if x not in bound and x not in imported
+                            and x not in modfns and x not in _RESOLVED_CALLS
+                            and x not in _BUILTIN_NAMES), None))
             if bad is not None:
                 return "unknown", (f"a return in {node.name}() flows through "
                                    f"{bad}, which this analysis cannot resolve")
@@ -9407,13 +9432,13 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     return "ignores", "no return derives from $SUTANDO_WORKSPACE"
 
 
-def _bind_sites(node):
-    """(target, value) for every name-binding form in a function body.
+def _bind_sites(node, walker=ast.walk):
+    """(target, value) for every name-binding form the walker reaches.
 
     Enumerated rather than matched statement by statement: a binding form the
     taint pass does not model leaves its names untainted, which reads as clean.
     """
-    for n in ast.walk(node):
+    for n in walker(node):
         if isinstance(n, ast.Assign):
             for t in n.targets:
                 yield t, n.value
@@ -9428,6 +9453,37 @@ def _bind_sites(node):
             for item in n.items:
                 if item.optional_vars is not None:
                     yield item.optional_vars, item.context_expr
+
+
+def _walk_outside_functions(node):
+    """ast.walk minus function and class bodies — i.e. module scope only."""
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        n = stack.pop()
+        yield n
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(n))
+
+
+def _param_binds(fn):
+    """(name, default-or-None) for every parameter.
+
+    A parameter is a binding the body never shows. Its default is analysable;
+    a caller-supplied value is not, so None here means unknown, never clean.
+    """
+    a = fn.args
+    pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    out, covered = [], set()
+    if a.defaults:
+        for arg, d in zip(pos[len(pos) - len(a.defaults):], a.defaults):
+            out.append((arg.arg, d)); covered.add(arg.arg)
+    for arg, d in zip(a.kwonlyargs, a.kw_defaults):
+        if d is not None:
+            out.append((arg.arg, d)); covered.add(arg.arg)
+    rest = pos + list(a.kwonlyargs) + [x for x in (a.vararg, a.kwarg) if x]
+    return out + [(arg.arg, None) for arg in rest if arg.arg not in covered]
 
 
 def _binding_pairs(target, value):
