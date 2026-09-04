@@ -239,8 +239,37 @@ handler?    = DISPATCH_DIR is non-empty (src/watch-tasks-stream.sh:91 initialise
               empty DISPATCH_DIR means the ticker is not armed in the first place.
 runners     = TASK_HANDLER_WORKERS (:89) while a handler exists.
 outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending| + |DISPATCH_DIR/direct|
-admit while   outstanding < 2 * runners,  re-counting after each claim
+throttle    = the RECONCILE caller admits only while outstanding < 2 * runners
 ```
+
+**It is a throttle on reconciliation, not a global cap, and `outstanding <= cap` is NOT an
+invariant.** Created/Renamed events stay unbounded so current behaviour is preserved exactly; only
+the startup/ticker sweep is bounded. So the promise is the narrow one — *a bounded reconcile call
+adds nothing once observed outstanding is at the threshold* — and an ordinary event may legitimately
+carry total outstanding above it. A design claiming a ceiling would be promising something the event
+path never agreed to. (Framing owed to keweichen; my earlier "admit while outstanding < 2*runners"
+implied the ceiling.)
+
+**The admission is one primitive in three phases, and the phase boundaries are what make it
+implementable.** The invariant it serves: *while pool dispatch is armed, no queue marker or
+`TASK_FILE` publication becomes visible except through one production-owned admission/transition
+primitive* — with the empty-`DISPATCH_DIR` path as the explicit unpooled exception.
+
+1. **Classify OUTSIDE the lock** — probe, route, and choose the caller mode
+   (`bounded-reconcile` / `unbounded-event`). The probe is an external subprocess; holding a
+   `mkdir` spinlock with no timeout across a process spawn would serialise every dispatch behind
+   the slowest probe, which is worse than the race it would close.
+2. **Commit UNDER one lock** — the shared owner checks the bound where it applies, acquires the
+   canonical claim, and creates or transitions exactly one `pending` or `direct` receipt. It
+   returns a typed outcome by out-parameter, since a bash function's exit status cannot carry
+   `queued` / `direct` / `lost` / `suppressed` / `refused-over-bound` distinctly — and `:390` must
+   tell `refused-over-bound` apart from the others rather than folding them.
+3. **Publish AFTER unlock** — queue or emit only from that admitted token. Stdout stays exclusively
+   `TASK_FILE:`.
+
+`queue_handler_task` therefore becomes a **downstream executor, not the admission owner** — which
+is the correction that matters, because putting the primitive inside it left the four direct exits
+bypassing admission entirely.
 
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
 revision had the ticker count "claims made this pass" and add that to the directory count. That
