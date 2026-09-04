@@ -285,6 +285,31 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    step 3 already gives: a memory loads when RECALLED, this file loads EVERY PASS — and all nine
    happened on a night when the memory existed and was loaded.
 
+3.45. **⚠ BEFORE `gh issue create`, RUN THE DUPLICATE GATE — CHAIN IT, do not just read it.**
+   Step 3.4 guards a claim you are about to make to the owner. This is the same rule for an artifact
+   you are about to file on GitHub, and it needs its own gate because the parking files it searches
+   are not GitHub.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/gh-duplicate-check.py \
+       --repo <owner/name> --title "<the title you are about to file>" \
+     && gh issue create --repo <owner/name> --title "..." --body-file <f>
+   # 0 no candidate -> the `&&` lets the create run · 1 DO NOT FILE, names the candidates
+   # 2 could not answer (search failed / no tokens / a decision parameter below 1) -> NOT a green light
+   ```
+
+   **The `&&` is the whole mechanism.** On 2026-09-04 I filed #3889 duplicating #3862 after running
+   the search in the SAME command block as the create: the answer printed, nothing consumed it, and
+   the create ran anyway. A check whose result is not the action's precondition is decoration.
+
+   It fails closed — a failed search returns "did not search", never "found nothing"; partial
+   coverage with no hits is exit 2; and `--max-queries 0` / `--min-overlap 0` are refused rather than
+   scoring a vacuous clean bill. A rc=0 still says in words that it is not proof of absence: an
+   `in:title` search cannot see a duplicate worded differently in its title.
+
+   Guarded by `tests/proactive-loop-gh-duplicate-check.test.py`, which pins THIS wiring as well as
+   the tool — an unreferenced gate runs never, which is worse than one described only in prose.
+
 3.5. **Apply the self-development policy gate.** Run:
 
    ```bash
