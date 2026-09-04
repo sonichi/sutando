@@ -453,32 +453,35 @@ else:
         )
         _py_header_keys = set(re.findall(r"[\"']([^\"']+)[\"']", _body))
 
-_tb2 = _src("src/task-bridge.ts")
-_ts_keys_m = re.search(r"const _HEADER_KEYS\s*=\s*\[([^\]]+)\]", _tb2, re.DOTALL)
-_ts_header_keys: set[str] = set()
-if _ts_keys_m:
-    _ts_header_keys = {
-        k.strip().strip("\"', ")
-        for k in _ts_keys_m.group(1).split(",")
-        if k.strip().strip("\"', ")
-    }
+_gen = _src("src/header_keys.ts")
+_gen_keys = set(re.findall(r"^\t'([^']+)',$", _gen, re.M))
 
+# Both TS guards derive from the generated src/header_keys.ts, so parity is one
+# question: is the artifact current, and do the consumers still import it.
 _check(
-    "header-key-parity: task_body_guard.py _HEADER_KEYS matches task-bridge.ts",
-    bool(_py_header_keys) and _py_header_keys == _ts_header_keys,
-    f"key mismatch: py={sorted(_py_header_keys - _ts_header_keys)} "
-    f"ts={sorted(_ts_header_keys - _py_header_keys)} — "
-    "add missing keys to both implementations to keep guards in sync",
+    "header-key-parity: src/header_keys.ts matches local_task_protocol.KNOWN_HEADER_KEYS",
+    bool(_py_header_keys) and _py_header_keys == _gen_keys,
+    f"generated file is stale: py-only={sorted(_py_header_keys - _gen_keys)} "
+    f"gen-only={sorted(_gen_keys - _py_header_keys)} — "
+    "run: python3 scripts/gen-header-keys.py",
 )
 
-_cs2 = _src("skills/phone-conversation/scripts/conversation-server.ts")
-_cs_missing = [k for k in _py_header_keys if k not in _cs2]
-_check(
-    "header-key-parity: conversation-server.ts _CONF_HEADER_RE contains all py keys",
-    not _cs_missing,
-    f"keys missing from conversation-server.ts _CONF_HEADER_RE: {_cs_missing} — "
-    "update the inline regex string to include them",
-)
+for _path, _sym in (("src/task-bridge.ts", "HEADER_KEYS"),
+                    ("skills/phone-conversation/scripts/conversation-server.ts",
+                     "HEADER_KEY_ALTERNATION")):
+    _consumer = _src(_path)
+    _check(
+        f"header-key-parity: {_path} imports the generated key set",
+        "from './header_keys.js'" in _consumer
+        or "from '../../../src/header_keys.js'" in _consumer,
+        f"{_path} no longer imports src/header_keys.ts — a hand-maintained copy "
+        "is exactly the drift this generation removed",
+    )
+    _check(
+        f"header-key-parity: {_path} uses {_sym} rather than a literal list",
+        _sym in _consumer,
+        f"{_path} does not reference {_sym}",
+    )
 
 # ---------------------------------------------------------------------------
 # Summary
