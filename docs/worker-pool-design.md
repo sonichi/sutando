@@ -76,8 +76,11 @@ the precise state §3 rule 6 promises the core will take over.
 
 Eligibility is **one value, computed once**: the core evaluates it in its sweep
 (it is the only instance that can see a room's oldest unclaimed task) and publishes
-it alongside the pool status; handlers read that verdict rather than each
-recomputing it from beats they can only partially observe.
+it alongside the pool status. **WORKER handlers read that verdict to gate
+themselves; the core's handler never does** — it routes on beats, and the core's
+stand-in decision belongs to the sweep that wrote the verdict. Who reads what, and
+why one reader per decision is load-bearing rather than tidy, is set out under the
+record's contract below; this rule is step 3's, and step 2 routes on beats alone.
 
 **That publisher is a step-3 component, and the handler ships in step 2** — so the
 wedge path has a window with a consumer and no producer, which is a latent no-op at
@@ -150,31 +153,44 @@ guessing at fields it does not know, and the step-3 suite exercises a reader
 meeting both an old and a new record across the atomic swap, since that is the one
 moment two versions coexist on disk.
 
-**Only WORKERS consult the record. The core never does, and that asymmetry is what
-makes the swap safe.** The obvious reading — both sides read it, and a disagreement
-resolves at the claim — is wrong in one direction: a claim arbitrates N>=2 candidates
-and cannot manufacture a missing one. Worker-reads-old(`eligible`) against
-core-reads-new(`wedged`) gives two claimants and the claim decides; but
-core-reads-old(`eligible`, so it suppresses as a non-target) against
-worker-reads-new(`wedged`, so it suppresses too) gives **zero**, and suppression
-leaves the task file untouched with no step-2 sweep to find it again. The task
-strands, which is the exact outcome the eligibility rule was added to prevent.
+**The whole eligibility record is a STEP-3 mechanism, and step 2 never reads it.**
+The obvious reading — both sides read it, and a disagreement resolves at the claim —
+is wrong in one direction: a claim arbitrates N>=2 candidates and cannot manufacture
+a missing one. Worker-reads-old(`eligible`) against core-reads-new(`wedged`) gives
+two claimants and the claim decides; but core-reads-old(`eligible`, so it suppresses
+as a non-target) against worker-reads-new(`wedged`, so it suppresses too) gives
+**zero**, and suppression leaves the task file untouched. The task strands, which is
+the exact outcome the eligibility rule was added to prevent.
 
-So the core decides from the beats it observes and the verdict it computed IN THIS
-SWEEP — it is the publisher, so it reads its own value, never a file it races with —
-and a worker decides from its own beat plus the published record. One reader per
-decision means the two can disagree about a target and still produce at least one
-claimant, because the core's branch cannot be flipped by a write it has not yet made.
-Both actor orders are then bounded: core-first sees its own verdict and either claims
-or defers to a target it believes eligible, and worker-first either claims or
-suppresses into the core's unchanged decision.
+Two readers of one racing file is the defect, so the staging removes the second
+reader rather than arbitrating between them:
 
-That leaves one residue and it is named rather than hidden: a worker that suppresses
-on a `wedged` verdict the core has not yet acted on waits until the core's next sweep
-— bounded by the sweep interval, not unbounded, since the core re-evaluates every
-unclaimed task each pass. Step 2 therefore owes a minimal periodic re-evaluation even
-though its stand-in logic is step 3's: without one, ANY suppress-suppress pair is
-terminal rather than delayed. That is a step-2 prerequisite, listed with the others.
+**Step 2 routes on BEATS ALONE.** No instance consults the record, because there is
+no publisher yet — the default stated above (absent record means every fresh-beat
+target is eligible) is therefore the *whole* rule in that window, not a fallback
+inside it. Beats are observed directly by each handler and are not a file two parties
+race, so the disagreement cannot arise: this is exactly the pre-rule behaviour and
+step 2 is a no-regression change. The wedge path simply does not exist yet.
+
+**Step 3 owns the wedge path, INSIDE THE SWEEP.** That answers the ownership question
+the staging otherwise leaves open, and it is forced by how routing actually runs:
+`SUTANDO_TASK_EVENT_HANDLER` is invoked as an EXTERNAL PROCESS per event
+(`src/watch-tasks-stream.sh:370-383`), so a handler cannot see an in-memory value the
+sweep computed — a design that has the core "read the verdict it just computed" is
+not implementable in a per-event subprocess. So in step 3 the core's stand-in
+decision is made by the sweep, which holds the verdict it just wrote; the core's
+event handler keeps routing on beats exactly as in step 2 and never consults the
+record. Workers read the record to gate THEMSELVES. One reader per decision, and the
+one party that could disagree with the file is the party that wrote it.
+
+The residue is then bounded by a thing that already exists rather than by a timer
+this design would have to invent: a worker that suppresses on a `wedged` verdict the
+core has not yet acted on waits until the core's next sweep, and the sweep is one of
+the two periodic things a pool has (see "Workers are task-only"). Step 2 owes NO new
+periodic re-evaluation — an earlier revision of this section asserted one and said it
+was listed with the step-2 prerequisites; it was not listed, and it contradicted both
+that section and the migration note that says the core sweep does not exist in the
+step-2 window. The correct resolution is the staging above, not a timer.
 
 **And a target checks its OWN verdict before claiming.** The eligibility rule above
 tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
