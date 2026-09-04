@@ -112,7 +112,10 @@ class Shorthand(unittest.TestCase):
     def test_an_ask_naming_a_pr_in_shorthand_is_REFUSED_before_sending(self):
         rc, err = self._run("please review #3760")
         self.assertEqual(rc, 7)
-        self.assertEqual(self.calls, [], "refused ask must not reach room_ops")
+        # room_ops calls only. `self.calls` records EVERY subprocess, so a
+        # refusal that resolves config without sending used to fail this.
+        sends = [c for c in self.calls if any("room_ops" in str(a) for a in c)]
+        self.assertEqual(sends, [], "refused ask must not reach room_ops")
         self.assertEqual(self._ledger(), [], "nothing recorded either")
 
     def test_the_refusal_says_what_it_refused_AND_what_would_satisfy_it(self):

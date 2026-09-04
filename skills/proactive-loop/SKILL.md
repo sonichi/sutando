@@ -267,7 +267,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ```bash
    python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence you are about to say>"
    # exit 1 = already parked, with file:line -> READ IT, then extend or say nothing is new
-   # exit 0 = genuinely untriaged -> proceed
+   # exit 0 = NO TOKEN MATCHED. That is not proof of absence -- the tool's own message says
+   #          "OR every token missed". Before proceeding, do step 3's fallback:
+   #          grep -n '^## ' "$H"/*.md  and read the ~25 headings. Enumerating cannot miss
+   #          the way a self-chosen token does, and the suspicion never generates the token
+   #          the answer is filed under.
    # exit 2 = could not answer (no parking files / empty claim) -> NOT a green light
    ```
 
@@ -280,6 +284,31 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    This is step 3's rule with the noun changed. It sits here rather than in a memory for the reason
    step 3 already gives: a memory loads when RECALLED, this file loads EVERY PASS — and all nine
    happened on a night when the memory existed and was loaded.
+
+3.45. **⚠ BEFORE `gh issue create`, RUN THE DUPLICATE GATE — CHAIN IT, do not just read it.**
+   Step 3.4 guards a claim you are about to make to the owner. This is the same rule for an artifact
+   you are about to file on GitHub, and it needs its own gate because the parking files it searches
+   are not GitHub.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/gh-duplicate-check.py \
+       --repo <owner/name> --title "<the title you are about to file>" \
+     && gh issue create --repo <owner/name> --title "..." --body-file <f>
+   # 0 no candidate -> the `&&` lets the create run · 1 DO NOT FILE, names the candidates
+   # 2 could not answer (search failed / no tokens / a decision parameter below 1) -> NOT a green light
+   ```
+
+   **The `&&` is the whole mechanism.** On 2026-09-04 I filed #3889 duplicating #3862 after running
+   the search in the SAME command block as the create: the answer printed, nothing consumed it, and
+   the create ran anyway. A check whose result is not the action's precondition is decoration.
+
+   It fails closed — a failed search returns "did not search", never "found nothing"; partial
+   coverage with no hits is exit 2; and `--max-queries 0` / `--min-overlap 0` are refused rather than
+   scoring a vacuous clean bill. A rc=0 still says in words that it is not proof of absence: an
+   `in:title` search cannot see a duplicate worded differently in its title.
+
+   Guarded by `tests/proactive-loop-gh-duplicate-check.test.py`, which pins THIS wiring as well as
+   the tool — an unreferenced gate runs never, which is worse than one described only in prose.
 
 3.5. **Apply the self-development policy gate.** Run:
 
@@ -321,7 +350,10 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    The six suites ship as `tests/proactive-loop-*.test.py` (CI discovers only `tests/*.test.py`;
    `tests/ci-covers-every-python-test.test.py` refuses a suite anywhere else). They sit outside
-   `$WORKSPACE/scripts`, so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json`
+   `$WORKSPACE/scripts`, so declare them (repo-relative) in
+   `$WORKSPACE/hosts/<host>/tool-suites-extra.json` — the vault carries `hosts/*/` and does not
+   carry `state/`, so a declaration left under `state/` is unbacked-up, and losing it disables its
+   suites silently. A `state/` copy is still read when no carried one exists.
    — `{"suites": ["tests/proactive-loop-idle-held.test.py", ...]}` — to put them under the same
    changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
 
@@ -687,6 +719,29 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing.
 
    **Don't hand-roll a process check to second-guess the probe.** `pgrep -f watch-tasks` / `ps | grep watch-tasks-stream` both match the wrapper shell that runs the check (its own argv contains the search string), so they return a pid for a transient subshell or pick the wrapper instead of the watcher — an attempt at this on 2026-08-07 reported rc=1 with the watcher demonstrably alive. `_watcher_trees()` already solves this by scoping to process trees; use its verdict via the probe.
+
+9.5. **⚠ BEFORE POSTING TO A PR THREAD, CHECK YOU ARE NOT TALKING TO YOURSELF (added
+   2026-09-04 after measuring it on this host).** Re-verifying a standing review is right; posting
+   that re-verification into silence is noise, and each repeat makes the next less likely to be
+   read. Measured across 36 open PRs: **5 threads where every recent event was mine and unanswered**
+   — #2300 at **7 events over 14.3 days** with the author never replying once, and I was composing
+   an eighth when this check was written.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/pr-monologue-check.py <number> --me <your-login>
+   # 0 safe to post · 1 REFUSE, naming the run and its span · 2 could not answer (NOT a green light)
+   ```
+
+   It merges BOTH surfaces (issue comments + reviews) so a thread answered only by a review does not
+   read as silence, and **drops `*[bot]` logins**: a CI bot commenting is not a human reading you.
+   That bot case was a live false SAFE — `github-actions[bot]` reset a real run of 2 to 0 on #2406,
+   clearing exactly the post the guard exists to stop. `--count-bots` reproduces the old answer, so
+   the fix has a control rather than an assertion.
+
+   **On a REFUSE, the answer is not "post anyway with better wording."** The thread has no reader;
+   re-solicit through a stand (`collaboration-intelligence`), or leave the flag standing and spend
+   the pass elsewhere. Guarded by `tests/proactive-loop-pr-monologue-check.test.py` (17 tests;
+   4 mutations verified red, including one that makes a fetch failure read as safe).
 
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages (unless in #bot2bot), Zoom invites, and messages already sent by you.
 

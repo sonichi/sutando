@@ -515,6 +515,15 @@ case "${1:-}" in
   --restart)       RESTART_REQUESTED=1 ;;
   --force-restart) RESTART_REQUESTED=1; FORCE_RESTART=1 ;;
 esac
+# graceful-restart.sh exec's this script holding its lock; an abort here would
+# otherwise leave that lock to age out (15 min) and defer the owner's next click.
+release_orchestrator_lock() {
+  [ -n "${GR_RID:-}" ] || return 0
+  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  local lock="$ws/state/locks/graceful-restart.lock"
+  [ "$(cat "$lock/rid" 2>/dev/null)" = "$GR_RID" ] && rm -rf "$lock"
+  return 0
+}
 log_restart_attempt() {
   local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
@@ -538,17 +547,17 @@ if [ -n "$RESTART_REQUESTED" ]; then
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    # Graceful window: Claude Code flushes telemetry/state on shutdown and can
-    # take several seconds — longer than the old ~1s (5×0.2s) ceiling that let a
-    # still-dying core slip into the "orphan reuse → exit 0" guard below. Poll ~3s.
-    for _ in $(seq 1 15); do
-      tmux_session_exists || core_claude_running || break
-      sleep 0.2
+    # The kill is already issued, so this wait can only be bounded, never
+    # abandoned: a SessionEnd handoff takes longer than a few seconds.
+    GRACE_S="${SUTANDO_RESTART_GRACE_S:-90}"
+    _ticks=$(( GRACE_S * 5 ))
+    while [ "$_ticks" -gt 0 ] && { tmux_session_exists || core_claude_running; }; do
+      sleep 0.2; _ticks=$(( _ticks - 1 ))
     done
     if tmux_session_exists || core_claude_running; then
       if [ -n "$FORCE_RESTART" ]; then
         # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
-        echo "  core still alive ~3s after SIGTERM — force-restart escalating to SIGKILL" >&2
+        echo "  core still alive ${GRACE_S}s after SIGTERM — force-restart escalating to SIGKILL" >&2
         tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
         core_claude_pids | while read -r pid; do
           [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
@@ -560,10 +569,10 @@ if [ -n "$RESTART_REQUESTED" ]; then
       else
         # plain restart must NOT hammer: the core may be legitimately mid-task.
         # Abort loud and point at force-restart rather than risk killing work.
-        echo "  ⚠ $SESSION core did not stop within ~3s of SIGTERM." >&2
-        echo "    'restart' won't SIGKILL a busy/wedged core — it may be mid-task." >&2
-        echo "    Re-run as: bash $0 --force-restart   (or wait and retry)." >&2
-        log_restart_attempt "abort: core would not stop gracefully (needs --force-restart)"
+        echo "  ⚠ $SESSION core did not stop within ${GRACE_S}s of SIGTERM." >&2
+        echo "    'restart' won't SIGKILL a wedged core — re-run as: bash $0 --force-restart" >&2
+        log_restart_attempt "abort: core would not stop within ${GRACE_S}s (needs --force-restart)"
+        release_orchestrator_lock
         exit 1
       fi
     fi
@@ -573,6 +582,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
       echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
       echo "    Investigate the stuck pid; rerun once it's gone." >&2
       log_restart_attempt "abort: core survived SIGKILL"
+      release_orchestrator_lock
       exit 1
     fi
   fi

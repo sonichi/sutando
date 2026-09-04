@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CT_PATH = REPO / "scripts" / "ci-triage.py"
+CT_PATH = REPO / "skills" / "review-preflight" / "scripts" / "ci-triage.py"
 
 if not CT_PATH.exists():
     raise SystemExit(f"ci-triage.py not found at {CT_PATH} — refusing to report "

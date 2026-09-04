@@ -14,7 +14,10 @@ from hitl.projector import (  # noqa: E402
     fallback_body,
     project,
 )
-from hitl.schema import Action, HumanRequirement, WIRE_FIELD  # noqa: E402
+from hitl.schema import (  # noqa: E402
+    Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
+    WIRE_FIELD, category_of,
+)
 
 ROOM = "!room:ag2.space"
 
@@ -112,6 +115,55 @@ class ProjectorTests(unittest.TestCase):
         req = make_req()
         req.transition("cancelled")
         self.assertIn("Cancelled", fallback_body(req))
+
+    def test_a_decision_does_not_wear_the_blocking_header(self):
+        """The card colours choice/confirmation apart from a real block; a client
+        that ignores the card field used to get the alarm header for every kind."""
+        for kind in ("choice", "confirmation"):
+            body = fallback_body(make_req(kind=kind))
+            self.assertNotIn("⚠", body, kind)
+            self.assertIn("needs a decision", body, kind)
+
+    def test_a_real_block_keeps_the_alarm(self):
+        for kind in ("auth", "permission", "billing", "external_action"):
+            body = fallback_body(make_req(kind=kind))
+            self.assertIn("⚠", body, kind)
+            self.assertIn("needs your attention", body, kind)
+
+    def test_an_unrecognised_kind_falls_back_to_blocked(self):
+        """Under-stating a block strands the user; over-warning only annoys."""
+        self.assertEqual(category_of("nonsense"), CATEGORY_BLOCKED)
+        self.assertIn("⚠", fallback_body(make_req(kind="unknown")))
+
+    def test_every_declared_kind_has_a_head(self):
+        """A kind added to KINDS without a category would KeyError at send time."""
+        for kind in KINDS:
+            self.assertIn(category_of(kind), (CATEGORY_BLOCKED, CATEGORY_DECISION), kind)
+
+    def test_a_kind_mapped_to_a_head_less_category_still_renders(self):
+        """The direct index was total only because construction coerces an
+        UNRECOGNISED kind to `unknown` — so the KeyError is unreachable that
+        way, and sonichi's first probe measured the coercion instead of the
+        renderer. It becomes reachable when a kind already IN `KINDS` is mapped
+        to a third category, which is why this remaps `choice` rather than
+        inventing one, and why the fallback is BLOCKED: raising here would
+        raise inside the renderer that exists for clients which cannot read
+        the structured field.
+        """
+        import hitl.schema as S
+        original = dict(S._KIND_CATEGORY)
+        S._KIND_CATEGORY["choice"] = "escalation"          # a category with no head
+        try:
+            req = make_req(kind="choice")
+            self.assertEqual(req.kind, "choice", "precondition: not coerced away")
+            self.assertEqual(category_of("choice"), "escalation")
+            body = fallback_body(req)
+            self.assertIn("⚠", body)
+            self.assertIn("needs your attention", body)
+        finally:
+            S._KIND_CATEGORY.clear()
+            S._KIND_CATEGORY.update(original)
+        self.assertEqual(category_of("choice"), CATEGORY_DECISION, "restored")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
-from resolve import resolve_user
+from resolve import resolve_user, match_member
 import receipt as _receipt
 from relations import RelationError, relation_fields
 
@@ -35,6 +35,27 @@ def build_body(mxid: str, message: str) -> str:
     """
     message = (message or "").strip()
     return f"{mxid} — {message}" if message else mxid
+
+
+def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None) -> "dict | None":
+    """Second chance for `handle` against the target room's membership.
+
+    None when the member list itself could not be read, so the caller keeps the
+    directory's own reason rather than reporting a membership miss that never
+    happened. Imported lazily: `members` reaches the network, and the directory
+    path must not pay for it.
+    """
+    try:
+        from members import room_members
+    except ImportError:
+        return None
+    got = room_members(room_id, agent_mxid)
+    if not got.get("ok"):
+        return None
+    ids = [m if isinstance(m, str) else (m.get("user_id") or m.get("id"))
+           for m in got.get("members") or []]
+    hit = match_member(handle, [i for i in ids if i])
+    return hit if hit.get("ok") or hit.get("candidates") else None
 
 
 def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = None,
@@ -60,6 +81,10 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         return _result(False, room_id=room_id, reason=str(e))
 
     res = resolve_user(handle, agents=agents)
+    if not res.get("ok") and not res.get("candidates"):
+        # /v1/agents lists only this account's own agents, so a peer agent in
+        # the room resolves nowhere and the mention would be unreachable.
+        res = _resolve_from_room(handle, room_id, agent_mxid) or res
     if not res.get("ok"):
         return _result(False, room_id=room_id, candidates=res.get("candidates"),
                        reason=res.get("reason") or "could not resolve handle")
