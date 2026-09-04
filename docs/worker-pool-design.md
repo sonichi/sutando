@@ -289,11 +289,14 @@ with its own reason.
    sort defect alone can be fixed first and separately by moving `priority`
    ahead of `task` in `_TASK_FIELDS`, exactly as #3872 did for
    `requested_worker`; that decouples the user-visible half from convergence.
-   Also each its own PR against an existing file: the watcher sentinel becomes
-   per instance (`state/watch-tasks-stream-<name>.pid` and its four readers,
-   since N watchers on one host overwrite the single file today) and the
-   fallback-receipt directory with it; the sparrow bridge records
-   `requested_worker` from the server envelope. **Not a prerequisite PR, a
+   Its own PR against an existing file, and the only one left: the watcher
+   sentinel becomes per instance (`state/watch-tasks-stream-<name>.pid` and its
+   four readers, since N watchers on one host overwrite the single file today)
+   and the fallback-receipt directory with it. The sparrow bridge carrying
+   `requested_worker` is **already done** by #3872 rather than pending —
+   exercised through `_write_task`, the field is serialized above `task:` and
+   the safe parser reads it back, so nothing further is owed there.
+   **Not a prerequisite PR, a
    requirement on step 2's own code:** the eligibility reader matches both
    `channel_id` and `chat_id`. No such reader exists on `main` — checked, it
    has never been there — so there is nothing to fix ahead of time; the failure
