@@ -551,6 +551,28 @@ finish(a, *dispatch(a))
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
 
+    def test_THREE_SOURCE_newest_extension_survives_intermediate_union(self) -> None:
+        """C -> A -> B: the first union must not out-date B by carrying the
+        migration's write time. B holds the newest extension of C's identity;
+        A adds only an unrelated pin. Both must reach the canonical file."""
+        me = os.getpid()
+        my_lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(me)],
+                                   capture_output=True, text=True).stdout.strip()
+        one_lstart = subprocess.run(["ps", "-o", "lstart=", "-p", "1"],
+                                    capture_output=True, text=True).stdout.strip()
+        old = {"service": SERVICE, "pid": me, "lstart": my_lstart,
+               "reason": "old witness", "expires_at": "2027-01-01T00:00:00Z"}
+        ext = dict(old, reason="extended witness", expires_at=FUTURE)
+        unrelated = {"service": "telegram-bridge", "pid": 1, "lstart": one_lstart,
+                     "reason": "unrelated", "expires_at": FUTURE}
+        self._write("src/c", [old], OLDER)
+        self._write("src/a", [unrelated], OLDER + 600)
+        self._write("src/b", [ext], OLDER + 1200)
+        self._migrate()
+        pins = pp.load_pins(self.tmp / "dest" / "state" / "process-pins.json")
+        got = sorted((p["reason"], p["expires_at"]) for p in pins)
+        self.assertEqual(got, [("extended witness", FUTURE), ("unrelated", FUTURE)], got)
+
     def test_FAILED_stat_call_printing_a_number_is_NOT_a_successful_answer(self) -> None:
         """Numeric OUTPUT is not a successful CALL.
 

@@ -312,10 +312,14 @@ def live_lstart_by_pid():
         return None
     table = {}
     for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
         parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0].isdigit():
-            table[parts[0]] = parts[1].strip()
-    return table
+        if len(parts) != 2 or not parts[0].isdigit():
+            return None      # a row that does not parse makes the whole table unusable
+        table[parts[0]] = parts[1].strip()
+    # rc 0 with no rows is not "no processes": it is an answer that cannot be right.
+    return table or None
 
 
 def _identity(pin: dict) -> tuple:
@@ -350,6 +354,52 @@ def merge_snapshots(newer: list, older: list, lstart_by_pid, now_ts: float) -> t
     return merged, kept, dropped
 
 
+def _sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def merge_into(dst, newer_p, older_p, expect_dst_sha256=None, now_ts=None) -> tuple:
+    """One locked transaction: strict loads, liveness probe, union, write.
+
+    The caller ordered `newer`/`older` by their mtimes outside the lock. If the
+    destination's bytes moved since (a concurrent arm/release), the destination
+    is the newest snapshot whatever the caller measured. Two snapshots with equal
+    mtimes and different bytes are an ambiguity, not a tie to break by scan order.
+    Returns (kept, dropped, total, newer_is_dst). Raises ValueError to refuse.
+    """
+    dst, newer_p, older_p = Path(dst), Path(newer_p), Path(older_p)
+    with _locked(dst):
+        if expect_dst_sha256 and dst.exists() and _sha256(dst) != expect_dst_sha256:
+            if newer_p != dst:
+                newer_p, older_p = dst, newer_p if older_p == dst else older_p
+        n_mt = newer_p.stat().st_mtime_ns if newer_p.exists() else 0
+        o_mt = older_p.stat().st_mtime_ns if older_p.exists() else 0
+        if n_mt == o_mt and newer_p.exists() and older_p.exists() \
+                and newer_p.read_bytes() != older_p.read_bytes():
+            raise ValueError("equal mtimes with different content — resolve by hand")
+        newer, older = _load_strict(newer_p), _load_strict(older_p)
+        merged, kept, dropped = merge_snapshots(newer, older, live_lstart_by_pid(),
+                                                time.time() if now_ts is None else now_ts)
+        if len(merged) > MAX_PINS:
+            raise ValueError(f"{len(merged)} pins exceeds the bound of {MAX_PINS}")
+        if kept:
+            save_pins(dst, merged)
+        elif newer_p != dst:
+            # The newer snapshot IS the answer: its bytes, verbatim, under the same lock.
+            tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
+            try:
+                tmp.write_bytes(newer_p.read_bytes())
+                os.replace(tmp, dst)
+            finally:
+                tmp.unlink(missing_ok=True)
+        # Provenance is the inputs' newest mtime, never the migration's write time.
+        prov = max(n_mt, o_mt)
+        if prov:
+            os.utime(dst, ns=(prov, prov))
+        return len(kept), len(dropped), len(merged), newer_p == dst
+
+
 def _cli(argv) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="process_pins")
@@ -358,18 +408,15 @@ def _cli(argv) -> int:
     m.add_argument("--into", required=True)
     m.add_argument("--newer", required=True, help="snapshot taken whole")
     m.add_argument("--older", required=True, help="snapshot whose live pins are added")
+    m.add_argument("--expect-dst-sha256", default=None,
+                   help="sha-256 of --into when the caller ordered the inputs; a mismatch means it moved")
     a = ap.parse_args(argv)
-    dst, newer_p, older_p = Path(a.into), Path(a.newer), Path(a.older)
-    merged, kept, dropped = merge_snapshots(load_pins(newer_p), load_pins(older_p),
-                                            live_lstart_by_pid(), time.time())
-    if len(merged) > MAX_PINS:
-        print(f"merge refused: {len(merged)} pins exceeds the bound of {MAX_PINS}", file=sys.stderr)
-        return 1
-    # Nothing live to add: the newer snapshot IS the answer, and the caller
-    # keeps its bytes verbatim rather than a re-serialisation.
-    if kept:
-        save_pins(dst, merged)
-    print(f"merged kept={len(kept)} dropped={len(dropped)} total={len(merged)}")
+    try:
+        kept, dropped, total, newer_is_dst = merge_into(a.into, a.newer, a.older, a.expect_dst_sha256)
+    except ValueError as e:
+        print(f"merge refused: {e}", file=sys.stderr)
+        return 2
+    print(f"merged kept={kept} dropped={dropped} total={total} newer={'dst' if newer_is_dst else 'src'}")
     return 0
 
 

@@ -1341,21 +1341,18 @@ commit_one() {
                 # A tie keeps the destination whole; the union still admits every
                 # live source pin, so no live veto is lost either way.
                 if [ "$src_mt" -gt "$dst_mt" ]; then newer="$src_file"; older="$dst_path"; else newer="$dst_path"; older="$src_file"; fi
-                local merge_out
-                if ! merge_out="$(python3 "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --newer "$newer" --older "$older")"; then
+                local merge_out py_bin dst_sha
+                py_bin="$(require_python "$REPO_DIR" "merge process-pin snapshots")" || return 1
+                dst_sha="$(_sha256_of "$dst_path")" || dst_sha=""
+                # Ordering, strict loading, liveness, union and the write all run
+                # under the record lock in process_pins; exit 2 is an ambiguity.
+                if ! merge_out="$("$py_bin" "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --newer "$newer" --older "$older" ${dst_sha:+--expect-dst-sha256 "$dst_sha"})"; then
                     echo "AMBIGUOUS: $rel — pin snapshots could not be merged — resolve by hand" >&2
                     return 1
                 fi
                 case "$merge_out" in
-                    *"kept=0 "*)
-                        # No live pin to carry over: the newer snapshot wins whole.
-                        if [ "$newer" = "$src_file" ]; then
-                            commit_copy "$src_file" "$dst_path" "$rel" || return 1
-                            echo "src-newer"
-                        else
-                            echo "dest-newer"
-                        fi
-                        ;;
+                    *"kept=0 "*"newer=src")  echo "src-newer" ;;
+                    *"kept=0 "*"newer=dst")  echo "dest-newer" ;;
                     *) echo "unioned" ;;
                 esac
             else
