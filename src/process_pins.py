@@ -29,9 +29,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import subprocess
-import sys
-import time
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -298,80 +295,3 @@ def armed_detail(results: list):
         if verdict == ARMED:
             return detail
     return None
-
-
-def live_lstart_by_pid():
-    """{pid: lstart} for every running process from one `ps` call, or None when
-    the enumeration itself failed — unknown is not the empty set."""
-    try:
-        out = subprocess.run(["ps", "-eo", "pid=,lstart="], capture_output=True,
-                             text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    table = {}
-    for line in out.stdout.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0].isdigit():
-            table[parts[0]] = parts[1].strip()
-    return table
-
-
-def _identity(pin: dict) -> tuple:
-    return (str(pin.get("service") or ""), str(pin.get("pid") or ""),
-            str(pin.get("lstart") or "").strip())
-
-
-def merge_snapshots(newer: list, older: list, lstart_by_pid, now_ts: float) -> tuple:
-    """Union of two pin snapshots that are independent sources, not one history.
-
-    The newer snapshot is taken whole. An older-only pin survives only while it
-    could still veto: unexpired, its pid live, its lstart matching. Unknown
-    liveness keeps it — a pin only ever suppresses a restart, so the safe error
-    is an extra pin, never a lost one. Returns (merged, kept, dropped).
-    """
-    seen = {_identity(p) for p in newer}
-    merged, kept, dropped = list(newer), [], []
-    for pin in older:
-        if _identity(pin) in seen:
-            continue
-        if _expired(pin, now_ts):
-            dropped.append(pin)
-            continue
-        if lstart_by_pid is not None:
-            live = lstart_by_pid.get(str(pin.get("pid") or ""))
-            if live is None or str(live).strip() != str(pin.get("lstart") or "").strip():
-                dropped.append(pin)
-                continue
-        merged.append(pin)
-        kept.append(pin)
-        seen.add(_identity(pin))
-    return merged, kept, dropped
-
-
-def _cli(argv) -> int:
-    import argparse
-    ap = argparse.ArgumentParser(prog="process_pins")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    m = sub.add_parser("merge", help="union two pin snapshots into --into (the newer one taken whole)")
-    m.add_argument("--into", required=True)
-    m.add_argument("--newer", required=True, help="snapshot taken whole")
-    m.add_argument("--older", required=True, help="snapshot whose live pins are added")
-    a = ap.parse_args(argv)
-    dst, newer_p, older_p = Path(a.into), Path(a.newer), Path(a.older)
-    merged, kept, dropped = merge_snapshots(load_pins(newer_p), load_pins(older_p),
-                                            live_lstart_by_pid(), time.time())
-    if len(merged) > MAX_PINS:
-        print(f"merge refused: {len(merged)} pins exceeds the bound of {MAX_PINS}", file=sys.stderr)
-        return 1
-    # Nothing live to add: the newer snapshot IS the answer, and the caller
-    # keeps its bytes verbatim rather than a re-serialisation.
-    if kept:
-        save_pins(dst, merged)
-    print(f"merged kept={len(kept)} dropped={len(dropped)} total={len(merged)}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(_cli(sys.argv[1:]))

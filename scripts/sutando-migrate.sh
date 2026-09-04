@@ -233,9 +233,6 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # Legacy sources are independent paths, not one history: a newer snapshot
-    # missing a pin proves nothing about a LIVE pin the older one carries.
-    "state/process-pins.json|pins-union"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"
@@ -352,69 +349,14 @@ classify() {
     echo "unknown"
 }
 
-# Integer-second mtime orders same-second writes by SCAN ORDER, resurrecting
-# older content under newest-wins. Emit nanoseconds.
-
-# GNU `-f` is --file-system: it prints a report to STDOUT and exits nonzero, so
-# a bare `bsd || gnu` substitution concatenates that report with the answer.
-_stat_field() {
-    local kind="$1" f="$2" bsd gnu v
-    case "$kind" in
-        mtime) bsd=%m; gnu=%Y ;;
-        size)  bsd=%z; gnu=%s ;;
-        *)     printf '0'; return 1 ;;
-    esac
-    v="$(LC_ALL=C stat -f "$bsd" "$f" 2>/dev/null)" || v=""
-    case "$v" in ''|*[!0-9]*) v="" ;; esac
-    if [ -z "$v" ]; then
-        v="$(LC_ALL=C stat -c "$gnu" "$f" 2>/dev/null)" || v=""
-        case "$v" in ''|*[!0-9]*) v="" ;; esac
-    fi
-    # Exhaustion is empty stdout + nonzero, never epoch 0 / size 0, so a caller
-    # can tell unknown from oldest. Under `set -e`: x="$(...)" || x="".
-    [ -n "$v" ] || return 1
-    printf '%s' "$v"
-}
-
-mtime_ns() {
-    local f="$1" v sec frac
-    # GNU `stat -f` is --file-system (succeeds, non-numeric) and GNU prints
-    # localeconv()->decimal_point. Hence LC_ALL=C, and validate rather than trust.
-    v=""
-    for _c in "stat -f %Fm" "stat -c %.9Y" "stat -f %m" "stat -c %Y"; do
-        # `|| v=""` not `|| true`: numeric OUTPUT is not a successful CALL, and
-        # the `||` also keeps the errexit exemption a bare assignment would lose.
-        v="$(LC_ALL=C $_c "$f" 2>/dev/null)" || v=""
-        # One integer, or one integer with one fractional part. `[!0-9.]` alone
-        # admits "." and "1.2.3", so a malformed read would read as a timestamp.
-        case "$v" in
-            ''|*[!0-9.]*)      v="" ;;
-            *.*.*)             v="" ;;
-            .|*.)              v="" ;;
-            .*)                v="" ;;
-            *)                 break ;;
-        esac
-    done
-    # Exhaustion is NOT epoch 0: empty stdout + nonzero, so no caller can read
-    # an unknown timestamp as the oldest possible file. Real 0 stays valid.
-    [ -n "$v" ] || return 1
-    case "$v" in
-        *.*) sec="${v%%.*}"; frac="${v#*.}" ;;
-        *)   sec="$v"; frac="" ;;
-    esac
-    frac="${frac}000000000"
-    printf '%s%s\n' "$sec" "${frac:0:9}"
-}
-
-# Check inflight age — 0: older than guard, 1: young (in-flight),
-# 2: mtime unavailable. A miss is NOT "young": callers must refuse, not classify.
+# Check inflight age — returns 0 if file is older than guard
 age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    mtime="$(_stat_field mtime "$file")" || return 2
+    mtime="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
     age=$((now - mtime))
-    [ "$age" -ge "$INFLIGHT_GUARD_SEC" ] || return 1
+    [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -437,8 +379,8 @@ record_xsrc() {
     # $1=tag, $2=relpath, $3=class, $4=abs-path
     local tag="$1" rel="$2" cls="$3" file="$4"
     local mt sz
-    mt="$(_stat_field mtime "$file")" || mt="unknown"
-    sz="$(_stat_field size "$file")" || sz="unknown"
+    mt="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
+    sz="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
     printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
 }
 
@@ -449,7 +391,7 @@ scan_source() {
     # Walk every non-ignored regular file under src.
     local file rel cls dest_path collision_kind="" size mtime_iso
     local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0 n_union=0
-    local bytes_total=0 n_size_unknown=0 n_mtime_unknown=0 _age_rc=0
+    local bytes_total=0
 
     REPORT_LINES+=("")
     REPORT_LINES+=("--- Source $tag — $src ---")
@@ -466,11 +408,7 @@ scan_source() {
         REPORT_LINES+=("  prior partial migration sentinels:")
         while IFS= read -r s; do
             local sm
-            # Separate calls: GNU -f prints a report to stdout AND exits nonzero,
-            # so one `||` substitution would concatenate report with date.
-            sm="$(LC_ALL=C stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null)" || sm=""
-            case "$sm" in ''|*[!0-9-]*) sm="" ;; esac
-            [ -n "$sm" ] || sm="$(LC_ALL=C stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
+            sm="$(stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null || stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
             REPORT_LINES+=("    $(basename "$s")  ($sm)")
         done <<<"$sentinels"
     fi
@@ -553,8 +491,7 @@ scan_source() {
         esac
 
         cls="$(classify "$rel")"
-        # An unavailable size must not print as a measured 0 — count it instead.
-        size="$(_stat_field size "$file")" || { size=0; n_size_unknown=$((n_size_unknown+1)); }
+        size="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
         bytes_total=$((bytes_total + size))
 
         # Index for cross-source collision detection (only classes that
@@ -615,9 +552,6 @@ scan_source() {
                 # in would make the dry-run describe the wrong action.
                 n_union=$((n_union+1))
                 ;;
-            pins-union)
-                n_union=$((n_union+1))
-                ;;
             rehome-state)
                 # Target is <dest>/state/<basename>
                 n_rehome=$((n_rehome+1))
@@ -640,14 +574,11 @@ scan_source() {
                 fi
                 ;;
             inflight-guard)
-                _age_rc=0; age_safe "$file" || _age_rc=$?
-                if [ "$_age_rc" = "0" ]; then
+                if age_safe "$file"; then
                     # Old in-flight artifact — treat as archive
                     n_structural=$((n_structural+1))
-                elif [ "$_age_rc" = "1" ]; then
-                    n_inflight=$((n_inflight+1))
                 else
-                    n_mtime_unknown=$((n_mtime_unknown+1))
+                    n_inflight=$((n_inflight+1))
                 fi
                 ;;
             skip-ephemeral|skip-unknown)
@@ -670,12 +601,7 @@ scan_source() {
     REPORT_LINES+=("    in-flight-skip (<${INFLIGHT_GUARD_SEC}s old):       $n_inflight")
     REPORT_LINES+=("    skip-ephemeral / .DS_Store / .gitkeep:$n_skip")
     REPORT_LINES+=("    unknown (no rule matched, will skip): $n_unknown")
-    [ "$n_mtime_unknown" -gt 0 ] && REPORT_LINES+=("    mtime UNAVAILABLE (in-flight class, commit will refuse): $n_mtime_unknown")
-    if [ "$n_size_unknown" -gt 0 ]; then
-        REPORT_LINES+=("    total bytes (>= — $n_size_unknown file(s) of unknown size not counted): $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
-    else
-        REPORT_LINES+=("    total bytes:                          $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
-    fi
+    REPORT_LINES+=("    total bytes:                          $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -833,7 +759,7 @@ index_dest_for_collisions() {
         local cls
         cls="$(classify "$rel")"
         case "$cls" in
-            structural|append|newest-mtime|pins-union|collision-keep-both|rehome-state)
+            structural|append|newest-mtime|collision-keep-both|rehome-state)
                 record_xsrc "DEST" "$rel" "existing" "$file"
                 ;;
         esac
@@ -872,10 +798,7 @@ report_cross_source() {
     total_identical="$(awk -F'\t' '
         {
             n[$1]++
-            # An unknown field cannot witness equality: unavailable mtime + equal
-            # size is ambiguous, not identical. NR keeps such rows distinct.
-            if ($4 == "unknown" || $5 == "unknown") key = $1 SUBSEP "amb" NR
-            else key = $1 SUBSEP $4 "|" $5
+            key = $1 SUBSEP $4 "|" $5
             if (!(key in seen)) { seen[key]=1; pairs[$1]++ }
         }
         END {
@@ -1043,16 +966,6 @@ copy_preserving_mtime() {
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
 }
 
-# The single commit-path copy boundary. Callers run inside conditional contexts
-# where errexit is disabled, so every failure must return explicitly.
-commit_copy() {
-    local src="$1" dst="$2" rel="$3"
-    if ! copy_preserving_mtime "$src" "$dst"; then
-        echo "FAILED: $rel — copy to $dst failed; source left in place" >&2
-        return 1
-    fi
-}
-
 # Unions top-level arrays; non-array fields follow the newer source.
 # Malformed input returns non-zero — a silent degrade is access loss.
 union_json_arrays_into() {
@@ -1208,32 +1121,18 @@ preflight_summary() {
     echo "$_total_files"
 }
 
-# Print a VALIDATED sha256 digest for $1, or nothing. Non-empty is not the test:
-# a broken hasher prints the same non-digest token for both files and compares equal.
-_sha256_of() {
-    local out rc
-    if command -v shasum >/dev/null 2>&1; then
-        out="$(shasum -a 256 "$1" 2>/dev/null)"; rc=$?
-    else
-        out="$(sha256sum "$1" 2>/dev/null)"; rc=$?
-    fi
-    [ "$rc" -eq 0 ] || return 1
-    # coreutils escapes a filename containing \\ or newline and prefixes the LINE
-    # with \\; the digest itself is unchanged, so strip it before validating.
-    out="${out#\\}"
-    out="${out%% *}"
-    case "$out" in
-        *[!0-9a-fA-F]*|"") return 1 ;;
-    esac
-    [ "${#out}" -eq 64 ] || return 1
-    printf '%s' "$out"
-}
-
+# SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
 sha_match() {
+    local a="$1" b="$2"
     local ha hb
-    ha="$(_sha256_of "$1")" || return 1
-    hb="$(_sha256_of "$2")" || return 1
-    [ "$ha" = "$hb" ]
+    if command -v shasum >/dev/null 2>&1; then
+        ha="$(shasum -a 256 "$a" 2>/dev/null | awk '{print $1}')"
+        hb="$(shasum -a 256 "$b" 2>/dev/null | awk '{print $1}')"
+    else
+        ha="$(sha256sum "$a" 2>/dev/null | awk '{print $1}')"
+        hb="$(sha256sum "$b" 2>/dev/null | awk '{print $1}')"
+    fi
+    [ -n "$ha" ] && [ "$ha" = "$hb" ]
 }
 
 # Per-file commit dispatch. $1=src-file abs, $2=src-relpath, $3=src-tag, $4=class
@@ -1246,7 +1145,7 @@ commit_one() {
         union-json-array)
             dst_path="$DEST_REAL/$rel"
             if [ ! -e "$dst_path" ]; then
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "copied"
                 return 0
             fi
@@ -1271,15 +1170,11 @@ commit_one() {
                 # Same content (mtime+size) → identical-drop. Different →
                 # keep-both: rename source-incoming to <file>.legacy-<tag>.
                 local src_mt src_sz dst_mt dst_sz
-                src_mt="$(_stat_field mtime "$src_file")" || src_mt=""
-                src_sz="$(_stat_field size "$src_file")" || src_sz=""
-                dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
-                dst_sz="$(_stat_field size "$dst_path")" || dst_sz=""
-                # Any unknown operand must never satisfy identical-drop: with
-                # ${v:-0} two failed stats compare 0==0. Unknown -> keep both.
-                if [ -z "$src_mt" ] || [ -z "$dst_mt" ] || [ -z "$src_sz" ] || [ -z "$dst_sz" ]; then
-                    :
-                elif [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
+                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+                src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
+                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                dst_sz="$(stat -f %z "$dst_path" 2>/dev/null || stat -c %s "$dst_path")"
+                if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
                     echo "identical-drop"
                     return 0
                 fi
@@ -1294,105 +1189,40 @@ commit_one() {
                 # entropy from /dev/urandom-seeded bash PRNG) + $$ (pid) instead.
                 local ts_suffix
                 ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
-                # Mutation site: an unknown operand must not pick the canonical
-                # path -- ${v:-0} reads oldest, empty makes `[ -gt ]` error out.
-                if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
-                    echo "collision-mtime-unavailable" >&2
-                    return 1
-                fi
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     # dest's content (whatever was there) goes to a sidecar.
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
                     # what was at dest before <src_tag> overwrote it" + the
                     # timestamp ensures 3-way collisions don't clobber.
-                    commit_copy "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix" "$rel" || return 1
-                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix"
+                    copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-wins-newer"
                 else
                     # src loses; preserve under tagged + timestamped sidecar.
-                    commit_copy "$src_file" "$dst_path.legacy-$tag-$ts_suffix" "$rel" || return 1
+                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix"
                     echo "dest-wins-newer"
                 fi
                 return 0
             else
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "copied"
                 return 0
             fi
-            ;;
-        pins-union)
-            # Newer snapshot whole, plus every older-only pin that is still live;
-            # the merge is process_pins.py's, so the reader and the migrator agree.
-            dst_path="$DEST_REAL/$rel"
-            if [ -e "$dst_path" ]; then
-                if sha_match "$src_file" "$dst_path"; then
-                    echo "dest-newer"
-                    return 0
-                fi
-                local src_mt dst_mt newer older
-                if ! src_mt="$(mtime_ns "$src_file")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for source $src_file — resolve by hand" >&2
-                    return 1
-                fi
-                if ! dst_mt="$(mtime_ns "$dst_path")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for destination $dst_path — resolve by hand" >&2
-                    return 1
-                fi
-                # A tie keeps the destination whole; the union still admits every
-                # live source pin, so no live veto is lost either way.
-                if [ "$src_mt" -gt "$dst_mt" ]; then newer="$src_file"; older="$dst_path"; else newer="$dst_path"; older="$src_file"; fi
-                local merge_out
-                if ! merge_out="$(python3 "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --newer "$newer" --older "$older")"; then
-                    echo "AMBIGUOUS: $rel — pin snapshots could not be merged — resolve by hand" >&2
-                    return 1
-                fi
-                case "$merge_out" in
-                    *"kept=0 "*)
-                        # No live pin to carry over: the newer snapshot wins whole.
-                        if [ "$newer" = "$src_file" ]; then
-                            commit_copy "$src_file" "$dst_path" "$rel" || return 1
-                            echo "src-newer"
-                        else
-                            echo "dest-newer"
-                        fi
-                        ;;
-                    *) echo "unioned" ;;
-                esac
-            else
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
-                echo "copied"
-            fi
-            return 0
             ;;
         newest-mtime)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                # Guard EACH before any arithmetic or write, source first: a
-                # source failure must stop before the destination is probed.
-                if ! src_mt="$(mtime_ns "$src_file")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for source $src_file — resolve by hand" >&2
-                    return 1
-                fi
-                if ! dst_mt="$(mtime_ns "$dst_path")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for destination $dst_path — resolve by hand" >&2
-                    return 1
-                fi
+                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                    copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-newer"
-                elif [ "$src_mt" -lt "$dst_mt" ]; then
-                    echo "dest-newer"
-                elif sha_match "$src_file" "$dst_path"; then
-                    echo "dest-newer"
                 else
-                    # Same instant, different content: scan order is not a
-                    # tiebreak, and picking either can discard a live decision.
-                    echo "AMBIGUOUS: $rel differs at an identical mtime — resolve by hand" >&2
-                    return 1
+                    echo "dest-newer"
                 fi
             else
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "copied"
             fi
             return 0
@@ -1425,22 +1255,16 @@ commit_one() {
             # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(_stat_field mtime "$src_file")" || src_mt=""
-                dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
-                # Fail closed BEFORE comparison, mutation or sentinel: unknown
-                # read as 0 let an older source overwrite a newer dest, exit 0.
-                if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
-                    echo "rehome-mtime-unavailable" >&2
-                    return 1
-                fi
+                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                    copy_preserving_mtime "$src_file" "$dst_path"
                     echo "rehomed-newer"
                 else
                     echo "rehomed-skip-older"
                 fi
             else
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "rehomed"
             fi
             return 0
@@ -1462,8 +1286,8 @@ commit_one() {
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
             mkdir -p "$(dirname "$dst_path")"
             local src_mt src_sz
-            src_mt="$(_stat_field mtime "$src_file")" || src_mt="unknown"
-            src_sz="$(_stat_field size "$src_file")" || src_sz="unknown"
+            src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+            src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
             # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
             # compound on a single line is NOT covered by `set -e` for its
             # left-side failure — the compound returns non-zero but execution
@@ -1582,12 +1406,12 @@ commit_one() {
                     }
                     echo "merged"
                 else
-                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                    copy_preserving_mtime "$src_file" "$dst_path"
                     echo "copied"
                 fi
             else
                 dst_path="$DEST_REAL/legacy/$tag/$rel"
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "sidecar"
             fi
             return 0
@@ -1598,20 +1422,14 @@ commit_one() {
             # double-process old work). Route to tasks/archive/<src-tag>/ or
             # results/archive/<src-tag>/ instead. Bug discovered when a stale
             # May 22 task migrated from B fired the watcher post-test.
-            local _age_rc=0; age_safe "$src_file" || _age_rc=$?
-            if [ "$_age_rc" = "0" ]; then
+            if age_safe "$src_file"; then
                 local subdir="${rel%%/*}"  # tasks or results
                 local file_base="${rel#*/}" # task-*.txt
                 dst_path="$DEST_REAL/$subdir/archive/$tag/$file_base"
-                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                copy_preserving_mtime "$src_file" "$dst_path"
                 echo "archived-stale"
-            elif [ "$_age_rc" = "1" ]; then
-                echo "skipped-inflight"
             else
-                # An unreadable mtime cannot witness in-flight vs stale; a skip
-                # here would complete the source and a later retry hits the sentinel.
-                echo "ERROR: $rel — mtime unavailable; refusing to classify in-flight vs stale" >&2
-                return 1
+                echo "skipped-inflight"
             fi
             return 0
             ;;
@@ -1621,7 +1439,7 @@ commit_one() {
             # experiments/, obsidian-vault/, personal-src/). Preserve under a
             # namespaced quarantine path rather than skip-unknown'ing it.
             dst_path="$DEST_REAL/legacy/$tag/quarantine/$rel"
-            commit_copy "$src_file" "$dst_path" "$rel" || return 1
+            copy_preserving_mtime "$src_file" "$dst_path"
             echo "quarantined"
             return 0
             ;;
@@ -1739,21 +1557,16 @@ commit_source() {
             n_skipped=$((n_skipped+1)); continue
         fi
         cls="$(classify "$rel")"
-        # A command substitution swallows the exit status, so `set -e` cannot
-        # carry a refusal out of here — capture it explicitly or the walk goes on.
-        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")" || {
-            echo "sutando-migrate: commit refused for $rel — source sentinel NOT written" >&2
-            return 1
-        }
+        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
         # Per-file progress on stderr — visible feedback during the copy walk
         # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
         if [ "$PROGRESS_TOTAL" -gt 0 ]; then
             PROGRESS_N=$((PROGRESS_N + 1))
-            _fsize="$(_stat_field size "$file")" || _fsize=""   # report only; "" = unknown
+            _fsize="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
             printf "  [%d/%d] %s (%s) → %s\n" \
                 "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
-                "$([ -n "$_fsize" ] && humanize_bytes "$_fsize" || echo "size unavailable")" "$outcome" >&2
+                "$(humanize_bytes "$_fsize")" "$outcome" >&2
             # Every 20 files: aggregate progress + ETA refinement
             if [ $((PROGRESS_N % 20)) -eq 0 ] && [ "$PROGRESS_N" -lt "$PROGRESS_TOTAL" ]; then
                 _pct=$((PROGRESS_N * 100 / PROGRESS_TOTAL))
@@ -1905,20 +1718,14 @@ commit_main() {
     echo
 
     # Order: C (richest) → A (merges atop C) → B (sentinel-deduped legacy)
-    # Propagate explicitly: errexit is exempt inside a containing conditional,
-    # and a refusal that keeps walking writes A's and B's sentinels anyway.
-    for _src in C A B; do
-        eval "_ok=\${${_src}_REAL_OK}"
-        [ -n "$_ok" ] || continue
-        include_src "$_src" || continue
-        commit_source "$_src" "$_ok" || {
-            echo "sutando-migrate: source $_src refused — halting before the remaining sources; no further sentinels written" >&2
-            return 1
-        }
-    done
+    [ -n "$C_REAL_OK" ] && include_src C && commit_source C "$C_REAL_OK"
+    [ -n "$A_REAL_OK" ] && include_src A && commit_source A "$A_REAL_OK"
+    [ -n "$B_REAL_OK" ] && include_src B && commit_source B "$B_REAL_OK"
 
-    # β rehome of source's .git → dest/.git is a SEPARATE step, in
-    # sutando-plus/scripts/sutando-migrate-sync.sh, run AFTER this commit succeeds.
+    # β rehome of source's .git → dest/.git is a SEPARATE step. See
+    # sutando-plus/scripts/sutando-migrate-sync.sh — runs AFTER this commit
+    # succeeds, only relevant to sutando-plus users who have a vault remote at
+    # the customized source location.
 
     # Auto-invoke Claude memory import — fixes Lucy's Maddy migration report
     # 2026-06-06: previously sutando-migrate set up the M2 directories but did
@@ -2309,7 +2116,7 @@ rollback_main() {
     else
         : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
     fi
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(_stat_field size "$backup_path" || echo 0)" >&2
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(stat -f %z "$backup_path")" >&2
     local sd
     [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
@@ -2349,54 +2156,42 @@ if os.path.exists(idx_path):
     with open(idx_path) as f:
         for line in f:
             rel, tag, cls, mt, sz = line.rstrip("\n").split("\t")
-            # unknown is a MISS, not a value: int("unknown") raised, and 0 would
-            # be a real mtime that compares equal to another miss.
-            def _num(v):
-                return int(v) if (v or "").isdigit() else None
             entries.append({"rel": rel, "tag": tag, "class": cls,
-                            "mtime": _num(mt), "size": _num(sz)})
+                            "mtime": int(mt or 0), "size": int(sz or 0)})
 by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
-def has_unknown(entries):
-    """A miss cannot witness equality: two unreadable mtimes are ambiguous, not equal."""
-    return any(e["mtime"] is None or e["size"] is None for e in entries)
 identical = sum(1 for v in collisions.values()
-                if not has_unknown(v)
-                and len({(e["mtime"], e["size"]) for e in v}) == 1)
+                if len({(e["mtime"], e["size"]) for e in v}) == 1)
 genuine = len(collisions) - identical
 by_class = defaultdict(int)
 for v in collisions.values():
     by_class[v[0]["class"]] += 1
-def _known(vals):
-    return [x for x in vals if x is not None]
 def has_size_mismatch(entries):
-    """True if KNOWN sizes differ — real content divergence the user must reason about."""
-    return len(set(_known(e["size"] for e in entries))) > 1
+    """True if entries differ in size — real content divergence the user must reason about."""
+    return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
-    return len(set(_known(e["mtime"] for e in entries))) > 1
-# Sort by actionability: size-mismatch (real content conflict), then unknown
-# metadata (ambiguous, commit fails closed), then mtime-only, then identical.
+    return len({e["mtime"] for e in entries}) > 1
+# Sort by actionability: size-mismatch (real content conflict) first, then
+# mtime-only diff (commit's newest-mtime resolves it), then identical
+# (drop-dup). Tiebreak by class then rel.
 def sort_key(item):
     k, v = item
-    if has_size_mismatch(v): prio = 0
-    elif has_unknown(v): prio = 1
-    elif has_mtime_mismatch(v): prio = 2
-    else: prio = 3
+    sz_diff = has_size_mismatch(v)
+    mt_diff = has_mtime_mismatch(v)
+    # priority: 0=size-diff (real), 1=mtime-only, 2=identical
+    if sz_diff: prio = 0
+    elif mt_diff: prio = 1
+    else: prio = 2
     return (prio, v[0]["class"], k)
 notable = [{"class": v[0]["class"], "rel": k,
             "size_mismatch": has_size_mismatch(v),
             "mtime_mismatch": has_mtime_mismatch(v),
-            "unknown_metadata": has_unknown(v),
             "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
            for k, v in sorted(collisions.items(), key=sort_key)]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
-unknown_meta = sum(1 for v in collisions.values()
-                   if not has_size_mismatch(v) and has_unknown(v))
-mtime_only = sum(1 for v in collisions.values()
-                 if not has_size_mismatch(v) and not has_unknown(v)
-                 and has_mtime_mismatch(v))
+mtime_only = sum(1 for v in collisions.values() if not has_size_mismatch(v) and has_mtime_mismatch(v))
 out = {
     "dest": dest,
     "sources": {"A": a or None, "B": b or None, "C": c or None},
@@ -2406,9 +2201,7 @@ out = {
         "identical_content": identical,
         "mtime_only_diff": mtime_only,  # commit's newest-mtime auto-resolves
         "size_mismatch": size_diff,     # the actionable subset — real content conflicts
-        "unknown_metadata": unknown_meta,  # a probe failed; ambiguous, never identical
-        # Legacy "genuine_conflicts" kept for backward-compat; equals
-        # mtime_only + size_mismatch + unknown_metadata
+        # Legacy "genuine_conflicts" kept for backward-compat; equals mtime_only + size_mismatch
         "genuine_conflicts": genuine,
         "by_class": dict(by_class),
     },
