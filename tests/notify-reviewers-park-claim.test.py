@@ -729,5 +729,65 @@ class RollbackAndIdentityControls(unittest.TestCase):
         self.assertNotIn("json.loads", src)
 
 
+def _nr():
+    spec = importlib.util.spec_from_file_location("nr_ident", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["nr_ident"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TypedIdentityMembership(unittest.TestCase):
+    """Every identity shape resolve() accepts must persist and compare."""
+
+    # A roster key shaped like an mxid, and a second person whose stand is that
+    # same string: both shapes are accepted by resolve(), so both must survive.
+    COLLIDING = {"@shared:x": {"stand": "@a-stand:x", "room": "!r"},
+                 "bob": {"stand": "@shared:x", "room": "!r"}}
+
+    def test_every_written_tag_survives_its_own_reader(self):
+        nr = _nr()
+        for name in self.COLLIDING:
+            tags = nr.component_tags(self.COLLIDING, name)
+            self.assertEqual(nr.valid_tags(sorted(tags)), tags, name)
+
+    def test_a_colliding_name_and_endpoint_stay_two_people(self):
+        nr = _nr()
+        canon = nr.component_resolver(self.COLLIDING)
+        self.assertNotEqual(canon("@shared:x"), canon("bob"))
+
+    def test_two_unrelated_names_also_stay_distinct(self):
+        # Control: the assertion above passes on a resolver that returns its
+        # own argument for everything.
+        nr = _nr()
+        canon = nr.component_resolver({"alice": {"stand": "A", "room": "!r"},
+                                       "carol": {"stand": "C", "room": "!r"}})
+        self.assertNotEqual(canon("alice"), canon("carol"))
+        self.assertTrue(canon("alice").startswith("person:"))
+
+    @staticmethod
+    def _shared_endpoint(n):
+        # One component, n distinct actors: same durable endpoint, own names.
+        return {f"p{i}": {"stand": "@shared:x", "room": "!r"} for i in range(n)}
+
+    def test_an_unrepresentable_component_is_refused_not_truncated(self):
+        nr = _nr()
+        with self.assertRaises(nr.MembershipTooLarge):
+            nr.component_tags(self._shared_endpoint(nr._MAX_TAGS + 88), "p0")
+
+    def test_a_component_within_the_bound_is_still_accepted(self):
+        # Control: refusing everything would satisfy the test above.
+        nr = _nr()
+        tags = nr.component_tags(self._shared_endpoint(nr._MAX_TAGS - 112), "p0")
+        self.assertEqual(len(tags), nr._MAX_TAGS - 111)
+
+    def test_a_legacy_row_still_overlaps_a_freshly_encoded_one(self):
+        # The encoding is a two-sided change: rows written before it must
+        # canonicalize to the same tag or every standing park reads as absent.
+        nr = _nr()
+        self.assertEqual(nr.valid_tags(["endpoint:mx:@sutando-rui:ag2.space"]),
+                         {nr._tag("endpoint", "mx", "@sutando-rui:ag2.space")})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

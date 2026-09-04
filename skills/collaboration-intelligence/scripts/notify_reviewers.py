@@ -35,6 +35,7 @@ import subprocess
 import threading
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 _REPO = Path(__file__).resolve().parents[3]
 # Bare `python3` can resolve to the Xcode CLT stub on a clean macOS host, which
@@ -814,6 +815,10 @@ def reserve_ask(a, t, who, person_of, roster, require_ref=True):
         reserved = claim_park(a.message, t["name"], who, canonical=person_of,
                               endpoint=t.get("endpoint"),
                               membership=component_tags(roster, t["name"]))
+    except MembershipTooLarge as e:
+        return False, "failure", (
+            f"{t['name']}: REFUSED — {e}; the no-repeat contract cannot be upheld "
+            "for an identity that will not persist. Nothing was sent.")
     except OSError as e:
         return False, "failure", (
             f"{t['name']}: REFUSED — could not reserve the park ({e}); sending now "
@@ -1025,18 +1030,45 @@ def identity_components(roster) -> dict:
 #: A persisted membership is attacker-adjacent state read back into a safety
 #: decision, so it is bounded and typed; anything else fails closed.
 _MAX_TAGS = 512
-_TAG_RE = re.compile(r"^(actor:[^\s:]+|endpoint:[^\s:]+:.+)$")
+#: Values are percent-encoded, so `:` is structure and never content — an
+#: mxid-shaped actor used to build a tag its own reader rejected.
+_TAG_RE = re.compile(r"^(actor:[^\s:]+|endpoint:(?:discord|mx):[^\s:]+)$")
+#: Rows written before the encoding: the endpoint tail carried a raw mxid.
+_LEGACY_TAG_RE = re.compile(r"^endpoint:(discord|mx):(\S+)$")
+
+
+class MembershipTooLarge(Exception):
+    """A component cannot be represented within the persisted tag bound."""
+
+
+def _tag(kind: str, *parts: str) -> str:
+    """One typed tag whose value segments cannot escape their slot."""
+    return kind + ":" + ":".join(quote(p, safe="") for p in parts)
+
+
+def _canon_tag(t: str) -> "str | None":
+    """`t` in canonical encoded form, or None when it is malformed."""
+    if _TAG_RE.match(t):
+        return t
+    m = _LEGACY_TAG_RE.match(t)
+    return _tag("endpoint", m.group(1), m.group(2)) if m else None
 
 
 def valid_tags(value) -> "set | None":
-    """The persisted tag set, or None when it is malformed (park stays on)."""
+    """The persisted tag set canonicalized, or None when malformed (park stays on).
+
+    Legacy rows are re-encoded so they still overlap a freshly computed set.
+    """
     if not isinstance(value, list) or len(value) > _MAX_TAGS:
         return None
     out = set()
     for t in value:
-        if not isinstance(t, str) or not _TAG_RE.match(t):
+        if not isinstance(t, str):
             return None
-        out.add(t)
+        c = _canon_tag(t)
+        if c is None:
+            return None
+        out.add(c)
     return out
 
 
@@ -1048,16 +1080,22 @@ def component_tags(roster, name: str) -> set:
     comp = identity_components(roster)
     actor_of = _actor_map(roster or {})
     root = comp.get(name)
-    tags = {f"actor:{actor_of.get(name, name)}"}
+    tags = {_tag("actor", actor_of.get(name, name))}
     for other, r in comp.items():
         if root is not None and r != root:
             continue
-        tags.add(f"actor:{actor_of.get(other, other)}")
+        tags.add(_tag("actor", actor_of.get(other, other)))
         endpoint = durable_endpoint((roster or {}).get(other) or {})
         if endpoint:
-            tags.add(f"endpoint:{endpoint}"
-                     if endpoint.startswith("discord:") else f"endpoint:mx:{endpoint}")
-    return set(sorted(tags)[:_MAX_TAGS])
+            scheme, _, rest = endpoint.partition(":")
+            tags.add(_tag("endpoint", "discord", rest)
+                     if scheme == "discord" else _tag("endpoint", "mx", endpoint))
+    if len(tags) > _MAX_TAGS:
+        # Truncating discards arbitrary identities and accepts the claim anyway,
+        # so a later send to the same person reads as un-parked.
+        raise MembershipTooLarge(
+            f"{name}: {len(tags)} identity tags exceeds the {_MAX_TAGS} bound")
+    return tags
 
 
 def component_resolver(roster):
@@ -1068,15 +1106,23 @@ def component_resolver(roster):
     """
     comp = identity_components(roster)
     actor_of = _actor_map(roster or {})
-    index = {}
+    axes = {"name": {}, "actor": {}, "endpoint": {}}
     for name, root in comp.items():
         key = f"person:{root[0]}:{root[1]}"
-        index[name] = key
-        index[actor_of.get(name, name)] = key
+        axes["name"][name] = key
+        axes["actor"].setdefault(actor_of.get(name, name), key)
         endpoint = durable_endpoint((roster or {}).get(name) or {})
         if endpoint:
-            index[endpoint] = key
-    return lambda w: index.get(w, w)
+            axes["endpoint"].setdefault(endpoint, key)
+
+    def canon(w):
+        # Most specific axis wins: one person's roster key equalling another's
+        # endpoint used to overwrite it, so both resolved to the second person.
+        for axis in ("name", "actor", "endpoint"):
+            if w in axes[axis]:
+                return axes[axis][w]
+        return w
+    return canon
 
 
 def _actor_map(roster) -> dict:
