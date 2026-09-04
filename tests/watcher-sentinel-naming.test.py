@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +133,25 @@ class Enumeration(unittest.TestCase):
         (self.d / "watch-tasks-stream-dir.pid").mkdir()
         self.assertEqual(self._names(), [])
         self.assertEqual(self._sh_names(), [])
+
+    def test_an_unreadable_state_dir_degrades_instead_of_raising(self):
+        """The reaper calls this at startup before anything else, so a raising
+        enumerator aborts the boot rather than skipping one sentinel.
+
+        `Path.glob` swallows a missing, unreadable or non-directory path on
+        CPython, so injection is the only way to reach the guard -- and the only
+        way to show it is not decoration.
+        """
+        (self.d / "watch-tasks-stream.pid").write_text("1\n")
+
+        def boom(self, pattern):
+            raise OSError(13, "Permission denied")
+
+        # The historic name comes from exists(); only the per-instance sweep
+        # raises, so a partial answer still beats an exception.
+        with unittest.mock.patch.object(Path, "glob", boom):
+            names = [p.name for p in up.watcher_sentinel_paths(self.d)]
+        self.assertEqual(names, ["watch-tasks-stream.pid"])
 
     def test_both_enumerators_agree(self):
         for n in ["watch-tasks-stream.pid", "watch-tasks-stream-w1.pid",
