@@ -295,8 +295,7 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
-                             signal_task_media_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
@@ -2655,6 +2654,25 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
     return _record_task_media(tid, task)
 
 
+
+# Signal Room tasks (5G ⑤a-cap), AG2 Space adapter edge: names the ONE directory a
+# Team result may attach from; `attach_markers_confined` withholds anything else.
+def _signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    output_q = shlex.quote(f"{media_dir}/<name>.png")  # a workspace path may hold spaces
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {output_q}), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]
+
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -2812,7 +2830,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         # A relay-stamped Signal task may attach from ITS OWN output directory only;
         # name it here (absolute) so the marker written is the one the guard confines.
         if isinstance(task.get("signal"), dict):
-            lines.extend(signal_task_media_lines(str(RESULTS_DIR / tid)))
+            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
         lines.extend(sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", f"results/{tid}.txt",
