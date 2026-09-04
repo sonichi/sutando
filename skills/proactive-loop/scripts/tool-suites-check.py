@@ -48,7 +48,23 @@ class ExtrasError(Exception):
     """A declared extra suite could not be resolved."""
 
 
-def extra_suites(statedir: Path, repo: Path):
+def extras_path(ws: Path, host: str | None = None) -> Path:
+    """Where the extras declaration lives, preferring the CARRIED location.
+
+    `state/` is in the vault's exclude set, and gitignore cannot re-include a
+    child of an excluded parent, so a file under it can never be backed up.
+    """
+    if host:
+        carried = ws / "hosts" / host / EXTRAS
+        if carried.is_file():
+            return carried
+    legacy = ws / "state" / EXTRAS
+    if legacy.is_file():
+        return legacy
+    return (ws / "hosts" / host / EXTRAS) if host else legacy
+
+
+def extra_suites(decl_or_statedir: Path, repo: Path):
     """Suites living OUTSIDE the workspace scripts dir, declared explicitly.
 
     A locally-deployed guard (e.g. a PreToolUse hook) keeps its suite with the
@@ -60,7 +76,9 @@ def extra_suites(statedir: Path, repo: Path):
     a typo or a moved file report a clean bill for a suite that never ran,
     which is the exact failure this whole check exists to prevent.
     """
-    f = statedir / EXTRAS
+    f = decl_or_statedir
+    if f.is_dir():                      # legacy call shape: a state directory
+        f = f / EXTRAS
     if not f.is_file():
         return []
     try:
@@ -93,16 +111,19 @@ def _warn_if_uncarried(decl: Path) -> None:
 
     Advisory only — a backup concern must never fail a test run.
     """
+    ws = decl.parent.parent
     try:
-        r = subprocess.run(["git", "-C", str(decl.parent.parent), "ls-files", "--error-unmatch",
-                            str(decl.relative_to(decl.parent.parent))],
+        r = subprocess.run(["git", "-C", str(ws), "ls-files", "--error-unmatch",
+                            str(decl.relative_to(ws))],
                            capture_output=True, text=True, timeout=10)
     except Exception:
         return                      # no git, no repo, or a path outside it: not our business
     if r.returncode != 0:
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
               f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Add its path to vault.sync.include.", file=sys.stderr)
+              f"Move it to hosts/<host>/{EXTRAS}, which the vault carries: `state/` is in the "
+              f"exclude set and gitignore cannot re-include a child of an excluded parent, so no "
+              f"vault.sync.include entry can reach it.", file=sys.stderr)
 
 
 def newest_mtime(paths) -> float:
@@ -153,6 +174,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=".", help="cwd for the suites (some import from src/)")
     ap.add_argument("--max-age-hours", type=float, default=24.0)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--host", default=os.environ.get("SUTANDO_HOST_LABEL"),
+                    help="host label; selects hosts/<host>/ over the uncarried state/ copy")
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
@@ -162,7 +185,7 @@ def main(argv=None) -> int:
         return 2
     tools, suites = tools_and_suites(scripts)
     try:
-        extras = extra_suites(statedir, Path(a.repo).resolve())
+        extras = extra_suites(extras_path(ws, a.host), Path(a.repo).resolve())
     except ExtrasError as e:
         print(f"CANNOT ANSWER: {e}", file=sys.stderr)
         return 2

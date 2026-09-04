@@ -5,7 +5,9 @@ purpose is that a MISSING declared suite must be loud rather than silent.
 
 Run:  python3 skills/proactive-loop/scripts/tool-suites-check.test.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -167,6 +169,54 @@ with tempfile.TemporaryDirectory() as td:
           r2.returncode, 1)
     check("stale-bytecode: and the failure names the suite",
           "thing.test.py" in (r2.stdout + r2.stderr), True)
+
+
+print("\ncase: the extras declaration resolves to a VAULT-CARRIED path")
+# state/ is in the vault's exclude set, and gitignore cannot re-include a child
+# of an excluded parent, so a declaration there can never be backed up.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    (ws / "hosts" / "H").mkdir(parents=True)
+    decl = json.dumps({"suites": []})
+    check("neither present -> the host path is proposed",
+          tsc.extras_path(ws, "H").parent.name, "H")
+    (ws / "state" / tsc.EXTRAS).write_text(decl)
+    check("only the legacy copy -> still read (an un-migrated host keeps its extras)",
+          tsc.extras_path(ws, "H").parent.name, "state")
+    (ws / "hosts" / "H" / tsc.EXTRAS).write_text(decl)
+    check("both present -> the carried copy wins",
+          tsc.extras_path(ws, "H").parent.name, "H")
+    check("no host label -> the legacy copy, never a hosts/None path",
+          tsc.extras_path(ws, None).parent.name, "state")
+
+print("\ncase: the uncarried warning names a remedy that can actually work")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    f = ws / "state" / tsc.EXTRAS
+    f.write_text(json.dumps({"suites": []}))
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        tsc.extra_suites(f, Path(td))
+    msg = buf.getvalue()
+    check("it warns at all", "NOT tracked" in msg, True)
+    check("it points at hosts/<host>/", "hosts/<host>/" in msg, True)
+    # The old remedy was "Add its path to vault.sync.include", which cannot
+    # reach a child of an excluded parent -- following it changes nothing.
+    check("it does not prescribe an include entry as the fix",
+          "Add its path to vault.sync.include" in msg, False)
+
+print("\ncase: a state DIRECTORY still resolves (the pre-move call shape)")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    repo = Path(td) / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "e.test.py").write_text("print('PASS')\n")
+    (ws / "state" / tsc.EXTRAS).write_text(json.dumps({"suites": ["tests/e.test.py"]}))
+    got = [x.name for x in tsc.extra_suites(ws / "state", repo)]
+    check("a directory argument is still accepted", got, ["e.test.py"])
 
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
