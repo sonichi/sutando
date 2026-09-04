@@ -65,6 +65,20 @@ task FILENAME) and emits only if it wins; a loser suppresses. This holds for the
 named target, the pinned target, a bound-set member and the core stand-in alike —
 being addressed selects a *candidate*, it does not confer ownership.
 
+**"Fresh" below means ELIGIBLE, not merely beating.** A target is eligible when
+its beat is fresh *and* the core's sweep has not declared it wedged under §3 rule 6
+(a pinned room's oldest unclaimed task older than `stand_in_after_s` while that
+target holds no claimed task). A wedged target is treated exactly as a stale one:
+the pin is unclaimable, so it falls through to rule 3 and the core stands in.
+Without this, rules 1 and 2 suppress on liveness alone and a handler that keeps
+beating without ever claiming holds its pinned tasks unclaimed indefinitely —
+the precise state §3 rule 6 promises the core will take over.
+
+Eligibility is **one value, computed once**: the core evaluates it in its sweep
+(it is the only instance that can see a room's oldest unclaimed task) and publishes
+it alongside the pool status; handlers read that verdict rather than each
+recomputing it from beats they can only partially observe.
+
 1. `requested_worker` names this instance: claim, then emit to this session.
    Names another instance whose beat is fresh: **suppress**.
    Names an instance whose beat is stale: the core claims and emits (stand-in),
@@ -316,9 +330,11 @@ justify a timer, so no `proactive-loop-pool` skill ships.
 4. **Reclaim:** the core, in its sweep, reclaims a task claimed by a worker
    whose beat is stale and one claimed with no result evidence, behind the
    done-flag. Workers reclaim nothing.
-5. **Stand-in:** while a pinned worker's beat is stale, the core claims that
-   room's tasks itself, and stops the moment the beat is fresh. The pin is not
-   changed; nothing is loaned or re-bound.
+5. **Stand-in:** while a pinned worker is ineligible — beat stale, or wedged
+   under rule 6 — the core claims that room's tasks itself, and stops when the
+   worker is eligible again. A fresh beat alone does not end a stand-in; rule 6
+   is what says whether beating counts. The pin is not changed; nothing is
+   loaned or re-bound.
 6. **Busy is not hung.** A worker with a fresh beat and a claimed, unfinished
    task is busy, and the core leaves its rooms alone. The core stands in for a
    fresh-beat worker only when a pinned room's oldest unclaimed task is older
