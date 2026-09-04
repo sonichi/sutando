@@ -120,10 +120,8 @@ def engage_rulebook(surface: str, provenance: str, result_path: str) -> str:
     )
 
 
-# Signal Room tasks (design 5G ⑤a-cap, room-native): the ONE place a Team result
-# may hand the room a file is the task's own output directory. This tells the
-# agent where that is and how to reference what it puts there; the egress guard
-# (`attach_markers_confined`) withholds any marker that points anywhere else.
+# Signal Room tasks (5G ⑤a-cap): the task's own output directory is the ONE place
+# a Team result may attach from; `attach_markers_confined` withholds anything else.
 def signal_task_media_lines(media_dir: str) -> list[str]:
     """Prose lines (no fence, no header-shaped line) appended after the Team
     guardrail of a Signal Room task, naming the task's own media directory."""

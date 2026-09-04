@@ -215,6 +215,22 @@ class TaskScopedAttachRoots(unittest.TestCase):
         out, _ = self._guard("x [file: task-signal-1/chart.png]", "ts5")
         self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
 
+    def test_tilde_marker_is_not_confined_even_when_home_is_the_root(self):
+        home = pathlib.Path(os.path.expanduser("~")).resolve()
+        out, _ = guard.guard_result_for_tier(
+            "x [file: ~/inside.png]", "team", REPO, suppress_journal=(self.sd, "ts5b"),
+            attach_roots=(str(home),))
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_marker_naming_the_root_itself_is_confined_but_not_sendable(self):
+        # The guard confines by LOCATION; the upload path independently requires a
+        # regular file, so a marker naming the directory is refused there.
+        out, why = self._guard(f"x [file: {self.root}]", "ts5c")
+        self.assertEqual((out, why), (f"x [file: {self.root}]", None))
+        sys.path.insert(0, "packages/ag2-sparrow")
+        from ag2_sparrow.send_allowlist import is_path_sendable
+        self.assertFalse(is_path_sendable(str(self.root)))
+
     def test_one_stray_marker_withholds_the_whole_result(self):
         body = f"x [file: {self.inside}]\n[file: {self.outside / 'other.png'}]"
         out, _ = self._guard(body, "ts6")

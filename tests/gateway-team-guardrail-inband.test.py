@@ -16,6 +16,7 @@ Run: python3 tests/gateway-team-guardrail-inband.test.py
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 import unittest
@@ -79,6 +80,11 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
             self.assertIn("image-generation", body)
             self.assertEqual(body.count(FENCE), 1,
                              "the media lines are prose after the guardrail, not a second fence")
+            # Nothing appended may parse as a header (local_task_protocol's shape).
+            header_shaped = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]?")
+            tail = body.split("===END SUTANDO SYSTEM INSTRUCTIONS===", 1)[1]
+            self.assertEqual([l for l in tail.splitlines() if header_shaped.match(l)], [],
+                             "the appended media prose must not contain a header-shaped line")
             # Still the narrower Team guardrail, in the same body.
             self.assertIn("TEAM-tier request from a trusted collaborator", body)
 

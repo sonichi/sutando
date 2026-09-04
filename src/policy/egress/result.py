@@ -168,9 +168,9 @@ def attach_markers_confined(body: str, attach_roots) -> bool:
     result may carry `[file:]` markers for files the task itself produced under
     its own output directory -- and nothing else. Realpath on both sides, so a
     symlink planted inside the root that points out of it is caught the way
-    send_allowlist catches it. A relative path is not confined: it would resolve
-    against whichever cwd the consumer happens to have, which is not a location
-    this policy can vouch for. An empty `attach_roots` confines nothing.
+    send_allowlist catches it. A relative or `~`-prefixed path is not confined:
+    it would resolve against a cwd or a home directory this policy cannot
+    vouch for. An empty `attach_roots` confines nothing.
     """
     roots = [os.path.realpath(str(r)) for r in (attach_roots or ()) if str(r).strip()]
     if not roots:
@@ -179,7 +179,7 @@ def attach_markers_confined(body: str, attach_roots) -> bool:
     if not values:
         return False
     for raw in values:
-        candidate = os.path.expanduser((raw or "").strip())
+        candidate = (raw or "").strip()
         if not candidate or not os.path.isabs(candidate):
             return False
         real = os.path.realpath(candidate)

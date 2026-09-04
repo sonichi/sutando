@@ -1131,14 +1131,10 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
-    # Task-scoped attachment allowance (Signal Room, 5G ⑤a-cap): a task the relay
-    # stamped `signal` (its media mode is committed in the sidecar BEFORE the
-    # task is queued) may carry `[file:]` markers for files under its own
-    # `<results>/<tid>/` -- the directory the task body named. Anything else
-    # stays a delivery-control leak. Fail-closed on any doubt: an unreadable
-    # sidecar or ledger grants nothing (the delivery itself defers later).
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from its own
+    # `<results>/<tid>/`; guest/unknown tiers and an unreadable sidecar grant nothing.
     attach_roots: tuple = ()
-    if guarded_tier(tier):
+    if tier == "team":
         _delivery_for_media = _delivery_tid(tid)
         _media_modes = _load_task_media() if _delivery_for_media is not None else None
         if (_media_modes is not None
@@ -2813,10 +2809,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
-        # A Signal Room task (relay-stamped `signal`) may hand the room files it
-        # produced under ITS OWN output directory -- the task-scoped allowance
-        # `_guarded_result_body` grants at result time. Name that directory here,
-        # absolute, so the marker the agent writes is the one the guard confines.
+        # A relay-stamped Signal task may attach from ITS OWN output directory only;
+        # name it here (absolute) so the marker written is the one the guard confines.
         if isinstance(task.get("signal"), dict):
             lines.extend(signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
