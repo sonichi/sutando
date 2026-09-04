@@ -92,8 +92,10 @@ corrupt; step 3's pins the transition.
 
 The record's contract, because a routing-critical shared file without one drifts:
 **one writer** (the core sweep; a worker that writes it is a defect, not a
-fallback), written **atomically** by temp-file plus `os.replace` so a reader never
-sees a partial file. This is the same one-writer/atomic/fail-toward-absence shape
+fallback), written **atomically** by temp-file plus `os.replace`, the temp file in
+the DESTINATION DIRECTORY — `os.replace` is only atomic within one filesystem, so a
+temp in `/tmp` degrades to a copy and a reader can see a partial file, which is the
+one thing this rule exists to prevent. This is the same one-writer/atomic/fail-toward-absence shape
 `core-status.json` already uses, and for the same reason: a truncated read of a
 status file was taken as a verdict once already.
 
@@ -125,10 +127,20 @@ which by the default above means eligible-if-its-beat-is-fresh:
 | `version` absent, not an integer, or not one this reader implements | absent |
 | `computed_at` absent, not an integer, or more than 60 s in the FUTURE | absent — a clock ahead must not confer permanent freshness |
 | `now > computed_at + stale_after_s` | absent (stale) — never its last value, or a dead publisher keeps a worker diverted forever |
-| `stale_after_s` absent or not a positive integer | absent |
+| `stale_after_s` absent, not an integer, or outside **60..600** | absent — see the bound below |
 | the instance is not a key of `instances` | absent — an unlisted instance is unjudged, not judged clean |
 | its value is not exactly `eligible` or `wedged` | absent |
 | any other key present anywhere | ignored, so the writer may add fields without stranding an old reader |
+
+**v1 fixes `stale_after_s` at 180, and a reader REFUSES anything outside 60..600.**
+An unbounded positive integer defeats the expiry guarantee two rows above: a record
+carrying `stale_after_s: 9223372036854775807` passes every cell of this matrix and
+then preserves a `wedged` verdict for the life of the host after the publisher dies —
+the dead-publisher case the row was written against, arriving through the field meant
+to bound it. The reader enforces the range because it is the party that survives a
+buggy or hostile writer; the writer emitting 180 is a convention, the reader's refusal
+is the guarantee. 60 is below no plausible sweep interval and 600 is ten minutes of
+stale routing, which is the most this design is willing to owe.
 
 Absent is the ONLY failure mode, deliberately: it collapses every partial-read
 disagreement onto the pre-rule behaviour, so two conforming readers cannot choose
@@ -136,7 +148,25 @@ opposite eligibility for one bad record. `version` is what makes a shape change
 safe — a reader that does not implement the version reads absent rather than
 guessing at fields it does not know, and the step-3 suite exercises a reader
 meeting both an old and a new record across the atomic swap, since that is the one
-moment two versions coexist on disk.
+moment two versions coexist on disk. The arbitration that test pins, stated rather
+than promised: a reader that opened the OLD record (instance `eligible`) and a swap
+that lands a NEW record (same instance `wedged`) race, and the reader's decision is
+CORRECT EITHER WAY — it acted on a verdict that was true when it read, and eligible
+is the safe direction (the core stands in one sweep later instead of never). The
+guarantee is only that no reader observes a torn record, never that two readers in
+the same instant agree; requiring the latter would need a lock this design does not
+take. So the expected result is: old-reader claims, new-reader suppresses, and the
+claim decides — the same resolution as every other race here.
+
+**And a target checks its OWN verdict before claiming.** The eligibility rule above
+tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
+2 letting the named worker, the pinned worker, a dedicated worker and every bound-set
+member claim unconditionally — so an instance the core has recorded `wedged` can still
+win the claim and strand the task, which is the exact state the stand-in exists to
+rescue. So each branch below is read as: **if my own verdict is `wedged`, suppress and
+let rule 3 reach the core**; absent-or-eligible, act as written. A wedged instance that
+claims nothing is unaffected — this only binds the one that is wedged and still
+claiming, which is the case that hurts.
 
 1. `requested_worker` names this instance: claim, then emit to this session.
    Names another instance whose beat is fresh: **suppress**.
@@ -477,8 +507,9 @@ every task, and pins remove the competition.
 A worker's heartbeat is bound to its process, not to its usefulness: it keeps
 beating with dead credentials, and a Codex worker's beat is a sidecar of the
 pane pid. So `.alive` answers only "is the process up". The signal for "is it
-working" is the **age of the oldest unclaimed task in a room pinned to a worker
-whose beat is fresh**, which the core computes in its sweep. Classifying a
+working" is the **age of the oldest unclaimed task ADDRESSED TO a worker whose beat
+is fresh** — by any route, matching §3 rule 6, not pinned rooms alone — which the
+core computes in its sweep. Classifying a
 worker that stopped, carried from #3604's operations section:
 
 | symptom | class | action |
