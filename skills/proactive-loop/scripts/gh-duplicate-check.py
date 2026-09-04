@@ -174,6 +174,14 @@ def main(argv=None) -> int:
     if failures:
         print(f"  ⚠ {failures} query(ies) failed — coverage is partial")
     if not hits:
+        if dropped:
+            # The unsearched remainder can hold the ONLY qualifying overlap, and rc 0
+            # chains straight into `gh issue create` — a printed warning gates nothing.
+            print(f"CANNOT ANSWER: {len(dropped)} token(s) were never searched "
+                  f"({', '.join(dropped)}) and nothing matched the {len(used)} that were. "
+                  f"A duplicate sharing only a dropped token is invisible here. "
+                  f"Re-run with --max-queries {len(toks)}.", file=sys.stderr)
+            return 2
         if failures:
             # Partial coverage cannot produce a clean bill: the queries that did
             # not run are exactly where an unseen duplicate would be.

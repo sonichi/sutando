@@ -124,19 +124,43 @@ class Scoring(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("NO CANDIDATE", out)
 
+
+    def test_a_candidate_sharing_only_a_DROPPED_token_is_not_cleared(self):
+        # qingyun-wu's control: the distinguishing overlap lies past the cap, so
+        # rc 0 would chain into `gh issue create` with the duplicate unseen.
+        title = "alpha bravo charlie delta epsilon foxtrot"
+        cand = {"number": 7, "state": "open", "html_url": "u",
+                "title": "epsilon foxtrot", "body": ""}
+        seen = {"n": 0}
+        def only_late(r, t, **k):
+            seen["n"] += 1
+            return [cand] if t in ("epsilon", "foxtrot") else []
+        rc, _, err = run(["--repo", "o/n", "--title", title], only_late)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("never searched", err)
+
+    def test_raising_the_cap_finds_that_same_candidate(self):
+        title = "alpha bravo charlie delta epsilon foxtrot"
+        cand = {"number": 7, "state": "open", "html_url": "u",
+                "title": "epsilon foxtrot", "body": ""}
+        rc, out, _ = run(["--repo", "o/n", "--title", title, "--max-queries", "6"],
+                         lambda r, t, **k: [cand] if t in ("epsilon", "foxtrot") else [])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("#7", out)
+
     def test_clean_result_states_it_is_not_proof_of_absence(self):
         rc, out, _ = run(BASE, lambda r, t, **k: [])
         self.assertEqual(rc, 0)
         self.assertIn("not proof of absence", out)
 
 
-    def test_a_clean_result_names_the_tokens_it_never_searched(self):
-        # The cap drops 2-8 tokens on real titles, often the most distinctive
-        # ones, so an unstated bound reads as a wider search than was run.
-        rc, out, _ = run(BASE + ["--max-queries", "1"], lambda r, t, **k: [])
-        self.assertEqual(rc, 0, out)
+    def test_the_header_names_the_tokens_it_never_searched(self):
+        # An unstated bound reads as a wider search than was run. The verdict is
+        # now rc 2 (see the dropped-token control); the header must still name them.
+        rc, out, err = run(BASE + ["--max-queries", "1"], lambda r, t, **k: [])
+        self.assertEqual(rc, 2, out)
         self.assertIn("NOT searched", out)
-        self.assertIn("never searched", out)
+        self.assertIn("never searched", err)
 
     def test_the_header_states_used_of_total(self):
         rc, out, _ = run(BASE + ["--max-queries", "1"], lambda r, t, **k: [])
@@ -206,7 +230,10 @@ class DecisionParametersCannotSilenceTheSearch(unittest.TestCase):
         self.assertEqual(rc, 1, out)
 
     def test_one_of_each_is_still_allowed(self):
-        rc, out, _ = run(BASE + ["--max-queries", "1", "--min-overlap", "1"],
+        # A title whose tokens all fit under the cap, so nothing is dropped and
+        # the genuine rc-0 path is reachable.
+        rc, out, _ = run(["--repo", "o/n", "--title", "eslint",
+                          "--max-queries", "1", "--min-overlap", "1"],
                          lambda r, t, **k: [])
         self.assertEqual(rc, 0, out)
 
