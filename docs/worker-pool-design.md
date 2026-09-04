@@ -67,7 +67,26 @@ carry their own), at the handler's probe, before any claim:
    this is a **dedicated** worker's own room: emit with no claim. Pinned to a bound set
    this worker belongs to: members race for the watcher's shared atomic claim
    (a hard link in `state/task-event-handler-claims/`); the winner emits.
-3. Otherwise the core emits and workers claim and discard.
+   Pinned to a FRESH instance that is not this one: claim and discard — the core
+   included. A pin is addressing, so the core is a non-target here exactly as a
+   worker is, and rule 3 must not be reached. Pinned to an instance whose beat
+   is stale: the pin is unclaimable, so it falls through to rule 3 and the core
+   stands in.
+3. The task is addressed to no live instance: the core emits and workers claim
+   and discard.
+
+Traced for the case the rule used to get wrong — a task with no
+`requested_worker` in a room pinned to worker-2, with worker-2 fresh:
+
+| instance | rule 1 | rule 2 | rule 3 | result |
+|---|---|---|---|---|
+| core     | no field | pin names a fresh instance, not me: claim, discard | not reached | discards |
+| worker-2 | no field | pin names me: emit, no claim | not reached | **emits** |
+| worker-3 | no field | pin names a fresh instance, not me: claim, discard | not reached | discards |
+
+Exactly one emit, and the claim is what makes the two discards safe to race.
+With worker-2's beat STALE the second column falls through for everyone, rule 3
+selects the core, and the workers discard — one emit again, by the stand-in.
 
 A task is eligible to exactly one instance except inside a bound set, where the
 claim settles it. A later form of addressing (an app control, a room command, a
