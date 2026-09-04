@@ -250,9 +250,13 @@ with tempfile.TemporaryDirectory() as d:
         got, note = mib._live_index(live)
     finally:
         pathlib.Path.glob = real_glob
-    # The scan raised, so cands is empty; MEMORY_DIR's own index still exists, so it is used.
-    check("an OSError from the scan is CAUGHT and falls back, not raised",
-          got == live / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+    # A raised scan proves nothing about uniqueness, so falling back to MEMORY_DIR's
+    # own index would re-open the exact hole this resolver closes.
+    check("an OSError from the scan REFUSES rather than falling back to the cwd default",
+          got is None and "CANNOT ANSWER" in note and "uniqueness" in note,
+          f"got={got} note={note!r}")
+    check("the scan-failure refusal says how to proceed",
+          "--index" in note and "SUTANDO_MEMORY_DIR" in note, f"note={note!r}")
 
 def _main_with_memory_dir(memory_dir, args):
     """main() re-imports health-check, so SUTANDO_MEMORY_DIR is how MEMORY_DIR is set."""

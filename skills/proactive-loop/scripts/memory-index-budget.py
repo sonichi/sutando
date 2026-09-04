@@ -109,8 +109,11 @@ def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
     projects = memory_dir.parent.parent
     try:
         cands = sorted(p for p in projects.glob("*/memory/MEMORY.md") if p.is_file())
-    except OSError:
-        cands = []
+    except OSError as e:
+        # A failed scan establishes nothing about uniqueness, so falling back to
+        # the cwd-derived default is the same fail-open this resolver exists to close.
+        return None, (f"CANNOT ANSWER: could not scan {projects} ({e}) — uniqueness "
+                      f"unestablished. Pass --index or set SUTANDO_MEMORY_DIR.")
     if not cands:
         if default.is_file():
             return default, ""
