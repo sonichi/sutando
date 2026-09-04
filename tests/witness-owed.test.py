@@ -343,7 +343,7 @@ class UpgradeWiring(unittest.TestCase):
         for token in ('[ -n "$GATE_WS" ] ||', '[ -n "$GATE_PY" ] ||',
                       '[ -f "$GATE_HELPER" ] ||', 'sutando-config.sh" python-bin',
                       '[ -n "$GATE_REPO" ] ||', '--repo "$GATE_REPO"', '--max-age "$GATE_MAX_AGE"',
-                      'sync-workspace.sh" --pull-only ||', 'publish --host "$GATE_HOST"'):
+                      'sync-workspace.sh" ||', 'publish --host "$GATE_HOST"'):
             self.assertIn(token, self.SRC, token)
         self.assertNotIn('python3 "$REPO/src/witness_owed.py"', self.SRC, "bare python3 may hit the CLT stub")
         # A missing host label cannot release a record, so it must not stop
@@ -428,6 +428,95 @@ class Round5Blockers(Fixture):
         self.assertIn(json.loads(path.read_text())["tag"], ("a", "b"))
         leftovers = list(path.parent.glob("*.tmp"))
         self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
+
+
+class Round5Publication(Fixture):
+    """keweichen's round-5 P1-1 controls: a stamp is a claim about RECORDS."""
+
+    def test_a_record_opened_after_the_stamp_unpublishes_the_host(self):
+        wo.publish(self.ws, HOST_A)
+        self.assertFalse(wo.unpublished(self.ws, HOST_A), "a just-published empty host reads as published")
+        self.open12(host=HOST_A)
+        self.assertTrue(wo.unpublished(self.ws, HOST_A),
+                        "a record opened after the stamp still read as published")
+        wo.publish(self.ws, HOST_A)
+        self.assertFalse(wo.unpublished(self.ws, HOST_A))
+
+    def test_the_gate_names_this_hosts_own_unpublished_records(self):
+        later = self.merge_topology()
+        wo.publish(self.ws, HOST_A)
+        self.open12(host=HOST_A)
+        hits = wo.blocking(self.ws, self.repo, later, self.base, host=HOST_A,
+                           target_repo="o/r", max_age_s=3600)
+        own = [h for h in hits if h.get("stale") and h.get("host") == HOST_A]
+        self.assertTrue(own, f"the host's own unpublished records did not block it: {hits}")
+        self.assertIn("publish and push", own[0]["reason"])
+
+    def test_a_peer_stamp_that_does_not_describe_its_records_is_stale(self):
+        import shutil
+        self.open12(host=HOST_A)
+        wo.publish(self.ws, HOST_A)
+        ws_b = Path(self.tmp.name) / "ws-b2"
+        shutil.copytree(self.ws / "hosts" / HOST_A, ws_b / "hosts" / HOST_A)
+        self.assertEqual(wo.stale_hosts(ws_b, HOST_B, 3600), [],
+                         "a faithfully carried subtree should be fresh")
+        # The carried subtree gains a record its stamp never covered — the shape
+        # a mid-write copy or a hand edit produces.
+        extra = ws_b / "hosts" / HOST_A / "witness-owed" / wo.record_key("o/r", 99)
+        extra.write_text(json.dumps({"repo": "o/r", "pr": 99, "head": "c" * 40, "host": HOST_A,
+                                     "reason": "r", "opened_by": "x",
+                                     "opened_at": "2026-09-04T00:00:00Z", "canary": None}))
+        self.assertEqual(wo.stale_hosts(ws_b, HOST_B, 3600), [HOST_A],
+                         "a fresh timestamp beside records it never covered read as published")
+
+    def test_a_host_with_nothing_to_publish_never_blocks_itself(self):
+        # Every host without records once blocked itself, which is a fleet-wide
+        # deadlock rather than a safety property.
+        later = self.merge_topology()
+        self.assertFalse(wo.unpublished(self.ws, HOST_B))
+        hits = wo.blocking(self.ws, self.repo, later, self.base, host=HOST_B,
+                           target_repo="o/r", max_age_s=3600)
+        self.assertEqual([h for h in hits if h.get("host") == HOST_B], [])
+
+
+class UpgradePublicationWiring(unittest.TestCase):
+    """The stamp must be written where a push can carry it, and before the
+    fleet is read. Ordering, not spelling: the indices are the assertion."""
+
+    def setUp(self):
+        self.sh = (ROOT / "skills" / "self-upgrade" / "scripts" / "upgrade.sh").read_text()
+
+    def test_this_host_publishes_before_it_reads_the_fleet(self):
+        publish = self.sh.index('publish --host "$GATE_HOST"')
+        sync = self.sh.index('bash "$REPO/scripts/sync-workspace.sh"')
+        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        self.assertLess(publish, sync, "the stamp must travel WITH the records the sync pushes")
+        self.assertLess(sync, check, "the fleet is read before it is refreshed")
+
+    def test_the_pre_gate_sync_is_a_full_tick_not_pull_only(self):
+        # --pull-only never publishes this host, so a fleet of pull-only
+        # updaters ages every stamp out and then refuses forever.
+        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        # Only INVOCATIONS count: the first draft of this assertion matched its
+        # own explanatory comment and failed on prose.
+        calls = [ln for ln in self.sh[:check].splitlines()
+                 if "sync-workspace.sh" in ln and not ln.lstrip().startswith("#")]
+        self.assertTrue(calls, "nothing refreshes the fleet before the gate reads it")
+        self.assertEqual([c for c in calls if "--pull-only" in c], [])
+
+    def test_a_canary_declaration_restamps_before_the_gate_reads_it(self):
+        # Declaring a canary MUTATES this host's record; without a re-stamp the
+        # gate refuses the very host the canary was declared for.
+        declare = self.sh.index('canary "$CANARY" --host "$GATE_HOST"')
+        publish = self.sh.index('publish --host "$GATE_HOST"', declare)
+        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        self.assertLess(publish, check)
+
+    def test_nothing_heavy_sits_between_the_pull_and_the_restart_handoff(self):
+        # A synchronous vault push here delayed the handoff past its budget.
+        pull = self.sh.index('git pull --ff-only')
+        handoff = self.sh.index('new-session -d -s "$SERVICE_SESSION"')
+        self.assertNotIn("sync-workspace.sh", self.sh[pull:handoff])
 
 
 if __name__ == "__main__":
