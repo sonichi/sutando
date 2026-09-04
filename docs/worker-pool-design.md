@@ -61,7 +61,7 @@ carry their own), at the handler's probe, before any claim:
 
 **Every emitter claims first.** An instance that decides it may emit acquires the
 task-specific claim (a hard link in `state/task-event-handler-claims/`, keyed on the
-task FILENAME) and emits only if it wins; a loser suppresses. This holds for the
+task's CANONICAL ID — see below) and emits only if it wins; a loser suppresses. This holds for the
 named target, the pinned target, a bound-set member and the core stand-in alike —
 being addressed selects a *candidate*, it does not confer ownership.
 
@@ -316,13 +316,19 @@ and the invariant is that **an unverified command is never worker work**:
 | **verified** | yes | yes | the core executes the command. |
 | **unsigned** (no stamper, or the stamper raised) | **no** | **no** | refused as a command AND withheld from every worker. Quarantined with the reason, and the owner is told the command did not run and why. It is not retried silently — a command that changes pool topology must not execute on an unverified envelope. |
 | **invalid** (stamp present, MAC mismatch) | **no** | **no** | same refusal, quarantined as tamper rather than outage, and reported loudly. |
+| **unverifiable** (no local key, or a present-but-corrupt one) | **no** | **no** | same refusal and the same withholding, but classified as a LOCAL OUTAGE, not tamper: the key is at fault, not the file. Held rather than quarantined, and the owner is told the host cannot judge envelopes at all — every command is refused until the key is restored. |
 
-Both non-verified rows fail SAFE in the sense that matters here: the task never
-becomes worker work and never mutates the pool. What it costs is availability
+Every non-verified row fails SAFE in the sense that matters here: the task never
+becomes worker work and never mutates the pool. There are four because the shipped
+verifier returns four — `verify_text` yields `verified` / `unsigned` / `invalid` /
+`unverifiable` (`src/task_envelope.py:133-139`), and a matrix that assigns
+dispositions to three of them leaves the fourth to whatever the caller does by
+default. That module's own docstring says enforcement must fail closed on
+`unsigned`/`unverifiable` and warns that `invalid` is not the only bad case. What it costs is availability
 during a signer outage — commands stop working until signing recovers — and that
 is the correct trade for an operation that resizes or re-pins the pool. The step-2
-suite owes one test per row, including the positive control that a verified
-command still executes, or the matrix is prose that never ran.
+suite owes one test per row — four, not three — including the positive control
+that a verified command still executes, or the matrix is prose that never ran.
 
 | command | effect |
 |---|---|
