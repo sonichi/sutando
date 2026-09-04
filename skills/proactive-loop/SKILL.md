@@ -323,7 +323,10 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    The six suites ship as `tests/proactive-loop-*.test.py` (CI discovers only `tests/*.test.py`;
    `tests/ci-covers-every-python-test.test.py` refuses a suite anywhere else). They sit outside
-   `$WORKSPACE/scripts`, so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json`
+   `$WORKSPACE/scripts`, so declare them (repo-relative) in
+   `$WORKSPACE/hosts/<host>/tool-suites-extra.json` — the vault carries `hosts/*/` and does not
+   carry `state/`, so a declaration left under `state/` is unbacked-up, and losing it disables its
+   suites silently. A `state/` copy is still read when no carried one exists.
    — `{"suites": ["tests/proactive-loop-idle-held.test.py", ...]}` — to put them under the same
    changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
 

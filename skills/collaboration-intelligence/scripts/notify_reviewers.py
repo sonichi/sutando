@@ -46,7 +46,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import host_rosters, roster_union
+from roster_union import host_rosters, roster_login, roster_union
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
@@ -216,16 +216,28 @@ def _is_collaborator(repo: str, login: str) -> bool:
 def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     """(login GitHub can answer for, why) — a roster key is not always one.
 
+    Explicit roster fields win over the key itself, unconditionally: a roster
+    key can coincide with an unrelated real login, and then the key is not
+    evidence. Which field declares that login is roster_union.roster_login's
+    call, not this reader's.
+
     `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
     capability check degrades to a silent no-op on exactly the aliased keys
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
+    # `or {}` keeps a truthy non-dict, and a hand-edited roster produces one.
+    entry = entry if isinstance(entry, dict) else {}
+    gh, field = roster_login(entry)
+    # Not probed: _is_github_user collapses "no such user" and "probe failed",
+    # so a timeout would discard owner-stated identity for the colliding key.
+    if gh:
+        return gh, f"roster {field} -> {gh}"
+    sib = entry.get("same_actor_as")
+    if sib:
+        return sib, f"via same_actor_as -> {sib}"
     if _is_github_user(name):
         return name, "key is a login"
-    sib = entry.get("same_actor_as")
-    if sib and _is_github_user(sib):
-        return sib, f"via same_actor_as -> {sib}"
     return name, "no login found for this key"
 
 

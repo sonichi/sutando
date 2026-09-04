@@ -1589,7 +1589,11 @@ def _auth_probe() -> bool:
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope",
+                # Which worker the sender asked for. Ahead of "task" so it can never
+                # be read from under the untrusted body; copied verbatim, never derived.
+                "requested_worker",
+                "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",

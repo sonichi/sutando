@@ -15,6 +15,7 @@ from __future__ import annotations
 
 
 import http.server
+import html
 import json
 import os
 import re
@@ -243,6 +244,24 @@ def _quota_freshness(data: dict, quota_file) -> dict:
     age_h = max(0.0, (datetime.now().timestamp() - ts) / 3600.0)
     return {"age_h": round(age_h, 1), "stale": age_h >= QUOTA_STALE_HOURS}
 
+
+
+_QUOTA_MODEL_MAX_LEN = 64
+
+
+def _quota_model_label(quota: dict) -> str:
+    """The model last seen consuming quota, from the proxy's `last_request`.
+
+    Read from what the proxy observed on the wire, not from a launch-time
+    marker: /model switches mid-session, and a stamped model would go stale.
+    """
+    lr = quota.get("last_request")
+    model = lr.get("model") if isinstance(lr, dict) else None
+    if not isinstance(model, str) or not model.strip():
+        return "model —"
+    # The value comes from a request body any local caller can send: escape
+    # at the sink and cap it, so the tile cannot carry markup or a novel.
+    return html.escape(model.strip()[:_QUOTA_MODEL_MAX_LEN])
 
 
 def _quota_has_data(quota: dict) -> bool:
@@ -677,7 +696,7 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:#8fa3c8">{_quota_model_label(stats["quota"])}</span><br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div>""" + _QUOTA_SPARK_JS + """</div>""")

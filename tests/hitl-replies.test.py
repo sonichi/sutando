@@ -352,5 +352,75 @@ class TestFallbackCarriesTheNote(unittest.TestCase):
         self.assertNotIn("answer", ev["content"][REPLY_FIELD])
 
 
+class SiblingLabelsAndWordInternalHyphens(unittest.TestCase):
+    """Echo Act IV Mini's two rows, both reproduced by execution at ffd8164a."""
+
+    def _two(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="approve", kind="answer", label="Approve"),
+                     Action(id="approve_all", kind="answer", label="Approve-all")])
+
+    def _one(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now")])
+
+    def test_a_shorter_sibling_does_not_claim_the_longer_labels_click(self):
+        """`Approve-all` returned Approve with note `all`: the scan returned on
+        the FIRST label that prefixed the text."""
+        a, note = match_action(self._two(), "Approve-all")
+        self.assertEqual(a.id, "approve_all")
+        self.assertIsNone(note)
+
+    def test_the_shorter_sibling_still_works_on_its_own(self):
+        a, note = match_action(self._two(), "Approve")
+        self.assertEqual(a.id, "approve")
+        self.assertIsNone(note)
+
+    def test_the_longest_matching_label_wins_when_a_note_follows(self):
+        a, note = match_action(self._two(), "Approve-all — because rui waited")
+        self.assertEqual(a.id, "approve_all")
+        self.assertEqual(note, "because rui waited")
+
+    def test_the_longest_label_wins_when_BOTH_are_valid_matches(self):
+        """The discriminating case for longest-wins, and it took a surviving
+        mutation to find: with `Approve-all` the hyphen boundary already
+        eliminates the shorter sibling, so first-wins and longest-wins agree.
+        They differ only when the longer label is the shorter one plus a
+        SEPARATOR, where both parse legally."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="ship", kind="answer", label="Ship"),
+                     Action(id="ship_fast", kind="answer", label="Ship: fast")])
+        a, note = match_action(req, "Ship: fast — now")
+        self.assertEqual(a.id, "ship_fast", "first-wins would pick `Ship`")
+        self.assertEqual(note, "now", "and would have swallowed `fast` into the note")
+
+    def test_a_hyphen_inside_a_word_is_not_a_separator(self):
+        """`Not now-ish, maybe Friday` became a decision — exactly the failure
+        the separator requirement exists to prevent, one character narrower
+        than the case the earlier test covered."""
+        a, note = match_action(self._one(), "Not now-ish, maybe Friday")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_hyphen_at_a_word_boundary_still_separates(self):
+        for text in ("Not now - later", "Not now-  later"):
+            a, note = match_action(self._one(), text)
+            self.assertEqual(a.id, "not_now", text)
+            self.assertEqual(note, "later", text)
+
+    def test_the_dashes_and_colon_need_no_surrounding_space(self):
+        for text, want in (("Not now—soon", "soon"), ("Not now:soon", "soon")):
+            a, note = match_action(self._one(), text)
+            self.assertEqual(a.id, "not_now", text)
+            self.assertEqual(note, want, text)
+
+    def test_the_previously_covered_prose_case_still_stays_prose(self):
+        for text in ("Not nowadays, this needs thought", "Not nowhere near ready"):
+            self.assertIsNone(match_action(self._one(), text)[0], text)
+
+
 if __name__ == "__main__":
     unittest.main()
