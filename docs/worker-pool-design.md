@@ -90,8 +90,10 @@ fresh-beat target is eligible** — exactly the behaviour before this rule exist
 step 2 is a no-regression change and the wedge path simply does not fire until step
 3 lands the sweep. Defaulting the other way would divert healthy pinned work to the
 core for the whole window, breaking the pin contract to fix a case that cannot yet
-be detected. Step 2's suite pins the default with the record absent and with it
-corrupt; step 3's pins the transition.
+be detected. Step 2 ships **no reader at all** — the default is its whole rule, so
+there is nothing to test absent-or-corrupt against yet; the reader and those cases
+arrive together in step 3, listed in its scope below. Step 3's suite pins absent,
+corrupt, stale, future-clock and the old/new transition.
 
 The record's contract, because a routing-critical shared file without one drifts:
 **one writer** (the core sweep; a worker that writes it is a defect, not a
@@ -168,9 +170,29 @@ reader rather than arbitrating between them:
 **Step 2 routes on BEATS ALONE.** No instance consults the record, because there is
 no publisher yet — the default stated above (absent record means every fresh-beat
 target is eligible) is therefore the *whole* rule in that window, not a fallback
-inside it. Beats are observed directly by each handler and are not a file two parties
-race, so the disagreement cannot arise: this is exactly the pre-rule behaviour and
-step 2 is a no-regression change. The wedge path simply does not exist yet.
+inside it.
+
+**That does NOT make the zero-candidate schedule go away, and an earlier revision of
+this section claimed it did.** The claim was that beats are observed directly rather
+than raced through a file, so two instances cannot disagree. False, and the trace
+below already says why: each watcher samples an AGING beat independently. The core
+reads worker-2 fresh and suppresses; the beat crosses stale; worker-2 reads itself
+stale and suppresses. Nobody claims. The pin swap has the same shape in reverse — a
+worker reads the old pin and suppresses, the pin swaps, the new target reads the new
+pin and suppresses, and the core sees a fresh target under either version. **The hole
+belongs to suppress-based routing over independently-sampled state, not to the
+record**, so removing the record does not remove it.
+
+**So suppression is never terminal, and the trigger that re-evaluates is the
+HEARTBEAT — not a new timer.** Every process already beats every 30s, and the beat is
+one of the two periodic things a pool has, so this adds work to an existing tick
+rather than a mechanism the "workers are task-only" rule would forbid. On its own
+tick each instance re-runs the routing rule for any task addressed to it that is
+still unclaimed and older than one beat interval; the ordinary claim then arbitrates
+whoever wakes. A suppress/suppress pair therefore costs one beat of latency instead
+of stranding the task, in step 2 and step 3 alike. That IS a step-2 prerequisite, and
+it is written into the step-2 list rather than asserted to be there — an earlier
+revision asserted a listing it never made.
 
 **Step 3 owns the wedge path, INSIDE THE SWEEP.** That answers the ownership question
 the staging otherwise leaves open, and it is forced by how routing actually runs:
@@ -623,6 +645,18 @@ with its own reason.
    `requested_worker` is **already done** by #3872 rather than pending —
    exercised through `_write_task`, the field is serialized above `task:` and
    the safe parser reads it back, so nothing further is owed there.
+   **A second requirement on step 2's own code, and the one that keeps a
+   suppress/suppress pair from stranding a task: each instance re-runs the routing
+   rule ON ITS OWN HEARTBEAT TICK** for any task addressed to it that is still
+   unclaimed and older than one beat interval. Not a new timer — the beat already
+   exists in every process and is one of the two periodic things a pool has — and
+   not a scan of the queue: only tasks this instance is a candidate for. Production
+   scans once at startup and then reacts to Created/Renamed events only
+   (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so
+   without this every zero-candidate schedule is terminal. Its suite pins BOTH
+   reverse orders: the beat crossing stale between the core's read and the
+   target's, and the pin swapping between two workers' reads.
+
    **Not a prerequisite PR, a
    requirement on step 2's own code:** the eligibility reader matches both
    `channel_id` and `chat_id`. No such reader exists on `main` — checked, it
@@ -630,7 +664,11 @@ with its own reason.
    is a Telegram-addressed task silently reading as unbound the first time
    someone pins a chat, and step 2's suite carries that case.
 3. core side: the pin table writer, the sweep (reclaim, stand-in, revive,
-   status line, timing record), with claim and liveness tests;
+   status line, timing record), with claim and liveness tests; **and the worker
+   side of the same step: the eligibility reader and its self-gate, which ship
+   WITH the publisher rather than ahead of it** — a reader that lands first is a
+   consumer with no producer, and one that never lands leaves the sweep publishing
+   a verdict nothing obeys;
 4. installer and plists, including per-worker model;
 5. later, each alone: the app's pin and create-worker controls, dedicated
    workers, pool status push.
