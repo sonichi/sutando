@@ -148,23 +148,45 @@ opposite eligibility for one bad record. `version` is what makes a shape change
 safe — a reader that does not implement the version reads absent rather than
 guessing at fields it does not know, and the step-3 suite exercises a reader
 meeting both an old and a new record across the atomic swap, since that is the one
-moment two versions coexist on disk. The arbitration that test pins, stated rather
-than promised: a reader that opened the OLD record (instance `eligible`) and a swap
-that lands a NEW record (same instance `wedged`) race, and the reader's decision is
-CORRECT EITHER WAY — it acted on a verdict that was true when it read, and eligible
-is the safe direction (the core stands in one sweep later instead of never). The
-guarantee is only that no reader observes a torn record, never that two readers in
-the same instant agree; requiring the latter would need a lock this design does not
-take. So the expected result is: old-reader claims, new-reader suppresses, and the
-claim decides — the same resolution as every other race here.
+moment two versions coexist on disk.
+
+**Only WORKERS consult the record. The core never does, and that asymmetry is what
+makes the swap safe.** The obvious reading — both sides read it, and a disagreement
+resolves at the claim — is wrong in one direction: a claim arbitrates N>=2 candidates
+and cannot manufacture a missing one. Worker-reads-old(`eligible`) against
+core-reads-new(`wedged`) gives two claimants and the claim decides; but
+core-reads-old(`eligible`, so it suppresses as a non-target) against
+worker-reads-new(`wedged`, so it suppresses too) gives **zero**, and suppression
+leaves the task file untouched with no step-2 sweep to find it again. The task
+strands, which is the exact outcome the eligibility rule was added to prevent.
+
+So the core decides from the beats it observes and the verdict it computed IN THIS
+SWEEP — it is the publisher, so it reads its own value, never a file it races with —
+and a worker decides from its own beat plus the published record. One reader per
+decision means the two can disagree about a target and still produce at least one
+claimant, because the core's branch cannot be flipped by a write it has not yet made.
+Both actor orders are then bounded: core-first sees its own verdict and either claims
+or defers to a target it believes eligible, and worker-first either claims or
+suppresses into the core's unchanged decision.
+
+That leaves one residue and it is named rather than hidden: a worker that suppresses
+on a `wedged` verdict the core has not yet acted on waits until the core's next sweep
+— bounded by the sweep interval, not unbounded, since the core re-evaluates every
+unclaimed task each pass. Step 2 therefore owes a minimal periodic re-evaluation even
+though its stand-in logic is step 3's: without one, ANY suppress-suppress pair is
+terminal rather than delayed. That is a step-2 prerequisite, listed with the others.
 
 **And a target checks its OWN verdict before claiming.** The eligibility rule above
 tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
 2 letting the named worker, the pinned worker, a dedicated worker and every bound-set
 member claim unconditionally — so an instance the core has recorded `wedged` can still
 win the claim and strand the task, which is the exact state the stand-in exists to
-rescue. So each branch below is read as: **if my own verdict is `wedged`, suppress and
-let rule 3 reach the core**; absent-or-eligible, act as written. A wedged instance that
+rescue. So each branch below is read as: **act only if my own beat is fresh AND the record
+says `eligible` or says nothing about me; a stale beat OR a `wedged` verdict
+suppresses** and lets rule 3 reach the core. Gating on `wedged` alone leaves the
+other half of the eligibility predicate ungated, so a stale-beat named or pinned
+worker would still claim unconditionally and beat the core's stand-in to the task —
+the stand-in exists precisely because that worker is stale. A wedged instance that
 claims nothing is unaffected — this only binds the one that is wedged and still
 claiming, which is the case that hurts.
 
