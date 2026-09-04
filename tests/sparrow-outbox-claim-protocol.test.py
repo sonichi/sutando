@@ -203,7 +203,7 @@ def _ttl_never_steals_live():
 
 
 # 6 ---------------------------------------------------------------------------
-@contract("a re-queued item starts from a full attempt budget")
+@contract("a re-queued item keeps its budget unless the operator resets it")
 def _requeue_resets_budget():
     m = outbox()
     acquire, park, requeue = need(m, "acquire_delivery_claim"), need(m, "park_item"), need(m, "requeue_item")
@@ -220,6 +220,11 @@ def _requeue_resets_budget():
             "the reset test is meaningless without a non-zero starting budget")
         park(root, "item-6", reason="unconfirmed")
         requeue(root, "item-6")
+        assert attempts(root, "item-6") == 3, (
+            f"reset is opt-in per the operator brief; got {attempts(root, 'item-6')}. "
+            "The plain form is 'one more try'; --reset-attempts is the full budget.")
+        park(root, "item-6", reason="unconfirmed")
+        requeue(root, "item-6", reset_attempts=True)
         assert attempts(root, "item-6") == 0, (
             f"re-queued item carries {attempts(root, 'item-6')} prior attempts; a "
             "hand-recovered item that parks instantly is indistinguishable from a "

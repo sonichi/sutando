@@ -733,21 +733,85 @@ def park_item(root: Path, item_id: str, reason: str = "") -> None:
     _write_item(Path(root), item_id, d)
 
 
-def requeue_item(root: Path, item_id: str) -> None:
-    """Hand-recovered item returns to the queue with a FULL attempt budget.
+def resend_epoch_for(root: Path, item_id: str) -> int:
+    """The item's re-send generation. 0 until an operator requeues it.
 
-    Carrying the old count forward makes a re-queued item park again instantly,
-    which is indistinguishable from a broken destination and hides the recovery.
-
-    Uses force-release (administrative destruction — see
-    `release_delivery_claim`): a concurrent live delivery of this item may be
-    interrupted and the item re-delivered after re-queue. At-least-once on this
-    administrative path is accepted by design; operators invoke it exactly
-    because normal ownership state can no longer be trusted.
+    Read by the delivery core to derive the idempotency key, so a requeued item
+    presents a NEW logical side effect the provider will not dedupe away.
     """
-    d = _read_item(Path(root), item_id)
-    d["status"] = "QUEUED"
-    d["attempts"] = 0
-    d["reason"] = None
-    _write_item(Path(root), item_id, d)
-    release_delivery_claim(Path(root), item_id, force=True)
+    try:
+        return int(_read_item(Path(root), item_id).get("resend_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_item(root: Path, item_id: str) -> Optional[dict]:
+    """The whole item record, or None when no record exists. Operator read."""
+    if not _item_path(Path(root), item_id).exists():
+        return None
+    return _read_item(Path(root), item_id)
+
+
+def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
+    """Every item record, newest id order, optionally filtered by status."""
+    d = _items_dir(Path(root))
+    if not d.is_dir():
+        return []
+    out: list[dict] = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if status is None or rec.get("status") == status:
+            out.append(rec)
+    return out
+
+
+class RequeueOutcome(str, Enum):
+    """Only REQUEUED means this call moved the item; the other two touched
+    nothing, which is what makes a repeated requeue safe to script."""
+
+    REQUEUED = "requeued"
+    NOT_PARKED = "not-parked"
+    ABSENT = "absent"
+
+
+def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
+                 operator: Optional[str] = None,
+                 reason: Optional[str] = None) -> RequeueOutcome:
+    """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
+
+    Refuses anything not PARKED, which is what makes it idempotent AND keeps it
+    from creating a second delivery: a live claim only exists on an item that is
+    not parked, so this can never destroy one. The force-release below therefore
+    clears a residue of the parked attempt, never a peer's in-flight work.
+
+    Ordering is crash-shaped: the claim goes first, the status last. A crash
+    between them leaves the item PARKED with no claim -- unchanged from the
+    operator's view, and a re-run completes it. The reverse order would publish
+    QUEUED while a stale claim still blocked every drain.
+
+    `reset_attempts` is opt-in per the operator brief. Left False on an item
+    already at MAX_ATTEMPTS, the next failure re-parks it immediately; that is
+    the intended "one more try" semantic, and --reset-attempts is the full
+    budget.
+    """
+    root = Path(root)
+    with _item_lock(root, item_id):
+        if not _item_path(root, item_id).exists():
+            return RequeueOutcome.ABSENT
+        d = _read_item(root, item_id)
+        if d.get("status") != "PARKED":
+            return RequeueOutcome.NOT_PARKED
+        _release_locked(root, item_id, force=True)
+        d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
+        d["status"] = "QUEUED"
+        d["reason"] = None
+        if reset_attempts:
+            d["attempts"] = 0
+        d["requeued_at"] = time.time()
+        d["requeued_by"] = operator or "unknown"
+        d["requeue_reason"] = reason or ""
+        _write_item(root, item_id, d)
+        return RequeueOutcome.REQUEUED
