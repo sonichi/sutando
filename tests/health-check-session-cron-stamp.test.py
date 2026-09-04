@@ -76,6 +76,22 @@ class SessionCronStampTest(unittest.TestCase):
             workspace, host_label="test-host", runtime=kw.pop("runtime", "claude"), **kw
         )
 
+    def test_a_shell_carrying_entry_is_not_an_expected_session_cron(self):
+        # /schedule-crons SKIPS a `shell_command` entry (no session shell leg),
+        # so counting it as expected warns forever and re-running cannot fix it.
+        entries = [
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "run"},
+            {"name": "main-loop", "cron": "*/5 * * * *",
+             "shell_command": "echo hi", "prompt_skill": "proactive-loop"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._workspace(Path(td), entries,
+                                 stamp={"ts": 1000.0, "registered": 1}, started_at=900.0)
+            r = self._check(ws)
+            self.assertEqual(r["status"], "ok",
+                             f"expected 1 (the prompt entry), not 2: {r['detail']}")
+            self.assertNotIn("0/", r["detail"])
+
     def test_no_stamp_warns(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._workspace(Path(td), SESSION_ENTRIES)

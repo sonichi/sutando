@@ -158,5 +158,56 @@ with tempfile.TemporaryDirectory() as td:
     check(emitted == ["conflict"] and ran == [("conflict", "echo hi")],
           f"conflict: launchd really is the executor (emitted={emitted} ran={ran})")
 
+# --- raw payload vs display, and session runnability -----------------------
+
+# keweichen r6 P1-1: schedule.list stripped the target while both executors ran
+# it verbatim, so the API advertised a different command from the one that fires.
+with tempfile.TemporaryDirectory() as td:
+    cfg = write(Path(td), [{**CODEX, "name": "pad", "prompt_skill": " morning \n"}])
+    row = {r["name"]: r for r in dash.list_schedules(cfg)}["pad"]
+    _, codex_target = sched.select_for_executor(sched.load_jobs(cfg)[0], sched.CODEX_FORMS)
+    check(row["prompt_or_skill"] == " morning \n",
+          f"schedule.list must carry the RAW target the executor runs (got {row['prompt_or_skill']!r})")
+    check(row["prompt_or_skill"] == codex_target,
+          "the API field and the Codex executor disagree about the payload")
+    check(row["description"] == "Runs the /morning skill",
+          f"the DESCRIPTION is the field that may tidy (got {row['description']!r})")
+
+with tempfile.TemporaryDirectory() as td:
+    cfg = write(Path(td), [{"name": "body", "cron": "0 6 * * *", "launchd": True,
+                            "prompt": "\n  preserve leading\ntrailing  \n\n"}])
+    row = {r["name"]: r for r in dash.list_schedules(cfg)}["body"]
+    check(row["prompt_or_skill"] == "\n  preserve leading\ntrailing  \n\n",
+          "a tuned prompt body must reach the API verbatim, whitespace included")
+
+# keweichen r6 P1-2: a shell-carrying record must not suppress step 4's fallback
+# while nothing registers a driver — that leaves the session with no loop at all.
+MIXED = {"name": "main-loop", "cron": "*/5 * * * *",
+         "shell_command": "echo hi", "prompt_skill": "proactive-loop"}
+with tempfile.TemporaryDirectory() as td:
+    cfg = write(Path(td), [MIXED])
+    row = {r["name"]: r for r in dash.list_schedules(cfg)}["main-loop"]
+    check(row["owner"] == "session", f"unmarked mixed record is session-owned (got {row['owner']!r})")
+    kind, _ = dash.select_for_executor(MIXED, dash.EXECUTOR_FORMS["session"])
+    check(kind == dash.MALFORMED,
+          "the shared policy must call a shell-carrying record NOT session-runnable")
+
+hc_spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(hc_spec)
+sys.modules["health_check"] = hc
+try:
+    hc_spec.loader.exec_module(hc)
+except SystemExit:
+    pass
+check(hasattr(hc, "check_session_cron_registration"),
+      "health-check still exposes the session-cron probe")
+
+skill = (REPO / "skills" / "schedule-crons" / "SKILL.md").read_text()
+step4 = skill.split("4. **Fallback")[1].split("\n5. ")[0]
+check("step 3 could actually register" in step4,
+      "step 4 must exclude entries step 3 skipped, or a mixed record kills the driver")
+check("shell_command" in step4 and "NO recurring driver" in step4,
+      "step 4 must name the shell-carrying case and its consequence")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

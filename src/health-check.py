@@ -1023,6 +1023,15 @@ def check_session_cron_registration(
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
+        # Same decision /schedule-crons makes, from the shared policy rather
+        # than a copy: a form the session cannot run is not an expected cron.
+        try:
+            from cron_execution_form import (  # noqa: PLC0415
+                EXECUTOR_FORMS, MALFORMED, select_for_executor)
+            if select_for_executor(entry, EXECUTOR_FORMS["session"])[0] == MALFORMED:
+                return False
+        except Exception:
+            pass  # policy unavailable — fall back to the structural checks
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
             return False

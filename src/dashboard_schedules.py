@@ -182,8 +182,8 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
         owner = schedule_owner(job)
         kind, raw_target = select_for_executor(
             job, EXECUTOR_FORMS.get(owner, LAUNCHD_FORMS))
-        # The selector returns the payload verbatim so execution is exact;
-        # these are display fields, so they are the ones that may tidy it.
+        # `raw_target` is what the executors run, byte for byte. Only the
+        # DESCRIPTION may tidy it; the API field must stay executable.
         target = raw_target.strip()
         if job.get("description") and kind != MALFORMED:
             desc = job["description"]
@@ -200,7 +200,7 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             desc = (_p[:100] + "…") if len(_p) > 100 else _p
         out.append({"name": job.get("name", "?"), "cron": expr,
                     "kind": kind,
-                    "prompt_or_skill": "" if kind == MALFORMED else target,
+                    "prompt_or_skill": "" if kind == MALFORMED else raw_target,
                     "owner": owner,
                     "description": desc,
                     "next_run": next_str,
