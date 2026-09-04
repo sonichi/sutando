@@ -25,20 +25,22 @@
 # would convert this bug into a different false "watcher is broken" signal.
 
 # --- naming ------------------------------------------------------------------
-# Unset instance keeps the historic name, so a single-instance install is
-# unchanged. Mirrored in src/util_paths.py; a test asserts they agree.
+# The stem only. The per-instance SUFFIX is not computed here: src/util_paths.py
+# owns it and delegates to src/runtime-api/instance_key.py, so a shell mirror
+# would be a second implementation of one contract.
 WATCHER_SENTINEL_STEM="watch-tasks-stream"
 
-# The sentinel THIS process writes. $1 = state dir, $2 = instance (optional;
-# defaults to $SUTANDO_INSTANCE, empty for the historic name).
+# The sentinel THIS process writes. $1 = state dir. Asks the Python owner, which
+# reads SUTANDO_INSTANCE_ID and the enrolled actor exactly as the run dir does.
+# A failure is fatal: guessing a path here is how two instances share one file.
 sentinel_path_for() {
-  local state_dir="$1" instance="${2-${SUTANDO_INSTANCE:-}}" clean
-  clean="$(printf '%s' "$instance" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^[.-]*//; s/[.-]*$//')"
-  if [ -n "$clean" ]; then
-    printf '%s/%s-%s.pid' "$state_dir" "$WATCHER_SENTINEL_STEM" "$clean"
-  else
-    printf '%s/%s.pid' "$state_dir" "$WATCHER_SENTINEL_STEM"
+  local state_dir="$1" here out
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if ! out="$(python3 "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
+    echo "watcher_sentinel: could not resolve the sentinel path" >&2
+    return 1
   fi
+  printf '%s' "$out"
 }
 
 # Every sentinel present, historic name first, one per line. A caller that asks

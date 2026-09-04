@@ -462,13 +462,55 @@ def write_private_text(path: "Path", text: str) -> None:
 WATCHER_SENTINEL_STEM = "watch-tasks-stream"
 
 
-def watcher_sentinel_path(state_dir, instance: "str | None" = None) -> Path:
-    """The sentinel this instance writes. No instance -> the historic name."""
-    if instance is None:
-        instance = os.environ.get("SUTANDO_INSTANCE", "")
-    instance = re.sub(r"[^A-Za-z0-9._-]", "-", instance.strip()).strip(".-")
-    suffix = f"-{instance}" if instance else ""
-    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
+def _runtime_identity():
+    """`(rundir, instance_key)` from src/runtime-api, or None when unavailable.
+
+    Imported lazily: util_paths is on the import path of probes that must not
+    acquire a runtime dependency merely to resolve a path.
+    """
+    import importlib.util
+    mods = {}
+    for name in ("instance_key", "rundir"):
+        src = Path(__file__).resolve().parent / "runtime-api" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"_wsent_{name}", src)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"_wsent_{name}"] = mod
+        sys.modules.setdefault(name, mod)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:  # noqa: BLE001 — an absent runtime is not a path error
+            return None
+        mods[name] = mod
+    return mods["rundir"], mods["instance_key"]
+
+
+def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
+    """The sentinel THIS instance writes.
+
+    The identity comes from `rundir` and the encoding from `instance_key` — the
+    same owners the run dir and the durable registry use, so two instances
+    cannot alias here while staying distinct there.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        # A default install has one watcher and the historic name is right. A
+        # non-default instance without the encoder would ALIAS, so refuse.
+        asked = instance if instance is not None else os.environ.get("SUTANDO_INSTANCE_ID")
+        if asked and asked != "default":
+            raise RuntimeError(
+                "cannot resolve a per-instance watcher sentinel: "
+                "src/runtime-api/{instance_key,rundir}.py did not import")
+        return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}.pid"
+
+    rundir, ikey = ident
+    inst = instance if instance is not None else rundir.instance_id()
+    who = agent if agent is not None else rundir.agent_id(state_dir)
+    if inst == ikey.DEFAULT_INSTANCE and who == rundir.DEFAULT_ACTOR:
+        return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}.pid"
+    key = ikey.instance_key(who, inst)
+    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}-{key}.pid"
 
 
 def watcher_sentinel_paths(state_dir) -> "list[Path]":
@@ -486,3 +528,13 @@ def watcher_sentinel_paths(state_dir) -> "list[Path]":
     except OSError:
         rest = []
     return found + rest
+
+
+if __name__ == "__main__":
+    # Path resolution for shell callers, so there is no second implementation
+    # of the identity encoding to keep in step with this one.
+    if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
+        print(watcher_sentinel_path(sys.argv[2]))
+    else:
+        print("usage: util_paths.py watcher-sentinel <state-dir>", file=sys.stderr)
+        raise SystemExit(2)

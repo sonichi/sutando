@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The watcher sentinel is per instance, and the shell and Python namers agree.
+"""The watcher sentinel is per instance, keyed on the runtime's own identity.
 
 The defect: every watcher on a host stamped `state/watch-tasks-stream.pid`, so
 on a pool host the Nth watcher's write erased the (N-1)th and the four readers
@@ -7,8 +7,12 @@ tracked only whichever ran last. Measured on a live pool host: six watcher
 processes, one record, four of them invisible to the startup reaper and to
 health-check.
 
-Two namers exist because two runtimes read the file, so the test that matters
-is that they cannot drift.
+There is ONE namer. The shell calls `util_paths.py`, which delegates to
+`src/runtime-api/instance_key.py` — the owner the run dir and the durable
+registry already share. An earlier revision of this file keyed on an invented
+`SUTANDO_INSTANCE` and mirrored a sanitizer in shell; both namers then agreed
+with each other and disagreed with production, which is why "the two agree" is
+no longer an assertion here.
 """
 import os
 import subprocess
@@ -37,53 +41,89 @@ def _sh(fn: str, *args: str, env: "dict | None" = None) -> str:
 class NamingContract(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
-        os.environ.pop("SUTANDO_INSTANCE", None)
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            os.environ.pop(k, None)
 
-    def test_no_instance_keeps_the_historic_name(self):
-        """A single-instance install must be byte-identical to before, or this
-        change is a migration rather than an addition."""
-        self.assertEqual(up.watcher_sentinel_path(self.d).name,
-                         "watch-tasks-stream.pid")
+    def _name(self, **env):
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        try:
+            return up.watcher_sentinel_path(self.d).name
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+
+    def test_the_canonical_default_keeps_the_historic_name(self):
+        """A single-instance install must be byte-identical to before."""
+        self.assertEqual(self._name(), "watch-tasks-stream.pid")
         self.assertEqual(Path(_sh("sentinel_path_for", str(self.d)).strip()).name,
                          "watch-tasks-stream.pid")
 
-    def test_an_instance_gets_its_own_file(self):
-        self.assertEqual(up.watcher_sentinel_path(self.d, "worker-2").name,
-                         "watch-tasks-stream-worker-2.pid")
-        self.assertEqual(
-            Path(_sh("sentinel_path_for", str(self.d), "worker-2").strip()).name,
-            "watch-tasks-stream-worker-2.pid")
-
-    def test_two_instances_do_not_collide(self):
-        a = up.watcher_sentinel_path(self.d, "worker-1")
-        b = up.watcher_sentinel_path(self.d, "worker-2")
+    def test_the_canonical_env_separates_two_watchers(self):
+        """SUTANDO_INSTANCE_ID is what the launcher exports. Keying on anything
+        else leaves every production watcher on the historic name."""
+        a = self._name(SUTANDO_INSTANCE_ID="worker-1")
+        b = self._name(SUTANDO_INSTANCE_ID="worker-2")
         self.assertNotEqual(a, b)
+        self.assertNotEqual(a, "watch-tasks-stream.pid")
 
-    def test_the_env_default_is_read_by_both(self):
-        os.environ["SUTANDO_INSTANCE"] = "core-2"
-        try:
-            self.assertEqual(up.watcher_sentinel_path(self.d).name,
-                             "watch-tasks-stream-core-2.pid")
-            self.assertEqual(
-                Path(_sh("sentinel_path_for", str(self.d),
-                         env={"SUTANDO_INSTANCE": "core-2"}).strip()).name,
-                "watch-tasks-stream-core-2.pid")
-        finally:
-            os.environ.pop("SUTANDO_INSTANCE", None)
+    def test_the_invented_variable_is_not_read(self):
+        """Guards the exact defect: a name nothing in the repo produces."""
+        self.assertEqual(self._name(SUTANDO_INSTANCE="worker-1"),
+                         "watch-tasks-stream.pid")
 
-    def test_both_namers_agree_across_a_range_of_names(self):
-        """The one assertion that survives either implementation being edited."""
-        for inst in ["", "core", "worker-2", "a.b_c", "../evil x", "  spaced  ",
-                     "UPPER", "-lead-", "...."]:
+    def test_the_actor_half_participates(self):
+        self.assertNotEqual(self._name(SUTANDO_AGENT_ID="A"),
+                            self._name(SUTANDO_AGENT_ID="B"))
+
+    def test_case_differing_instances_do_not_share_a_file(self):
+        """macOS and Windows default to case-insensitive filesystems, where two
+        names that differ only in case are ONE file and the second write wins."""
+        self.assertNotEqual(self._name(SUTANDO_INSTANCE_ID="worker").lower(),
+                            self._name(SUTANDO_INSTANCE_ID="Worker").lower())
+
+    def test_punctuation_does_not_alias(self):
+        for a, b in (("lead", "-lead-"), ("a b", "a?b"), ("a.b", "a-b")):
+            with self.subTest(pair=(a, b)):
+                self.assertNotEqual(self._name(SUTANDO_INSTANCE_ID=a),
+                                    self._name(SUTANDO_INSTANCE_ID=b))
+
+    def test_a_punctuation_only_instance_does_not_become_the_default(self):
+        self.assertNotEqual(self._name(SUTANDO_INSTANCE_ID="...."),
+                            "watch-tasks-stream.pid")
+
+    def test_the_shell_asks_the_python_owner(self):
+        """Not "the two agree" — the shell has no namer of its own to disagree
+        with. Any instance the shell resolves must be the Python answer."""
+        self.assertNotIn("tr -c", SHELL.read_text())
+        for inst in ("worker-1", "Worker", "a?b", "-lead-", "...."):
             with self.subTest(inst=inst):
-                self.assertEqual(
-                    up.watcher_sentinel_path(self.d, inst).name,
-                    Path(_sh("sentinel_path_for", str(self.d), inst).strip()).name)
+                sh = Path(_sh("sentinel_path_for", str(self.d),
+                              env={"SUTANDO_INSTANCE_ID": inst}).strip()).name
+                self.assertEqual(sh, self._name(SUTANDO_INSTANCE_ID=inst))
 
     def test_a_hostile_instance_name_cannot_escape_the_state_dir(self):
         p = up.watcher_sentinel_path(self.d, "../../etc/passwd")
         self.assertEqual(p.parent, self.d)
         self.assertNotIn("/", p.name)
+
+    def test_a_non_default_instance_refuses_rather_than_aliasing(self):
+        """With the encoder unavailable, the historic name would silently put
+        two instances on one file. Refuse instead."""
+        with unittest.mock.patch.object(up, "_runtime_identity",
+                                        return_value=None):
+            os.environ["SUTANDO_INSTANCE_ID"] = "worker-1"
+            try:
+                with self.assertRaises(RuntimeError):
+                    up.watcher_sentinel_path(self.d)
+                os.environ["SUTANDO_INSTANCE_ID"] = "default"
+                self.assertEqual(up.watcher_sentinel_path(self.d).name,
+                                 "watch-tasks-stream.pid")
+            finally:
+                os.environ.pop("SUTANDO_INSTANCE_ID", None)
 
 
 class Enumeration(unittest.TestCase):
