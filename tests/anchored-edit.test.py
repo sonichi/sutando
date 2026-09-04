@@ -157,5 +157,79 @@ class AtomicReplacement(unittest.TestCase):
                          "a failed replace must not leave a temp file behind")
 
 
+class InProcessPaths(unittest.TestCase):
+    """The CLI cases run under subprocess, so coverage cannot see the lines they
+    execute. These drive the same branches in-process, which is also the only way
+    `_atomic_write` itself gets executed rather than mocked."""
+
+    def _tmp(self, body="alpha beta"):
+        f = Path(tempfile.mkdtemp()) / "t.txt"
+        f.write_text(body)
+        return f
+
+    def _main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = ae.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_old_file_and_new_file_are_read_from_disk(self):
+        f = self._tmp()
+        d = f.parent
+        (d / "o").write_text("beta")
+        (d / "n").write_text("gamma")
+        rc, out, _ = self._main([str(f), "--old-file", str(d / "o"),
+                                 "--new-file", str(d / "n")])
+        self.assertEqual(rc, 0)
+        self.assertEqual(f.read_text(), "alpha gamma")
+
+    def test_missing_target_refuses(self):
+        rc, out, err = self._main(["/nonexistent/nope.txt", "--old", "a", "--new", "b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no such file", err)
+        self.assertEqual(out, "")
+
+    def test_neither_old_nor_old_file_refuses(self):
+        rc, out, err = self._main([str(self._tmp())])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+
+    def test_drifted_anchor_refuses_in_process(self):
+        f = self._tmp()
+        rc, out, err = self._main([str(f), "--old", "delta", "--new", "x"])
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSED", err)
+        self.assertEqual(f.read_text(), "alpha beta")
+
+    def test_count_mismatch_refuses_in_process(self):
+        f = self._tmp("x x")
+        rc, out, err = self._main([str(f), "--old", "x", "--new", "y",
+                                   "--allow-multi", "--count", "3"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(f.read_text(), "x x")
+
+
+class AtomicWriteDirect(unittest.TestCase):
+    """`_atomic_write` executed for real. Every other test mocks it, so without
+    this the helper the review asked for is the one thing never run."""
+
+    def test_it_replaces_content_and_preserves_mode(self):
+        f = Path(tempfile.mkdtemp()) / "t.txt"
+        f.write_text("old")
+        f.chmod(0o600)
+        ae._atomic_write(f, "new")
+        self.assertEqual(f.read_text(), "new")
+        self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+
+    def test_a_failure_mid_write_leaves_no_temp_and_keeps_the_original(self):
+        f = Path(tempfile.mkdtemp()) / "t.txt"
+        f.write_text("original")
+        with unittest.mock.patch.object(ae.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                ae._atomic_write(f, "replacement")
+        self.assertEqual(f.read_text(), "original")
+        self.assertEqual([q.name for q in f.parent.iterdir()], ["t.txt"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
