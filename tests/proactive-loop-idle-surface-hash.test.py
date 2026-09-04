@@ -198,6 +198,21 @@ def _refuses(raw, label):
 _refuses('{"streak": 7, "held_item_ids": [["keep","owner"', "truncated JSON")
 _refuses('[1, 2, 3]', "valid JSON that is not an object")
 
+# The DECISION path fails open (a torn record must not suppress the surface,
+# per tests/idle-surface-canonical-hash.test.py) while the WRITE stays closed.
+_torn = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_torn.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+_torn_before = _torn.read_text()
+_r = subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                     "--state", str(_torn), "--items", '[["a","owner"]]', "--commit"],
+                    capture_output=True, text=True, timeout=30)
+check("torn record: --commit still POSTS (open on the decision) AND leaves the "
+      "file byte-identical (closed on the write)",
+      _r.returncode == 0 and _r.stdout.startswith("post")
+      and _torn.read_text() == _torn_before,
+      f"rc={_r.returncode} out={_r.stdout.strip()[:40]!r} "
+      f"changed={_torn.read_text() != _torn_before}")
+
 _fresh = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
 subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
                 "--state", str(_fresh), "--pass-outcome", "noop"],

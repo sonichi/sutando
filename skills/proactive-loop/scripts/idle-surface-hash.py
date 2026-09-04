@@ -170,7 +170,9 @@ def main(argv=None) -> int:
         return None
 
     if locked_update(path, compare_and_commit) is REFUSED:
-        return 2
+        # Fail OPEN on the decision, CLOSED on the write: a torn record must
+        # never suppress the surface, and must never be overwritten either.
+        compare_and_commit({})
     print(f"{'post' if seen['changed'] else 'quiet'} {h}")
     return 0
 
