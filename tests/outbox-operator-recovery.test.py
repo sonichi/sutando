@@ -2,9 +2,7 @@
 """Operator recovery: PARKED -> QUEUED must be atomic, idempotent, and must
 never manufacture a second delivery.
 
-The epoch assertions run against the SHIPPED key derivation (DeliveryCore), not
-a local re-computation: a requeue that bumps a number nobody reads is the same
-silent non-delivery it exists to fix.
+Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
 import json
 import sys
@@ -18,6 +16,8 @@ sys.path.insert(0, str(ROOT / "packages" / "ag2-sparrow"))
 
 import outbox  # noqa: E402
 import outbox_cli  # noqa: E402
+
+import undelivered_quarantine as uq  # noqa: E402
 
 ITEM = "task-abc"
 OTHER = "task-def"
@@ -245,6 +245,66 @@ class CliSurface(unittest.TestCase):
             self.assertEqual(rec["status"], "PARKED")
             claim = outbox.read_delivery_claim(root, ITEM)
             self.assertEqual(claim.drainer_id, "drainer-9")
+
+
+class BodyRestoredNotJustTheRecord(unittest.TestCase):
+    """The record is half the recovery. The BODY is a result file the terminal
+    path moved into results/undelivered/, and the drain's scan is a
+    non-recursive glob over results/ — so a requeue that only flips the record
+    delivers nothing, silently, which is the failure this PR exists to fix."""
+
+    def _quarantined(self, td):
+        root, results = Path(td) / "ob", Path(td) / "results"
+        results.mkdir()
+        _parked(root)
+        (results / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
+        uq.quarantine(results / f"{ITEM}.txt", results, when=1700000000)
+        return root, results
+
+    def test_requeue_without_results_dir_leaves_the_body_quarantined(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td)
+            self.assertEqual(outbox_cli.main(
+                ["--root", str(root), "requeue", ITEM]), 0)
+            self.assertFalse((results / f"{ITEM}.txt").exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
+    def test_requeue_with_results_dir_returns_the_body_to_the_drain(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td)
+            self.assertEqual(outbox_cli.main(
+                ["--root", str(root), "requeue", ITEM,
+                 "--results-dir", str(results)]), 0)
+            restored = results / f"{ITEM}.txt"
+            self.assertTrue(restored.exists(),
+                            "requeue must return the body the drain scans for")
+            self.assertEqual(restored.read_text(encoding="utf-8"), "the reply")
+            self.assertEqual(uq.find_quarantined(results, ITEM), [])
+
+    def test_a_newer_live_result_is_never_overwritten(self):
+        """A reply already waiting to go is the one the user should get."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td)
+            (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
+            outbox_cli.main(["--root", str(root), "requeue", ITEM,
+                             "--results-dir", str(results)])
+            self.assertEqual(
+                (results / f"{ITEM}.txt").read_text(encoding="utf-8"), "newer")
+
+    def test_the_drains_glob_cannot_see_the_quarantine(self):
+        """Pins WHY the restore is needed: the scan is non-recursive."""
+        with TemporaryDirectory() as td:
+            _root, results = self._quarantined(td)
+            self.assertEqual(sorted(results.glob("task-*.txt")), [])
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
+    def test_quarantine_naming_has_one_owner(self):
+        """The bridge must not spell the quarantined name itself; two copies of
+        a filename format is how the two directions stop agreeing."""
+        bridge = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
+                  / "remote_gateway_bridge.py").read_text(encoding="utf-8")
+        self.assertNotIn('f"{rfile.stem}-{int(time.time())}.txt"', bridge)
+        self.assertIn("undelivered_quarantine.quarantine(", bridge)
 
 
 class Delegation(unittest.TestCase):

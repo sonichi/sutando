@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import outbox
+import undelivered_quarantine
 
 
 def _default_operator() -> str:
@@ -88,6 +89,11 @@ def cmd_requeue(args) -> int:
     payload = {"item_id": args.item_id, "result": result.value}
     if result is outbox.RequeueOutcome.REQUEUED:
         payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
+        # The record is only half the recovery: the BODY was moved out of the
+        # drain's view, and nothing re-reads the quarantine directory.
+        if args.results_dir:
+            restored = undelivered_quarantine.restore(args.results_dir, args.item_id)
+            payload["restored_body"] = str(restored) if restored else None
     _emit(payload, args.json)
     if result is outbox.RequeueOutcome.REQUEUED:
         return 0
@@ -116,6 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
     rq.add_argument("--reset-attempts", action="store_true",
                     help="restore the full attempt budget (default: keep the "
                          "count, so one more failure re-parks)")
+    rq.add_argument("--results-dir", type=Path,
+                    help="results/ directory: also returns the quarantined "
+                         "body to the drain (without it the record is "
+                         "requeued but nothing is re-sent)")
     rq.add_argument("--operator", help="recorded as who did it")
     rq.add_argument("--reason", help="recorded as why")
     rq.set_defaults(func=cmd_requeue)
