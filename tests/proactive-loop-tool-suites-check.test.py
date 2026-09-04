@@ -168,6 +168,26 @@ with tempfile.TemporaryDirectory() as td:
     check("stale-bytecode: and the failure names the suite",
           "thing.test.py" in (r2.stdout + r2.stderr), True)
 
+print("N. advice naming vault.sync.include must also name its REPLACE semantics")
+with tempfile.TemporaryDirectory() as td:
+    ws, repo = scaffold(td, extras=["tests/extra.test.py"])
+    # The warning only fires when the declaration is untracked inside a git repo.
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "t"], check=True)
+    (ws / "README.md").write_text("x\n")
+    subprocess.run(["git", "-C", str(ws), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "init"], check=True)
+    rc, out = run(ws, repo)
+    check("the uncarried warning fires at all", "NOT tracked in the workspace vault" in out, True)
+    # The key REPLACES the carrier set and the set is a whitelist, so advice to
+    # add one path without restating the rest silently empties the vault.
+    names_key = "vault.sync.include" in out
+    names_replace = "REPLACES" in out and "restate" in out
+    check("advice names the key", names_key, True)
+    check("and does not stop before the replace semantics", not names_key or names_replace, True)
+
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
     for f in FAILURES:

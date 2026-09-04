@@ -102,7 +102,11 @@ def _warn_if_uncarried(decl: Path) -> None:
     if r.returncode != 0:
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
               f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Add its path to vault.sync.include.", file=sys.stderr)
+              f"To carry it, add its path to vault.sync.include AND restate the entries "
+              f"already there (`scripts/sutando-config.sh vault-sync-include` prints them) — "
+              f"that key REPLACES the carrier set rather than extending it, and the set is a "
+              f"whitelist, so listing this file alone drops everything else from the vault.",
+              file=sys.stderr)
 
 
 def newest_mtime(paths) -> float:
