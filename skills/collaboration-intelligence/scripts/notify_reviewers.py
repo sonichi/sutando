@@ -216,6 +216,11 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
+    stated = entry.get("github")
+    if stated:
+        # The entry's own field outranks the key heuristic below: a roster key
+        # can collide with an unrelated real account, and that probe is silent.
+        return stated, f"roster github field -> {stated}"
     if _is_github_user(name):
         return name, "key is a login"
     sib = entry.get("same_actor_as")
