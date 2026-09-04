@@ -183,13 +183,35 @@ pin and suppresses, and the core sees a fresh target under either version. **The
 belongs to suppress-based routing over independently-sampled state, not to the
 record**, so removing the record does not remove it.
 
-**So suppression is never terminal, and the trigger that re-evaluates is the
-HEARTBEAT — not a new timer.** Every process already beats every 30s, and the beat is
-one of the two periodic things a pool has, so this adds work to an existing tick
-rather than a mechanism the "workers are task-only" rule would forbid. On its own
-tick each instance re-lists the pending task directory, re-runs the routing rule
-over what it finds, and claims what it is now the candidate for; the ordinary claim
-arbitrates whoever wakes. A suppress/suppress pair therefore costs one beat of
+**So suppression is never terminal, and the re-evaluation is owned by the WATCHER,
+on its own 30s reconciliation.** An earlier revision put it on the heartbeat, which has
+no execution path to it: `src/core_heartbeat.py` is a detached liveness sidecar started
+as its own process (`startup.sh:690-697`) and contains ZERO references to
+`dispatch_task`, `acquire_task_claim` or `TASK_FILE` — routing and claiming live in
+`src/watch-tasks-stream.sh:127-147,370-404`. "On its own beat each instance re-runs the
+routing rule" therefore named a process that cannot run it, and choosing the heartbeat
+because it was already periodic put the work where the timer was instead of where the
+capability is.
+
+The watcher already owns every piece: it lists `tasks/*.txt` at startup, it holds the
+hard-link claim, and `dispatch_task` IS the production emit path. The reconciliation
+calls THAT — it does not get a second claim recipe of its own, which is the thing most
+likely to drift from the first. On its own
+tick the watcher re-lists the pending task directory and runs each file through
+`dispatch_task` exactly as a Created event would; the ordinary claim arbitrates whoever
+wakes, and a task this instance is not a candidate for suppresses as always.
+
+**No age gate, and that is a decision rather than an omission.** An earlier draft
+admitted only files older than one beat, which buys nothing and costs three things: a
+suppress/suppress pair can then need TWO ticks rather than one, a 29-second-old urgent
+task waits while an older low-priority one is admitted ahead of it, and a file with a
+future mtime is either never eligible or immediately eligible depending on a comparison
+nobody specified. Re-listing everything pending removes all three questions — a task
+already claimed is skipped by the claim, not by an age test, so the gate was never
+load-bearing. Order is the queue's existing priority order, not directory order. One
+tick claims every file this instance is the candidate for, bounded by the same
+capacity/busy rule that bounds event-driven claiming; reconciliation is not a second
+scheduler and must not be able to admit work the event path would refuse. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
 
 **It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
@@ -203,7 +225,7 @@ ELSEWHERE and apply the stale-target fallthrough, which is by definition not
 
 The cost is the one production already pays. `watch-tasks-stream.sh:639-645` lists
 `tasks/*.txt` at every startup for exactly this reason — a restart gap leaves files
-no event will re-announce — so a per-beat re-list is that same sweep on a 30s tick,
+no event will re-announce — so the watcher's 30 s reconciliation is that same sweep on a timer,
 not a new capability. It is bounded by the PENDING directory, which is small by
 construction because tasks are consumed and archived promptly (measured on this host
 while writing: 1 pending against 8,442 archived). If that ever stops holding, the
@@ -665,23 +687,27 @@ with its own reason.
    exercised through `_write_task`, the field is serialized above `task:` and
    the safe parser reads it back, so nothing further is owed there.
    **A second requirement on step 2's own code, and the one that keeps a
-   suppress/suppress pair from stranding a task: each instance re-runs the routing
-   rule ON ITS OWN HEARTBEAT TICK** for any task addressed to it that is still
-   unclaimed and older than one beat interval. Not a new timer — the beat already
-   exists in every process and is one of the two periodic things a pool has — and it
-   IS a re-list of the pending directory, not a filtered walk of "tasks addressed to
-   me": that set is not enumerable without looking, since the fields that address a
-   task live inside the file and the pin can change after the file lands. The core's
-   tick additionally considers tasks addressed elsewhere, because a dead worker emits
-   no beat and someone must apply the stale-target fallthrough. Production scans once
-   at startup and then reacts to Created/Renamed events only
+   suppress/suppress pair from stranding a task: the WATCHER re-lists the pending
+   directory every 30 s and runs each file through `dispatch_task`**, the same path a
+   Created event takes. Owned by the watcher and not the heartbeat, because
+   `core_heartbeat.py` is a detached liveness sidecar with no reference to
+   `dispatch_task`, `acquire_task_claim` or `TASK_FILE`; the watcher already lists
+   `tasks/*.txt` at startup and already holds the claim, so this is that sweep on a
+   timer rather than a new capability or a second claim recipe. It is a full re-list,
+   not a filtered walk of "tasks addressed to me": that set is not enumerable without
+   looking, since the fields that address a task live inside the file and the pin can
+   change after the file lands. **No age gate** — see the routing section for why the
+   "older than one beat" form costs a second tick, inverts priority against a fresher
+   urgent task, and leaves future mtimes undefined, while buying nothing the claim does
+   not already do. Order is the queue's priority order; one tick claims everything this
+   instance is the candidate for, under the same capacity/busy rule as the event path.
+   Production scans once at startup and then reacts to Created/Renamed events only
    (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so without
-   this every zero-candidate schedule is terminal; the per-beat re-list is that same
-   startup sweep on a tick, bounded by a pending directory that is small by
-   construction. Its suite pins BOTH reverse orders — the beat crossing stale between
-   the core's read and the target's, and the pin swapping between two workers' reads —
-   and a repin-after-suppress case, where no event is generated and only the re-list
-   finds the task.
+   this every zero-candidate schedule is terminal. Its suite pins BOTH reverse orders —
+   the beat crossing stale between the core's read and the target's, and the pin
+   swapping between two workers' reads — plus a repin-after-suppress case where no event
+   is generated at all, and one asserting the reconciliation claims through
+   `dispatch_task` rather than a path of its own.
 
    **Not a prerequisite PR, a
    requirement on step 2's own code:** the eligibility reader matches both
