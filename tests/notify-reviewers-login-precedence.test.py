@@ -96,6 +96,13 @@ class LoginPrecedenceTests(unittest.TestCase):
         login, _ = self.mod._github_login("yixuan", roster)
         self.assertEqual(login, "yixuan-ag2")
 
+    def test_a_MALFORMED_row_falls_through_instead_of_raising(self):
+        # `(roster or {}).get(name) or {}` keeps a truthy non-dict, so a
+        # hand-edited roster reaches the resolver as a string, not a mapping.
+        login, why = self.mod._github_login("sonichi", {"sonichi": "yixuan-ag2"})
+        self.assertEqual(login, "sonichi")
+        self.assertEqual(why, "key is a login")
+
     def test_neither_resolves(self):
         login, why = self.mod._github_login("stand-handle", {"stand-handle": {}})
         self.assertEqual(login, "stand-handle")

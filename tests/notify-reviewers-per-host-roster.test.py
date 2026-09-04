@@ -190,6 +190,15 @@ class PerHostRoster(unittest.TestCase):
         self.assertEqual(via_notify, {"a": "john-the-dev", "b": "sonichi", "c": ""},
                          "a deployed spelling resolved to nothing")
 
+    def test_roster_login_reports_no_login_for_a_row_that_is_not_a_mapping(self):
+        """The shared owner's contract: a malformed row yields no login rather
+        than raising into whichever reader happened to touch it first."""
+        sys.path.insert(0, str(SCRIPT.parent))
+        from roster_union import roster_login
+        self.assertEqual(roster_login("john-the-dev"), ("", ""))
+        self.assertEqual(roster_login(None), ("", ""))
+        self.assertEqual(roster_login({"gh": "x"}), ("x", "gh"))
+
     def test_a_differing_LEGACY_row_is_kept_under_a_suffix_never_a_bare_overwrite(self):
         """john-the-dev's repro: host="" used to collapse the suffix to the bare
         key, so the LEGACY row overwrote local and nothing preserved the loser."""

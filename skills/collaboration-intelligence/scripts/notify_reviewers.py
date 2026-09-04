@@ -220,6 +220,8 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
+    # `or {}` keeps a truthy non-dict, and a hand-edited roster produces one.
+    entry = entry if isinstance(entry, dict) else {}
     gh, field = roster_login(entry)
     if gh and _is_github_user(gh):
         return gh, f"roster {field} -> {gh}"
