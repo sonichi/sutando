@@ -29,13 +29,13 @@ def parking_files():
                         personal_path("current-track.md")) if p.exists()]
 
 # entities worth searching for: paths, dotted filenames, backticked identifiers
-ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+){1,3})\b')
+ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+){1,3})\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+){1,4})\b')
 STOP = {"health-check", "not-running", "restart-needed", "session-read", "read-limit"}
 
 def tokens(name, text):
     out = [name] if name else []
     for m in ENT.finditer(text):
-        t = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        t = (m.group(1) or m.group(2) or m.group(3) or m.group(4) or "").strip()
         if 3 <= len(t) <= 40 and t.lower() not in STOP and t != name:
             out.append(t)
     seen, uniq = set(), []
@@ -57,7 +57,7 @@ def report(name, text, files):
         # produced by construction. That is cannot-answer, never untriaged.
         print(f"  NO NOUNS   {label:25} — extracted 0 searchable tokens, so NOTHING was "
               f"searched. Cannot answer; re-state with a filename, a `backticked` term, "
-              f"or a hyphenated-name.")
+              f"a hyphenated-name, or a snake_case identifier.")
         return "no_tokens"
     hits, seen_at = [], set()
     for tok in toks:

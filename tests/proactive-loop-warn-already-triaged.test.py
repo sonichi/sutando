@@ -47,6 +47,46 @@ class Tokens(unittest.TestCase):
         self.assertEqual(wat.tokens("memory-index", "text")[0], "memory-index")
 
 
+class SnakeCaseIdentifiers(unittest.TestCase):
+    """A claim whose only distinctive noun is snake_case used to yield ZERO
+    tokens, so the tool refused (exit 2) instead of searching. Most claims about
+    this codebase name a snake_case symbol -- `dev_dag2_dspace`, `PARK_REASONS`,
+    `notify_discord_dm` -- so the refusal covered the common case, not an edge.
+    """
+
+    def test_a_snake_case_identifier_is_extracted(self):
+        self.assertIn("dev_dag2_dspace",
+                      wat.tokens("", "the dev_dag2_dspace lane stopped writing"))
+
+    def test_an_uppercase_constant_is_extracted(self):
+        self.assertIn("PARK_REASONS",
+                      wat.tokens("", "PARK_REASONS is referenced only by the reader"))
+
+    def test_a_leading_underscore_identifier_is_extracted(self):
+        self.assertIn("_quarantine_undelivered",
+                      wat.tokens("", "_quarantine_undelivered drops its why argument"))
+
+    def test_a_snake_case_claim_reaches_parked_material(self):
+        # The end-to-end shape: before the fix this returned "no_tokens" and
+        # nothing was searched, so parked material stayed invisible.
+        f = _files("# notes\n## the dev_dag2_dspace lane is a lock flip, not a bug\nbody\n")
+        verdict, out = _report("", "the dev_dag2_dspace lane stopped writing", f)
+        self.assertEqual(verdict, "parked")
+
+    def test_a_snake_case_claim_that_is_genuinely_absent_still_reports_untriaged(self):
+        # Widening the tokenizer must not make every claim look parked; this is
+        # the half that fails if the new alternative matches too much.
+        f = _files("# notes\n## something else entirely\nbody\n")
+        verdict, _ = _report("", "the dev_dag2_dspace lane stopped writing", f)
+        self.assertEqual(verdict, "untriaged")
+
+    def test_ordinary_prose_still_yields_no_searchable_tokens(self):
+        # The refusal branch must survive: a sentence naming no identifier is
+        # still unanswerable, and saying so is the whole point of exit 2.
+        self.assertEqual(
+            wat.tokens("", "The owner asked me to review the pull request and merge it"), [])
+
+
 class ClaimFindsParkedMaterial(unittest.TestCase):
     def test_a_heading_hit_reports_candidates_and_is_not_untriaged(self):
         f = _files("# notes\n## the `widget-cache.py` decision\nbody\n")
