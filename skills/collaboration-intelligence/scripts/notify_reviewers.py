@@ -10,6 +10,11 @@ sends (a bounced mention notifies no one).
 
 Usage:
   notify_reviewers.py --reviewers rui,kewei --message "re-review #3303" [--send]
+  notify_reviewers.py --reviewers rui,kewei --body-file ask.md [--send]
+
+Use --body-file for any prose carrying backticks, $ or an apostrophe: the shell
+rewrites those before argv reaches this process, so no validation here can
+recover the original. Same policy as bot2bot-post and discord-bridge.
 
 Without --send it prints the exact room_ops commands (plan mode). A refused
 entry never starves the batch: resolvable reviewers are still notified and
@@ -436,7 +441,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reviewers", required=True,
                     help="comma-separated roster keys")
-    ap.add_argument("--message", required=True)
+    ap.add_argument("--message", default=None)
+    ap.add_argument("--body-file", dest="body_file", default=None,
+                    help="read the message from a FILE instead of argv. Use it for any "
+                         "prose containing backticks, $ or an apostrophe — the shell "
+                         "mangles those before this script can see them.")
     ap.add_argument("--send", action="store_true")
     ap.add_argument("--allow-single", metavar="REASON", default="",
                     help="deliberately notify ONE reviewer; requires a reason")
@@ -450,6 +459,17 @@ def main() -> int:
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
+    # Resolved into a.message here so every gate below reads one field; a body that
+    # reached argv has already been through the shell and cannot be recovered.
+    if (a.message is None) == (a.body_file is None):
+        raise SystemExit("ERROR: give exactly one of --message or --body-file")
+    if a.body_file is not None:
+        # Imported here, not at module scope: `_REPO` is positional, so a copy run
+        # from elsewhere has no src/ path and a top-level import breaks --message too.
+        from body_file import read_body_file
+        a.message = read_body_file(a.body_file)
+        if not a.message.strip():
+            raise SystemExit(f"ERROR: --body-file {a.body_file!r} is empty — refusing to send")
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
