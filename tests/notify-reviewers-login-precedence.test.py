@@ -49,6 +49,25 @@ class LoginPrecedenceTests(unittest.TestCase):
         self.assertEqual(login, "sonichi")
         self.assertEqual(why, "key is a login")
 
+    def test_roster_gh_wins_over_a_colliding_key(self):
+        # `gh` is the documented roster field and is a direct login, so it is
+        # more explicit than a key alias resolved by probing.
+        roster = {"yixuan": {"gh": "yixuan-ag2"}}
+        login, why = self.mod._github_login("yixuan", roster)
+        self.assertEqual(login, "yixuan-ag2")
+        self.assertIn("gh", why)
+
+    def test_gh_outranks_same_actor_as(self):
+        roster = {"yixuan": {"gh": "yixuan-ag2", "same_actor_as": "sonichi"}}
+        login, _ = self.mod._github_login("yixuan", roster)
+        self.assertEqual(login, "yixuan-ag2")
+
+    def test_a_gh_that_is_not_a_login_falls_through(self):
+        roster = {"sonichi": {"gh": "no-such-account"}}
+        login, why = self.mod._github_login("sonichi", roster)
+        self.assertEqual(login, "sonichi")
+        self.assertEqual(why, "key is a login")
+
     def test_neither_resolves(self):
         login, why = self.mod._github_login("stand-handle", {"stand-handle": {}})
         self.assertEqual(login, "stand-handle")
