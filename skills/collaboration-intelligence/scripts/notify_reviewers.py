@@ -869,11 +869,13 @@ def claim_park(message: str, reviewer: str, actor: str = None,
         # on a spelling match skips the union, losing the history it carries.
         hit = _membership_overlap(led, message, membership) if membership else None
         if hit is not None:
-            prior, ident = hit
+            prior, ident, matched = hit
+            # Only the streams that overlapped may learn `unknown`: a PR in the
+            # same message that was never sent has nothing possibly-landed.
             record_asks(message, ident.get("reviewer") or reviewer,
                         outcome="unknown", actor=ident.get("actor"),
                         endpoint=ident.get("endpoint"),
-                        membership=prior | set(membership))
+                        membership=prior | set(membership), only=matched)
             return None
         if unknown_parked(message, reviewer, who, canonical=canonical,
                           endpoint=endpoint):
@@ -884,13 +886,14 @@ def claim_park(message: str, reviewer: str, actor: str = None,
 
 def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
     """An unresolved OUTCOME_UNKNOWN record for this notice whose persisted
-    membership intersects the candidate's component, with its identity."""
+    membership intersects the candidate's component: (tags, identity, matched),
+    where `matched` is the set of canonical (repo, pr) refs that overlapped."""
     refs = {(r, str(n)) for r, n in _refs(message)}
     if not refs or not led.exists():
         return None
     # _streams() is the one reader: folded state, string-validated identity —
     # a raw shape cannot crash this or be re-emitted (44 KB vs 6.7 MB reparse).
-    best = None
+    best, matched, all_tags = None, set(), set()
     try:
         streams = _streams(led)
     except OSError:
@@ -904,25 +907,29 @@ def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
         tags = set(st["membership"] or ())
         if not tags or not (tags & set(cand)):
             continue
-        best = (tags, {k: st["last_identity"].get(k)
-                       for k in ("reviewer", "actor", "endpoint")})
-    return best
+        matched.add((repo, int(pr)))
+        all_tags |= tags
+        best = {k: st["last_identity"].get(k) for k in ("reviewer", "actor", "endpoint")}
+    if best is None:
+        return None
+    return all_tags, best, matched
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
                 actor: str = None, detail: str = None,
-                endpoint: str = None, membership=None) -> int:
-    """Locked public writer. Every append serialises against the compactor."""
+                endpoint: str = None, membership=None, only=None) -> int:
+    """Locked public writer. Every append serialises against the compactor.
+    `only`: canonical (repo, pr) set; when given, refs outside it are not written."""
     if not _PR_URL.search(message or ""):
         return 0        # nothing to write, so no path to resolve and no lock
     led = ledger_path()
     with _ledger_lock(led):
         return _append(led, message, reviewer, outcome, actor, detail,
-                       endpoint, membership)
+                       endpoint, membership, only)
 
 
 def _append(p: Path, message: str, reviewer: str, outcome: str,
             actor: str = None, detail: str = None,
-            endpoint: str = None, membership=None) -> int:
+            endpoint: str = None, membership=None, only=None) -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
@@ -931,6 +938,8 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
     the receipt is RetrySafety.UNSAFE, so an unrecorded unknown invites the
     repeat that duplicates the ping."""
     refs = _refs_spelled(message)
+    if only is not None:
+        refs = [(r, n) for r, n in refs if (_canon_repo(r), n) in only]
     if not refs:
         return 0
     if not isinstance(outcome, str) or outcome not in _KNOWN_OUTCOMES:

@@ -471,6 +471,59 @@ with nr._ledger_lock(led):
 """
 
 
+class AParkOnOnePrDoesNotContaminateTheOthers(unittest.TestCase):
+    """keweichen's P1 (#3509, 2026-09-03): with PR A parked, a combined A+B ask
+    was refused AND wrote an `unknown` row for B, which had never been sent —
+    so B alone was then parked too. The overlap must name which refs matched
+    and the park must record only those streams."""
+
+    A = "https://github.com/sonichi/sutando/pull/3509"
+    B = "https://github.com/sonichi/sutando/pull/3510"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self.prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        self.nr = _load()
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+            "channel": "room", "outcome": "unknown", "membership": ["actor:k"],
+            "endpoint": "d", "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ")}) + "\n")
+
+    def tearDown(self):
+        if self.prev is None:
+            os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+        else:
+            os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.prev
+
+    def _rows(self, pr):
+        return [json.loads(l) for l in self.led.read_text().splitlines() if l.strip()
+                and json.loads(l).get("pr") == pr]
+
+    def test_combined_ask_is_refused_but_B_is_not_parked_by_it(self):
+        got = self.nr.claim_park(f"re-review {self.A} and {self.B}", "k", "k",
+                                 endpoint="d", membership={"actor:k"})
+        self.assertIsNone(got, "A is parked, so the combined ask must be refused")
+        self.assertEqual(self._rows(3510), [],
+                         "B was never sent; the refusal must not manufacture a row for it")
+        self.assertGreaterEqual(len(self._rows(3509)), 2,
+                                "positive control: A's own stream still records the union")
+
+    def test_B_alone_is_still_admissible_afterward(self):
+        self.nr.claim_park(f"re-review {self.A} and {self.B}", "k", "k",
+                           endpoint="d", membership={"actor:k"})
+        got = self.nr.claim_park(f"re-review {self.B}", "k", "k",
+                                 endpoint="d", membership={"actor:k"})
+        self.assertIsNotNone(got, "B alone must claim: nothing about B was ever unknown")
+        self.assertEqual([r["outcome"] for r in self._rows(3510)], ["pending"])
+
+    def test_the_control_A_alone_is_still_refused(self):
+        self.assertIsNone(self.nr.claim_park(f"re-review {self.A}", "k", "k",
+                                             endpoint="d", membership={"actor:k"}))
+
+
 class HoldingOneLedgerIsNotReentrancyOnAnother(unittest.TestCase):
     """Requested by @kewei-red-ag2space; harness rebuilt on their second review.
 
@@ -562,6 +615,14 @@ class RollbackAndIdentityControls(unittest.TestCase):
              / "collaboration-intelligence" / "scripts" / "notify_reviewers.py")
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(src)
+        # The old reader imports its siblings; extracting the script alone
+        # raises ImportError before any assertion runs.
+        for sib in ("roster_union.py", "lookup.py"):
+            g = subprocess.run(["git", "-C", str(REPO), "show",
+                                f"origin/main:skills/collaboration-intelligence/scripts/{sib}"],
+                               capture_output=True, text=True)
+            if g.returncode == 0:
+                (f.parent / sib).write_text(g.stdout)
         spec = importlib.util.spec_from_file_location("nr_main", f)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
