@@ -75,7 +75,7 @@ class NotifierMapsTheTriState(unittest.TestCase):
         payload = {"ok": False, "reason": "network error: timed out", "state": "unknown"}
         rc1, s1 = self._invoke(payload)
         rc2, s2 = self._invoke(payload)
-        self.assertEqual((s1, s2), (1, 1), "the ambiguous send must not be repeated")
+        self.assertEqual((s1, s2), (1, 0), "the ambiguous send must not be repeated")
         self.assertIn("unknown", self._outcomes())
         self.assertNotIn("failed", self._outcomes())
 
@@ -83,7 +83,7 @@ class NotifierMapsTheTriState(unittest.TestCase):
         payload = {"ok": True, "event_id": None, "state": "unconfirmed"}
         rc1, s1 = self._invoke(payload)
         rc2, s2 = self._invoke(payload)
-        self.assertEqual((s1, s2), (1, 1))
+        self.assertEqual((s1, s2), (1, 0), "a 200 without proof must not be repeated")
         self.assertNotIn("confirmed", self._outcomes())
         self.assertIn("unknown", self._outcomes())
 
@@ -91,7 +91,7 @@ class NotifierMapsTheTriState(unittest.TestCase):
         payload = {"ok": False, "reason": "HTTP 403 not a joined member", "state": "failed"}
         rc1, s1 = self._invoke(payload)
         rc2, s2 = self._invoke(payload)
-        self.assertEqual((s1, s2), (1, 2), "a proven non-delivery releases the park")
+        self.assertEqual((s1, s2), (1, 1), "a proven non-delivery releases the park")
         self.assertEqual(self._outcomes().count("failed"), 2)
 
     def test_the_control_an_event_id_is_confirmed(self):
