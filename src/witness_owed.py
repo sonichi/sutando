@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,9 +31,26 @@ _RECORD_KEY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 _STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TOMBSTONE_FIELDS = ("repo", "pr", "head", "owed_by", "witness", "closed_by", "closed_at")
 FIELDS = ("repo", "pr", "head", "host", "reason", "opened_by", "opened_at")
 STAMP_NAME = ".published"
 DEFAULT_MAX_AGE_S = 3600.0
+
+
+def validate_host(host: object) -> str:
+    """A host becomes a path component, so it must be ONE ordinary segment.
+    A bare non-empty check let `../../x` resolve outside the workspace."""
+    if not isinstance(host, str) or not _HOST.match(host) or host in (".", ".."):
+        raise ValueError(f"host must be one path segment matching {_HOST.pattern}, got {host!r}")
+    return host
+
+
+def record_key(repo: str, pr: int) -> str:
+    """Percent-encoding, because `/`->`-` is NOT injective: `a-b/c` and
+    `a/b-c` both became `a-b-c`, so two repos shared one record file."""
+    enc = repo.replace("%", "%25").replace("/", "%2F")
+    return f"{enc}#{int(pr)}.json"
 
 
 def validate_record(data: object, path: Path) -> dict:
@@ -58,7 +76,7 @@ def validate_record(data: object, path: Path) -> dict:
     canary = data.get("canary")
     if canary is not None and canary != host:
         raise ValueError("canary may only name the owing host")
-    if path.name != f"{repo.replace('/', '-')}#{pr}.json":
+    if path.name != record_key(repo, pr):
         raise ValueError(f"file name does not match {repo}#{pr}")
     if path.parent.name != "witness-owed" or path.parent.parent.name != host:
         raise ValueError(f"record is not under hosts/{host}/witness-owed/")
@@ -67,7 +85,13 @@ def validate_record(data: object, path: Path) -> dict:
 
 def records_dir(workspace: Path, host: str) -> Path:
     """Where THIS host writes: the carried per-host subtree, never state/."""
-    return Path(workspace) / "hosts" / host / "witness-owed"
+    validate_host(host)
+    d = Path(workspace) / "hosts" / host / "witness-owed"
+    # Containment is checked on the RESOLVED pair and the caller keeps its own
+    # path shape: returning the resolved form rewrites /var -> /private/var.
+    if Path(workspace).resolve() not in d.resolve().parents:
+        raise ValueError(f"host {host!r} resolves outside the workspace")
+    return d
 
 
 def all_records_dirs(workspace: Path) -> list[Path]:
@@ -79,11 +103,11 @@ def all_records_dirs(workspace: Path) -> list[Path]:
 
 
 def record_path(workspace: Path, host: str, repo: str, pr: int) -> Path:
-    return records_dir(workspace, host) / f"{repo.replace('/', '-')}#{int(pr)}.json"
+    return records_dir(workspace, host) / record_key(repo, pr)
 
 
 def find_record(workspace: Path, repo: str, pr: int) -> Path | None:
-    name = f"{repo.replace('/', '-')}#{int(pr)}.json"
+    name = record_key(repo, pr)
     for d in all_records_dirs(workspace):
         if (d / name).is_file():
             return d / name
@@ -96,7 +120,9 @@ def _now() -> str:
 
 def _atomic_write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # One shared `.tmp` name made two concurrent writers race: the loser's
+    # os.replace hit a name the winner had already consumed (FileNotFoundError).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, path)
 
@@ -126,14 +152,44 @@ def tombstones(workspace: Path) -> dict[tuple[str, int], dict]:
     for d in all_records_dirs(workspace):
         for p in sorted((d / "tombstones").glob("*.json")):
             try:
-                t = json.loads(p.read_text())
-                if not isinstance(t, dict) or not _REPO.match(str(t.get("repo"))) \
-                        or not _SHA.match(str(t.get("head"))) or not str(t.get("witness", "")).strip():
-                    continue
-                out[(t["repo"], int(t["pr"]))] = t
+                t = validate_tombstone(json.loads(p.read_text()), p)
             except (OSError, ValueError, TypeError):
                 continue
+            out[(t["repo"], int(t["pr"]))] = t
     return out
+
+
+def validate_tombstone(data: object, path: Path) -> dict:
+    """A tombstone CLOSES another host's record, so it is validated exactly as
+    hard as one. Three fields were checked; the writer's path, owners and
+    timestamp were not, and a malformed tombstone silently cleared a record."""
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+    for k in TOMBSTONE_FIELDS:
+        if k not in data:
+            raise ValueError(f"missing field {k}")
+    repo, pr, head = data["repo"], data["pr"], data["head"]
+    if not isinstance(repo, str) or not _REPO.match(repo):
+        raise ValueError("repo must be owner/name")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+        raise ValueError("pr must be a positive integer")
+    if not isinstance(head, str) or not _SHA.match(head):
+        raise ValueError("head must be a commit sha")
+    for k in ("owed_by", "witness", "closed_by"):
+        if not isinstance(data[k], str) or not data[k].strip():
+            raise ValueError(f"{k} must be a non-empty string")
+    validate_host(data["owed_by"])
+    validate_host(data["closed_by"])
+    if data["owed_by"] == data["closed_by"]:
+        raise ValueError("a tombstone is a FOREIGN closure; the owing host closes its own record")
+    if not isinstance(data["closed_at"], str) or not _STAMP.match(data["closed_at"]):
+        raise ValueError("closed_at must be an ISO-8601 UTC stamp")
+    if path.name != record_key(repo, pr):
+        raise ValueError(f"file name does not match {repo}#{pr}")
+    if path.parent.name != "tombstones" or path.parent.parent.name != "witness-owed" \
+            or path.parent.parent.parent.name != data["closed_by"]:
+        raise ValueError(f"tombstone is not under hosts/{data['closed_by']}/witness-owed/tombstones/")
+    return data
 
 
 def list_open(workspace: Path) -> list[dict]:
@@ -180,7 +236,12 @@ def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
         if h == host:
             continue
         try:
-            t = json.loads((d / STAMP_NAME).read_text()).get("published_at")
+            stamp = json.loads((d / STAMP_NAME).read_text())
+            # A stamp naming a different host is not this host's freshness
+            # evidence; unchecked, one host's stamp vouched for another's view.
+            if not isinstance(stamp, dict) or stamp.get("host") != h:
+                raise ValueError("stamp does not name the host whose directory holds it")
+            t = stamp.get("published_at")
             age = (now - datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
         except (OSError, ValueError, TypeError):
             out.append(h)
