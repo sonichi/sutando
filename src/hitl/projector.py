@@ -55,6 +55,15 @@ def fallback_body(req: HumanRequirement) -> str:
     return head
 
 
+def pending_ids(manager: HitlManager) -> List[str]:
+    """Requirement ids whose revision is ahead of their projection.
+
+    A caller owning retry cadence needs to tell "nothing to send" from "every
+    send was refused"; `project()` returns an empty list for both.
+    """
+    return [r.id for r in manager.store.all() if manager.needs_projection(r.id)]
+
+
 def project(manager: HitlManager, send: Sender, room_id: str) -> List[Tuple[str, Optional[str]]]:
     """Drive every requirement whose revision is ahead of its projection.
 

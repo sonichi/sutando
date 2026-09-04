@@ -15,7 +15,8 @@ from typing import Any, Dict, List, Optional
 WIRE_FIELD = "space.ag2.hitl"
 
 KINDS = frozenset(
-    {"auth", "permission", "choice", "confirmation", "billing", "external_action", "unknown"}
+    {"auth", "permission", "choice", "confirmation", "billing", "external_action",
+     "core-blocked", "unknown"}
 )
 
 CATEGORY_BLOCKED = "blocked"
