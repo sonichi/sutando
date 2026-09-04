@@ -32,6 +32,7 @@ def run(args):
         rc = ih.main(args)
     return rc, out.getvalue(), err.getvalue()
 
+KEY_HELD = ih.KEY
 print("idle-held")
 
 p = state(BASE)
@@ -399,13 +400,15 @@ def _refuses_held(argv, label):
         rc, _, err = run(["--state", str(f)] + argv)
     except SystemExit as e:
         rc, err = e.code, "SystemExit"
+    # "usage:" would mean argparse rejected the argv and the guard never ran —
+    # two of these arms passed that way before the flags were corrected.
     check(f"fail-closed: {label} refuses AND leaves the file byte-identical",
-          rc == 2 and f.read_text() == before,
+          rc == 2 and f.read_text() == before and "usage:" not in str(err),
           f"rc={rc} changed={f.read_text() != before} err={str(err).strip()[:60]!r}")
 
 _refuses_held(["--init-empty"], "--init-empty")
-_refuses_held(["--add", "x:owner", "--note", "n"], "--add")
-_refuses_held(["--archive"], "--archive")
+_refuses_held(["--add", "x:owner", "--write"], "--add --write")
+_refuses_held(["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write")
 
 _valid_h = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
 _valid_h.write_text(json.dumps({"streak": 7}))
@@ -415,6 +418,64 @@ check("CONTROL: a VALID keyless record still initialises — corrupt is the "
       _rc_h == 0 and json.loads(_valid_h.read_text()).get("held_item_ids") == []
       and json.loads(_valid_h.read_text()).get("streak") == 7,
       f"rc={_rc_h} {_valid_h.read_text()[:70]}")
+
+# TOCTOU: the pre-lock parse can succeed and the record still be unusable by the
+# time the lock is held, which is the only way these branches are reached.
+def _raced(err):
+    def hook(path):
+        return (None, err) if err else (json.loads(pathlib.Path(path).read_text()), None)
+    return hook
+
+_orig_rss = ih.idle_state.read_state_strict
+def _under_race(argv, err="raced corruption", seed=None):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text(json.dumps(seed if seed is not None else {"streak": 1}))
+    before = f.read_text()
+    ih.idle_state.read_state_strict = _raced(err)
+    try:
+        rc, _, err_out = run(["--state", str(f)] + argv)
+    finally:
+        ih.idle_state.read_state_strict = _orig_rss
+    return rc, f.read_text() == before, err_out
+
+for _argv, _label, _seed in (
+        (["--init-empty"], "--init-empty", {"streak": 1}),
+        (["--add", "x:owner", "--write"], "--add --write", {"held_item_ids": []}),
+        (["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write",
+         {"held_item_ids": [], "held_item_notes": {"gone": "n"}}),
+):
+    _rc, _same, _e = _under_race(_argv, seed=_seed)
+    check(f"raced corruption: {_label} exits 2 and writes nothing",
+          _rc == 2 and _same and "usage:" not in _e,
+          f"rc={_rc} unchanged={_same} err={_e.strip()[:60]!r}")
+
+# The locked doc already holds the id this call meant to add: apply_ops errs
+# under the lock, so the whole write aborts rather than half-landing.
+_f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_f.write_text(json.dumps({KEY_HELD: []}))
+_before = _f.read_text()
+ih.idle_state.read_state_strict = lambda path: ({KEY_HELD: [["x", "owner"]]}, None)
+try:
+    _rc, _, _err = run(["--state", str(_f), "--add", "x:owner", "--write"])
+finally:
+    ih.idle_state.read_state_strict = _orig_rss
+check("a racer that added the same id under the lock aborts the write (exit 1)",
+      _rc == 1 and _f.read_text() == _before and "REFUSED" in _err,
+      f"rc={_rc} unchanged={_f.read_text() == _before} err={_err.strip()[:60]!r}")
+
+# A racer archived the orphan between the snapshot and the lock: re-deriving
+# under the lock finds nothing left, so the write aborts instead of re-moving it.
+_ar = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_ar.write_text(json.dumps({KEY_HELD: [], "held_item_notes": {"gone": "n"}}))
+_ar_before = _ar.read_text()
+ih.idle_state.read_state_strict = lambda path: ({KEY_HELD: [], "held_item_notes": {}}, None)
+try:
+    _rc, _, _ = run(["--state", str(_ar), "--archive-orphan-notes", "--write"])
+finally:
+    ih.idle_state.read_state_strict = _orig_rss
+check("a racer that already archived the orphan aborts the write, not re-moves it",
+      _rc == 0 and _ar.read_text() == _ar_before,
+      f"rc={_rc} unchanged={_ar.read_text() == _ar_before}")
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

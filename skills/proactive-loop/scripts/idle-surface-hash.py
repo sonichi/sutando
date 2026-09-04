@@ -74,8 +74,7 @@ def held_hash(items) -> str:
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from idle_state import (ABORT, REFUSED, locked_update, read_state,  # noqa: E402
-                        write_state)
+from idle_state import ABORT, REFUSED, locked_update  # noqa: E402
 
 
 def record_outcome(path: Path, outcome: str) -> dict:

@@ -25,15 +25,6 @@ ABORT = object()
 REFUSED = object()
 
 
-def read_state(path: Path) -> dict:
-    """Lenient read for callers that want a default. NEVER use before a write."""
-    try:
-        doc = json.loads(Path(path).read_text())
-        return doc if isinstance(doc, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
 def read_state_strict(path: Path):
     """(doc, err) — absent is ({}, None); unreadable or malformed is (None, why).
 

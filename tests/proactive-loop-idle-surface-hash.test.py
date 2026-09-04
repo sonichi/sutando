@@ -222,6 +222,37 @@ check("CONTROL: an ABSENT record still initialises — absent is not corrupt",
       _fresh.read_text()[:60] if _fresh.exists() else "not created")
 
 
+# read_state_strict's three refusal shapes, in-process: a subprocess arm proves
+# the same behaviour but is invisible to the coverage gate.
+_d = pathlib.Path(tempfile.mkdtemp()) / "adir.json"
+_d.mkdir()
+_doc, _err = _ist.read_state_strict(_d)
+check("read_state_strict: an unreadable path is (None, why), not a default",
+      _doc is None and _err and "unreadable" in _err, f"{_doc!r} {_err!r}")
+
+_nd = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+_nd.write_text("[1, 2, 3]")
+_doc, _err = _ist.read_state_strict(_nd)
+check("read_state_strict: valid JSON that is not an object is (None, why)",
+      _doc is None and _err and "not a JSON object" in _err, f"{_doc!r} {_err!r}")
+
+_ab = pathlib.Path(tempfile.mkdtemp()) / "missing.json"
+check("read_state_strict CONTROL: absent is ({}, None) — a first run, not a fault",
+      _ist.read_state_strict(_ab) == ({}, None), repr(_ist.read_state_strict(_ab)))
+
+# record_outcome is the pure-write path: it must abort the process, not return.
+_ro = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_ro.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+_ro_before = _ro.read_text()
+try:
+    ish.record_outcome(_ro, "noop")
+    _code = None
+except SystemExit as e:
+    _code = e.code
+check("record_outcome on a torn record raises SystemExit(2) and writes nothing",
+      _code == 2 and _ro.read_text() == _ro_before,
+      f"code={_code!r} changed={_ro.read_text() != _ro_before}")
+
 print(f"\nidle-surface-hash: {ran - len(fails)}/{ran} passed")
 if fails:
     print("FAILED: " + ", ".join(fails))
