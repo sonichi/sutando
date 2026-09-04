@@ -486,31 +486,48 @@ def _runtime_identity():
     return mods["rundir"], mods["instance_key"]
 
 
-def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
-    """The sentinel THIS instance writes.
+def instance_scope_key(state_dir, instance=None, agent=None) -> str:
+    """This runtime's `(agent_id, instance_id)` key, or "" for the canonical
+    default — the ONE discriminator every per-instance path uses.
 
-    The identity comes from `rundir` and the encoding from `instance_key` — the
-    same owners the run dir and the durable registry use, so two instances
-    cannot alias here while staying distinct there.
+    Identity comes from `rundir` and the encoding from `instance_key`, the same
+    owners the run dir and the durable registry use, so two instances cannot
+    alias here while staying distinct there.
     """
     ident = _runtime_identity()
     if ident is None:
-        # A default install has one watcher and the historic name is right. A
+        # A default install has one runtime and the historic paths are right. A
         # non-default instance without the encoder would ALIAS, so refuse.
         asked = instance if instance is not None else os.environ.get("SUTANDO_INSTANCE_ID")
         if asked and asked != "default":
             raise RuntimeError(
-                "cannot resolve a per-instance watcher sentinel: "
+                "cannot resolve a per-instance path: "
                 "src/runtime-api/{instance_key,rundir}.py did not import")
-        return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}.pid"
-
+        return ""
     rundir, ikey = ident
     inst = instance if instance is not None else rundir.instance_id()
     who = agent if agent is not None else rundir.agent_id(state_dir)
     if inst == ikey.DEFAULT_INSTANCE and who == rundir.DEFAULT_ACTOR:
-        return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}.pid"
-    key = ikey.instance_key(who, inst)
-    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}-{key}.pid"
+        return ""
+    return ikey.instance_key(who, inst)
+
+
+def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
+    """The sentinel THIS instance writes."""
+    key = instance_scope_key(state_dir, instance, agent)
+    suffix = f"-{key}" if key else ""
+    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
+
+
+def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
+    """Where THIS instance records "my optional handler declined this task".
+
+    That receipt is instance-local knowledge. Shared, another instance reads it
+    as its own and bypasses its handler, sending the task to its live core.
+    """
+    key = instance_scope_key(state_dir, instance, agent)
+    base = Path(state_dir) / "task-event-handler-fallbacks"
+    return base / key if key else base
 
 
 def watcher_sentinel_paths(state_dir) -> "list[Path]":
@@ -535,6 +552,9 @@ if __name__ == "__main__":
     # of the identity encoding to keep in step with this one.
     if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
         print(watcher_sentinel_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
+        print(handler_fallbacks_dir(sys.argv[2]))
     else:
-        print("usage: util_paths.py watcher-sentinel <state-dir>", file=sys.stderr)
+        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+              file=sys.stderr)
         raise SystemExit(2)

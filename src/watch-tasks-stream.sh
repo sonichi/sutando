@@ -95,7 +95,12 @@ FSWATCH_PID=""
 CLEANING_UP=0
 GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-FALLBACKS_DIR="$WORKSPACE_DIR/state/task-event-handler-fallbacks"
+# Per instance: this receipt says "MY optional handler declined this task", and
+# a shared one makes another instance bypass its own handler. Owner: util_paths.
+FALLBACKS_DIR="$(python3 "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+  echo "watch-tasks-stream: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 WATCHER_ID="$$-${RANDOM:-0}"
 
 claim_is_live() {

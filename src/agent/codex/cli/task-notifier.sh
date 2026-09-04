@@ -12,7 +12,12 @@ else
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
-TASK_HANDLER_FALLBACKS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-fallbacks"
+# Same per-instance receipt the watcher writes; resolved by its owner so the
+# two cannot disagree about which instance a declined task belongs to.
+TASK_HANDLER_FALLBACKS_DIR="$(python3 "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+  echo "task-notifier: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
