@@ -84,7 +84,8 @@ print(f"{prev or ''}\t{src}")
 PYEOF
 )"; PREV="${PREVLINE%%	*}"; PREV_SRC="${PREVLINE#*	}"
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
-BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --count)"; BASE="${BASE:-0}"
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --count)"; BRC=$?
+case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
 bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null || { echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
 CONFIRMED=false
 VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"

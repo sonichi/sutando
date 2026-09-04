@@ -9,6 +9,8 @@ cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
+# One failed capture, then normal: the first capture-pane call exits 1.
+case " $* " in *" capture-pane "*) n=$(( $(cat "$TMUX_LOG.caps" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMUX_LOG.caps"; [ "${TMUX_FAIL_CAPTURE_N:-0}" = "$n" ] && exit 1;; esac
 case " $* " in *" capture-pane "*)
   [ -n "${TMUX_CAP_DELAY:-}" ] && sleep "$TMUX_CAP_DELAY"
   # State-driven pane: one acceptance line per /model sent; in TMUX_DIALOG mode the
@@ -19,7 +21,7 @@ case " $* " in *" capture-pane "*)
   [ -n "${TMUX_NO_ACCEPT:-}" ] && { k=0; dlg=""; }
   # Render what the real CLI prints for each ACCEPTED send (display name, not id);
   # TMUX_ACCEPT_AS forces a different model's line; TMUX_PERSIST_SETTINGS mimics the CLI saving the pick.
-  disp() { case "$1" in opus|claude-opus-5*) echo "Opus 5";; sonnet|claude-sonnet-5*) echo "Sonnet 5";; haiku|claude-haiku-4-5*) echo "Haiku 4.5";; fable|claude-fable-5-1*) echo "Fable 5.1";; default) echo "Default (recommended)";; *) echo "$1";; esac; }
+  disp() { case "$1" in claude-opus-5-1*) echo "Opus 5.1";; opus|claude-opus-5*) echo "Opus 5";; sonnet|claude-sonnet-5*) echo "Sonnet 5";; haiku|claude-haiku-4-5*) echo "Haiku 4.5";; fable|claude-fable-5-1*) echo "Fable 5.1";; default) echo "Default (recommended)";; *) echo "$1";; esac; }
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
@@ -33,7 +35,7 @@ chmod +x "$T/bin/tmux"
 export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="/tmp/sutando-tmux.sock"
 printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; SETTINGS_BEFORE="$(cat "$T/cfg/settings.json")"
 fails=0; ok(){ echo "  ok   $1"; }; fail(){ echo "  FAIL $1 — $2"; fails=$((fails+1)); }
-run(){ : > "$TMUX_LOG"; "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
+run(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"; "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
 settings_untouched(){ [ "$(cat "$T/cfg/settings.json")" = "$SETTINGS_BEFORE" ]; }
 
 rc=$(run 'gpt-5; rm -rf /'); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && [ ! -e "$T/state/model-switch.json" ] && ok "1 a non-claude name is refused (rc=2), nothing written or sent" || fail "1" "rc=$rc"
@@ -105,4 +107,18 @@ rc=$(TMUX_PERSIST_SETTINGS="$T/cfg/settings.json" run opus); R=$(python3 -c "imp
 [ "$rc" = 0 ] && [ "$R" = "claude-fable-5-1[1m] settings.json" ] && [ "$NOW" = "opus" ] && ok "29 the CLI persisted the NEW model on acceptance; previous still records the model BEFORE the send" || fail "29 previous read after acceptance" "rc=$rc R=$R settings-now=$NOW"
 printf '%s\n' "$SETTINGS_BEFORE" > "$T/cfg/settings.json"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 29 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- exact display name, and a blind pane is never a zero
+rm -f "$T/state/model-switch.json"
+rc=$(TMUX_ACCEPT_AS=claude-opus-5-1 run claude-opus-5 --accept-timeout 1); [ "$rc" = 8 ] && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "30 adjacent version: pane says 'Opus 5.1', claude-opus-5 requested -> exit 8, NO record" || fail "30 adjacent version" "rc=$rc $(cat "$T/err")"
+rc=$(run claude-opus-5-1); R=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['model'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "claude-opus-5-1" ] && ok "31 ...and the exact version is accepted (Opus 5.1)" || fail "31" "rc=$rc R=$R $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_AS=claude-opus-5-1 run opus); [ "$rc" = 0 ] && ok "32 an alias (opus) accepts whichever version the CLI chose" || fail "32 alias" "rc=$rc $(cat "$T/err")"
+rm -f "$T/state/model-switch.json" "$T/tmux.log.caps"
+# capture order in a run: sender dry-run x2, BASELINE (3rd), sender send — fail the 3rd
+rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model" "$TMUX_LOG" && [ ! -e "$T/state/model-switch.json" ] && grep -q "could not read the core pane" "$T/err" \
+  && ok "33 the baseline capture fails: refuse BEFORE sending, nothing recorded (a blind pane is not a zero)" || fail "33 blind baseline" "rc=$rc $(cat "$T/err")"
+rm -f "$T/tmux.log.caps"
+# The capture counter must reset per run: run() truncates the log, so reset the counter with it.
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 33 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
