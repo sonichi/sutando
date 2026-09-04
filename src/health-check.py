@@ -8293,10 +8293,10 @@ def check_task_watcher() -> dict:
     as one that is always green.
     """
     name = "task-watcher"
-    # Newest-stamped of every instance's sentinel: on a pool host each watcher
-    # writes its own, and asking about one file answers about one watcher.
-    _sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
-    pid_file = _sentinels[0] if _sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
+    # EVERY instance's sentinel: on a pool host each watcher writes its own, so
+    # a probe that reads one file classifies the other N-1 as untracked.
+    sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
+    pid_file = sentinels[0] if sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
     # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
     # so take the snapshot here: None is unavailable, "" is genuinely empty.
     ps_out = _ps_snapshot()
@@ -8341,34 +8341,57 @@ def check_task_watcher() -> dict:
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
-    try:
-        pid = int(pid_file.read_text().strip())
-    except Exception as e:  # noqa: BLE001
-        return {"name": name, "status": "warn",
-                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
-    argv = _proc_argv(pid)
-    if not argv:
+    # Classify EVERY sentinel, because each names a different watcher. The
+    # single-sentinel host takes exactly the branches it always did.
+    live, dead_pids, reused, unreadable = {}, [], [], []
+    for sp in sentinels:
+        try:
+            spid = int(sp.read_text().strip())
+        except Exception as e:  # noqa: BLE001
+            unreadable.append((sp, str(e)[:40]))
+            continue
+        sargv = _proc_argv(spid)
+        if not sargv:
+            dead_pids.append(spid)
+        elif "watch-tasks-stream" not in sargv:
+            reused.append((spid, sargv))
+        else:
+            live[spid] = sp
+
+    if not live:
+        if unreadable and not dead_pids and not reused:
+            return {"name": name, "status": "warn",
+                    "detail": f"unreadable PID sentinel ({unreadable[0][1]}) — restart the watcher"}
+        if reused and not dead_pids:
+            # PID reuse: the sentinel outlived the watcher and the OS handed the
+            # number to something else. `kill -0` alone would call this alive.
+            rpid, rargv = reused[0]
+            return {"name": name, "status": "warn",
+                    "detail": f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}"}
+        pid = dead_pids[0] if dead_pids else 0
         if roots:
-            # The sentinel tracks only the MOST RECENT start, so a dead one does
-            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            # A dead sentinel does NOT mean nothing drains tasks/ — restarting
+            # here is what makes the duplicates.
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
                               f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
                               "stop them and restart one cleanly"}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
-    if "watch-tasks-stream" not in argv:
-        # PID reuse: the sentinel outlived the watcher and the OS handed the
-        # number to something else. `kill -0` alone would call this alive.
-        return {"name": name, "status": "warn",
-                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
-    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+
+    tracked = {str(p) for p in live}
+    extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
+        keep = ", ".join(str(p) for p in sorted(live))
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
+                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by any "
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
-    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+                          f"more than once. Keep the tracked one(s) ({keep}), stop the rest"}
+    alive = ", ".join(str(p) for p in sorted(live))
+    if len(live) == 1:
+        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
