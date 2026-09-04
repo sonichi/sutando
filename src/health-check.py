@@ -9241,7 +9241,7 @@ _REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
 _RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
 
 
-def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
+def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     """(verdict, why) for one workspace_default copy, WITHOUT importing it.
 
     Verdicts: "honours" / "ignores" / "unknown". Static because detection must not
@@ -9318,7 +9318,7 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
             if d.endswith(".environ.get") or d.endswith("getenv"):
                 continue                         # an env read: reads_env judges it
             sib = sibling(d)
-            if sib is not None and sib[1].name == "resolve_workspace":
+            if _hops > 0 and sib is not None and sib[1].name == "resolve_workspace":
                 continue                         # same-name delegate: analysed below
             return d or "<expr>"
         return None
@@ -9363,7 +9363,10 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
                     continue
                 sib = sibling(d)
                 if sib is not None and sib[1].name == node.name:
-                    sub, _ = _resolver_env_verdict(sib[0])   # one hop, same name
+                    if _hops <= 0:               # budget spent: mutual delegates
+                        return "unknown", (f"{node.name}() delegates to {d}() beyond "
+                                           f"the one-hop limit")
+                    sub, _ = _resolver_env_verdict(sib[0], _hops - 1)
                     if sub != "ignores":
                         return sub, (f"{node.name}() delegates to {d}(), which is "
                                      f"{sub}")

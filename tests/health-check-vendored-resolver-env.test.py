@@ -203,6 +203,39 @@ class UnresolvedIsNeverClean(unittest.TestCase):
         self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "honours")
 
 
+class TheHopIsBudgeted(unittest.TestCase):
+    """Round 5: the one-hop limit was documented in prose and unenforced, so
+    mutual delegates recursed to RecursionError instead of failing closed."""
+
+    def test_mutual_delegates_fail_closed_instead_of_recursing(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "workspace_default.py").write_text(
+            "import b\ndef resolve_workspace():\n    return b.resolve_workspace()\n")
+        (d / "b.py").write_text(
+            "import workspace_default\n"
+            "def resolve_workspace():\n    return workspace_default.resolve_workspace()\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "unknown")
+        self.assertIn("b.resolve_workspace", why)
+
+    def test_a_self_delegating_file_also_fails_closed(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "workspace_default.py").write_text(
+            "import workspace_default\n"
+            "def resolve_workspace():\n    return workspace_default.resolve_workspace()\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "unknown")
+
+    def test_one_real_hop_still_resolves(self):
+        """Negative control: budgeting the hop must not disable it."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace():\n    return Path('/c')\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n    return sutando_config.resolve_workspace()\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""
