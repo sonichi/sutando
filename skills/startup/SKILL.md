@@ -54,15 +54,29 @@ Invoke `/schedule-crons`. This handles:
   a hand-rolled registration leaves that probe reporting the crons as never registered.
 - Ensuring a fallback `/proactive-loop` cron exists at `*/10 * * * *` if `crons.json` doesn't include one (post-#954 belt-and-suspenders)
 
-### Step 3 — Confirm
+### Step 3 — Verify, then confirm
 
-Emit a one-line summary so the operator (or main session's first turn) sees what fired:
+**Run the ceremony gate BEFORE claiming completion.** It is health-check's `session-crons` probe
+— the same stamp-vs-session-boundary test the desktop app's ceremony-health uses to decide whether
+to re-send `/startup` — so the agent sees the app's criterion at the one moment it can act on it:
 
+```bash
+python3 skills/startup/scripts/verify-ceremony.py    # rc 0 = stamped this boot; rc 1 = NOT complete
 ```
-/startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
-```
 
-The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+- **rc 0** → emit the one-line summary so the operator (or main session's first turn) sees what fired:
+
+  ```
+  /startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
+  ```
+
+  The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+- **rc 1** → do NOT print `/startup complete`. Print the gate's output verbatim, invoke `/schedule-crons`
+  (the only writer of `hosts/<hostname>/schedule-crons-stamp.json`), and re-run the gate. A hand-rolled
+  `CronCreate` passes every cheap check — `CronList` looks perfect and the cron fires — and still fails
+  this one, which is exactly why the app kept re-sending `/startup` to a session that believed it was
+  done (135 sends across four episodes, the longest 25 h, stamp unchanged in every one).
+- **rc 2** → the probe could not run; say so and do not claim completion.
 
 ## Sequence diagram
 

@@ -91,6 +91,9 @@ def run_send(stub_payload, roster=None, stub_stderr=""):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         f"sys.stdout.write({stub_payload!r})\n"
@@ -179,6 +182,9 @@ def run_room(members_payload, *extra, roster=None, env_overrides=None):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
@@ -211,6 +217,9 @@ def run_room_per_room(per_room: dict, default, *extra, roster=None):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     seen = root / "queried.txt"
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"

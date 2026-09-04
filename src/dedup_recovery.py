@@ -19,16 +19,20 @@ try:  # pragma: no cover - exercised by whichever context imports it
     from .local_task_protocol import find_result, valid_archive_lookup_id
     from .result_markers import (
         build_requeued_task,
+        dedup_cross_sender_target,
         dedup_decision,
         dedup_requeue_count,
+        task_user_id,
     )
     from .task_archive import find_task_file
 except ImportError:  # pragma: no cover - flat src/ import path
     from local_task_protocol import find_result, valid_archive_lookup_id
     from result_markers import (
         build_requeued_task,
+        dedup_cross_sender_target,
         dedup_decision,
         dedup_requeue_count,
+        task_user_id,
     )
     from task_archive import find_task_file
 
@@ -36,6 +40,7 @@ __all__ = [
     "plan_dedup_recovery",
     "report_disposition",
     "REPORT_TEMPLATE",
+    "CROSS_SENDER_TEMPLATE",
     "MALFORMED_TEMPLATE",
 ]
 
@@ -47,6 +52,11 @@ MALFORMED_TEMPLATE = (
 REPORT_TEMPLATE = (
     "⚠️ This was folded into `{holder}`, which delivered nothing, and "
     "re-asking didn't recover it. It needs a direct answer."
+)
+
+CROSS_SENDER_TEMPLATE = (
+    "⚠️ This was folded into `{holder}`, which was asked by someone else, so the "
+    "reply went to them. Re-asking didn't recover it. It needs a direct answer."
 )
 
 
@@ -91,15 +101,28 @@ def plan_dedup_recovery(
     holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
 
     decision = dedup_decision(holder_text, orig_text)
-    if decision == "honour":
+    # "honour" asks whether the holder replied, never WHO it replied to: across
+    # senders its reply reaches its own asker and this one is left silent.
+    cross_sender = None
+    if decision == "honour" and holder and orig_text:
+        cross_sender = dedup_cross_sender_target(
+            task_user_id(orig_text),
+            _read(find_task_file(Path(tasks_dir), holder)),
+        )
+    if decision == "honour" and not cross_sender:
         return "honour", None
+    # `dedup_decision` short-circuits on holder-delivered, so its requeue cap is
+    # never reached here — a cross-sender fold is delivered by construction.
+    if cross_sender and dedup_requeue_count(orig_text) >= 1:
+        return "report", CROSS_SENDER_TEMPLATE.format(holder=holder)
 
-    if decision == "requeue" and orig_text:
+    if (decision == "requeue" or cross_sender) and orig_text:
         if commit_identity is not None and not commit_identity(new_task_id):
             return "defer", None
         body = build_requeued_task(
             orig_text, new_task_id, dedup_requeue_count(orig_text) + 1,
-            asking_channel, holder, reason="holder-empty",
+            asking_channel, holder,
+            reason="cross-sender" if cross_sender else "holder-empty",
             channel_dir=channel_dir,
         )
         try:

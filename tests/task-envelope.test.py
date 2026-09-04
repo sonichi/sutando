@@ -340,12 +340,12 @@ class WriterWiring(unittest.TestCase):
             gw = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
             ltp.set_task_stamper(lambda t: E.stamp_text(t, ws))
             try:
-                tid = gw._write_task({
+                written = gw._write_task({
                     "task": "hello from the wire",
                     "source": "ag2space", "channel_id": "!room:x",
                     "user_id": "@qingyun:ag2.space", "id": "task-991"})
-                self.assertIsNotNone(tid)
-                out = (tasks / f"{tid}.txt").read_text()
+                self.assertIsNotNone(written)
+                out = (tasks / f"{written[0]}.txt").read_text()
                 self.assertEqual(E.verify_text(out, ws)["verdict"],
                                  "verified",
                                  "the LIVE gateway writer must emit stamped "

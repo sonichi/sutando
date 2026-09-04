@@ -117,6 +117,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
+- **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
@@ -178,6 +179,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
+- **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
