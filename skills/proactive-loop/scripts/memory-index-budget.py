@@ -28,8 +28,6 @@ exit 0 safe · 1 an entry would drop (or the addition would not load) · 2 canno
 from __future__ import annotations
 
 import argparse
-import socket
-import subprocess
 import importlib.util
 import os
 import sys
@@ -95,29 +93,35 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
 # loads; a checkout can host several. Resolve by IDENTITY, never by freshness.
 
 
-def _host_pointer_path(projects: Path) -> Path:
-    """Where THIS host records which corpus it loads. Per-host by construction:
-    `hosts/` is synced, so a shared filename would deliver a peer's answer here."""
-    workspace = projects.parent.parent
-    label = os.environ.get("SUTANDO_HOST_LABEL") or ""
+def _host_label(repo: Path) -> "str | None":
+    """Delegate to src/util_paths._host_label; a private copy drifts from the
+    per-host contract the rest of the workspace addresses."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_mib_util_paths", repo / "src" / "util_paths.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        label = (mod._host_label() or "").strip()
+        return label or None
+    except Exception:
+        return None
+
+
+def _host_pointer_path(projects: Path, repo: Path) -> "Path | None":
+    """Where THIS host records which corpus it loads, or None if the label owner
+    cannot answer -- guessing the label is what the delegation exists to stop."""
+    label = _host_label(repo)
     if not label:
-        try:
-            label = subprocess.run(["scutil", "--get", "LocalHostName"],
-                                   capture_output=True, text=True, timeout=5).stdout.strip()
-        except Exception:
-            label = ""
-    if not label:
-        label = socket.gethostname().split(".")[0]
-    return workspace / "hosts" / label / "memory-corpus"
+        return None
+    return projects.parent.parent / "hosts" / label / "memory-corpus"
 
 
-def _host_stated_index(projects: Path) -> "tuple[Path | None, str]":
-    """(index, why) from this host's recorded pointer; (None, "") when unrecorded.
-
-    A pointer is owner-stated identity, so it outranks every inference below it --
-    but it is NOT a guess: absent means absent, and the caller still refuses.
-    """
-    ptr = _host_pointer_path(projects)
+def _host_stated_index(projects: Path, repo: Path) -> "tuple[Path | None, str]":
+    """(index, why) from the pointer; (None, "") when unrecorded -- absent is
+    absent, so the caller still refuses rather than inferring."""
+    ptr = _host_pointer_path(projects, repo)
+    if ptr is None:
+        return None, ""
     try:
         raw = ptr.read_text().strip()
     except OSError:
@@ -127,12 +131,9 @@ def _host_stated_index(projects: Path) -> "tuple[Path | None, str]":
     return Path(raw).expanduser(), f"{ptr}"
 
 
-def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
-    """(index, note). index None means refuse -- the note says why.
-
-    Freshness is not identity: an unrelated project edited more recently is not
-    the corpus this session loads, and an mtime cannot separate the two.
-    """
+def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
+    """(index, note); index None means refuse and the note says why. Freshness is
+    not identity -- an mtime cannot say which corpus this session loads."""
     default = memory_dir / "MEMORY.md"
     # MEMORY_DIR is already derived FROM this override when it is set, so the
     # caller's memory_dir is owner-stated identity -- do not re-read the var.
@@ -141,7 +142,7 @@ def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
             return default, ""
         return None, f"CANNOT ANSWER: SUTANDO_MEMORY_DIR resolves to {default}, which is not a file"
     projects = memory_dir.parent.parent
-    stated, why = _host_stated_index(projects)
+    stated, why = _host_stated_index(projects, repo)
     if stated is not None:
         if stated.is_file():
             return stated, ""
@@ -161,7 +162,7 @@ def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
     if len(cands) == 1:
         return cands[0], ""
     names = ", ".join(c.parent.parent.name for c in cands)
-    ptr = _host_pointer_path(projects)
+    ptr = _host_pointer_path(projects, repo) or "<hosts/<label>/memory-corpus>"
     return None, (
         f"CANNOT ANSWER: {len(cands)} candidate indexes under {projects} and nothing "
         f"authoritative names one ({names}). An mtime says which was edited last, not "
@@ -193,7 +194,7 @@ def main(argv=None) -> int:
     if a.index:
         index, note = Path(a.index), ""
     else:
-        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")))
+        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")), repo)
         if index is None:
             # note is non-empty IFF index is None -- every resolved path returns "".
             print(note, file=sys.stderr)

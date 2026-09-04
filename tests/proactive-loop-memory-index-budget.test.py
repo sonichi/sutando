@@ -144,7 +144,7 @@ with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
-    got, note = mib._live_index(stale)
+    got, note = mib._live_index(stale, REPO)
     # A 12-day gap is exactly the case where "freshest" looks authoritative and
     # is not: an unrelated project edited later is still not what loads here.
     check("resolution: two corpora and no authoritative signal REFUSES, however wide the gap",
@@ -158,7 +158,30 @@ with tempfile.TemporaryDirectory() as d:
 # the test does not depend on the machine it runs on.
 def _ptr_for(projects):
     os.environ["SUTANDO_HOST_LABEL"] = "test-host"
-    return mib._host_pointer_path(projects)
+    return mib._host_pointer_path(projects, REPO)
+
+
+def _canonical_label():
+    """What the repo's own host-label owner answers, for parity comparison."""
+    return subprocess.run(["bash", "scripts/sutando-config.sh", "host-label"],
+                          cwd=REPO, capture_output=True, text=True).stdout.strip()
+
+
+# The label must come from the canonical owner, not a private copy. A copy that
+# omits the legacy override addresses a different hosts/<label>/ than everything else.
+for _name, _env in [("unset", {}),
+                    ("legacy SUTANDO_HOST_OVERRIDE", {"SUTANDO_HOST_OVERRIDE": "legacy-host"}),
+                    ("explicit SUTANDO_HOST_LABEL", {"SUTANDO_HOST_LABEL": "explicit-host"}),
+                    ("blank label falls through", {"SUTANDO_HOST_LABEL": "   "})]:
+    for _k in ("SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"):
+        os.environ.pop(_k, None)
+    os.environ.update(_env)
+    _got = mib._host_pointer_path(pathlib.Path("/tmp/ws/.claude-sutando/projects"), REPO)
+    check(f"host label parity with sutando-config.sh: {_name}",
+          _got is not None and _got.parent.name == _canonical_label(),
+          f"tool={_got.parent.name if _got else None} canonical={_canonical_label()}")
+for _k in ("SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"):
+    os.environ.pop(_k, None)
 
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
@@ -168,7 +191,7 @@ with tempfile.TemporaryDirectory() as d:
     check("pointer: it is per-host by construction, not a shared filename",
           ptr.parent.name == "test-host" and ptr.parent.parent.name == "hosts", f"ptr={ptr}")
     # The pointer adds a way in; it does not soften the ambiguous refusal.
-    got, note = mib._live_index(stale)
+    got, note = mib._live_index(stale, REPO)
     check("pointer: absent pointer leaves the ambiguous refusal intact",
           got is None and "CANNOT ANSWER" in note, f"got={got}")
     check("pointer: the refusal now names the file to record, so a host is not stuck",
@@ -177,16 +200,16 @@ with tempfile.TemporaryDirectory() as d:
     # the pointer can produce this answer.
     ptr.parent.mkdir(parents=True, exist_ok=True)
     ptr.write_text(str(live / "MEMORY.md") + "\n")
-    got, note = mib._live_index(stale)
+    got, note = mib._live_index(stale, REPO)
     check("pointer: a recorded corpus resolves, outranking both cwd and freshness",
           got == live / "MEMORY.md" and note == "", f"got={got} note={note!r}")
     # Falling through here would let a typo silently measure a different corpus.
     ptr.write_text(str(projects / "no-such" / "memory" / "MEMORY.md"))
-    got, note = mib._live_index(stale)
+    got, note = mib._live_index(stale, REPO)
     check("pointer: a pointer to a missing file REFUSES, never falls back to inference",
           got is None and "is not a file" in note, f"got={got} note={note!r}")
     ptr.write_text("   \n")
-    got, note = mib._live_index(stale)
+    got, note = mib._live_index(stale, REPO)
     check("pointer: an empty pointer is 'unrecorded', not 'recorded as nothing'",
           got is None and "CANNOT ANSWER" in note and "RECORD IT ONCE" in note, f"note={note!r}")
     os.environ.pop("SUTANDO_HOST_LABEL", None)
@@ -194,7 +217,7 @@ with tempfile.TemporaryDirectory() as d:
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
     only = _tree(projects, "slug-only", index_of(LIMIT // 3), age_s=60)
-    got, note = mib._live_index(only)
+    got, note = mib._live_index(only, REPO)
     check("resolution: a single corpus is unchanged behaviour and says nothing",
           got == only / "MEMORY.md" and note == "", f"got={got} note={note!r}")
 
@@ -202,7 +225,7 @@ with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
     a = _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
-    got, note = mib._live_index(a)
+    got, note = mib._live_index(a, REPO)
     check("resolution: near-simultaneous indexes REFUSE too -- the gap never decides",
           got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
 
@@ -214,7 +237,7 @@ with tempfile.TemporaryDirectory() as d:
     outside = pathlib.Path(d) / "elsewhere" / "memory"
     outside.mkdir(parents=True)
     (outside / "MEMORY.md").write_text(index_of(LIMIT // 2))
-    got, _ = mib._live_index(mine)
+    got, _ = mib._live_index(mine, REPO)
     check("resolution: a fresher index OUTSIDE projects/ is not eligible",
           got == mine / "MEMORY.md", f"got {got}")
 
@@ -238,13 +261,13 @@ with tempfile.TemporaryDirectory() as d:
     _prev = os.environ.get("SUTANDO_MEMORY_DIR")
     os.environ["SUTANDO_MEMORY_DIR"] = str(older)
     try:
-        got, note = mib._live_index(older)
+        got, note = mib._live_index(older, REPO)
         check("resolution: with the override set, the caller's memory_dir is trusted outright",
               got == older / "MEMORY.md" and note == "", f"got={got} note={note!r}")
-        got, note = mib._live_index(newer)
+        got, note = mib._live_index(newer, REPO)
         check("resolution: an override set means NO sibling scan -- a fresher tree is ignored",
               got == newer / "MEMORY.md" and note == "", f"got={got} note={note!r}")
-        got, note = mib._live_index(projects / "slug-absent" / "memory")
+        got, note = mib._live_index(projects / "slug-absent" / "memory", REPO)
         check("resolution: override set but the index missing REFUSES, never falls back to a scan",
               got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
     finally:
@@ -262,13 +285,13 @@ with tempfile.TemporaryDirectory() as d:
     empty = pathlib.Path(d) / "elsewhere" / "memory"
     empty.mkdir(parents=True)
     (empty / "MEMORY.md").write_text(index_of(LIMIT // 3))
-    got, note = mib._live_index(empty)          # its projects/ parent holds no */memory/MEMORY.md
+    got, note = mib._live_index(empty, REPO)          # its projects/ parent holds no */memory/MEMORY.md
     check("fallback: no candidates under projects/ but MEMORY_DIR has one -> use it",
           got == empty / "MEMORY.md" and note == "", f"got={got} note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
     missing = pathlib.Path(d) / "nowhere" / "memory"
-    got, note = mib._live_index(missing)
+    got, note = mib._live_index(missing, REPO)
     check("refusal: no candidates and no index at MEMORY_DIR -> None + CANNOT ANSWER",
           got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
 
@@ -284,7 +307,7 @@ with tempfile.TemporaryDirectory() as d:
         return real_glob(self, pattern, *a, **k)
     pathlib.Path.glob = boom
     try:
-        got, note = mib._live_index(live)
+        got, note = mib._live_index(live, REPO)
     finally:
         pathlib.Path.glob = real_glob
     # A raised scan proves nothing about uniqueness, so falling back to MEMORY_DIR's
