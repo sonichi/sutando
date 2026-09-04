@@ -52,6 +52,22 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(
             G.offenders('gh pr comment 1 --body "built at $(date) ok"'), ["--body"])
 
+    def test_ANSI_C_quoting_holds_a_substitution_literal_so_denying_it_cries_wolf(self):
+        """`$'...'` processes backslash escapes ONLY, so the body really is prose.
+
+        This pins the ALLOW, not the decoding: disabling the scanner's ANSI-C
+        branch leaves every assertion here green, because this guard reads `$(`
+        out of the text either way. The decoding itself is pinned against bash
+        in tests/shell-scan-oracle.test.py, where that mutation DOES turn red.
+        """
+        self.assertEqual(G.offenders("gh pr comment 1 --body $'$(date)'"), [])
+        self.assertEqual(G.offenders("gh pr comment 1 --body $'built at $(date) ok'"), [])
+        self.assertEqual(G.offenders("gh pr comment 1 --body $'`date`'"), [])
+        # Control: the same shapes OUTSIDE $'...' still deny, or the three
+        # assertions above would pass on a guard that flags nothing at all.
+        self.assertEqual(
+            G.offenders('gh pr comment 1 --body "built at $(date) ok"'), ["--body"])
+
     def test_a_newline_ends_the_command_like_a_semicolon(self):
         """`whitespace_split` eats a newline, so `armed` survived a line break
         and a non-gh tool on line 2 was denied (yixuan-ag2, #3830)."""
