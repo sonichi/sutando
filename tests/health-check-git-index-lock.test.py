@@ -6,6 +6,8 @@ writer (the lock left behind by a killed `git add`), not a hand-made file only.
 """
 import importlib.util
 import os
+import shlex
+import unittest.mock
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,16 @@ class GitIndexLock(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _repo(self, name):
+        """A real git repo at an arbitrary name, so a path with spaces is testable."""
+        d = Path(self.tmp.name) / name
+        d.mkdir()
+        _git(d, "init", "-q", "-b", "main")
+        (d / "f.txt").write_text("x")
+        _git(d, "add", "f.txt")
+        _git(d, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base")
+        return d
 
     def _lock(self, age_s):
         p = self.repo / ".git" / "index.lock"
@@ -127,6 +139,79 @@ class GitIndexLock(unittest.TestCase):
         plain = Path(self.tmp.name) / "plain"
         plain.mkdir()
         self.assertEqual(hc.check_git_index_lock(plain)["status"], "ok")
+
+    # ---- malformed `gitdir:` pointers (keweichen, 2026-09-04) ----------------
+
+    def _worktree_like(self, name, pointer_body):
+        """A checkout whose `.git` is a FILE, as a worktree's is."""
+        d = Path(self.tmp.name) / name
+        d.mkdir()
+        (d / ".git").write_bytes(pointer_body)
+        return d
+
+    def test_an_empty_gitdir_target_is_rejected_not_resolved_to_the_checkout(self):
+        # Path("") resolves to the repo, so the advice would name <repo>/index.lock.
+        d = self._worktree_like("empty-target", b"gitdir:\n")
+        stray = d / "index.lock"
+        stray.write_text("")
+        old = time.time() - 9.4 * 3600
+        os.utime(stray, (old, old))
+        self.assertIsNone(hc._git_dir(d))
+        r = hc.check_git_index_lock(d)
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("rm ", r["detail"])
+
+    def test_a_nul_gitdir_target_does_not_escape_the_always_on_sweep(self):
+        """NOT a control for the try/except: on CPython 3.14/macOS `is_dir()`
+        swallows both, so this passes with the guard removed. It pins the
+        CONTRACT (a malformed pointer yields None), and the guard exists for
+        the platforms where the reviewer measured ValueError/OSError."""
+        d = self._worktree_like("nul-target", b"gitdir: /tmp/a\x00b\n")
+        self.assertIsNone(hc._git_dir(d))
+        self.assertEqual(hc.check_git_index_lock(d)["status"], "ok")
+
+    def test_an_overlong_gitdir_target_does_not_escape_either(self):
+        """Same caveat as the NUL case above — contract pin, not a control."""
+        d = self._worktree_like("long-target", b"gitdir: /" + b"x" * 5000 + b"\n")
+        self.assertIsNone(hc._git_dir(d))
+        self.assertEqual(hc.check_git_index_lock(d)["status"], "ok")
+
+    # ---- unknown stat result is not a measured absence -----------------------
+
+    def test_a_stat_error_that_is_not_absence_is_reported_as_unmeasured(self):
+        repo = self._repo("stat-eacces")
+        real_stat = Path.stat
+
+        def boom(self_path, *a, **k):
+            if self_path.name == "index.lock":
+                raise PermissionError(13, "Permission denied")
+            return real_stat(self_path, *a, **k)
+
+        with unittest.mock.patch.object(Path, "stat", boom):
+            r = hc.check_git_index_lock(repo)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("UNMEASURED", r["detail"])
+        self.assertNotIn("unblocked", r["detail"])
+
+    def test_a_genuinely_missing_lock_is_still_a_clean_ok(self):
+        repo = self._repo("no-lock")
+        r = hc.check_git_index_lock(repo)
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("no index.lock", r["detail"])
+
+    # ---- the advice must be shell-safe --------------------------------------
+
+    def test_the_advice_quotes_a_path_with_spaces_so_argv_stays_one_operand(self):
+        repo = self._repo("valid repo with spaces")
+        lock = repo / ".git" / "index.lock"
+        lock.write_text("")
+        old = time.time() - 9.4 * 3600
+        os.utime(lock, (old, old))
+        detail = hc.check_git_index_lock(repo)["detail"]
+        for verb in ("lsof", "rm"):
+            argv = shlex.split(detail.split(f"`{verb} ", 1)[1].split("`", 1)[0])
+            self.assertEqual(argv, [str(lock)],
+                             f"{verb} would act on {len(argv)} operands, not the lock")
 
     def test_the_probe_is_wired_into_the_run(self):
         src = (ROOT / "src" / "health-check.py").read_text()
