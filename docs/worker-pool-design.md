@@ -108,6 +108,19 @@ filename decides between them. An earlier version of this section argued that
 racing two discards is safe — true, and insufficient, because neither of the
 races that matter is discard-against-discard.
 
+**The claim key is the canonical task id, not the basename on disk.** Step 2 has
+the claimant rename `task-X.txt` to `task-X.claimed-W.txt` (§3 rule 1), and the
+watcher dispatches every direct-child `*.txt` on Created **and Renamed** with no
+lifecycle-name exclusion (`src/watch-tasks-stream.sh:639-702`). So a key taken from
+the basename mutates under the very operation this design prescribes: the rename
+re-enters as `task-X.claimed-W.txt`, whose key nobody holds, and the task is emitted
+a second time or the rename cycle repeats. Deriving the key by stripping the
+lifecycle suffix makes the redispatch lose the race it already lost, which is the
+correctness argument; excluding `.claimed-*` / `.assigned-*` from dispatch is the
+cheaper first gate and stops the event being raised at all. Step 2 owes both, plus a
+rename test and a restart test — an initial sweep that meets a `.claimed-*` file left
+by a previous run fails the same way with no rename in sight.
+
 **Prerequisite for step 2, stated as such.** No suppress disposition exists today.
 The probe's handled results are exit 0 (queue a fallback handler), exit 4 (queue a
 required handler), exit 3 (emit directly) and an else branch that also emits
@@ -318,10 +331,12 @@ justify a timer, so no `proactive-loop-pool` skill ships.
 
 ## Coordination contract (claim-only; the primitives are #3604's)
 
-1. **Claim:** exclusivity is the watcher's hard-link claim
-   (`state/task-event-handler-claims/<filename>`, first link wins, a dead
+1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the
+   CANONICAL task id — `state/task-event-handler-claims/<task-id>`, the basename
+   with any `.claimed-*` / `.assigned-*` suffix stripped (first link wins, a dead
    owner's claim retired by pid); the claimant then renames `tasks/task-X.txt`
    to `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads.
+   Keying on the raw basename would hand the renamed file a key nobody holds.
    There is no assignment step; eligibility is `requested_worker` and the pin
    table.
 2. **Done-flags:** `state/cores/<name>/done/task-X.flag` is written before any
