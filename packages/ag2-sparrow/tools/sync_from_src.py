@@ -43,6 +43,9 @@ MAP = {
     # so the coverage gate (source = src) can see them.
     "outbox.py": "outbox.py",
     "outbox_adapter.py": "outbox_adapter.py",
+    # one reader of the pin table: the bridge binds at ingress, the follower
+    # claim path defers — two copies would disagree about who owns a room
+    "pool_affinity.py": "pool_affinity.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"
