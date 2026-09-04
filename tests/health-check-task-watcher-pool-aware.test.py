@@ -610,5 +610,40 @@ class AllOwnerlessCleanupRestartsExactlyOne(unittest.TestCase):
                 self.assertEqual(_groups(d)["session-owned"], {"200"}, d)
 
 
+class Step9ContractIsSelfConsistent(unittest.TestCase):
+    """A STRUCTURAL check, not a behavioural one — deliberately.
+
+    Step 9 is the executable remedy: the agent reading it stops processes. Two
+    surrounding safety invariants once said "stop ONLY ownerless" and "never
+    stop a watcher whose owning core is alive", while the group table required
+    stopping `same-core duplicates` — every one of which has a live owning
+    core. A consumer obeying either invariant leaves the duplicate running, so
+    the defect the probe identifies survives its own remedy. Behaviour cannot
+    observe a contradiction between two prose rules; only the text can.
+    """
+
+    SKILL = (Path(__file__).resolve().parent.parent
+             / "skills" / "proactive-loop" / "SKILL.md")
+
+    def setUp(self):
+        self.text = self.SKILL.read_text(encoding="utf-8")
+        self.assertIn("same-core duplicates", self.text,
+                      "fixture is stale: step 9 no longer names the fourth group")
+
+    def test_no_ownerless_only_stop_rule_survives_beside_the_fourth_group(self):
+        bad = re.findall(r"(?i)stop only the pids[^.\n]*ownerless", self.text)
+        self.assertEqual(bad, [], f"ownerless-only stop rule coexists with same-core duplicates: {bad}")
+
+    def test_the_liveness_invariant_does_not_forbid_duplicate_cleanup(self):
+        # "never stop a watcher whose owning core is alive" is TRUE of every
+        # same-core duplicate, so as an unqualified rule it bans the cleanup.
+        bad = [m for m in re.findall(r"\*\*Never stop [^*]+\*\*", self.text)
+               if "owning core is alive" in m]
+        self.assertEqual(bad, [], f"unqualified liveness ban still present: {bad}")
+
+    def test_the_protected_thing_is_named_as_the_survivor(self):
+        self.assertRegex(self.text, r"(?i)never stop a core's LAST live watcher")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

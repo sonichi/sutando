@@ -365,9 +365,12 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
-   **⚠ STOP ONLY THE PIDS THE PROBE ITSELF CLASSIFIES AS OWNERLESS.** The sentinel is
-   single-valued, but a pool legitimately runs **one watcher per core**, so N-1 correct watchers
-   always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
+   **⚠ STOP EXACTLY THE PIDS THE PROBE CLASSIFIES AS `ownerless` OR `same-core duplicates`, AND
+   NOTHING ELSE.** The sentinel is single-valued, but a pool legitimately runs **one watcher per
+   core**, so N-1 correct watchers always read as "untracked duplicates" and which pid holds the
+   sentinel is arbitrary. The probe's four groups are the whole contract: `session-owned` keeps one
+   survivor per core and `unverified` is neither stopped nor counted, so "untracked by the sentinel"
+   is never on its own a reason to stop anything.
 
    The probe does this classification for you, same-host, and now does it in **every** multi-root
    branch. **Act only on the four labelled groups it emits.** Key on that structure, never on
@@ -420,8 +423,12 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | multiple trees, some **not tracked by the sentinel** | same — group rules, then the same post-cleanup contract (stop ownerless + same-core duplicates → rerun probe → start exactly ONE only if none remains). The sentinel's own tree is classified too, so an orphaned sentinel beside a live replacement is named for cleanup rather than protected. |
    | not running (no sentinel, no trees) / pid dead or recycled with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
-   **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
-   express on its own, and the one that makes the difference between a cleanup and an outage.
+   **Never stop a core's LAST live watcher** — that is the invariant the table cannot express on its
+   own, and the one that makes the difference between a cleanup and an outage. Note the shape: a
+   `same-core duplicate` also has a live owning core, and stopping it is correct precisely because
+   the same core keeps its `session-owned` survivor. The protected thing is the survivor, not the
+   owner's liveness; phrasing it as "never stop a watcher whose owning core is alive" forbids the
+   duplicate cleanup this step exists to perform.
 
    **A missing sentinel is UNKNOWN, not DEAD.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
 
