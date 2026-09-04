@@ -22,12 +22,21 @@ from hitl.replies import (  # noqa: E402
     REPLY_FIELD,
     HitlReplyHandler,
     actions_dir,
+    match_action,
     parse_reply,
 )
 from hitl.events import events_dir, ingest  # noqa: E402
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 
 OWNER = "@owner:ag2.space"
+
+
+def _mgr_with(req):
+    """A manager whose store already holds `req` — for the fallback path, which
+    looks a requirement up by the card event it was projected as."""
+    m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))
+    m.create(req)
+    return m
 
 
 def event(payload, actor=OWNER, etype="message.created", eid="$e1", **content):
@@ -211,6 +220,136 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual(chain.offer(event(None, eid="$chat")), ["$chat"])
         self.assertEqual(seen, ["$chat"])
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
+
+
+class TestFallbackCarriesTheNote(unittest.TestCase):
+    """The client appends the human's note to the click body so the timeline
+    shows what they actually said; the fallback must still recognise the click
+    AND carry the note on as the answer."""
+
+    def _req(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="approve", kind="answer", label="Approve it")])
+
+    def test_a_bare_label_is_still_a_click_with_no_note(self):
+        a, note = match_action(self._req(), "Not now")
+        self.assertEqual(a.id, "not_now")
+        self.assertIsNone(note)
+
+    def test_label_plus_note_is_the_same_click_carrying_the_note(self):
+        a, note = match_action(
+            self._req(), "Not now — I will talk to him. Ignore his request for now.")
+        self.assertEqual(a.id, "not_now")
+        self.assertEqual(note, "I will talk to him. Ignore his request for now.")
+
+    def test_a_sentence_merely_starting_with_a_label_is_not_a_click(self):
+        """Without the separator requirement, 'Not nowadays...' would answer
+        the card — a prose reply silently becoming a decision."""
+        a, note = match_action(self._req(), "Not nowadays, this needs thought")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_an_unrelated_reply_stays_a_message(self):
+        a, _ = match_action(self._req(), "what does this even mean?")
+        self.assertIsNone(a)
+
+    def test_a_label_with_an_empty_note_is_a_bare_click(self):
+        a, note = match_action(self._req(), "Not now —   ")
+        self.assertEqual(a.id, "not_now")
+        self.assertIsNone(note)
+
+    def test_the_action_id_also_matches(self):
+        a, note = match_action(self._req(), "approve: rui has waited long enough")
+        self.assertEqual(a.id, "approve")
+        self.assertEqual(note, "rui has waited long enough")
+
+    def test_a_longer_sibling_label_owns_its_own_click(self):
+        """A shorter label prefixes the longer one, and the hyphen inside the
+        longer label reads as a separator, so first-match returned the WRONG
+        action with the rest of the real label as its note."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="approve", kind="answer", label="Approve"),
+                     Action(id="approve_all", kind="answer", label="Approve-all")])
+        a, note = match_action(req, "Approve-all")
+        self.assertEqual(a.id, "approve_all")
+        self.assertIsNone(note)
+
+    def test_exact_match_beats_a_prefix_from_an_earlier_action(self):
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="not_now_later", kind="answer", label="Not now: later")])
+        a, note = match_action(req, "Not now: later")
+        self.assertEqual(a.id, "not_now_later")
+        self.assertIsNone(note)
+
+    def test_the_longest_matching_label_wins_when_a_note_follows(self):
+        """Exact match cannot decide this one — the text is longer than either
+        label — so the prefix pass has to prefer the longer label, or the
+        shorter sibling claims the click and eats the rest of the real label."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="not_now_later", kind="answer", label="Not now: later")])
+        a, note = match_action(req, "Not now: later \u2014 but ask me again on Friday")
+        self.assertEqual(a.id, "not_now_later")
+        self.assertEqual(note, "but ask me again on Friday")
+
+    def test_a_hyphenated_word_is_not_a_separator(self):
+        """`-` joins words in English, so accepting it with no break around it
+        turns ordinary prose into a decision — the failure the separator
+        requirement exists to prevent, arriving through the separator list."""
+        a, note = match_action(self._req(), "Not now-ish, maybe Friday")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_label_that_is_a_word_stem_does_not_claim_a_hyphenated_reply(self):
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="re", kind="answer", label="Re")])
+        a, note = match_action(req, "Re-run the job")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_hyphen_with_a_break_around_it_still_separates(self):
+        for text in ("Not now - later", "Not now- later"):
+            with self.subTest(text=text):
+                a, note = match_action(self._req(), text)
+                self.assertEqual(a.id, "not_now")
+                self.assertEqual(note, "later")
+
+    def test_the_dashes_and_colon_need_no_break(self):
+        """They never join two halves of a word, so the hyphen rule must not
+        widen to them — that would break the happy path this class covers."""
+        for text, want in (("Not now\u2014later", "later"),
+                           ("Not now\u2013later", "later"),
+                           ("Not now:later", "later")):
+            with self.subTest(text=text):
+                a, note = match_action(self._req(), text)
+                self.assertEqual(a.id, "not_now")
+                self.assertEqual(note, want)
+
+    def test_the_note_reaches_the_wire_as_answer(self):
+        h = HitlReplyHandler(_mgr_with(self._req()), "@owner:x")
+        req = h._manager.active()[0]
+        h._manager.store.save(req, projection={"revision": 1, "event_id": "$card"})
+        ev = h.task_to_event({"id": "t", "source_message_id": "$m", "channel_id": "!r",
+                              "user_id": "@owner:x", "reply_to_event": "$card",
+                              "task": "Not now — talking to him first"})
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["content"][REPLY_FIELD]["answer"], "talking to him first")
+
+    def test_a_bare_click_puts_no_answer_on_the_wire(self):
+        h = HitlReplyHandler(_mgr_with(self._req()), "@owner:x")
+        req = h._manager.active()[0]
+        h._manager.store.save(req, projection={"revision": 1, "event_id": "$card"})
+        ev = h.task_to_event({"id": "t", "source_message_id": "$m", "channel_id": "!r",
+                              "user_id": "@owner:x", "reply_to_event": "$card",
+                              "task": "Not now"})
+        self.assertNotIn("answer", ev["content"][REPLY_FIELD])
 
 
 if __name__ == "__main__":
