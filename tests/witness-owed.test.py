@@ -353,5 +353,82 @@ class UpgradeWiring(unittest.TestCase):
         self.assertIn('${GATE_HOST:+--host "$GATE_HOST"}', self.SRC)
 
 
+class Round5Blockers(Fixture):
+    """keweichen's round-5 P1-2 controls, each reproduced against the
+    production writers/readers. Every one of these passed BEFORE the fix."""
+
+    def _open(self, repo="o/r", pr=12, host=HOST_A):
+        return wo.open_record(self.ws, repo, pr, self.owed, host, "why", "me")
+
+    def test_a_malformed_tombstone_cannot_clear_an_open_record(self):
+        # Wrong filename, wrong owners, no timestamp — yet three fields were
+        # enough to close a peer's record.
+        self._open()
+        self.assertEqual(len(wo.list_open(self.ws)), 1)
+        bad = wo.records_dir(self.ws, HOST_B) / "tombstones" / "not-the-record-name.json"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text(json.dumps({"repo": "o/r", "pr": 12, "head": self.owed,
+                                   "witness": "https://example/x"}))
+        self.assertEqual(len(wo.list_open(self.ws)), 1,
+                         "a tombstone missing owners/timestamp and misnamed still closed the record")
+
+    def test_a_tombstone_cannot_be_written_by_the_owing_host(self):
+        self._open()
+        stone = wo.records_dir(self.ws, HOST_A) / "tombstones" / wo.record_key("o/r", 12)
+        stone.parent.mkdir(parents=True, exist_ok=True)
+        stone.write_text(json.dumps({"repo": "o/r", "pr": 12, "head": self.owed,
+                                     "owed_by": HOST_A, "closed_by": HOST_A,
+                                     "witness": "https://example/x", "closed_at": "2026-09-04T00:00:00Z"}))
+        self.assertEqual(len(wo.list_open(self.ws)), 1,
+                         "a host tombstoned its OWN record, bypassing close_record's checks")
+
+    def test_a_stamp_naming_another_host_is_not_freshness(self):
+        wo.open_record(self.ws, "o/r", 12, self.owed, HOST_B, "why", "me")
+        d = wo.records_dir(self.ws, HOST_B)
+        wo._atomic_write(d / wo.STAMP_NAME, {"host": HOST_A, "published_at": wo._now()})
+        self.assertEqual(wo.stale_hosts(self.ws, HOST_A, 3600.0), [HOST_B],
+                         "host-a's stamp vouched for host-b's directory")
+
+    def test_valid_repo_names_cannot_collide_on_one_record_file(self):
+        # `a-b/c` and `a/b-c` both became `a-b-c` under replace('/', '-').
+        first = self._open(repo="a-b/c", pr=7)
+        second = self._open(repo="a/b-c", pr=7)
+        self.assertNotEqual(first, second, "two distinct repos share one record file")
+        keys = {r["repo"] for r in wo.list_open(self.ws)}
+        self.assertEqual(keys, {"a-b/c", "a/b-c"},
+                         f"one repo's record overwrote the other's: {keys}")
+        self.assertIsNotNone(wo.find_record(self.ws, "a-b/c", 7))
+        self.assertIsNotNone(wo.find_record(self.ws, "a/b-c", 7))
+
+    def test_a_host_cannot_escape_the_workspace(self):
+        for bad in ("../../escaped", "a/b", ".", "..", "", "  "):
+            with self.assertRaises(ValueError, msg=f"host {bad!r} was accepted"):
+                wo.records_dir(self.ws, bad)
+
+    def test_concurrent_writers_do_not_destroy_each_other(self):
+        import threading
+        path = wo.records_dir(self.ws, HOST_A) / "concurrent.json"
+        start = threading.Barrier(2)
+        errors = []
+
+        def w(tag):
+            try:
+                start.wait(timeout=5)
+                wo._atomic_write(path, {"tag": tag})
+            except Exception as exc:            # noqa: BLE001 - the control IS the type
+                errors.append(type(exc).__name__)
+
+        ts = [threading.Thread(target=w, args=(t,)) for t in ("a", "b")]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(errors, [], f"a shared .tmp name made concurrent writers race: {errors}")
+        self.assertTrue(path.is_file())
+        self.assertIn(json.loads(path.read_text())["tag"], ("a", "b"))
+        leftovers = list(path.parent.glob("*.tmp"))
+        self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
+
+
 if __name__ == "__main__":
     unittest.main()

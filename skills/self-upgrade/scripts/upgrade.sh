@@ -116,10 +116,20 @@ GATE_REPO="$(printf '%s' "$GATE_URL" | sed -E 's#/+$##; s#\.git$##' | sed -nE 's
 # with it off, foreign host subtrees are a fleet this host cannot refresh.
 GATE_VAULT="$(bash "$REPO/scripts/sutando-config.sh" vault-enabled 2>/dev/null || true)"
 GATE_MAX_AGE="${SUTANDO_WITNESS_MAX_AGE:-3600}"
+# nan/inf parse as floats and defeat expiry entirely, so a stale fleet view
+# would read as fresh forever. Manifest declaration is still owed.
+case "$GATE_MAX_AGE" in
+  *[!0-9.]*|""|".") echo "self-upgrade: ABORT — SUTANDO_WITNESS_MAX_AGE must be a finite positive number of seconds, got '$GATE_MAX_AGE'" >&2; exit 4;;
+esac
+awk -v v="$GATE_MAX_AGE" 'BEGIN{ exit !(v+0 > 0) }' ||
+  { echo "self-upgrade: ABORT — SUTANDO_WITNESS_MAX_AGE must be > 0, got '$GATE_MAX_AGE'" >&2; exit 4; }
 if [ "$GATE_VAULT" = "true" ]; then
   bash "$REPO/scripts/sync-workspace.sh" --pull-only || { echo "self-upgrade: ABORT — vault pull failed, so the fleet's witness-owed records cannot be called fresh" >&2; exit 4; }
 elif [ -d "$GATE_WS/hosts" ] && [ -n "$GATE_HOST" ] && find "$GATE_WS/hosts" -mindepth 2 -maxdepth 2 -name witness-owed -not -path "$GATE_WS/hosts/$GATE_HOST/*" | grep -q .; then
-  echo "self-upgrade: ABORT — foreign host witness-owed subtrees exist but the vault is disabled, so they cannot be refreshed" >&2; exit 4
+  echo "self-upgrade: ABORT — foreign host witness-owed subtrees exist but the vault is disabled, so they cannot be refreshed" >&2
+  echo "  Enable the vault, or re-stamp this host's view once its records are current:" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS publish --host ${GATE_HOST:-<this-host>}" >&2
+  exit 4
 fi
 if [ -n "$CANARY" ]; then
   [ -n "$GATE_HOST" ] || { echo "self-upgrade: ABORT — cannot resolve this host's label, so it cannot be declared the canary for $CANARY" >&2; exit 4; }
@@ -129,7 +139,10 @@ if [ -n "$CANARY" ]; then
 fi
 if ! "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" --repo "$GATE_REPO" --max-age "$GATE_MAX_AGE" ${GATE_HOST:+--host "$GATE_HOST"}; then
   echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
-  echo "  Post the exact-head round trip to the PR thread and close the record: witness_owed.py close owner/repo#N --witness <url>" >&2
+  echo "  Post the exact-head round trip to the PR thread, then close the record ON THE OWING HOST:" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS close owner/repo#N --witness <url> --host <owing-host>" >&2
+  echo "  From any OTHER host, tombstone it instead (same arguments, --host is THIS host):" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS tombstone owner/repo#N --witness <url> --host ${GATE_HOST:-<this-host>}" >&2
   echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
   exit 4
 fi

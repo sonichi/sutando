@@ -266,7 +266,7 @@ and loads whichever repo it reviews.
     in those terms. The PR may then be approved and merged on its harness proof. `self-upgrade`
     reads the record and refuses to fast-forward a live core onto any head that newly contains
     the owed PR (`src/witness_owed.py check`, exit 3) until the exact-head round trip is posted
-    back to the thread and the record is closed with its location (`close ... --witness <url>`).
+    back to the thread and the record is closed with its location (`close <owner/repo#N> --witness <url> --host <owing-host>`; from any other host, `tombstone` with the same arguments and `--host` naming THIS host).
     A precondition on the whole exception: it is usable only once this gate itself is live on
     every deployment host — an updater that predates the gate reads no record, so the first
     deferral after the gate lands must wait for the fleet to carry it. The circular case — the
