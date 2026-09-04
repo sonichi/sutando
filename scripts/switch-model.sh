@@ -18,7 +18,7 @@ if ! printf '%s' "$MODEL" | grep -Eq '^(default|opus|sonnet|haiku|fable|claude-[
   echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
 fi
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+CFG="$(bash "$HERE/scripts/sutando-config.sh" claude-home-path settings.json)"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$HERE/scripts/sutando-config.sh" workspace)/state"
 if [ -n "$DRY" ]; then
   echo "dry-run: would pin model=$MODEL in $CFG, record $STATE_DIR/model-switch.json, send '/model $MODEL' to tmux -S $SOCK -t $SESSION"; exit 0
