@@ -3087,6 +3087,17 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
 # the slowest legitimate case measured here and 113x below the incident's 9.4h.
 GIT_LOCK_STALE_S = 300.0
 
+# `git rev-parse --local-env-vars` (git 2.50) plus the two discovery bounds. Any
+# of these inherited makes git answer for ANOTHER repository despite `-C`.
+GIT_REPO_SELECTION_ENV = frozenset({
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
 
 def _git_dir(repo: Path) -> "Path | None":
     """The real .git directory, as GIT resolves it.
@@ -3098,15 +3109,19 @@ def _git_dir(repo: Path) -> "Path | None":
     would escape an always-on sweep. Unresolvable means no remedy, not a guess.
     """
     import subprocess as _sp
+    env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_SELECTION_ENV}
     try:
         r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
-                    capture_output=True, text=True, timeout=20)
+                    capture_output=True, text=True, timeout=20, env=env)
     except (OSError, ValueError, _sp.SubprocessError):
         return None
-    if r.returncode != 0 or not r.stdout.strip():
+    # Only the record terminator comes off: a trailing space in the path is
+    # significant, and stripping it names a different directory.
+    raw = r.stdout.removesuffix("\n")
+    if r.returncode != 0 or not raw:
         return None
     try:
-        g = Path(r.stdout.strip())
+        g = Path(raw)
         return g if g.is_dir() else None
     except (ValueError, OSError, RuntimeError):
         return None
@@ -3145,7 +3160,8 @@ def check_git_index_lock(repo_dir: "Path | None" = None,
         # Only a missing file is an absence; any other stat error leaves the
         # question unanswered, and "unblocked" would state an unmade measurement.
         return {"name": name, "status": "warn",
-                "detail": (f"cannot tell whether {lock} exists ({type(e).__name__}: {e.strerror or e}) "
+                "detail": (f"cannot tell whether {lock} exists "
+                           f"({type(e).__name__}: {getattr(e, 'strerror', None) or e}) "
                            f"— this is UNMEASURED, not a clean checkout")}
     age = (now if now is not None else time.time()) - st.st_mtime
     if age < 0:
