@@ -9302,6 +9302,27 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 elif al.name == "expandvars":
                     expandvars_names.add(bound)
 
+    # A trusted name that is REBOUND anywhere is no longer proven: `import os,
+    # helper; os = helper` and a second `from helper import getenv` both do it.
+    bound_counts: "dict[str, int]" = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                nm = al.asname or al.name.split(".")[0]
+                bound_counts[nm] = bound_counts.get(nm, 0) + 1
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                nm = al.asname or al.name
+                bound_counts[nm] = bound_counts.get(nm, 0) + 1
+    for tgt, _val in _bind_sites(tree):
+        for nm, _v in _binding_pairs(tgt, _val):
+            bound_counts[nm] = bound_counts.get(nm, 0) + 1
+    rebound = {nm for nm, c in bound_counts.items() if c > 1}
+    os_names -= rebound
+    getenv_names -= rebound
+    environ_names -= rebound
+    expandvars_names -= rebound
+
     # env = os.environ: a .get on the alias is the same read, but only when the
     # base is a name proven to be os. Collected through the taint pass's own model.
     aliases = {nm for tgt, val in _bind_sites(tree)
@@ -9382,9 +9403,9 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             if isinstance(n, ast.Subscript):
                 base = _dots(n.value)
                 if not _is_environ_base(base):
-                    # A subscript on an imported module's attribute is arbitrary
-                    # code, and no Call node exists for unresolved_call to catch.
-                    if "." in base and base.split(".")[0] in imported:
+                    # A subscript on imported-but-unproven code, dotted or bare;
+                    # no Call node exists for unresolved_call to catch either one.
+                    if base.split(".")[0] in imported:
                         return f"a subscript on the unresolved {base}"
                     continue
                 key = n.slice

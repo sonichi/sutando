@@ -578,6 +578,64 @@ class ProvenanceNotSuffix(unittest.TestCase):
             "    return Path(getenv('SUTANDO_WORKSPACE'))\n"), "honours")
 
 
+class ProvenanceIsBindingAware(unittest.TestCase):
+    """Round 10: provenance was collected into unordered sets and never
+    invalidated, so a REBOUND trusted name kept its proof. qingyun-wu's two
+    controls read 'ignores' at 5ffd704b."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_reassigning_the_os_name_revokes_its_proof(self):
+        self.assertEqual(self._verdict(
+            "import os, helper\nfrom pathlib import Path\n"
+            "os = helper\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_later_colliding_import_revokes_it_too(self):
+        self.assertEqual(self._verdict(
+            "from os import getenv\nfrom helper import getenv\n"
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(getenv('HOME'))\n"), "unknown")
+
+    def test_a_shadowed_bare_environ_subscript_too(self):
+        """A bare name has no dotted root, and a Subscript has no Call node, so
+        this needed the subscript check widened rather than provenance alone."""
+        self.assertEqual(self._verdict(
+            "from os import environ\nfrom helper import environ\n"
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(environ['HOME'])\n"), "unknown")
+
+    def test_an_unshadowed_import_keeps_its_proof(self):
+        """Negative control: revocation must key on REBINDING, not on the name
+        appearing twice in the file for any reason."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_an_os_environ_alias_still_works(self):
+        """Negative control: `env = os.environ` binds env, not os — the alias
+        must not be mistaken for a rebinding of the trusted name."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "env = os.environ\n"
+            "def resolve_workspace():\n"
+            "    return Path(env['HOME'])\n"), "ignores")
+
+    def test_and_the_removed_variable_is_still_caught(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('SUTANDO_WORKSPACE'))\n"), "honours")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""
