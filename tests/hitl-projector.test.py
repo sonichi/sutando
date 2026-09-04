@@ -140,6 +140,31 @@ class ProjectorTests(unittest.TestCase):
         for kind in KINDS:
             self.assertIn(category_of(kind), (CATEGORY_BLOCKED, CATEGORY_DECISION), kind)
 
+    def test_a_kind_mapped_to_a_head_less_category_still_renders(self):
+        """The direct index was total only because construction coerces an
+        UNRECOGNISED kind to `unknown` — so the KeyError is unreachable that
+        way, and sonichi's first probe measured the coercion instead of the
+        renderer. It becomes reachable when a kind already IN `KINDS` is mapped
+        to a third category, which is why this remaps `choice` rather than
+        inventing one, and why the fallback is BLOCKED: raising here would
+        raise inside the renderer that exists for clients which cannot read
+        the structured field.
+        """
+        import hitl.schema as S
+        original = dict(S._KIND_CATEGORY)
+        S._KIND_CATEGORY["choice"] = "escalation"          # a category with no head
+        try:
+            req = make_req(kind="choice")
+            self.assertEqual(req.kind, "choice", "precondition: not coerced away")
+            self.assertEqual(category_of("choice"), "escalation")
+            body = fallback_body(req)
+            self.assertIn("⚠", body)
+            self.assertIn("needs your attention", body)
+        finally:
+            S._KIND_CATEGORY.clear()
+            S._KIND_CATEGORY.update(original)
+        self.assertEqual(category_of("choice"), CATEGORY_DECISION, "restored")
+
 
 if __name__ == "__main__":
     unittest.main()

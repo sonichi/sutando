@@ -21,8 +21,8 @@ KINDS = frozenset(
 
 CATEGORY_BLOCKED = "blocked"
 CATEGORY_DECISION = "decision"
-# Mirrors the client's hitlCategory.ts. An unlisted kind is BLOCKED: under-stating
-# a block strands the user, over-stating a decision only over-warns.
+# Mirrors ag2-space/cinny-webclient src/app/components/message/hitlCategory.ts
+# (#847). An unlisted kind is BLOCKED: under-stating a block strands the user.
 _KIND_CATEGORY = {
     "auth": CATEGORY_BLOCKED,
     "permission": CATEGORY_BLOCKED,

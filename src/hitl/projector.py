@@ -48,7 +48,9 @@ def fallback_body(req: HumanRequirement) -> str:
     """Plain-text rendering for clients that ignore the hitl content field."""
     device = (req.device or {}).get("name", "")
     where = f" (on {device})" if device else ""
-    head = f"{_CATEGORY_HEADS[category_of(req.kind)]} — {req.message}{where}"
+    lead = _CATEGORY_HEADS.get(category_of(req.kind),
+                               _CATEGORY_HEADS[CATEGORY_BLOCKED])
+    head = f"{lead} — {req.message}{where}"
     closer = _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
