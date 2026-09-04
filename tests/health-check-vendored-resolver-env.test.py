@@ -152,6 +152,57 @@ class EquivalentForms(unittest.TestCase):
             "    return Path(os.path.expanduser('~/w'))\n"), "ignores")
 
 
+class UnresolvedIsNeverClean(unittest.TestCase):
+    """Round 4: the fallback was applied only to the return expression and
+    ignored dotted callees, so both shapes below read 'ignores' at 6a4ace97."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_a_local_assigned_from_an_opaque_call_taints_the_return(self):
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    raw = mystery()\n"
+            "    return Path(raw)\n"), "unknown")
+
+    def test_a_dotted_callee_is_unresolved_too(self):
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(config.workspace())\n"), "unknown")
+
+    def test_a_readable_same_name_delegate_is_analysed_not_guessed(self):
+        """The canonical resolver delegates to a sibling module; that hop is
+        taken, so a real file is not condemned as unknown."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path('/configured')\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    return sutando_config.resolve_workspace()\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+    def test_the_delegate_carries_its_own_verdict_back(self):
+        """Same hop, dirty delegate: the honours verdict must propagate."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    return sutando_config.resolve_workspace()\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "honours")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

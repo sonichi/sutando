@@ -9254,6 +9254,25 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
         return "unknown", f"could not parse: {str(e)[:60]}"
     modfns = {n.name: n for n in ast.walk(tree)
               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def sibling(dotted: "str"):
+        """One hop: `mod.fn` where mod.py sits beside this file. A delegate we
+        can read is analysed, not guessed at."""
+        mod, _, name = dotted.rpartition(".")
+        if not mod or "." in mod:
+            return None
+        sib = path.parent / f"{mod}.py"
+        if not sib.is_file():
+            return None
+        try:
+            sub = ast.parse(sib.read_text())
+        except Exception:                        # noqa: BLE001
+            return None
+        for n in ast.walk(sub):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+                return sib, n
+        return None
+
     fn = modfns.get("resolve_workspace")
     if fn is None:
         return "unknown", "no resolve_workspace() to analyse"
@@ -9283,16 +9302,25 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
                     return True
         return False
 
-    def opaque_call(node) -> "str | None":
-        """Name a call whose result this analysis cannot account for."""
+    def unresolved_call(node) -> "str | None":
+        """Name the first call whose result this analysis cannot account for.
+
+        Bare AND dotted callees both count: `mystery()` and `config.workspace()`
+        can each return the removed value. Only module functions (followed
+        below), pure constructors, and os.path helpers are resolved.
+        """
         for n in ast.walk(node):
             if not isinstance(n, ast.Call):
                 continue
             d = _dots(n.func)
             if d in modfns or d in _RESOLVED_CALLS or d.startswith("os.path."):
                 continue
-            if "." not in d and d not in modfns:
-                return d or "<expr>"
+            if d.endswith(".environ.get") or d.endswith("getenv"):
+                continue                         # an env read: reads_env judges it
+            sib = sibling(d)
+            if sib is not None and sib[1].name == "resolve_workspace":
+                continue                         # same-name delegate: analysed below
+            return d or "<expr>"
         return None
 
     def verdict(node, seen: frozenset) -> "tuple[str, str] | None":
@@ -9300,31 +9328,47 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
         if node.name in seen:
             return None                          # recursion guard
         seen = seen | {node.name}
-        tainted, changed = set(), True
-        while changed:                           # tiny fixpoint over local aliases
+        tainted, murky, changed = set(), {}, True
+        while changed:                           # two fixpoints, one walk
             changed = False
             for n in ast.walk(node):
-                if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
-                    if not (reads_env(n.value) or any(
-                            isinstance(x, ast.Name) and x.id in tainted
-                            for x in ast.walk(n.value))):
+                if not (isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None):
+                    continue
+                names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)]
+                env = reads_env(n.value) or any(x in tainted for x in names)
+                unk = unresolved_call(n.value) or next(
+                    (murky[x] for x in names if x in murky), None)
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    if not isinstance(t, ast.Name):
                         continue
-                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
-                        if isinstance(t, ast.Name) and t.id not in tainted:
-                            tainted.add(t.id); changed = True
+                    if env and t.id not in tainted:
+                        tainted.add(t.id); changed = True
+                    if unk and t.id not in murky:
+                        murky[t.id] = unk; changed = True
         for n in ast.walk(node):
             if not (isinstance(n, ast.Return) and n.value is not None):
                 continue
-            if reads_env(n.value) or any(isinstance(x, ast.Name) and x.id in tainted
-                                         for x in ast.walk(n.value)):
+            names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)]
+            if reads_env(n.value) or any(x in tainted for x in names):
                 return "honours", (f"a return in {node.name}() derives from the env "
                                    f"(line {n.lineno})")
-            for c in ast.walk(n.value):          # follow calls into this module
-                if isinstance(c, ast.Call) and _dots(c.func) in modfns:
-                    deeper = verdict(modfns[_dots(c.func)], seen)
+            for c in ast.walk(n.value):          # follow calls we can read
+                if not isinstance(c, ast.Call):
+                    continue
+                d = _dots(c.func)
+                if d in modfns:
+                    deeper = verdict(modfns[d], seen)
                     if deeper is not None:
                         return deeper
-            bad = opaque_call(n.value)
+                    continue
+                sib = sibling(d)
+                if sib is not None and sib[1].name == node.name:
+                    sub, _ = _resolver_env_verdict(sib[0])   # one hop, same name
+                    if sub != "ignores":
+                        return sub, (f"{node.name}() delegates to {d}(), which is "
+                                     f"{sub}")
+            bad = unresolved_call(n.value) or next(
+                (murky[x] for x in names if x in murky), None)
             if bad is not None:
                 return "unknown", (f"a return in {node.name}() flows through "
                                    f"{bad}(), which this analysis cannot resolve")
