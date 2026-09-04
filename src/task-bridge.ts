@@ -86,7 +86,9 @@ const _ZWSP = '​';
 // Generated from local_task_protocol.KNOWN_HEADER_KEYS: a key the Python
 // reader accepts but this guard misses is a forged-header hole.
 const _HEADER_KEYS = HEADER_KEYS;
-const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
+// Exported so a test can prove the CONSTRUCTED guard covers every generated
+// key; a source grep passes on a literal that silently drops one.
+export const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
 // Every separator str.splitlines() / universal-newline readers treat as a
 // line boundary — fold ALL to '\n' so the guard's line-set matches the
