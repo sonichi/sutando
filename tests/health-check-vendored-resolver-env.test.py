@@ -39,9 +39,18 @@ class VendoredResolverEnvProbe(unittest.TestCase):
     def _ws(self) -> Path:
         return Path(tempfile.mkdtemp())
 
-    def test_no_copies_is_not_a_finding(self):
-        """An empty tree must return None, never a warn — absence is not a defect."""
-        self.assertIsNone(hc.check_vendored_resolver_env(workspace_dir=self._ws()))
+    def test_zero_copies_reports_coverage_rather_than_going_silent(self):
+        """Sutando-Mini on #3892: a probe that finds nothing must SAY so.
+
+        Returning None makes "scanned, found none" indistinguishable from "the scan
+        looked in the wrong place", which is the vacuous-green shape this probe was
+        written to catch — one layer down, inside the probe itself.
+        """
+        r = hc.check_vendored_resolver_env(workspace_dir=self._ws())
+        self.assertIsNotNone(r, "a zero result went out as silence")
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("zero copies scanned", r["detail"],
+                      "the detail must state coverage, not imply a clean bill")
 
     def test_a_compliant_copy_reads_ok(self):
         """The discriminating control: without it the probe could warn on any copy."""

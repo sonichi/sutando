@@ -9259,8 +9259,14 @@ def check_vendored_resolver_env(workspace_dir: "Path | None" = None) -> "dict | 
             if ".git" in f.parts or f.resolve() == canonical:
                 continue
             copies.append(f)
+    roots_seen = [str(r) for r in roots if r.is_dir()]
     if not copies:
-        return None                       # nothing vendored here; not a finding
+        # NOT None. A silent absence cannot be told from a scan that looked in the
+        # wrong place — the vacuous-green shape this probe exists to catch.
+        return {"name": name, "status": "ok",
+                "detail": f"no vendored workspace_default under {len(roots_seen)} "
+                          f"root(s) ({', '.join(roots_seen) or 'none present'}) — "
+                          "zero copies scanned, so this is coverage, not a clean bill"}
     bogus = "/tmp/sutando-healthcheck-not-the-workspace"
     probe_src = ("import sys; sys.path.insert(0, %r)\n"
                  "from workspace_default import resolve_workspace\n"
