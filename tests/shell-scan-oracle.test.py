@@ -83,9 +83,8 @@ class MatchesBash(unittest.TestCase):
         "gh pr comment 1 --body $'\\cA'",
         "gh pr comment 1 --body $'\\e[0m'",
         "gh pr comment 1 --body pre$'mid'post",
-        # A NUL cannot reach argv, so bash truncates the SPAN that contains it
-        # and keeps concatenating: $'a\\0b'c is "ac". A scanner that retains the
-        # NUL sees a target bash never delivers, and the guard under-denies.
+        # A NUL cannot reach argv: bash truncates the SPAN, not the word, so
+        # $'a\\0b'c is "ac" and a scanner keeping the NUL under-denies.
         "gh release create v1 --target $'abc1234\\0suffix'",
         "gh release create v1 --target $'abc1234\\x00suffix'",
         "gh release create v1 --target $'abc1234\\000suffix'",
