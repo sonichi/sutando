@@ -28,10 +28,8 @@ PRIVATE_PARSER = (
     (re.compile(r"punctuation_chars"), "configures its own lexer"),
 )
 
-# Guards that still parse shell themselves, each with the issue tracking its
-# migration. An entry is a debt to repay, not a permanent carve-out:
-# `test_no_exemption_is_stale` fails once a guard no longer needs one, so the
-# list cannot outlive its reason.
+# Guards still parsing shell themselves, with the issue tracking each.
+# `test_no_exemption_is_stale` fails once one no longer needs the entry.
 NOT_YET_MIGRATED = {
     "comment-signature-guard.py": "sonichi/sutando#3849",
     "review-authority-guard.py": "sonichi/sutando#3849",
