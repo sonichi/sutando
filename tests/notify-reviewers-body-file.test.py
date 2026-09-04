@@ -88,6 +88,42 @@ with tempfile.TemporaryDirectory() as td:
     check("a FIFO is refused rather than blocking forever",
           "not a regular file" in (r.stdout + r.stderr), True)
 
+print("\ncase: resolve_body, in-process")
+# In-process as well as via the CLI: a subprocess run is invisible to coverage,
+# so the arms above exercise these lines without ever attributing them.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("nr", str(TOOL))
+nr = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(nr)
+except SystemExit:
+    pass
+
+check("argv body passes through unchanged", nr.resolve_body(HAZARD, None), HAZARD)
+
+with tempfile.TemporaryDirectory() as td:
+    p = Path(td) / "ask.md"
+    p.write_text(HAZARD + "\n")
+    check("a file body is read VERBATIM — backtick and apostrophe intact",
+          nr.resolve_body(None, str(p)), HAZARD)
+
+    for label, args in (("both", (HAZARD, str(p))), ("neither", (None, None))):
+        try:
+            nr.resolve_body(*args)
+            check(f"{label} -> SystemExit", "no raise", "SystemExit")
+        except SystemExit as e:
+            check(f"{label} -> SystemExit naming the rule",
+                  "give exactly one of" in str(e), True)
+
+    empty = Path(td) / "empty.md"
+    empty.write_text("\n  \n")
+    try:
+        nr.resolve_body(None, str(empty))
+        check("empty file -> SystemExit", "no raise", "SystemExit")
+    except SystemExit as e:
+        check("empty file -> refuses rather than sending a blank ask",
+              "refusing to send" in str(e), True)
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s)")
     sys.exit(1)

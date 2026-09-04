@@ -437,6 +437,25 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
                   f"Not yet asked: {', '.join(unasked) or '<roster exhausted>'}")
 
 
+def resolve_body(message, body_file) -> str:
+    """The ask body, from argv or from a file — exactly one of the two.
+
+    A body that reached argv has already been through the shell and cannot be
+    recovered, so --body-file is the only path that preserves backticks and $.
+    """
+    if (message is None) == (body_file is None):
+        raise SystemExit("ERROR: give exactly one of --message or --body-file")
+    if body_file is None:
+        return message
+    # Imported here, not at module scope: `_REPO` is positional, so a copy run
+    # from elsewhere has no src/ path and a top-level import breaks --message too.
+    from body_file import read_body_file
+    text = read_body_file(body_file)
+    if not text.strip():
+        raise SystemExit(f"ERROR: --body-file {body_file!r} is empty — refusing to send")
+    return text
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reviewers", required=True,
@@ -459,17 +478,7 @@ def main() -> int:
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
-    # Resolved into a.message here so every gate below reads one field; a body that
-    # reached argv has already been through the shell and cannot be recovered.
-    if (a.message is None) == (a.body_file is None):
-        raise SystemExit("ERROR: give exactly one of --message or --body-file")
-    if a.body_file is not None:
-        # Imported here, not at module scope: `_REPO` is positional, so a copy run
-        # from elsewhere has no src/ path and a top-level import breaks --message too.
-        from body_file import read_body_file
-        a.message = read_body_file(a.body_file)
-        if not a.message.strip():
-            raise SystemExit(f"ERROR: --body-file {a.body_file!r} is empty — refusing to send")
+    a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
