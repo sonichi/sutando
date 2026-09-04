@@ -113,7 +113,9 @@ def _ansi_c(body: str) -> str:
         out.append("\\")
         out.append(nxt)
         i += 2
-    return "".join(out)
+    # A NUL cannot survive into argv, so bash truncates THIS span at it — the
+    # rest of the word still concatenates ($'a\\0b'c is "ac", not "a").
+    return "".join(out).split("\x00", 1)[0]
 
 
 def _ansi_c_span(command: str, i: int):

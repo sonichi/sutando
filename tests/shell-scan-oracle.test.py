@@ -83,6 +83,16 @@ class MatchesBash(unittest.TestCase):
         "gh pr comment 1 --body $'\\cA'",
         "gh pr comment 1 --body $'\\e[0m'",
         "gh pr comment 1 --body pre$'mid'post",
+        # A NUL cannot reach argv, so bash truncates the SPAN that contains it
+        # and keeps concatenating: $'a\\0b'c is "ac". A scanner that retains the
+        # NUL sees a target bash never delivers, and the guard under-denies.
+        "gh release create v1 --target $'abc1234\\0suffix'",
+        "gh release create v1 --target $'abc1234\\x00suffix'",
+        "gh release create v1 --target $'abc1234\\000suffix'",
+        "gh release create v1 --target $'abc1234\\0'suffix",
+        "gh pr comment 1 --body $'a\\0b'$'c\\0d'",
+        "gh pr comment 1 --body $'\\0lead'",
+        "gh pr comment 1 --body pre$'abc\\0suf'post",
         "gh pr comment 1 --body $'plain' --title after",
         # $"..." is locale translation: bash drops the $ too, so the same
         # under-deny as $'...' reached the sha match by a second route.
