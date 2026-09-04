@@ -265,6 +265,73 @@ class TestFallbackCarriesTheNote(unittest.TestCase):
         self.assertEqual(a.id, "approve")
         self.assertEqual(note, "rui has waited long enough")
 
+    def test_a_longer_sibling_label_owns_its_own_click(self):
+        """A shorter label prefixes the longer one, and the hyphen inside the
+        longer label reads as a separator, so first-match returned the WRONG
+        action with the rest of the real label as its note."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="approve", kind="answer", label="Approve"),
+                     Action(id="approve_all", kind="answer", label="Approve-all")])
+        a, note = match_action(req, "Approve-all")
+        self.assertEqual(a.id, "approve_all")
+        self.assertIsNone(note)
+
+    def test_exact_match_beats_a_prefix_from_an_earlier_action(self):
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="not_now_later", kind="answer", label="Not now: later")])
+        a, note = match_action(req, "Not now: later")
+        self.assertEqual(a.id, "not_now_later")
+        self.assertIsNone(note)
+
+    def test_the_longest_matching_label_wins_when_a_note_follows(self):
+        """Exact match cannot decide this one — the text is longer than either
+        label — so the prefix pass has to prefer the longer label, or the
+        shorter sibling claims the click and eats the rest of the real label."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="not_now_later", kind="answer", label="Not now: later")])
+        a, note = match_action(req, "Not now: later \u2014 but ask me again on Friday")
+        self.assertEqual(a.id, "not_now_later")
+        self.assertEqual(note, "but ask me again on Friday")
+
+    def test_a_hyphenated_word_is_not_a_separator(self):
+        """`-` joins words in English, so accepting it with no break around it
+        turns ordinary prose into a decision — the failure the separator
+        requirement exists to prevent, arriving through the separator list."""
+        a, note = match_action(self._req(), "Not now-ish, maybe Friday")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_label_that_is_a_word_stem_does_not_claim_a_hyphenated_reply(self):
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="re", kind="answer", label="Re")])
+        a, note = match_action(req, "Re-run the job")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_hyphen_with_a_break_around_it_still_separates(self):
+        for text in ("Not now - later", "Not now- later"):
+            with self.subTest(text=text):
+                a, note = match_action(self._req(), text)
+                self.assertEqual(a.id, "not_now")
+                self.assertEqual(note, "later")
+
+    def test_the_dashes_and_colon_need_no_break(self):
+        """They never join two halves of a word, so the hyphen rule must not
+        widen to them — that would break the happy path this class covers."""
+        for text, want in (("Not now\u2014later", "later"),
+                           ("Not now\u2013later", "later"),
+                           ("Not now:later", "later")):
+            with self.subTest(text=text):
+                a, note = match_action(self._req(), text)
+                self.assertEqual(a.id, "not_now")
+                self.assertEqual(note, want)
+
     def test_the_note_reaches_the_wire_as_answer(self):
         h = HitlReplyHandler(_mgr_with(self._req()), "@owner:x")
         req = h._manager.active()[0]
