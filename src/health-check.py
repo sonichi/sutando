@@ -9309,19 +9309,16 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     rebound = _rebound_names(src)
     if rebound is None:
         return "unknown", "symbol table refused this source"
-    # symtable calls colliding imports both `imported`, neither `assigned`; unlike
-    # binding forms, imports are a CLOSED set of two node types, so this enumerates.
-    imp_counts: "dict[str, int]" = {}
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for al in n.names:
-                nm = al.asname or al.name.split(".")[0]
-                imp_counts[nm] = imp_counts.get(nm, 0) + 1
-        elif isinstance(n, ast.ImportFrom):
-            for al in n.names:
-                nm = al.asname or al.name
-                imp_counts[nm] = imp_counts.get(nm, 0) + 1
-    rebound |= {nm for nm, c in imp_counts.items() if c > 1}
+    # `ignores` is certified for a PROVEN shape and refused otherwise, rather than
+    # for anything no blacklist has caught yet — the tail is unbounded, the shape is not.
+    provable = _import_provenance(tree)
+    if provable is None:
+        return "unknown", "a star import binds names this analysis cannot enumerate"
+    # Proven == bound by exactly one MODULE-SCOPE import. A nested `import os` does
+    # not prove a module-scope name, and two bindings prove neither.
+    rebound |= {nm for nm, c in provable.items() if c != 1}
+    for s in (os_names, getenv_names, environ_names, expandvars_names):
+        rebound |= {nm for nm in s if nm not in provable}
     os_names -= rebound
     getenv_names -= rebound
     environ_names -= rebound
@@ -9550,6 +9547,27 @@ def _walk_outside_functions(node):
                           ast.ClassDef, ast.Lambda)):
             continue
         stack.extend(ast.iter_child_nodes(n))
+
+
+def _import_provenance(tree):
+    """{name: module-scope import count}, or None if the module star-imports.
+
+    Scoped to module level on purpose: a nested `import os` is found by a
+    file-wide walk and proves nothing about the name the resolver actually sees.
+    """
+    counts = {}
+    for n in _walk_outside_functions(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                nm = al.asname or al.name.split(".")[0]
+                counts[nm] = counts.get(nm, 0) + 1
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                if al.name == "*":
+                    return None
+                nm = al.asname or al.name
+                counts[nm] = counts.get(nm, 0) + 1
+    return counts
 
 
 def _rebound_names(src):

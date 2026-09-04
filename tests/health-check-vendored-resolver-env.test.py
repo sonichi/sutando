@@ -636,6 +636,55 @@ class ProvenanceIsBindingAware(unittest.TestCase):
             "    return Path(os.getenv('SUTANDO_WORKSPACE'))\n"), "honours")
 
 
+class ProvenanceCertifiesAProvenShape(unittest.TestCase):
+    """`ignores` is asserted for a shape this analysis can prove, and refused for
+    everything else. The prior rule enumerated what to EXCLUDE, which is a
+    blacklist over an open set: `import *` binds names it cannot list, and a
+    file-wide walk counted a nested import as module-scope proof."""
+
+    def _v(self, body, helper=None):
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(helper or (
+            "import os\ndef getenv(key):\n"
+            "    return os.environ['SUTANDO_WORKSPACE']\n"))
+        (d / "workspace_default.py").write_text(body)
+        return hc._resolver_env_verdict(d / "workspace_default.py")[0]
+
+    def test_a_star_import_is_never_proven(self):
+        """qingyun-wu's round-13 control: the star binds `os`, the nested import
+        is what the file-wide walk counted."""
+        self.assertEqual(self._v(
+            "from helper import *\nfrom pathlib import Path\n"
+            "def unrelated():\n    import os\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_nested_import_does_not_prove_a_module_scope_name(self):
+        """The scope half, on its own — no star import in sight."""
+        self.assertEqual(self._v(
+            "from pathlib import Path\n"
+            "def unrelated():\n    import os\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_module_scope_import_is_still_proven(self):
+        """The negative that keeps this a rule and not a refusal-of-everything."""
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_a_real_read_is_still_detected(self):
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n"), "honours")
+
+    def test_the_helper_reports_star_as_unanalysable(self):
+        self.assertIsNone(hc._import_provenance(
+            __import__("ast").parse("from helper import *\n")))
+
+
 class BindingRevocationIsNotEnumerated(unittest.TestCase):
     """Six rounds each shipped a binding form the next round found, so the
     enumeration itself was the defect. CPython's symbol table is the language's
