@@ -16,7 +16,7 @@ and loads whichever repo it reviews.
 
 > **Single source of truth.** These lessons live here in `REVIEW.md` only — they are
 > **not** duplicated in `CLAUDE.md`. They reach reviewers three ways: `review-preflight.py`
-> (**run it before reviewing**: `python3 scripts/review-preflight.py <PR>`) reads this file and
+> (**run it before reviewing**: `python3 skills/pr-review/scripts/review-preflight.py <PR>`) reads this file and
 > prints the criteria on every pre-review run (for the core agent);
 > `scripts/review-checks.sh` runs the machine `checks:` block below in CI; and Claude Code's
 > managed GitHub-App reviewer reads this file directly. (The in-session `/code-review` reads
