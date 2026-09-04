@@ -152,6 +152,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'hitl-schema.test.py failed' }
           python tests/comment-signature-guard.test.py
           if ($LASTEXITCODE -ne 0) { throw 'comment-signature-guard.test.py failed' }
+          python tests/notify-reviewers-body-file.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'notify-reviewers-body-file.test.py failed' }
+          python tests/body-file-read.test.py ReaderContract
+          if ($LASTEXITCODE -ne 0) { throw 'body-file-read.test.py failed' }
           python tests/shutdown-sentinel.test.py
           if ($LASTEXITCODE -ne 0) { throw 'shutdown-sentinel.test.py failed' }
           python tests/cron-state-lock-windows.test.py
