@@ -636,6 +636,76 @@ class ProvenanceIsBindingAware(unittest.TestCase):
             "    return Path(os.getenv('SUTANDO_WORKSPACE'))\n"), "honours")
 
 
+class EveryBindingSourceRevokes(unittest.TestCase):
+    """Round 10 revoked provenance for imports and _bind_sites; parameters were a
+    SECOND enumerator it never consulted, so a parameter default could shadow a
+    trusted name and keep the module-level proof. Two enumerators of the same
+    question is the defect — one left out is one false clean per form."""
+
+    def _v(self, body):
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef getenv(key):\n"
+            "    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(body)
+        return hc._resolver_env_verdict(d / "workspace_default.py")[0]
+
+    def test_a_parameter_default_shadowing_os_is_not_proven(self):
+        """qingyun-wu's round-11 control, verbatim. `ignores` at the parent."""
+        self.assertEqual(self._v(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace(os=helper):\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_an_except_as_rebinding_is_not_proven(self):
+        """Same class, a form neither round named. `ignores` at the parent."""
+        self.assertEqual(self._v(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    try:\n        pass\n"
+            "    except Exception as os:\n        pass\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_parameter_that_shadows_nothing_stays_clean(self):
+        """The negative that makes it a rule and not 'revoke on any parameter'.
+
+        The key is a LITERAL, so the non-literal-key rule cannot fire and this
+        isolates the parameter axis by itself."""
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace(base='/tmp'):\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_an_unshadowed_import_is_still_proven(self):
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_a_real_read_is_still_detected_through_a_parameter(self):
+        """Over-revoking would hide a genuine honours; it must not."""
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace(base='/tmp'):\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n"), "honours")
+
+    def test_the_probe_reports_the_shadowed_copy_rather_than_ok(self):
+        """Integrated: the classifier verdict must reach the probe's status."""
+        ws = Path(tempfile.mkdtemp())
+        d = ws / "skill-repos" / "shadowed" / "scripts"
+        d.mkdir(parents=True)
+        (d / "helper.py").write_text(
+            "import os\ndef getenv(key):\n"
+            "    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace(os=helper):\n"
+            "    return Path(os.getenv('HOME'))\n")
+        r = hc.check_vendored_resolver_env(workspace_dir=ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("none honour", r["detail"])
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

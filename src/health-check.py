@@ -9302,21 +9302,11 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 elif al.name == "expandvars":
                     expandvars_names.add(bound)
 
-    # A trusted name that is REBOUND anywhere is no longer proven: `import os,
-    # helper; os = helper` and a second `from helper import getenv` both do it.
+    # A trusted name REBOUND anywhere is no longer proven — import, assignment or
+    # parameter default alike. One enumerator: a form left out is a false clean.
     bound_counts: "dict[str, int]" = {}
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for al in n.names:
-                nm = al.asname or al.name.split(".")[0]
-                bound_counts[nm] = bound_counts.get(nm, 0) + 1
-        elif isinstance(n, ast.ImportFrom):
-            for al in n.names:
-                nm = al.asname or al.name
-                bound_counts[nm] = bound_counts.get(nm, 0) + 1
-    for tgt, _val in _bind_sites(tree):
-        for nm, _v in _binding_pairs(tgt, _val):
-            bound_counts[nm] = bound_counts.get(nm, 0) + 1
+    for nm in _all_bound_names(tree):
+        bound_counts[nm] = bound_counts.get(nm, 0) + 1
     rebound = {nm for nm, c in bound_counts.items() if c > 1}
     os_names -= rebound
     getenv_names -= rebound
@@ -9546,6 +9536,42 @@ def _walk_outside_functions(node):
                           ast.ClassDef, ast.Lambda)):
             continue
         stack.extend(ast.iter_child_nodes(n))
+
+
+def _all_bound_names(tree):
+    """Every name bound anywhere in the module, once per binding site.
+
+    One enumerator, so a form modelled for taint but forgotten by revocation
+    cannot leave a shadowed name certified clean. Over-counting only costs an
+    `unknown`; under-counting is the false clean this exists to prevent.
+    """
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                yield al.asname or al.name.split(".")[0]
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                yield al.asname or al.name
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield n.name
+            for nm, _d in _param_binds(n):
+                yield nm
+        elif isinstance(n, ast.Lambda):
+            for nm, _d in _param_binds(n):
+                yield nm
+        elif isinstance(n, ast.ClassDef):
+            yield n.name
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            yield n.name
+        elif isinstance(n, ast.Global) or isinstance(n, ast.Nonlocal):
+            for nm in n.names:
+                yield nm
+        # `match x: case os:` binds too; ast.MatchAs is 3.10+, so probe by name.
+        elif type(n).__name__ == "MatchAs" and getattr(n, "name", None):
+            yield n.name
+    for tgt, val in _bind_sites(tree):
+        for nm, _v in _binding_pairs(tgt, val):
+            yield nm
 
 
 def _param_binds(fn):
