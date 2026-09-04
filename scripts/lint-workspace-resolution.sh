@@ -39,7 +39,7 @@ mode="${1:-all}"  # all | --diff
 
 # Patterns that signal direct workspace resolution.
 # Each pattern is a single ERE alternation we feed grep -E.
-PATTERN_ENV='(process\.env|process\.env\[)["'\'']?SUTANDO_WORKSPACE|os\.environ(\.get)?\(["'\'']SUTANDO_WORKSPACE|os\.getenv\(["'\'']SUTANDO_WORKSPACE'
+PATTERN_ENV='(process\.env|process\.env\[)["'\'']?SUTANDO_WORKSPACE|os\.environ(\.get)?\(["'\'']SUTANDO_WORKSPACE|os\.environ\[["'\'']SUTANDO_WORKSPACE|os\.getenv\(["'\'']SUTANDO_WORKSPACE'
 PATTERN_HARDCODED_HOME='\.sutando/workspace'
 PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 
@@ -97,7 +97,7 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # which predate this --diff lint and are grandfathered. A repo-tooling script has
 # no workspace to go through the wrapper for; the wrapper resolves the workspace,
 # which is the wrong directory here.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|skills/review-preflight/scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|skills/review-preflight/scripts/review-preflight\.py|tests/.+\.(test\.)?(py|ts|sh)|src/[^/]+\.test\.py|packages/ag2-sparrow/.*\.py)$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form
