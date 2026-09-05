@@ -33,8 +33,10 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
+    from .local_task_protocol import canonical_access_tier
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
+    from local_task_protocol import canonical_access_tier
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -102,12 +104,10 @@ def resolve_access_tier(task_file) -> str:
     if not candidates:
         return "owner"
     # Conflicting explicit tiers can only come from injection — fail closed.
-    normed = {"guest" if t == "other" else t for t in candidates}
+    normed = {canonical_access_tier(t) for t in candidates}
     if len(normed) > 1:
         return "guest"
-    tier = candidates[-1]
-    if tier == "other":
-        tier = "guest"
+    tier = normed.pop()
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
