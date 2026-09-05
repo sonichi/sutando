@@ -995,7 +995,8 @@ that a verified command still executes, or the matrix is prose that never ran.
 | command | effect |
 |---|---|
 | pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim |
-| spawn N · resize to N · remove worker W · set model of W | the core runs the installer (`spawn-worker`) |
+| spawn N · set model of W | the core runs the installer (`spawn-worker`) |
+| resize to N (shrinking) · remove worker W | an ORDERED transition — see "Removing a worker" below — because the installer alone leaves the departing worker's bindings pointing at an instance that can never return |
 
 What the app needs back is read-only: `state/pool-status.json` (workers, mode,
 the core's status line), which the core writes and the bridge already pushes.
@@ -1026,6 +1027,29 @@ not justify a timer of their own, so no `proactive-loop-pool` skill ships.
 4. **Reclaim:** the core, in its sweep, reclaims a task claimed by a worker
    whose beat is stale and one claimed with no result evidence, behind the
    done-flag. Workers reclaim nothing.
+**Removing a worker is an ordered transition, not an installer call.** No-stand-in makes an
+ineligible worker's rooms wait for it to return; a REMOVED worker never returns, so the same rule
+would strand those rooms forever and `resize to 0` could not restore core-only mode. The
+installer-only path at the command table has no step that rewrites a binding, which is exactly the
+gap. So removing W runs in this order, and the order is the contract:
+
+1. **Stop admitting.** W is marked ineligible first, so it takes no new claims while the rest runs.
+2. **Drain what it holds.** W's already-CLAIMED work is reclaimed behind the done flag, per rule 5 —
+   this is the one reclamation no-stand-in has always permitted, and it is why `resize to 0` can
+   promise that in-flight work is not lost.
+3. **REWRITE THE BINDINGS.** W is removed from every room's `instances`. A room left with no entries
+   is UNBOUND, and unbound work reaches the core under rule 3 — the ordinary path, not a stand-in.
+4. **Then** run the installer to remove the plist, and stop the process per the fence above.
+
+Steps 3 and 4 in that order is the whole point: reversed, there is a window in which the plist is
+gone and the bindings still name it. `resize to 0` is this transition applied to every worker, which
+is what leaves every room unbound and the core serving them all — core-only mode, reached by rule 3
+rather than by a stand-in exception.
+
+**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an
+explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping
+itself to a room whose worker might still come back.
+
 5. **No stand-in:** while a pinned worker is ineligible — beat stale, or wedged
    under rule 6 — new work for its rooms stays PENDING. The core does not claim
    it, and neither does any other worker. Work the ineligible worker had ALREADY
@@ -1060,7 +1084,7 @@ process whose absence stops work, which is already true of every install today.
 |---|---|---|---|
 | create | core | owner command (`spawn N`) | one plist per worker, the config dir and model captured in it |
 | start / stop one worker | launchd, revived by the core | `launchctl kickstart` (launchd defers non-demand spawns, so KeepAlive and timers do not bring a worker back) | on SIGTERM the worker unlinks its `.alive`, so its rooms go unserved at once |
-| shutdown of the pool | core | owner command (`resize to 0`) | workers stop; their claimed-but-unfinished tasks are reclaimed by the core, never dropped |
+| shutdown of the pool | core | owner command (`resize to 0`) | the ordered remove transition per worker — stop admitting, drain claimed work, REWRITE the bindings, then the installer; every room ends unbound and the core serves it under rule 3. Claimed-but-unfinished tasks are reclaimed by the core, never dropped |
 | resume after host sleep | core | beats return | a host sleep is not N dead workers; the core waits for beats before reclaiming (#3782) |
 | death of a worker | core | beat stale past the window | the core kickstarts the plist; its rooms stay pending until it returns or an owner re-binds. Claimed-but-unfinished work is reclaimed behind the done flag, so nothing in flight is lost |
 

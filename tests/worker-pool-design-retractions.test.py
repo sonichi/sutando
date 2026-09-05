@@ -339,5 +339,40 @@ class NoStandInPathIsDescribed(unittest.TestCase):
         self.assertTrue(self.STANDIN.search(c) and self.TRIGGER.search(c))
 
 
+class RemovalUnbindsBeforeTheInstaller(unittest.TestCase):
+    """A removed worker never returns, so no-stand-in would strand its rooms forever
+    unless removal rewrites the bindings — and the rewrite must precede the installer.
+    """
+
+    # Prose test, same class as the stand-in scan: a regression net over the wording
+    # that exists, not a proof the transition is correct.
+    def _text(self):
+        return DOC.read_text(encoding="utf-8")
+
+    def test_remove_is_not_installer_only(self):
+        t = self._text()
+        self.assertNotIn(
+            "remove worker W | the core runs the installer", t,
+            "remove/resize listed as an installer call leaves bindings naming a worker "
+            "that cannot return")
+
+    def test_unbind_step_precedes_the_installer_step(self):
+        t = self._text()
+        i_rewrite = t.find("REWRITE THE BINDINGS")
+        i_installer = t.find("run the installer to remove the plist")
+        self.assertNotEqual(i_rewrite, -1, "no binding-rewrite step is described")
+        self.assertNotEqual(i_installer, -1, "no installer step is described")
+        self.assertLess(
+            i_rewrite, i_installer,
+            "the plist must go AFTER the bindings, or there is a window where the "
+            "plist is gone and the bindings still name it")
+
+    def test_resize_to_zero_reaches_core_by_rule_three(self):
+        t = self._text()
+        self.assertRegex(
+            t, r"every room ends unbound and the core serves it under rule 3",
+            "resize to 0 must restore core-only mode by UNBINDING, not by a stand-in")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
