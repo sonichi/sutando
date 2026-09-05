@@ -44,8 +44,7 @@ class AgentsView:
     @staticmethod
     def _identity_key(entry: dict):
         # Absent start time is not evidence of sameness: pid alone recycles.
-        # Only the writer's scalar types qualify: an unhashable payload value
-        # must not reach a dict key and take enumeration down with it.
+        # Only the writer's scalar types qualify — others cannot key a dict.
         pid, started = entry.get("pid"), entry.get("started_at")
         if isinstance(pid, bool) or isinstance(started, bool):
             return None
