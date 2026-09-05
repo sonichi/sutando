@@ -30,9 +30,21 @@ class CliWedgeProbe(unittest.TestCase):
         (ws / "state").mkdir()
         (ws / "tasks").mkdir()
         self.ws = ws
-        self._saved = (hc.WORKSPACE_DIR, hc._local_core_socket, hc._resolve_tmux_bin, hc._resolve_launch_env)
+        self._saved = (hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env)
+        # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
+        self._saved_time = hc.time
+        import time as _time
+        self._t = [_time.time()]
+        def _now():
+            self._t[0] += 60.0
+            return self._t[0]
+        hc.time = SimpleNamespace(time=_now)
         hc.WORKSPACE_DIR = ws
-        hc._local_core_socket = lambda *a, **k: "/tmp/fake.sock"
+        # A REAL fresh heartbeat under an accepted local label; socket and session both come from it.
+        (ws / "state" / "cores").mkdir()
+        self._saved_labels = hc._local_host_labels
+        hc._local_host_labels = lambda *a, **k: {"canon", "alias"}
+        self.write_alive("canon", "/tmp/fake.sock", "sutando-core")
         self.frames = [IDLE]
         # A stand-in tmux BINARY drives the real capture/identity: next frame per capture,
         # a real-looking identity, and — like tmux with two windows — no bare `=sutando-core`.
@@ -62,15 +74,13 @@ class CliWedgeProbe(unittest.TestCase):
         self.tmux.chmod(0o755)
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
         hc._resolve_launch_env = lambda: dict(os.environ)
-        # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
-        self._saved_time = hc.time
-        self._t = [1_000_000.0]
-        def _now():
-            self._t[0] += 60.0
-            return self._t[0]
-        hc.time = SimpleNamespace(time=_now)
-        self._saved_record = hc._fresh_local_core_record
-        hc._fresh_local_core_record = lambda *a, **k: {"session": "sutando-core", "socket": "/tmp/fake.sock"}
+
+    def write_alive(self, label, socket, session):
+        import time as _time
+        p = self.ws / "state" / "cores" / f"{label}.alive"
+        p.write_text(json.dumps({"host": label, "socket": socket, "session": session, "status": "running", "schema_version": 3}))
+        os.utime(p, (self._t[0] + 30, self._t[0] + 30))  # fresh on the fake clock
+        return p
 
     def _serve(self):
         self.frames_file.write_text("\n===\n".join(self.frames))
@@ -80,11 +90,14 @@ class CliWedgeProbe(unittest.TestCase):
     def check(self):
         if not self.frames_file.exists():
             self._serve()
+        # A live core beats between passes: keep every heartbeat file fresh on the fake clock.
+        for p in (self.ws / "state" / "cores").glob("*.alive"):
+            os.utime(p, (self._t[0] + 30, self._t[0] + 30))
         return hc.check_cli_wedge()
 
     def tearDown(self):
-        hc.WORKSPACE_DIR, hc._local_core_socket, hc._resolve_tmux_bin, hc._resolve_launch_env = self._saved
-        hc._fresh_local_core_record = self._saved_record
+        hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env = self._saved
+        hc._local_host_labels = self._saved_labels
         hc.time = self._saved_time
         self.tmp.cleanup()
 
@@ -115,7 +128,7 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertIn(c["name"], ("cli-wedge",))
 
     def test_no_local_core_is_ok_and_says_so(self):
-        hc._local_core_socket = lambda *a, **k: None
+        (self.ws / "state" / "cores" / "canon.alive").unlink()
         c = self.check()
         self.assertEqual((c["name"], c["status"]), ("cli-wedge", "ok"))
         self.assertIn("no local core pane", c["detail"])
@@ -168,22 +181,21 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertNotIn("not readable", c["detail"])
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
-    def test_session_name_comes_from_the_heartbeat_not_a_hardcode(self):
-        # Control for the adjacent hardcode: a core launched as `custom-core` (SUTANDO_TMUX_SESSION)
-        # is what the fresh heartbeat records; the fake server knows only that session.
-        hc._fresh_local_core_record = lambda *a, **k: {"session": "custom-core", "socket": "/tmp/fake.sock"}
+    def test_socket_and_session_come_from_the_same_record_even_under_an_alternate_label(self):
+        # The socket came from the multi-label resolver and the session from the canonical-label
+        # reader, so an ALIAS heartbeat gave the socket but not its session; one record feeds both.
+        (self.ws / "state" / "cores" / "canon.alive").unlink()
+        self.write_alive("alias", "/tmp/fake.sock", "custom-core")
         with patch.dict(os.environ, {"FAKE_SESSION": "custom-core"}):
             for _ in range(2):
                 c = self.check()
         self.assertNotIn("not readable", c["detail"])
         self.assertEqual(c["evidence"]["sample_count"], 2)
-        # …and with the heartbeat silent about the session, the default name is tried and misses
-        hc._fresh_local_core_record = lambda *a, **k: None
-        with patch.dict(os.environ, {"FAKE_SESSION": "custom-core"}, clear=False):
-            os.environ.pop("SUTANDO_TMUX_SESSION", None)
-            c2 = self.check()
-        self.assertIn("not readable", c2["detail"])
-        self.assertIn("sutando-core", c2["detail"])
+        # two fresh records: the NEWER one supplies both fields, never a mix
+        newer = self.write_alive("canon", "/tmp/newer.sock", "newer-core")
+        os.utime(newer, (self._t[0] + 35, self._t[0] + 35))
+        rec = hc._local_core_record()
+        self.assertEqual((rec["socket"], rec["session"]), ("/tmp/newer.sock", "newer-core"))
 
     def test_working_pane_is_ok(self):
         self.frames = [f"● wrote {chr(97 + i)}.ts\n" for i in range(12)]

@@ -768,14 +768,14 @@ def check_cli_wedge() -> dict:
     except Exception as e:  # noqa: BLE001 — a missing detector is a detail, not a failure
         check["detail"] = f"detector unavailable: {e}"
         return check
-    socket = _local_core_socket()
+    record = _local_core_record()
+    socket = record.get("socket") if record else None
     if not socket:
         check["detail"] = "no local core pane to read (no fresh heartbeat on this host)"
         return check
-    # The module's own capture/identity (one implementation, one target), through
-    # the same tmux binary and healed PATH every other probe here uses.
+    # Socket AND session from the SAME heartbeat record; the module's own
+    # capture/identity through the tmux binary and healed PATH every probe uses.
     tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
-    record = _fresh_local_core_record() or {}
     session = record.get("session") or os.environ.get("SUTANDO_TMUX_SESSION", cli_wedge.DEFAULT_SESSION)
     target = cli_wedge.core_target(socket, session, tmux_bin=tmux_bin, env=env)
     frame = cli_wedge.capture_pane(socket, target, tmux_bin=tmux_bin, env=env) if target else None
@@ -5088,6 +5088,14 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
     function). Returning None when this host has no fresh heartbeat is right:
     "no local core is running" is not evidence that a core bypasses the proxy.
     """
+    record = _local_core_record(workspace)
+    return record.get("socket") if record else None
+
+
+def _local_core_record(workspace: Optional[Path] = None) -> Optional[dict]:
+    """This HOST's freshest live heartbeat RECORD (multi-label, newest wins) — the
+    one object every consumer should take socket AND session from, so a probe
+    cannot pair one record's socket with another's session (or a default)."""
     if workspace is None:
         workspace = WORKSPACE_DIR
     cores_dir = workspace / "state" / "cores"
@@ -5095,7 +5103,7 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         return None
     labels = _local_host_labels()
     now = time.time()
-    best_mtime, best_socket = None, None
+    best_mtime, best = None, None
     for alive_file in cores_dir.glob("*.alive"):
         if alive_file.stem not in labels:
             continue                      # another machine's heartbeat
@@ -5110,8 +5118,8 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
-            best_mtime, best_socket = mtime, sock
-    return best_socket
+            best_mtime, best = mtime, payload
+    return best
 
 
 def core_env_has_proxy_url(
