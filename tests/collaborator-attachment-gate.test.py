@@ -222,6 +222,28 @@ class TaskScopedAttachRoots(unittest.TestCase):
             attach_roots=(str(home),))
         self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
 
+    def test_relative_or_tilde_marker_is_refused_even_when_cwd_is_the_root(self):
+        """Pins isabs. The pair above withhold for the REALPATH reason, not this one:
+        `os.path.realpath` does not expand `~`, so both resolve under CWD, and with cwd
+        outside the root they land outside it whether or not isabs runs. Moving cwd AND
+        HOME inside the root makes realpath land INSIDE, so only isabs still withholds.
+        Credit: john-the-dev, who found it by mutation on #3911 — deleting isabs left
+        all 57 tests green."""
+        cwd, home = os.getcwd(), os.environ.get("HOME")
+        os.chdir(self.root)
+        os.environ["HOME"] = str(self.root)
+        try:
+            self.assertFalse(guard.attach_markers_confined(
+                "x\n[file: chart.png]", (str(self.root),)))
+            self.assertFalse(guard.attach_markers_confined(
+                "x\n[file: ~/chart.png]", (str(self.root),)))
+        finally:
+            os.chdir(cwd)
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
+
     def test_marker_naming_the_root_itself_is_confined_but_not_sendable(self):
         # The guard confines by LOCATION; the upload path independently requires a
         # regular file, so a marker naming the directory is refused there.
