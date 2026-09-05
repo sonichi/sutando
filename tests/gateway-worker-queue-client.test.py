@@ -40,7 +40,10 @@ def check(cond: bool, msg: str) -> None:
 # ── stub broker: records every call; serves TASK on the first `serve_n` polls,
 # ignores the worker= query entirely (a broker that predates seats) ──────────
 STATE = {"gets": [], "acks": [], "results": [], "heartbeats": [], "workers": [],
-         "other": [], "serve_n": 0, "heartbeat_404": False, "task": None}
+         "other": [], "serve_n": 0, "heartbeat_404": False, "task": None,
+         # A modern broker advertises the extension; `strict` models a legacy
+         # relay that REJECTS unknown result keys instead of ignoring them.
+         "advertise": True, "strict": False, "rejected": []}
 TASK = {"id": "task-CLOUD1", "timestamp": "2026-09-03T00:00:00Z",
         "task": "hello cloud seat", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -74,13 +77,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/v1/results":
-            STATE["results"].append(self._body()); self._json(200, {"ok": True}); return
+            body = self._body()
+            allowed = {"id", "body"} | ({"metadata"} if STATE["advertise"] else set())
+            if STATE["strict"] and set(body) - allowed:
+                STATE["rejected"].append(sorted(body))
+                self._json(422, {"error": "unknown field"}); return
+            STATE["results"].append(body); self._json(200, {"ok": True}); return
         if self.path.startswith("/v1/tasks/") and self.path.endswith("/ack"):
             STATE["acks"].append((self.path, self._body())); self._json(200, {}); return
         if self.path == "/v1/heartbeat":
             if STATE["heartbeat_404"]:
                 self.send_response(404); self.end_headers(); return
-            STATE["heartbeats"].append(self._body()); self._json(200, {}); return
+            STATE["heartbeats"].append(self._body())
+            caps = {"capabilities": ["worker-metadata"]} if STATE["advertise"] else {}
+            self._json(200, caps); return
         if self.path == "/v1/workers":
             STATE["workers"].append(self._body()); self._json(200, {}); return
         STATE["other"].append((self.path, self._body()))
@@ -379,6 +389,54 @@ def main() -> int:
     seat7._retry_review_control_results()
     check(STATE["results"] == [{"id": "worker-pin-778-cafe", "body": "[no-send]"}],
           f"a second drain does not re-post the close: {STATE['results']}")
+
+    # A relay that 422s un-advertised keys must still receive the documented
+    # {id, body}; before the fix `metadata` rode every result and was refused.
+    print("\n8. legacy relay (does NOT advertise worker-metadata) — envelope preserved")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    STATE["rejected"].clear()
+    STATE["advertise"] = False
+    STATE["strict"] = True
+    ws8 = root / "ws8"; ws8.mkdir()
+    legacy8 = _load("legacy8", ws8, port,
+                    SUTANDO_WORKER_ID="home-1", SUTANDO_WORKER_LOCATION="home")
+    check(legacy8._post_heartbeat(set(), force=True) is True,
+          "heartbeat reaches the legacy broker")
+    check(legacy8._broker_worker_metadata is False,
+          "no advertisement → the client does NOT enable the metadata extension")
+    legacy8.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (legacy8.RESULTS_DIR / "task-LEGACY1.txt").write_text("answer for a legacy relay\n")
+    legacy8._save_inflight({"task-LEGACY1"})
+    legacy8._post_ready_results(legacy8._load_inflight())
+    check(STATE["rejected"] == [],
+          f"the strict relay refused nothing: {STATE['rejected']}")
+    check(len(STATE["results"]) == 1 and sorted(STATE["results"][0]) == ["body", "id"],
+          f"wire-keys are exactly the documented envelope: "
+          f"{sorted(STATE['results'][0]) if STATE['results'] else None}")
+    check(not (legacy8.RESULTS_DIR / "task-LEGACY1.txt").exists(),
+          "the result was delivered, not left behind for a retry")
+    check(not list((legacy8._STATE.parent / "results" / "undelivered").glob("*"))
+          if (legacy8._STATE.parent / "results" / "undelivered").exists() else True,
+          "nothing was quarantined as undelivered")
+    print(f"     legacy payload: {json.dumps(STATE['results'][0], sort_keys=True)}"
+          if STATE["results"] else "     legacy payload: NONE")
+
+    # control: the SAME strict relay, now advertising → the extension returns.
+    for k in ("results", "heartbeats"):
+        STATE[k].clear()
+    STATE["advertise"] = True
+    check(legacy8._post_heartbeat(set(), force=True) is True, "second heartbeat sent")
+    check(legacy8._broker_worker_metadata is True,
+          "control: an advertising broker re-enables the extension")
+    (legacy8.RESULTS_DIR / "task-LEGACY2.txt").write_text("answer once advertised\n")
+    legacy8._save_inflight({"task-LEGACY2"})
+    legacy8._post_ready_results(legacy8._load_inflight())
+    check(len(STATE["results"]) == 1
+          and STATE["results"][0].get("metadata")
+          == {"worker_id": legacy8.WORKER_ID, "location": legacy8.WORKER_LOCATION},
+          f"control: attribution rides again once advertised: {STATE['results']}")
+    STATE["strict"] = False
 
     srv.shutdown()
     if FAILS:

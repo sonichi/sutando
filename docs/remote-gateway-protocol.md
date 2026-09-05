@@ -94,6 +94,12 @@ Return a task's result.
 body: { "id": "task-123", "body": "<result text>" }
 ```
 
+`metadata` (`worker_id`, `location`) is an OPTIONAL extension to this envelope.
+The client sends it only after the broker advertises `worker-metadata` in its
+heartbeat reply, so a relay that rejects unknown keys keeps receiving exactly
+`{id, body}`. Result attribution is therefore absent, not lost, against a broker
+that does not advertise it.
+
 ### `POST /v1/heartbeat`
 
 Periodic liveness + capability ping.
@@ -108,6 +114,15 @@ body: {
   "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
 }
 ```
+
+The reply may advertise the broker's own capabilities:
+
+```
+reply: { "capabilities": ["worker-metadata"] }
+```
+
+`worker-metadata` tells the client the broker accepts the optional `metadata`
+key on `POST /v1/results`. Brokers that omit it receive the documented envelope.
 
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways

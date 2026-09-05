@@ -1563,6 +1563,9 @@ def _auth_probe() -> bool:
         return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
+# Result `metadata` is an EXTENSION to the documented {id, body} envelope, so it
+# ships only once the broker advertises it; a strict relay 422s unknown keys.
+_broker_worker_metadata = False
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Routing keys the pool lead reads with a strict task-last
@@ -2338,6 +2341,14 @@ def _maybe_push_agent_profile() -> bool:
     return True
 
 
+def _note_broker_capabilities(reply) -> None:
+    """Re-read the broker's advertised capabilities from each heartbeat reply.
+    Recomputed (not latched) so a downgraded broker turns the extension back off."""
+    global _broker_worker_metadata
+    caps = reply.get("capabilities") if isinstance(reply, dict) else None
+    _broker_worker_metadata = isinstance(caps, list) and "worker-metadata" in caps
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2367,7 +2378,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["status"] = _status
         if _step is not None:
             payload["step"] = _step
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _note_broker_capabilities(_req("POST", "/v1/heartbeat", payload, timeout=10))
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3419,8 +3430,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
     # Pool done-flag owner first; else this seat answered it (cloud, home).
-    doc["metadata"] = {"worker_id": _worker_of(tid) or WORKER_ID,
-                       "location": WORKER_LOCATION}
+    if _broker_worker_metadata:
+        doc["metadata"] = {"worker_id": _worker_of(tid) or WORKER_ID,
+                           "location": WORKER_LOCATION}
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
