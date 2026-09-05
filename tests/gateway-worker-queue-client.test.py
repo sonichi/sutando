@@ -343,6 +343,43 @@ def main() -> int:
                   (seat6._STATE / "withheld-review-control-results").glob("*.json"))
     check(left == [], f"no journal file stranded under a raw-id path: {left}")
 
+    # ── 7. journal-before-ACK: a failed durable write must not leave an ack ──
+    print("7. the close intent is durable before the ack")
+    ws7 = root / "ws7"; ws7.mkdir()
+    seat7 = _load("wqc_pin_durable", ws7, port, SUTANDO_WORKER_ID="cloud-1",
+                  SUTANDO_WORKER_LOCATION="cloud")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+
+    def _explode(*_a, **_k):
+        raise RuntimeError("process loss at the durability boundary")
+
+    real_queue = seat7._queue_review_control_result
+    seat7._queue_review_control_result = _explode
+    try:
+        seat7._consume_worker_pin({"id": "worker-pin-777-beef", "task": "pin"})
+    except RuntimeError:
+        pass
+    finally:
+        seat7._queue_review_control_result = real_queue
+    check(STATE["acks"] == [],
+          f"no ack when the close intent could not be persisted: {STATE['acks']}")
+    check(not seat7._control_result_path("worker-pin-777-beef").is_file(),
+          "and no journal file either — the pin stays redeliverable")
+
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    check(seat7._consume_worker_pin({"id": "worker-pin-778-cafe", "task": "pin"}) is True,
+          "the normal path still consumes the pin")
+    check(STATE["acks"] == [("/v1/tasks/worker-pin-778-cafe/ack",
+                             {"id": "worker-pin-778-cafe"})],
+          f"normal path acks once: {STATE['acks']}")
+    check(STATE["results"] == [{"id": "worker-pin-778-cafe", "body": "[no-send]"}],
+          f"normal path closes the lease exactly once: {STATE['results']}")
+    seat7._retry_review_control_results()
+    check(STATE["results"] == [{"id": "worker-pin-778-cafe", "body": "[no-send]"}],
+          f"a second drain does not re-post the close: {STATE['results']}")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1

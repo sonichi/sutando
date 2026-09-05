@@ -1130,8 +1130,10 @@ def _consume_worker_pin(task: dict) -> bool:
     # ACK, journal path, payload and status check must see ONE id, or a
     # deferred close reports itself archived under a path nothing wrote.
     pinned = dict(task, id=tid)
-    _post_task_ack(_local_tid(tid))
+    # Durable close intent BEFORE the ack: an ack stops redelivery, so a crash
+    # between them strands a lease with nothing left on disk to close it.
     _queue_review_control_result(pinned)
+    _post_task_ack(_local_tid(tid))
     _retry_review_control_results()
     if _control_result_path(tid).is_file():
         _log(f"worker-pin {tid}: lease close deferred — next poll retries")
