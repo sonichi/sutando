@@ -37,12 +37,27 @@ class PresentTourTests(unittest.TestCase):
             shutil.copyfile(SCRIPT, script)
             log = Path(d) / "argv.json"
             stub_presenter(engine / "local-card.py", log)
+            (engine / "local-cards").mkdir()
+            (engine / "local-cards" / "page-anchors.json").write_text("{}")  # the app-owned registry marks the home
             r = run(script, "--room", "!r:x")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("lc_stub", r.stdout)
             argv = json.loads(log.read_text())
             self.assertEqual(argv[:2], ["present", "tour"])
             self.assertEqual(argv[argv.index("--room") + 1], "!r:x")
+
+    def test_immediate_parent_without_the_registry_is_never_executed(self):
+        # <dir>/local-card.py beside <dir>/checkout is NOT the desktop presenter without the registry
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "checkout" / "skills" / "wizard" / "scripts" / "present-tour.py"
+            script.parent.mkdir(parents=True)
+            shutil.copyfile(SCRIPT, script)
+            log = Path(d) / "argv.json"
+            stub_presenter(Path(d) / "local-card.py", log)
+            r = run(script)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("text-only", r.stdout)
+            self.assertFalse(log.exists(), "the adjacent unrelated script was executed")
 
     def test_unrelated_higher_ancestor_is_never_executed(self):
         # a local-card.py two levels above the engine dir must not be picked up

@@ -9,12 +9,13 @@ from pathlib import Path
 
 
 def find_presenter(script: Path) -> Path | None:
-    # Only the two supported locations: engine/local-card.py beside engine/sutando/
-    # (the desktop layout), or the checkout root; never an arbitrary ancestor's file.
+    # A directory is trusted as the desktop presenter's home only if it also holds
+    # the app-owned card registry; a bare same-named file beside a checkout is not.
     repo = script.resolve().parents[3]
-    for candidate in (repo.parent / "local-card.py", repo / "local-card.py"):
-        if candidate.is_file():
-            return candidate
+    for home in (repo.parent, repo):
+        presenter = home / "local-card.py"
+        if presenter.is_file() and (home / "local-cards" / "page-anchors.json").is_file():
+            return presenter
     return None
 
 
