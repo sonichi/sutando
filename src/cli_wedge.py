@@ -407,9 +407,8 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     if now - run[-1]["ts"] > th["continuity_gap_s"]:
         v = classify_ids([], False, [], work[0], 0.0, work[1], th)
         return {**v, **meta, "reason": f"last sample {now - run[-1]['ts']:.0f}s ago — no current observation"}
-    # The caller's cadence decides whether a run ever reaches two samples. Judge the
-    # RECENT cadence — the gaps behind the trailing singleton runs — not the whole
-    # window, or a 30-min→hourly change stays "unknown" until the old gaps age out.
+    # Judge the RECENT cadence (gaps behind the trailing singleton runs), not the
+    # whole window: a 30-min→hourly change must not stay "unknown" until old gaps age out.
     singletons = 0
     for r in reversed(runs):
         if len(r) != 1:
