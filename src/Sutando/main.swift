@@ -83,6 +83,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // modePresenterMenuItem} requests the switch via state/voice-mode.request
     // (for active/meeting) or POST :7877/presenter/on (for presenter).
     var voiceMode: String = "active"
+    var modelSubmenu: NSMenu?
     weak var modeActiveMenuItem: NSMenuItem?
     weak var modeMeetingMenuItem: NSMenuItem?
     weak var modePresenterMenuItem: NSMenuItem?
@@ -343,6 +344,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.submenu = pauseSubmenu
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
+        // Model submenu — items are read from skills/model-switch/manifest.json on every
+        // open, so the choices change with the skill and never need an app rebuild.
+        let modelSubmenu = NSMenu()
+        modelSubmenu.delegate = self
+        self.modelSubmenu = modelSubmenu
+        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
+        modelItem.submenu = modelSubmenu
+        menu.addItem(modelItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
@@ -2543,6 +2552,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                       failVerb: "Core stop")
     }
 
+    /// Switch the core's model via scripts/switch-model.sh --confirm: the click is the
+    /// owner's instruction, and the script records only after the CLI accepts.
+    @objc func switchModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        notify("Sutando", "Switching core to \(sender.title)…")
+        runCoreAction(script: repoRoot + "/scripts/switch-model.sh",
+                      args: [model, "--confirm", "--session", "sutando-core", "--socket", sutandoTmuxSocket],
+                      okMessage: "Core switched to \(sender.title) — accepted by the CLI and saved as its default.",
+                      failVerb: "Model switch to \(sender.title)")
+    }
+
     /// Shared runner for core start/stop scripts: detached bash, stderr
     /// surfaced via notify on failure (same contract as restartCore).
     private func runCoreAction(script: String, args: [String],
@@ -2711,3 +2731,72 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory) // menu bar only, no dock icon
 app.run()
+
+extension AppDelegate: NSMenuDelegate {
+    static let modelChoicesManifest = "/skills/model-switch/manifest.json"
+    static let modelChoicesKey = "MODEL_SWITCH_CHOICES"
+
+    /// `id=Title;id=Title…` from the manifest's config block; nil when unreadable or empty.
+    func modelChoices() -> [(title: String, id: String)]? {
+        guard let data = FileManager.default.contents(atPath: repoRoot + AppDelegate.modelChoicesManifest),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cfg = root["config"] as? [String: Any],
+              let raw = cfg[AppDelegate.modelChoicesKey] as? String else { return nil }
+        let pairs = raw.split(separator: ";").compactMap { entry -> (title: String, id: String)? in
+            guard let eq = entry.firstIndex(of: "=") else { return nil }
+            let id = entry[..<eq].trimmingCharacters(in: .whitespaces)
+            let title = entry[entry.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            return (id.isEmpty || title.isEmpty) ? nil : (title: title, id: id)
+        }
+        return pairs.isEmpty ? nil : pairs
+    }
+
+    /// The model the switch script last recorded as accepted (state/model-switch.json).
+    func recordedModel() -> String? {
+        guard let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return root["model"] as? String
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === modelSubmenu else { return }
+        menu.removeAllItems()
+        let current = recordedModel()
+        if let choices = modelChoices() {
+            for c in choices {
+                let it = NSMenuItem(title: c.title, action: #selector(switchModel(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = c.id
+                it.state = (c.id == current) ? .on : .off
+                menu.addItem(it)
+            }
+        } else {
+            let it = NSMenuItem(title: "Choices unreadable: skills/model-switch/manifest.json", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let other = NSMenuItem(title: "Other model…", action: #selector(switchOtherModel), keyEquivalent: "")
+        other.target = self
+        menu.addItem(other)
+    }
+
+    /// Any id the owner types; the script still refuses one the CLI does not accept.
+    @objc func switchOtherModel() {
+        let alert = NSAlert()
+        alert.messageText = "Switch the core to which model?"
+        alert.informativeText = "An alias (opus, sonnet, fable) or a full id (claude-fable-5-1[1m]). The switch is recorded only after the CLI accepts it."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "model id"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Switch")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let model = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !model.isEmpty else { return }
+        let it = NSMenuItem(title: model, action: nil, keyEquivalent: "")
+        it.representedObject = model
+        switchModel(it)
+    }
+}
