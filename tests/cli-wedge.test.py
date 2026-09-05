@@ -299,6 +299,16 @@ class IoEdge(unittest.TestCase):
         v2 = w.classify_window(dense + sparse[:2], (True, "x"), sparse[1]["ts"] + 10)
         self.assertEqual(v2["kind"], "unknown")
 
+    def test_rapid_pane_replacements_are_not_a_sparse_cadence(self):
+        # Codex on 07e56e5: three singleton runs split by pane identity, 10 s apart, must not
+        # read as "samples arrive every 10s, past the 2700s limit".
+        e = lambda ts, pane: {"ts": ts, "state": "a", "raw_state": "a", "patterns": [], "pane": pane}
+        entries = [e(0.0, "1:1"), e(10.0, "2:2"), e(20.0, "3:3"), e(30.0, "4:4")]
+        v = w.classify_window(entries, (True, "x"), 35.0)
+        self.assertEqual((v["kind"], v["observation_runs"], v["run_samples"]), ("unknown", 4, 1))
+        self.assertEqual(v["recent_gap_s"], 10.0)
+        self.assertIn("fewer than 2 samples", v["reason"])
+
     def test_a_new_pane_identity_starts_a_new_run(self):
         e = lambda ts, pane: {"ts": ts, "state": "a", "raw_state": "a", "patterns": [], "pane": pane}
         entries = [e(0.0, "100:1"), e(60.0, "100:1"), e(120.0, "200:2"), e(180.0, "200:2")]

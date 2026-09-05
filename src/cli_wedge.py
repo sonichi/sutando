@@ -83,6 +83,9 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
 }
 PROVIDER_LIMIT_PATTERNS = ("quota-limit",)
+# Exact session, window 0 — the launcher's core window. A bare `=name` is a pane
+# target and stops resolving once the session has a second window (the app adds `gateway`).
+DEFAULT_TARGET = "=sutando-core:0"
 
 def normalize(frame: str) -> str:
     """Strip volatile fields so two frames differing only in clocks, counters,
@@ -246,12 +249,13 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
 
 # ---- I/O edge -------------------------------------------------------------
 
-def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
-                 runner: Callable = subprocess.run) -> Optional[str]:
-    """One pane frame, or None when tmux cannot be read (absent = no reading)."""
+def capture_pane(socket_path: str, target: str = DEFAULT_TARGET, tmux_bin: str = "tmux",
+                 runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
+    """One pane frame, or None when tmux cannot be read (absent = no reading).
+    The one capture implementation: health-check and the CLI both call this."""
     try:
         proc = runner([tmux_bin, "-S", socket_path, "capture-pane", "-p", "-t", target],
-                      capture_output=True, text=True, timeout=10)
+                      capture_output=True, text=True, timeout=10, env=env)
     except Exception:  # noqa: BLE001 — a failed probe is an absent reading, never a verdict
         return None
     if getattr(proc, "returncode", 1) != 0:
@@ -262,13 +266,13 @@ def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
 _PANE_ID = re.compile(r"^\d+:\d+$")
 
 
-def pane_identity(socket_path: str, target: str, tmux_bin: str = "tmux",
-                  runner: Callable = subprocess.run) -> Optional[str]:
+def pane_identity(socket_path: str, target: str = DEFAULT_TARGET, tmux_bin: str = "tmux",
+                  runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
     """`pane_pid:session_created` for the target, or None when unknown. A new
     core process is a new observation run; None never resets anything."""
     try:
         proc = runner([tmux_bin, "-S", socket_path, "display-message", "-p", "-t", target,
-                       "#{pane_pid}:#{session_created}"], capture_output=True, text=True, timeout=10)
+                       "#{pane_pid}:#{session_created}"], capture_output=True, text=True, timeout=10, env=env)
     except Exception:  # noqa: BLE001 — identity unknown is not a reading
         return None
     out = (getattr(proc, "stdout", "") or "").strip()
@@ -417,6 +421,8 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     if len(run) < 2 and singletons >= 3:
         recent = sorted(b[0]["ts"] - a[0]["ts"] for a, b in zip(runs[-singletons:], runs[-singletons + 1:]))
         meta["recent_gap_s"] = round(recent[len(recent) // 2], 1)
+    # Singleton runs split by pane identity (rapid core restarts) are not a cadence.
+    if len(run) < 2 and singletons >= 3 and meta["recent_gap_s"] >= th["continuity_gap_s"]:
         v = classify_ids([], False, [], work[0], 0.0, work[1], th)
         return {**v, **meta, "kind": "cadence-too-sparse",
                 "reason": f"the last {singletons} samples arrived ~{meta['recent_gap_s']:.0f}s apart, past the {th['continuity_gap_s']}s continuity limit — a static pane cannot be observed at this rate"}
@@ -493,7 +499,7 @@ def main(argv: Optional[list] = None) -> int:
     for name in ("record", "probe"):
         p = sub.add_parser(name)
         p.add_argument("--socket", required=True)
-        p.add_argument("--target", default="sutando-core")
+        p.add_argument("--target", default=DEFAULT_TARGET)
         p.add_argument("--tmux", default="tmux")
         p.add_argument("--workspace", default=None, help="defaults to the configured workspace")
         if name == "record":

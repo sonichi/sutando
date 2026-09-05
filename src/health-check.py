@@ -772,19 +772,17 @@ def check_cli_wedge() -> dict:
     if not socket:
         check["detail"] = "no local core pane to read (no fresh heartbeat on this host)"
         return check
-    res = _run_tmux(socket, "capture-pane", "-p", "-t", "=sutando-core")
-    if res is None or getattr(res, "returncode", 1) != 0:
+    # The module's own capture/identity (one implementation, one target), through
+    # the same tmux binary and healed PATH every other probe here uses.
+    tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
+    frame = cli_wedge.capture_pane(socket, cli_wedge.DEFAULT_TARGET, tmux_bin=tmux_bin, env=env)
+    if frame is None:
         check["detail"] = "pane not readable — no reading, not a verdict"
         return check
     now = time.time()
-    # Pane identity (pid:session-created) starts a new observation run after a core restart.
-    ident = _run_tmux(socket, "display-message", "-p", "-t", "=sutando-core", "#{pane_pid}:#{session_created}")
-    pane = None
-    if ident is not None and getattr(ident, "returncode", 1) == 0:
-        cand = (getattr(ident, "stdout", "") or "").strip()
-        pane = cand if re.match(r"^\d+:\d+$", cand) else None
+    pane = cli_wedge.pane_identity(socket, cli_wedge.DEFAULT_TARGET, tmux_bin=tmux_bin, env=env)
     try:
-        entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now, pane=pane)
+        entries = cli_wedge.append_window(WORKSPACE_DIR, frame, now, pane=pane)
         verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR, now), now)
     except Exception as e:  # noqa: BLE001 — an advisory check must never abort the run
         check["detail"] = f"no reading — window state unusable ({type(e).__name__}: {e})"
