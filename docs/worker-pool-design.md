@@ -296,6 +296,23 @@ exit rather than a gap in this contract. The rule that generalises both: **a tas
 exactly once, and `direct` is a state that admission can be entered into or moved into — never a
 state that skips it.**
 
+**Completion and release.** Admission without a defined release is a leak: the bound counts
+receipts, so a receipt nobody removes lowers the ceiling permanently and the pool starves without
+any component reporting a fault.
+
+| | contract |
+|---|---|
+| owner | the process holding the receipt — the core or worker whose exit created or transitioned it. Never a third party, never the ticker on a live holder |
+| trigger | the task reaches a terminal state: a result is written and archived, **or** the claim is released after a failure. Both paths release; only the terminal state differs |
+| signal | the holder unlinks its own file under `direct/`, in the same step that writes the result |
+| crash | the holder dies holding it. The receipt is orphaned, and the **reconciliation ticker** is its only reclaimer: past `stale_after_s` measured from the receipt's own mtime, it unlinks the receipt. The task itself is untouched — still unclaimed on disk, so it is re-admitted normally |
+| failure | unlink is best-effort and idempotent. A double release is not an error, and a failed unlink must not fail the task — the ticker is the backstop |
+
+**The admitted count is derived by listing `direct/`, never held in a counter**, so removing the
+file *is* the decrement and there is no second number to drift out of step. This is the same defect
+class the outcome contract above records: a queued winner that both wrote a marker and incremented a
+counter admitted two against a bound of four. One artifact per admission, counted by listing it.
+
 Handler fallback (`:255`, `:506`, `:542` — the disposition-1 branch) already emits a task that *holds a claim*: it
 writes a `FALLBACKS_DIR` marker and calls `emit_fallback_task_file` / `emit_task_file`. So the task
 was counted when it was first admitted, and moving it to `direct` is a state change on an existing
@@ -694,8 +711,7 @@ not decide one. #3859 closed on this document.
 
 ## The binding table
 
-`state/pool/bindings.json`, an object keyed by room id:
-`{"<room>": {"instance": "<name>", "pinned": true}}`. One writer (the core) and
+`state/pool/bindings.json`. One writer (the core) and
 N readers (every worker, on every claim), so it carries the contract this repo
 has twice been bitten for lacking:
 
@@ -710,6 +726,38 @@ has twice been bitten for lacking:
   exists to stop scatter, never to stop work.
 - **Only `pinned: true` binds.** A bare entry without it is decayed handler
   state, not an owner's binding, and must not constrain routing.
+
+**Schema.** A room binds to an ordered **set** of instances, not to one name — one
+worker per room cannot express a room served by a pair, and it cannot express which
+rooms must be kept off the same worker:
+
+```json
+{
+  "version": 1,
+  "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}},
+  "exclusions": [{"group": "<label>", "rooms": ["<room>", "..."],
+                  "rule": "distinct-instance"}]
+}
+```
+
+- **`instances` is a membership set, and the claim settles which member takes a given
+  task** — the same rule the routing section states for a bound set. Nothing hands out
+  turns, so a strict preference order between racing workers is not enforceable and must
+  not be implied: every eligible member (beat fresh, not quiesced) may claim, and the
+  first rename wins. Order carries operator preference only where a **single** reader is
+  choosing — the core picking a stand-in — never as a promise about a race.
+- **Every entry ineligible is not an error**: the room falls to the core, exactly as an
+  unreadable file does. A binding exists to stop scatter, never to stop work.
+- **`distinct-instance`** means no single worker may hold bindings for two rooms in the
+  same group — the rooms' contexts must not meet inside one session. The core rejects a
+  bind command that would violate it, and a worker re-checks at claim time and declines
+  rather than trusting the file it just read; a stale read must not be able to merge two
+  contexts that were deliberately separated.
+- **An empty `instances` is not the same as an absent room.** Absent means unbound;
+  empty means deliberately bound to nobody, and both route to the core — but only the
+  first may be filled in by handler affinity.
+- A legacy `"instance": "<name>"` string reads as a one-element `instances` for one
+  release, so the retired affinity file can be migrated without a flag day.
 
 `state/cores/channel-<room-id>.handler` is the automatic room-to-instance
 affinity this design retires: it binds a room to whoever handled it first, which
@@ -888,6 +936,29 @@ worker that stopped, carried from #3604's operations section:
 | beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets and the core stands in. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and the stand-in never fires. Measured live: four seats beating normally at zero throughput |
 | beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
+
+**Quiesce is a state on disk, not a mood.** The table above prescribes quiescing a quota-spent
+worker, and a prescription with no writer and no reset is why four seats beat normally at zero
+throughput. The record is `state/pool/quiesced/<instance>.json`, written temp-plus-`os.replace`
+like every other pool file:
+
+```json
+{"instance": "<name>", "observed_at": "<iso>", "until": "<iso>",
+ "window": "5h|7d", "source": "<the provider error that was seen>"}
+```
+
+| | contract |
+|---|---|
+| writer | **the worker itself, and only it.** It is the process holding the failing turn, and writing a local file needs no quota. One file per instance, so one writer per file — the core never writes here, which is what keeps this off the shared-mutable-state path |
+| the core's role | reads it, and separately stands in on unclaimed-task age. Those two paths are independent on purpose: a worker too broken to write its own record still gets stood in for, just more slowly |
+| routing exclusion | a quiesced instance is skipped in `instances` order at claim time. A room whose every binding is quiesced falls to the core — the same fall-through as an unreadable bindings file |
+| reset | the worker unlinks the file on its first successful turn. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again |
+| attribution | `window` and `source` are what let an operator tell quota-spent from hung. Without them both look like "beat fresh, nothing claimed" |
+
+**Expiry fails toward eligibility, deliberately.** A quiesce record that outlives its window strands a
+seat forever, and a stranded seat is invisible — it beats, it is healthy, it simply never claims. So a
+stale record is ignored rather than trusted. The cost of being wrong is one failed turn that
+re-writes the record; the cost of the opposite default is a permanently dark worker nothing reports.
 
 **Codex workers have no in-session task watcher.** A Codex worker learns of a
 task only when something types the pool entry at it, so its worst-case claim
