@@ -278,6 +278,20 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.done_text('{"content": "[deduped: task-1]"}'), "closed, no message sent from here")
         self.assertEqual(hook.done_text('{"content": "Done, here it is"}'), "replied")
 
+    def test_last_narration_reads_only_the_tail_of_a_large_transcript(self):
+        tp = self.ws / "big.jsonl"
+        filler = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "old " * 200}]}}) + "\n"
+        with open(tp, "w") as f:
+            for _ in range(200):  # ~170 KB, well past the 64 KB window
+                f.write(filler)
+            f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "the newest line\nmore"}]}}) + "\n")
+        self.assertGreater(tp.stat().st_size, hook.TAIL_BYTES)
+        self.assertEqual(hook.last_narration(tp), "the newest line")
+        # the window's first, partial line is dropped rather than parsed
+        with open(tp, "a") as f:
+            f.write('{"type": "assistant", "message": {"content": [{"type": "text", "text": "HALF')
+        self.assertEqual(hook.last_narration(tp), "the newest line")
+
     def test_payload_without_session_or_with_unknown_event_writes_nothing(self):
         self.assertEqual(hook.handle({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"description": "x"}}, self.p, self.run), [])
         self.assertEqual(hook.handle({"hook_event_name": "Notification", "session_id": "S1"}, self.p, self.run), [])

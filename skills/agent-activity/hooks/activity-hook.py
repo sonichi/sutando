@@ -163,12 +163,22 @@ def working_line(tool_name: str, tool_input) -> str | None:
     return re.split(r"(?<=[.;])\s", desc.strip(), maxsplit=1)[0][:MAXLEN]
 
 
+TAIL_BYTES = 64 * 1024
+
+
 def last_narration(transcript: Path) -> str | None:
-    """First line of the last assistant text block, from complete lines only (a row mid-write is ignored)."""
+    """First line of the last assistant text block, read from the file's tail only (a transcript grows
+    to tens of MB; Stop fires per turn), from complete lines only (a row mid-write is ignored)."""
     try:
-        data = transcript.read_bytes()
+        with open(transcript, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            data = f.read()
     except OSError:
         return None
+    if size > TAIL_BYTES:
+        data = data[data.find(b"\n") + 1:]  # drop the partial first line of the window
     if not data.endswith(b"\n"):
         data = data[: data.rfind(b"\n") + 1]
     for raw in reversed(data.decode("utf-8", errors="replace").splitlines()):
