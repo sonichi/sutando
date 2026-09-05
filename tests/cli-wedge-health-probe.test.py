@@ -44,6 +44,19 @@ class CliWedgeProbe(unittest.TestCase):
         hc.WORKSPACE_DIR, hc._local_core_socket, hc._run_tmux = self._saved
         self.tmp.cleanup()
 
+    def test_missing_detector_module_is_a_detail_not_a_failure(self):
+        saved = sys.modules.get("cli_wedge")
+        sys.modules["cli_wedge"] = None  # makes `import cli_wedge` raise
+        try:
+            c = hc.check_cli_wedge()
+        finally:
+            if saved is None:
+                sys.modules.pop("cli_wedge", None)
+            else:
+                sys.modules["cli_wedge"] = saved
+        self.assertEqual(c["status"], "ok")
+        self.assertIn("detector unavailable", c["detail"])
+
     def test_no_local_core_is_ok_and_says_so(self):
         hc._local_core_socket = lambda *a, **k: None
         c = hc.check_cli_wedge()

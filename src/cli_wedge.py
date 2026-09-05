@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402 — the one sanctioned resolver
+
 RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     (name, re.compile(rx, re.IGNORECASE))
     for name, rx in (
@@ -233,12 +236,7 @@ def classify_window(entries: list, work: tuple, now: float) -> dict:
 # ---- CLI: record real traces / replay / one-shot probe ----------------------
 
 def _default_workspace() -> Path:
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from workspace_default import resolve_workspace  # type: ignore
-        return Path(resolve_workspace())
-    except Exception:  # noqa: BLE001 — the CLI still works with --workspace
-        return Path(os.environ.get("SUTANDO_WORKSPACE_DIR", "workspace"))
+    return Path(resolve_workspace())
 
 
 def record(args, sampler: Callable, clock=time.time, sleep=time.sleep) -> Path:
@@ -288,7 +286,7 @@ def main(argv: Optional[list] = None) -> int:
         p.add_argument("--socket", required=True)
         p.add_argument("--target", default="sutando-core")
         p.add_argument("--tmux", default="tmux")
-        p.add_argument("--workspace", default=str(_default_workspace()))
+        p.add_argument("--workspace", default=None, help="defaults to the configured workspace")
         if name == "record":
             p.add_argument("--label", required=True, help="idle | build | retry | rate-limit | …")
             p.add_argument("--seconds", type=float, default=60)
@@ -306,6 +304,8 @@ def main(argv: Optional[list] = None) -> int:
     def sampler():
         return capture_pane(a.socket, a.target, a.tmux)
 
+    if a.workspace is None:
+        a.workspace = str(_default_workspace())
     if a.cmd == "record":
         print(record(a, sampler))
         return 0

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """cli_wedge: normalization, novelty, the advisory classifier, the persisted
 window, the I/O edge with fakes, and the record/replay/probe CLI end to end."""
+import contextlib
+import io
 import json
 import os
 import stat
@@ -189,8 +191,13 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
 
 
 class Cli(unittest.TestCase):
-    def run_cli(self, *args):
-        return subprocess.run([sys.executable, str(REPO / "src" / "cli_wedge.py"), *args], capture_output=True, text=True)
+    """main() is driven IN-PROCESS so coverage sees it; one subprocess test keeps the entry point honest."""
+
+    def run_main(self, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = w.main(list(args))
+        return rc, buf.getvalue()
 
     def test_record_then_replay_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
@@ -198,19 +205,18 @@ class Cli(unittest.TestCase):
             frames = Path(d) / "frames.txt"
             frames.write_text("\n===\n".join(retry_frame(i) for i in range(12)))
             tmux = fake_tmux(Path(d), frames)
-            r = self.run_cli("record", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws),
-                             "--label", "retry", "--seconds", "5", "--interval", "0", "--max-samples", "12", "--keep-raw")
-            self.assertEqual(r.returncode, 0, r.stderr)
-            trace = Path(r.stdout.strip())
+            rc, out = self.run_main("record", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws),
+                                    "--label", "retry", "--seconds", "5", "--interval", "0", "--max-samples", "12", "--keep-raw")
+            self.assertEqual(rc, 0)
+            trace = Path(out.strip())
             self.assertTrue(trace.exists() and trace.name.startswith("retry-"))
             lines = [json.loads(l) for l in trace.read_text().splitlines()]
             self.assertEqual(len(lines), 13)  # 12 samples + summary
             self.assertTrue(lines[-1]["summary"])
             self.assertIn("raw", lines[0])
-            rep = self.run_cli("replay", str(trace), "--work-outstanding")
-            self.assertEqual(rep.returncode, 0, rep.stderr)
-            verdict = json.loads(rep.stdout)
-            self.assertEqual(verdict["kind"], "retry-loop")
+            rc, out = self.run_main("replay", str(trace), "--work-outstanding")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["kind"], "retry-loop")
 
     def test_probe_persists_a_window_and_reports(self):
         with tempfile.TemporaryDirectory() as d:
@@ -221,18 +227,30 @@ class Cli(unittest.TestCase):
             tmux = fake_tmux(Path(d), frames)
             out = None
             for _ in range(3):
-                r = self.run_cli("probe", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws))
-                self.assertEqual(r.returncode, 0, r.stderr)
-                out = json.loads(r.stdout)
-            self.assertEqual(out["kind"], "idle")
-            self.assertEqual(out["sample_count"], 3)
+                rc, out = self.run_main("probe", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws))
+                self.assertEqual(rc, 0)
+            verdict = json.loads(out)
+            self.assertEqual((verdict["kind"], verdict["sample_count"]), ("idle", 3))
             self.assertTrue(w.window_path(ws).exists())
 
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:
-            r = self.run_cli("probe", "--socket", "/x", "--tmux", "/nonexistent/tmux", "--workspace", d)
+            rc, out = self.run_main("probe", "--socket", "/x", "--tmux", "/nonexistent/tmux", "--workspace", d)
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["kind"], "unknown")
+
+    def test_default_workspace_is_the_configured_one(self):
+        # No env fallback: the sanctioned resolver answers (lint-workspace-resolution).
+        self.assertIsInstance(w._default_workspace(), Path)
+        self.assertNotIn("SUTANDO_WORKSPACE_DIR", (REPO / "src" / "cli_wedge.py").read_text())
+
+    def test_entry_point_runs_as_a_script(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.jsonl"
+            p.write_text(json.dumps({"ts": 1, "normalized": "a"}) + "\n" + json.dumps({"ts": 2, "normalized": "b"}) + "\n")
+            r = subprocess.run([sys.executable, str(REPO / "src" / "cli_wedge.py"), "replay", str(p)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(json.loads(r.stdout)["kind"], "unknown")
+            self.assertEqual(json.loads(r.stdout)["kind"], "working")
 
     def test_record_sampler_none_frames_are_skipped(self):
         args = SimpleNamespace(workspace=tempfile.mkdtemp(), label="idle", seconds=3, interval=0, max_samples=5, keep_raw=False)
