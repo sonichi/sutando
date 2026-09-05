@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Presents the desktop app's `tour` local card; without a presenter beside any
-# ancestor of this checkout (a non-desktop install) it is text-only and exits 0.
+# Presents the desktop `tour` card; with no presenter above this checkout it is text-only (exit 0).
 from __future__ import annotations
 
 import argparse
