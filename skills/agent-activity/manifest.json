@@ -1,8 +1,22 @@
 {
   "name": "agent-activity",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "stability": "experimental",
   "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
   "hooks": [
-    { "event": "PreToolUse", "command": "./hooks/activity-hook.py" },
-    { "event": "Stop", "command": "./hooks/activity-hook.py" }
+    {
+      "event": "PreToolUse",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "Stop",
+      "command": "./hooks/activity-hook.py"
+    }
   ]
 }
