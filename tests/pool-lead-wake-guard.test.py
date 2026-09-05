@@ -387,6 +387,37 @@ class RestartedLeadInheritsWakeEvidence(WakeGuardBase):
         self.assertEqual(lead.reclaim_claimed(), [])
         self.assertEqual(self._names(), ["task-restart.claimed-core-2.txt"])
 
+    def test_a_respawn_inside_the_open_window_keeps_the_grace(self):
+        """THE REGRESSION. The deadline used to live only on the PoolLead
+        object while the durable sample was overwritten with the post-wake
+        pair, so a lead dying inside its own window handed the successor
+        evidence showing NO skew -- and a non-None seeded sample also
+        excluded it from the cold-lead fallback. Both escapes closed at
+        once, and a live core's claim was repooled."""
+        (self.tasks / "task-respawn.claimed-core-2.txt").write_text("x")
+        self._sleep_whole_host(968)      # wall jumps, monotonic does not
+        self.assertEqual(self.lead.reclaim_claimed(), [],
+                         "the first lead must open the grace window")
+        self.clock += 4
+        self.mono += 4                   # 4s later: still inside the window
+        self.assertEqual(self._restart_lead().reclaim_claimed(), [],
+                         "a successor inside the open window inherits it")
+        self.assertEqual(self._names(), ["task-respawn.claimed-core-2.txt"])
+
+    def test_control_a_respawn_after_the_window_still_reclaims(self):
+        """The discriminating control: inheritance must expire by TIME, or
+        the fix converts one host sleep into an unbounded deferral. Without
+        this, a test suite cannot tell the fix from a blanket defer."""
+        (self.tasks / "task-respawn.claimed-core-2.txt").write_text("x")
+        self._sleep_whole_host(968)
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.clock += LEAD_STALE_S + 10
+        self.mono += LEAD_STALE_S + 10   # the window has expired
+        self.assertEqual(
+            self._restart_lead().reclaim_claimed(),
+            [("task-respawn.claimed-core-2.txt", "repooled")],
+            "an expired window must not be inherited")
+
     def test_control_a_restart_without_a_sleep_still_reclaims_a_dead_owner(self):
         """The discriminating case: inherited evidence must not become a
         blanket deferral. Lead restarts with NO wall/monotonic skew, so a

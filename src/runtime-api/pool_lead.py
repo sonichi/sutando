@@ -443,12 +443,18 @@ class PoolLead:
     def _wake_evidence_path(self) -> Path:
         return self.state_dir / "pool" / "lead-tick.json"
 
-    def _load_wake_evidence(self) -> "tuple[float, float] | None":
-        """Previous lead's last (wall, mono) sample, or None if unusable.
+    def _load_wake_evidence(self) -> "tuple[float, float, float | None] | None":
+        """Previous lead's last (wall, mono, defer_until) sample, or None.
 
         monotonic is BOOT-relative, so a predecessor's sample is
         differenceable here; a reboot resets it, which shows up as a stored
         value ahead of ours and is discarded.
+
+        The stored deadline carries an OPEN grace window across a respawn.
+        Without it the successor loads a post-wake pair showing no skew and
+        is ALSO excluded from the cold-lead fallback, because its seeded
+        sample is not None -- both escapes close together and the window is
+        silently lost.
         """
         try:
             d = json.loads(self._wake_evidence_path().read_text())
@@ -457,16 +463,29 @@ class PoolLead:
             return None
         if m > self.mono():
             return None
-        return w, m
+        try:
+            du = d.get("defer_until")
+            du = None if du is None else float(du)
+        except (TypeError, ValueError):
+            du = None
+        # A deadline outside the window it was opened for is corrupt or
+        # foreign, never evidence; an expired one must not resurrect grace.
+        if du is not None and not (m <= du <= m + LEAD_STALE_S):
+            du = None
+        return w, m, du
 
-    def _save_wake_evidence(self, wall: float, mono: float) -> None:
+    def _save_wake_evidence(self, wall: float, mono: float,
+                            defer_until: "float | None" = None) -> None:
         # Best-effort: losing the sample costs one grace window, while
         # raising here would abort the reclaim sweep that called us.
         try:
             p = self._wake_evidence_path()
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"wall": wall, "mono": mono}))
+            payload = {"wall": wall, "mono": mono}
+            if defer_until is not None:
+                payload["defer_until"] = defer_until
+            tmp.write_text(json.dumps(payload))
             os.replace(tmp, p)
         except OSError:
             pass
@@ -490,10 +509,13 @@ class PoolLead:
             # left one: seed from it so the skew test below covers tick 1.
             seeded = self._load_wake_evidence()
             if seeded is not None:
-                last, last_mono = seeded
+                last, last_mono, carried = seeded
+                # The window belongs to the host's wake event, not to the
+                # process that opened it; expiry stays time-only.
+                if carried is not None and mono < carried:
+                    self._reclaim_defer_until = carried
         self._last_reclaim_tick = now
         self._last_reclaim_mono = mono
-        self._save_wake_evidence(now, mono)
         if last is not None and last_mono is not None:
             if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
                 # Deadline in MONOTONIC time: a backward wall correction must
@@ -505,10 +527,13 @@ class PoolLead:
             try:
                 followers = list(self.followers_fn())
             except Exception:  # noqa: BLE001 — broken resolver must not defer
+                self._save_wake_evidence(
+                    now, mono, getattr(self, "_reclaim_defer_until", None))
                 return False
             if followers and not any(self.alive_fn(f) for f in followers):
                 self._reclaim_defer_until = mono + LEAD_STALE_S
         du = getattr(self, "_reclaim_defer_until", None)
+        self._save_wake_evidence(now, mono, du)
         return du is not None and mono < du
 
     def reclaim_dead(self) -> "list[str]":
