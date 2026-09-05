@@ -1678,6 +1678,13 @@ def _ag2space_access_path():
 # Known tier vocabulary and privilege ordering. `_tier_for` uses this ordering
 # to choose the lower of the broker-attested tier and the local cap.
 _TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
+# A legal tier this table has not ranked (`collaborator`, until the fold settles it)
+# must never score as the floor: unranked reads as an escalation, not as nothing.
+_UNRANKED = max(_TIER_RANK.values()) + 1
+
+
+def _rank(tier):
+    return _TIER_RANK.get(tier, _UNRANKED)
 
 
 def _normalized_tier(value):
@@ -1690,14 +1697,14 @@ _TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
 def _has_above_local(cached) -> bool:
     """True if the cached map grants anyone a tier ABOVE this node's LOCAL_TIER."""
     local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
-    return any(_TIER_RANK.get(v, 0) > local_rank for v in cached.values())
+    return any(_rank(v) > local_rank for v in cached.values())
 
 
 def _stale_safe(cached):
     """Keep stale caps at or below LOCAL_TIER and drop stale privilege grants.
     Transient demotion is safer than retaining a possibly revoked escalation."""
     local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
-    return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
+    return {k: v for k, v in cached.items() if _rank(v) <= local_rank}
 
 # Durable on-disk backup of the last-known-good tierMap, under state/auth/ — the
 # cleanup-exempt per-host install-state dir (per CLAUDE.md; never wiped by
@@ -1716,6 +1723,8 @@ def _validate_tier_map(raw):
             t = local_task_protocol.canonical_access_tier(tier)
             if isinstance(who, str) and t in _TIER_RANK:
                 tm[who.strip()] = t
+            elif isinstance(who, str) and t in local_task_protocol.ACCESS_TIERS:
+                print(f"[tier-map] {who.strip()}: legal tier {t!r} is not ranked here yet — dropped, not granted", flush=True)
     return tm
 
 

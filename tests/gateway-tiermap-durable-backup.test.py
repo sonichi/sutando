@@ -218,6 +218,26 @@ check("restored grant above LOCAL_TIER is projected down, not resurrected",
       _above == "team", f"got {_above}")
 
 
+# 16. A legal-but-unranked tier (`collaborator`, until the fold ranks it) is an
+# escalation for the stale-cache rule, never the floor, whatever LOCAL_TIER is.
+_prev_local, rgb.LOCAL_TIER = rgb.LOCAL_TIER, "team"
+check("unranked tier counts as above local for the stale-cache check",
+      rgb._has_above_local({"@a:ag2.space": "collaborator"}) is True, "read as no escalation")
+check("unranked tier is dropped by _stale_safe, not kept as a floor grant",
+      rgb._stale_safe({"@a:ag2.space": "collaborator", "@b:ag2.space": "team"}) == {"@b:ag2.space": "team"}, "kept")
+rgb.LOCAL_TIER = _prev_local
+
+# 17. The loader still drops it (the accepted set must match the live reader's),
+# but says so instead of losing a grant in silence.
+import contextlib
+import io
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _vm = rgb._validate_tier_map({"@a:ag2.space": "collaborator", "@b:ag2.space": "team"})
+check("loader drops the unranked tier", _vm == {"@b:ag2.space": "team"}, f"got {_vm}")
+check("loader names the dropped grant", "collaborator" in _buf.getvalue() and "@a:ag2.space" in _buf.getvalue(), f"stdout={_buf.getvalue()!r}")
+
+
 if failures:
     print(f"\n{len(failures)} FAILED: {failures}")
     sys.exit(1)
