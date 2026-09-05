@@ -383,5 +383,94 @@ class RemovalUnbindsBeforeTheInstaller(unittest.TestCase):
             "resize to 0 must restore core-only mode by UNBINDING, not by a stand-in")
 
 
+class WedgedVerdictHasACommandedExit(unittest.TestCase):
+    """Rule 6 publishes `wedged` from two inputs, and the verdict freezes both: the
+    worker suppresses on its own pin, so its oldest task stays unclaimed and it stays
+    claim-less. Nothing the WORKER does moves either input, so an exit phrased as "until
+    the worker returns" describes a transition the document's own rules forbid.
+
+    The discrimination this class has to make: the same phrasing is CORRECT for a STALE
+    beat, where returning restores freshness directly. Only the wedged case is absorbing,
+    so a scan that flags "until the worker returns" everywhere would reject four true
+    sentences to catch one false one.
+    """
+
+    WEDGED = re.compile(r"wedged|hung session|rule 6", re.I)
+    # An exit that the worker performs by itself.
+    SELF_EXIT = re.compile(
+        r"clears when the worker returns"
+        r"|until (that instance|the worker|it) returns"
+        r"|so the worker itself resumes"
+        r"|a fresh beat (restores|is enough)", re.I)
+    # Scoped to denials OF THE EXIT: a broad `not|cannot` exempted the pre-fix sentence,
+    # whose leading clause ("does not rescue that state") denies something else.
+    DENIAL = re.compile(
+        r"does not clear itself|cannot mean|not something the instance can"
+        r"|cannot be cleared by|never a fresh beat|does not restore eligibility", re.I)
+
+    def _sentences(self):
+        """Physical lines are wrapped mid-sentence; join a paragraph, then split."""
+        text = DOC.read_text(encoding="utf-8")
+        out = []
+        for para in text.split("\n\n"):
+            joined = " ".join(x.strip() for x in para.splitlines())
+            out.extend(x.strip() for x in re.split(r"(?<=[.!?])\s+", joined) if x.strip())
+        return out
+
+    def test_no_wedged_passage_offers_a_self_exit(self):
+        bad = [x for x in self._sentences()
+               if self.WEDGED.search(x) and self.SELF_EXIT.search(x)
+               and not self.DENIAL.search(x)]
+        self.assertEqual(bad, [], "a wedged verdict cannot be cleared by the worker: it "
+                                  "suppresses on its own pin, which is what keeps both of "
+                                  "rule 6's inputs unchanged")
+
+    def test_the_scan_fires_on_the_pre_fix_wording(self):
+        """Control. This is the sentence the document actually carried at `d2113f44`."""
+        c = ("Rule 6 does not rescue that state by taking the work: the wedged verdict "
+             "makes the pin unclaimable, so the task is visibly pending and clears when "
+             "the worker returns or an owner re-binds.")
+        self.assertTrue(self.WEDGED.search(c) and self.SELF_EXIT.search(c))
+        self.assertFalse(self.DENIAL.search(c), "control must not read as a denial")
+
+    def test_a_stale_beat_returning_is_not_flagged(self):
+        """Scope control: the same phrasing is TRUE of a stale beat and must survive.
+        A returning worker's beat is fresh again, which is the whole input."""
+        for ok in [
+            "The core kickstarts the plist; the work stays pending until the worker "
+            "returns or an owner re-binds.",
+            "Its rooms stay pending until it returns or an owner re-binds.",
+        ]:
+            with self.subTest(ok=ok):
+                self.assertTrue(self.SELF_EXIT.search(ok), "sanity: phrasing matches")
+                self.assertFalse(self.WEDGED.search(ok),
+                                 "a stale-beat exit must not be read as a wedged one")
+
+    def test_the_reset_names_an_owner(self):
+        t = DOC.read_text(encoding="utf-8")
+        self.assertIn("Clearing a wedged verdict", t,
+                      "no section defines the exit from the wedged state")
+        # Anchor on the HEADING: two passages point AT this section by name, so find()
+        # and rfind() both land on a cross-reference and measure the wrong span.
+        head = "**Clearing a wedged verdict — the reset is COMMANDED"
+        self.assertEqual(t.count(head), 1, "the section heading must be unique")
+        section = t[t.find(head):][:2600]
+        self.assertIn("kick-pool", section,
+                      "the reset must name the actor that performs it; an exit with no "
+                      "owner is the absorbing state written a second way")
+        self.assertRegex(section, r"absorbing",
+                         "the section must say WHY a reset is required, not just that "
+                         "one exists")
+
+    def test_the_admitted_risk_is_stated_and_bounded(self):
+        """A kick that clears the verdict lets a still-hung worker strand one task. That
+        is the harm the self-suppression gate prevents, so trading it must be explicit."""
+        t = DOC.read_text(encoding="utf-8")
+        self.assertRegex(
+            t, r"bounded, re-detectable strand over a permanently dark room",
+            "the trade-off has to be stated in the direction it was decided; a reader "
+            "who cannot see the cost cannot re-open the decision")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

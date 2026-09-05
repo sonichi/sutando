@@ -79,8 +79,10 @@ Without this, rules 1 and 2 suppress on liveness alone and a handler that keeps
 beating without ever claiming holds its pinned tasks unclaimed indefinitely, with
 nothing recording that it is doing so. Rule 6 does not rescue that state by taking
 the work — v1 has no stand-in — it NAMES it: the wedged verdict makes the pin
-unclaimable, so the task is visibly pending and clears when the worker returns or
-an owner re-binds, instead of sitting claimed-by-nobody and unreported.
+unclaimable, so the task is visibly pending instead of sitting claimed-by-nobody and
+unreported. **The verdict does not clear itself** — it freezes both of its own inputs, so
+no automatic exit exists. The exit is the commanded reset in "Clearing a wedged verdict"
+under §3 rule 6.
 
 Eligibility is **one value, computed once**: the core evaluates it in its sweep
 (it is the only instance that can see a room's oldest unclaimed task) and publishes
@@ -585,9 +587,12 @@ tells every OTHER instance when to stop suppressing; on its own it leaves rules 
 instance claim unconditionally — so an instance the core has recorded `wedged` can still
 win the claim and strand the task. So each branch below is read as: **act only if my own
 beat is fresh AND the record says `eligible` or says nothing about me; a stale beat OR a
-`wedged` verdict suppresses**, and the room's work then stays pending until that instance
-returns or an owner re-binds the room. It does NOT fall through to rule 3: the room is
-bound, and v1 has no second claimant for a bound room.
+`wedged` verdict suppresses**, and the room's work then stays pending until the verdict is
+reset or an owner re-binds the room. Note what "until that instance returns" cannot mean here:
+an instance suppressing on its OWN verdict is the reason its oldest unclaimed task stays
+unclaimed, which is the input that produced the verdict — so returning is not something the
+instance can demonstrate from inside this gate. See "Clearing a wedged verdict". It does NOT
+fall through to rule 3: the room is bound, and v1 has no second claimant for a bound room.
 
 Suppressing is still strictly better than claiming, and that is the whole reason to gate
 both halves of the predicate rather than one. A wedged instance that claims **strands** the
@@ -1086,6 +1091,37 @@ itself to a room whose worker might still come back.
    (`pool_lead.py:514-547`), so a long task never has the core answering the
    same room concurrently.
 
+   **Clearing a wedged verdict — the reset is COMMANDED, and it has to be, because the
+   verdict is otherwise absorbing.** Rule 6 publishes `wedged` from two inputs: the age of
+   the oldest unclaimed task addressed to the worker, and the worker holding no claimed
+   task. The verdict then makes that worker suppress on its own pin, so it cannot claim
+   that task — which is what keeps the task unclaimed and the worker claim-less. Both
+   inputs are frozen BY the verdict. A fresh beat does not move either one, and the rule
+   above already refuses to treat beating as recovery for the measured reason that a hung
+   session beats normally at zero throughput. So the next sweep sees identical inputs and
+   republishes `wedged` forever: the room is permanently dark, with every individual rule
+   behaving exactly as written.
+
+   The reset therefore cannot be inferred; some actor must perform it. **`kick-pool` owns
+   it.** Un-wedging the idle prompt and clearing the verdict are one transition, not two —
+   a kick that leaves the verdict standing changes nothing observable, since the worker
+   resumes and still suppresses. The kick deletes the instance's entry from the published
+   eligibility record (making it absent, which rule 1's table already reads as eligible),
+   and the next sweep re-evaluates from scratch.
+
+   **This admits exactly one task's worth of risk, deliberately.** A worker still hung
+   after the kick claims the admitted task and strands it — claimed, undeliverable — which
+   is the harm the self-suppression gate above exists to prevent. It is bounded: one task,
+   re-detected by the next sweep in one `stand_in_after_s` window, and visible as a claimed
+   task whose worker holds no lease. That is strictly better than the alternative it
+   replaces, where the harm is unbounded and silent. **State the direction plainly: this
+   design prefers a bounded, re-detectable strand over a permanently dark room.**
+
+   The kick is an owner action in v1, not something the core does on a timer. Automating it
+   would put the core in a kick/re-wedge loop against a genuinely broken worker, and a loop
+   that keeps admitting one task per window is a slow leak rather than a fix. Rate-limiting
+   an automatic kick is a v2 question and is deliberately not answered here.
+
 There is no election, no consensus and no degraded mode: the core is the only
 process whose absence stops work, which is already true of every install today.
 
@@ -1126,7 +1162,7 @@ worker that stopped, carried from #3604's operations section:
 |---|---|---|
 | auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
 | timeouts, 5xx | transport | back off and retry; do not touch the session |
-| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the room stops admitting new work; the kick script un-wedges an idle prompt so the worker itself resumes |
+| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the room stops admitting new work. `kick-pool` un-wedges the idle prompt **and clears the `wedged` verdict in the same transition** — un-wedging alone does not resume the worker, because it suppresses on its own verdict. See "Clearing a wedged verdict" |
 | beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets, and its rooms stay pending meanwhile. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and never becomes visible as stuck. Measured live: four seats beating normally at zero throughput |
 | beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
