@@ -628,12 +628,14 @@ class QuiesceHasOneOwnerEndToEnd(unittest.TestCase):
     def _flat(self):
         return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
 
-    def test_the_reset_is_the_sidecars_not_the_workers(self):
-        """Absorbing in the same shape as the wedged verdict: a quiesced instance is
-        excluded from claims, so it can never produce the 'first successful turn' the
-        old reset waited on."""
+    def test_the_reset_belongs_to_the_component_that_wrote_it(self):
+        """Two supersessions. The worker could never produce the 'first successful turn'
+        it was told to reset on (excluded from claims). Then the SIDECAR was named here
+        while other rows named the wrapper -- the test name itself carried the wrong owner
+        for two heads. Writer and deleter are one component, by construction."""
         f = self._flat()
-        self.assertRegex(f, r"the sidecar that wrote it, and only that sidecar, unlinks it")
+        self.assertRegex(f, r"the WRAPPER that wrote it, and only that wrapper, unlinks it")
+        self.assertRegex(f, r"the same component as the writer row, by construction")
         self.assertNotRegex(
             f, r"the worker unlinks the file on its first successful turn",
             "the party excluded from claiming cannot clear the record by claiming")
@@ -815,7 +817,7 @@ class OwnerRulingsOnMembershipAndReporting(unittest.TestCase):
         per-ACCOUNT, so the core is another session on it and goes dark in the same outage."""
         f = self._flat()
         self.assertRegex(f, r"the reporter of a resource exhaustion must not depend on that resource")
-        self.assertRegex(f, r"Never the worker, and never the core")
+        self.assertRegex(f, r"Never the worker, never the core")
         for wrong in (r"writer \| \*\*the worker itself, and only it",
                       r"writer \| \*\*the CORE, and only it"):
             with self.subTest(wrong=wrong):
@@ -839,6 +841,88 @@ class OwnerRulingsOnMembershipAndReporting(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertNotIn(token, f, "cut by owner ruling; a residue re-creates "
                                            "the contradiction it was cut to remove")
+
+
+class NoSummaryOutlivesItsRetraction(unittest.TestCase):
+    """Twice now a paragraph retracted a guarantee while a HEADER and a TABLE ROW kept
+    asserting it. The reviewer reads the body; an implementer reads the summary. So this
+    checks the CLASS -- any sentence asserting first-pin is fenced -- not one phrasing.
+    """
+
+    ASSERTS_FENCE = re.compile(
+        r"first-pin[^.]{0,80}\bis fenced\b"
+        r"|first-pin is fenced"
+        r"|fenced by the claim-then-re-read", re.I)
+    DENIAL = re.compile(r"is NOT fenced|does not fence|cannot .{0,20}fence"
+                        r"|was wrong|retracted|earlier revision", re.I)
+
+    def _sentences(self):
+        text = DOC.read_text(encoding="utf-8")
+        out = []
+        for para in text.split("\n\n"):
+            joined = " ".join(x.strip() for x in para.splitlines())
+            out.extend(x.strip() for x in re.split(r"(?<=[.!?|])\s+", joined) if x.strip())
+        return out
+
+    def test_no_sentence_asserts_first_pin_is_fenced(self):
+        bad = [x for x in self._sentences()
+               if self.ASSERTS_FENCE.search(x) and not self.DENIAL.search(x)]
+        self.assertEqual(bad, [], "a summary that outlives its own retraction is what an "
+                                  "implementer builds from")
+
+    def test_the_scan_fires_on_both_retracted_summaries(self):
+        """Controls: the exact strings this document carried at 99477bed."""
+        for c in ("**First-pin is fenced by a RE-READ AFTER THE CLAIM, not in-process.**",
+                  "a first-pin is fenced by the claim-then-re-read rule"):
+            with self.subTest(c=c):
+                self.assertTrue(self.ASSERTS_FENCE.search(c))
+                self.assertFalse(self.DENIAL.search(c), "control must not read as a denial")
+
+    def test_the_retractions_themselves_are_not_flagged(self):
+        for ok in ("**First-pin is NOT fenced. v1 accepts a bounded overlap**",
+                   "v1 does not fence first-pin. It ACCEPTS a bounded overlap"):
+            with self.subTest(ok=ok):
+                self.assertTrue(self.DENIAL.search(ok), "sanity: reads as a denial")
+
+
+class QuiesceOwnerIsONEComponentEverywhere(unittest.TestCase):
+    """Three revisions each fixed ONE row and left the others: writer said
+    'sidecar or wrapper', the roles row said SIDECAR, the transport row said WRAPPER, and
+    reset said 'the sidecar that wrote it'. Four rows, three owners, one record.
+    """
+
+    ROWS = ("| writer |", "| the three roles, kept apart |",
+            "| the report transport, named", "| reset — SOLE authorized transition |")
+
+    def _rows(self):
+        text = DOC.read_text(encoding="utf-8")
+        out = {}
+        for line in text.splitlines():
+            for r in self.ROWS:
+                if line.startswith(r):
+                    out[r] = line
+        return out
+
+    def test_all_four_rows_are_present(self):
+        self.assertEqual(sorted(self._rows()), sorted(self.ROWS),
+                         "a missing row means the scan below proves nothing")
+
+    def test_every_row_names_the_wrapper_and_none_names_the_sidecar_as_owner(self):
+        for r, line in self._rows().items():
+            with self.subTest(row=r):
+                self.assertRegex(line, r"(?i)wrapper", "the owner must be named in the row")
+        roles = self._rows()["| the three roles, kept apart |"]
+        self.assertNotRegex(roles, r"The SIDECAR, which costs no quota",
+                            "the roles row named a different owner than the writer row")
+        reset = self._rows()["| reset — SOLE authorized transition |"]
+        self.assertNotRegex(reset, r"the sidecar that wrote it",
+                            "writer and deleter must be the same component")
+
+    def test_the_rule_is_not_offered_as_the_owner(self):
+        """'a process that makes no model calls' is a PREDICATE. It admits several
+        components, which is how three rows drifted apart while each looked correct."""
+        w = self._rows()["| writer |"]
+        self.assertRegex(w, r"a rule is not an owner")
 
 
 if __name__ == "__main__":
