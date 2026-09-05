@@ -97,6 +97,22 @@ class Classifier(unittest.TestCase):
         r = w.classify([retry_frame(i) for i in range(12)], True, 60)
         self.assertEqual(r["kind"], "retry-loop")
 
+    def test_quota_limited_pane_is_case2_even_though_it_moves(self):
+        # Owner screenshot 2026-09-05 (Claude Code): each scheduled turn ends at once
+        # with the same provider message; only the clock and the verb change.
+        def frame(i):
+            verb = ("Brewed", "Worked", "Sautéed")[i % 3]
+            return (
+                f"* Running scheduled task (Sep 4 5:{17 + i // 3:02d}pm)\n"
+                "  L You've hit your session limit · resets 6pm (America/Los_Angeles)\n"
+                "    /usage-credits to finish what you're working on.\n"
+                f"* {verb} for 1s · done 5:{17 + i // 3:02d} PM · 1 monitor still running\n"
+            )
+        v = w.classify([frame(i) for i in range(12)], True, 300)
+        self.assertEqual((v["kind"], v["warn"]), ("retry-loop", True))
+        self.assertIn("quota-limit", v["matched_patterns"])
+        self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
+
     def test_case2_retry_loop_when_only_counters_move(self):
         v = w.classify([retry_frame(i) for i in range(20)], True, 60)
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("retry-loop", True, "high"))

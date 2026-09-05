@@ -48,6 +48,9 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("reconnecting", r"\breconnect(ing)?\b"),
         ("connection-error", r"\bconnection (error|reset|refused)\b"),
         ("timeout", r"\btimed? ?out\b"),
+        # A CLI told to stop by its provider: every turn ends the same way while the
+        # clock keeps moving, so only the text tells this from real work.
+        ("quota-limit", r"\b(session|usage|weekly|daily|plan) limit\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
     )
 )
 
