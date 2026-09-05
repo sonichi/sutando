@@ -113,6 +113,118 @@ class TaskMediaRoute(unittest.TestCase):
     def _result_posts(self):
         return [c for c in self.calls if c[1] == "/v1/results"]
 
+    # -- 0. the team-tier allowance (5G ⑤a-cap): the guard runs for real ------ #
+
+    def _team_signal_task(self, tid: str) -> dict:
+        task = self._signal_task(tid)
+        task["access_tier"] = "team"
+        task["user_id"] = "@collab:server"
+        return task
+
+    def _allow_this_workspace_results(self, mod) -> None:
+        # send_allowlist fixes its results root at first import (the shim's set_dirs
+        # wiring); this harness reloads the bridge per test, so register this ws's.
+        import ag2_sparrow.send_allowlist as send_allowlist
+        send_allowlist.register_extra_roots(str(mod.RESULTS_DIR))
+
+    def test_team_result_attaches_a_file_from_its_own_output_dir(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-in"))
+        own = mod.RESULTS_DIR / "task-team-in"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-in", f"the chart [file: {own / 'chart.png'}]")
+        mod._post_ready_results({"task-team-in"})
+        media = self._media_posts()
+        self.assertEqual(len(media), 1, "an in-root attachment is uploaded on the task's lease")
+        self.assertTrue(media[0][1].startswith("/v1/tasks/"), media[0][1])
+        self.assertEqual(media[0][2]["filename"], "chart.png")
+        self.assertTrue(self._result_posts(), "and the result itself is delivered")
+
+    def test_ordinary_team_task_gets_no_allowance(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        task = self._team_signal_task("task-team-plain")
+        del task["signal"]  # an ordinary relay task: no task-media sidecar entry
+        mod._write_task(task)
+        own = mod.RESULTS_DIR / "task-team-plain"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-plain", f"x [file: {own / 'chart.png'}]")
+        try:
+            mod._post_ready_results({"task-team-plain"})
+        except Exception:
+            pass
+        self.assertEqual(self._media_posts(), [], "no sidecar entry ⇒ no allowance, even in-root")
+
+    def test_guest_or_unknown_tier_gets_no_allowance(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-lost"))
+        # The task file vanishes (month-archived and gone): tier resolves to guest.
+        for f in mod.TASKS_DIR.glob("task-team-lost*"):
+            f.unlink()
+        own = mod.RESULTS_DIR / "task-team-lost"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-lost", f"x [file: {own / 'chart.png'}]")
+        try:
+            mod._post_ready_results({"task-team-lost"})
+        except Exception:
+            pass
+        self.assertEqual(self._media_posts(), [], "guest/unknown provenance never earns the Team allowance")
+
+    def test_team_dedup_requeue_attaches_from_the_original_tasks_dir(self):
+        """A requeue's body is the ORIGINAL body (media instruction naming the
+        original's dir) and it answers the ORIGINAL delivery — so that is the dir
+        the allowance confines to, not the requeue id's."""
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        holder = "task-22d83e59601f3a1fef"
+        mod._write_task(self._team_signal_task("task-team-rq"))
+        mod.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt").write_text("")
+        self._result(mod, "task-team-rq", f"[deduped: {holder}]")
+        inflight = {"task-team-rq"}
+        mod._post_ready_results(inflight)
+        reask = [p.stem for p in mod.TASKS_DIR.glob("task-*.txt") if p.stem != "task-team-rq"]
+        self.assertEqual(len(reask), 1, "the dedup was not re-asked")
+        body = (mod.TASKS_DIR / f"{reask[0]}.txt").read_text()
+        orig_dir = mod.RESULTS_DIR / "task-team-rq"
+        self.assertIn(f"[file: {orig_dir}/<name>.png]", body,
+                      "the requeue carries the ORIGINAL media instruction verbatim")
+        orig_dir.mkdir(parents=True, exist_ok=True)
+        (orig_dir / "chart.png").write_bytes(b"payload")
+        self._result(mod, reask[0], f"here [file: {orig_dir / 'chart.png'}]")
+        mod._post_ready_results(inflight)
+        self.assertEqual([c[1] for c in self._media_posts()], ["/v1/tasks/task-team-rq/media"],
+                         "a file under the ORIGINAL task's dir uploads on the original delivery's lease")
+
+    def test_team_result_pointing_outside_its_dir_uploads_nothing(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-out"))
+        stray = self._attachment()  # a /tmp file — allowlisted for OWNER sends, not this task's root
+        self._result(mod, "task-team-out", f"the chart [file: {stray}]")
+        try:
+            mod._post_ready_results({"task-team-out"})
+        except Exception:
+            pass  # a review-routing failure leaves the result for retry; either way no upload
+        self.assertEqual(self._media_posts(), [], "an out-of-root marker never reaches the media route")
+        delivered = [c for c in self._result_posts() if c[2].get("result", "").startswith("the chart")]
+        self.assertEqual(delivered, [], "and the raw body is never delivered to the room")
+
     # -- 1. wire-id resolution --------------------------------------------- #
 
     def test_upload_uses_the_delivery_id_not_the_local_id(self):
