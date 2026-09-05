@@ -51,7 +51,8 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("timeout", r"\btimed? ?out\b"),
         # A CLI told to stop by its provider: every turn ends the same way while the
         # clock keeps moving, so only the text tells this from real work.
-        ("quota-limit", r"\b(session|usage|weekly|daily|plan) limit\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
+        # A limit HIT, not a limit mentioned: Codex's idle banner says "usage limit resets available".
+        ("quota-limit", r"\b(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|\b(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
     )
 )
 
@@ -378,8 +379,12 @@ def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Option
     return (bool(reasons), "; ".join(reasons))
 
 
-def window_path(workspace: Path) -> Path:
-    return workspace / "state" / "cli-wedge" / "window.jsonl"
+def window_path(workspace: Path, slot: Optional[str] = None) -> Path:
+    """One rolling window per watched target: the core's own is `window.jsonl`; an explicit
+    target gets its own file, so probing a worker pane never resets the core's run."""
+    if not slot:
+        return workspace / "state" / "cli-wedge" / "window.jsonl"
+    return workspace / "state" / "cli-wedge" / f"window-{hashlib.sha256(slot.encode()).hexdigest()[:12]}.jsonl"
 
 
 def _private_dir(path: Path) -> None:
@@ -420,14 +425,14 @@ def load_window(path: Path) -> list:
     return entries
 
 
-def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane: Optional[str] = None) -> list:
+def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane: Optional[str] = None, slot: Optional[str] = None) -> list:
     """Persist one sample into the rolling window so the statistic spans
     health-check passes; returns the window (oldest first). `pane` is the pane's
     identity (pid:session-created) so a restarted core starts a new run.
     The whole load → append → truncate → replace runs under one lock: the app's
     health-check and the launchd fallback are independent writers, and an
     atomic replace alone lets the later loader overwrite the earlier append."""
-    path = window_path(workspace)
+    path = window_path(workspace, slot)
     _private_dir(path.parent)
     lock = path.with_name(path.name + ".lock")
     fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
@@ -611,8 +616,11 @@ def main(argv: Optional[list] = None) -> int:
         return 0
     ws = Path(a.workspace)
     now = time.time()
-    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux))
-    print(json.dumps(classify_window(entries, work_outstanding(ws, now), now), indent=1))
+    # An explicit target is not this core: its window is its own, and this core's queue says
+    # nothing about its work.
+    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux), slot=a.target)
+    work = (False, "no work signal for an explicit --target") if a.target else work_outstanding(ws, now)
+    print(json.dumps(classify_window(entries, work, now), indent=1))
     return 0
 
 

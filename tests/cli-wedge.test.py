@@ -122,6 +122,27 @@ class Classifier(unittest.TestCase):
         self.assertIn("quota-limit", v["current_patterns"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
 
+    def test_codex_idle_banner_is_not_a_provider_limit(self):
+        # Codex CLI at its idle prompt (chi-air-blue, 2026-09-05): the banner mentions "usage limit"
+        # while nothing is limited. Only a HIT (hit / reached / exceeded / limit reached) is the pattern.
+        def frame(i):
+            return (
+                "OpenAI Codex (v0.42)\n"
+                "You have 3 usage limit resets available\n"
+                f"  {'⠋⠙⠹⠸'[i % 4]} model: gpt-5-codex · /status for details\n"
+                "› \n"
+            )
+        v = w.classify([frame(i) for i in range(20)], False, 60)
+        self.assertNotIn("quota-limit", v["matched_patterns"], v)
+        self.assertNotEqual(v["kind"], "provider-limit", v)
+        # Positive controls: the phrasings that DO mean a limit was hit still match.
+        for line in ("You've hit your usage limit · resets 6pm",
+                     "You have reached your weekly limit",
+                     "Session limit reached. Try again at 6pm",
+                     "usage limit exceeded for this plan",
+                     "/usage-credits to finish what you're working on."):
+            self.assertIn("quota-limit", w.matched_patterns([line]), line)
+
     def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
         # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
         frames = ["$ run tests\ncommand timed out after 30s\n"] + [IDLE] * 11
@@ -431,6 +452,25 @@ class Cli(unittest.TestCase):
             verdict = json.loads(out)
             self.assertEqual((verdict["kind"], verdict["sample_count"]), ("idle", 3))
             self.assertTrue(w.window_path(ws).exists())
+
+    def test_probe_targets_keep_separate_windows(self):
+        # Two worker panes probed alternately each keep their own run; the core's window is untouched.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(6)))
+            tmux = fake_tmux(Path(d), frames)
+            outs = []
+            for target in ("=worker-1:1", "=worker-2:1", "=worker-1:1", "=worker-2:1"):
+                rc, out = self.run_main("probe", "--socket", "/s", "--target", target, "--workspace", str(ws), "--tmux", str(tmux))
+                self.assertEqual(rc, 0)
+                outs.append(json.loads(out))
+            self.assertEqual([o["sample_count"] for o in outs], [1, 1, 2, 2], outs)
+            self.assertIn("no work signal", outs[0]["work_detail"])
+            self.assertFalse(w.window_path(ws).exists(), "an explicit target must not write the core's window")
+            self.assertTrue(w.window_path(ws, "=worker-1:1").exists())
+            self.assertNotEqual(w.window_path(ws, "=worker-1:1"), w.window_path(ws, "=worker-2:1"))
+            self.assertEqual(w.window_path(ws), w.window_path(ws, None))
 
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:
