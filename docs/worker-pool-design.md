@@ -844,13 +844,16 @@ rooms must be kept off the same worker:
   drain protocol or admission record is required — because after this revision there is no
   operation left for one to guard.
 
-  What this costs, stated plainly: a dead worker's rooms are served by the core rather than by a
-  standby worker, so they lose worker-level parallelism until an owner re-binds or the worker
-  returns. That is a throughput property, not a correctness one, and v1 takes it deliberately.
+  What this costs, stated plainly: a dead worker's rooms stay pending until an owner re-binds them
+  or the worker returns. Nothing else serves them in the meantime — not a standby worker, and not
+  the core. That is a liveness cost, not a correctness one, and v1 takes it deliberately: a second
+  claimant for a bound room is the race this design exists to remove.
   True fan-out — and automatic failover with it — needs group identity, group admission, group
   release and a multi-room story, and remains out of scope.
-- **Every entry ineligible is not an error**: the room falls to the core, exactly as an
-  unreadable file does. A binding exists to stop scatter, never to stop work.
+- **Every entry ineligible is not an error**: the room's work stays pending until an entry becomes
+  eligible again or an owner re-binds. This is NOT the unbound case — a room with no binding still
+  falls to the core under rule 3. A binding exists to stop scatter; honouring it while every entry
+  is ineligible costs latency, and the alternative costs a second claimant.
 - **`distinct-instance`** means no single worker may hold bindings for two rooms in the
   same group — the rooms' contexts must not meet inside one session. The core rejects a
   bind command that would violate it, and a worker re-checks at claim time and declines
@@ -1061,8 +1064,8 @@ like every other pool file:
 | | contract |
 |---|---|
 | writer | **the worker itself, and only it.** It is the process holding the failing turn, and writing a local file needs no quota. One file per instance, so one writer per file — the core never writes here, which is what keeps this off the shared-mutable-state path |
-| the core's role | reads it, and separately stands in on unclaimed-task age. Those two paths are independent on purpose: a worker too broken to write its own record still gets stood in for, just more slowly |
-| routing exclusion | a quiesced instance is skipped in `instances` order at claim time. A room whose every binding is quiesced falls to the core — the same fall-through as an unreadable bindings file |
+| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. A worker too broken to write its own record is simply never eligible — the quiesce record makes that visible sooner, it does not change who serves the room |
+| routing exclusion | a quiesced instance is skipped in `instances` order at claim time. A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |
 | reset | the worker unlinks the file on its first successful turn. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again |
 | attribution | `window` and `source` are what let an operator tell quota-spent from hung. Without them both look like "beat fresh, nothing claimed" |
 

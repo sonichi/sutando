@@ -261,26 +261,75 @@ class NoStandInPathIsDescribed(unittest.TestCase):
     is not described anywhere, which is exactly what (b) claims.
     """
 
-    TRIGGER = re.compile(r"stale|wedged|ineligible|quota spent|hung session", re.I)
-    STANDIN = re.compile(r"core stands in|stands? in for (its|the) rooms?|"
-                         r"the core claims (that|its|the) room", re.I)
+    # Semantic, not lexical. The previous pattern listed three exact phrasings and
+    # so returned zero hits on a document carrying nineteen stand-in lines.
+    STANDIN = re.compile(
+        r"core stands? in\b"
+        r"|stands? in (for|on)\b"
+        r"|stand-in decision"
+        r"|(served|handled|claimed|picked up) by the core"
+        r"|falls? (to|back to) the core"
+        r"|core (takes|took) over"
+        r"|the core (claims|serves|owns) (that|its|the|his|her|their) room",
+        re.I)
+    # A bound room whose worker cannot act. Rule 3 (work addressed to NOBODY) is a
+    # different case and legitimately reaches the core, so the scan must not flag it.
+    TRIGGER = re.compile(r"stale|wedged|ineligible|quota spent|hung session|quiesced"
+        r"|dead worker|too broken|gets stood in for", re.I)
+    # No lexical unbound-exemption: it cannot tell "this room is unbound" from
+    # "like an unbound room". Pairing with TRIGGER is what separates them.
 
     def _lines(self):
         return DOC.read_text(encoding="utf-8").splitlines()
 
-    def test_no_line_pairs_ineligibility_with_the_core_claiming(self):
-        bad = [(i + 1, l) for i, l in enumerate(self._lines())
-               if self.STANDIN.search(l)]
+    def test_no_bound_room_falls_to_the_core(self):
+        bad = [(i + 1, l.strip()[:70]) for i, l in enumerate(self._lines())
+               if self.STANDIN.search(l) and self.TRIGGER.search(l)]
         self.assertEqual(
             bad, [],
-            "a stand-in path is described at %s" % [n for n, _ in bad])
+            "a stand-in path for a BOUND room is described at %s"
+            % [n for n, _ in bad])
 
-    def test_the_check_fires_on_an_injected_stand_in(self):
-        """A checker never observed failing is not a validated checker."""
-        injected = "| a worker's beat goes stale | the core stands in for its rooms |"
-        self.assertTrue(self.STANDIN.search(injected),
-                        "the pattern cannot detect a stand-in it is meant to forbid")
-        self.assertTrue(self.TRIGGER.search(injected))
+    def test_the_check_fires_on_wording_it_does_not_contain(self):
+        """A control quoting the pattern's own branch validates nothing.
+
+        The previous control injected the literal string "the core stands in
+        for its rooms" -- the first alternate of the pattern it was testing --
+        so it asserted only that a regex matches itself. These paraphrases
+        share the meaning and none is a literal branch.
+        """
+        for phrase in [
+            "When a worker is stale, the core takes over its room.",
+            "a dead worker's rooms are served by the core",
+            "the room falls to the core",
+            "the core's stand-in decision",
+            "stands in on unclaimed-task age",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(
+                    self.STANDIN.search(phrase),
+                    "pattern cannot detect a stand-in phrased as: %r" % phrase)
+
+    def test_rule_three_is_not_flagged(self):
+        """Negative control: work addressed to nobody still reaches the core.
+
+        Rule 3 survives direction (b) untouched, so these must NOT trip the
+        scan. They match STANDIN and carry no ineligibility trigger, which is
+        precisely the discrimination the pairing buys.
+        """
+        for ok in [
+            "An unbound room falls to the core, exactly as an unreadable file does.",
+            "A task addressed to nobody is served by the core.",
+        ]:
+            with self.subTest(ok=ok):
+                self.assertTrue(self.STANDIN.search(ok), "sanity: phrasing matches")
+                self.assertFalse(self.TRIGGER.search(ok),
+                                 "rule 3 must not be flagged as a stand-in")
+
+    def test_the_pairing_fires_on_the_reviewers_control(self):
+        """keweichen's control: paraphrased stand-in on an ineligible worker."""
+        c = "When a worker is stale, the core takes over its room."
+        self.assertTrue(self.STANDIN.search(c) and self.TRIGGER.search(c))
 
 
 if __name__ == "__main__":
