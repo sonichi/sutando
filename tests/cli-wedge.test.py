@@ -528,6 +528,34 @@ class Cli(unittest.TestCase):
             rc, out = self.run_main(*base)
             self.assertIn("queued task", json.loads(out)["work_detail"])
 
+    def test_a_work_file_never_silences_the_cores_own_queue(self):
+        # --work-file keyed for workers plus the core in --targets: the core still reads its queue
+        # (no key for it), and a key for the core's own target is honoured when present.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True)
+            for i in range(3):
+                (ws / "tasks" / f"task-{i}.txt").write_text("x")
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1,=sutando-core:0"]
+            with patch.object(w, "_local_host_label", return_value="host"):
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual(by["=sutando-core:0"]["role"], "core")
+                self.assertTrue(by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"])
+                self.assertIn("queued task", by["=sutando-core:0"]["work_detail"])
+                self.assertNotIn("None", by["=sutando-core:0"]["work_detail"])
+                self.assertEqual(by["=w1:1"]["work_outstanding"], False)
+                wf.write_text(json.dumps({"=sutando-core:0": {"outstanding": False, "detail": "deliverer says drained"}}))
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual((by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"]["work_detail"]), (False, "deliverer says drained"))
+
     def test_probe_targets_gives_one_verdict_per_worker_with_its_own_signal(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d) / "ws"
@@ -573,13 +601,13 @@ class Cli(unittest.TestCase):
                 self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
 
     def test_a_malformed_socket_in_the_heartbeat_is_an_unreadable_record(self):
-        # One bad shared-state record must not crash the diagnostic at realpath().
+        # One bad socket must not crash the diagnostic at realpath(), nor cost the core its session.
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
             with patch.object(w, "_local_host_label", return_value="host"):
                 for bad in (["/s"], {"path": "/s"}, 7, True):
                     (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": bad, "session": "core-2"}))
-                    self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION), bad)
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), bad)
                 for absent in ({"host": "host", "session": "core-2"}, {"host": "host", "socket": None, "session": "core-2"}, {"host": "host", "socket": "", "session": "core-2"}):
                     (cores / "host.alive").write_text(json.dumps(absent))
                     self.assertEqual(w.core_identity(ws), (None, "core-2"), absent)

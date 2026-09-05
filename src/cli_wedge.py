@@ -379,9 +379,10 @@ def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Option
 
 
 def work_signal(target: Optional[str], workspace: Path, now: float, work_file: Optional[str] = None,
-                say: Optional[bool] = None) -> tuple:
+                say: Optional[bool] = None, core: bool = False) -> tuple:
     """The (outstanding, detail) input for one target. The caller's word wins (`say`, or a
-    work file keyed by target); the core's own queue is read only for the core's own pane."""
+    work file keyed by target); the core's pane (`core`, or no target) falls back to its own queue."""
+    core = core or target is None
     if say is not None:
         return (bool(say), "caller says work outstanding" if say else "caller says nothing outstanding")
     if work_file:
@@ -395,8 +396,10 @@ def work_signal(target: Optional[str], workspace: Path, now: float, work_file: O
             if type(val) is not bool:  # "false", 0, 1, null: a malformed record is a missing signal, never a verdict input
                 return (False, f"work file: 'outstanding' for {target!r} is not a boolean ({val!r}) — no work signal")
             return (val, str(rec.get("detail") or ("work file: outstanding" if val else "work file: nothing outstanding")))
+        if core:
+            return work_outstanding(workspace, now)
         return (False, f"no work signal for {target!r} in the work file")
-    if target:
+    if not core:
         return (False, "no work signal for an explicit --target")
     return work_outstanding(workspace, now)
 
@@ -417,10 +420,10 @@ def core_identity(workspace: Path) -> tuple:
     and the environment names a pane to probe, never who the core is."""
     try:
         r = json.loads((workspace / "state" / "cores" / f"{_local_host_label()}.alive").read_text())
-        sock = r.get("socket") if isinstance(r, dict) else None
-        # A socket of any type but a string is not a record this reader understands.
-        if isinstance(r, dict) and isinstance(r.get("session"), str) and r["session"] and (sock is None or isinstance(sock, str)):
-            return (sock or None, r["session"])
+        if isinstance(r, dict) and isinstance(r.get("session"), str) and r["session"]:
+            sock = r.get("socket")
+            # A socket of any type but a non-empty string is no socket; the session still counts.
+            return (sock if isinstance(sock, str) and sock else None, r["session"])
     except (OSError, ValueError, AttributeError):
         pass
     return (None, DEFAULT_SESSION)
@@ -700,8 +703,8 @@ def probe_one(a, ws: Path, target: str, role: str) -> dict:
     now = time.time()
     slot = None if role == "core" else window_slot(a.socket, target)
     entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux), slot=slot)
-    work = work_signal(None if role == "core" else target, ws, now,
-                       work_file=getattr(a, "work_file", None), say=getattr(a, "say_work", None))
+    work = work_signal(target, ws, now, work_file=getattr(a, "work_file", None),
+                       say=getattr(a, "say_work", None), core=(role == "core"))
     return {**classify_window(entries, work, now), "target": target, "role": role}
 
 
