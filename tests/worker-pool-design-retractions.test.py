@@ -53,6 +53,10 @@ RETRACTED = [
     ("members race for the same claim",
      "same retraction, in the routing rule: pinned-to-a-set means claim only when this "
      "worker IS instances[0]; otherwise suppress."),
+    ("it is bounded and benign",
+     "asserted, not shown. The per-task claim covers ONE task; two DIFFERENT tasks "
+     "in one room each win their own claim, which is the concurrency this section "
+     "forbids. The window is fenced by a generation revalidated before execution."),
 ]
 
 

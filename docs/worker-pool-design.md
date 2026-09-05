@@ -772,6 +772,7 @@ rooms must be kept off the same worker:
 ```json
 {
   "version": 1,
+  "generation": 7,
   "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}},
   "exclusions": [{"group": "<label>", "rooms": ["<room>", "..."],
                   "rule": "distinct-instance"}]
@@ -793,17 +794,38 @@ rooms must be kept off the same worker:
   about two workers INSIDE one. Measured against the production claim: *different task keys,
   same room -> 0, 0* (both won), against a control *one group key -> 0, 1*. Making that safe
   needs group identity, group admission, group release and a multi-room story; a single bound
-  instance needs none of it. To be exact about what "contended" means here: a repin DOES
-  create a bounded window of contention, and the per-task claim — which already exists and
-  already arbitrates it — is what covers it. What v1 does not need is a second, ROOM-scoped
-  lease layered on top of that claim.
+  instance needs none of it.
 
-  **The one window this leaves is a repin**, and it is bounded and benign: between the core's
-  rewrite and a worker's next re-read, the outgoing instance may still read itself as bound.
-  Trace B already covers the same-task case — the claim settles it and the loser suppresses.
-  For two *different* tasks the outgoing worker is, by construction, the one the core just
-  declared unreachable, so this is not the healthy-pair concurrency the paragraph above rules
-  out. A later PR may add true fan-out; until then a set is redundancy, not parallelism.
+  **A repin is fenced by a generation, because the per-task claim alone does not cover it.**
+  Two earlier revisions of this section called the repin window "bounded and benign" and pointed
+  at the claim. That is true for ONE task — Trace B — and false for two: an outgoing instance
+  still reading itself as `instances[0]` can claim a *different* task than the incoming one, and
+  two different tasks each win their own claim. The result is exactly the one-room concurrency
+  this section forbids, so "benign" was asserted rather than shown.
+
+  So `bindings.json` carries a monotonic `generation`, incremented by the core on every write:
+
+  ```json
+  {"version": 1, "generation": 7,
+   "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}}, "exclusions": [...]}
+  ```
+
+  | step | rule |
+  |---|---|
+  | read | a worker reads `generation` in the same read that tells it it is `instances[0]` |
+  | claim | it claims as usual — the claim is unchanged and still first-rename-wins |
+  | **revalidate** | **after winning and BEFORE emitting or executing, it re-reads `generation`. Changed → release the claim and suppress.** The task returns to unclaimed and the incoming instance takes it |
+  | reconcile | the core releases any claim held by an instance that is no longer `instances[0]`, so a worker that died inside the window does not strand the task |
+
+  Revalidation is what makes the window closed rather than bounded: a claim can still be *won*
+  under a stale generation, but it cannot be *executed* under one, and execution is what
+  duplicates. The remaining exposure is a worker that revalidates, sees no change, and is
+  repinned in the microseconds before it emits — which the reconcile row then recovers, because
+  the claim is held by a non-current instance.
+
+  This is the fencing token, not a lease: no one acquires or holds anything, and a crash needs
+  no expiry. Group identity, group admission, group release and a multi-room story are still
+  out of scope, and still what true fan-out would require.
 - **Every entry ineligible is not an error**: the room falls to the core, exactly as an
   unreadable file does. A binding exists to stop scatter, never to stop work.
 - **`distinct-instance`** means no single worker may hold bindings for two rooms in the
