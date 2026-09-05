@@ -9,8 +9,21 @@ implementation and is not merged as one piece. It supersedes the
 of that record (the unclaimed-work backstop belongs to the lead; followers stay
 purely event-driven) — superseded because it sites the backstop on a lead this
 design no longer has, not because its reasoning was wrong; see **The reconciliation
-ticker**, which answers its O(N) objection rather than dropping it. Every other
-decision in that record stands.
+ticker**, which answers its O(N) objection rather than dropping it.
+
+**It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the
+binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per
+context group*, enforced by the lead refusing to create the second one. This design is
+room-keyed and has no lead, so neither survives: **the refusing party does not exist.** An
+earlier revision of this document claimed that cutting the `exclusions` rule dissolved the
+conflict. It did not, and that claim is retracted here — `exclusions` was one way grouped
+rooms ended up on non-coordinating workers, never the reason the binding unit is a room.
+What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by
+the claim, not per group by an assigner.** Two rooms of one former context group may run
+turns at the same time, and so may two members bound to one room. Group identity, group
+admission and group release are named as out of scope for v1 in the routing section and
+remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in
+v1 can express it. Every other decision in that record stands.
 
 The words below are the ones the code uses from now on: **core** (the one
 session every install has), **worker** (an extra session the core created),
@@ -1287,9 +1300,10 @@ like every other pool file:
 |---|---|
 | writer | **a process that makes NO MODEL CALLS — the per-instance heartbeat sidecar (`src/core_heartbeat.py`) or the wrapper that owns the tmux session. Never the worker, and never the core.** The rule it follows: *the reporter of a resource exhaustion must not depend on that resource.* Quota is per-ACCOUNT, so every model session on it — the core included — goes dark together; a core-written record fails in exactly the outage it exists to describe. Owner, 2026-09-05, on my second attempt: *"I don't think the core owns that either. When there's quota issue all the CLI sessions may stop responding."* Two earlier revisions got this wrong in the same shape — first the worker (because a local write needs no quota, true and beside the point), then the core (because the worker might be too broken, also true and beside the point). Both named a party that the outage can take with it |
 | the three roles, kept apart | the SESSION hits the error and lets it surface in its output — that is the error appearing, not a report. The SIDECAR, which costs no quota and outlives the session it watches, turns that into the durable record. The CORE only READS it, as a peer that may itself be dark |
-| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. A worker too broken to write its own record is simply never eligible — the quiesce record makes that visible sooner, it does not change who serves the room |
-| routing exclusion | a quiesced instance is skipped in `instances` order at claim time. A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |
-| reset | the worker unlinks the file on its first successful turn. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again |
+| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with "a worker too broken to write its own record is simply never eligible" — a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |
+| the report transport, named | the session's provider error reaches the sidecar through the session's own **output stream** — the tmux pane the wrapper already owns, and the log the sidecar already tails for the beat. No new channel, and nothing the failing session has to successfully DO. If the sidecar cannot read that stream on some runtime, that runtime has no quiesce detection and the design must say so rather than assume one |
+| routing exclusion | a quiesced instance is skipped at claim time (not "in `instances` order" — the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |
+| reset — SOLE authorized transition | **the sidecar that wrote it, and only that sidecar, unlinks it.** An earlier revision assigned the unlink to the worker "on its first successful turn", which is absorbing in exactly the way §3 rule 6's wedged verdict was: a quiesced instance is excluded from claims by the row above, so it can never produce that turn, and the record clears only by expiring — at which point the unlink it was waiting for is moot. One writer, one deleter, same process. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again, which is the fail-toward-eligibility below and NOT a substitute for the reset |
 | attribution | `window` and `source` are what let an operator tell quota-spent from hung. Without them both look like "beat fresh, nothing claimed" |
 
 **Expiry fails toward eligibility, deliberately.** A quiesce record that outlives its window strands a

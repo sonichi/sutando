@@ -574,6 +574,79 @@ class AcceptanceIsWrittenByTheReceiver(unittest.TestCase):
                 self.assertIn(fn, f)
 
 
+class QuiesceHasOneOwnerEndToEnd(unittest.TestCase):
+    """Two superseded writers left residues the writer-row fix did not reach: a
+    justification that only made sense when the worker wrote, a reset the worker cannot
+    perform, and an ordering word the owner's ruling removed.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_reset_is_the_sidecars_not_the_workers(self):
+        """Absorbing in the same shape as the wedged verdict: a quiesced instance is
+        excluded from claims, so it can never produce the 'first successful turn' the
+        old reset waited on."""
+        f = self._flat()
+        self.assertRegex(f, r"the sidecar that wrote it, and only that sidecar, unlinks it")
+        self.assertNotRegex(
+            f, r"the worker unlinks the file on its first successful turn",
+            "the party excluded from claiming cannot clear the record by claiming")
+
+    def test_expiry_is_not_offered_as_the_reset(self):
+        f = self._flat()
+        self.assertRegex(f, r"NOT a substitute for the reset",
+                         "fail-toward-eligibility bounds the damage; it does not clear it")
+
+    def test_the_report_transport_is_named(self):
+        """'the sidecar records it' is not a design until the error can reach the sidecar
+        without the failing session having to succeed at anything."""
+        f = self._flat()
+        self.assertRegex(f, r"the report transport, named")
+        self.assertRegex(f, r"nothing the failing session has to successfully DO")
+
+    def test_no_residue_of_the_worker_writer_justification(self):
+        f = self._flat()
+        self.assertNotRegex(
+            f, r"A worker too broken to write its own record is simply never eligible — the quiesce",
+            "a reason that only held while the worker was the writer")
+        self.assertNotRegex(
+            f, r"skipped in `instances` order at claim time",
+            "the set is unordered by owner ruling; order words are residue")
+
+
+class DecisionsTwoAndThreeAreSupersededExplicitly(unittest.TestCase):
+    """Cutting `exclusions` removed one route by which grouped rooms met different
+    workers. It never touched the reason the binding unit is a room, and the reviewer
+    said so. The claim that it dissolved the conflict is retracted in the document.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_supersession_is_stated_not_implied(self):
+        f = self._flat()
+        self.assertRegex(f, r"supersedes Decisions 2 and 3 of that record, explicitly")
+        self.assertNotRegex(
+            f, r"Every other decision in that record stands\. \*\*It also",
+            "the standing-decisions sentence must follow the carve-out, not precede it")
+
+    def test_the_reason_is_the_missing_actor(self):
+        f = self._flat()
+        self.assertRegex(f, r"the refusing party does not exist")
+
+    def test_the_dissolution_claim_is_retracted_in_place(self):
+        f = self._flat()
+        self.assertRegex(f, r"that claim is retracted here")
+
+    def test_the_replacement_semantics_are_stated(self):
+        """A supersession that removes a guarantee without naming what replaces it moves
+        the question rather than answering it."""
+        f = self._flat()
+        self.assertRegex(
+            f, r"the binding unit is the ROOM, and concurrency is bounded per TASK by the claim")
+
+
 class CrossReferencesResolve(unittest.TestCase):
     """`see "X"` must name a heading that exists. Written after two anchors in one day
     pointed at nothing: a section titled with OUTGOING while its references said
