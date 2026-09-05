@@ -274,7 +274,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         import core_heartbeat
         f = self.tmp / "tmux"
         ver = self.tmp / "server-version"
-        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo \"tmux $(cat '%s' 2>/dev/null || echo none)\";;\n  *display-message*) [ -s '%s' ] && cat '%s' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % (ver, ver, ver))
+        # PATH is pinned to the temp dir below, so the stand-in must use absolute tool paths.
+        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo \"tmux $(/bin/cat '%s' 2>/dev/null || echo none)\";;\n  *display-message*) [ -s '%s' ] && /bin/cat '%s' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % (ver, ver, ver))
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
             first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")        # cold boot: no server yet
