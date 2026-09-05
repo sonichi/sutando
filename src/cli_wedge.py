@@ -23,6 +23,7 @@ this module writes is owner-only from birth (0600 in a 0700 directory).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -344,17 +345,28 @@ def load_window(path: Path) -> list:
 def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane: Optional[str] = None) -> list:
     """Persist one sample into the rolling window so the statistic spans
     health-check passes; returns the window (oldest first). `pane` is the pane's
-    identity (pid:session-created) so a restarted core starts a new run."""
+    identity (pid:session-created) so a restarted core starts a new run.
+    The whole load → append → truncate → replace runs under one lock: the app's
+    health-check and the launchd fallback are independent writers, and an
+    atomic replace alone lets the later loader overwrite the earlier append."""
     path = window_path(workspace)
-    entries = load_window(path)
-    # Hashes and pattern names only — no pane text is ever persisted here.
-    entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
-             "patterns": matched_patterns([frame])}
-    if pane:
-        entry["pane"] = pane
-    entries.append(entry)
-    entries = entries[-keep:]
-    _write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+    _private_dir(path.parent)
+    lock = path.with_name(path.name + ".lock")
+    fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        entries = load_window(path)
+        # Hashes and pattern names only — no pane text is ever persisted here.
+        entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
+                 "patterns": matched_patterns([frame])}
+        if pane:
+            entry["pane"] = pane
+        entries.append(entry)
+        entries = entries[-keep:]
+        _write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
     return entries
 
 

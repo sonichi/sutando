@@ -413,6 +413,62 @@ class Cli(unittest.TestCase):
             self.assertEqual(w.replay(p, work=True)["kind"], "retry-loop")
 
 
+class ConcurrentWriters(unittest.TestCase):
+    """Two independent writers (the app's health-check and the launchd fallback) must
+    not lose each other's sample: the production append_window is the contract."""
+
+    def test_forked_writers_keep_every_sample(self):
+        import multiprocessing as mp
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            w.append_window(ws, IDLE, 1.0)
+            # Every worker holds the lock only inside append_window; a barrier lines them up
+            # at the door so they contend for the same read/modify/write.
+            n = 6
+            barrier = mp.Barrier(n)
+
+            def worker(i):
+                barrier.wait(timeout=20)
+                w.append_window(ws, working_frame(i), 10.0 + i)
+
+            ctx = mp.get_context("fork")
+            procs = [ctx.Process(target=worker, args=(i,)) for i in range(n)]
+            for pr in procs:
+                pr.start()
+            for pr in procs:
+                pr.join(30)
+            self.assertEqual([pr.exitcode for pr in procs], [0] * n)
+            entries = w.load_window(w.window_path(ws))
+            self.assertEqual(len(entries), 1 + n)
+            self.assertEqual(sorted(e["ts"] for e in entries), [1.0] + [10.0 + i for i in range(n)])
+            self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
+
+    def test_without_the_lock_the_same_race_loses_a_sample(self):
+        # Negative control: the pre-fix shape — load, then append+replace after every
+        # sibling has loaded — drops all but one writer's sample.
+        import multiprocessing as mp
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            w.append_window(ws, IDLE, 1.0)
+            n = 3
+            barrier = mp.Barrier(n)
+
+            def racy(i):
+                path = w.window_path(ws)
+                entries = w.load_window(path)
+                barrier.wait(timeout=20)  # everyone has loaded the same 1 entry
+                entries.append({"ts": 10.0 + i, "state": "s", "raw_state": "r", "patterns": []})
+                w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+
+            ctx = mp.get_context("fork")
+            procs = [ctx.Process(target=racy, args=(i,)) for i in range(n)]
+            for pr in procs:
+                pr.start()
+            for pr in procs:
+                pr.join(30)
+            self.assertEqual(len(w.load_window(w.window_path(ws))), 2)  # 1 + one survivor, not 4
+
+
 class Confidentiality(unittest.TestCase):
     """The rolling window never carries pane text and every file is owner-only."""
 
