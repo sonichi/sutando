@@ -66,7 +66,7 @@ carry their own), at the handler's probe, before any claim:
 **Every emitter claims first.** An instance that decides it may emit acquires the
 task-specific claim (a hard link in `state/task-event-handler-claims/`, keyed on the
 task's CANONICAL ID — see below) and emits only if it wins; a loser suppresses. This holds for the
-named target, the pinned target, a bound-set member and the core stand-in alike —
+named target, the pinned target, the room's bound instance and the core stand-in alike —
 being addressed selects a *candidate*, it does not confer ownership.
 
 **"Fresh" below means ELIGIBLE, not merely beating.** A target is eligible when
@@ -575,8 +575,8 @@ neither replaces the other.
 
 **And a target checks its OWN verdict before claiming.** The eligibility rule above
 tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
-2 letting the named worker, the pinned worker, a dedicated worker and every bound-set
-member claim unconditionally — so an instance the core has recorded `wedged` can still
+2 letting the named worker, the pinned worker, a dedicated worker and the room's bound
+instance claim unconditionally — so an instance the core has recorded `wedged` can still
 win the claim and strand the task, which is the exact state the stand-in exists to
 rescue. So each branch below is read as: **act only if my own beat is fresh AND the record
 says `eligible` or says nothing about me; a stale beat OR a `wedged` verdict
@@ -592,9 +592,10 @@ claiming, which is the case that hurts.
    Names an instance whose beat is stale: the core claims and emits (stand-in),
    workers suppress.
 2. No field, and the room addresses this worker — it is **pinned** to it, or
-   this is a **dedicated** worker's own room: claim, then emit. Pinned to a bound set
-   this worker belongs to: members race for the same claim; the winner emits and the
-   losers suppress. Pinned to a FRESH instance that is not this one: **suppress**
+   this is a **dedicated** worker's own room: claim, then emit. Pinned to a set whose
+   `instances[0]` is this worker: the same — claim, then emit. Pinned to a set this worker
+   is in but NOT at position 0: **suppress** (it is standby, not a claimant). Pinned to a
+   FRESH instance that is not this one: **suppress**
    — the core included. A pin is addressing, so the core is a non-target here
    exactly as a worker is, and rule 3 must not be reached. Pinned to an instance
    whose beat is stale: the pin is unclaimable, so it falls through to rule 3 and
@@ -716,9 +717,10 @@ both workers suppress without taking a claim, the core then takes the claim on
 that key, wins it uncontested, and consumes exactly once. The stand-in is not
 exempt from the claim; it is simply the only instance contending for it here.
 
-The bound-set case is the one place the claim arbitrates target-against-target,
-and it is the case it was designed for: every member is a target, so the winner
-emits and the losers suppress rather than discard. Elsewhere the claim is still
+A repin is the one place the claim arbitrates target-against-target, and only for
+the bounded window in which an outgoing and an incoming `instances[0]` both read
+themselves as bound; a set's later members are standby and never claimants, so
+there is no steady-state target-against-target. Elsewhere the claim is still
 load-bearing — Trace A is target-against-stand-in — but only ever between one
 target and the core.
 
@@ -791,7 +793,10 @@ rooms must be kept off the same worker:
   about two workers INSIDE one. Measured against the production claim: *different task keys,
   same room -> 0, 0* (both won), against a control *one group key -> 0, 1*. Making that safe
   needs group identity, group admission, group release and a multi-room story; a single bound
-  instance needs none of it.
+  instance needs none of it. To be exact about what "contended" means here: a repin DOES
+  create a bounded window of contention, and the per-task claim — which already exists and
+  already arbitrates it — is what covers it. What v1 does not need is a second, ROOM-scoped
+  lease layered on top of that claim.
 
   **The one window this leaves is a repin**, and it is bounded and benign: between the core's
   rewrite and a worker's next re-read, the outgoing instance may still read itself as bound.
@@ -939,8 +944,8 @@ not justify a timer of their own, so no `proactive-loop-pool` skill ships.
    older than `stand_in_after_s` (default 300) **and** the worker holds no
    claimed task, plus one sweep of grace after its last finish. "Addressed to
    it" is every route in the routing rule, not the pin alone: a
-   `requested_worker` task, a task in a room pinned to it or to a bound set it
-   belongs to, and a dedicated worker's own room. Scoping this to pinned rooms
+   `requested_worker` task, a task in a room whose `instances[0]` is it, and a
+   dedicated worker's own room. Scoping this to pinned rooms
    would leave the other three routes with a wedged target that is never
    ineligible, so rules 1 and 2 suppress on it forever. This is the claim-only
    form of #3604's claimed-load, busy-deferral cap and post-busy grace

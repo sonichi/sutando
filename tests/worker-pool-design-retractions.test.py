@@ -46,6 +46,13 @@ RETRACTED = [
      "a bound set that races needs a group lease v1 does not define. A room has ONE "
      "bound instance (instances[0]); later entries are a failover order the CORE "
      "consults on a binding rewrite, never a set workers contend for."),
+    ("every member is a target",
+     "a set's later members are STANDBY and never claimants. Only a repin makes two "
+     "instances momentarily both read themselves as instances[0], and the per-task "
+     "claim already arbitrates that window."),
+    ("members race for the same claim",
+     "same retraction, in the routing rule: pinned-to-a-set means claim only when this "
+     "worker IS instances[0]; otherwise suppress."),
 ]
 
 
