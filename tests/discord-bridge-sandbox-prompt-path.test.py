@@ -15,6 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 _BRIDGE_CCD = tempfile.mkdtemp(prefix="sandbox-prompt-ccd-")
 os.environ["CLAUDE_CONFIG_DIR"] = _BRIDGE_CCD
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")  # hermetic: never the host's
 _bridge_ch = Path(_BRIDGE_CCD) / "channels" / "discord"
 _bridge_ch.mkdir(parents=True, exist_ok=True)
 (_bridge_ch / "access.json").write_text(json.dumps({"allowFrom": ["4242"]}))
