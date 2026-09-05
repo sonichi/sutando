@@ -124,9 +124,9 @@ def _render(msg, clip=CLIP):
     body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:
-        # A top-level attachment lives outside `content`, so a file-only message
-        # rendered as a BLANK LINE — the forward bug, one branch over.
-        marks = _attachment_marks(msg.get("attachments"))
+        # A top-level attachment lives outside `content` (file-only messages
+        # rendered blank); its FILENAME is user-supplied, so the marks redact too.
+        marks = [_redact(m) for m in _attachment_marks(msg.get("attachments"))]
         body = body[:clip] if clip is not None else body
         return " ".join(x for x in (body, *marks) if x)
     fwd = (snaps[0].get("message") or {})
