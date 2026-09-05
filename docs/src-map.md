@@ -279,6 +279,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).
 - **`supervisor.py`** — Runtime supervisor pass: detector -> manager -> projector, one turn.
+- **`tui_gate.py`** — A TUI gate as a HumanRequirement with semantic actions, and the keys that answer it.
 
 ## `src/launchd/`
 
