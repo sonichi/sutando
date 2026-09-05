@@ -752,6 +752,58 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
     return sorted(found)
 
 
+
+def check_cli_wedge() -> dict:
+    """Advisory CLI progress detector over the core's tmux pane (src/cli_wedge.py).
+
+    Case 1: the RAW pane unchanged while work is outstanding. Case 2: the
+    pane moves but revisits states already seen (retry loop). It reads the
+    pane, not the process — a green here is not core health — and it only
+    ever warns: nothing keys recovery off this check, and no failure inside
+    it may escape (an unwritable or corrupt window is "no reading").
+    """
+    check = {"name": "cli-wedge", "status": "ok", "detail": ""}
+    try:
+        import cli_wedge  # src/ is on sys.path (see the workspace_default import)
+    except Exception as e:  # noqa: BLE001 — a missing detector is a detail, not a failure
+        check["detail"] = f"detector unavailable: {e}"
+        return check
+    record = _local_core_record()
+    socket = record.get("socket") if record else None
+    if not socket:
+        check["detail"] = "no local core pane to read (no fresh heartbeat on this host)"
+        return check
+    # Socket AND session from the SAME heartbeat record; the module's own
+    # capture/identity through the tmux binary and healed PATH every probe uses.
+    tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
+    session = record.get("session") or os.environ.get("SUTANDO_TMUX_SESSION", cli_wedge.DEFAULT_SESSION)
+    target = cli_wedge.core_target(socket, session, tmux_bin=tmux_bin, env=env)
+    # A core sampling the pane it runs in sees its own output move; the static case could never accumulate.
+    inside = cli_wedge.sampled_from_inside(socket, target, tmux_bin=tmux_bin, env=env) if target else None
+    if inside:
+        check["detail"] = f"skipped — sampled from inside the pane it watches ({inside})"
+        return check
+    frame = cli_wedge.capture_pane(socket, target, tmux_bin=tmux_bin, env=env) if target else None
+    if frame is None:
+        check["detail"] = f"pane not readable (session {session!r}) — no reading, not a verdict"
+        return check
+    now = time.time()
+    pane = cli_wedge.pane_identity(socket, target, tmux_bin=tmux_bin, env=env)
+    try:
+        entries = cli_wedge.append_window(WORKSPACE_DIR, frame, now, pane=pane)
+        verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR, now), now)
+    except Exception as e:  # noqa: BLE001 — an advisory check must never abort the run
+        check["detail"] = f"no reading — window state unusable ({type(e).__name__}: {e})"
+        return check
+    check["status"] = "warn" if verdict.get("warn") else "ok"
+    check["detail"] = (f"{verdict['kind']} ({verdict['confidence']}): {verdict['reason']}"
+                       " — advisory; reads the pane, not the process")
+    check["evidence"] = {k: verdict.get(k) for k in
+                         ("duration", "sample_count", "novel_state_count", "novelty_rate",
+                          "matched_patterns", "current_patterns", "consecutive_pattern_samples",
+                          "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
+    return check
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -5041,6 +5093,14 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
     function). Returning None when this host has no fresh heartbeat is right:
     "no local core is running" is not evidence that a core bypasses the proxy.
     """
+    record = _local_core_record(workspace)
+    return record.get("socket") if record else None
+
+
+def _local_core_record(workspace: Optional[Path] = None) -> Optional[dict]:
+    """This HOST's freshest live heartbeat RECORD (multi-label, newest wins) — the
+    one object every consumer should take socket AND session from, so a probe
+    cannot pair one record's socket with another's session (or a default)."""
     if workspace is None:
         workspace = WORKSPACE_DIR
     cores_dir = workspace / "state" / "cores"
@@ -5048,7 +5108,7 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         return None
     labels = _local_host_labels()
     now = time.time()
-    best_mtime, best_socket = None, None
+    best_mtime, best = None, None
     for alive_file in cores_dir.glob("*.alive"):
         if alive_file.stem not in labels:
             continue                      # another machine's heartbeat
@@ -5063,8 +5123,8 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
-            best_mtime, best_socket = mtime, sock
-    return best_socket
+            best_mtime, best = mtime, payload
+    return best
 
 
 def core_env_has_proxy_url(
@@ -11324,6 +11384,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
+    # Advisory CLI progress detector (pane static with work outstanding / retry
+    # loop); reads the pane, never the process, and drives no recovery.
+    checks.append(check_cli_wedge())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
