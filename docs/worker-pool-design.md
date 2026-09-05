@@ -722,8 +722,8 @@ emits and the losers suppress rather than discard. Elsewhere the claim is still
 load-bearing — Trace A is target-against-stand-in — but only ever between one
 target and the core.
 
-A task is eligible to exactly one instance except inside a bound set, where the
-claim settles it. A later form of addressing (an app control, a room command, a
+A task is eligible to exactly one instance: the room's `instances[0]`.
+There is no bound set to race over — see the binding table. A later form of addressing (an app control, a room command, a
 skill that binds a task to a worker at mint time) enters at the same point: it
 either sets `requested_worker` or writes the pin table, and the rule above is
 unchanged. There is no least-loaded fallback, no automatic binding of a
@@ -776,24 +776,29 @@ rooms must be kept off the same worker:
 }
 ```
 
-- **A room's set is a FAILOVER order, not a concurrency grant — v1 admits one worker per
-  room at a time.** Two members claiming two different tasks for the same room would each win
+- **A room has exactly ONE bound instance at a time; the rest of `instances` is a failover
+  ORDER the CORE consults, never a set workers race over.** `instances[0]` is the binding.
+  A worker claims a room's task only if it reads itself as `instances[0]`; the later entries
+  are not eligible and do not race. Failover is a **binding rewrite**: when the core declares
+  a worker dead it moves that name out of position 0 and `os.replace`s the file — the same
+  single-writer, atomic path the table above already specifies. No lease is required, and none
+  is defined, because nothing is ever contended.
+
+  This is chosen over the alternative — a set with a group lease — because the lease is the
+  part v1 does not have. Two members claiming two different tasks for one room would each win
   their task-specific claim and then drive one room's context concurrently, which
-  `distinct-instance` does not prevent: that rule separates rooms across workers, and says
-  nothing about two workers inside one room. Measured by a reviewer against the production
-  claim: *different task keys, same room -> claim results 0, 0* (both won), against a control
-  *using one group key -> 0, 1* (one won). Making concurrency safe needs a group-scoped lease
-  keyed on the room — group identity, group admission, group release, and a story for
-  multi-room groups — and none of that is in v1. So it is **scoped out explicitly** rather
-  than left implied: a room's second and later `instances` entries are STANDBY, eligible only
-  when no earlier member holds the room's lease. A later PR may add true fan-out; until it
-  does, a set is redundancy, not parallelism.
-- **`instances` is a membership set, and the claim settles which member takes a given
-  task** — the same rule the routing section states for a bound set. Nothing hands out
-  turns, so a strict preference order between racing workers is not enforceable and must
-  not be implied: every eligible member (beat fresh, not quiesced) may claim, and the
-  first rename wins. Order carries operator preference only where a **single** reader is
-  choosing — the core picking a stand-in — never as a promise about a race.
+  `distinct-instance` cannot prevent: that rule separates rooms ACROSS workers and says nothing
+  about two workers INSIDE one. Measured against the production claim: *different task keys,
+  same room -> 0, 0* (both won), against a control *one group key -> 0, 1*. Making that safe
+  needs group identity, group admission, group release and a multi-room story; a single bound
+  instance needs none of it.
+
+  **The one window this leaves is a repin**, and it is bounded and benign: between the core's
+  rewrite and a worker's next re-read, the outgoing instance may still read itself as bound.
+  Trace B already covers the same-task case — the claim settles it and the loser suppresses.
+  For two *different* tasks the outgoing worker is, by construction, the one the core just
+  declared unreachable, so this is not the healthy-pair concurrency the paragraph above rules
+  out. A later PR may add true fan-out; until then a set is redundancy, not parallelism.
 - **Every entry ineligible is not an error**: the room falls to the core, exactly as an
   unreadable file does. A binding exists to stop scatter, never to stop work.
 - **`distinct-instance`** means no single worker may hold bindings for two rooms in the

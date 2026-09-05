@@ -42,6 +42,10 @@ RETRACTED = [
      "the task file is written BEFORE the notification, so its presence is true on "
      "both sides of the emit and cannot prove publication. The ticker branches on the "
      "task's CLAIM state, never on its existence."),
+    ("the claim settles which member takes a given",
+     "a bound set that races needs a group lease v1 does not define. A room has ONE "
+     "bound instance (instances[0]); later entries are a failover order the CORE "
+     "consults on a binding rewrite, never a set workers contend for."),
 ]
 
 
