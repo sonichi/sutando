@@ -865,8 +865,9 @@ _refuse_foreign_host_deletions() {
 # reader prefer a stale snapshot over the live root file.
 #
 # Secret-safe: copies ONLY access.json, never the sibling .env (bot tokens).
-# Non-fatal by construction: every step tolerates failure and the function
-# returns 0, so a snapshot hiccup can never block the push.
+# Config copies are best-effort (return 0). The build_log snapshot is not: a
+# per-host copy left PARTIAL by a failed write returns 3 and the caller withholds
+# that tick's push rather than vault a truncated log.
 _snapshot_per_host_config() {
     local _cfg
     _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
@@ -1769,7 +1770,8 @@ _push_only_impl() {
     # credential-shaped paths AFTER (see the two functions' rationale).
     # Back up per-host config ($CLAUDE_CONFIG_DIR settings.json + channel
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
-    # a rebuild. Non-fatal: never blocks the push.
+    # a rebuild. Config failures are non-fatal; a PARTIAL build_log snapshot (rc 3) is
+    # the one case that withholds the push — see the branch below.
     local _snap_rc=0
     _snapshot_per_host_config || _snap_rc=$?
     if [ "$_snap_rc" -eq 3 ]; then
