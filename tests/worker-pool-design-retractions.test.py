@@ -3,6 +3,7 @@
 A line narrating its own retraction is exempt, or this flags the fix itself.
 """
 import pathlib
+import re
 import unittest
 
 DOC = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design.md"
@@ -85,8 +86,12 @@ def live_hits(text, phrase):
         if not buf:
             return
         flat = " ".join(" ".join(buf).split())
-        if phrase in flat and not any(h in flat.lower() for h in HISTORICAL):
-            out.append(start)
+        # Per SENTENCE, not per paragraph: a paragraph-wide exemption lets a
+        # live re-assertion ride along beside any retraction narration.
+        for sent in re.split(r"(?<=[.:;])\s+", flat):
+            if phrase in sent and not any(h in sent.lower() for h in HISTORICAL):
+                out.append(start)
+                return
 
     for i, line in enumerate(text.splitlines(), 1):
         if line.strip():
@@ -180,6 +185,33 @@ class RetractedClaimsStayRetracted(unittest.TestCase):
         for phrase, _ in RETRACTED:
             self.assertEqual(
                 live_hits(f"an earlier revision said {phrase} here", phrase), [])
+
+
+class ExemptionIsSentenceScoped(unittest.TestCase):
+    """A re-assertion beside a retraction narration must still be caught.
+
+    Reported by @yixuan-ag2 against 8e0ba96b with the control pair below: the
+    exemption was judged over the whole flattened paragraph, so any pin phrase
+    co-located with a HISTORICAL token went silently exempt -- and the exempt
+    paragraphs are precisely the ones discussing retractions.
+    """
+
+    def test_a_live_reassertion_inside_an_exempt_paragraph_is_caught(self):
+        for phrase, _ in RETRACTED:
+            exempt = ("An earlier revision used to claim this, and it was "
+                      "retracted. " + phrase + " remains true of the ticker.")
+            self.assertTrue(
+                live_hits(exempt, phrase),
+                "%r rode along beside a HISTORICAL token" % phrase,
+            )
+
+    def test_the_narration_itself_is_still_exempt(self):
+        for phrase, _ in RETRACTED:
+            narration = "An earlier draft said " + phrase + " and that was retracted."
+            self.assertEqual(
+                live_hits(narration, phrase), [],
+                "%r false-positived on its own retraction" % phrase,
+            )
 
 
 class EveryPinCanFire(unittest.TestCase):
