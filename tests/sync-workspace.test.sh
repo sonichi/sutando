@@ -1515,6 +1515,54 @@ esac
 
 # ============================================================================
 echo
+echo "==== Test 29: reserved snapshot temps never reach the vault on the DEFAULT path, even with an operator-edited exclude ===="
+# The default (bidirectional) tick commits local edits BEFORE the pull; an operator-edited exclude
+# is kept as-is, so it may lack the built-in denies. The guard must hold at that boundary too.
+t29_run() {  # $1 root  $2 host  $3 operator|canonical  -> prints "<snap in vault> <repair in vault> <build_log in vault>"
+  local root="$1" host="$2" mode="$3" vault="$1/vault.git" ws="$1/ws" br="refs/heads/host/$2/t29ws" repo="$1/repo"
+  # Own fixture repo: hosts/*/ is carried only when the config lists it (the shared fixture does not).
+  mkdir -p "$ws/hosts/$host" "$repo/scripts" "$repo/src"; git init -q --bare "$vault"; git init -q "$repo"; touch "$repo/CLAUDE.md"
+  cp "$FIXTURE_REPO/scripts/"*.sh "$repo/scripts/"; cp "$FIXTURE_REPO/src/sutando_config.py" "$repo/src/"
+  printf '%s\n' '{"workspace":{"path":"${REPO_DIR}/workspace"},"vault":{"enabled":false,"sync":{"include":["notes/","build_log.md","hosts/*/"],"exclude":[]}}}' > "$repo/sutando.config.json"
+  local envv=(SUTANDO_REPO_DIR="$repo" SUTANDO_WORKSPACE="$ws" SUTANDO_TEST_MODE=1 SUTANDO_WS_ID_OVERRIDE=t29ws SUTANDO_HOST_OVERRIDE="$host" SUTANDO_SYNC_LOCK_DIR="$root/lock.d")
+  env "${envv[@]}" bash "$repo/scripts/sync-workspace.sh" --vault-url "$vault" --init >/dev/null 2>&1
+  if [ "$mode" = operator ]; then
+    # An exclude from before the denies existed, with one operator rule so the refresh is refused.
+    grep -v 'snap\.??????\|repair\.??????' "$ws/.git/info/exclude" > "$ws/.git/info/exclude.new" && mv "$ws/.git/info/exclude.new" "$ws/.git/info/exclude"
+    echo '!my/operator/rule' >> "$ws/.git/info/exclude"
+  fi
+  printf 'log\n'  > "$ws/hosts/$host/build_log.md"
+  printf 'temp\n' > "$ws/hosts/$host/build_log.md.snap.AB12cd"
+  printf 'sha\n'  > "$ws/hosts/$host/.build_log.snapshot-sha.repair.CD34ef"
+  SUTANDO_FORCE_SYNC=1 env "${envv[@]}" bash "$repo/scripts/sync-workspace.sh" --vault-url "$vault" >/dev/null 2>&1
+  local a=0 b=0 c=0
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/build_log.md.snap.AB12cd" 2>/dev/null && a=1
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/.build_log.snapshot-sha.repair.CD34ef" 2>/dev/null && b=1
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/build_log.md" 2>/dev/null && c=1
+  echo "$a $b $c"
+}
+T29_OP="$TEST_ROOT/t29-operator"; mkdir -p "$T29_OP"
+t29_op="$(t29_run "$T29_OP" t29host operator)"
+if [ "$t29_op" = "0 0 1" ]; then
+  echo "  OK: operator-edited exclude, default path: build_log vaulted, neither reserved temp is (snap repair log = $t29_op)"; pass=$((pass+1))
+else
+  echo "  FAIL: operator-edited exclude, default path: snap repair log = $t29_op (want 0 0 1)"; fail=$((fail+1))
+fi
+if grep -q '!my/operator/rule' "$T29_OP/ws/.git/info/exclude" && ! grep -q 'snap\.??????' "$T29_OP/ws/.git/info/exclude"; then
+  echo "  OK: ...and the operator's exclude was left as-is (rule kept, denies still absent) — the guard, not the exclude, did it"; pass=$((pass+1))
+else
+  echo "  FAIL: the operator's exclude was rewritten, so this run did not exercise the guard"; fail=$((fail+1))
+fi
+T29_CN="$TEST_ROOT/t29-canonical"; mkdir -p "$T29_CN"
+t29_cn="$(t29_run "$T29_CN" t29ctl canonical)"
+if [ "$t29_cn" = "0 0 1" ]; then
+  echo "  OK: control — canonical exclude, default path: same outcome (snap repair log = $t29_cn)"; pass=$((pass+1))
+else
+  echo "  FAIL: control — canonical exclude: snap repair log = $t29_cn (want 0 0 1)"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail

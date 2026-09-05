@@ -716,10 +716,8 @@ check "...and a partial destination with no usable source keeps its intent and w
 rm -f "$_stg" "$_INT"
 
 echo "17. the WRITER DIES mid-replace: a signal exit is an UNKNOWN outcome, verified, never pushed as whole"
-# The shim runs the real interpreter on the --replace mode with one call patched to SIGKILL the
-# process: after the real truncate (destination now EMPTY), or before it (destination untouched).
-# The caller then sees exit 137, not the 3 that names a partial write. `--rollforward` may be
-# limited to one block so the same-tick recovery also stops short.
+# The shim SIGKILLs the real --replace after the truncate (destination EMPTY) or before it; the
+# caller sees 137, not the 3 that names a partial write. --rollforward may be limited to one block.
 _kill_shim() {
     _kz="$(mktemp -d)"
     if [ "$1" = after-truncate ]; then

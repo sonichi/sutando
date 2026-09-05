@@ -816,11 +816,6 @@ _enforce_carrier_set_pre() {
     fi
 }
 
-# Carrier-set enforcement, post-stage half — refuse credential-shaped files
-# at the staging boundary even when exclude rules missed them (defense in
-# depth; the exclude file is config, this is policy). File-level refusal,
-# not run-level: dying here would wedge every future tick behind one bad
-# path — silent staleness, the exact failure mode sync exists to prevent.
 # The reserved snapshot temps stay out of every commit whatever the exclude file says: an
 # operator-edited file is kept as-is (refused refresh), so it may predate the built-in denies.
 _unstage_reserved_temps() {
@@ -834,6 +829,11 @@ _unstage_reserved_temps() {
     return 0
 }
 
+# Carrier-set enforcement, post-stage half — refuse credential-shaped files
+# at the staging boundary even when exclude rules missed them (defense in
+# depth; the exclude file is config, this is policy). File-level refusal,
+# not run-level: dying here would wedge every future tick behind one bad
+# path — silent staleness, the exact failure mode sync exists to prevent.
 _refuse_staged_secrets() {
     local _secret_hits=0 _sf
     while IFS= read -r -d '' _sf; do
@@ -1391,6 +1391,7 @@ _init_impl() {
     # inner/outer boundary that the in-tree .gitignore previously breached
     # (2026-06-04 leak fix).
     git add -A 2>/dev/null || true
+    _unstage_reserved_temps
     _refuse_staged_secrets
     # First-init must push a host branch to the vault even on an empty
     # workspace (no carrier-set files yet). The pre-(6) layout had an
@@ -1665,6 +1666,7 @@ _migrate_flat_anchor() {
 _commit_local_pre_pull() {
     generate_exclude 2>/dev/null || true
     git add --ignore-removal . 2>/dev/null || true
+    _unstage_reserved_temps
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
             && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"

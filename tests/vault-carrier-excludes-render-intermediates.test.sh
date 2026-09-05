@@ -473,9 +473,8 @@ check "the widened temp file is removed on every return path" \
     test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
 
 
-# An OPERATOR-edited exclude file is kept as-is (refused refresh), so it may predate the built-in
-# denies. The reserved temp families must still stay out of the index: real git add -A, then the
-# push path's guard, loaded from the script (a missing guard leaves the stub, which keeps nothing out).
+# An operator-edited exclude may predate the built-in denies; the guard (loaded from the script, a
+# missing one leaves the stub that keeps nothing out) must still keep the temps out after git add -A.
 _unstage_reserved_temps() { :; }
 eval "$(sed -n '/^_unstage_reserved_temps() {/,/^}$/p' "$SYNC_SH")"
 log() { :; }
@@ -500,6 +499,8 @@ check "...while the real build_log beside them stays staged" \
     test "$(git -C "$OPS" ls-files --cached hosts/H/build_log.md | wc -l | tr -d ' ')" -eq 1
 check "...and the guard runs in the push path right after git add -A" \
     bash -c 'grep -A1 -E "^    git add -A$" <<< "$1" | grep -q "_unstage_reserved_temps"' _ "$SYNC_CODE"
+check "...and after every staging site: push (git add -A), init (git add -A || true), pre-pull (git add --ignore-removal .)" \
+    test "$(grep -A1 -E '^    git add (-A|--ignore-removal \.)( 2>/dev/null \|\| true)?$' <<< "$SYNC_CODE" | grep -c '_unstage_reserved_temps')" -eq 3
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ]
