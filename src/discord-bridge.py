@@ -3973,14 +3973,8 @@ async def _handle_discord_message(message, force=False):
     user_task_text = confine_user_content(
         f"[Discord @{username}] {text}{attachment_note}{reply_context}"
     )
-    # Write task text to a /tmp file and reference via `"$(cat ...)"` heredoc
-    # form instead of shlex.quote'ing it inline. Reason: codex's stdin parser
-    # hangs 7-20min on nested-quote escapes (`'"'"'` style) that arise when
-    # the agent's Bash tool eval-wraps the bridge-injected codex command. The
-    # heredoc form has no nesting depth at any layer; codex receives the file
-    # contents directly via shell command substitution. Per memory
-    # `feedback_codex_nested_quotes_hang_stdin` (Lucy 2026-05-08) + reproduced
-    # live 2026-05-09 PT on Mini coord ping (task-1778363006905, hung 7+min).
+    # The prompt reaches codex as argv through a quoted heredoc the core's shell expands:
+    # no file on disk, and no nested quoting for codex's stdin parser to hang on.
     #
     # Sutando-identity preamble for codex-sandbox-tier tasks (team/other).
     # Without this, codex answers identity/capability questions about ITSELF
