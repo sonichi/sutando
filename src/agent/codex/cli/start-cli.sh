@@ -306,7 +306,18 @@ if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
   # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
-  python3 "$REPO/src/core_heartbeat.py" --stop >/dev/null 2>&1 || true
+  # The repository resolver picks the interpreter; with none, say so rather than sweep or guess.
+  _hb_py=""
+  if [ -r "$REPO/scripts/python-binary.sh" ]; then
+    # shellcheck source=scripts/python-binary.sh
+    . "$REPO/scripts/python-binary.sh"
+    _hb_py="$(resolve_python "$REPO" 2>/dev/null || true)"
+  fi
+  if [ -n "$_hb_py" ]; then
+    "$_hb_py" "$REPO/src/core_heartbeat.py" --stop >/dev/null 2>&1 || echo "WARN heartbeat handoff (--stop) failed — old writer may still be running" >&2
+  else
+    echo "WARN no runnable python3 for the heartbeat handoff — old writer left running" >&2
+  fi
 elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
   # Sessions created before runtime markers existed are Claude sessions. Never
   # attach a selected Codex launcher to an unknown/foreign canonical session.

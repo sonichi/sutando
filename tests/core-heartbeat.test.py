@@ -28,7 +28,7 @@ _ARGV_PARSE = ('#!/bin/sh\nsock=""; sess=""; prev=""\nfor a in "$@"; do\n  case 
                '  prev="$a"\ndone\n')
 
 
-EXPORTED_CLIENT = 'case "$*" in\n  *-V*) echo \'tmux 3.5a\';;\n  *has-session*) [ "$sess" = real ] && exit 0 || { echo "no such session: $sess" >&2; exit 1; };;\n  *list-sessions*) case "$*" in *socket_path*) echo "$sock";; *) echo real;; esac;;\n  *list-panes*) [ "$sess" = real ] && echo 4242 || exit 1;;\n  *display-message*) [ "$sess" = real ] && echo "3.5a|$sock|real" || { echo "no such session" >&2; exit 1; };;\n  *) exit 1;;\nesac\n'
+EXPORTED_CLIENT = 'case "$*" in\n  *-V*) echo \'tmux 3.5a\';;\n  *has-session*) [ "$sess" = real ] && exit 0 || { echo "no such session: $sess" >&2; exit 1; };;\n  *list-sessions*) case "$*" in *socket_path*) echo "$sock";; *) echo real;; esac;;\n  *list-panes*) [ "$sess" = real ] && echo 4242 || exit 1;;\n  *display-message*) [ "$sess" = real ] && echo "3.5a|$sock|" || { echo "no such session" >&2; exit 1; };;\n  *) exit 1;;\nesac\n'
 
 
 def _wait_file(path, deadline_s=5.0):
@@ -246,8 +246,9 @@ class TestHeartbeatWrite(unittest.TestCase):
         # display-message succeeds only when `speaks`; -V always answers.
         f = self.tmp / name
         refuse = "echo 'protocol version mismatch (client 8, server 9)' >&2; exit 1"
-        body = (_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *list-sessions*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n") % (
-            version, ('echo "$sock"' if speaks else refuse), (('echo "%s|$sock|$sess"' % version) if speaks else refuse))
+        # Real tmux renders #{session_name} EMPTY under -t (TustinOC, 3.5a and 3.7c): the fake does the same.
+        body = (_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *list-sessions*) %s;;\n  *has-session*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n") % (
+            version, ('echo "$sock"' if speaks else refuse), ('exit 0' if speaks else refuse), (('echo "%s|$sock|"' % version) if speaks else refuse))
         f.write_text(body); f.chmod(0o755); return str(f)
 
     def test_tmux_backend_records_a_client_verified_against_the_socket(self):
@@ -277,7 +278,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         # a lying SUTANDO_TMUX_SESSION left the payload unverified with a compatible client present.
         import core_heartbeat
         f = self.tmp / "tmux"
-        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *'-t =real'*) echo \"3.6b|$sock|real\";;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n")
+        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *has-session*'-t =real'*) exit 0;;\n  *display-message*'-t =real'*) echo \"3.6b|$sock|\";;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n")
         f.chmod(0o755)
         _obs, _pid = core_heartbeat._observed_session, core_heartbeat.core_pid
         core_heartbeat._observed_session = lambda sock: "real"
@@ -298,8 +299,9 @@ class TestHeartbeatWrite(unittest.TestCase):
         ver = self.tmp / "server-version"
         # PATH is pinned to the temp dir below, so the stand-in must use absolute tool paths.
         f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo \"tmux $(/bin/cat '%s' 2>/dev/null || echo none)\";;\n"
-                     "  *display-message*) [ -s '%s' ] && echo \"$(/bin/cat '%s')|$sock|$sess\" || { echo 'no server running' >&2; exit 1; };;\n"
-                     "  *) exit 1;;\nesac\n" % (ver, ver, ver))
+                     "  *has-session*) [ -s '%s' ] && exit 0 || { echo 'no server running' >&2; exit 1; };;\n"
+                     "  *display-message*) [ -s '%s' ] && echo \"$(/bin/cat '%s')|$sock|\" || { echo 'no server running' >&2; exit 1; };;\n"
+                     "  *) exit 1;;\nesac\n" % (ver, ver, ver, ver))
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
             first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")        # cold boot: no server yet
@@ -319,7 +321,8 @@ class TestHeartbeatWrite(unittest.TestCase):
             b = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
         self.assertEqual((b["tmux_verified"], b["tmux_candidates"]), (False, [str(self.tmp / "absent")]))
         f = self.tmp / "tmux"
-        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *display-message*) echo \"3.6b|$sock|$sess\"; /bin/rm -f \"$0\";;\n  *) exit 1;;\nesac\n")
+        # speaks (socket + session), then is gone before -V is asked
+        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) /bin/rm -f \"$0\"; exit 1;;\n  *has-session*) exit 0;;\n  *display-message*) echo \"3.6b|$sock|\";;\n  *) exit 1;;\nesac\n")
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
             b2 = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
@@ -333,16 +336,16 @@ class TestHeartbeatWrite(unittest.TestCase):
             b = core_heartbeat._tmux_backend(sock="/tmp/definitely-no-server.sock", sess="nope")
         self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
                          (None, None, None, False), b)
-        for name, out in (("bare-version", "echo '3.6b'"), ("other-socket", "echo \"3.6b|/tmp/other.sock|$sess\""),
-                          ("other-session", "echo \"3.6b|$sock|someone-else\"")):
+        for name, out, hs in (("bare-version", "echo '3.6b'", "exit 0"), ("other-socket", "echo \"3.6b|/tmp/other.sock|\"", "exit 0"),
+                              ("no-such-session", "echo \"3.6b|$sock|\"", "echo \"can't find session\" >&2; exit 1")):
             f = self.tmp / name
-            f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % out)
+            f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *has-session*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % (hs, out))
             f.chmod(0o755)
             with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
                 b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
             self.assertFalse(b["tmux_verified"], (name, b))
         g = self.tmp / "odd-version"   # speaks, but its -V is not a tmux banner
-        g.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'something 9.9';;\n  *display-message*) echo \"3.6b|$sock|$sess\";;\n  *) exit 1;;\nesac\n")
+        g.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'something 9.9';;\n  *has-session*) exit 0;;\n  *display-message*) echo \"3.6b|$sock|\";;\n  *) exit 1;;\nesac\n")
         g.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(g), "PATH": str(self.tmp / "empty")}):
             b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
@@ -384,6 +387,10 @@ class TestHeartbeatWrite(unittest.TestCase):
         codex = (ROOT / "src" / "agent" / "codex" / "cli" / "start-cli.sh").read_text()
         self.assertIn('core_heartbeat.py" --stop', restart)
         self.assertIn('core_heartbeat.py" --stop', codex)
+        self.assertNotIn('pkill -f "$REPO/src/core_heartbeat.py"', restart)   # no argv sweep as a fallback
+        self.assertIn('"$PY_BIN" "$REPO/src/core_heartbeat.py" --stop', restart)
+        self.assertNotIn('python3 "$REPO/src/core_heartbeat.py" --stop', codex)  # resolver, not bare python3
+        self.assertIn('resolve_python "$REPO"', codex[:codex.index('core_heartbeat.py" --stop')])
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
     def test_stop_other_writers_in_process_ends_a_stand_in_and_reports_it(self):
@@ -407,6 +414,8 @@ class TestHeartbeatWrite(unittest.TestCase):
             self.assertIsNone(bystander.poll())
             self.assertFalse(core_heartbeat._is_writer_argv(f"python3 -c import time; time.sleep(60) {script} not-a-writer", script))
             self.assertTrue(core_heartbeat._is_writer_argv(f"/opt/py/bin/python3.12 {script} --interval 60", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(
+                f"/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python {script} --interval 60", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"bash {script}", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"python3 {script}x", script))
         finally:

@@ -164,15 +164,19 @@ def _tmux_backend(sock: str | None = None, sess: str | None = None) -> dict:
     chosen, server_version = None, None
     for binary in seen:
         try:
-            # Bounded: two candidates on a 30 s beat must not spend 10 s on a hung binary.
+            # Bounded (a hung binary must not eat the beat). The server proves itself by socket path; tmux
+            # renders #{session_name} EMPTY under -t, so the session is RESOLVED by has-session, not rendered.
             r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}",
-                                "#{version}|#{socket_path}|#{session_name}"],
+                                "#{version}|#{socket_path}"], capture_output=True, text=True, timeout=2)
+            parts = (r.stdout or "").strip().split("|")
+            if not (r.returncode == 0 and len(parts) >= 2 and parts[0] and " " not in parts[0]
+                    and _same_socket(parts[1], sock)):
+                continue
+            h = subprocess.run([binary, "-S", sock, "has-session", "-t", f"={sess}"],
                                capture_output=True, text=True, timeout=2)
         except Exception:
             continue
-        parts = (r.stdout or "").strip().split("|")
-        if (r.returncode == 0 and len(parts) == 3 and parts[0] and " " not in parts[0]
-                and _same_socket(parts[1], sock) and parts[2] == sess):
+        if h.returncode == 0:
             chosen, server_version = binary, parts[0][:_MAX_FIELD]
             break
     version = None
@@ -643,7 +647,8 @@ def _is_writer_argv(args: str, script: str) -> bool:
         return False
     prefix = args[:i].rstrip()
     after = args[i + len(script):]
-    return (bool(re.search(r"python[0-9.]*$", prefix)) and " -c" not in f" {prefix}"
+    # Apple's framework interpreter reports itself as `.../Python.app/Contents/MacOS/Python`.
+    return (bool(re.search(r"python[0-9.]*$", prefix, re.IGNORECASE)) and " -c" not in f" {prefix}"
             and (after == "" or after[0] == " "))
 
 

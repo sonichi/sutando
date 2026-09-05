@@ -61,10 +61,11 @@ _WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 # The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
 # startup.sh only starts one when none is running, and an old writer keeps its old schema.
-if [ -n "${_VOICE_PY:-}" ]; then
-    "$_VOICE_PY" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null || true
+# No interpreter → no handoff, said aloud; an argv sweep is never the fallback.
+if [ -n "${PY_BIN:-}" ]; then
+    "$PY_BIN" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null || echo "  WARN heartbeat handoff (--stop) failed — the old writer may still be running"
 else
-    pkill -f "$REPO/src/core_heartbeat.py" 2>/dev/null
+    echo "  WARN no runnable python3 for the heartbeat handoff — old writer left running (startup will not replace it)"
 fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
