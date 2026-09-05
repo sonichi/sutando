@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,9 +40,24 @@ sys.modules["dbridge_sandbox_prompt"] = db_bridge
 _bspec.loader.exec_module(db_bridge)
 
 
+def _bash_executable() -> str:
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            root = Path(git).resolve().parent.parent
+            for relative in ("bin/bash.exe", "usr/bin/bash.exe"):
+                candidate = root / relative
+                if candidate.is_file():
+                    return str(candidate)
+    return shutil.which("bash") or "bash"
+
+
+BASH = _bash_executable()
+
+
 def _evaluate(arg: str) -> str:
     """What codex would receive: the argument after the core's shell expands it."""
-    return subprocess.run(["bash", "-c", "printf '%s' " + arg], capture_output=True, text=True).stdout
+    return subprocess.run([BASH, "-c", "printf '%s' " + arg], capture_output=True, text=True).stdout
 
 
 class SandboxPromptArgument(unittest.TestCase):
@@ -74,7 +90,7 @@ class SandboxPromptArgument(unittest.TestCase):
         # Stand-in for sandbox A: it gets A as argv and then searches the workspace state for any prompt.
         script = ("sandbox(){ printf '%s\\n' \"$1\"; ls " + str(db_bridge.STATE_DIR)
                   + "/sandbox-prompts 2>/dev/null | wc -l | tr -d ' '; }; sandbox " + a)
-        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout.splitlines()
+        out = subprocess.run([BASH, "-c", script], capture_output=True, text=True).stdout.splitlines()
         self.assertEqual(out, ["owner request A", "0"])
         self.assertNotIn("request B", " ".join(out))
         self.assertEqual(_evaluate(b), "other sender request B")
