@@ -775,12 +775,15 @@ def check_cli_wedge() -> dict:
     # The module's own capture/identity (one implementation, one target), through
     # the same tmux binary and healed PATH every other probe here uses.
     tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
-    frame = cli_wedge.capture_pane(socket, cli_wedge.DEFAULT_TARGET, tmux_bin=tmux_bin, env=env)
+    record = _fresh_local_core_record() or {}
+    session = record.get("session") or os.environ.get("SUTANDO_TMUX_SESSION", cli_wedge.DEFAULT_SESSION)
+    target = cli_wedge.core_target(socket, session, tmux_bin=tmux_bin, env=env)
+    frame = cli_wedge.capture_pane(socket, target, tmux_bin=tmux_bin, env=env) if target else None
     if frame is None:
-        check["detail"] = "pane not readable — no reading, not a verdict"
+        check["detail"] = f"pane not readable (session {session!r}) — no reading, not a verdict"
         return check
     now = time.time()
-    pane = cli_wedge.pane_identity(socket, cli_wedge.DEFAULT_TARGET, tmux_bin=tmux_bin, env=env)
+    pane = cli_wedge.pane_identity(socket, target, tmux_bin=tmux_bin, env=env)
     try:
         entries = cli_wedge.append_window(WORKSPACE_DIR, frame, now, pane=pane)
         verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR, now), now)

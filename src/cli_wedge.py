@@ -83,9 +83,7 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
 }
 PROVIDER_LIMIT_PATTERNS = ("quota-limit",)
-# Exact session, window 0 — the launcher's core window. A bare `=name` is a pane
-# target and stops resolving once the session has a second window (the app adds `gateway`).
-DEFAULT_TARGET = "=sutando-core:0"
+DEFAULT_SESSION = "sutando-core"
 
 def normalize(frame: str) -> str:
     """Strip volatile fields so two frames differing only in clocks, counters,
@@ -249,7 +247,23 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
 
 # ---- I/O edge -------------------------------------------------------------
 
-def capture_pane(socket_path: str, target: str = DEFAULT_TARGET, tmux_bin: str = "tmux",
+def core_target(socket_path: str, session: str = DEFAULT_SESSION, tmux_bin: str = "tmux",
+                runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
+    """`=<session>:<lowest window index>` — the launcher's core window, whatever
+    base-index says. A bare `=name` is a pane target and stops resolving once the
+    session has a second window; a fixed `:0` assumes base-index 0. None = no reading."""
+    try:
+        proc = runner([tmux_bin, "-S", socket_path, "list-windows", "-t", f"={session}", "-F", "#{window_index}"],
+                      capture_output=True, text=True, timeout=10, env=env)
+    except Exception:  # noqa: BLE001 — a failed probe is an absent reading, never a verdict
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    idx = [int(x) for x in (getattr(proc, "stdout", "") or "").split() if x.isdigit()]
+    return f"={session}:{min(idx)}" if idx else None
+
+
+def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
                  runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
     """One pane frame, or None when tmux cannot be read (absent = no reading).
     The one capture implementation: health-check and the CLI both call this."""
@@ -266,7 +280,7 @@ def capture_pane(socket_path: str, target: str = DEFAULT_TARGET, tmux_bin: str =
 _PANE_ID = re.compile(r"^\d+:\d+$")
 
 
-def pane_identity(socket_path: str, target: str = DEFAULT_TARGET, tmux_bin: str = "tmux",
+def pane_identity(socket_path: str, target: str, tmux_bin: str = "tmux",
                   runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
     """`pane_pid:session_created` for the target, or None when unknown. A new
     core process is a new observation run; None never resets anything."""
@@ -499,7 +513,8 @@ def main(argv: Optional[list] = None) -> int:
     for name in ("record", "probe"):
         p = sub.add_parser(name)
         p.add_argument("--socket", required=True)
-        p.add_argument("--target", default=DEFAULT_TARGET)
+        p.add_argument("--session", default=os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION))
+        p.add_argument("--target", default=None, help="override the resolved =<session>:<window> target")
         p.add_argument("--tmux", default="tmux")
         p.add_argument("--workspace", default=None, help="defaults to the configured workspace")
         if name == "record":
@@ -517,8 +532,13 @@ def main(argv: Optional[list] = None) -> int:
         print(json.dumps(replay(Path(a.path), a.work_outstanding), indent=1))
         return 0
 
+    target = a.target or core_target(a.socket, a.session, a.tmux)
+    if target is None:
+        print(json.dumps({"kind": "unknown", "warn": False, "reason": f"session {a.session!r} not found on {a.socket}"}))
+        return 0
+
     def sampler():
-        return capture_pane(a.socket, a.target, a.tmux)
+        return capture_pane(a.socket, target, a.tmux)
 
     if a.workspace is None:
         a.workspace = str(_default_workspace())
@@ -531,7 +551,7 @@ def main(argv: Optional[list] = None) -> int:
         return 0
     ws = Path(a.workspace)
     now = time.time()
-    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, a.target, a.tmux))
+    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux))
     print(json.dumps(classify_window(entries, work_outstanding(ws, now), now), indent=1))
     return 0
 

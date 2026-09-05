@@ -319,6 +319,14 @@ class IoEdge(unittest.TestCase):
         entries2 = [e(0.0, "100:1"), {"ts": 60.0, "state": "a", "raw_state": "a", "patterns": []}]
         self.assertEqual(len(w.observation_runs(entries2, 2700)), 1)
 
+    def test_core_target_uses_the_lowest_live_window_index(self):
+        run = lambda *a, **k: SimpleNamespace(returncode=0, stdout="1\n2\n")   # base-index 1
+        self.assertEqual(w.core_target("/s", "sutando-core", "tmux", runner=run), "=sutando-core:1")
+        run0 = lambda *a, **k: SimpleNamespace(returncode=0, stdout="0\n1\n")
+        self.assertEqual(w.core_target("/s", "custom", "tmux", runner=run0), "=custom:0")
+        self.assertIsNone(w.core_target("/s", "gone", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout="")))
+        self.assertIsNone(w.core_target("/s", "s", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="")))
+
     def test_pane_identity_probe(self):
         ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
         self.assertEqual(ok, "4242:1788000000")
@@ -333,6 +341,8 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import sys, pathlib\n"
+        "if 'list-windows' in sys.argv: print('0'); sys.exit(0)\n"
+        "if 'display-message' in sys.argv: print('4242:1788000000'); sys.exit(0)\n"
         f"ff = pathlib.Path({str(frames_file)!r}); idx = pathlib.Path({str(frames_file)!r} + '.idx')\n"
         "frames = ff.read_text().split('\\n===\\n')\n"
         "i = int(idx.read_text()) if idx.exists() else 0\n"
