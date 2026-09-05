@@ -217,6 +217,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -518,9 +519,12 @@ def _chunk_for_discord(
     if len(preview) > 1:
         # Compose-side feedback: a multi-chunk delivery means the body failed
         # the one-message cap. The composer never sees the split otherwise.
+        # Not an inequality: the split point depends on line structure, so a
+        # body AT the cap can still need two chunks. Report both, claim neither.
         print(
             f"  [delivery-gate] body needed {len(preview)} chunk(s) "
-            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            f"(body {len(text)} chars, one-message cap {max_len}) "
+            "— compose-side cap missed",
             flush=True,
         )
     if len(preview) <= max_chunks:
@@ -4106,10 +4110,10 @@ async def _handle_discord_message(message, force=False):
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
             "   - On SUCCESS (exit 0): stdout line 1 is `VERDICT-MARKER: <token>`; the verdict is ONLY the text after the LAST occurrence of that exact <token>. The token is a per-run nonce, so a diff or verdict that quotes a marker literal cannot truncate the extract. Everything before it is codex's exec trace (kept there deliberately so codex-bounded.sh --stall can watch it) and contains repository source the agent inlined while working — copying the whole stream, or its tail, quotes that source as the PR's own content. Extract after the last marker and write ONLY that to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
-            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
+            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), then write exactly `[no-send]` to results/task-{id}.txt so the task archives — the bridge delivers nothing for that marker, so this is still no sender reply. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
-            "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
+            "   - Then write exactly `[no-send]` to results/task-{id}.txt: the bridge delivers nothing for that marker (no sender reply) and archives the task. A task left with no result stays in tasks/ forever, where health-check's task-queue probe and the end-of-pass queue check report it as unanswered.\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
             "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
             "   - Content is empty / punctuation-only / meta-chatter about the relay itself\n"
@@ -4155,11 +4159,10 @@ async def _handle_discord_message(message, force=False):
     # channel_name / guild_name: human-readable labels so the task-consumer can
     # disambiguate one team channel from another without grepping numeric IDs
     # against a memory file. DM channels have no `.name` attr; DMs have no
-    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
-    # containing \n (rare but possible) can't inject a spurious metadata
-    # line into the task file's k:v shape (per qingyun review on #1077).
-    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
-    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
+    # guild. Default to "DM" for both. Both are attacker-settable (a server or
+    # channel name), and land above `access_tier:`, so they flatten via the guard.
+    channel_name = header_safe_value(getattr(message.channel, "name", None) or "DM")
+    guild_name = header_safe_value(message.guild.name if message.guild else "DM")
     # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
@@ -4276,6 +4279,9 @@ async def _handle_discord_message(message, force=False):
         rulebook_key = select_rulebook_key(access_tier, is_collaborator)
         return (
             f"id: {task_id}\n"
+            # Second line on purpose: every reader is first-match, so nothing a
+            # sender can set (channel_name, guild_name) may precede the tier.
+            f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
@@ -4289,7 +4295,6 @@ async def _handle_discord_message(message, force=False):
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
-            f"access_tier: {access_tier}\n"
             f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
@@ -5164,10 +5169,8 @@ async def poll_results():
                                 task_body = _tier_path.read_text()
                             except Exception:
                                 continue
-                            for ln in task_body.splitlines():
-                                if ln.startswith("access_tier:"):
-                                    task_tier = ln.split(":", 1)[1].strip() or "other"
-                                    break
+                            task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                         .headers.get("access_tier") or "other").strip() or "other"
                             break  # first readable file wins; missing all → "other"
                         if task_tier != "owner":
                             print(
@@ -6026,10 +6029,8 @@ async def poll_dm_fallback():
                     task_tier = "other"
                     try:
                         task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
-                        for ln in task_body.splitlines():
-                            if ln.startswith("access_tier:"):
-                                task_tier = ln.split(":", 1)[1].strip() or "other"
-                                break
+                        task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                     .headers.get("access_tier") or "other").strip() or "other"
                     except Exception:
                         task_tier = "other"
 

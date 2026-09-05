@@ -120,9 +120,9 @@ class _FakeTelemetry:
 # 1. newly queued task → one event tagged with the task's source
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    tid = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
-                           "user_id": "@rui:ag2.space", "access_tier": "owner",
-                           "channel_id": "!room:ag2.space"})
+    tid, _ = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
+                              "user_id": "@rui:ag2.space", "access_tier": "owner",
+                              "channel_id": "!room:ag2.space"})
 check("write returns the task id", tid == "task-telem1")
 check("one task_processed event", t.calls == ["ag2space"], repr(t.calls))
 
@@ -158,8 +158,8 @@ check("archived redelivery writes no task file",
 _fresh_dirs()
 _prev = sys.modules.pop("telemetry", None)
 try:
-    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
-                           "access_tier": "owner"})
+    tid, _ = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
+                              "access_tier": "owner"})
 finally:
     if _prev is not None:
         sys.modules["telemetry"] = _prev
@@ -169,8 +169,8 @@ check("missing telemetry module → task still queued",
 # 6. telemetry raising mid-call → write still succeeds (fire-and-forget)
 _fresh_dirs()
 with _FakeTelemetry(raise_on_call=True) as t:
-    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
-                           "access_tier": "owner"})
+    tid, _ = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
+                              "access_tier": "owner"})
 check("raising telemetry never breaks the write",
       tid == "task-telem6" and (rgb.TASKS_DIR / "task-telem6.txt").exists())
 check("raising telemetry was attempted", t.calls == ["ag2space"], repr(t.calls))

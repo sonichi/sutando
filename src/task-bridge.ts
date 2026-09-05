@@ -99,7 +99,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id',
+	'instance_id', 'collaborator', 'requested_worker',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -1124,7 +1124,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			// unusual exceptions (not ENOENT) so a real file-system
 			// problem is observable, while still containing the throw.
 			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code && code !== 'ENOENT') {
+			if (code !== 'ENOENT') {
 				console.error(`${ts()} [TaskBridge] result-scan threw (non-fatal):`, err);
 			}
 		}

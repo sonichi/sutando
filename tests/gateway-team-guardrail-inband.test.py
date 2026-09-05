@@ -47,8 +47,9 @@ def _write(mod, **over) -> str:
     task = {"id": "inband1", "task": "please look at the parser",
             "user_id": "@x:ag2.space", "access_tier": "team"}
     task.update(over)
-    tid = mod._write_task(task)
-    assert tid, "writer returned no task id"
+    written = mod._write_task(task)
+    assert written, "writer returned no task id"
+    tid = written[0]
     return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
 
@@ -104,8 +105,9 @@ class CollaboratorBranchReachesTheBody(unittest.TestCase):
                 "user_id": "@c:ag2.space", "access_tier": "team",
                 "collaborator": True}
         task.update(over)
-        tid = mod._write_task(task)
-        assert tid, "writer returned no task id"
+        written = mod._write_task(task)
+        assert written, "writer returned no task id"
+        tid = written[0]
         return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
     def test_attested_collaborator_gets_the_engage_rulebook_at_its_own_result_path(self):
