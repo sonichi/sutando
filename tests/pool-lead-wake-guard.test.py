@@ -19,7 +19,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
 from pool_follower import LEAD_STALE_S  # noqa: E402
-from pool_lead import PoolLead  # noqa: E402
+from pool_lead import ASSIGN_STUCK_S, PoolLead  # noqa: E402
 
 
 class WakeGuardBase(unittest.TestCase):
@@ -101,6 +101,44 @@ class SuspensionAfterTheEntryGuard(WakeGuardBase):
         self.assertEqual(self.lead.reclaim_dead(), [],
                          "an assignment was repooled on a suspension the entry guard missed")
         self.assertEqual(self._names(), ["task-race.assigned-core-2.txt"])
+
+    def _sleep_at_nth_wall_read(self, n, seconds=968):
+        """Wall-only jump on the Nth now() call, owner still ALIVE. The stuck
+        sweep skips dead owners, so only a live-owner skew reaches its rename."""
+        calls = {"n": 0}
+        real = self.lead.now
+
+        def now():
+            calls["n"] += 1
+            if calls["n"] == n:
+                self.clock += seconds       # wall moves, monotonic does NOT
+            return real()
+        self.lead.now = now
+        return calls
+
+    def test_stuck_sweep_declines_after_a_mid_scan_suspension(self):
+        f = self.tasks / "task-midscan.assigned-core-2.txt"
+        f.write_text("x")
+        self.lead.reclaim_stuck_assignments()          # adopt into the ledger
+        self.clock += ASSIGN_STUCK_S + 10
+        self.mono += ASSIGN_STUCK_S + 10               # awake: both move together
+        self.assertTrue(self.alive["core-2"], "owner must stay alive for this path")
+        self._sleep_at_nth_wall_read(3)                # the first age read
+        self.assertEqual(self.lead.reclaim_stuck_assignments(), [],
+                         "a live core's assignment was repooled on a suspension "
+                         "the entry guard could not see")
+        self.assertEqual(self._names(), ["task-midscan.assigned-core-2.txt"])
+
+    def test_control_stuck_sweep_still_repools_with_no_suspension(self):
+        f = self.tasks / "task-stuck.assigned-core-2.txt"
+        f.write_text("x")
+        self.lead.reclaim_stuck_assignments()
+        self.clock += ASSIGN_STUCK_S + 10
+        self.mono += ASSIGN_STUCK_S + 10
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         ["task-stuck.assigned-core-2.txt"],
+                         "control: without a skew the sweep must still repool")
+        self.assertEqual(self._names(), ["task-stuck.txt"])
 
     def test_a_genuinely_dead_owner_with_no_suspension_still_reclaims(self):
         """Control: without the mid-scan clock jump the rename MUST happen,

@@ -654,6 +654,10 @@ class PoolLead:
                 # the cap anchors to file age, so a wedged core still yields
                 ledger[f.name] = self.now() - max_age_s + BUSY_EXIT_GRACE_S
                 continue
+            # Same post-observation re-check as the dead/claimed variants: the
+            # entry guard cannot see a suspension that began after the age read.
+            if self._host_gap_defers_reclaim():
+                return out
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
