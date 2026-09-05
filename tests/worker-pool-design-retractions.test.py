@@ -686,18 +686,28 @@ class OwnerRulingsOnMembershipAndReporting(unittest.TestCase):
             f, r"does not stop two turns inside one ROOM",
             "the trade must be legible where the decision is recorded")
 
-    def test_the_quiesce_writer_is_not_the_worker(self):
+    def test_the_quiesce_writer_depends_on_no_model_quota(self):
+        """Superseded twice. Worker -> core -> a process that makes no model calls. Quota is
+        per-ACCOUNT, so the core is another session on it and goes dark in the same outage."""
         f = self._flat()
-        self.assertRegex(f, r"the CORE, and only it — never the worker")
-        self.assertNotRegex(
-            f, r"writer \| \*\*the worker itself, and only it",
-            "owner ruling: a blocking error is not reported by the party it blocks")
+        self.assertRegex(f, r"the reporter of a resource exhaustion must not depend on that resource")
+        self.assertRegex(f, r"Never the worker, and never the core")
+        for wrong in (r"writer \| \*\*the worker itself, and only it",
+                      r"writer \| \*\*the CORE, and only it"):
+            with self.subTest(wrong=wrong):
+                self.assertNotRegex(f, wrong, "both earlier writers die in the outage they report")
 
-    def test_the_no_quota_argument_is_answered_not_deleted(self):
-        """The old writer had a true argument (a local write needs no quota). Deleting it
-        invites its return; naming why it answers the wrong question does not."""
+    def test_the_three_roles_stay_apart(self):
         f = self._flat()
-        self.assertRegex(f, r"self-reporting fails in the case it exists for")
+        self.assertRegex(f, r"that is the error appearing, not a report",
+                         "a session surfacing its own error is not the session reporting")
+
+    def test_both_superseded_writers_keep_their_arguments(self):
+        """Each wrong writer had a TRUE argument. Deleting a true argument invites its
+        return; recording why it answers the wrong question does not."""
+        f = self._flat()
+        self.assertRegex(f, r"true and beside the point")
+        self.assertRegex(f, r"Both named a party that the outage can take with it")
 
     def test_exclusions_is_gone_entirely(self):
         f = self._flat()
