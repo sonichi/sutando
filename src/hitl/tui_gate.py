@@ -68,9 +68,15 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     """Build the requirement a gate deserves. Unparseable dialogs fall back to the
     blocked card with no semantic button: a key is never guessed."""
     options, caret = parse_options(prompt)
-    subject: Dict[str, object] = {"state": state, "gate": gate or "", "detail": detail,
-                                  "session": session, "source": SOURCE,
-                                  "options": options, "caret": caret}
+    subject: Dict[str, object] = {
+        "session": session,
+        "source": SOURCE,
+        "supervisor_state": state,
+        "gate": gate or "",
+        "detail": detail,
+        "options": options,
+        "caret": caret,
+    }
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
