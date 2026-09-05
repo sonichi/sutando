@@ -108,8 +108,8 @@ one thing this rule exists to prevent. This is the same one-writer/atomic/fail-t
 `core-status.json` already uses, and for the same reason: a truncated read of a
 status file was taken as a verdict once already.
 
-Shape, pinned exactly — a step-2 reader and a step-3 writer are built at different
-times by different people, so "a per-instance verdict" is not a contract. It lives
+Shape, pinned exactly — "a per-instance verdict" is not a contract, and the reader
+and the writer are separate components even though step 3 ships both. It lives
 under the `eligibility` key of `state/pool-status.json`:
 
 ```json
@@ -121,10 +121,18 @@ under the `eligibility` key of `state/pool-status.json`:
 ```
 
 `computed_at` is **Unix seconds**, integer. `stale_after_s` travels **inside the
-record** rather than being derived from the sweep interval: the step-2 consumer
-ships before the sweep exists and has no way to know that interval, so a bound
-stated as "two sweep intervals" is one the earlier reader cannot evaluate — the
-publisher must say it outright. `instances` maps an instance name to the enum
+record** rather than being derived from the sweep interval, because a reader must
+not have to know the publisher's cadence to judge freshness: a bound stated as
+"two sweep intervals" is unevaluable by anything that does not already share the
+publisher's configuration, and that includes the core, an operator reading the
+file by hand, and any later consumer. The publisher says it outright.
+
+An earlier draft justified this by a **step-2 reader** predating the sweep. That
+reason was wrong and contradicted this document in three other places
+(`:89-100`, `:162-177`, `:929-934`): **step 2 ships no reader at all**, and the
+reader arrives with the step-3 publisher. The conclusion survives its retracted
+premise — self-describing staleness is right because a consumer should not need
+the producer's config, not because of a staging gap that does not exist. `instances` maps an instance name to the enum
 `eligible` | `wedged`, and nothing else.
 
 Validation is a matrix, and **every failing cell means ABSENT for that instance**,

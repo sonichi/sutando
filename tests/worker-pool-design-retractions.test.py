@@ -53,6 +53,11 @@ CONTRACT = [
      "four things happened",
      "the outcome set is five, not four: refused-over-bound is distinct from "
      "operational failure and :390 must tell them apart."),
+    ("step 2 ships no reader",
+     "the step-2 consumer",
+     "the reader arrives with the step-3 publisher; an earlier draft justified "
+     "self-describing staleness by a step-2 consumer that three other sections "
+     "say does not exist."),
     ("prior receipt",
      "never by a second admission",
      "two contracts, not one: a direct exit WITH a prior receipt transitions it, one "
