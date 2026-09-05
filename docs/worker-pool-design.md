@@ -1527,11 +1527,20 @@ production-path tests; the staged list below marks which those are.
    cursor — which is also the control proving an early stop loses nothing.
 
    **Not a prerequisite PR, a
-   requirement on step 2's own code:** the eligibility reader matches both
-   `channel_id` and `chat_id`. No such reader exists on `main` — checked, it
-   has never been there — so there is nothing to fix ahead of time; the failure
-   is a Telegram-addressed task silently reading as unbound the first time
-   someone pins a chat, and step 2's suite carries that case.
+   requirement on step 2's own code:** the **BINDING LOOKUP** matches both
+   `channel_id` and `chat_id`. **It is NOT the eligibility reader, and the two
+   were one phrase here until two reviewers found the contradiction at one head.**
+   They answer different questions against different files: the binding lookup asks
+   *which instance is this room pinned to*, off the pin table, and step 2 owns it;
+   the eligibility reader asks *may that instance claim right now*, off the
+   pool-status record, and step 3 owns it with its publisher. Naming both "the
+   eligibility reader" put one component in two stages and contradicted **Step 2
+   routes on BEATS ALONE** three hundred lines above — which is the same document
+   requiring a step-2 record reader and forbidding one. No binding lookup on
+   `channel_id`/`chat_id` exists on `main` — checked, it has never been there — so
+   there is nothing to fix ahead of time; the failure is a Telegram-addressed task
+   silently reading as unbound the first time someone pins a chat, and step 2's
+   suite carries that case.
 3. core side: the pin table writer, the sweep (reclaim, revive, status line,
    timing record — no stand-in), with claim and liveness tests; **and the worker
    side of the same step: the eligibility reader and its self-gate, which ship

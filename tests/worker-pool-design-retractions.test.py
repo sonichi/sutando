@@ -508,6 +508,33 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class OneComponentBelongsToOneStage(unittest.TestCase):
+    """Step 2 was assigned "the eligibility reader" while three hundred lines earlier the
+    same document says step 2 routes on BEATS ALONE and consults no record. One phrase
+    covering two components put one of them in two stages at once.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_step_two_owns_a_binding_lookup_not_an_eligibility_reader(self):
+        f = self._flat()
+        self.assertRegex(f, r"requirement on step 2's own code:\*\* the \*\*BINDING LOOKUP\*\*",
+                         "step 2's component must not be named the eligibility reader")
+
+    def test_the_two_components_are_told_apart_by_question_and_file(self):
+        f = self._flat()
+        self.assertIn("which instance is this room pinned to", f)
+        self.assertIn("may that instance claim right now", f)
+
+    def test_only_step_three_owns_the_eligibility_reader(self):
+        """Exactly one surviving 'eligibility reader' mention, and it is step 3's."""
+        f = self._flat()
+        self.assertEqual(f.count("the eligibility reader and its self-gate"), 1)
+        self.assertNotRegex(f, r"step 2's own code:\*\* the eligibility reader",
+                            "the step-2 assignment is the defect")
+
+
 class Rule3IsABindingTestNotALivenessTest(unittest.TestCase):
     """Two reviewers independently found the same contradiction at one head: rule 3 and the
     role summaries said the core claims work addressed to "no LIVE worker/instance", which a
