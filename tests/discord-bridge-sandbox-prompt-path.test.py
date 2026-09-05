@@ -102,7 +102,9 @@ class SandboxPromptPath(unittest.TestCase):
     def test_prompt_is_written_under_the_workspace_not_tmp(self):
         p = db_bridge.write_sandbox_prompt("task-1", "hello")
         self.assertEqual(p, self.d / "state" / "sandbox-prompts" / "task-1.txt")
-        self.assertFalse(str(p).startswith("/tmp"))
+        # Structural, not lexical: CI runs the checkout itself under /tmp.
+        self.assertEqual(self._old_SANDBOX_PROMPTS_DIR, db_bridge.STATE_DIR / "sandbox-prompts")
+        self.assertEqual(p.name, "task-1.txt")
         self.assertEqual(p.read_text(), "hello")
         self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(p.parent.stat().st_mode), 0o700)
