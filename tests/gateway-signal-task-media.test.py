@@ -90,9 +90,10 @@ class TaskMediaRoute(unittest.TestCase):
     # -- fixtures ---------------------------------------------------------- #
 
     def _attachment(self) -> str:
-        """An allowlisted file: /tmp/sutando-* is a send_allowlist prefix."""
+        """An allowlisted file under this gateway's result root."""
+        self._allow_this_workspace_results(self.mod)
         fd, fpath = tempfile.mkstemp(prefix="sutando-signal-media-", suffix=".txt",
-                                     dir="/tmp")
+                                     dir=self.mod.RESULTS_DIR)
         os.write(fd, b"payload")
         os.close(fd)
         self.addCleanup(lambda: os.path.exists(fpath) and os.unlink(fpath))
