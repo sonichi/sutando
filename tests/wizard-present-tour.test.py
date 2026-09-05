@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """present-tour.py: text-only without a presenter; delegates with the right args when one exists."""
-import json, os, subprocess, sys, tempfile, unittest
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -30,7 +35,8 @@ class PresentTourTests(unittest.TestCase):
 
     def test_room_flag_without_value_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            stub = Path(d) / "local-card.py"; stub.write_text("print('never')\n")
+            stub = Path(d) / "local-card.py"
+            stub.write_text("print('never')\n")
             env = {**os.environ, "LOCAL_CARD_BIN": str(stub)}
             r = subprocess.run([sys.executable, str(SCRIPT), "--room"], env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 2)
