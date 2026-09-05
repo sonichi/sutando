@@ -81,7 +81,7 @@ nothing recording that it is doing so. Rule 6 does not rescue that state by taki
 the work — v1 has no stand-in — it NAMES it: the wedged verdict makes the pin
 unclaimable, so the task is visibly pending instead of sitting claimed-by-nobody and
 unreported. **The verdict does not clear itself** — it freezes both of its own inputs, so
-no automatic exit exists. The exit is the commanded reset in "Clearing a wedged verdict"
+no automatic exit exists. The exit is the commanded reset — see "Clearing a wedged verdict"
 under §3 rule 6.
 
 Eligibility is **one value, computed once**: the core evaluates it in its sweep
@@ -846,7 +846,9 @@ rooms must be kept off the same worker:
   - a **stale beat file** keeps the lead assigning work to a worker that is no longer there.
 
   So the re-bind fence is: stop the wrapper, remove or disable the plist so `kick-pool` cannot
-  revive it, end the tmux session, clear the beat — then write the new binding. Restarting the
+  revive it, end the tmux session, clear the beat — then write the new binding. **This fence is
+  stated for worker-to-worker, and two other binding transitions need one too — see "Every
+  transition fences its outgoing claimant" below.** Restarting the
   worker afterwards is `launchctl bootstrap`, NOT `kickstart`: `kickstart` targets an already-loaded
   job and cannot restore one `bootout` removed. Every `kickstart` elsewhere in this document
   describes reviving a worker whose plist is still loaded, which is a different operation from this
@@ -860,6 +862,40 @@ rooms must be kept off the same worker:
   alternative — a room-scoped admission boundary that fences one binding without touching the
   process — is the right shape and is out of v1 scope, because it needs an admission check the
   worker consults per claim rather than a supervisor boundary.
+
+  **Every transition fences its outgoing claimant, and for two of the three that claimant is
+  the CORE.** The fence above stops a worker. It does not cover the other two ways a binding changes,
+  and both have the same check-then-act shape this section spent three revisions removing:
+
+  | transition | outgoing claimant | incoming claimant |
+  |---|---|---|
+  | re-bind R from W to V | worker W | worker V |
+  | **first-pin** R (unbound) to W | **the core**, serving R under rule 3 | worker W |
+  | **unpin** R from W | worker W | **the core**, under rule 3 |
+
+  First-pin: the core reads R unbound and claims task X, is suspended, the owner pins R to W, W
+  reads itself `instances[0]` and claims task Y. Different task keys, same room — the per-task
+  claims do not contend, so **both win**, which is the identical measurement this section already
+  quotes (*0, 0*). Unpin is that race mirrored.
+
+  **First-pin is fenced in-process, and only the core can be.** The process that executes the pin
+  command and the process that serves R under rule 3 are the SAME process. So the core does not
+  need a token to fence itself: it publishes the new table only after its own claimed-but-unfinished
+  work for R is done. It is reading its own state, not sampling another process's, so there is no
+  interval to be suspended past and nothing to validate at a boundary. This is the one place the
+  timer objection below does not apply, and it applies only here — a worker cannot use it, because
+  a worker's view of another instance is always a sample.
+
+  **Unpin takes the re-bind fence unchanged, because it IS a re-bind — to nobody.** The outgoing
+  claimant is a separate process, so by this section's own argument the enforcer is the process
+  boundary; there is no in-process shortcut available in that direction. Treating unpin as a
+  lighter operation than re-bind is what left it unfenced.
+
+  What each costs, in the direction decided: first-pin waits on the core's outstanding work for
+  that one room, which is bounded by that work and usually zero. Unpin costs a worker stop, which
+  is process-wide and therefore also stops W's OTHER rooms — the same trade the paragraph above
+  states for re-bind, and it is worth saying out loud that an owner unpinning one room does not
+  expect to pause three.
 
   **The two rows above once claimed they needed no fencing, then tried to buy one with a timer.
   Both were wrong, and the second is the more instructive.** The stale row said the core is a single
@@ -999,7 +1035,7 @@ that a verified command still executes, or the matrix is prose that never ran.
 
 | command | effect |
 |---|---|
-| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim |
+| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim. **Neither is a bare write** — a first-pin drains the core's own outstanding work for R first, an unpin takes the full re-bind fence; see "Every transition fences its outgoing claimant" |
 | spawn N · set model of W | the core runs the installer (`spawn-worker`) |
 | resize to N (shrinking) · remove worker W | an ORDERED transition — see "Removing a worker" below — because the installer alone leaves the departing worker's bindings pointing at an instance that can never return |
 

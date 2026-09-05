@@ -472,5 +472,83 @@ class WedgedVerdictHasACommandedExit(unittest.TestCase):
             "who cannot see the cost cannot re-open the decision")
 
 
+class EveryBindingTransitionFencesItsOutgoingClaimant(unittest.TestCase):
+    """A binding changes three ways, and only worker-to-worker had a fence. For first-pin
+    the outgoing claimant is the CORE serving R under rule 3; for unpin the INCOMING one
+    is. Both are the same check-then-act the section spent three revisions removing.
+    """
+
+    def _text(self):
+        return DOC.read_text(encoding="utf-8")
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", self._text())
+
+    def test_first_pin_and_unpin_are_not_bare_writes(self):
+        f = self._flat()
+        self.assertNotRegex(
+            f, r"unpin room R \| the core rewrites the pin table; workers read it on "
+               r"every claim \|",
+            "a bare rewrite races the core's own rule-3 claim against the new binding")
+
+    def test_the_core_is_named_as_a_claimant_on_both_sides(self):
+        f = self._flat()
+        for phrase, why in [
+            ("first-pin** R (unbound) to W | **the core**",
+             "first-pin's outgoing claimant is the core, not a worker"),
+            ("unpin** R from W | worker W | **the core**",
+             "unpin's incoming claimant is the core"),
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, f, why)
+
+    def test_the_in_process_fence_is_claimed_only_for_the_core(self):
+        """The document's own argument is that an interval cannot fence a separate
+        process. The core fencing itself is sound BECAUSE it reads its own state, so the
+        exemption must be stated as core-only or it reads as a general escape hatch."""
+        f = self._flat()
+        self.assertIn("applies only here — a worker cannot use it", f,
+                      "an in-process fence offered generally would re-license the timer "
+                      "argument this section removed")
+
+    def test_unpin_is_not_treated_as_lighter_than_a_rebind(self):
+        f = self._flat()
+        self.assertIn("Unpin takes the re-bind fence unchanged", f,
+                      "unpin's outgoing claimant is a separate process, so the process "
+                      "boundary is the only enforcer available")
+
+    def test_the_unpin_cost_is_stated(self):
+        f = self._flat()
+        self.assertRegex(f, r"unpinning one room does not expect to pause three",
+                         "a process-wide stop for a per-room command is a cost an owner "
+                         "cannot see from the command name")
+
+
+class CrossReferencesResolve(unittest.TestCase):
+    """`see "X"` must name a heading that exists. Written after two anchors in one day
+    pointed at nothing: a section titled with OUTGOING while its references said
+    outgoing, and a test scan that anchored on a phrase two passages quote by name.
+    """
+
+    REF = re.compile(r'[Ss]ee "([^"]{4,90})"')
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_every_quoted_section_reference_resolves(self):
+        flat = self._flat()
+        refs = sorted(set(self.REF.findall(flat)))
+        self.assertGreaterEqual(len(refs), 3, "scan found no references to check")
+        dangling = [r for r in refs
+                    if ("**" + r) not in flat and ("## " + r) not in flat]
+        self.assertEqual(dangling, [], "a pointer to a heading that does not exist")
+
+    def test_the_scan_fires_on_a_dangling_reference(self):
+        flat = self._flat() + ' see "A Section That Does Not Exist Here" below'
+        refs = set(self.REF.findall(flat))
+        self.assertIn("A Section That Does Not Exist Here", refs)
+        self.assertNotIn("**A Section That Does Not Exist Here", flat)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
