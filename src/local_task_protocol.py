@@ -122,7 +122,8 @@ LIFECYCLE_STATES = ("pending", "result_written", "archived")
 # and `ambient` is sandboxed observation — never instructions.
 ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 
-# Legacy spellings readers still accept for one release; writers emit the value.
+# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits
+# the value; removal is gated on the writers, not on a release count.
 LEGACY_ACCESS_TIER_ALIASES = {"other": "guest"}
 
 
