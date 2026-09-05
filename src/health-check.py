@@ -778,6 +778,11 @@ def check_cli_wedge() -> dict:
     tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
     session = record.get("session") or os.environ.get("SUTANDO_TMUX_SESSION", cli_wedge.DEFAULT_SESSION)
     target = cli_wedge.core_target(socket, session, tmux_bin=tmux_bin, env=env)
+    # A core sampling the pane it runs in sees its own output move; the static case could never accumulate.
+    inside = cli_wedge.sampled_from_inside(socket, target, tmux_bin=tmux_bin, env=env) if target else None
+    if inside:
+        check["detail"] = f"skipped — sampled from inside the pane it watches ({inside})"
+        return check
     frame = cli_wedge.capture_pane(socket, target, tmux_bin=tmux_bin, env=env) if target else None
     if frame is None:
         check["detail"] = f"pane not readable (session {session!r}) — no reading, not a verdict"

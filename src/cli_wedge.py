@@ -289,6 +289,47 @@ def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
 
 
 _PANE_ID = re.compile(r"^\d+:\d+$")
+_PANE_REF = re.compile(r"^(%\d+):(\d+)$")
+
+
+def _pid_ancestors(pid: Optional[int] = None, runner: Callable = subprocess.run, limit: int = 64) -> list:
+    """This process's pid and its parents, upward, stopping at pid 1 (never included)."""
+    pid = os.getpid() if pid is None else pid
+    chain, seen = [], set()
+    while pid and pid > 1 and pid not in seen and len(chain) < limit:
+        seen.add(pid)
+        chain.append(pid)
+        try:
+            proc = runner(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+            out = (getattr(proc, "stdout", "") or "").strip()
+            pid = int(out) if out.isdigit() else 0
+        except Exception:  # noqa: BLE001 — an unreadable chain ends the walk, it does not invent one
+            break
+    return chain
+
+
+def sampled_from_inside(socket_path: str, target: str, tmux_bin: str = "tmux",
+                        runner: Callable = subprocess.run, env: Optional[dict] = None,
+                        tmux_pane: Optional[str] = None, ancestors: Optional[list] = None) -> Optional[str]:
+    """Why the caller must NOT sample `target` (it runs inside that pane), else None.
+    Own output always moves, so a self-sample can never accumulate the static case."""
+    try:
+        proc = runner([tmux_bin, "-S", socket_path, "display-message", "-p", "-t", target, "#{pane_id}:#{pane_pid}"],
+                      capture_output=True, text=True, timeout=10, env=env)
+    except Exception:  # noqa: BLE001 — unknown provenance is not a reason to skip
+        return None
+    out = (getattr(proc, "stdout", "") or "").strip()
+    m = _PANE_REF.match(out) if getattr(proc, "returncode", 1) == 0 else None
+    if not m:
+        return None
+    pane_id, pane_pid = m.group(1), int(m.group(2))
+    tmux_pane = os.environ.get("TMUX_PANE") if tmux_pane is None else tmux_pane
+    if tmux_pane and tmux_pane == pane_id:
+        return f"TMUX_PANE {pane_id} is the target pane"
+    chain = _pid_ancestors() if ancestors is None else list(ancestors)
+    if pane_pid in chain:
+        return f"caller pid chain reaches the pane shell (pid {pane_pid})"
+    return None
 
 
 def pane_identity(socket_path: str, target: str, tmux_bin: str = "tmux",

@@ -337,6 +337,15 @@ class IoEdge(unittest.TestCase):
         self.assertIsNone(w.core_target("/s", "gone", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout="")))
         self.assertIsNone(w.core_target("/s", "s", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="")))
 
+    def test_sampled_from_inside_guard(self):
+        ok = lambda *a, **k: SimpleNamespace(returncode=0, stdout="%7:4242\n")
+        self.assertIn("TMUX_PANE", w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%7", ancestors=[1]))
+        self.assertIn("pid chain", w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="", ancestors=[99, 4242]))
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%8", ancestors=[99]))
+        bad = lambda *a, **k: SimpleNamespace(returncode=1, stdout="")
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=bad, tmux_pane="%7", ancestors=[4242]))
+        self.assertIn(os.getppid(), w._pid_ancestors())
+
     def test_pane_identity_probe(self):
         ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
         self.assertEqual(ok, "4242:1788000000")

@@ -64,7 +64,8 @@ class CliWedgeProbe(unittest.TestCase):
             "if t != '=' + sess + ':1':\n"  # base-index 1: the core window is 1, and a bare =name is no pane
             "    sys.stderr.write(\"can't find pane: \" + t + \"\\n\"); sys.exit(1)\n"
             "if 'display-message' in a:\n"
-            "    print('4242:1788000000'); sys.exit(0)\n"
+            "    fmt = a[-1]\n"
+            "    print(os.environ.get('FAKE_PANE_ID', '%987654') + ':' + os.environ.get('FAKE_PANE_PID', '4242')) if 'pane_id' in fmt else print('4242:1788000000'); sys.exit(0)\n"
             f"ff = pathlib.Path({str(self.frames_file)!r}); idx = pathlib.Path({str(self.idx)!r})\n"
             "frames = ff.read_text().split('\\n===\\n')\n"
             "i = int(idx.read_text()) if idx.exists() else 0\n"
@@ -196,6 +197,26 @@ class CliWedgeProbe(unittest.TestCase):
         os.utime(newer, (self._t[0] + 35, self._t[0] + 35))
         rec = hc._local_core_record()
         self.assertEqual((rec["socket"], rec["session"]), ("/tmp/newer.sock", "newer-core"))
+
+    def test_sampling_from_inside_the_watched_pane_is_skipped(self):
+        # The stand-in names THIS process as the pane shell: a core sampling its own pane must not.
+        self.frames = [IDLE] * 4
+        with patch.dict(os.environ, {"FAKE_PANE_PID": str(os.getpid()), "TMUX_PANE": "%1"}):
+            c = self.check()
+        self.assertEqual(c["status"], "ok")
+        self.assertTrue(c["detail"].startswith("skipped — sampled from inside the pane it watches"), c["detail"])
+        self.assertFalse((self.ws / "state" / "cli-wedge" / "window.jsonl").exists(), "a skipped sample must not be recorded")
+
+    def test_tmux_pane_naming_the_target_is_skipped(self):
+        with patch.dict(os.environ, {"TMUX_PANE": "%987654"}):
+            c = self.check()
+        self.assertTrue(c["detail"].startswith("skipped — sampled from inside the pane it watches"), c["detail"])
+
+    def test_an_outside_caller_still_samples(self):
+        with patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            c = self.check()
+        self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
+        self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())
 
     def test_working_pane_is_ok(self):
         self.frames = [f"● wrote {chr(97 + i)}.ts\n" for i in range(12)]
