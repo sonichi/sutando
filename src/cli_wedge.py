@@ -6,7 +6,8 @@ static while work is outstanding — pure static, no normalization, per the
 spec; (2) the pane moves but revisits the same states (a retry loop), measured
 as novelty over NORMALIZED frames — clocks, durations, counters, spinners and
 token counts would fake novelty. A pane whose only motion is a clock is
-neither verdict: it is reported as `clock_only` so traces can settle it.
+ALIVE (Chi, from running these panes daily): reported as `clock-only`, never a
+warning, and kept in every trace so the observation can be re-checked.
 
 This reads the CLI, not the process. A green result here is not evidence the
 core is healthy; it complements `.alive` and the runtime probes, never replaces
@@ -161,9 +162,9 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
                     "reason": f"pane unchanged for {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
         return {**base, "kind": "idle", "confidence": "high", "warn": False,
                 "reason": "pane unchanged and nothing outstanding"}
-    if clock_only and not work_outstanding:
-        return {**base, "kind": "clock-only", "confidence": "none", "warn": False,
-                "reason": "only volatile fields (clock/counters) change and nothing is outstanding — recorded for the harness, not judged"}
+    if clock_only:
+        return {**base, "kind": "clock-only", "confidence": "medium", "warn": False,
+                "reason": "only volatile fields (clock/counters) change — a live CLI, not a wedge (operator observation); recorded for the harness"}
     if work_outstanding and nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"]:
         return {**base, "kind": "low-novelty", "confidence": "low", "warn": True,
                 "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples with work outstanding, no retry text — repetitive, cause unknown"}

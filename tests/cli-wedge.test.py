@@ -89,13 +89,13 @@ class Classifier(unittest.TestCase):
         self.assertNotEqual(v["kind"], "static-with-work")
         self.assertFalse(v["raw_static"])
         self.assertTrue(v["clock_only"])
-        # ...and without work it is recorded, not judged
-        q = w.classify(frames, False, 900)
-        self.assertEqual((q["kind"], q["warn"]), ("clock-only", False))
-        # with work, over enough samples, case 2's novelty statistic notices it softly
-        many = [idle_with_clock(i) for i in range(12)]
-        s = w.classify(many, True, 900)
-        self.assertEqual((s["kind"], s["warn"], s["confidence"]), ("low-novelty", True, "low"))
+        # A clock-only pane is ALIVE (Chi): never a warning, with or without work, however long
+        for work in (False, True):
+            q = w.classify([idle_with_clock(i) for i in range(12)], work, 900)
+            self.assertEqual((q["kind"], q["warn"]), ("clock-only", False), work)
+        # ...unless retry text says otherwise: counters-only motion WITH retry text is still case 2
+        r = w.classify([retry_frame(i) for i in range(12)], True, 60)
+        self.assertEqual(r["kind"], "retry-loop")
 
     def test_case2_retry_loop_when_only_counters_move(self):
         v = w.classify([retry_frame(i) for i in range(20)], True, 60)
