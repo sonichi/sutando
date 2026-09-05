@@ -472,6 +472,71 @@ class Cli(unittest.TestCase):
             self.assertNotEqual(w.window_path(ws, "=worker-1:1"), w.window_path(ws, "=worker-2:1"))
             self.assertEqual(w.window_path(ws), w.window_path(ws, None))
 
+    def test_probe_takes_the_callers_work_signal_for_a_worker(self):
+        # The deliverer knows what a worker owes; the core's queue does not. A work file keyed by
+        # target, or an explicit flag, replaces the core-queue read for explicit targets.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=worker-1:1": {"outstanding": True, "detail": "task-abc handed 40s ago, no result"},
+                                      "=worker-2:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((rc, v["work_outstanding"], v["work_detail"], v["target"]), (0, True, "task-abc handed 40s ago, no result", "=worker-1:1"))
+            rc, out = self.run_main(*base, "--target", "=worker-2:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "work file: nothing outstanding"))
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual(v["work_outstanding"], False)
+            self.assertIn("no work signal for '=worker-9:1'", v["work_detail"])
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-outstanding")
+            self.assertEqual(json.loads(out)["work_outstanding"], True)
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--no-work")
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "caller says nothing outstanding"))
+            # a missing or broken work file is a missing signal, never a verdict input
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(Path(d) / "absent.json"))
+            self.assertIn("work file unreadable", json.loads(out)["work_detail"])
+            # the core's own pane still reads its own queue (no explicit target)
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            rc, out = self.run_main(*base)
+            self.assertIn("queued task", json.loads(out)["work_detail"])
+
+    def test_probe_targets_gives_one_verdict_per_worker_with_its_own_signal(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": True, "detail": "owes task-1"}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1, =w2:1", "--work-file", str(wf)]
+            rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((rc, v["socket"], sorted(v["targets"])), (0, "/s", ["=w1:1", "=w2:1"]))
+            self.assertEqual((v["targets"]["=w1:1"]["work_outstanding"], v["targets"]["=w1:1"]["work_detail"]), (True, "owes task-1"))
+            self.assertFalse(v["targets"]["=w2:1"]["work_outstanding"])
+            rc, out = self.run_main(*base)
+            v2 = json.loads(out)
+            self.assertEqual([v2["targets"][k]["sample_count"] for k in ("=w1:1", "=w2:1")], [2, 2])
+            self.assertFalse(w.window_path(ws).exists())
+            self.assertTrue(w.window_path(ws, "=w1:1").exists() and w.window_path(ws, "=w2:1").exists())
+
+    def test_work_signal_precedence(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); wf = Path(d) / "w.json"
+            wf.write_text(json.dumps({"outstanding": True, "detail": "flat record"}))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf)), (True, "flat record"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf), say=False), (False, "caller says nothing outstanding"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0), (False, "no work signal for an explicit --target"))
+            wf.write_text("{not json")
+            self.assertIn("unreadable", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
+
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self.run_main("probe", "--socket", "/x", "--tmux", "/nonexistent/tmux", "--workspace", d)

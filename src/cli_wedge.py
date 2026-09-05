@@ -378,6 +378,26 @@ def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Option
     return (bool(reasons), "; ".join(reasons))
 
 
+def work_signal(target: Optional[str], workspace: Path, now: float, work_file: Optional[str] = None,
+                say: Optional[bool] = None) -> tuple:
+    """The (outstanding, detail) input for one target. The caller's word wins (`say`, or a
+    work file keyed by target); the core's own queue is read only for the core's own pane."""
+    if say is not None:
+        return (bool(say), "caller says work outstanding" if say else "caller says nothing outstanding")
+    if work_file:
+        try:
+            data = json.loads(Path(work_file).read_text())
+        except (OSError, ValueError) as e:
+            return (False, f"work file unreadable ({type(e).__name__}) — no work signal")
+        rec = data.get(target) if isinstance(data, dict) and target in data else data
+        if isinstance(rec, dict) and "outstanding" in rec and (target in data or "outstanding" in data):
+            return (bool(rec.get("outstanding")), str(rec.get("detail") or ("work file: outstanding" if rec.get("outstanding") else "work file: nothing outstanding")))
+        return (False, f"no work signal for {target!r} in the work file")
+    if target:
+        return (False, "no work signal for an explicit --target")
+    return work_outstanding(workspace, now)
+
+
 def window_path(workspace: Path, slot: Optional[str] = None) -> Path:
     """One rolling window per watched target: the core's own is `window.jsonl`; an explicit
     target gets its own file, so probing a worker pane never resets the core's run."""
@@ -579,6 +599,12 @@ def main(argv: Optional[list] = None) -> int:
         p.add_argument("--socket", required=True)
         p.add_argument("--session", default=os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION))
         p.add_argument("--target", default=None, help="override the resolved =<session>:<window> target")
+        if name == "probe":
+            p.add_argument("--targets", default=None, help="comma-separated explicit targets, one verdict each (worker panes)")
+            p.add_argument("--work-file", default=None, help="JSON {<target>: {outstanding, detail}} — the deliverer's work signal per target")
+            g = p.add_mutually_exclusive_group()
+            g.add_argument("--work-outstanding", dest="say_work", action="store_true", default=None, help="the caller says the target owes work")
+            g.add_argument("--no-work", dest="say_work", action="store_false", help="the caller says nothing is outstanding")
         p.add_argument("--tmux", default="tmux")
         p.add_argument("--workspace", default=None, help="defaults to the configured workspace")
         if name == "record":
@@ -596,31 +622,37 @@ def main(argv: Optional[list] = None) -> int:
         print(json.dumps(replay(Path(a.path), a.work_outstanding), indent=1))
         return 0
 
+    if a.workspace is None:
+        a.workspace = str(_default_workspace())
+    ws = Path(a.workspace)
+    if a.cmd == "probe" and a.targets:
+        # Several worker panes in one call: each keeps its own window and its own work signal.
+        out = {}
+        for t in [x.strip() for x in a.targets.split(",") if x.strip()]:
+            out[t] = probe_one(a, ws, t)
+        print(json.dumps({"socket": a.socket, "targets": out}, indent=1))
+        return 0
     target = a.target or core_target(a.socket, a.session, a.tmux)
     if target is None:
         print(json.dumps({"kind": "unknown", "warn": False, "reason": f"session {a.session!r} not found on {a.socket}"}))
         return 0
-
-    def sampler():
-        return capture_pane(a.socket, target, a.tmux)
-
-    if a.workspace is None:
-        a.workspace = str(_default_workspace())
     if a.cmd == "record":
-        print(record(a, sampler))
+        print(record(a, lambda: capture_pane(a.socket, target, a.tmux)))
         return 0
-    frame = sampler()
-    if frame is None:
-        print(json.dumps({"kind": "unknown", "warn": False, "reason": "pane not readable"}))
-        return 0
-    ws = Path(a.workspace)
-    now = time.time()
-    # An explicit target is not this core: its window is its own, and this core's queue says
-    # nothing about its work.
-    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux), slot=a.target)
-    work = (False, "no work signal for an explicit --target") if a.target else work_outstanding(ws, now)
-    print(json.dumps(classify_window(entries, work, now), indent=1))
+    print(json.dumps(probe_one(a, ws, target, explicit=bool(a.target)), indent=1))
     return 0
+
+
+def probe_one(a, ws: Path, target: str, explicit: bool = True) -> dict:
+    """One sample of one target into its own window, classified with the caller's work signal."""
+    frame = capture_pane(a.socket, target, a.tmux)
+    if frame is None:
+        return {"kind": "unknown", "warn": False, "reason": "pane not readable", "target": target}
+    now = time.time()
+    slot = target if explicit else None
+    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux), slot=slot)
+    work = work_signal(slot, ws, now, work_file=getattr(a, "work_file", None), say=getattr(a, "say_work", None))
+    return {**classify_window(entries, work, now), "target": target}
 
 
 if __name__ == "__main__":
