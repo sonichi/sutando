@@ -60,7 +60,9 @@ skill hook. The hook never depends on the agent remembering anything:
   `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.
   A result whose body starts with `[no-send]`, `[REPLIED]` or `[deduped: …]` closes the task with
   "closed, no message sent from here", never "replied".
-- **Bounded.** The live log keeps the newest 400 rows (older rows move to `agent-activity.archive.jsonl`),
+- **Bounded, one writer at a time.** Every append and the rotation that follows it run under one
+  `flock` on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
+  sessions write at once. The live log keeps the newest 400 rows (older rows move to `agent-activity.archive.jsonl`),
   and the session bindings file drops a task once its done row exists, so the per-tool-call reads stay small.
 - **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
   is never written to, so narration cannot cross rooms. The writer's own calls never become rows.

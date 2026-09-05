@@ -12,6 +12,7 @@ at <workspace>/state/agent-activity.jsonl. Rows of a task stay live in the drawe
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -55,7 +56,7 @@ def task_from_file(path: Path) -> tuple[dict, str | None]:
 
 
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
-           done: bool = False, workspace: Path | None = None) -> dict:
+           done: bool = False, workspace: Path | None = None, live_rows: int | None = None) -> dict:
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     rec: dict = {"ts": time.time(), "line": line.strip(), "kind": kind}
@@ -67,9 +68,13 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         rec["done"] = True
     path = log_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:  # O_APPEND: one row per write, never rewritten
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    rotate(path)
+    # One lock for the append AND the rotation; the log is opened only under it, so no writer holds
+    # an inode that a concurrent rotation replaces.
+    with open(path.with_suffix(".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        rotate(path, live_rows if live_rows is not None else LIVE_ROWS)
     return rec
 
 
@@ -78,7 +83,7 @@ LIVE_ROWS = 400
 
 def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
     """The live file keeps the newest `keep` rows; older rows move to <name>.archive.jsonl, so every
-    reader that re-parses the live file per event stays bounded."""
+    reader that re-parses the live file per event stays bounded. Called with the writer lock held."""
     try:
         rows = path.read_text(encoding="utf-8").splitlines()
     except OSError:

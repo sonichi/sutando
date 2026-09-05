@@ -32,6 +32,15 @@ card = load("activity")
 hook = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
 
 
+def _append_many(ws, writer, count, live_rows):
+    import pathlib as _pl
+    c = load_at(REPO / "skills" / "agent-activity" / "scripts" / "activity.py")
+    for i in range(count):
+        kind, done = ("done", True) if i == count - 1 else ("working", False)
+        c.append(f"{writer}-{i}", kind=kind, room=None, task={"id": f"task-{writer}"}, done=done,
+                 workspace=_pl.Path(ws), live_rows=live_rows)
+
+
 def _bind_in_process(ws, task_id, sid):
     import pathlib as _pl
     h = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
@@ -71,6 +80,20 @@ class Writer(unittest.TestCase):
         arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
         self.assertEqual((len(live), len(arch)), (card.LIVE_ROWS, 3))
         self.assertIn('"row 0"', arch[0]); self.assertIn(f'"row {card.LIVE_ROWS + 2}"', live[-1])
+
+    def test_concurrent_appenders_lose_no_row_across_rotation(self):
+        # Rotation used to replace the inode while another writer held it, losing that writer's row.
+        # Eight processes x 30 rows, live window 25: every row lands exactly once, done rows included.
+        import multiprocessing as mp
+        with mp.get_context("fork").Pool(8) as pool:
+            pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
+        live = card.log_path(self.ws).read_text().splitlines()
+        arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
+        lines = [json.loads(l)["line"] for l in live + arch]
+        expected = [f"w{i}-{j}" for i in range(8) for j in range(30)]
+        self.assertEqual(sorted(lines), sorted(expected), f"lost={set(expected)-set(lines)} dup={len(lines)-len(set(lines))}")
+        self.assertEqual(len(live), 25)
+        self.assertEqual(sum(1 for l in live + arch if json.loads(l).get("done")), 8, "every done row survived")
 
     def test_default_room_is_the_owners_latest_ag2space_room(self):
         st = self.ws / "state"
