@@ -184,6 +184,58 @@ with tempfile.TemporaryDirectory() as td:
     check("touching a tool in the UNSELECTED dir re-triggers", "running" in p.stdout, True)
 
 
+def third_dir_case(td):
+    """A THIRD layout: scripts/ populated, tools/ absent, tools also in bin/.
+
+    Reported by jsun-m on another host (3852-r3), measured not inferred: the
+    fixed `(scripts, tools)` pair resolves on the populated scripts/ and stops,
+    so four tools under bin/ are never stat'd. They broke one of them and the
+    sweep still printed `fresh` — the same invisible-from-inside shape this PR
+    exists to fix, with scripts/ populated instead of empty.
+    """
+    ws = Path(td) / "ws9"
+    for d in ("scripts", "bin", "state"):
+        (ws / d).mkdir(parents=True)
+    (ws / "scripts" / "kept.py").write_text("def verdict():\n    return 1\n")
+    (ws / "scripts" / "kept.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    (ws / "bin" / "elsewhere.py").write_text("def verdict():\n    return 2\n")
+    (ws / "bin" / "elsewhere.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    return ws
+
+
+with tempfile.TemporaryDirectory() as td:
+    ws = third_dir_case(td)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("a third dir's suite is DISCOVERED, not just unwatched", "elsewhere.test.py" in p.stdout, True)
+    check("...alongside the conventional one", "kept.test.py" in p.stdout, True)
+    check("...counted as 2, so neither sits silently outside the set",
+          "2 of 2 suites pass" in p.stdout, True)
+    # The reported symptom: an edit in the third dir left the trigger blind.
+    subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                   capture_output=True, text=True)
+    os.utime(ws / "bin" / "elsewhere.py", None)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("touching a tool in the THIRD dir re-triggers", "running" in p.stdout, True)
+
+with tempfile.TemporaryDirectory() as td:
+    # Discovery must stay bounded: a dir with no .py is not watched, and dotted
+    # dirs are skipped so a vendored tree cannot enlarge the sweep.
+    ws = Path(td) / "ws10"
+    for d in ("tools", "state", "notes", ".hidden"):
+        (ws / d).mkdir(parents=True)
+    (ws / "tools" / "t.py").write_text("x = 1\n")
+    (ws / "notes" / "readme.md").write_text("no python here\n")
+    (ws / ".hidden" / "h.py").write_text("x = 1\n")
+    names = [d.name for d in tsc.watched_dirs(ws)]
+    check("a dir with no .py is not watched", "notes" in names, False)
+    check("a dotted dir is skipped", ".hidden" in names, False)
+    check("the dir that does hold .py IS watched", "tools" in names, True)
+    check("a missing workspace yields no candidates, not a crash",
+          tsc.watched_dirs(Path(td) / "nope"), [])
+
+
 print("7. in-process: the trigger rule and the two scope refusals")
 check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
 check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
