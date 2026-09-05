@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""The eslint workflow's docs-only skip must never strand its required check.
-
-`eslint over first-party TS + JS` is a required status check on `main`. A
-workflow-level `paths:` filter would leave it permanently unreported, so the
-skip has to live in step `if:` guards while the job itself always runs. These
-checks execute the gate's real shell, extracted from the workflow, rather than
-a restatement of it.
-"""
+"""`eslint over first-party TS + JS` is a REQUIRED check: a `paths:` filter would
+leave it unreported, so the skip lives in step guards and the job always runs."""
 
 import os
 import re
@@ -91,6 +85,12 @@ if shutil.which("bash"):
           run_gate(script, "scripts/build-bundle.mjs") == "run=true")
     check("a lockfile change lints",
           run_gate(script, "package-lock.json") == "run=true")
+    # Every dependency input `npm ci` consults, not just the lockfile: a shrinkwrap
+    # takes precedence over it, and .npmrc can change what install even fetches.
+    check("a shrinkwrap change lints",
+          run_gate(script, "npm-shrinkwrap.json") == "run=true")
+    check("an .npmrc change lints",
+          run_gate(script, ".npmrc") == "run=true")
     check("an edit to this workflow lints",
           run_gate(script, ".github/workflows/eslint.yml") == "run=true")
     # The two ways the probe can break must both fail toward doing the work,

@@ -58,9 +58,9 @@ jobs:
             echo 'Scope undetermined (or push to main) — linting.'
             exit 0
           fi
-          # Everything ESLint reads: the sources its flat config matches, its own
-          # config, the workflow, tsconfig, and the lockfile that pins the rules.
-          if grep -qE '\.(ts|tsx|js|mjs|cjs)$|^eslint\.config\.mjs$|^package(-lock)?\.json$|^tsconfig[^/]*\.json$|^\.github/workflows/eslint\.yml$' /tmp/eslint-scope.txt; then
+          # Everything ESLint reads, plus every dependency input `npm ci` consults:
+          # package.json, package-lock.json, npm-shrinkwrap.json and .npmrc.
+          if grep -qE '\.(ts|tsx|js|mjs|cjs)$|^eslint\.config\.mjs$|^package(-lock)?\.json$|^npm-shrinkwrap\.json$|^\.npmrc$|^tsconfig[^/]*\.json$|^\.github/workflows/eslint\.yml$' /tmp/eslint-scope.txt; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           else
             echo 'run=false' >> "$GITHUB_OUTPUT"
