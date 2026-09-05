@@ -38,10 +38,18 @@ class Normalization(unittest.TestCase):
         self.assertEqual(len({w.state_id(f) for f in frames}), 1)
 
     def test_each_volatile_class_is_replaced(self):
-        n = w.normalize("2026-09-05T04:20:01Z 12:34 PM took 3.5s 12.3k tokens 3/10 45% ⠋ loading... ───── run 42")
-        for token in ("<ts>", "<clock>", "<dur>", "<tokens>", "<count>", "<pct>", "<spin>", "<dots>", "<rule>", "#"):
+        n = w.normalize("2026-09-05T04:20:01Z 12:34 PM took 3.5s 12.3k tokens 3/10 45% ⠋ loading... ───── attempt 4 run 42")
+        for token in ("<ts>", "<clock>", "<dur>", "<tokens>", "<count>", "<pct>", "<spin>", "<dots>", "<rule>", "attempt #"):
             self.assertIn(token, n, token)
-        self.assertNotRegex(n, r"\d")
+        # No blanket digit stripping (owner review): a bare number is content until a trace says otherwise.
+        self.assertIn("run 42", n)
+
+    def test_semantic_digits_are_progress_not_noise(self):
+        self.assertNotEqual(w.state_id("editing migration_41.sql\n"), w.state_id("editing migration_42.sql\n"))
+        self.assertNotEqual(w.state_id("processing shard 17\n"), w.state_id("processing shard 18\n"))
+        # …while counters that only say "again" still collapse
+        self.assertEqual(w.state_id("attempt 3 of the same call\n"), w.state_id("attempt 4 of the same call\n"))
+        self.assertEqual(w.state_id("error at line 183\n"), w.state_id("error at line 184\n"))
 
     def test_real_content_change_is_a_new_state(self):
         self.assertNotEqual(w.state_id(working_frame(0)), w.state_id(working_frame(1)))
@@ -109,9 +117,36 @@ class Classifier(unittest.TestCase):
                 f"* {verb} for 1s · done 5:{17 + i // 3:02d} PM · 1 monitor still running\n"
             )
         v = w.classify([frame(i) for i in range(12)], True, 300)
-        self.assertEqual((v["kind"], v["warn"]), ("retry-loop", True))
-        self.assertIn("quota-limit", v["matched_patterns"])
+        # A provider-blocked CLI is its own kind (owner review), not forced into "retry loop".
+        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("provider-limit", True, "high"))
+        self.assertIn("quota-limit", v["current_patterns"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
+
+    def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
+        # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
+        frames = ["$ run tests\ncommand timed out after 30s\n"] + [IDLE] * 11
+        v = w.classify(frames, True, 600)
+        self.assertNotEqual(v["kind"], "retry-loop")
+        self.assertEqual(v["current_patterns"], [])
+        self.assertEqual((v["pattern_sample_count"], v["consecutive_pattern_samples"]), (1, 0))
+        self.assertIn("timeout", v["matched_patterns"])  # still reported as evidence, just not deciding
+        # the same residue through the persisted window: the trailing static run decides
+        entries = [{"ts": 0.0, "state": "t", "raw_state": "t", "patterns": ["timeout"]}] + \
+                  [{"ts": 60.0 * i, "state": "i", "raw_state": "i", "patterns": []} for i in range(1, 12)]
+        self.assertEqual(w.classify_window(entries, (False, ""), 660.0)["kind"], "idle")
+
+    def test_retry_text_must_be_current_and_recurrent(self):
+        # retry-loop = low novelty AND retry text that is current and recurrent
+        frames = [retry_frame(0), IDLE, IDLE] + [retry_frame(i) for i in range(9)]
+        v = w.classify(frames, True, 60)
+        self.assertEqual(v["kind"], "retry-loop")
+        self.assertEqual(v["consecutive_pattern_samples"], 9)
+        self.assertEqual(v["pattern_sample_count"], 10)
+        # a single current sample with retry text is not yet recurrent — low novelty alone
+        # is the softer, cause-unknown warning, never "retry loop"
+        v2 = w.classify([IDLE] * 11 + [retry_frame(0)], True, 60)
+        self.assertNotIn(v2["kind"], ("retry-loop", "provider-limit"))
+        self.assertEqual(v2["consecutive_pattern_samples"], 1)
 
     def test_case2_retry_loop_when_only_counters_move(self):
         v = w.classify([retry_frame(i) for i in range(20)], True, 60)
@@ -179,8 +214,12 @@ class IoEdge(unittest.TestCase):
             (ws / "state").mkdir()
             (ws / "tasks").mkdir()
             self.assertEqual(w.work_outstanding(ws), (False, ""))
-            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
-            self.assertEqual(w.work_outstanding(ws), (True, "core-status running"))
+            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": 1000.0}))
+            self.assertEqual(w.work_outstanding(ws, now=1012.0), (True, "core-status running (12s old)"))
+            # graceful-restart's contract: "running" older than the TTL is a crashed core's last word
+            self.assertEqual(w.work_outstanding(ws, now=1000.0 + 901), (False, ""))
+            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))  # no ts: not counted
+            self.assertEqual(w.work_outstanding(ws, now=1000.0), (False, ""))
             (ws / "state" / "core-status.json").write_text("{not json")
             (ws / "tasks" / "task-abc.txt").write_text("task: x\n")
             self.assertEqual(w.work_outstanding(ws), (True, "1 queued task(s)"))
@@ -190,21 +229,23 @@ class IoEdge(unittest.TestCase):
             ws = Path(d)
             (ws / "tasks").mkdir()
             (ws / "state").mkdir()
-            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
+            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": 1490.0}))
             entries = w.append_window(ws, working_frame(0), 1000.0)
             entries = w.append_window(ws, IDLE, 1100.0)
             entries = w.append_window(ws, IDLE, 1400.0)
             self.assertEqual(len(entries), 3)
-            v = w.classify_window(entries, w.work_outstanding(ws), 1500.0)
+            v = w.classify_window(entries, w.work_outstanding(ws, now=1500.0), 1500.0)
             # the static run started at 1100 (the working frame before it does not count)
             self.assertEqual(v["duration"], 400.0)
             self.assertEqual(v["kind"], "static-with-work")
             self.assertEqual(v["trailing_static_samples"], 2)
-            self.assertEqual(v["sample_count"], 3)  # the window is still reported whole
+            self.assertEqual(v["sample_count"], 3)  # the run is still reported whole
+            self.assertEqual(v["confidence"], "low")  # 2 samples: one gap, however long (TustinOC)
+            self.assertEqual((v["observation_runs"], v["median_gap_s"]), (1, 300.0))
             # a clock-only trailing run is NOT a static run (raw ids differ)
             for i in range(3):
                 entries = w.append_window(ws, idle_with_clock(i), 1500.0 + i)
-            self.assertNotEqual(w.classify_window(entries, w.work_outstanding(ws), 1600.0)["kind"], "static-with-work")
+            self.assertNotEqual(w.classify_window(entries, w.work_outstanding(ws, now=1600.0), 1600.0)["kind"], "static-with-work")
             # a corrupt line is skipped, not fatal; the cap holds
             with w.window_path(ws).open("a") as fh:
                 fh.write("{not json\n")
@@ -212,6 +253,39 @@ class IoEdge(unittest.TestCase):
                 entries = w.append_window(ws, working_frame(i % 26), 2000.0 + i, keep=20)
             self.assertEqual(len(entries), 20)
             self.assertEqual(w.classify_window([], (False, ""), 0.0)["kind"], "unknown")
+
+    def test_a_gap_starts_a_new_observation_run(self):
+        # Owner review P1: 10:00 pane A, laptop asleep, 18:00 pane A — two glimpses, not 8 hours.
+        e = lambda ts: {"ts": ts, "state": "a", "raw_state": "a", "patterns": []}
+        entries = [e(36000.0), e(36000.0 + 8 * 3600)]
+        v = w.classify_window(entries, (True, "1 queued task(s)"), 36000.0 + 8 * 3600 + 5)
+        self.assertEqual((v["kind"], v["observation_runs"], v["run_samples"]), ("unknown", 2, 1))
+        self.assertNotEqual(v.get("confidence"), "high")
+        # three samples within the continuity limit ARE a run, and the duration is the run's
+        entries = [e(0.0), e(600.0), e(1200.0)]
+        v = w.classify_window(entries, (True, "1 queued task(s)"), 1230.0)
+        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("static-with-work", "high", 1230.0, 1))
+        # a window whose newest sample is itself older than the limit has no current observation
+        v = w.classify_window(entries, (True, "1 queued task(s)"), 1200.0 + 5000)
+        self.assertEqual(v["kind"], "unknown")
+        self.assertIn("no current observation", v["reason"])
+
+    def test_a_new_pane_identity_starts_a_new_run(self):
+        e = lambda ts, pane: {"ts": ts, "state": "a", "raw_state": "a", "patterns": [], "pane": pane}
+        entries = [e(0.0, "100:1"), e(60.0, "100:1"), e(120.0, "200:2"), e(180.0, "200:2")]
+        v = w.classify_window(entries, (True, "x"), 200.0)
+        self.assertEqual((v["observation_runs"], v["run_samples"], v["duration"]), (2, 2, 80.0))
+        self.assertEqual(w.observation_runs(entries, 2700)[1][0]["pane"], "200:2")
+        # an unknown identity never resets
+        entries2 = [e(0.0, "100:1"), {"ts": 60.0, "state": "a", "raw_state": "a", "patterns": []}]
+        self.assertEqual(len(w.observation_runs(entries2, 2700)), 1)
+
+    def test_pane_identity_probe(self):
+        ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
+        self.assertEqual(ok, "4242:1788000000")
+        junk = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="❯ some pane text"))
+        self.assertIsNone(junk)
+        self.assertIsNone(w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout="")))
 
 
 def fake_tmux(dir_: Path, frames_file: Path) -> Path:

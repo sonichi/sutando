@@ -777,9 +777,15 @@ def check_cli_wedge() -> dict:
         check["detail"] = "pane not readable — no reading, not a verdict"
         return check
     now = time.time()
+    # Pane identity (pid:session-created) starts a new observation run after a core restart.
+    ident = _run_tmux(socket, "display-message", "-p", "-t", "=sutando-core", "#{pane_pid}:#{session_created}")
+    pane = None
+    if ident is not None and getattr(ident, "returncode", 1) == 0:
+        cand = (getattr(ident, "stdout", "") or "").strip()
+        pane = cand if re.match(r"^\d+:\d+$", cand) else None
     try:
-        entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now)
-        verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR), now)
+        entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now, pane=pane)
+        verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR, now), now)
     except Exception as e:  # noqa: BLE001 — an advisory check must never abort the run
         check["detail"] = f"no reading — window state unusable ({type(e).__name__}: {e})"
         return check
@@ -788,7 +794,8 @@ def check_cli_wedge() -> dict:
                        " — advisory; reads the pane, not the process")
     check["evidence"] = {k: verdict.get(k) for k in
                          ("duration", "sample_count", "novel_state_count", "novelty_rate",
-                          "matched_patterns", "work_outstanding")}
+                          "matched_patterns", "current_patterns", "consecutive_pattern_samples",
+                          "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
 def check_secret_scanner_mode() -> dict:

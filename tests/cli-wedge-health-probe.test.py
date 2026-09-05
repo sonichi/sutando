@@ -33,7 +33,10 @@ class CliWedgeProbe(unittest.TestCase):
         hc.WORKSPACE_DIR = ws
         hc._local_core_socket = lambda *a, **k: "/tmp/fake.sock"
         self.frames = [IDLE]
-        hc._run_tmux = lambda sock, *args: SimpleNamespace(returncode=0, stdout=self.frames[min(self.calls(), len(self.frames) - 1)])
+        # capture-pane serves the next frame; the identity probe answers like a real pane
+        hc._run_tmux = lambda sock, *args: (
+            SimpleNamespace(returncode=0, stdout=self.frames[min(self.calls(), len(self.frames) - 1)])
+            if "capture-pane" in args else SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
         self._n = 0
 
     def calls(self):
@@ -91,7 +94,8 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
     def test_static_pane_with_work_outstanding_warns(self):
-        (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
+        import time as _t
+        (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": _t.time()}))
         for _ in range(3):
             c = hc.check_cli_wedge()
         self.assertEqual(c["status"], "warn")
@@ -107,6 +111,15 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertEqual(c["status"], "warn")
         self.assertIn("retry-loop", c["detail"])
         self.assertIn("retrying", c["evidence"]["matched_patterns"])
+
+    def test_stale_running_status_is_not_work(self):
+        # graceful-restart's contract: "running" stamped long ago is a crashed core, not work.
+        (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": 1.0}))
+        for _ in range(3):
+            c = hc.check_cli_wedge()
+        self.assertEqual(c["status"], "ok")
+        self.assertIn("idle", c["detail"])
+        self.assertFalse(c["evidence"]["work_outstanding"])
 
     def test_working_pane_is_ok(self):
         self.frames = [f"● wrote {chr(97 + i)}.ts\n" for i in range(12)]

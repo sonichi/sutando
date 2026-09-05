@@ -54,7 +54,8 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     )
 )
 
-# Order matters: composite tokens (timestamps, durations) before bare digits.
+# Context-specific only (owner review: no blanket digit stripping — "shard 17" vs
+# "shard 18" is progress). Composite tokens (timestamps, durations) come first.
 _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?"), "<ts>"),
     (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp][Mm])?\b"), "<clock>"),
@@ -62,16 +63,25 @@ _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b\d+(?:\.\d+)?[kKmM]?\s*tokens?\b"), "<tokens>"),
     (re.compile(r"\b\d+\s*/\s*\d+\b"), "<count>"),
     (re.compile(r"\b\d+(?:\.\d+)?%"), "<pct>"),
+    (re.compile(r"\b(attempt|retry|retries|try|line|col|iteration|round|turn)\s+#?\d+\b", re.IGNORECASE), r"\1 #"),
     (re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒◴◷◶◵]"), "<spin>"),
     (re.compile(r"(?:\.\s?){2,}|…+"), "<dots>"),
     (re.compile(r"[─━═]{2,}"), "<rule>"),
-    (re.compile(r"\d+"), "#"),
 )
 
-# Provisional: min samples before case 2 speaks; novel/samples at or below
-# which a window counts as repetitive; static seconds for high confidence.
-PROVISIONAL_THRESHOLDS = {"min_samples": 10, "low_novelty_rate": 0.25, "static_high_conf_s": 300}
-
+# Provisional (V1 is instrumentation; real traces tune these) and reported in every
+# verdict. status_ttl_s mirrors graceful-restart.sh busy() (GR_STATUS_TTL_S).
+PROVISIONAL_THRESHOLDS = {
+    "min_samples": 10,
+    "low_novelty_rate": 0.25,
+    "static_high_conf_s": 300,
+    "static_high_conf_samples": 3,
+    "pattern_min_consecutive": 2,
+    "pattern_min_rate": 0.5,
+    "continuity_gap_s": 2700,
+    "status_ttl_s": 900,
+}
+PROVIDER_LIMIT_PATTERNS = ("quota-limit",)
 
 def normalize(frame: str) -> str:
     """Strip volatile fields so two frames differing only in clocks, counters,
@@ -137,26 +147,55 @@ def novelty_of_ids(state_ids: list) -> Novelty:
     return Novelty(n, novel, (novel / n) if n else 0.0, n >= 2 and novel == 1, list(state_ids))
 
 
+def pattern_stats(pattern_samples: list, th: dict) -> dict:
+    """Retry text per SAMPLE, not a union over the window: a `timeout` in one old
+    frame must not colour ten idle frames after it. Recurrent = the trailing
+    samples all carry text, or enough of the run does; current = the newest does."""
+    n = len(pattern_samples)
+    current = sorted(set(pattern_samples[-1])) if pattern_samples else []
+    with_pat = sum(1 for ps in pattern_samples if ps)
+    consecutive = 0
+    for ps in reversed(pattern_samples):
+        if not ps:
+            break
+        consecutive += 1
+    rate = (with_pat / n) if n else 0.0
+    recurrent = bool(current) and (consecutive >= th["pattern_min_consecutive"]
+                                   or (n >= th["min_samples"] and rate >= th["pattern_min_rate"]))
+    return {"current_patterns": current, "pattern_sample_count": with_pat,
+            "pattern_rate": round(rate, 3), "consecutive_pattern_samples": consecutive,
+            "retry_current": recurrent}
+
+
 def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    clock-only | static-with-work | retry-loop | low-novelty | unknown; the
-    last three before unknown are warnings. `raw_static` is case 1's input
-    (frame-for-frame equality); when None it is computed from `frames`."""
+    clock-only | static-with-work | retry-loop | provider-limit | low-novelty |
+    unknown; the four before unknown are warnings. `raw_static` is case 1's
+    input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
         raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
-    return classify_ids([state_id(f) for f in frames], raw_static, matched_patterns(frames),
+    return classify_ids([state_id(f) for f in frames], raw_static, [matched_patterns([f]) for f in frames],
                         work_outstanding, duration_s, work_detail, thresholds)
 
 
-def classify_ids(state_ids: list, raw_static: bool, pats: list, work_outstanding: bool,
-                 duration_s: float, work_detail: str = "", thresholds: Optional[dict] = None) -> dict:
+def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool,
+                 duration_s: float, work_detail: str = "", thresholds: Optional[dict] = None,
+                 gaps: Optional[list] = None) -> dict:
     """The verdict from hashes and pattern names alone — what the persisted
-    window carries, so no pane text is needed (or stored) to classify."""
+    window carries, so no pane text is needed (or stored) to classify. `pats`
+    is one list of pattern names per sample (a flat list means every sample)."""
     th = {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}
     nov = novelty_of_ids(state_ids)
+    if pats and all(isinstance(x, str) for x in pats):
+        pats = [list(pats) for _ in state_ids]
+    ps = pattern_stats(list(pats or []), th)
     clock_only = (not raw_static) and nov.static
+    spacing = {}
+    if gaps:
+        g = sorted(gaps)
+        spacing = {"median_gap_s": round(g[len(g) // 2], 1), "max_gap_s": round(g[-1], 1)}
     base = {
         "advisory": True,
         "note": "CLI progress detector — reads the pane, not the process; not a health guarantee",
@@ -164,7 +203,9 @@ def classify_ids(state_ids: list, raw_static: bool, pats: list, work_outstanding
         "sample_count": nov.sample_count,
         "novel_state_count": nov.novel_state_count,
         "novelty_rate": round(nov.novelty_rate, 3),
-        "matched_patterns": pats,
+        "matched_patterns": sorted({p for s in (pats or []) for p in s}),
+        **ps,
+        **spacing,
         "work_outstanding": work_outstanding,
         "work_detail": work_detail,
         "raw_static": bool(raw_static),
@@ -173,29 +214,34 @@ def classify_ids(state_ids: list, raw_static: bool, pats: list, work_outstanding
     }
     if nov.sample_count < 2:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
-                "reason": "fewer than 2 samples — nothing to compare"}
-    # Retry text decides first: a loop whose only motion is counters/clocks
-    # normalizes to ONE state and would otherwise read as merely static.
-    if pats and (raw_static or nov.static or (nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"])):
-        return {**base, "kind": "retry-loop", "confidence": "high" if nov.sample_count >= th["min_samples"] else "medium", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct state(s) over {nov.sample_count} samples and retry text present ({', '.join(pats)})"}
+                "reason": "fewer than 2 samples in the current observation run — nothing to compare"}
+    enough = nov.sample_count >= th["min_samples"]
+    # A provider told the CLI to stop: not a retry loop, a blocked state of its own.
+    # The pane keeps moving (clock, verb), so only current, recurrent text tells.
+    if ps["retry_current"] and any(p in ps["current_patterns"] for p in PROVIDER_LIMIT_PATTERNS):
+        return {**base, "kind": "provider-limit", "confidence": "high" if ps["consecutive_pattern_samples"] >= 3 else "medium",
+                "warn": True, "reason": f"provider limit text on the last {ps['consecutive_pattern_samples']} sample(s) ({', '.join(ps['current_patterns'])})"}
+    low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
+    # Retry loop = low novelty AND retry text that is current and recurrent (not a stale residue).
+    if ps["retry_current"] and (raw_static or nov.static or low_novelty):
+        return {**base, "kind": "retry-loop", "confidence": "high" if enough else "medium", "warn": True,
+                "reason": f"{nov.novel_state_count} distinct state(s) over {nov.sample_count} samples; retry text on the last {ps['consecutive_pattern_samples']} ({', '.join(ps['current_patterns'])})"}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
     if raw_static:
         if work_outstanding:
-            high = duration_s >= th["static_high_conf_s"]
+            high = duration_s >= th["static_high_conf_s"] and nov.sample_count >= th["static_high_conf_samples"]
             return {**base, "kind": "static-with-work", "confidence": "high" if high else "low", "warn": True,
-                    "reason": f"pane unchanged for {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
+                    "reason": f"pane unchanged across {nov.sample_count} samples over {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
         return {**base, "kind": "idle", "confidence": "high", "warn": False,
                 "reason": "pane unchanged and nothing outstanding"}
     if clock_only:
         return {**base, "kind": "clock-only", "confidence": "medium", "warn": False,
                 "reason": "only volatile fields (clock/counters) change — a live CLI, not a wedge (operator observation); recorded for the harness"}
-    if work_outstanding and nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"]:
+    if work_outstanding and low_novelty:
         return {**base, "kind": "low-novelty", "confidence": "low", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples with work outstanding, no retry text — repetitive, cause unknown"}
+                "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples with work outstanding, no current retry text — repetitive, cause unknown"}
     return {**base, "kind": "working", "confidence": "medium" if nov.novelty_rate < 0.6 else "high", "warn": False,
             "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples"}
-
 
 # ---- I/O edge -------------------------------------------------------------
 
@@ -212,12 +258,39 @@ def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
     return proc.stdout
 
 
-def work_outstanding(workspace: Path) -> tuple:
-    """True when the core says it is running or a task file is queued."""
+_PANE_ID = re.compile(r"^\d+:\d+$")
+
+
+def pane_identity(socket_path: str, target: str, tmux_bin: str = "tmux",
+                  runner: Callable = subprocess.run) -> Optional[str]:
+    """`pane_pid:session_created` for the target, or None when unknown. A new
+    core process is a new observation run; None never resets anything."""
+    try:
+        proc = runner([tmux_bin, "-S", socket_path, "display-message", "-p", "-t", target,
+                       "#{pane_pid}:#{session_created}"], capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001 — identity unknown is not a reading
+        return None
+    out = (getattr(proc, "stdout", "") or "").strip()
+    return out if getattr(proc, "returncode", 1) == 0 and _PANE_ID.match(out) else None
+
+
+def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Optional[float] = None) -> tuple:
+    """True when the core says it is running AND said so recently, or a task file
+    is queued. Same contract as graceful-restart.sh busy(): a "running" older
+    than the TTL is a crashed core's last word, not work."""
+    now = time.time() if now is None else now
+    ttl = PROVISIONAL_THRESHOLDS["status_ttl_s"] if ttl_s is None else ttl_s
     reasons = []
     try:
-        if json.loads((workspace / "state" / "core-status.json").read_text()).get("status") == "running":
-            reasons.append("core-status running")
+        st = json.loads((workspace / "state" / "core-status.json").read_text())
+        if st.get("status") == "running":
+            ts = st.get("ts")
+            age = (now - ts) if isinstance(ts, (int, float)) else None
+            if age is not None and 0 <= age <= ttl:
+                reasons.append(f"core-status running ({age:.0f}s old)")
+            else:
+                # Not counted: a stale or unstamped "running" is not evidence of work.
+                pass
     except (OSError, ValueError, AttributeError):
         pass
     tasks = list((workspace / "tasks").glob("task-*.txt"))
@@ -249,7 +322,8 @@ def _write_private(path: Path, text: str) -> None:
 
 def _valid_entry(e) -> bool:
     return (isinstance(e, dict) and isinstance(e.get("ts"), (int, float))
-            and isinstance(e.get("state"), str) and isinstance(e.get("patterns", []), list))
+            and isinstance(e.get("state"), str) and isinstance(e.get("patterns", []), list)
+            and isinstance(e.get("pane", ""), str))
 
 
 def load_window(path: Path) -> list:
@@ -267,47 +341,81 @@ def load_window(path: Path) -> list:
     return entries
 
 
-def append_window(workspace: Path, frame: str, now: float, keep: int = 20) -> list:
+def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane: Optional[str] = None) -> list:
     """Persist one sample into the rolling window so the statistic spans
-    health-check passes; returns the window (oldest first)."""
+    health-check passes; returns the window (oldest first). `pane` is the pane's
+    identity (pid:session-created) so a restarted core starts a new run."""
     path = window_path(workspace)
     entries = load_window(path)
     # Hashes and pattern names only — no pane text is ever persisted here.
-    entries.append({"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
-                    "patterns": matched_patterns([frame])})
+    entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
+             "patterns": matched_patterns([frame])}
+    if pane:
+        entry["pane"] = pane
+    entries.append(entry)
     entries = entries[-keep:]
     _write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
     return entries
 
 
-def classify_window(entries: list, work: tuple, now: float) -> dict:
-    """Classify persisted samples (hashes only). Case 2 looks at the whole
-    window; case 1 at the TRAILING run of one RAW state, since earlier
-    different frames only say the pane moved before it stopped."""
-    entries = [e for e in entries if _valid_entry(e)]
+def observation_runs(entries: list, gap_s: float) -> list:
+    """Split samples into runs of continuous observation: a gap longer than
+    `gap_s` (host asleep, health-check not running) or a different pane
+    identity starts a new run. Two identical frames eight hours apart are two
+    glimpses, not eight hours of watching."""
+    runs = []
+    for e in entries:
+        if runs:
+            prev = runs[-1][-1]
+            if e["ts"] - prev["ts"] > gap_s or (e.get("pane") and prev.get("pane") and e["pane"] != prev["pane"]):
+                runs.append([e])
+                continue
+            runs[-1].append(e)
+        else:
+            runs.append([e])
+    return runs
+
+
+def classify_window(entries: list, work: tuple, now: float, thresholds: Optional[dict] = None) -> dict:
+    """Classify the CURRENT observation run of persisted samples (hashes only).
+    Case 2 looks at the whole run; case 1 at the TRAILING stretch of one RAW
+    state, since earlier different frames only say the pane moved before it
+    stopped. Duration is measured inside the run, never across a gap."""
+    th = {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}
+    entries = sorted((e for e in entries if _valid_entry(e)), key=lambda e: e["ts"])
     if not entries:
-        return classify_ids([], False, [], work[0], 0.0, work[1])
-    ids = [e["state"] for e in entries]
-    raws = [e.get("raw_state") for e in entries]
-    pats = sorted({p for e in entries for p in e.get("patterns", []) if isinstance(p, str)})
-    whole_raw_static = len(entries) >= 2 and all(raws) and len(set(raws)) == 1
-    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - entries[0]["ts"]), work[1])
-    if whole["kind"] in ("retry-loop", "low-novelty"):
-        return whole
-    last = entries[-1].get("raw_state")
-    run = []
-    for e in reversed(entries):
+        return classify_ids([], False, [], work[0], 0.0, work[1], th)
+    runs = observation_runs(entries, th["continuity_gap_s"])
+    run = runs[-1]
+    meta = {"observation_runs": len(runs), "run_started": run[0]["ts"], "run_samples": len(run),
+            "window_samples": len(entries), "last_sample_age_s": round(max(0.0, now - run[-1]["ts"]), 1)}
+    if now - run[-1]["ts"] > th["continuity_gap_s"]:
+        v = classify_ids([], False, [], work[0], 0.0, work[1], th)
+        return {**v, **meta, "reason": f"last sample {now - run[-1]['ts']:.0f}s ago — no current observation"}
+    gaps = [b["ts"] - a["ts"] for a, b in zip(run, run[1:])]
+    ids = [e["state"] for e in run]
+    raws = [e.get("raw_state") for e in run]
+    pats = [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in run]
+    whole_raw_static = len(run) >= 2 and all(raws) and len(set(raws)) == 1
+    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps)
+    if whole["kind"] in ("retry-loop", "provider-limit", "low-novelty"):
+        return {**whole, **meta}
+    last = run[-1].get("raw_state")
+    tail = []
+    for e in reversed(run):
         if not last or e.get("raw_state") != last:
             break
-        run.append(e)
-    if len(run) >= 2:
-        run_pats = sorted({p for e in run for p in e.get("patterns", []) if isinstance(p, str)})
-        trailing = classify_ids([e["state"] for e in run], True, run_pats, work[0], max(0.0, now - run[-1]["ts"]), work[1])
+        tail.append(e)
+    if len(tail) >= 2:
+        tail = list(reversed(tail))
+        tail_gaps = [b["ts"] - a["ts"] for a, b in zip(tail, tail[1:])]
+        trailing = classify_ids([e["state"] for e in tail], True,
+                                [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in tail],
+                                work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps)
         if trailing["kind"] in ("idle", "static-with-work"):
-            return {**trailing, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
-                    "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(run)}
-    return whole
-
+            return {**trailing, **meta, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
+                    "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(tail)}
+    return {**whole, **meta}
 
 # ---- CLI: record real traces / replay / one-shot probe ----------------------
 
@@ -388,8 +496,9 @@ def main(argv: Optional[list] = None) -> int:
         print(json.dumps({"kind": "unknown", "warn": False, "reason": "pane not readable"}))
         return 0
     ws = Path(a.workspace)
-    entries = append_window(ws, frame, time.time())
-    print(json.dumps(classify_window(entries, work_outstanding(ws), time.time()), indent=1))
+    now = time.time()
+    entries = append_window(ws, frame, now, pane=pane_identity(a.socket, a.target, a.tmux))
+    print(json.dumps(classify_window(entries, work_outstanding(ws, now), now), indent=1))
     return 0
 
 
