@@ -118,27 +118,48 @@ def _socket_path() -> str:
 _TMUX_BACKEND: dict | None = None
 
 
-def _tmux_backend(refresh: bool = False) -> dict:
-    """Which tmux created this core's server: the binary the launcher used
-    (SUTANDO_TMUX_BIN when the app exported one, else the PATH tmux) and its
-    `-V` string. A socket path alone is not a connection descriptor — a client
-    with a different tmux gets "protocol version mismatch" and reads the core
-    as absent (desktop, 2026-09-05). Resolved once per process; a client must
-    still verify the recorded binary speaks the server before trusting it."""
+def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | None = None) -> dict:
+    """Which tmux can talk to THIS core's server, verified, plus the server's own
+    version. A socket path alone is not a connection descriptor: a client of
+    another version gets "protocol version mismatch" and reads the core as
+    absent (desktop, 2026-09-05). Candidates are the PATH tmux (what both
+    launchers run) and SUTANDO_TMUX_BIN (what the app exports); the first that
+    can `display-message` the recorded socket+session is recorded as
+    `tmux_binary` with its `-V` as `tmux_version`, and the server answers
+    `tmux_server_version` itself. Nothing speaks → nulls, never a guess.
+    Resolved once per process."""
     global _TMUX_BACKEND
     if _TMUX_BACKEND is not None and not refresh:
         return _TMUX_BACKEND
-    binary = os.environ.get("SUTANDO_TMUX_BIN") or shutil.which("tmux")
-    version = None
-    if binary:
+    sock = sock or _socket_path()
+    sess = sess or core_session()
+    seen: list[str] = []
+    for c in (shutil.which("tmux"), os.environ.get("SUTANDO_TMUX_BIN")):
+        if c and c not in seen:
+            seen.append(c)
+    chosen, server_version = None, None
+    for binary in seen:
         try:
-            r = subprocess.run([binary, "-V"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}", "#{version}"],
+                               capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+        out = (r.stdout or "").strip()
+        if r.returncode == 0 and out:
+            chosen, server_version = binary, out
+            break
+    version = None
+    if chosen:
+        try:
+            r = subprocess.run([chosen, "-V"], capture_output=True, text=True, timeout=5)
             out = (r.stdout or r.stderr or "").strip()
             if r.returncode == 0 and out:
                 version = out.split()[-1] if out.lower().startswith("tmux") else out
         except Exception:
             version = None
-    _TMUX_BACKEND = {"backend": "tmux", "tmux_binary": binary, "tmux_version": version}
+    _TMUX_BACKEND = {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
+                     "tmux_server_version": server_version, "tmux_verified": chosen is not None,
+                     "tmux_candidates": seen}
     return _TMUX_BACKEND
 
 
@@ -429,8 +450,8 @@ def write_beat(status: str = "running") -> None:
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        # The tmux that created the server, so a client can start from the same
-        # binary instead of guessing (a version mismatch reads as "no core").
+        # A client verified to speak this server + the server's own version, so a
+        # reader starts from a compatible binary (a mismatch reads as "no core").
         **_tmux_backend(),
         "schema_version": 4,
     }

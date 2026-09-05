@@ -97,8 +97,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         # schema 4: the tmux that created the server, so a client can start from the
         # same binary — a version mismatch otherwise reads a live core as absent.
         self.assertEqual(data["backend"], "tmux")
-        self.assertIn("tmux_binary", data)
-        self.assertIn("tmux_version", data)
+        for k in ("tmux_binary", "tmux_version", "tmux_server_version", "tmux_verified", "tmux_candidates"):
+            self.assertIn(k, data)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
         # session: what tmux says this core is IN, not what the env claims.
@@ -221,18 +221,34 @@ class TestHeartbeatWrite(unittest.TestCase):
             else:
                 os.environ.pop("SUTANDO_CORE_LOCALITY", None)
 
-    def test_tmux_backend_records_the_launcher_binary_and_its_version(self):
+    def _fake_tmux(self, name, speaks, version="3.6b"):
+        # display-message succeeds only when `speaks`; -V always answers.
+        f = self.tmp / name
+        body = "#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % (
+            version, ("echo '%s'" % version) if speaks else "echo 'protocol version mismatch (client 8, server 9)' >&2; exit 1")
+        f.write_text(body); f.chmod(0o755); return str(f)
+
+    def test_tmux_backend_records_a_client_verified_against_the_socket(self):
         import core_heartbeat
-        fake = self.tmp / "tmux"
-        fake.write_text("#!/bin/sh\necho 'tmux 3.6b'\n")
-        fake.chmod(0o755)
-        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(fake)}):
-            b = core_heartbeat._tmux_backend(refresh=True)
-        self.assertEqual((b["backend"], b["tmux_binary"], b["tmux_version"]), ("tmux", str(fake), "3.6b"))
-        # a binary that cannot run leaves the version None, never raises
-        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "missing")}):
-            b2 = core_heartbeat._tmux_backend(refresh=True)
-        self.assertEqual((b2["tmux_binary"], b2["tmux_version"]), (str(self.tmp / "missing"), None))
+        path_tmux = self._fake_tmux("tmux", speaks=True, version="3.6b")
+        exported = self._fake_tmux("exported-tmux", speaks=False, version="3.5a")
+        # Codex's mixed case: the app exported one binary, the launcher ran the PATH one.
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported, "PATH": str(self.tmp)}):
+            b = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
+                         (path_tmux, "3.6b", "3.6b", True))
+        self.assertEqual(b["tmux_candidates"], [path_tmux, exported])
+        # the other way round: only the exported binary speaks → it is the record
+        path_tmux2 = self._fake_tmux("tmux", speaks=False, version="3.6b")
+        exported2 = self._fake_tmux("exported-tmux", speaks=True, version="3.5a")
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported2, "PATH": str(self.tmp)}):
+            b2 = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((b2["tmux_binary"], b2["tmux_version"], b2["tmux_server_version"]), (exported2, "3.5a", "3.5a"))
+        # nothing speaks → nulls and verified False, never a guess
+        self._fake_tmux("tmux", speaks=False); self._fake_tmux("exported-tmux", speaks=False)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "exported-tmux"), "PATH": str(self.tmp)}):
+            b3 = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((b3["tmux_binary"], b3["tmux_version"], b3["tmux_server_version"], b3["tmux_verified"]), (None, None, None, False))
         core_heartbeat._tmux_backend(refresh=True)  # back to this host's real answer
 
     def test_write_beat_is_atomic_via_tmp(self):
