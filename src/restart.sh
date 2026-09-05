@@ -3,8 +3,11 @@
 # Does NOT touch the Claude Code CLI (core agent) — that's managed separately.
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
+#   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REBUILD_APP=0
+[ "${1:-}" = "--rebuild-app" ] && REBUILD_APP=1
 
 # The sentinel IS the clean-exit signal, so a failed write must be visible: a
 # stub interpreter here would let a stop look successful while nothing changed.
@@ -129,6 +132,18 @@ done
 # A restart is not a shutdown: a sentinel left set would make the surviving
 # core read it as one. --stop-only exits above and deliberately keeps it.
 _shutdown_state clear || true
+
+# The app is already stopped (pkill above, drained by the wait loop), so the
+# build replaces a binary nothing is running. A failed build keeps the old one.
+if [ "$REBUILD_APP" -eq 1 ]; then
+    echo "Rebuilding the menu-bar app..."
+    if bash "$REPO/scripts/install-menu-bar-app.sh" > /tmp/sutando-app-build.log 2>&1; then
+        echo "  ✓ menu-bar app rebuilt"
+    else
+        echo "  ✗ menu-bar app rebuild failed — see /tmp/sutando-app-build.log; relaunching the existing binary"
+    fi
+fi
+
 # Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
 # is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
 APP_BIN="$REPO/src/Sutando/Sutando"

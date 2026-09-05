@@ -67,6 +67,7 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -74,6 +75,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path as _Path
 
 
 def _ensure_tmux_on_path():
@@ -404,6 +406,152 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
 AUTO_ANSWER_CARRY_S = 120.0
 
 
+# ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
+# `src/hitl` — the Manager dedups, the projector renders the card.
+_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+HITL_KIND = "core-blocked"
+_TUI_SOURCE = "tui"
+#: a driven click that has not moved the core by then expires as "did not take".
+DRIVE_SETTLE_S = 15.0
+
+
+def escalation_message(state, detail, kind, prompt):
+    """The card body. The core is blocked, so this is the only thing that will
+    reach the owner until they act."""
+    head = ("I am blocked and cannot continue without you."
+            if state == "blocked-human" else
+            "I am signed out and cannot continue without you.")
+    lines = [head, "", f"State: {state} — {detail}"]
+    if kind and kind != "unknown":
+        lines.append(f"Gate: {kind}")
+    if prompt:
+        excerpt = "\n".join(prompt.strip().splitlines()[-6:])
+        lines += ["", "What the terminal is showing:", "```", excerpt, "```"]
+    lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
+                  "Nothing else I do can clear this one."]
+    return "\n".join(lines)
+
+
+def _hitl_manager(out_path):
+    """The shared requirement store, or None when `src/hitl` is unavailable —
+    the monitor must keep writing its state file either way."""
+    try:
+        here = _osp.dirname(_osp.abspath(__file__))
+        if here not in _sys.path:
+            _sys.path.insert(0, here)
+        from hitl.manager import HitlManager, HitlStore, default_store
+
+        ws = _osp.dirname(_osp.dirname(_osp.abspath(out_path)))
+        return HitlManager(HitlStore(default_store(_Path(ws))))
+    except Exception as exc:  # noqa: BLE001
+        # A store that cannot be BUILT is as optional as one that cannot import.
+        print(f"hitl unavailable ({exc}); no card will be raised", file=_sys.stderr)
+        return None
+
+
+def escalate(manager, state, detail, kind, prompt, session):
+    """Raise ONE requirement per episode. The Manager dedups on
+    (runtime, kind, device) + guard, so the prompt IS the episode key: the same
+    prompt returns the same record, a different one mints a new card.
+
+    Returns the requirement, or None when nothing could be raised.
+    """
+    if manager is None:
+        return None
+    try:
+        from hitl import tui_gate
+        req = tui_gate.requirement_for(state, kind, prompt, session, detail,
+                                       escalation_message(state, detail, kind, prompt))
+        return manager.create(req)
+    except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
+        print(f"hitl escalation failed: {exc}", file=_sys.stderr)
+        return None
+
+
+def resolve_escalations(manager, session):
+    """Clear THIS session's requirements once its core is no longer blocked —
+    the card says answered because the core moved, not because anyone clicked.
+
+    Scoped by session: one worker recovering must not clear a sibling's card.
+    """
+    if manager is None:
+        return []
+    try:
+        mine = [r.id for r in manager.active()
+                if (r.subject or {}).get("source") == _TUI_SOURCE
+                and (r.subject or {}).get("session") == session]
+        for req_id in mine:
+            manager.resolve(req_id)   # returns blocked task ids, not a verdict
+        return mine
+    except Exception as exc:  # noqa: BLE001
+        print(f"hitl resolve failed: {exc}", file=_sys.stderr)
+        return []
+
+
+def drive_escalations(manager, session, prompt, state, send):
+    """Realise a click as keys against the dialog on screen NOW, once; a dialog that
+    changed since the click expires the card. Returns [(req_id, keys or None)]."""
+    if manager is None:
+        return []
+    acted = []
+    try:
+        from hitl import tui_gate
+        from hitl.manager import POLICY_DECIDER
+        from hitl.schema import STATUS_IN_PROGRESS
+
+        def _expire(req_id, note):
+            with manager.store.locked():
+                cur = manager.get(req_id)
+                if cur is not None:
+                    cur.answer = {"note": note}
+                    manager.store.save(cur)
+            manager.expire(req_id)
+
+        for r in manager.active():
+            subj = r.subject or {}
+            if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
+                    or r.status != STATUS_IN_PROGRESS or not r.chosen_action
+                    or r.decided_by == POLICY_DECIDER):
+                continue
+            keys = tui_gate.keys_for(r, prompt, state)
+            if subj.get("driven_at"):
+                # Still the same dialog after the settle window: the keys did not take.
+                # A different dialog: the core moved, resolve_escalations closes it.
+                if keys is not None and time.time() - subj["driven_at"] > DRIVE_SETTLE_S:
+                    _expire(r.id, tui_gate.DID_NOT_TAKE_NOTE)
+                    acted.append((r.id, None))
+                continue
+            if keys is None:
+                _expire(r.id, tui_gate.STALE_NOTE)
+                acted.append((r.id, None))
+                continue
+            sent = []
+            for k in keys:
+                if not send(k):
+                    break
+                sent.append(k)
+            if len(sent) < len(keys):
+                # A half-walked caret is a dialog nobody can reason about: never
+                # finish it later. Record what went in, then hand it to the human.
+                with manager.store.locked():
+                    cur = manager.get(r.id)
+                    if cur is not None:
+                        cur.subject = {**(cur.subject or {}), "driven_keys": sent, "driven_partial": True}
+                        manager.store.save(cur)
+                _expire(r.id, tui_gate.DID_NOT_TAKE_NOTE)
+                acted.append((r.id, None))
+                continue
+            with manager.store.locked():
+                cur = manager.get(r.id)
+                if cur is not None:
+                    cur.subject = {**(cur.subject or {}), "driven_at": time.time(), "driven_keys": sent}
+                    manager.store.save(cur)
+            acted.append((r.id, sent))
+    except Exception as exc:  # noqa: BLE001 — never let the driver take down the monitor
+        print(f"hitl drive failed: {exc}", file=_sys.stderr)
+    return acted
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -424,6 +572,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
+    ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
+                    help="write the supervisor state but never raise a card for a block")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -438,6 +588,7 @@ def main():
     rh.SESSION = a.session
 
     last_sig = None
+    hitl = _hitl_manager(a.out) if a.chat_escalation else None
     stable_prompt = 0
     last_prompt = None
     answered_prompt = None
@@ -479,6 +630,16 @@ def main():
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
             last_sig = sig
+
+        # The Manager owns per-episode dedup; leaving the blocked set resolves
+        # the card, so the owner sees it close without clicking anything.
+        if a.chat_escalation:
+            if state in _CHAT_ESCALATE_STATES:
+                drive_escalations(hitl, a.session, prompt, state,
+                                  lambda k: send_keys(a.socket, a.session, k))
+                escalate(hitl, state, detail, kind, prompt, a.session)
+            else:
+                resolve_escalations(hitl, a.session)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

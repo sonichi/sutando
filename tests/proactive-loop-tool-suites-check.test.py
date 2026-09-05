@@ -5,7 +5,9 @@ purpose is that a MISSING declared suite must be loud rather than silent.
 
 Run:  python3 skills/proactive-loop/scripts/tool-suites-check.test.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -124,10 +126,135 @@ check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
 check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
 go, why = tsc.should_run({"tools_mtime": 5.0, "ran_at": 0.0}, 5.0, 3600, 7200.0)
 check("unchanged but older than --max-age -> run", (go, "last run was" in why), (True, True))
+
+# A red run stamps `ran_at`/`tools_mtime` like any other, so without reading the
+# recorded failure list the next call reports fresh and exits 0 on a red tree.
+go, why = tsc.should_run(
+    {"tools_mtime": 5.0, "ran_at": 90.0, "failed": ["a.test.py"]}, 5.0, 3600, 100.0)
+check("a previous run with FAILURES re-runs, though nothing changed",
+      (go, "failing" in why), (True, True))
+check("CONTROL: the same state with an EMPTY failed list is fresh",
+      tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0, "failed": []},
+                     5.0, 3600, 100.0)[0], False)
+check("CONTROL: and with no `failed` key at all it is still fresh",
+      tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
 with tempfile.TemporaryDirectory() as td:
     check("no scripts/ dir -> exit 2", tsc.main(["--workspace", td]), 2)
     (Path(td) / "scripts").mkdir()
     check("zero suites -> exit 2 (a scope result, not a clean bill)", tsc.main(["--workspace", td]), 2)
+
+def stale_bytecode_case(td):
+    """A tool the suite imports, run once, then edited to the same length.
+
+    A same-size edit in the same second is served the pre-edit bytecode, so the
+    suite asserts against code that is not on disk and still exits 0.
+    """
+    ws = Path(td) / "ws2"
+    (ws / "scripts").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "scripts" / "thing.py").write_text('def verdict():\n    return "AAAA"\n')
+    (ws / "scripts" / "thing.test.py").write_text(
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "p = Path(__file__).with_name('thing.py')\n"
+        "s = importlib.util.spec_from_file_location('thing', p)\n"
+        "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+        "print('verdict', m.verdict())\n"
+        "sys.exit(0 if m.verdict() == 'AAAA' else 1)\n")
+    return ws
+
+
+with tempfile.TemporaryDirectory() as td:
+    ws = stale_bytecode_case(td)
+    args = ["--workspace", str(ws), "--repo", str(Path(td))]
+    r1 = subprocess.run(PYBASE + [str(TOOL)] + args, capture_output=True, text=True)
+    check("stale-bytecode: first run passes (the tool really does say AAAA)", r1.returncode, 0)
+
+    tool = ws / "scripts" / "thing.py"
+    tool.write_text(tool.read_text().replace('"AAAA"', '"BBBB"'))
+    check("stale-bytecode: the edit is on disk", '"BBBB"' in tool.read_text(), True)
+
+    r2 = subprocess.run(PYBASE + [str(TOOL)] + args, capture_output=True, text=True)
+    # Without a fresh cache the suite imports the PRE-edit module, still sees
+    # AAAA, and this run reports 0 — green on code that no longer exists.
+    check("stale-bytecode: the edited tool is seen, so the suite FAILS",
+          r2.returncode, 1)
+    check("stale-bytecode: and the failure names the suite",
+          "thing.test.py" in (r2.stdout + r2.stderr), True)
+
+
+print("\ncase: the extras declaration resolves to a VAULT-CARRIED path")
+# The vault carries hosts/*/ and not state/, so a declaration left under state/
+# is unbacked-up; losing it disables its suites with a green exit.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    (ws / "hosts" / "H").mkdir(parents=True)
+    decl = json.dumps({"suites": []})
+    check("neither present -> the host path is proposed",
+          tsc.extras_path(ws, "H").parent.name, "H")
+    (ws / "state" / tsc.EXTRAS).write_text(decl)
+    check("only the legacy copy -> still read (an un-migrated host keeps its extras)",
+          tsc.extras_path(ws, "H").parent.name, "state")
+    (ws / "hosts" / "H" / tsc.EXTRAS).write_text(decl)
+    check("both present -> the carried copy wins",
+          tsc.extras_path(ws, "H").parent.name, "H")
+    check("an unresolvable host -> the legacy copy, never a hosts/None path",
+          tsc.extras_path(ws, None).parent.name, "state")
+
+print("\ncase: a migrated host with NO environment override still finds its extras")
+# The documented invocation passes no --host, so an env-only default drops a
+# migrated host to the absent state/ copy and exits green on zero extras.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "scripts").mkdir(parents=True)
+    (ws / "scripts" / "dummy.test.py").write_text("print('PASS')\n")
+    repo = Path(td) / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "declared.test.py").write_text("print('PASS')\n")
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "util_paths.py").write_text(
+        "def _host_label():\n    return 'RESOLVED-HOST'\n")
+    (ws / "hosts" / "RESOLVED-HOST").mkdir(parents=True)
+    (ws / "hosts" / "RESOLVED-HOST" / tsc.EXTRAS).write_text(
+        json.dumps({"suites": ["tests/declared.test.py"]}))
+    env = dict(os.environ); env.pop("SUTANDO_HOST_LABEL", None)
+    r = subprocess.run([sys.executable, str(TOOL), "--workspace", str(ws),
+                        "--repo", str(repo), "--force"],
+                       capture_output=True, text=True, env=env)
+    check("the declared suite actually ran", "declared.test.py" in r.stdout, True)
+    check("it is counted, not silently dropped", "2 of 2 suites pass" in r.stdout, True)
+    check("exit 0", r.returncode, 0)
+
+print("\ncase: the uncarried warning names a remedy that can actually work")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    f = ws / "state" / tsc.EXTRAS
+    f.write_text(json.dumps({"suites": []}))
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        tsc.extra_suites(f, Path(td))
+    msg = buf.getvalue()
+    check("it warns at all", "NOT tracked" in msg, True)
+    check("it points at hosts/<host>/", "hosts/<host>/" in msg, True)
+    # The old remedy was a bare "Add its path to vault.sync.include". A whitelist
+    # re-include DOES work in general; it fails here for two other reasons.
+    check("it does not prescribe a bare include entry as the fix",
+          "Add its path to vault.sync.include." in msg, False)
+    check("it names the carve-out ordering", "after includes" in msg, True)
+    check("it warns that include REPLACES the carrier set", "REPLACES" in msg, True)
+
+print("\ncase: a state DIRECTORY still resolves (the pre-move call shape)")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    repo = Path(td) / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "e.test.py").write_text("print('PASS')\n")
+    (ws / "state" / tsc.EXTRAS).write_text(json.dumps({"suites": ["tests/e.test.py"]}))
+    got = [x.name for x in tsc.extra_suites(ws / "state", repo)]
+    check("a directory argument is still accepted", got, ["e.test.py"])
 
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")

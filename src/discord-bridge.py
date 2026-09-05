@@ -218,6 +218,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -796,6 +797,15 @@ def archive_path(kind: str, task_id: str) -> "Path":
     month_dir = base / ym
     month_dir.mkdir(parents=True, exist_ok=True)
     return month_dir / f"{task_id}.txt"
+
+
+def sandbox_prompt_argument(text: str) -> str:
+    """The prompt as a quoted heredoc for the core's own shell, so no prompt is ever
+    written to a file a same-user sandbox could read; codex receives it as argv."""
+    tag = "SUTANDO_PROMPT"
+    while re.search(rf"^{tag}\s*$", text, re.M):
+        tag += "_" + os.urandom(3).hex()
+    return f'"$(cat <<\'{tag}\'\n{text}\n{tag}\n)"'
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> bool:
@@ -4183,14 +4193,8 @@ async def _handle_discord_message(message, force=False):
     user_task_text = confine_user_content(
         f"[Discord @{username}] {text}{attachment_note}{reply_context}"
     )
-    # Write task text to a /tmp file and reference via `"$(cat ...)"` heredoc
-    # form instead of shlex.quote'ing it inline. Reason: codex's stdin parser
-    # hangs 7-20min on nested-quote escapes (`'"'"'` style) that arise when
-    # the agent's Bash tool eval-wraps the bridge-injected codex command. The
-    # heredoc form has no nesting depth at any layer; codex receives the file
-    # contents directly via shell command substitution. Per memory
-    # `feedback_codex_nested_quotes_hang_stdin` (Lucy 2026-05-08) + reproduced
-    # live 2026-05-09 PT on Mini coord ping (task-1778363006905, hung 7+min).
+    # The prompt reaches codex as argv through a quoted heredoc the core's shell expands:
+    # no file on disk, and no nested quoting for codex's stdin parser to hang on.
     #
     # Sutando-identity preamble for codex-sandbox-tier tasks (team/other).
     # Without this, codex answers identity/capability questions about ITSELF
@@ -4215,9 +4219,6 @@ async def _handle_discord_message(message, force=False):
     else:
         codex_prompt_text = user_task_text
 
-    prompt_path = f"/tmp/sutando-{task_id}.txt"
-    Path(prompt_path).write_text(codex_prompt_text)
-    quoted_task = f'"$(cat {prompt_path})"'
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):
@@ -4260,16 +4261,8 @@ async def _handle_discord_message(message, force=False):
             secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
             enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
-            # Rewrite the prompt file with the enriched body. quoted_task
-            # already points to `"$(cat {prompt_path})"` — keep the heredoc
-            # form (per PR #652's codex-stdin-hang fix). Using shlex.quote
-            # here would reintroduce the nested-escape pathology codex's
-            # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
-            # Deep async-handler branch (fires only when a ref actually enriches);
-            # not independently invocable from unit tests — the enrich/confine
-            # logic is covered via confine_user_content's own tests. no-cover here
-            # keeps the diff gate honest without a Discord-message integration rig.
-            Path(prompt_path).write_text(user_task_text)  # pragma: no cover
+            # The enriched body replaces the prompt; the launch argument is composed later.
+            codex_prompt_text = user_task_text  # pragma: no cover
         elif access_tier in ("team", "other") and not is_collaborator:
             # Silent-escalate stays NON-OWNER-only, and collaborators are
             # excluded too. The prefetch above now runs for all tiers (so the
@@ -4312,7 +4305,7 @@ async def _handle_discord_message(message, force=False):
     # instruction that told the agent to NO-REPLY archive, but that left the
     # task in `pending_replies` until age-out — leak-prone per MacBook's #639
     # review. Removed in favor of skipping the task-file write entirely.)
-    tier_instructions = _tier_rulebooks(quoted_task)
+    tier_instructions = _tier_rulebooks(sandbox_prompt_argument(codex_prompt_text))
 
     # Auto-react BEFORE writing the task — gives the user an instant visual ack
     # at gateway-event speed, while the rest of task processing (file write,
@@ -4331,11 +4324,10 @@ async def _handle_discord_message(message, force=False):
     # channel_name / guild_name: human-readable labels so the task-consumer can
     # disambiguate one team channel from another without grepping numeric IDs
     # against a memory file. DM channels have no `.name` attr; DMs have no
-    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
-    # containing \n (rare but possible) can't inject a spurious metadata
-    # line into the task file's k:v shape (per qingyun review on #1077).
-    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
-    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
+    # guild. Default to "DM" for both. Both are attacker-settable (a server or
+    # channel name), and land above `access_tier:`, so they flatten via the guard.
+    channel_name = header_safe_value(getattr(message.channel, "name", None) or "DM")
+    guild_name = header_safe_value(message.guild.name if message.guild else "DM")
     # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
@@ -4452,6 +4444,9 @@ async def _handle_discord_message(message, force=False):
         rulebook_key = select_rulebook_key(access_tier, is_collaborator)
         return (
             f"id: {task_id}\n"
+            # Second line on purpose: every reader is first-match, so nothing a
+            # sender can set (channel_name, guild_name) may precede the tier.
+            f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
@@ -4465,7 +4460,6 @@ async def _handle_discord_message(message, force=False):
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
-            f"access_tier: {access_tier}\n"
             f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
@@ -5077,6 +5071,7 @@ async def poll_results():
         # A task written straight into tasks/ was never in pending_replies, so
         # its result would sit forever. Adopt the route it declared, then let
         # the existing resolution below turn it into a channel.
+
         global _orphan_route_cursor
         _adopted, _orphan_route_cursor = orphan_result_routes(
             RESULTS_DIR, TASKS_DIR,
@@ -5346,10 +5341,8 @@ async def poll_results():
                                 task_body = _tier_path.read_text()
                             except Exception:
                                 continue
-                            for ln in task_body.splitlines():
-                                if ln.startswith("access_tier:"):
-                                    task_tier = ln.split(":", 1)[1].strip() or "other"
-                                    break
+                            task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                         .headers.get("access_tier") or "other").strip() or "other"
                             break  # first readable file wins; missing all → "other"
                         if task_tier != "owner":
                             print(
@@ -6208,10 +6201,8 @@ async def poll_dm_fallback():
                     task_tier = "other"
                     try:
                         task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
-                        for ln in task_body.splitlines():
-                            if ln.startswith("access_tier:"):
-                                task_tier = ln.split(":", 1)[1].strip() or "other"
-                                break
+                        task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                     .headers.get("access_tier") or "other").strip() or "other"
                     except Exception:
                         task_tier = "other"
 

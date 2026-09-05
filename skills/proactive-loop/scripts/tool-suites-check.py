@@ -26,9 +26,11 @@ exit 0 all pass (or fresh) · 1 a suite failed · 2 cannot answer
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -47,7 +49,39 @@ class ExtrasError(Exception):
     """A declared extra suite could not be resolved."""
 
 
-def extra_suites(statedir: Path, repo: Path):
+def resolve_host(repo: Path) -> "str | None":
+    """The canonical per-host label, via the repo's own resolver.
+
+    Reading `$SUTANDO_HOST_LABEL` alone made a migrated host with no export
+    fall back to the absent `state/` copy and silently run zero extras.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_tsc_util_paths", repo / "src" / "util_paths.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._host_label()
+    except Exception:
+        return os.environ.get("SUTANDO_HOST_LABEL")
+
+
+def extras_path(ws: Path, host: str | None = None) -> Path:
+    """Where the extras declaration lives, preferring the CARRIED location.
+
+    An include entry for a `state/` path is re-ignored by the `state/` carve-out
+    the vault emits after the includes, and setting `include` REPLACES the set.
+    """
+    if host:
+        carried = ws / "hosts" / host / EXTRAS
+        if carried.is_file():
+            return carried
+    legacy = ws / "state" / EXTRAS
+    if legacy.is_file():
+        return legacy
+    return (ws / "hosts" / host / EXTRAS) if host else legacy
+
+
+def extra_suites(decl_or_statedir: Path, repo: Path):
     """Suites living OUTSIDE the workspace scripts dir, declared explicitly.
 
     A locally-deployed guard (e.g. a PreToolUse hook) keeps its suite with the
@@ -59,7 +93,9 @@ def extra_suites(statedir: Path, repo: Path):
     a typo or a moved file report a clean bill for a suite that never ran,
     which is the exact failure this whole check exists to prevent.
     """
-    f = statedir / EXTRAS
+    f = decl_or_statedir
+    if f.is_dir():                      # legacy call shape: a state directory
+        f = f / EXTRAS
     if not f.is_file():
         return []
     try:
@@ -92,16 +128,21 @@ def _warn_if_uncarried(decl: Path) -> None:
 
     Advisory only — a backup concern must never fail a test run.
     """
+    ws = decl.parent.parent
     try:
-        r = subprocess.run(["git", "-C", str(decl.parent.parent), "ls-files", "--error-unmatch",
-                            str(decl.relative_to(decl.parent.parent))],
+        r = subprocess.run(["git", "-C", str(ws), "ls-files", "--error-unmatch",
+                            str(decl.relative_to(ws))],
                            capture_output=True, text=True, timeout=10)
     except Exception:
         return                      # no git, no repo, or a path outside it: not our business
     if r.returncode != 0:
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
               f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Add its path to vault.sync.include.", file=sys.stderr)
+              f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no config "
+              f"edit. Do NOT add a state/ path to vault.sync.include: the vault emits carve-outs "
+              f"after includes so a `state/` exclude re-ignores it, and `include` REPLACES the "
+              f"carrier set rather than extending it (see sync-workspace.sh:36-45).",
+              file=sys.stderr)
 
 
 def newest_mtime(paths) -> float:
@@ -113,6 +154,10 @@ def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple
         return True, "no previous run recorded"
     if newest > state.get("tools_mtime", 0.0):
         return True, "a tool or suite changed since the last green run"
+    # The failure list is recorded on every run; without this it was written
+    # and never read, so one red pass reported and the next skipped it.
+    if state.get("failed"):
+        return True, f"previous run left {len(state['failed'])} suite(s) failing"
     age = now - state.get("ran_at", 0.0)
     if age > max_age:
         return True, f"last run was {age/3600:.1f}h ago (> {max_age/3600:.0f}h)"
@@ -121,11 +166,22 @@ def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple
 
 def run_suites(suites, cwd) -> "list[tuple[str, int, str]]":
     out = []
+    # A fresh bytecode cache per run: an edited tool can otherwise be served its
+    # PRE-edit .pyc and report green. `-B` stops writing, not reading.
+    env = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix="tool-suites-pyc-") as pycache:
+        env["PYTHONPYCACHEPREFIX"] = pycache
+        out.extend(_run_each(suites, cwd, env))
+    return out
+
+
+def _run_each(suites, cwd, env) -> "list[tuple[str, int, str]]":
+    out = []
     for s in suites:
         try:
             # NO extra argv: unittest would read it as a test-name selector.
             r = subprocess.run([sys.executable, str(s)], capture_output=True,
-                               text=True, timeout=180, cwd=cwd)
+                               text=True, timeout=180, cwd=cwd, env=env)
             lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
             last = lines[-1] if lines else (r.stderr.strip().splitlines() or ["(no output)"])[-1]
             out.append((s.name, r.returncode, last[:100]))
@@ -141,6 +197,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=".", help="cwd for the suites (some import from src/)")
     ap.add_argument("--max-age-hours", type=float, default=24.0)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--host", default=None,
+                    help="host label; defaults to the repo's canonical resolver")
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
@@ -150,7 +208,8 @@ def main(argv=None) -> int:
         return 2
     tools, suites = tools_and_suites(scripts)
     try:
-        extras = extra_suites(statedir, Path(a.repo).resolve())
+        host = a.host or resolve_host(Path(a.repo).resolve())
+        extras = extra_suites(extras_path(ws, host), Path(a.repo).resolve())
     except ExtrasError as e:
         print(f"CANNOT ANSWER: {e}", file=sys.stderr)
         return 2

@@ -335,6 +335,18 @@ function isRejectionRecord(x: unknown): x is RejectionRecord {
 }
 
 /** Append one rejection to a (possibly foreign/corrupt) prior ledger, keeping the newest `max`. */
+export interface LastRequest { model: string; at: string }
+
+/** The model that last consumed quota through this proxy, carried across
+ *  requests that name none (a non-messages call must not blank the tile). */
+export function withLastRequest(prev: unknown, model: string, at: string): LastRequest | undefined {
+	if (model) return { model, at };
+	const old = (prev as { last_request?: unknown } | null)?.last_request;
+	if (old && typeof old === 'object' && typeof (old as LastRequest).model === 'string' && (old as LastRequest).model
+		&& typeof (old as LastRequest).at === 'string') return old as LastRequest;
+	return undefined;
+}
+
 export function appendRejection(prev: unknown, rej: RejectionRecord, max: number = MAX_RECENT_REJECTIONS): RejectionRecord[] {
 	const list = Array.isArray(prev) ? prev.filter(isRejectionRecord) : [];
 	list.push(rej);
@@ -347,7 +359,7 @@ export interface ProxyDeps {
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
-	updateQuotaState: (headers: Record<string, string>) => void;
+	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
 	recordRejection: (rej: RejectionRecord) => void;
 	now: () => number;
 	idleTimeoutMs: number;
@@ -524,7 +536,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders);
+							deps.updateQuotaState(quotaHeaders, requestModel(body));
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {
@@ -644,15 +656,18 @@ function recordRejection(rej: RejectionRecord): void {
 	} catch { /* best effort */ }
 }
 
-function updateQuotaState(headers: Record<string, string>): void {
+function updateQuotaState(headers: Record<string, string>, model = ''): void {
 	try {
 		// The header write replaces the file, so carry the rejection ledger across it.
-		const prevLedger = readQuotaFile().recent_rejections;
+		const prev = readQuotaFile();
+		const prevLedger = prev.recent_rejections;
+		const lastRequest = withLastRequest(prev, model, new Date().toISOString());
 		const state: Record<string, unknown> = {
 			available: true,
 			last_checked: new Date().toISOString(),
 			headers,
 			recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
+			...(lastRequest ? { last_request: lastRequest } : {}),
 		};
 
 		// Parse specific headers
