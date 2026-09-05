@@ -396,6 +396,23 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertNotIn("answers with the **server's own socket path and that session name**", doc)
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
+    def test_recording_the_writer_pid_never_creates_the_cores_dir(self):
+        # A harness that stubs write_beat() must leave no state/cores behind: a later reader takes an
+        # EMPTY cores dir as "every core offline" (signal_room_tasks.core_is_alive), so the pid record
+        # waits for the first beat to bring the directory into existence.
+        import core_heartbeat
+        with tempfile.TemporaryDirectory() as d:
+            cores = Path(d) / "state" / "cores"
+            with patch.object(core_heartbeat, "CORES_DIR", cores), \
+                 patch.object(core_heartbeat, "_alive_path", lambda: cores / "host.alive"), \
+                 patch.object(core_heartbeat, "_PID_RECORDED", False):
+                core_heartbeat._record_writer_pid()
+                self.assertFalse(cores.exists(), "no beat yet: nothing may be created")
+                cores.mkdir(parents=True)
+                core_heartbeat._record_writer_pid()
+                self.assertTrue((cores / "host.heartbeat.pid").exists())
+                self.assertTrue(core_heartbeat._PID_RECORDED)
+
     def test_stop_other_writers_in_process_ends_a_stand_in_and_reports_it(self):
         # Coverage runs in-process: the handoff itself, not only its CLI wrapper, must be exercised here.
         import core_heartbeat
@@ -404,6 +421,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script, "not-a-writer"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}   # no core → publishes nothing
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)  # a host that ran before; the record waits for the dir
         old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()), "the writer did not record its pid")
@@ -576,6 +594,7 @@ class TestHeartbeatCli(unittest.TestCase):
         script = ROOT / "src" / "core_heartbeat.py"
         # A REAL old writer (it records its own pid before its first beat), plus a bystander whose argv
         # merely mentions the script path — the shape a pgrep sweep would have killed.
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)  # a host that ran before; the record waits for the dir
         old = subprocess.Popen([sys.executable, str(script), "--interval", "60"],
                                env={**self.env, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")},
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

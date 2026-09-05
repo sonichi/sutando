@@ -569,6 +569,8 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
         if saw_core:
             try:
                 write_beat(status=status)
+                if not _PID_RECORDED:
+                    _record_writer_pid()
             except Exception as e:
                 # Don't die on transient FS hiccups — log + retry next tick.
                 print(f"core_heartbeat: write failed: {e}", file=sys.stderr, flush=True)
@@ -612,12 +614,17 @@ def _pidfile() -> Path:
     return _alive_path().with_suffix(".heartbeat.pid")
 
 
+_PID_RECORDED = False
+
+
 def _record_writer_pid() -> None:
-    """The writer's own record of itself, written before the first beat so a restart can find it
-    even when no .alive has been published yet."""
+    """The writer's own record of itself, beside the .alive. Never creates the directory: only a beat
+    may bring state/cores into existence (a harness that stubs write_beat must leave no trace)."""
+    global _PID_RECORDED
     try:
-        CORES_DIR.mkdir(parents=True, exist_ok=True)
-        _pidfile().write_text(f"{os.getpid()} {Path(__file__).resolve()}\n")
+        if CORES_DIR.is_dir():
+            _pidfile().write_text(f"{os.getpid()} {Path(__file__).resolve()}\n")
+            _PID_RECORDED = True
     except Exception:  # pragma: no cover — best-effort
         pass
 
