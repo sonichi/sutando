@@ -550,5 +550,54 @@ class CrossReferencesResolve(unittest.TestCase):
         self.assertNotIn("**A Section That Does Not Exist Here", flat)
 
 
+class DirectHandoffNamesAnAcceptance(unittest.TestCase):
+    """The shipped Codex consumer skips any candidate carrying a claim, before it reads
+    the fallback marker, and `TASK_FILE:` is its only wake. A direct exit that claims and
+    then emits therefore publishes a wake its consumer must refuse.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_consumer_skip_is_named_with_its_location(self):
+        f = self._flat()
+        self.assertIn("task-notifier.sh:188", f,
+                      "the skip that breaks the handoff must be cited, not described")
+        self.assertIn("wait_for_core_idle", f,
+                      "the no-other-trigger half is what makes the skip terminal; without "
+                      "it a reader assumes a later poll recovers")
+
+    def test_acceptance_is_a_value_the_executor_reads(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"a claim exists AND is not addressed to me",
+            "an ownership handoff the executor cannot read is the presence-flag it replaces")
+
+    def test_release_belongs_to_the_accepting_executor(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"the party that releases is the party that acted",
+            "watcher-side release fires no second event, so the skipped task is never "
+            "re-offered")
+
+    def test_both_death_windows_get_opposite_recoveries(self):
+        """The point of separating them: one needs the claim retired, the other needs it
+        preserved. A section naming only 'watcher death' has not answered either."""
+        f = self._flat()
+        for phrase in ("Death BEFORE publish", "Death AFTER publish"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, f)
+        self.assertRegex(
+            f, r"the first needs the claim retired, the second needs it preserved",
+            "the recoveries must be stated as opposite, or the sweep races acceptance")
+
+    def test_the_claude_side_is_stated_as_a_finding_not_a_gap(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"no change and that is a finding",
+            "'the other executor is fine' is the reason this shipped; it belongs in the "
+            "document rather than in the reviewer's head")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

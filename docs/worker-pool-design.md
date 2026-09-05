@@ -388,6 +388,50 @@ THREE crash windows, and they are distinct states rather than one described thre
 primitive inside `queue_handler_task`, and one that took the lock at `dispatch_task` entry and would
 have held a no-timeout spinlock across a subprocess probe.)
 
+**The named ownership handoff has to be a value the EXECUTOR reads, because today the claim's mere
+existence means "not yours" and the direct path deadlocks on that.** Measured against the shipped
+Codex consumer rather than reasoned about:
+
+- `next_pending_task` skips any candidate with a claim file — `[ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue`
+  (`src/agent/codex/cli/task-notifier.sh:188`) — unconditionally, and BEFORE it consults the
+  fallback marker, so no fallback event overrides it.
+- `TASK_FILE:` is only a wake: the loop re-scans the whole queue through that same function
+  (`:376-386`). There is no other trigger — `wait_for_core_idle` (`:166-179`) polls for IDLENESS,
+  never for new work.
+- The watcher persists and emits BEFORE releasing, deliberately (`src/watch-tasks-stream.sh:524`):
+  *"duplicate delivery is acceptable here, while release-before-emit could permanently strand work."*
+
+Compose those three and the direct exit emits a wake its consumer is required to refuse: the claim
+is still present at wake time, the candidate is skipped, and the later release fires no second
+event. The task stays durable and unsubmitted — not lost, but never delivered, which is worse than
+lost because every surface reports it as pending.
+
+**The transition, and it is a field that already exists rather than a new file.** `acquire_task_claim`
+writes a FOUR-LINE record — pid, watcher id, task path, disposition — and publishes it by hard link
+(`:129-146`). Line 4 is already `must-handle` | `fallback`. The Codex consumer reads none of the
+four. So:
+
+| | contract |
+|---|---|
+| the claim is | a HANDOFF RECORD, never a "someone else has this" flag. Its line-4 disposition says who must act |
+| direct exit writes | a disposition naming the accepting executor, durable BEFORE the `TASK_FILE:` emit — this is obligation 1 (`receipt-before-emit`), not a new rule |
+| the executor's test | changes from *a claim exists* to **a claim exists AND is not addressed to me**. One `sed -n '4p'` at `task-notifier.sh:188`, the same read the watcher's own `claim_disposition` (`:169-178`) already performs |
+| release | is the ACCEPTING EXECUTOR's, on completion — not the watcher's. This is also what closes the no-second-event hole: the party that releases is the party that acted |
+| acceptance is durable | or the startup stale-claim sweep (`:210-215`, `claim_is_live` / `retire_stale_claim`) races an executor that has already taken the work. **A claim an executor has accepted is not stale merely because its writing watcher died** |
+
+**Both watcher-death windows, stated as the different recoveries they are.** Death BEFORE publish:
+the claim is durable and no wake ever fires, so nothing is running — the next watcher's startup
+sweep quarantines the dead owner's record and the task is re-admitted normally. Death AFTER publish:
+the consumer woke, read the disposition, and owns the work and its release — so the sweep must
+observe acceptance and leave the claim alone. Collapsing these is the failure: the first needs the
+claim retired, the second needs it preserved, and only the acceptance record tells them apart.
+
+**Claude's wiring needs no change and that is a finding, not an omission.** Its consumer is this
+document's own `Monitor`-driven reader, which acts on the emitted `TASK_FILE:` line directly and
+consults no claims directory — so the deadlock is specific to the Codex consumer's skip rule. Two
+executors reading the same emission under different rules is what let this ship: the design was
+checked against the one that has no rule to violate.
+
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
 revision had the ticker count "claims made this pass" and add that to the directory count. That
 was wrong three ways at once, and the first is the one this section had already condemned in
