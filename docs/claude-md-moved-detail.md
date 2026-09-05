@@ -35,13 +35,17 @@ api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
+{"host": "...", "pid": ..., "heartbeat_pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...",
+ "socket": "...", "session": "sutando-core", "locality": {"kind": "local|cloud", "host": "..."},
+ "backend": "tmux", "tmux_binary": "/opt/homebrew/bin/tmux", "tmux_version": "3.6b", "schema_version": 4}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`backend` / `tmux_binary` / `tmux_version` (schema 4) name the tmux that created the core's server: the binary the launcher used (`SUTANDO_TMUX_BIN` when the app exported one, else the PATH `tmux`) and its `-V` string. A socket path is not a full connection descriptor — a client with a different tmux version gets "protocol version mismatch" and misreads a live core as absent. Treat the recorded path as the first candidate and verify it speaks the server; it may have moved. `pid` is the core's, `heartbeat_pid` the writer's (schema 3); `session` is the observed tmux session.
 
 `locality` is the core's self-reported {kind: local|cloud, host} (Track 10) —
 additive and informational; mtime remains the liveness signal, so readers that

@@ -47,6 +47,7 @@ import json
 import os
 import signal
 import subprocess
+import shutil
 import socket
 import sys
 import time
@@ -112,6 +113,33 @@ def _locality() -> dict[str, str]:
 def _socket_path() -> str:
     """The tmux socket this core runs on. Mirrors start-cli.sh's resolution."""
     return os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+
+
+_TMUX_BACKEND: dict | None = None
+
+
+def _tmux_backend(refresh: bool = False) -> dict:
+    """Which tmux created this core's server: the binary the launcher used
+    (SUTANDO_TMUX_BIN when the app exported one, else the PATH tmux) and its
+    `-V` string. A socket path alone is not a connection descriptor — a client
+    with a different tmux gets "protocol version mismatch" and reads the core
+    as absent (desktop, 2026-09-05). Resolved once per process; a client must
+    still verify the recorded binary speaks the server before trusting it."""
+    global _TMUX_BACKEND
+    if _TMUX_BACKEND is not None and not refresh:
+        return _TMUX_BACKEND
+    binary = os.environ.get("SUTANDO_TMUX_BIN") or shutil.which("tmux")
+    version = None
+    if binary:
+        try:
+            r = subprocess.run([binary, "-V"], capture_output=True, text=True, timeout=5)
+            out = (r.stdout or r.stderr or "").strip()
+            if r.returncode == 0 and out:
+                version = out.split()[-1] if out.lower().startswith("tmux") else out
+        except Exception:
+            version = None
+    _TMUX_BACKEND = {"backend": "tmux", "tmux_binary": binary, "tmux_version": version}
+    return _TMUX_BACKEND
 
 
 def core_session() -> str:
@@ -401,7 +429,10 @@ def write_beat(status: str = "running") -> None:
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        "schema_version": 3,
+        # The tmux that created the server, so a client can start from the same
+        # binary instead of guessing (a version mismatch reads as "no core").
+        **_tmux_backend(),
+        "schema_version": 4,
     }
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))

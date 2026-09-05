@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -92,7 +93,12 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual(data["heartbeat_pid"], os.getpid())
         self.assertNotEqual(data["pid"], data["heartbeat_pid"])
         self.assertEqual(data["status"], "custom-status")
-        self.assertEqual(data["schema_version"], 3)
+        self.assertEqual(data["schema_version"], 4)
+        # schema 4: the tmux that created the server, so a client can start from the
+        # same binary — a version mismatch otherwise reads a live core as absent.
+        self.assertEqual(data["backend"], "tmux")
+        self.assertIn("tmux_binary", data)
+        self.assertIn("tmux_version", data)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
         # session: what tmux says this core is IN, not what the env claims.
@@ -214,6 +220,20 @@ class TestHeartbeatWrite(unittest.TestCase):
                 os.environ["SUTANDO_CORE_LOCALITY"] = saved
             else:
                 os.environ.pop("SUTANDO_CORE_LOCALITY", None)
+
+    def test_tmux_backend_records_the_launcher_binary_and_its_version(self):
+        import core_heartbeat
+        fake = self.tmp / "tmux"
+        fake.write_text("#!/bin/sh\necho 'tmux 3.6b'\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(fake)}):
+            b = core_heartbeat._tmux_backend(refresh=True)
+        self.assertEqual((b["backend"], b["tmux_binary"], b["tmux_version"]), ("tmux", str(fake), "3.6b"))
+        # a binary that cannot run leaves the version None, never raises
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "missing")}):
+            b2 = core_heartbeat._tmux_backend(refresh=True)
+        self.assertEqual((b2["tmux_binary"], b2["tmux_version"]), (str(self.tmp / "missing"), None))
+        core_heartbeat._tmux_backend(refresh=True)  # back to this host's real answer
 
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
