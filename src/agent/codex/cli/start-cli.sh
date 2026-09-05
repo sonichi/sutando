@@ -241,13 +241,17 @@ ensure_core_monitor() {
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
 # One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
 # `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
+# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
+# parent, so stop and start would each resolve on their own and could disagree.
+_HB_PY=""
+resolve_heartbeat_python() {
+  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
+}
 heartbeat_python() {
-  if [ -z "${_HB_PY:-}" ] && [ -r "$REPO/scripts/python-binary.sh" ]; then
-    # shellcheck source=scripts/python-binary.sh
-    . "$REPO/scripts/python-binary.sh"
-    _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
-  fi
-  [ -n "${_HB_PY:-}" ] && printf '%s' "$_HB_PY"
+  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
 }
 ensure_core_heartbeat() {
   pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
@@ -317,6 +321,7 @@ ensure_codex_scheduler() {
 # five-minute main loop while this runtime is selected.
 ensure_durable_schedules
 ensure_codex_scheduler
+resolve_heartbeat_python
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
@@ -357,9 +362,8 @@ fi
 # Past the attach/reuse exit above, so this is a genuine Codex core boot. The
 # sentinel is cleared at each launch site below, never before one can fail.
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
-  # shellcheck source=scripts/python-binary.sh
-  . "$REPO/scripts/python-binary.sh"
-  _sd_py="$(resolve_python "$REPO")"
+  # The one interpreter resolved above serves the policy read too: one resolution per launch.
+  _sd_py="$_HB_PY"
 else
   _sd_py=""
 fi

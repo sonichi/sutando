@@ -6,6 +6,7 @@ import shutil
 import signal
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -422,6 +423,25 @@ exit 0
             "launcher did not start the core heartbeat writer",
         )
         self.assertEqual(marker_text, "heartbeat-started")
+
+    def test_restart_resolves_the_heartbeat_interpreter_once_for_stop_and_start(self):
+        # The resolver records who called it. The launcher (any $(...) depth keeps $0 and $$) must
+        # resolve exactly once and hand that one interpreter to both the --stop and the start.
+        calls = Path(self.tmp.name) / "resolve-calls"
+        with open(self.root / "scripts/python-binary.sh", "a") as f:
+            f.write(
+                "\nresolve_python() {\n"
+                f"  printf '%s:%s\\n' \"$$\" \"$0\" >> '{calls}'\n"
+                f"  printf '%s' '{sys.executable}'\n"
+                "}\n"
+            )
+        marker = Path(self.tmp.name) / "heartbeat.log"
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        started = _read_when_nonempty(marker, time.monotonic() + 5)
+        mine = [l for l in calls.read_text().splitlines() if l.endswith("start-cli.sh")]
+        self.assertEqual(len(mine), 1, f"the launcher must resolve once, in its own shell: {mine}")
+        self.assertEqual(started, "heartbeat-started", "no replacement writer started after --stop")
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
