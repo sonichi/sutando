@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""Present the desktop app's `tour` local card, if the presenter is installed.
+# Presents the desktop app's `tour` local card; without a presenter beside any
+# ancestor of this checkout (a non-desktop install) it is text-only and exits 0.
+from __future__ import annotations
 
-The presenter (`local-card.py`) ships with the AG2 Space desktop app one level
-above the engine checkout; a non-desktop install has none, and that is the
-text-only case, not an error (exit 0, prints `text-only`).
-"""
-import os
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve()
-REPO = HERE.parents[3]
 
-
-def find_presenter() -> Path | None:
-    override = os.environ.get("LOCAL_CARD_BIN")
-    candidates = [Path(override)] if override else [REPO.parent / "local-card.py"]
-    return next((p for p in candidates if p.is_file()), None)
+def find_presenter(start: Path) -> Path | None:
+    # The desktop app ships local-card.py one level above the engine checkout
+    # (engine/local-card.py beside engine/sutando/); walk up so a symlinked or
+    # relocated checkout still finds it.
+    for parent in start.resolve().parents:
+        candidate = parent / "local-card.py"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def main(argv: list[str]) -> int:
-    presenter = find_presenter()
-    if presenter is None:
+    ap = argparse.ArgumentParser(description="present the wizard tour card if the desktop presenter exists")
+    ap.add_argument("--room", help="room the tour is about (room-bound actions resolve here)")
+    ap.add_argument("--presenter", help="explicit path to local-card.py (tests; production walks up from here)")
+    a = ap.parse_args(argv)
+    presenter = Path(a.presenter) if a.presenter else find_presenter(Path(__file__))
+    if presenter is None or not presenter.is_file():
         print("text-only: no local-card presenter beside this checkout")
         return 0
     args = [sys.executable, str(presenter), "present", "tour", "--set", "body=Tap any stop to open it."]
-    if "--room" in argv:
-        i = argv.index("--room")
-        if i + 1 >= len(argv):
-            print("--room needs a room id", file=sys.stderr)
-            return 2
-        args += ["--room", argv[i + 1]]
+    if a.room:
+        args += ["--room", a.room]
     proc = subprocess.run(args, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
