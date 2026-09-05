@@ -373,6 +373,57 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIn('core_heartbeat.py" --stop', codex)
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
+    def test_stop_other_writers_in_process_ends_a_stand_in_and_reports_it(self):
+        # Coverage runs in-process: the handoff itself, not only its CLI wrapper, must be exercised here.
+        import core_heartbeat
+        script = str(Path(core_heartbeat.__file__).resolve())
+        old = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.3)
+            self.assertTrue(core_heartbeat._pid_running(old.pid))
+            n = core_heartbeat.stop_other_writers(timeout_s=5.0)
+            self.assertGreaterEqual(n, 1)
+            self.assertIsNotNone(old.wait(timeout=5))
+        finally:
+            if old.poll() is None:
+                old.kill(); old.wait()
+        self.assertFalse(core_heartbeat._pid_running(old.pid))   # reaped: lookup fails or state is Z
+        self.assertTrue(core_heartbeat._pid_running(os.getpid()))
+        with patch("core_heartbeat.os.kill", side_effect=PermissionError):
+            self.assertTrue(core_heartbeat._pid_running(1))       # not ours to signal, but running
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
+            self.assertTrue(core_heartbeat._pid_running(os.getpid()))   # unknown state reads as running
+        # main(--stop) with nothing to stop still answers, and never raises
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = core_heartbeat.main(["--stop"])
+        self.assertEqual(rc, 0)
+        self.assertIn("core_heartbeat: stopped", buf.getvalue())
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no pgrep")):
+            self.assertEqual(core_heartbeat.stop_other_writers(), 0)
+
+    def test_client_and_socket_helpers_fail_closed_on_errors(self):
+        import core_heartbeat
+        # a candidate that cannot be executed is skipped, not raised
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "absent-tmux"), "PATH": str(self.tmp / "empty")}):
+            core_heartbeat._CLIENT_CACHE.clear()
+            self.assertIsNone(core_heartbeat._client_for("/tmp/nope.sock"))
+        # a non-path reported socket is not the socket
+        self.assertFalse(core_heartbeat._same_socket(123, "/tmp/x.sock"))  # type: ignore[arg-type]
+        self.assertFalse(core_heartbeat._same_socket("", "/tmp/x.sock"))
+        self.assertTrue(core_heartbeat._same_socket("/tmp/x.sock", "/tmp/x.sock"))
+        # a signalled exit unlinks .alive once more after the loop
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        alive.parent.mkdir(parents=True, exist_ok=True); alive.write_text("{}")
+        core_heartbeat._SIGNALLED = True; core_heartbeat._SHUTDOWN_REQUESTED = True
+        try:
+            self.assertEqual(core_heartbeat.run_forever(interval=0.01), 0)
+        finally:
+            core_heartbeat._SIGNALLED = False; core_heartbeat._SHUTDOWN_REQUESTED = False
+        self.assertFalse(alive.exists())
+
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
         a concurrent reader at the destination path never sees a half-file."""
