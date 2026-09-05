@@ -132,6 +132,13 @@ def load_bridge(config_root: Path):
     # sees this exec-loaded code under "<string>" and reports 0% on the file.
     code = compile(src, str(BRIDGE), "exec")
     exec(code, bridge.__dict__)
+    # Rebind both writer paths under the temp root: with no canonical file the
+    # resolver may fall back to the real ~/.claude access.json.
+    bridge.ACCESS_FILE = env_dir / "access.json"
+    bridge.ACCESS_BACKUP_FILE = env_dir / "discord-access-backup.json"
+    for pth in (bridge.ACCESS_FILE, bridge.ACCESS_BACKUP_FILE):
+        if Path(config_root).resolve() not in Path(pth).resolve().parents:
+            raise RuntimeError(f"bridge path escaped the temp root: {pth}")
     return bridge
 
 
@@ -172,7 +179,6 @@ def behavioral(bridge) -> list:
 
     # 3b. FAILURE MODE: a global tierMap "collaborator" must load as team —
     #     the tier is per-channel; owner stays owner, legacy other reads guest.
-    bridge.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     bridge.ACCESS_FILE.write_text(json.dumps({
         "allowFrom": [OWNER, "777"], "groups": {},
         "tierMap": {"777": "collaborator", OWNER: "owner", "888": "other"}}))
