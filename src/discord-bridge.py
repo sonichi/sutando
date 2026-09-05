@@ -5105,12 +5105,8 @@ async def poll_results():
                     continue
 
                 try:
-                    # [reply: <message_id>] — the agent signals "this result
-                    # is a reply to that message", so the bridge POSTs with
-                    # `message_reference` rather than as a fresh message. Taken
-                    # from parse_markers() above, which already stripped it from
-                    # the body: a second regex here searched a body the shared
-                    # parser had emptied and always found None.
+                    # Taken from parse_markers(), which already stripped it —
+                    # a second regex here would search an emptied body.
                     _reply = next((a.value for a in _parsed.actions
                                    if a.kind == "reply"), None)
                     reply_to_id = int(_reply) if _reply else None

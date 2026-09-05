@@ -170,12 +170,8 @@ def _code_lines(text: str) -> set:
 # occurrences are DETECTED anywhere; only STANDALONE ones are stripped.
 _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 
-# [reply: <message-id>] — deliver this body as a reply to that message.
-# It was parsed only by discord-bridge's own private regex on the TASK path, so
-# a proactive body carrying it had the marker printed to the user as literal
-# text: the exact leak this module's header names as its reason to exist.
-# 17-20 digits is a Discord snowflake; anything else is not a target and is left
-# in place rather than silently eaten.
+# [reply: <message-id>] — deliver this body as a reply to that message. 17-20
+# digits is a Discord snowflake; anything else is left in place, never eaten.
 _REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
 
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
@@ -263,18 +259,15 @@ def parse_markers(text: str) -> ParseResult:
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
     # marker so it can't leak into the DM, but emit NO redirect action so the
     # private body stays in the owner's DM.
-    # 2. LEADING MARKERS — [channel:] and [reply:] in either order. Order
-    # independence is not cosmetic: a producer writing the redirect first left
-    # the reply marker unparsed and printed to the user, which is the leak this
-    # module exists to prevent.
+    # 2. LEADING MARKERS — [channel:] and [reply:] in either order; order
+    # independence keeps an unparsed marker from reaching the user as text.
     while True:
         redirect_match = _REDIRECT_RE.match(body)
         if redirect_match:
             channel = redirect_match.group(1).strip()
             if not dm_only and channel:
-                # Empty target = no action: value="" release-loops at the
-                # default sink (claimable yet foreign) and int("")s in Discord
-                # conversion.
+                # Empty target = no action: "" release-loops at the default
+                # sink and raises in Discord's int() conversion.
                 actions.append(Action(kind="redirect", value=channel))
             body = body[redirect_match.end():]
             continue
