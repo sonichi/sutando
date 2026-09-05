@@ -817,11 +817,22 @@ rooms must be kept off the same worker:
   | **revalidate** | **after winning and BEFORE emitting or executing, it re-reads `generation`. Changed → release the claim and suppress.** The task returns to unclaimed and the incoming instance takes it |
   | reconcile | the core releases any claim held by an instance that is no longer `instances[0]`, so a worker that died inside the window does not strand the task |
 
-  Revalidation is what makes the window closed rather than bounded: a claim can still be *won*
-  under a stale generation, but it cannot be *executed* under one, and execution is what
-  duplicates. The remaining exposure is a worker that revalidates, sees no change, and is
-  repinned in the microseconds before it emits — which the reconcile row then recovers, because
-  the claim is held by a non-current instance.
+  **Revalidation alone is check-then-act, and moving the check closer never closes it.** A worker
+  that re-reads `generation`, sees no change, and is repinned before it emits has still executed
+  under a stale authorization; the reconcile row recovers the CLAIM afterwards but cannot unsend
+  an external effect. So the generation is not the fence on its own — it records the repin, and
+  the fence is that **a repin only ever happens in one of two states, and each carries its own
+  guarantee**:
+
+  | repin cause | why no live worker is executing under the old generation |
+  |---|---|
+  | **death** — beat stale past `stand_in_after_s` (`:988`, the only automatic cause) | the outgoing worker **fences itself**: before executing, it compares its OWN last successful beat write against the same `stand_in_after_s`, and refuses if it is older. Core and worker then decide on the same fact with the same threshold, so "the core thinks it is dead while it thinks it is alive" is not a reachable disagreement — the worker reaches the same verdict from local, monotonic state, with no agreement protocol |
+  | **owner command** — an explicit repin of a live worker | the worker is by definition responsive, so the core **drains before it rewrites**: it stops the outgoing instance claiming, waits for it to report no in-flight task, and only then increments `generation`. A repin that cannot drain is refused and surfaced, not forced |
+
+  Self-fencing is what makes the death case safe without distributed agreement: the dangerous
+  interleaving is exactly *core says dead, worker says alive*, and both sides are reading the
+  worker's own beat age against one constant. Draining is what makes the owner case safe, and it
+  is affordable precisely because a live worker can answer.
 
   This is the fencing token, not a lease: no one acquires or holds anything, and a crash needs
   no expiry. Group identity, group admission, group release and a multi-room story are still

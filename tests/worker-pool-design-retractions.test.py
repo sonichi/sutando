@@ -57,6 +57,11 @@ RETRACTED = [
      "asserted, not shown. The per-task claim covers ONE task; two DIFFERENT tasks "
      "in one room each win their own claim, which is the concurrency this section "
      "forbids. The window is fenced by a generation revalidated before execution."),
+    ("it cannot be *executed* under one",
+     "revalidate-then-execute is check-then-act: a repin landing between the two "
+     "still executes under a stale generation, and reconcile cannot unsend an "
+     "external effect. The fence is per repin CAUSE — self-fencing on beat age for "
+     "death, drain-before-rewrite for an owner command."),
 ]
 
 
