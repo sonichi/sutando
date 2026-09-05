@@ -94,8 +94,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertNotEqual(data["pid"], data["heartbeat_pid"])
         self.assertEqual(data["status"], "custom-status")
         self.assertEqual(data["schema_version"], 4)
-        # schema 4: the tmux that created the server, so a client can start from the
-        # same binary — a version mismatch otherwise reads a live core as absent.
+        # schema 4: a client VERIFIED to speak to this server (not its creator) and the
+        # server's own version, so a reader starts from a compatible binary.
         self.assertEqual(data["backend"], "tmux")
         for k in ("tmux_binary", "tmux_version", "tmux_server_version", "tmux_verified", "tmux_candidates"):
             self.assertIn(k, data)

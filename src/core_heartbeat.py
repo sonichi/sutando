@@ -116,19 +116,17 @@ def _socket_path() -> str:
 
 
 def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | None = None) -> dict:
-    """Which tmux can talk to THIS core's server, verified, plus the server's own
-    version. A socket path alone is not a connection descriptor: a client of
-    another version gets "protocol version mismatch" and reads the core as
-    absent (desktop, 2026-09-05). Candidates are the PATH tmux (what both
-    launchers run) and SUTANDO_TMUX_BIN (what the app exports); the first that
-    can `display-message` the recorded socket+session is recorded as
-    `tmux_binary` with its `-V` as `tmux_version`, and the server answers
-    `tmux_server_version` itself. Nothing speaks → nulls, never a guess.
-    Re-verified on EVERY beat (one bounded display-message, ~ms): a memo would
-    survive a server replacement between beats and advertise a dead
-    compatibility fact — the exact upgrade/restart case these fields diagnose.
-    Verified against the OBSERVED session (the recorded one), not the env's claim.
-    `refresh` is accepted for callers that used it; there is nothing to refresh."""
+    """A tmux client VERIFIED to speak to this core's server, plus the server's own
+    version. Recorded so a reader can start from a compatible client instead of
+    guessing: tmux versions with incompatible protocols cannot talk to each other,
+    and a probe that cannot connect looks like an absent core. Candidates are the
+    PATH tmux (what both launchers run) and SUTANDO_TMUX_BIN (what the app exports);
+    the first that can `display-message` the recorded socket and the OBSERVED
+    session is `tmux_binary` (its `-V` is `tmux_version`), and the server answers
+    `tmux_server_version` itself. This is a compatible client, not the server's
+    creator. Nothing speaks → nulls, never a guess; nothing is memoized, so a
+    cold-boot miss or a server replacement is seen on the next beat. `refresh` is
+    accepted for callers that used it; there is nothing to refresh."""
     del refresh
     sock = sock or _socket_path()
     sess = sess or _observed_session(sock)
@@ -151,7 +149,7 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
     version = None
     if chosen:
         try:
-            r = subprocess.run([chosen, "-V"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run([chosen, "-V"], capture_output=True, text=True, timeout=2)
             out = (r.stdout or r.stderr or "").strip()
             if r.returncode == 0 and out:
                 version = out.split()[-1] if out.lower().startswith("tmux") else out
@@ -450,8 +448,8 @@ def write_beat(status: str = "running") -> None:
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        # A client verified to speak this server AND this (observed) session, plus
-        # the server's own version, so a reader starts from a compatible binary.
+        # A client verified to speak this server and this (observed) session, plus the
+        # server's own version: a compatible client for readers, not the creator.
         **_tmux_backend(sock=sock, sess=observed_session),
         "schema_version": 4,
     }
