@@ -62,6 +62,13 @@ class CliWedgeProbe(unittest.TestCase):
         self.tmux.chmod(0o755)
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
         hc._resolve_launch_env = lambda: dict(os.environ)
+        # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
+        self._saved_time = hc.time
+        self._t = [1_000_000.0]
+        def _now():
+            self._t[0] += 60.0
+            return self._t[0]
+        hc.time = SimpleNamespace(time=_now)
         self._saved_record = hc._fresh_local_core_record
         hc._fresh_local_core_record = lambda *a, **k: {"session": "sutando-core", "socket": "/tmp/fake.sock"}
 
@@ -78,6 +85,7 @@ class CliWedgeProbe(unittest.TestCase):
     def tearDown(self):
         hc.WORKSPACE_DIR, hc._local_core_socket, hc._resolve_tmux_bin, hc._resolve_launch_env = self._saved
         hc._fresh_local_core_record = self._saved_record
+        hc.time = self._saved_time
         self.tmp.cleanup()
 
     def test_missing_detector_module_is_a_detail_not_a_failure(self):
@@ -126,8 +134,7 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
     def test_static_pane_with_work_outstanding_warns(self):
-        import time as _t
-        (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": _t.time()}))
+        (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": self._t[0] + 60.0}))
         for _ in range(3):
             c = self.check()
         self.assertEqual(c["status"], "warn")

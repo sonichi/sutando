@@ -161,8 +161,18 @@ class Classifier(unittest.TestCase):
         self.assertIn("rate-limit", v["matched_patterns"])
 
     def test_retry_text_with_few_samples_is_medium_confidence(self):
-        v = w.classify([retry_frame(i) for i in range(4)], True, 10)
+        v = w.classify([retry_frame(i) for i in range(4)], True, 90)
         self.assertEqual((v["kind"], v["confidence"]), ("retry-loop", "medium"))
+
+    def test_no_verdict_before_the_run_has_lasted(self):
+        # Live witness 2026-09-05: two identical frames one second apart with the word
+        # "timeout" in the operator's own shell text read as retry-loop. A second is not evidence.
+        v = w.classify([retry_frame(0), retry_frame(0)], True, 1)
+        self.assertEqual((v["kind"], v["warn"]), ("unknown", False))
+        self.assertIn("too short", v["reason"])
+        self.assertEqual(w.classify([IDLE] * 3, True, 30)["kind"], "unknown")          # would warn → too short
+        self.assertEqual(w.classify([IDLE] * 3, True, 60)["kind"], "static-with-work")
+        self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
     def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
@@ -379,7 +389,11 @@ class Cli(unittest.TestCase):
             self.assertIn("raw", lines[0])
             rc, out = self.run_main("replay", str(trace), "--work-outstanding")
             self.assertEqual(rc, 0)
-            self.assertEqual(json.loads(out)["kind"], "retry-loop")
+            # 12 samples at interval 0 span under a second: a warning needs the run to have lasted
+            v = json.loads(out)
+            self.assertEqual((v["kind"], v["warn"]), ("unknown", False))
+            self.assertIn("too short", v["reason"])
+            self.assertIn("retrying", v["matched_patterns"])  # the evidence is still there
 
     def test_probe_persists_a_window_and_reports(self):
         with tempfile.TemporaryDirectory() as d:
@@ -457,7 +471,7 @@ class Cli(unittest.TestCase):
     def test_replay_classifies_a_hash_only_trace(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "t.jsonl"
-            lines = [json.dumps({"ts": float(i), "state": "same", "raw_state": f"r{i}", "patterns": ["retrying"]}) for i in range(12)]
+            lines = [json.dumps({"ts": 10.0 * i, "state": "same", "raw_state": f"r{i}", "patterns": ["retrying"]}) for i in range(12)]
             p.write_text("\n".join(lines) + "\n")
             self.assertEqual(w.replay(p, work=True)["kind"], "retry-loop")
 

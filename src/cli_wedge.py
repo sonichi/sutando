@@ -81,6 +81,7 @@ PROVISIONAL_THRESHOLDS = {
     "pattern_min_rate": 0.5,
     "continuity_gap_s": 2700,
     "status_ttl_s": 900,
+    "min_duration_s": 60,
 }
 PROVIDER_LIMIT_PATTERNS = ("quota-limit",)
 DEFAULT_SESSION = "sutando-core"
@@ -217,6 +218,16 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if nov.sample_count < 2:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
                 "reason": "fewer than 2 samples in the current observation run — nothing to compare"}
+    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th)
+    # Two frames a second apart cannot establish a wedge: a WARNING needs the run to have lasted.
+    if verdict["warn"] and duration_s < th["min_duration_s"]:
+        return {**base, "kind": "unknown", "confidence": "none", "warn": False,
+                "reason": f"observation too short ({duration_s:.0f}s of {th['min_duration_s']}s) for a warning — nothing to conclude yet"}
+    return verdict
+
+
+def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_only: bool,
+                  work_outstanding: bool, duration_s: float, work_detail: str, th: dict) -> dict:
     enough = nov.sample_count >= th["min_samples"]
     # A provider told the CLI to stop: not a retry loop, a blocked state of its own.
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
