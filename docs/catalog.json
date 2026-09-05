@@ -443,6 +443,16 @@
    "status": "draft",
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
+  },
+  "docs/proactive-loop-rationale.md": {
+   "title": "Proactive loop — rationale and measurements",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
+   "last_verified": "2026-09-04"
   }
  }
 }

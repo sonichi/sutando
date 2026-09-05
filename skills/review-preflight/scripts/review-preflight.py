@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 LESSONS_HEADING = re.compile(r"^##\s+Lessons\b", re.I)
 CHECKS_HEADING = re.compile(r"^##\s+Checks\b", re.I)
@@ -105,15 +106,26 @@ def resolve_repo(explicit: "str | None" = None, env: "dict | None" = None) -> st
 DECISIVE = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
 
 
+class PriorArt(NamedTuple):
+    """Whether the check ran, and what it found — as separate fields, never one value.
+
+    `checked=False` and an empty `items` are both falsy, so a single return
+    value lets one `if not x` merge "unchecked" into "nothing there".
+    """
+    checked: bool
+    items: "list[str]"
+    verdicts: "list[str]"
+
+
 def prior_art(pr: str, runner=None,
-              repo: "str | None" = None) -> "tuple[list[str], list[str]] | None":
+              repo: "str | None" = None) -> PriorArt:
     """(prose to read, decisive verdicts) already on the PR, oldest first.
 
-    None means COULD NOT CHECK, which is not the same as "nothing there" — a
-    reviewer told nothing and a reviewer told the check failed behave
-    differently, so the two must never render alike.
+    checked=False means COULD NOT CHECK, which is not the same as "nothing
+    there" — a reviewer told nothing and a reviewer told the check failed
+    behave differently, so the two must never render alike.
 
-    The second list is latest-state-per-login and is NOT subject to the
+    `verdicts` is latest-state-per-login and is NOT subject to the
     display cap, so a verdict cannot be lost to prose or to truncation.
     """
     run = runner or (lambda a: subprocess.run(a, capture_output=True,
@@ -126,13 +138,13 @@ def prior_art(pr: str, runner=None,
         try:
             r = run(["gh", "api", f"repos/{resolve_repo(repo)}/" + path, "--paginate"])
         except (OSError, subprocess.SubprocessError):
-            return None
+            return PriorArt(False, [], [])
         if r.returncode != 0:
-            return None
+            return PriorArt(False, [], [])
         try:
             rows = json.loads(r.stdout) if r.stdout.strip() else []
         except ValueError:
-            return None
+            return PriorArt(False, [], [])
         for row in rows:
             state = row.get(verdict) if verdict else None
             who = (row.get("user") or {}).get("login", "?")
@@ -145,8 +157,8 @@ def prior_art(pr: str, runner=None,
                 continue
             label = kind if not state else f"{kind}, {state}"
             out.append(f"{ts}  {who} ({label})")
-    return sorted(out), sorted(
-        f"{ts}  {who}: {state}" for who, (ts, state) in latest.items())
+    return PriorArt(True, sorted(out), sorted(
+        f"{ts}  {who}: {state}" for who, (ts, state) in latest.items()))
 
 
 PRIOR_ART_SHOWN = 8
@@ -248,24 +260,31 @@ def stale_approval_block(pr: str, rows: "list[dict] | None") -> "list[str]":
                 verdict]
     return out
 
-def verdict_block(verdicts: "list[str] | None") -> "list[str]":
+def verdict_block(art: PriorArt) -> "list[str]":
     """Every login's current decisive state, uncapped and prose-independent.
 
     Separate from the prose list because the two answer different questions:
     what must I read, versus where does this PR actually stand.
     """
-    if verdicts is None:
+    # Same tri-state as prior_art_block, for the same reason: an unchecked call
+    # and a PR with no verdicts are both empty, and only `checked` tells them apart.
+    state = "unchecked" if not art.checked else "none" if not art.verdicts else "found"
+    if state == "unchecked":
         return ["DECISIVE STATE: *** COULD NOT CHECK *** — treat as unknown, not clean."]
-    if not verdicts:
+    if state == "none":
         return ["DECISIVE STATE: none — no APPROVED or CHANGES_REQUESTED on record."]
+    verdicts = art.verdicts
     return (["DECISIVE STATE (latest per login; a bare verdict carries no prose to read):"]
             + [f"  {v}" for v in verdicts])
 
 
-def prior_art_block(pr: str, seen: "list[str] | None",
+def prior_art_block(pr: str, art: PriorArt,
                     repo: "str | None" = None) -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
-    if seen is None:
+    # Branch on a distinct state, never on falsiness: equality cannot merge two
+    # cases, so reordering these arms is a no-op rather than a silent bug.
+    state = "unchecked" if not art.checked else "empty" if not art.items else "found"
+    if state == "unchecked":
         # An unexpanded placeholder is the one COULD-NOT-CHECK with a fix the
         # reader can apply, so it must not read as generic gh flakiness.
         if (repo or resolve_repo()) == "{owner}/{repo}":
@@ -276,8 +295,9 @@ def prior_art_block(pr: str, seen: "list[str] | None",
         return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
                 "the call failed. Read the thread yourself: an unchecked thread is not an",
                 "empty one."]
-    if not seen:
+    if state == "empty":
         return ["ALREADY ON THIS THREAD: nothing to read — no prose on the thread yet."]
+    seen = art.items
     # Name the truncation: a bare count above a short list reads as the count
     # being wrong, not the list being cut.
     head = (f"ALREADY ON THIS THREAD — showing last {PRIOR_ART_SHOWN} of {len(seen)};"
@@ -296,9 +316,8 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
-        got = prior_art(pr, repo=repo)
-        seen, verdicts = (None, None) if got is None else got
-        out += verdict_block(verdicts) + prior_art_block(pr, seen, repo=repo) + [""]
+        art = prior_art(pr, repo=repo)
+        out += verdict_block(art) + prior_art_block(pr, art, repo=repo) + [""]
         out += stale_approval_block(pr, stale_approvals(pr, repo=repo)) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")

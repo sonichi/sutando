@@ -8045,7 +8045,7 @@ def _park_reason_tally(kept) -> str:
     names a cause for the other four states something no writer recorded.
     """
     counts = {}
-    for name, _age in kept:
+    for name, *_ in kept:
         reason = next((p for p in str(name).split(".") if p in PARK_REASONS),
                       "unlabelled")
         counts[reason] = counts.get(reason, 0) + 1
@@ -8089,7 +8089,7 @@ def check_proactive_quarantine() -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
-    kept: list[tuple[str, int]] = []
+    kept: list[tuple[str, int, int]] = []
     unreadable = 0
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
@@ -8097,7 +8097,11 @@ def check_proactive_quarantine() -> dict:
         try:
             if not path.is_file():
                 continue
-            age = now - path.stat().st_mtime
+            st = path.stat()
+            age = now - st.st_mtime
+            # Every writer here MOVES an existing inode (rename, link+unlink),
+            # which keeps mtime and refreshes ctime: ctime is the arrival.
+            arrived = now - st.st_ctime
         except OSError:
             unreadable += 1
             continue
@@ -8111,7 +8115,7 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age)))
+        kept.append((path.name, int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:
@@ -8119,7 +8123,11 @@ def check_proactive_quarantine() -> dict:
         return {"name": name, "status": status,
                 "detail": f"no quarantined proactive bodies{partial}"}
     kept.sort(key=lambda item: -item[1])
-    oldest_name, oldest_age = kept[0]
+    oldest_name, oldest_age, _ = kept[0]
+    # Oldest reads the same filling or inert; the newest ARRIVAL (ctime, not
+    # mtime — see the loop) is what separates them.
+    newest_arrival = min(item[2] for item in kept)
+    arrival = _quarantine_arrival_clause(newest_arrival, oldest_age)
     return {
         "name": name,
         "status": "warn",
@@ -8128,9 +8136,28 @@ def check_proactive_quarantine() -> dict:
         "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ "
                    f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
                    f"directory, so they stay until someone acts; oldest {oldest_name} "
-                   f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
-                   f"{partial}"),
+                   f"({_quarantine_age_label(oldest_age)})"
+                   f"{arrival}{partial}"),
     }
+
+
+def _quarantine_hm(seconds: int) -> str:
+    return f"{seconds // 3600}h{seconds % 3600 // 60}m"
+
+
+def _quarantine_age_label(age: int) -> str:
+    # Negative means the clock sits behind the file: skew, not a measurement.
+    return _quarantine_hm(age) if age >= 0 else f"future-dated by {_quarantine_hm(-age)}"
+
+
+def _quarantine_arrival_clause(newest_arrival: int, oldest_age: int) -> str:
+    if newest_arrival < 0:
+        return f"; newest is {_quarantine_age_label(newest_arrival)} (clock skew?)"
+    # Compare what is RENDERED: 7201s and 7200s both print 2h0m, and printing
+    # one duration twice is noise (bulk writes leave exactly that shape).
+    if _quarantine_hm(newest_arrival) == _quarantine_age_label(oldest_age):
+        return ""
+    return f"; newest arrived {_quarantine_hm(newest_arrival)} ago"
 
 
 def _ps_snapshot() -> "str | None":
