@@ -966,21 +966,45 @@ rooms must be kept off the same worker:
   claims do not contend, so **both win**, which is the identical measurement this section already
   quotes (*0, 0*). Unpin is that race mirrored.
 
-  **First-pin is fenced in-process, and only the core can be.** The process that executes the pin
-  command and the process that serves R under rule 3 are the SAME process. So the core does not
-  need a token to fence itself: it publishes the new table only after its own claimed-but-unfinished
-  work for R is done. It is reading its own state, not sampling another process's, so there is no
-  interval to be suspended past and nothing to validate at a boundary. This is the one place the
-  timer objection below does not apply, and it applies only here — a worker cannot use it, because
-  a worker's view of another instance is always a sample.
+  **First-pin is fenced by a RE-READ AFTER THE CLAIM, not in-process.** An earlier revision said the
+  process executing the pin and the process serving R under rule 3 are the same, so the core could
+  fence itself by draining. **That premise is false on the Codex path**, and this document already
+  contains the evidence: `task-notifier.sh` starts `watch-tasks-stream.sh` as a DETACHED background
+  process (`os.setsid` then `execv`) while the owner command is typed into the interactive core. Two
+  processes. Draining the core's work fences nothing the watcher is about to do, and the watcher can
+  pass its routing read before the binding write and publish its claim after it.
+
+  The fence uses the two atomic primitives that already exist and are visible to BOTH processes —
+  the per-task claim (a hard link that only one acquirer wins) and the bindings write (`os.replace`).
+  It orders them:
+
+  > **Claim first, then RE-READ the bindings, and release without executing if the room is no longer
+  > yours.** Any instance that acquires a claim for a task in room R re-reads `bindings.json` before
+  > it does any work, and verifies it is still an eligible claimant for R — the core that it is still
+  > unbound, a worker that it is still a member. If not, it releases the claim and suppresses.
+
+  Why this closes what draining could not: the claim is the serialization point, and it is a file
+  both processes see. If the pin lands before the re-read, the claimant observes it and stands down.
+  If the pin lands after, the claimant already holds the only claim for that task and finishes it —
+  one task, already admitted, which is the bounded case. **There is no interval to be suspended
+  past**, because the check is not "has enough time elapsed" but "what does the file say now, after I
+  won". A suspended claimant re-reads on resumption and sees the newer table.
+
+  It is also NOT the generation/token this section rejects below. Nothing is stamped into the claim
+  and nothing validates a version; the claimant re-reads the same authoritative file every other
+  reader uses, at a point where it holds exclusive rights to the one task in question. The rejected
+  mechanism was a token that would let a claimant PROVE its stale read was current; this makes a
+  stale read impossible to act on instead.
 
   **Unpin takes the re-bind fence unchanged, because it IS a re-bind — to nobody.** The outgoing
   claimant is a separate process, so by this section's own argument the enforcer is the process
   boundary; there is no in-process shortcut available in that direction. Treating unpin as a
   lighter operation than re-bind is what left it unfenced.
 
-  What each costs, in the direction decided: first-pin waits on the core's outstanding work for
-  that one room, which is bounded by that work and usually zero. Unpin costs a worker stop, which
+  What each costs, in the direction decided: first-pin costs one extra bindings read per claim —
+  paid by every claimant on every task, not only during a pin — and, in the racing case, one task
+  claimed and released without work. It does NOT wait for the core to drain, which is what the
+  superseded version bought at the price of a premise that does not hold. Unpin costs a worker stop, which
   is process-wide and therefore also stops W's OTHER rooms — the same trade the paragraph above
   states for re-bind, and it is worth saying out loud that an owner unpinning one room does not
   expect to pause three.
@@ -1118,7 +1142,7 @@ that a verified command still executes, or the matrix is prose that never ran.
 
 | command | effect |
 |---|---|
-| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim. **Neither is a bare write** — a first-pin drains the core's own outstanding work for R first, an unpin takes the full re-bind fence; see "Every transition fences its outgoing claimant" |
+| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim. **Neither is a bare write** — a first-pin is fenced by the claim-then-re-read rule (the pin itself needs no drain), an unpin takes the full re-bind fence; see "Every transition fences its outgoing claimant" |
 | spawn N · set model of W | the core runs the installer (`spawn-worker`) |
 | resize to N (shrinking) · remove worker W | an ORDERED transition — see "Removing a worker" below — because the installer alone leaves the departing worker's bindings pointing at an instance that can never return |
 

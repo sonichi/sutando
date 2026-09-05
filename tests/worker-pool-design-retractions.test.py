@@ -502,14 +502,37 @@ class EveryBindingTransitionFencesItsOutgoingClaimant(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, f, why)
 
-    def test_the_in_process_fence_is_claimed_only_for_the_core(self):
-        """The document's own argument is that an interval cannot fence a separate
-        process. The core fencing itself is sound BECAUSE it reads its own state, so the
-        exemption must be stated as core-only or it reads as a general escape hatch."""
+    def test_the_in_process_premise_is_retracted(self):
+        """Superseded. The premise was that the pin-executing process and the rule-3
+        claiming process are the same. On the Codex path they are two processes, and this
+        document already carried the evidence when the premise was written."""
         f = self._flat()
-        self.assertIn("applies only here — a worker cannot use it", f,
-                      "an in-process fence offered generally would re-license the timer "
-                      "argument this section removed")
+        self.assertNotRegex(
+            f, r"First-pin is fenced in-process, and only the core can be",
+            "the same-process premise is false wherever the watcher is detached")
+        self.assertRegex(f, r"That premise is false on the Codex path")
+        self.assertRegex(f, r"DETACHED background process",
+                         "name the mechanism, not just the verdict")
+
+    def test_the_fence_is_claim_then_reread(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"Claim first, then RE-READ the bindings, and release without executing")
+        self.assertRegex(f, r"the claim is the serialization point")
+
+    def test_it_is_distinguished_from_the_rejected_token(self):
+        """This section rejects a generation/token below. A fence that IS one, unlabelled,
+        would contradict that -- so the difference has to be argued, not assumed."""
+        f = self._flat()
+        self.assertRegex(f, r"NOT the generation/token this section rejects")
+        self.assertRegex(f, r"makes a stale read impossible to act on instead")
+
+    def test_the_new_cost_is_stated_and_the_old_one_withdrawn(self):
+        f = self._flat()
+        self.assertRegex(f, r"one extra bindings read per claim")
+        self.assertNotRegex(
+            f, r"first-pin waits on the core's outstanding work for that one room",
+            "the drain was bought with the false premise and goes with it")
 
     def test_unpin_is_not_treated_as_lighter_than_a_rebind(self):
         f = self._flat()
