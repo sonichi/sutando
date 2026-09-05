@@ -31,7 +31,7 @@ from typing import NamedTuple
 
 # A marker is a control only where the shared parser EXECUTES it, so the guard
 # derives its classification from parse_markers rather than a parallel grammar.
-try:
+try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
     from .local_task_protocol import canonical_access_tier
 except ImportError:
