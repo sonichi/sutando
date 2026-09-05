@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""The human report must name the workspace it measured.
-
-Assertions read rendered output, never source text: a source substring
-stays green when the line is present but unreachable.
-"""
+"""The human report must name the workspace it measured, asserted on rendered
+output: a source substring stays green when the line is present but unreachable."""
 import contextlib
 import importlib.util
 import io
@@ -86,15 +83,12 @@ class HumanReportTests(unittest.TestCase):
 
 
 class RevertedSourceControl(unittest.TestCase):
-    """Proves the tests above discriminate.
-
-    Both mutations, because deleting the line is the weak one: `if False:`
-    leaves the text intact and removes only the behavior.
-    """
+    """Both mutations, because deleting the line is the weak one: `if False:`
+    leaves the text intact and removes only the behavior."""
 
     def _import_mutant(self, source):
-        # No file on disk: a temp module under src/ is traced by coverage and then
-        # deleted, and the run fails with "No source for code" after the tests pass.
+        # In memory, never a file: coverage traces any module written under src/ and
+        # then fails the run with "No source for code" once cleanup removes it.
         mod = types.ModuleType("health_check_mutant")
         mod.__file__ = SRC
         exec(compile(source, "<hc-mutant>", "exec"), mod.__dict__)
