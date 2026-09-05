@@ -251,6 +251,46 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual((b3["tmux_binary"], b3["tmux_version"], b3["tmux_server_version"], b3["tmux_verified"]), (None, None, None, False))
         core_heartbeat._tmux_backend(refresh=True)  # back to this host's real answer
 
+    def test_tmux_backend_verifies_the_observed_session_not_the_env_claim(self):
+        # The verifier must use the OBSERVED session write_beat records, not the env's claim:
+        # a lying SUTANDO_TMUX_SESSION left the payload unverified with a compatible client present.
+        import core_heartbeat
+        f = self.tmp / "tmux"
+        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *'-t =real'*) echo '3.6b';;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n")
+        f.chmod(0o755)
+        _obs, _pid = core_heartbeat._observed_session, core_heartbeat.core_pid
+        core_heartbeat._observed_session = lambda sock: "real"
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
+        try:
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "lie", "SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
+                core_heartbeat._TMUX_BACKEND = None
+                core_heartbeat.write_beat()
+        finally:
+            core_heartbeat._observed_session, core_heartbeat.core_pid = _obs, _pid
+            core_heartbeat._tmux_backend(refresh=True)
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual((data["session"], data["tmux_verified"], data["tmux_binary"], data["tmux_server_version"]), ("real", True, str(f), "3.6b"))
+
+    def test_tmux_backend_never_memoizes_a_failure(self):
+        # yixuan on e95ed74: a cold-boot miss must not become permanent nulls.
+        import core_heartbeat
+        f = self.tmp / "tmux"
+        gate = self.tmp / "server-up"
+        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *display-message*) [ -e '%s' ] && echo '3.6b' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % gate)
+        f.chmod(0o755)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
+            core_heartbeat._TMUX_BACKEND = None
+            first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")   # server not up yet
+            self.assertFalse(first["tmux_verified"])
+            self.assertIsNone(core_heartbeat._TMUX_BACKEND)                 # nothing cached
+            gate.write_text("up")
+            second = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")  # same call, no refresh
+            self.assertTrue(second["tmux_verified"])
+            self.assertEqual(second["tmux_server_version"], "3.6b")
+            third = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")   # success IS memoized
+            self.assertIs(third, second)
+        core_heartbeat._tmux_backend(refresh=True)
+
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
         a concurrent reader at the destination path never sees a half-file."""

@@ -126,13 +126,14 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
     launchers run) and SUTANDO_TMUX_BIN (what the app exports); the first that
     can `display-message` the recorded socket+session is recorded as
     `tmux_binary` with its `-V` as `tmux_version`, and the server answers
-    `tmux_server_version` itself. Nothing speaks → nulls, never a guess.
-    Resolved once per process."""
+    `tmux_server_version` itself. Nothing speaks → nulls, never a guess — and a
+    failure is never memoized, so a cold-boot miss heals on the next beat.
+    Verified against the OBSERVED session (the recorded one), not the env's claim."""
     global _TMUX_BACKEND
     if _TMUX_BACKEND is not None and not refresh:
         return _TMUX_BACKEND
     sock = sock or _socket_path()
-    sess = sess or core_session()
+    sess = sess or _observed_session(sock)
     seen: list[str] = []
     for c in (shutil.which("tmux"), os.environ.get("SUTANDO_TMUX_BIN")):
         if c and c not in seen:
@@ -140,8 +141,9 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
     chosen, server_version = None, None
     for binary in seen:
         try:
+            # Bounded: two candidates on a 30 s beat must not spend 10 s on a hung binary.
             r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}", "#{version}"],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=2)
         except Exception:
             continue
         out = (r.stdout or "").strip()
@@ -157,10 +159,12 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
                 version = out.split()[-1] if out.lower().startswith("tmux") else out
         except Exception:
             version = None
-    _TMUX_BACKEND = {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
-                     "tmux_server_version": server_version, "tmux_verified": chosen is not None,
-                     "tmux_candidates": seen}
-    return _TMUX_BACKEND
+    result = {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
+              "tmux_server_version": server_version, "tmux_verified": chosen is not None,
+              "tmux_candidates": seen}
+    # Only a verified answer is worth keeping; an unverified one is re-probed next beat.
+    _TMUX_BACKEND = result if chosen else None
+    return result
 
 
 def core_session() -> str:
@@ -424,6 +428,8 @@ def write_beat(status: str = "running") -> None:
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     target = _alive_path()
     cpid = core_pid()
+    sock = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+    observed_session = _observed_session(sock)
     payload = {
         "host": _hostname(),
         # The CORE's pid — what this file has always claimed to carry. Falls
@@ -444,15 +450,14 @@ def write_beat(status: str = "running") -> None:
         "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
         # Same runtime-authored argument as `socket`, but the env cannot be
         # trusted here: the Claude launcher hardcodes the session, so ask tmux.
-        "session": _observed_session(
-            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")),
+        "session": observed_session,
         # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        # A client verified to speak this server + the server's own version, so a
-        # reader starts from a compatible binary (a mismatch reads as "no core").
-        **_tmux_backend(),
+        # A client verified to speak this server AND this (observed) session, plus
+        # the server's own version, so a reader starts from a compatible binary.
+        **_tmux_backend(sock=sock, sess=observed_session),
         "schema_version": 4,
     }
     tmp = target.with_suffix(".alive.tmp")
