@@ -13260,6 +13260,7 @@ def main():
     # Human-readable
     if not quiet:
         print("Sutando Health Check")
+        print(f"workspace: {WORKSPACE_DIR}")
         print("=" * 40)
 
         for c in checks:
