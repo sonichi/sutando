@@ -31,6 +31,7 @@ from pathlib import Path
 # CI runs tests from the repo root; derive it the way the sibling suites do.
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = Path(_REPO) / "src" / "outbox.py"
+sys.path.insert(0, str(SRC.parent))
 spec = importlib.util.spec_from_file_location("outbox_claim_machine_sut", SRC)
 ob = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ob                      # dataclasses need the registry
@@ -120,34 +121,28 @@ class GatedPath(type(Path())):
         return super().stat(*a, **k)
 
 
-class FcntlProxy:
-    """fcntl facade: a worker announces entry into a flock wait so the
+class LockProxy:
+    """Lock facade: a worker announces entry into a lock wait so the
     scheduler can skip its steps instead of burning the arrival window."""
 
     def __init__(self, real, driver):
         self._real, self._driver = real, driver
 
-    def __getattr__(self, name):
-        val = getattr(self._real, name)
-        if name != "flock" or not callable(val):
-            return val
-
-        def wrapped(fd, op):
-            d = self._driver
-            actor = d.gate.actor_of.get(threading.get_ident())
+    def __call__(self, fd, **kwargs):
+        d = self._driver
+        actor = d.gate.actor_of.get(threading.get_ident())
+        if actor is not None:
+            d.in_flock[actor] = True
+        try:
+            return self._real(fd, **kwargs)
+        finally:
             if actor is not None:
-                d.in_flock[actor] = True
-            try:
-                return val(fd, op)
-            finally:
-                if actor is not None:
-                    d.in_flock[actor] = False
-        return wrapped
+                d.in_flock[actor] = False
 
 
 def _dead_pid():
     """A pid that is genuinely dead: spawn-and-reap a child."""
-    p = subprocess.Popen(["/usr/bin/true"])
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     return p.pid
 
@@ -167,9 +162,8 @@ class ClaimDriver:
         self._saved_os = ob.os
         ob.os = OsProxy(os, self.gate, self._root_holder)
         self.in_flock = {a: False for a in ACTORS}
-        self._saved_fcntl = getattr(ob, "fcntl", None)
-        if self._saved_fcntl is not None:
-            ob.fcntl = FcntlProxy(self._saved_fcntl, self)
+        self._saved_lock_fd = ob.lock_fd
+        ob.lock_fd = LockProxy(self._saved_lock_fd, self)
         self._saved_path = ob.Path
         GatedPath._gate = self.gate
         GatedPath._root = str(self.root)
@@ -353,8 +347,7 @@ class ClaimDriver:
             for t in self.threads.values():
                 t.join(timeout=2)
             ob.os = self._saved_os
-            if self._saved_fcntl is not None:
-                ob.fcntl = self._saved_fcntl
+            ob.lock_fd = self._saved_lock_fd
             ob.Path = self._saved_path
             GatedPath._gate = None
             if self._saved_read is not None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -25,8 +27,14 @@ def lock_fd(fd: int, *, blocking: bool = True) -> None:
         fcntl.flock(fd, flags)
         return
     os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
-    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-    msvcrt.locking(fd, mode, 1)
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if not blocking or exc.errno != errno.EACCES:
+                raise
+            time.sleep(0.05)
 
 
 def unlock_fd(fd: int) -> None:
@@ -43,11 +51,14 @@ def locked_file(path: Path, *, create_mode: int = 0o644):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, create_mode)
+    acquired = False
     try:
         lock_fd(fd)
+        acquired = True
         yield fd
     finally:
         try:
-            unlock_fd(fd)
+            if acquired:
+                unlock_fd(fd)
         finally:
             os.close(fd)

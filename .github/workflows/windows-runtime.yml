@@ -144,6 +144,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/outbox-windows.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'outbox-windows.test.py failed' }
+          python tests/sparrow-outbox-claim-protocol.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'sparrow-outbox-claim-protocol.test.py failed' }
+          python tests/outbox-race.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'outbox-race.test.py failed' }
           python tests/process-pins.test.py
           if ($LASTEXITCODE -ne 0) { throw 'process-pins.test.py failed' }
           python tests/process-pins-reader-rejects-what-writer-rejects.test.py

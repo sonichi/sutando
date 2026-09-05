@@ -258,6 +258,7 @@ def main() -> int:
         # --- a crash mid-claim must LEAVE the torn file ----------------------
         real_fdopen = os.fdopen
         def boom(*a, **k):
+            os.close(a[0])
             raise OSError("disk went away mid-write")
         os.fdopen = boom
         try:

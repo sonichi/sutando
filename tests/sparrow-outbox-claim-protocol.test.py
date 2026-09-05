@@ -51,19 +51,27 @@ Run: python3 tests/sparrow-outbox-claim-protocol.test.py
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import mock_open, patch
+
+if os.name != "nt":
+    import fcntl
 
 REPO = Path(__file__).resolve().parents[1]
 # Import the CANONICAL src/ copy: .coveragerc measures src, not packages/,
 # so testing the vendored copy would leave these lines unmeasured.
 sys.path.insert(0, str(REPO / "src"))
+
+_dead_child = subprocess.Popen([sys.executable, "-c", "pass"])
+_dead_child.wait()
+DEAD_PID = _dead_child.pid
 
 NOT_IMPL: list[str] = []
 FAILED: list[str] = []
@@ -164,11 +172,12 @@ def _three_states():
     for want in ("ALIVE", "DEAD", "UNKNOWN"):
         assert hasattr(State, want), f"OwnerState.{want} missing"
     assert ident(os.getpid()).state == State.ALIVE, "own live pid must read ALIVE"
-    assert ident(999_999).state == State.DEAD, "absent pid must read DEAD (ESRCH)"
+    assert ident(DEAD_PID).state == State.DEAD, "exited child must read DEAD"
     # Inspectability is platform-specific; never-DEAD is not. DEAD is the value
     # that lets another drainer steal a live owner's claim.
-    assert ident(1).state != State.DEAD, (
-        f"pid 1 read {ident(1).state}; a live process must never read DEAD, however "
+    live_pid = os.getpid() if os.name == "nt" else 1
+    assert ident(live_pid).state != State.DEAD, (
+        f"pid {live_pid} read {ident(live_pid).state}; a live process must never read DEAD, however "
         "opaque it is. This is the value that steals a running worker's claim")
     if sys.platform == "darwin":
         # Darwin-specific: root-owned live processes answer EPERM there, so a
@@ -232,7 +241,6 @@ def _requeue_resets_budget():
 def _proc_stat_parse():
     m = outbox()
     parse = need(m, "_linux_process_identity")   # presence is the contract here
-    del parse
     # Fields come after the LAST ')': comm is arbitrary text in parens, and a
     # naive line.split()[21] returns 0 here.
     raw = ("4321 (my weird ) proc) S 1 4321 4321 0 -1 4194304 1 0 0 0 1 1 0 0 "
@@ -243,6 +251,10 @@ def _proc_stat_parse():
         "breaks any parser that splits the whole line")
     assert raw.split()[21] != "555000", (
         "the naive split now agrees, so this control no longer proves anything")
+    reads = [mock_open(read_data=raw.encode())(), mock_open(read_data="btime 1000\n")()]
+    with patch("builtins.open", side_effect=reads), \
+            patch.object(m.os, "sysconf", return_value=100, create=True):
+        assert parse(4321) == m.ProcessIdentity(4321, m.OwnerState.ALIVE, 6550000000)
 
 
 # 8 ---------------------------------------------------------------------------
@@ -314,7 +326,7 @@ def _c11():
         assert acquire(root, "item-cas", "dead-owner") is True
         p = claim_path(root, "item-cas")
         rec = json.loads(p.read_text(encoding="utf-8"))
-        rec["pid"] = 999999                  # a pid that is not running
+        rec["pid"] = DEAD_PID
         rec["claimed_at"] = 0.0              # and long past any TTL
         p.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
         # Both drainers observed the same stale claim before either acted.
@@ -470,7 +482,7 @@ def _c16():
         assert acquire(root, "item-wedge", "dead-owner") is True
         claim = m._claim_path(root, "item-wedge")
         rec = json.loads(claim.read_text(encoding="utf-8"))
-        rec.update(pid=999999, claimed_at=0.0)
+        rec.update(pid=DEAD_PID, claimed_at=0.0)
         claim.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
 
         real_link = os.link
@@ -620,18 +632,22 @@ def _c21():
         sweep(root / "does-not-exist")          # iterdir -> FileNotFoundError
         ro = root / "unreadable"
         ro.mkdir()
-        os.chmod(ro, 0o000)                     # iterdir -> PermissionError
-        try:
-            sweep(ro)
-        finally:
-            os.chmod(ro, 0o755)
+        if os.name == "nt":
+            with patch.object(Path, "iterdir", side_effect=PermissionError):
+                sweep(ro)
+        else:
+            os.chmod(ro, 0o000)
+            try:
+                sweep(ro)
+            finally:
+                os.chmod(ro, 0o755)
         # the whole point of the swallow: claiming still works after a bad sweep
         assert acquire(root, "task-after-bad-sweep", "D1") is True
         assert release(root, "task-after-bad-sweep", "D1") is True
 
 
 # 22 --------------------------------------------------------------------------
-@contract("without the fence, locking is byte-compatible with pre-striping builds")
+@contract("unfenced namespace stays stable; pre-striping flock compatibility is POSIX-only")
 def _c22():
     m = outbox()
     acquire = need(m, "acquire_delivery_claim")
@@ -641,25 +657,27 @@ def _c22():
     safe = need(m, "_safe_key")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        # An origin/main process flocks the per-item file directly; without
-        # the fence the new build must contend on the SAME inode.
+        # Pre-striping POSIX builds flock the same per-item inode directly.
         with item_lock(root, "task-mixed"):
             legacy = root / locks_dir / f"{safe('task-mixed')}.lock"
             assert legacy.exists(), (
                 "fence absent yet no per-item lock file — the new build moved "
                 "namespaces without a migration, old writers cannot see it")
-            fd = os.open(str(legacy), os.O_CREAT | os.O_RDWR, 0o644)
-            try:
-                blocked = False
+            if os.name != "nt":
+                fd = os.open(str(legacy), os.O_CREAT | os.O_RDWR, 0o644)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
-                    blocked = True
-                assert blocked, ("an old-version flock on the per-item file "
-                                 "succeeded while the new build held the item "
-                                 "lock — no cross-version mutual exclusion")
-            finally:
-                os.close(fd)
+                    blocked = False
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        blocked = True
+                    assert blocked, ("an old-version flock on the per-item file "
+                                     "succeeded while the new build held the item "
+                                     "lock — no cross-version mutual exclusion")
+                finally:
+                    os.close(fd)
+            else:
+                print("  n/a  legacy flock contention: no pre-fix native Windows outbox")
         # and no fence means NO sweep: a legacy file must survive an acquire
         (root / locks_dir / "survivor-item.aaaabbbbccccdddd.lock").touch()
         assert acquire(root, "task-other", "D1") is True
