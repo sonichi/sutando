@@ -133,9 +133,12 @@ exit 0
         # Stub the heartbeat writer: the launcher must start it (it is the sole
         # writer of state/cores/<host>.alive that cron-runner gates fires on).
         # Record that it ran; exit immediately so no daemon lingers in the test.
+        # `--stop` is the restart handoff: the real CLI ends other writers and exits; the stub just exits.
         (self.root / "src/core_heartbeat.py").write_text(
-            "import os\n"
+            "import os, sys\n"
             "from pathlib import Path\n"
+            "if '--stop' in sys.argv:\n"
+            "    sys.exit(0)\n"
             "Path(os.environ['HEARTBEAT_PID']).write_text(str(os.getpid()))\n"
             "with open(os.environ['HEARTBEAT_LOG'], 'w') as f:\n"
             "    f.write('heartbeat-started')\n"
@@ -163,7 +166,19 @@ exit 0
 ''')
 
     def tearDown(self):
-        self.tmp.cleanup()
+        # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
+        pid_file = Path(self.tmp.name) / "heartbeat.pid"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(int(pid_file.read_text()), 0)
+            except (FileNotFoundError, ValueError, ProcessLookupError):
+                break
+            time.sleep(0.01)
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _write_exe(self, name, body):
         path = self.bin / name
