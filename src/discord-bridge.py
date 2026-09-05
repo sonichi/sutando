@@ -6032,7 +6032,7 @@ async def poll_dm_fallback():
                         task_tier = local_task_protocol.canonical_access_tier(
                             local_task_protocol.parse_task_headers(task_body)
                             .headers.get("access_tier")) or "guest"
-                    except Exception:  # pragma: no cover — dm-fallback has no execution driver; the rename left its logic unchanged
+                    except Exception:
                         task_tier = "guest"
 
                     if task_tier == "owner":
