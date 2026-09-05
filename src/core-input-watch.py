@@ -489,10 +489,8 @@ def resolve_escalations(manager, session):
 
 
 def drive_escalations(manager, session, prompt, state, send):
-    """Realise the owner's click: the keys tui_gate derives for the dialog on screen
-    NOW, sent once. A dialog that changed since the click expires the card instead.
-    Returns [(req_id, keys or None)] for what this tick acted on.
-    """
+    """Realise a click as keys against the dialog on screen NOW, once; a dialog that
+    changed since the click expires the card. Returns [(req_id, keys or None)]."""
     if manager is None:
         return []
     acted = []
@@ -517,6 +515,8 @@ def drive_escalations(manager, session, prompt, state, send):
                 continue
             keys = tui_gate.keys_for(r, prompt, state)
             if subj.get("driven_at"):
+                # Still the same dialog after the settle window: the keys did not take.
+                # A different dialog: the core moved, resolve_escalations closes it.
                 if keys is not None and time.time() - subj["driven_at"] > DRIVE_SETTLE_S:
                     _expire(r.id, tui_gate.DID_NOT_TAKE_NOTE)
                     acted.append((r.id, None))
@@ -525,15 +525,28 @@ def drive_escalations(manager, session, prompt, state, send):
                 _expire(r.id, tui_gate.STALE_NOTE)
                 acted.append((r.id, None))
                 continue
+            sent = []
             for k in keys:
                 if not send(k):
                     break
+                sent.append(k)
+            if len(sent) < len(keys):
+                # A half-walked caret is a dialog nobody can reason about: never
+                # finish it later. Record what went in, then hand it to the human.
+                with manager.store.locked():
+                    cur = manager.get(r.id)
+                    if cur is not None:
+                        cur.subject = {**(cur.subject or {}), "driven_keys": sent, "driven_partial": True}
+                        manager.store.save(cur)
+                _expire(r.id, tui_gate.DID_NOT_TAKE_NOTE)
+                acted.append((r.id, None))
+                continue
             with manager.store.locked():
                 cur = manager.get(r.id)
                 if cur is not None:
-                    cur.subject = {**(cur.subject or {}), "driven_at": time.time(), "driven_keys": keys}
+                    cur.subject = {**(cur.subject or {}), "driven_at": time.time(), "driven_keys": sent}
                     manager.store.save(cur)
-            acted.append((r.id, keys))
+            acted.append((r.id, sent))
     except Exception as exc:  # noqa: BLE001 — never let the driver take down the monitor
         print(f"hitl drive failed: {exc}", file=_sys.stderr)
     return acted

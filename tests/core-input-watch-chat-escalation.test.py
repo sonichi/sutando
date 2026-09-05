@@ -310,5 +310,40 @@ class TestDrive(unittest.TestCase):
         self.assertEqual(M.drive_escalations(None, "s", PERM, "blocked-human", lambda k: True), [])
 
 
+class TestPartialSend(unittest.TestCase):
+    """Reviewer P1: a key sequence that half-lands must never read as driven, and
+    must never be finished later against a caret nobody can place."""
+
+    def _blocked(self, m):
+        return M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+
+    def test_a_refused_second_key_expires_the_card_and_records_only_what_went_in(self):
+        from hitl.schema import STATUS_EXPIRED
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "deny")                      # plan: Down, Down, Enter
+        def flaky(k):
+            sent.append(k)
+            return len(sent) < 2                  # first Down accepted, second refused
+        acted = M.drive_escalations(m, "s", PERM, "blocked-human", flaky)
+        self.assertEqual(sent, ["Down", "Down"])
+        self.assertEqual(acted, [(r.id, None)])
+        cur = m.get(r.id)
+        self.assertEqual(cur.status, STATUS_EXPIRED)
+        self.assertEqual(cur.subject["driven_keys"], ["Down"])
+        self.assertTrue(cur.subject["driven_partial"])
+        self.assertEqual(cur.answer, {"note": "The answer did not take. Open the terminal to finish it."})
+
+    def test_after_a_partial_send_nothing_is_ever_typed_again_for_that_card(self):
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "deny")
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or len(sent) < 2)
+        moved = PERM.replace("  ❯ 1. Yes", "    1. Yes").replace("    2. Yes, and", "  ❯ 2. Yes, and")
+        for _ in range(3):
+            M.drive_escalations(m, "s", moved, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, ["Down", "Down"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

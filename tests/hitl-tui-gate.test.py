@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""A TUI dialog becomes a card with the buttons a human would expect, and a click
-becomes the keystrokes that answer THAT dialog — never a guessed key, never a key
-into a dialog the human did not see (owner spec 2026-09-04: the card says `yes`;
-the driver decides what `yes` means on screen, after checking the screen)."""
+"""A dialog becomes a card with the buttons a human expects; a click becomes the keys that
+answer THAT dialog: never a guessed key, never a key into a dialog the human did not see."""
 import pathlib
 import sys
 import unittest
@@ -132,6 +130,54 @@ class TestKeys(unittest.TestCase):
 
     def test_an_unknown_action_sends_nothing(self):
         self.assertIsNone(G.keys_for(clicked(req("permission", PERM), "open_terminal"), PERM, "blocked-human"))
+
+
+TWO_DIALOGS = ("  Do you want to proceed?\n"
+               "    1. Yes\n"
+               "    2. No\n"
+               "  ✓ Yes\n"
+               "  Select a deployment\n"
+               "  ❯ 1. Production\n"
+               "    2. Staging\n"
+               "  Esc to cancel")
+TRUST = "  Do you trust the files in this folder?\n  ❯ 1. Yes, proceed\n    2. No, exit"
+BYPASS = "  in Bypass Permissions mode.\n  ❯ 1. No, exit\n    2. Yes, I accept\n  Enter to confirm"
+
+
+class TestLiveDialogOnly(unittest.TestCase):
+    """Reviewer P1: a resolved dialog still visible above the live one must not
+    feed the buttons, even though the prompt fingerprint is identical."""
+
+    def test_only_the_block_with_the_caret_is_parsed(self):
+        self.assertEqual(G.parse_options(TWO_DIALOGS), (["Production", "Staging"], 0))
+
+    def test_the_card_is_built_from_the_live_dialog(self):
+        r = req("selection", TWO_DIALOGS)
+        self.assertEqual(r.kind, "choice")
+        self.assertEqual([a.label for a in r.actions], ["Production", "Staging", "Open terminal"])
+        self.assertEqual(r.message, "Select a deployment")
+        self.assertEqual(G.keys_for(clicked(r, "opt2"), TWO_DIALOGS, "blocked-human"), ["Down", "Enter"])
+
+    def test_no_caret_anywhere_falls_back_to_the_last_block(self):
+        flat = TWO_DIALOGS.replace("  ❯ 1. Production", "    1. Production")
+        self.assertEqual(G.parse_options(flat), (["Production", "Staging"], None))
+
+
+class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
+    """Reviewer blocker: a numbered rendering of a trust / bypass / credit dialog
+    must still keep the blocked card, whatever its options say."""
+
+    def test_trust_bypass_fable_and_session_limit_keep_the_blocked_card(self):
+        for gate, prompt in (("folder-trust", TRUST), ("bypass-permissions", BYPASS),
+                             ("fable-limit-unfocused", FABLE), ("fable-limit", FABLE),
+                             ("session-limit", "  You've hit your usage limit\n  ❯ 1. Upgrade\n    2. Wait")):
+            r = req(gate, prompt)
+            self.assertEqual(r.kind, G.FALLBACK_KIND, gate)
+            self.assertEqual([a.id for a in r.actions], ["open_terminal"], gate)
+            self.assertIsNone(G.keys_for(clicked(r, "opt1"), prompt, "blocked-human"), gate)
+
+    def test_the_allowlist_is_the_only_way_in(self):
+        self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
 
 
 if __name__ == "__main__":

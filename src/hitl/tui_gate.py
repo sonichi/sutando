@@ -1,11 +1,5 @@
 """A TUI gate as a HumanRequirement with semantic actions, and the keys that answer it.
-
-The monitor (core-input-watch) sees a Claude Code dialog as text. This module is the
-policy between that text and the card: which kind it is, which buttons it carries, and
-— once a button is clicked — which keystrokes realise that click. The UI never names a
-key; the card says `allow`/`deny`/`opt3`/`continue` and this module translates, after
-re-checking that the dialog on screen is still the one the human saw.
-"""
+The card names an action; only this module knows which keys realise it on the live dialog."""
 from __future__ import annotations
 
 import hashlib
@@ -19,6 +13,9 @@ FALLBACK_KIND = "core-blocked"
 STALE_NOTE = "This prompt has changed. Refresh the action."
 DID_NOT_TAKE_NOTE = "The answer did not take. Open the terminal to finish it."
 
+# Only these gates may carry a one-click button; trust, bypass and credit-spending
+# dialogs keep the blocked card however their text is rendered.
+SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
@@ -31,28 +28,51 @@ def guard_for(session: str, prompt: Optional[str], state: str) -> str:
     return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
 
 
-def parse_options(prompt: Optional[str]) -> Tuple[List[str], Optional[int]]:
-    """Numbered options in order, and the 0-based index the caret (❯) sits on."""
-    options: List[str] = []
-    caret: Optional[int] = None
-    for line in (prompt or "").splitlines():
+def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
+    """Each contiguous run of numbered lines: (start line, labels, caret index)."""
+    blocks: List[Tuple[int, List[str], Optional[int]]] = []
+    cur: Optional[Tuple[int, List[str], Optional[int]]] = None
+    for i, line in enumerate((prompt or "").splitlines()):
         m = _OPTION.match(line)
         if not m:
+            if cur is not None and line.strip():
+                blocks.append(cur)
+                cur = None
             continue
+        if cur is None:
+            cur = (i, [], None)
+        start, labels, caret = cur
         if m.group(1):
-            caret = len(options)
-        options.append(m.group(3))
-    return options, caret
+            caret = len(labels)
+        labels.append(m.group(3))
+        cur = (start, labels, caret)
+    if cur is not None:
+        blocks.append(cur)
+    return blocks
+
+
+def parse_options(prompt: Optional[str]) -> Tuple[List[str], Optional[int]]:
+    """The LIVE dialog's options: the block holding the caret, else the last one.
+    A resolved dialog still visible above the live one must not feed the buttons."""
+    blocks = option_blocks(prompt)
+    if not blocks:
+        return [], None
+    live = next((b for b in reversed(blocks) if b[2] is not None), blocks[-1])
+    return live[1], live[2]
 
 
 def question(prompt: Optional[str], detail: str) -> str:
     """The lines a human would read as the question: above the options, frames and
     key hints dropped, the last three kept."""
     kept: List[str] = []
-    for line in (prompt or "").splitlines():
-        if _OPTION.match(line):
-            break
+    blocks = option_blocks(prompt)
+    live_start = next((b[0] for b in reversed(blocks) if b[2] is not None), blocks[-1][0] if blocks else None)
+    lines = (prompt or "").splitlines()
+    for line in (lines[:live_start] if live_start is not None else lines):
         s = line.strip()
+        if _OPTION.match(line) or s.startswith("✓"):
+            kept = []  # an older dialog's options or its recorded answer: not this question
+            continue
         if not s or _FRAME.match(s) or _HINT.search(s):
             continue
         kept.append(s)
@@ -65,8 +85,8 @@ def _open_terminal() -> Action:
 
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str) -> HumanRequirement:
-    """Build the requirement a gate deserves. Unparseable dialogs fall back to the
-    blocked card with no semantic button: a key is never guessed."""
+    """The requirement a gate deserves; unparseable or non-semantic gates keep the
+    blocked card with no button, so a key is never guessed."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -80,7 +100,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if gate == "login" or state == "logged-out":
+    if gate is not None and gate not in SEMANTIC_GATES and state != "logged-out":
+        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
+    elif gate == "login" or state == "logged-out":
         kind, title = "auth", "Claude needs to be reconnected"
         message = "Your Claude session has expired. Sign in again to continue."
         actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
@@ -89,8 +111,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         message = question(prompt, detail)
         actions = [Action(id="continue", kind="continue", label="Continue")]
     elif options:
-        # Kind follows the OPTIONS, not the gate label: classify() names a Yes/No
-        # dialog `selection` whenever its caret row sits below the question.
+        # Kind follows the OPTIONS: classify() names a Yes/No dialog `selection`.
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)
