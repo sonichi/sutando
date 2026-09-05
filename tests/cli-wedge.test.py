@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -468,8 +469,8 @@ class Cli(unittest.TestCase):
             self.assertEqual([o["sample_count"] for o in outs], [1, 1, 2, 2], outs)
             self.assertIn("no work signal", outs[0]["work_detail"])
             self.assertFalse(w.window_path(ws).exists(), "an explicit target must not write the core's window")
-            self.assertTrue(w.window_path(ws, "=worker-1:1").exists())
-            self.assertNotEqual(w.window_path(ws, "=worker-1:1"), w.window_path(ws, "=worker-2:1"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=worker-1:1")).exists())
+            self.assertNotEqual(w.window_path(ws, w.window_slot("/s", "=worker-1:1")), w.window_path(ws, w.window_slot("/s", "=worker-2:1")))
             self.assertEqual(w.window_path(ws), w.window_path(ws, None))
 
     def test_probe_takes_the_callers_work_signal_for_a_worker(self):
@@ -525,30 +526,61 @@ class Cli(unittest.TestCase):
             v2 = json.loads(out)
             self.assertEqual([v2["targets"][k]["sample_count"] for k in ("=w1:1", "=w2:1")], [2, 2])
             self.assertFalse(w.window_path(ws).exists())
-            self.assertTrue(w.window_path(ws, "=w1:1").exists() and w.window_path(ws, "=w2:1").exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=w1:1")).exists() and w.window_path(ws, w.window_slot("/s", "=w2:1")).exists())
 
-    def test_a_named_session_is_a_worker_not_the_core(self):
-        # Probing workers by --session used to share the core's window and borrow its queue, silently.
-        # A named session is a worker (own slot, no borrowed signal); only the unnamed default is the core.
+    def _alive(self, ws: Path, session: str, socket: str = "/s") -> None:
+        cores = ws / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
+        (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": socket, "session": session, "schema_version": 4}))
+
+    def test_role_comes_from_identity_not_from_how_the_session_was_spelled(self):
+        # The heartbeat record names the core's session. Naming that session explicitly is still the
+        # core; a worker reached through the environment with no flag is still a worker.
         with tempfile.TemporaryDirectory() as d:
-            ws = Path(d) / "ws"
-            frames = Path(d) / "frames.txt"
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(12)))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--session", "sutando-core")        # explicit, but it IS the core
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("core", True), v)
+            self.assertIn("queued task", v["work_detail"])
+            self.assertTrue(w.window_path(ws).exists())
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):     # env names a WORKER, no flag
+                rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False), v)
+            self.assertIn("no work signal", v["work_detail"])
+            self.assertEqual(v["target"], "=core-2:0")
+            rc, out = self.run_main(*base, "--target", "=sutando-core:0")       # explicit target that IS the core
+            self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "sutando-core", "--role", "worker")   # the override wins
+            v = json.loads(out); self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False))
+            rc, out = self.run_main(*base, "--target", "=core-9:0", "--role", "core")
+            self.assertEqual(json.loads(out)["role"], "core")
+            # no heartbeat record: the configured default is the core, a named other session a worker
+            (ws / "state" / "cores" / "host.alive").unlink()
+            rc, out = self.run_main(*base); self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "core-3"); self.assertEqual(json.loads(out)["role"], "worker")
+
+    def test_windows_are_keyed_by_socket_as_well_as_target(self):
+        # Two tmux servers on one host can both hold =core-2:1; the same target on two sockets must not
+        # share a window (alternating pane identities would split every sample into a new run).
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
             frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
             tmux = fake_tmux(Path(d), frames)
-            (ws / "tasks").mkdir(parents=True); (ws / "tasks" / "task-1.txt").write_text("x")
-            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
             counts = []
-            for sess in ("core-2", "core-4", "core-2", "core-4"):
-                rc, out = self.run_main(*base, "--session", sess)
-                v = json.loads(out); counts.append(v["sample_count"])
-                self.assertFalse(v["work_outstanding"], v)
-                self.assertIn("no work signal", v["work_detail"])
+            for sock in ("/s1", "/s2", "/s1", "/s2"):
+                rc, out = self.run_main("probe", "--socket", sock, "--target", "=core-2:1", "--workspace", str(ws), "--tmux", str(tmux))
+                counts.append(json.loads(out)["sample_count"])
             self.assertEqual(counts, [1, 1, 2, 2])
-            self.assertFalse(w.window_path(ws).exists(), "a named session must not write the core's window")
-            rc, out = self.run_main(*base)   # the unnamed default IS the core: shared window, its own queue
-            v = json.loads(out)
-            self.assertTrue(w.window_path(ws).exists())
-            self.assertIn("queued task", v["work_detail"])
+            self.assertNotEqual(w.window_slot("/s1", "=core-2:1"), w.window_slot("/s2", "=core-2:1"))
+            self.assertEqual(w.window_slot("/s1", "=x"), w.window_slot("/s1", "=x"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s1", "=core-2:1")).exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s2", "=core-2:1")).exists())
+            self.assertFalse(w.window_path(ws).exists())
 
     def test_work_signal_precedence(self):
         with tempfile.TemporaryDirectory() as d:

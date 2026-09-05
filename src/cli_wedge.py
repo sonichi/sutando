@@ -401,6 +401,25 @@ def work_signal(target: Optional[str], workspace: Path, now: float, work_file: O
     return work_outstanding(workspace, now)
 
 
+def core_identity(workspace: Path) -> tuple:
+    """(socket, session) of THIS host's core as its heartbeat records it; the configured default
+    when no record is readable. The record is the authority — an env value is only a claim."""
+    try:
+        recs = sorted((workspace / "state" / "cores").glob("*.alive"), key=lambda q: q.stat().st_mtime, reverse=True)
+        for q in recs:
+            r = json.loads(q.read_text())
+            if isinstance(r.get("session"), str) and r.get("session"):
+                return (r.get("socket") or None, r["session"])
+    except (OSError, ValueError, AttributeError):
+        pass
+    return (None, os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION))
+
+
+def window_slot(socket_path: str, target: str) -> str:
+    """One window per (server, pane): two servers on one host can both hold `=core-2:1`."""
+    return f"{os.path.realpath(socket_path)}|{target}"
+
+
 def window_path(workspace: Path, slot: Optional[str] = None) -> Path:
     """One rolling window per watched target: the core's own is `window.jsonl`; an explicit
     target gets its own file, so probing a worker pane never resets the core's run."""
@@ -605,6 +624,8 @@ def main(argv: Optional[list] = None) -> int:
         p.add_argument("--target", default=None, help="override the resolved =<session>:<window> target")
         if name == "probe":
             p.add_argument("--targets", default=None, help="comma-separated explicit targets, one verdict each (worker panes)")
+            p.add_argument("--role", choices=("core", "worker"), default=None,
+                           help="override the role; by default the core's own pane (per its heartbeat record) is 'core', every other target is 'worker'")
             p.add_argument("--work-file", default=None, help="JSON {<target>: {outstanding, detail}} — the deliverer's work signal per target")
             g = p.add_mutually_exclusive_group()
             g.add_argument("--work-outstanding", dest="say_work", action="store_true", default=None, help="the caller says the target owes work")
@@ -629,16 +650,25 @@ def main(argv: Optional[list] = None) -> int:
     if a.workspace is None:
         a.workspace = str(_default_workspace())
     ws = Path(a.workspace)
+    # The core's identity is what its heartbeat records, not how the argument was spelled.
+    core_sock, core_sess = core_identity(ws)
+    core_t = core_target(a.socket, core_sess, a.tmux) if (core_sock is None or os.path.realpath(core_sock) == os.path.realpath(a.socket)) else None
+
+    def role_of(t: str) -> str:
+        if getattr(a, "role", None):
+            return a.role
+        return "core" if (core_t is not None and t == core_t) else "worker"
+
     if a.cmd == "probe" and a.targets:
-        # Several worker panes in one call: each keeps its own window and its own work signal.
+        # Several panes in one call: each keeps its own window and its own work signal.
         out = {}
         for t in [x.strip() for x in a.targets.split(",") if x.strip()]:
-            out[t] = probe_one(a, ws, t)
+            out[t] = probe_one(a, ws, t, role_of(t))
         print(json.dumps({"socket": a.socket, "targets": out}, indent=1))
         return 0
-    # Only the unnamed default is the core's own pane; a named session is a worker like an explicit target.
-    explicit = bool(a.target) or a.session is not None
-    session = a.session or os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION)
+    # The environment still SELECTS the pane (a worker's launcher exports its own session); only the role
+    # is decided by identity above.
+    session = a.session or os.environ.get("SUTANDO_TMUX_SESSION") or core_sess
     target = a.target or core_target(a.socket, session, a.tmux)
     if target is None:
         print(json.dumps({"kind": "unknown", "warn": False, "reason": f"session {session!r} not found on {a.socket}"}))
@@ -646,20 +676,22 @@ def main(argv: Optional[list] = None) -> int:
     if a.cmd == "record":
         print(record(a, lambda: capture_pane(a.socket, target, a.tmux)))
         return 0
-    print(json.dumps(probe_one(a, ws, target, explicit=explicit), indent=1))
+    print(json.dumps(probe_one(a, ws, target, role_of(target)), indent=1))
     return 0
 
 
-def probe_one(a, ws: Path, target: str, explicit: bool = True) -> dict:
-    """One sample of one target into its own window, classified with the caller's work signal."""
+def probe_one(a, ws: Path, target: str, role: str) -> dict:
+    """One sample of one target: the core's pane shares the core window and reads the core's queue;
+    any other pane gets a window keyed by (socket, target) and the caller's work signal."""
     frame = capture_pane(a.socket, target, a.tmux)
     if frame is None:
-        return {"kind": "unknown", "warn": False, "reason": "pane not readable", "target": target}
+        return {"kind": "unknown", "warn": False, "reason": "pane not readable", "target": target, "role": role}
     now = time.time()
-    slot = target if explicit else None
+    slot = None if role == "core" else window_slot(a.socket, target)
     entries = append_window(ws, frame, now, pane=pane_identity(a.socket, target, a.tmux), slot=slot)
-    work = work_signal(slot, ws, now, work_file=getattr(a, "work_file", None), say=getattr(a, "say_work", None))
-    return {**classify_window(entries, work, now), "target": target}
+    work = work_signal(None if role == "core" else target, ws, now,
+                       work_file=getattr(a, "work_file", None), say=getattr(a, "say_work", None))
+    return {**classify_window(entries, work, now), "target": target, "role": role}
 
 
 if __name__ == "__main__":
