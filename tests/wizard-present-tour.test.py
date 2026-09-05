@@ -44,6 +44,20 @@ class PresentTourTests(unittest.TestCase):
             self.assertEqual(argv[:2], ["present", "tour"])
             self.assertEqual(argv[argv.index("--room") + 1], "!r:x")
 
+    def test_unrelated_higher_ancestor_is_never_executed(self):
+        # a local-card.py two levels above the engine dir must not be picked up
+        with tempfile.TemporaryDirectory() as d:
+            engine = Path(d) / "somewhere" / "engine"
+            script = engine / "sutando" / "skills" / "wizard" / "scripts" / "present-tour.py"
+            script.parent.mkdir(parents=True)
+            shutil.copyfile(SCRIPT, script)
+            log = Path(d) / "argv.json"
+            stub_presenter(Path(d) / "local-card.py", log)  # unrelated, above the boundary
+            r = run(script, "--room", "!r:x")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("text-only", r.stdout)
+            self.assertFalse(log.exists(), "the unrelated script was executed")
+
     def test_explicit_presenter_is_used(self):
         with tempfile.TemporaryDirectory() as d:
             stub = Path(d) / "local-card.py"

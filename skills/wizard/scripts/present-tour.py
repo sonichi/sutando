@@ -8,11 +8,11 @@ import sys
 from pathlib import Path
 
 
-def find_presenter(start: Path) -> Path | None:
-    # The desktop app ships engine/local-card.py beside engine/sutando/; walking
-    # up finds it from a symlinked or relocated checkout as well.
-    for parent in start.resolve().parents:
-        candidate = parent / "local-card.py"
+def find_presenter(script: Path) -> Path | None:
+    # Only the two supported locations: engine/local-card.py beside engine/sutando/
+    # (the desktop layout), or the checkout root; never an arbitrary ancestor's file.
+    repo = script.resolve().parents[3]
+    for candidate in (repo.parent / "local-card.py", repo / "local-card.py"):
         if candidate.is_file():
             return candidate
     return None
