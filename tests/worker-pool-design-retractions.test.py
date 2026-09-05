@@ -508,6 +508,38 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class AHistoricalLabelReachesTheConclusionsThatRestOnIt(unittest.TestCase):
+    """Marking Trace B historical left the paragraph immediately after it asserting the
+    trace's conclusion as live policy, and left the schema calling `instances` ordered while
+    the paragraph below defines it unordered. A label moves; the sentences depending on it
+    do not move with it.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_repin_arbitration_conclusion_is_inside_the_historical_account(self):
+        f = self._flat()
+        self.assertNotRegex(
+            f, r"A repin is the one place the claim arbitrates target-against-target, and only for",
+            "the conclusion outlived the trace it rests on")
+        self.assertRegex(f, r"Still part of the historical account above")
+
+    def test_the_fence_is_named_as_why_the_window_does_not_exist(self):
+        f = self._flat()
+        self.assertRegex(f, r"Under the normative fence that superseded it there is no such\s+window")
+
+    def test_what_survives_is_separated_from_what_does_not(self):
+        """A blanket retraction would also delete the equal-members claim, which is true."""
+        f = self._flat()
+        self.assertRegex(f, r"contention\s+between members of ONE set is expected and is settled by the per-task claim")
+
+    def test_the_schema_says_unordered(self):
+        f = self._flat()
+        self.assertNotRegex(f, r"A room binds to an ordered \*\*set\*\*")
+        self.assertRegex(f, r"A room binds to an UNORDERED \*\*set\*\*")
+
+
 class TheFenceSummaryAgreesWithItsOwnBody(unittest.TestCase):
     """Three sites disagreed about the SAME transition set: a heading saying every transition
     fences, a subsection saying first-pin does not, and a trace performing a live/live repin

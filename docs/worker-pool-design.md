@@ -879,12 +879,18 @@ recoverable state this design prefers to a stranded claim.
 Rule 3 still selects the core, unchanged, for work addressed to nobody — an unbound room,
 or an unreadable bindings file. That case never had a second claimant to race.
 
-A repin is the one place the claim arbitrates target-against-target, and only for
-the bounded window in which an outgoing and an incoming member both read themselves as bound.
-Contention between members of ONE set is expected and settled by the per-task claim; what the
-repin window adds is contention between a set being replaced and its replacement. Elsewhere the claim is still
-load-bearing only in that repin window: with the stand-in gone, target-against-target is
-the sole contention v1 has left.
+**Still part of the historical account above, and this paragraph is why marking the trace
+alone was not enough.** In Trace B's world a repin is the one place the claim arbitrates
+target-against-target, for the bounded window in which an outgoing and an incoming member both
+read themselves as bound. **Under the normative fence that superseded it there is no such
+window**: the outgoing worker is STOPPED before the binding is rewritten, so no live/live
+claimant pair exists for a claim to arbitrate. Leaving the conclusion live while the trace above
+it was labelled historical left two mutually exclusive mechanisms on the page — the label moved
+and the sentence that depended on it did not.
+
+What survives into v1 is the other half, which never depended on the repin window: **contention
+between members of ONE set is expected and is settled by the per-task claim.** That is the
+equal-members case, not a transition.
 
 A task is eligible to every member of the room's `instances` set, and the per-task claim
 decides which member takes it — see the binding table. A later form of addressing (an app control, a room command, a
@@ -927,7 +933,10 @@ has twice been bitten for lacking:
 - **Only `pinned: true` binds.** A bare entry without it is decayed handler
   state, not an owner's binding, and must not constrain routing.
 
-**Schema.** A room binds to an ordered **set** of instances, not to one name — one
+**Schema.** A room binds to an UNORDERED **set** of instances, not to one name — the word
+was "ordered" here while the paragraph twenty lines below defines the same field as an unordered
+membership set in which position carries no meaning; unordered is the contract, and ordering would
+change both serialization expectations and whether position implies precedence. One
 worker per room cannot express a room served by a pair, and it cannot express which
 rooms must be kept off the same worker:
 
