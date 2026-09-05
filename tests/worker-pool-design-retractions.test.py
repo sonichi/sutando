@@ -15,6 +15,16 @@ HISTORICAL = (
 )
 
 RETRACTED = [
+    ("never a second live claimant",
+     "the core stand-in is check-then-act like any other: a worker can pass its "
+     "eligibility read just before the core crosses stand_in_after_s and claim a "
+     "different task for the same room. The document's own measurement -- different "
+     "task keys, same room -> 0, 0 -- says both win, so the core needs the "
+     "revocation boundary it once claimed to be exempt from."),
+    ("the core can simply tell it to stop",
+     "responsive is not quiescent: an answer describes the instant it was written "
+     "and does not forbid the next claim. The re-bind goes over the same durable "
+     "revocation boundary as the stale case."),
     ("same capacity/busy rule",
      "the event path bounds EXECUTION, not ADMISSION: queue_handler_task claims "
      "and marks pending before draining, so there is no admission bound to "

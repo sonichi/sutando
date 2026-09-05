@@ -805,14 +805,44 @@ rooms must be kept off the same worker:
 
   | event | what v1 does |
   |---|---|
-  | a worker's beat goes stale past `stand_in_after_s` | **the core stands in for its rooms** and kickstarts the plist. The core is a single arbiter, so there is never a second live claimant and nothing to fence |
+  | a worker's beat goes stale past `stand_in_after_s` | the core **revokes the worker's admission, waits out the bound below, and only then stands in** for its rooms, kickstarting the plist |
   | the worker comes back | it re-reads the binding, finds itself still `instances[0]`, and resumes. Nothing was reassigned, so nothing has to be revoked |
-  | the owner wants a different worker on that room | an explicit re-bind command, applied while the outgoing worker is **responsive** — the core can simply tell it to stop and wait for the answer, because a live worker can answer |
+  | the owner wants a different worker on that room | an explicit re-bind command, applied over the **same revocation boundary**. Responsive is not quiescent: an answer says the worker was alive when it answered, not that it will not claim next tick |
+
+  **The two rows above used to claim they needed no fencing at all, and that was wrong on this
+  document's own evidence.** The stale row read "the core is a single arbiter, so there is never a
+  second live claimant"; the rebind row said a responsive worker can simply be told to stop. Both
+  are check-then-act. A worker samples its eligibility, passes, and claims task X while the core —
+  having just crossed `stand_in_after_s` — claims task Y for the same room. The per-task claims do
+  not contend, and the measurement is already in this section, four paragraphs up: *different task
+  keys, same room -> 0, 0* (both won). The argument used there to reject the group-lease
+  alternative applies unchanged to the core, and an earlier revision exempted the core from it.
+  Responsiveness fails the same way: the empty answer describes the instant it was written, and
+  nothing in it forbids the next claim.
+
+  **The revocation boundary.** One durable record, one writer, a bounded wait instead of an
+  acknowledgement — because a dead worker cannot acknowledge:
+
+  - **state** — `admission` under the same `state/pool-status.json` record, per instance, values
+    `admitted` | `revoked`, carried by the existing `version` field.
+  - **writer** — the core, and only the core, over the same single-writer atomic path the table
+    above specifies. A worker never writes it, so the record is never contended.
+  - **reader** — every worker, immediately before each claim. `revoked`, absent, or unreadable all
+    mean *do not claim*; a worker that cannot read its own admission has lost the right to act on
+    the room, which is the fail-closed direction.
+  - **ordering** — write `revoked`, then wait one full beat interval plus one claim window, then
+    stand in. The wait is what bounds an in-flight check-then-act: any read that already passed
+    must reach its claim inside that window or not at all, so after it no admitted claimant exists.
+    This is a bound, not a lease — nothing is renewed and nothing expires.
+
+  **What it costs, stated plainly:** the room is unserved for that bounded interval on every
+  stand-in and every re-bind. v1 takes serial unavailability over a second live claimant, the same
+  trade this section already makes one level up.
 
   So `instances[1:]` is an **owner-facing preference list**, read by a human deciding whom to
-  re-bind to. It is not a runtime path, nothing consults it automatically, and no generation,
-  lease or drain protocol is required to make it safe — because the unsafe operation was
-  removed rather than guarded.
+  re-bind to. It is not a runtime path and nothing consults it automatically. No generation, lease
+  or drain protocol is required — but a revocation boundary is, and the earlier claim that nothing
+  at all was needed did not survive this document's own measurement.
 
   What this costs, stated plainly: a dead worker's rooms are served by the core rather than by a
   standby worker, so they lose worker-level parallelism until an owner re-binds or the worker
