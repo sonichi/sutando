@@ -34,6 +34,7 @@ Exit code: 0 on pass, 1 on fail.
 
 import contextlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -168,6 +169,18 @@ def behavioral(bridge) -> list:
     access_no_collab = {"groups": {str(SERVING): {"allowFrom": [SUSAN]}}}
     if ric(access_no_collab, SUSAN, SERVING) is not False:
         fails.append("team sender absent from collaborators should resolve False")
+
+    # 3b. FAILURE MODE: a global tierMap "collaborator" must load as team —
+    #     the tier is per-channel; owner stays owner, legacy other reads guest.
+    bridge.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    bridge.ACCESS_FILE.write_text(json.dumps({
+        "allowFrom": [OWNER, "777"], "groups": {},
+        "tierMap": {"777": "collaborator", OWNER: "owner", "888": "other"}}))
+    loaded = bridge.load_tier_map()
+    if loaded.get("777") != "team":
+        fails.append(f"tierMap 'collaborator' must load as team, got {loaded.get('777')!r}")
+    if loaded.get(OWNER) != "owner" or loaded.get("888") != "guest":
+        fails.append(f"tierMap owner/other must load as owner/guest, got {loaded!r}")
 
     # 4. Unknown sender / unknown channel → False (fail-closed).
     if ric(access, "999", SERVING) is not False:

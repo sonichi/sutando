@@ -921,7 +921,18 @@ def load_tier_map() -> dict:
     try:
         data = json.loads(ACCESS_FILE.read_text())
         tier_map = data.get("tierMap")
-        return tier_map if isinstance(tier_map, dict) else {}
+        if not isinstance(tier_map, dict):
+            return {}
+        out = {}
+        for uid, raw in tier_map.items():
+            tier = local_task_protocol.canonical_access_tier(raw)
+            # collaborator is per-channel and comes only from the serving
+            # channel's list; a global map entry may grant at most team.
+            if tier == "collaborator":
+                print(f"  [tier-map] {uid}: 'collaborator' is not a global tier; read as team", flush=True)
+                tier = "team"
+            out[uid] = tier
+        return out
     except Exception:
         return {}
 
