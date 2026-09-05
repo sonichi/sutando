@@ -29,6 +29,7 @@ sys.path.insert(0, str(_HERE.parent / "src"))
 sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 
 from pool_follower import LEAD_STALE_S
+from pool_routing import HOME_ID  # noqa: E402
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
 from pool_notify import PoolNotifier
@@ -74,6 +75,15 @@ def _workspace() -> Path:
     return Path(out.stdout.strip())
 
 
+def _host_label() -> str:
+    try:
+        r = subprocess.run(["bash", str(_HERE / "sutando-config.sh"), "host-label"],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=2.0)
@@ -115,8 +125,17 @@ def main() -> int:
         rt = (m.group(1).strip() if m else "") or "claude"
         return rt if rt in ("claude", "codex") else "claude"
 
-    lead = PoolLead(tasks, state, followers, alive,
-                    metrics=PoolMetrics(state), runtime_fn=runtime_of)
+    _host = {"label": _host_label()}
+    def home_alive() -> bool:
+        return bool(_host["label"]) and alive(_host["label"])
+    # The home seat's beat file is host-labelled; it is routed under HOME_ID.
+    def home_fn() -> "str | None":
+        return HOME_ID if home_alive() else None
+    def member_alive(inst: str) -> bool:
+        return home_alive() if inst == HOME_ID else alive(inst)
+    lead = PoolLead(tasks, state, followers, member_alive,
+                    metrics=PoolMetrics(state), runtime_fn=runtime_of,
+                    home_fn=home_fn)
     status = PoolStatusWriter(tasks, state, followers, alive,
                               bindings_fn=lead.bindings)
     notifier = PoolNotifier(tasks, state, _send_notice)
