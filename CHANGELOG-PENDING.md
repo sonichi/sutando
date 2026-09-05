@@ -11,6 +11,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- `sandbox.runtime` config option (`codex` default, `gemini`): on installs without Codex CLI, non-owner (team/other) Discord tasks delegate to the Gemini CLI, read-only and sandboxed, through the same two-stage rulebook instead of ending in the Stage-2 fallback sentinel. `SUTANDO_SANDBOX_RUNTIME` overrides per-invocation. ([#3760])
 - report-feedback: `--auto` mode for agent-initiated bug reports — honors the owner's `state/feedback-prefs.json` toggles (auto-report + send-logs, both default on), dedupes identical titles (24h), and caps volume (5/day).
 
 ## Fixed
