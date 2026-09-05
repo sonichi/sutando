@@ -7,7 +7,8 @@ in-flight set have reached the disk — and must withhold the ack entirely
 otherwise. Acks that never confirm are persisted and retried.
 
 Covers:
-  1. the four state writes go temp → fsync file → rename → fsync directory;
+  1. the four state writes go temp → fsync file → rename → fsync directory
+     where the platform supports directory descriptors;
   2. a task queued by a pre-durability client and redelivered after the upgrade
      is verified, fsync'd and given its sidecar before a durable ack is allowed,
      as is the pending reply of a redelivery this node already handled;
@@ -118,7 +119,7 @@ class DurableAck(unittest.TestCase):
 
     # -- 1. the durable-write sequence -------------------------------------- #
 
-    def test_durable_write_fsyncs_the_file_then_the_directory(self):
+    def test_durable_write_fsyncs_the_file_then_the_directory_when_supported(self):
         mod = self.mod
         trace: list[str] = []
         real_fsync, real_replace = mod.os.fsync, mod.os.replace
@@ -135,7 +136,10 @@ class DurableAck(unittest.TestCase):
         with patch.object(mod.os, "fsync", spy_fsync), \
              patch.object(mod.os, "replace", spy_replace):
             self.assertTrue(mod._durable_write(self.ws / "state" / "x.json", "{}"))
-        self.assertEqual(trace, ["fsync-file", "rename", "fsync-dir"])
+        expected = ["fsync-file", "rename"]
+        if os.name != "nt":
+            expected.append("fsync-dir")
+        self.assertEqual(trace, expected)
 
     def test_the_queue_write_publishes_through_the_durable_sequence(self):
         mod = self.mod
@@ -157,8 +161,11 @@ class DurableAck(unittest.TestCase):
         # Both files are staged and fsync'd first; the sidecar then commits, and
         # only after that does the task become visible to the watcher.
         self.assertEqual(trace[:at].count("file"), 2)
-        self.assertEqual(trace[at:at + 4], ["rename:remote-task-media.json", "dir",
-                                            "rename:task-seq.txt", "dir"])
+        expected = ["rename:remote-task-media.json", "rename:task-seq.txt"]
+        if os.name != "nt":
+            expected[1:1] = ["dir"]
+            expected.append("dir")
+        self.assertEqual(trace[at:at + len(expected)], expected)
 
     # -- 2. a pre-durability task redelivered after the upgrade -------------- #
 
@@ -228,12 +235,14 @@ class DurableAck(unittest.TestCase):
 
         return patch.object(self.mod.os, "open", refuse)
 
-    def test_the_repair_fsyncs_the_queued_task_and_its_directory(self):
+    def test_the_repair_fsyncs_the_queued_task_and_its_directory_when_supported(self):
         mod = self.mod
         tfile = mod.TASKS_DIR / "task-old4.txt"
         tfile.write_text("id: task-old4\n")
-        at_ack, watch = self._fsync_watch({tfile.stat().st_ino,
-                                           mod.TASKS_DIR.stat().st_ino})
+        want = {tfile.stat().st_ino}
+        if os.name != "nt":
+            want.add(mod.TASKS_DIR.stat().st_ino)
+        at_ack, watch = self._fsync_watch(want)
         with watch:
             self._ack_round([self._task("task-old4")])
         self.assertEqual(at_ack, [True],
@@ -257,8 +266,10 @@ class DurableAck(unittest.TestCase):
         # write_text, so this process has committed nothing of its own.
         rfile = mod.RESULTS_DIR / "task-red.txt"
         rfile.write_text("the answer the core already produced")
-        at_ack, watch = self._fsync_watch({rfile.stat().st_ino,
-                                           mod.RESULTS_DIR.stat().st_ino})
+        want = {rfile.stat().st_ino}
+        if os.name != "nt":
+            want.add(mod.RESULTS_DIR.stat().st_ino)
+        at_ack, watch = self._fsync_watch(want)
         with watch:
             self._ack_round([self._task("task-red")])
         self.assertEqual(at_ack, [True],
