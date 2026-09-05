@@ -508,6 +508,44 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class Rule3IsABindingTestNotALivenessTest(unittest.TestCase):
+    """Two reviewers independently found the same contradiction at one head: rule 3 and the
+    role summaries said the core claims work addressed to "no LIVE worker/instance", which a
+    bound-but-stale worker satisfies, while the no-stand-in sections require bound work to
+    stay pending. Both outcomes were required for {W1 stale}. The discriminator is BINDING.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_no_live_worker_phrasing_is_gone_from_the_role_summaries(self):
+        f = self._flat()
+        for dead in ["claim every task addressed to no live worker",
+                     "core claims whatever no live worker is addressed by",
+                     "addressed to no live instance: the core emits"]:
+            with self.subTest(phrase=dead):
+                self.assertNotIn(dead, f,
+                                 "a liveness-worded rule 3 makes the core a stand-in by the back door")
+
+    def test_rule_three_names_binding_as_the_test(self):
+        f = self._flat()
+        self.assertRegex(f, r"This is a binding test, not a liveness test",
+                         "say which property decides, or the next reader re-derives liveness")
+        self.assertRegex(f, r"A room bound to a stale instance is bound, so it does NOT reach rule 3")
+
+    def test_no_stand_in_is_quantified_over_the_whole_set(self):
+        """A per-member reading suppresses a healthy W2 because W1 died."""
+        f = self._flat()
+        self.assertRegex(
+            f, r"a room goes unserved only when EVERY bound member is\s+ineligible, never when one is",
+            "the quantifier IS the rule; without it the mixed set has two required outcomes")
+
+    def test_the_mixed_set_case_is_worked_not_just_asserted(self):
+        f = self._flat()
+        self.assertRegex(f, r"\{`?W1 stale, W2 live`?\}|`\{W1 stale, W2 live\}`",
+                         "name the case both reviewers used, so the control is checkable")
+
+
 class TheStopFenceStatesItsOwnInverse(unittest.TestCase):
     """The fence lets the implementer DISABLE or REMOVE the plist. `bootstrap` undoes
     neither on its own: a disabled label refuses to load, and a removed one has no path to

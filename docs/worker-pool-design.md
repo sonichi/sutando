@@ -47,7 +47,7 @@ mode the pool has to detect; it is the absence of a pool.
 
 | component | may do | must not do |
 |---|---|---|
-| **core** | create, destroy and resize the pool; choose a worker's model; execute every lifecycle command; write the pin table; claim every task addressed to no live worker; sweep worker beats, reclaim, revive, report | claim a task addressed to a live worker |
+| **core** | create, destroy and resize the pool; choose a worker's model; execute every lifecycle command; write the pin table; claim every task addressed to NO WORKER AT ALL (an UNBOUND room) -- never one addressed to a bound-but-stale worker; sweep worker beats, reclaim, revive, report | claim a task addressed to a live worker |
 | **worker** | claim tasks **addressed to it**; execute them | claim anything else; create, destroy or reclaim anything |
 | **launchd** | keep the processes it was given alive | decide how many there are |
 | **app / bridges** | produce intent as owner tasks; render `state/pool-status.json` | call an API into the pool or touch its state |
@@ -62,7 +62,7 @@ belongs to the core on the owner's word.
 A worker claims what is **addressed to it**. Addressing is the general idea;
 v1 ships two ways of expressing it and leaves room for more, because a later
 way to address a worker is a new input to the same rule, not a new rule. The
-core claims whatever no live worker is addressed by.
+core claims whatever is addressed to NOBODY -- an unbound room. A bound room whose worker is stale is NOT that case.
 
 Routing is therefore two pieces of data and one rule, evaluated by each watcher
 for itself. The data, both of them forms of addressing: the envelope field **`requested_worker`**, which the server
@@ -721,7 +721,12 @@ claiming, which is the case that hurts.
    whose beat is stale: the pin is unclaimable, so the task stays PENDING. It does
    NOT fall through to rule 3 — rule 3 is for work addressed to nobody, and this
    work is addressed.
-3. The task is addressed to no live instance: the core emits and workers suppress.
+3. The task is addressed to NOBODY -- the room is UNBOUND, i.e. the pin table names no
+   instance for it: the core emits and workers suppress. **This is a binding test, not a
+   liveness test.** A room bound to a stale instance is bound, so it does NOT reach rule 3;
+   its work stays pending under the no-stand-in rule. Reading rule 3 as "no LIVE instance"
+   is what made the core a stand-in by the back door, and it required the opposite outcome
+   from the same document.
 
 **Suppress means: take no claim, emit nothing, queue nothing, and leave the task
 file untouched.** It is not "claim and discard", and the difference is the whole
@@ -906,7 +911,12 @@ rooms must be kept off the same worker:
   carries no meaning.** A worker claims a room's task if it reads itself anywhere in that room's
   set, and the per-task claim decides which member gets which task. There is no primary, no
   standby and no failover order, so a member going dead demotes nobody and promotes nobody: the
-  remaining members simply keep claiming. The set is rewritten by exactly ONE event, and death is
+  remaining members simply keep claiming. **So the no-stand-in rule is quantified over the SET, and
+  the quantifier is the whole rule: a room goes unserved only when EVERY bound member is
+  ineligible, never when one is.** For `{W1 stale, W2 live}` W2 keeps claiming and the room is
+  served; suppression applies to W1 alone. A per-member reading of that rule and this paragraph
+  demand opposite outcomes for the same set, which is the contradiction two reviewers found at
+  the same head. The set is rewritten by exactly ONE event, and death is
   not it: an **owner re-bind**, which `os.replace`s the file over the same single-writer, atomic
   path the table above specifies.
 
