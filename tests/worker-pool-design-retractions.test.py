@@ -269,7 +269,8 @@ class NoStandInPathIsDescribed(unittest.TestCase):
         r"|stand-in decision"
         r"|(served|handled|claimed|picked up) by the core"
         r"|falls? (to|back to) the core"
-        r"|core (takes|took) over"
+        r"|stale-target fallthrough"
+        r"|core (?:\w+ ){0,2}(?:take|takes|took|taking) over"
         r"|the core (claims|serves|owns) (that|its|the|his|her|their) room",
         re.I)
     # A bound room whose worker cannot act. Rule 3 (work addressed to NOBODY) is a
@@ -280,8 +281,14 @@ class NoStandInPathIsDescribed(unittest.TestCase):
     # "like an unbound room". Pairing with TRIGGER is what separates them.
 
     def _lines(self):
-        return DOC.read_text(encoding="utf-8").splitlines()
+        """Sentences, not physical lines. Markdown wraps at ~90 chars, so a trigger and
+        its stand-in routinely land on different lines of one sentence and never pair."""
+        text = DOC.read_text(encoding="utf-8")
+        joined = re.sub(r"\n(?![\s*\-|#])", " ", text)
+        return [u for block in joined.splitlines() for u in re.split(r"(?<=[.;])\s+", block)]
 
+    # A regex cannot tell an assertion from its denial: a sentence stating that no
+    # fallthrough exists matches the same tokens as one describing it.
     def test_no_bound_room_falls_to_the_core(self):
         bad = [(i + 1, l.strip()[:70]) for i, l in enumerate(self._lines())
                if self.STANDIN.search(l) and self.TRIGGER.search(l)]

@@ -76,8 +76,11 @@ older than `stand_in_after_s` while it holds no claimed task). A wedged target i
 the pin is unclaimable, so the task stays PENDING — it does not fall through to
 rule 3, and nothing else claims it.
 Without this, rules 1 and 2 suppress on liveness alone and a handler that keeps
-beating without ever claiming holds its pinned tasks unclaimed indefinitely —
-the precise state §3 rule 6 promises the core will take over.
+beating without ever claiming holds its pinned tasks unclaimed indefinitely, with
+nothing recording that it is doing so. Rule 6 does not rescue that state by taking
+the work — v1 has no stand-in — it NAMES it: the wedged verdict makes the pin
+unclaimable, so the task is visibly pending and clears when the worker returns or
+an owner re-binds, instead of sitting claimed-by-nobody and unreported.
 
 Eligibility is **one value, computed once**: the core evaluates it in its sweep
 (it is the only instance that can see a room's oldest unclaimed task) and publishes
@@ -436,10 +439,12 @@ latency instead of stranding the task, in step 2 and step 3 alike.
 "Only tasks addressed to me" is not enumerable: `requested_worker` and the room id
 live INSIDE flat task files, the pin is mutable, and suppression leaves no receipt —
 so after a repin, no event tells the new target that an existing file now addresses
-it. It can learn that only by looking. The same argument binds the CORE harder: a
-dead worker emits no further beat, so the core's tick must consider tasks addressed
-ELSEWHERE and apply the stale-target fallthrough, which is by definition not
-"addressed to me".
+it. It can learn that only by looking. The same argument binds the CORE harder, and for a
+different reason than an earlier revision gave: a dead worker emits no further beat, so
+the core's tick must consider tasks addressed ELSEWHERE — not to claim them, but because
+rule 6's verdict is defined over exactly those tasks (the oldest unclaimed task addressed
+to that instance). The core scans other instances' work to WRITE the eligibility verdict;
+it never takes it. No fallthrough to the core exists for a bound room.
 
 ### The reconciliation ticker
 
