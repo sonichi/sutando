@@ -6839,7 +6839,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing = [], []
+    unconsumed, trailing, unpublished = [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
@@ -6875,8 +6875,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             if fired is None:
                 missed.append((j["name"], j["minutes_since_due"]))
             else:
-                unconsumed.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed:
+                # A completion record means the consumer DID run; blaming it would
+                # send the reader to the wrong layer. Separate bucket, separate cause.
+                bucket = unpublished if j.get("completion_today") else unconsumed
+                bucket.append((j["name"], fired, j["minutes_since_due"]))
+    if not late and not missed and not drifted and not unconsumed and not unpublished:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6908,6 +6911,10 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
+    for n, fired, m in unpublished:
+        bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} and COMPLETED "
+                    f"(a task-cron result exists) but published no artifact {m} min past "
+                    f"due — the producer, not the consumer, and not the cron")
     for n, fired, m in unconsumed:
         bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
                     f"no output {m} min past due — the schedule fired and the task was "
@@ -7094,8 +7101,12 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = bool(arts) and launchd
         # Last resort, and the only lane needing no per-job config: a job that
         # publishes nothing dated still leaves a task-cron result when it finishes.
+        # Computed ALWAYS, not only as the no-artifact fallback below. A job that
+        # published artifacts and then lost its producer keeps its history, so the
+        # fallback never runs and its real completion record stays invisible.
+        completions = _daily_task_record_minutes(ws / "results", jname)
         if not arts:
-            arts = _daily_task_record_minutes(ws / "results", jname)
+            arts = completions
             used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
@@ -7112,6 +7123,9 @@ def check_daily_cron_punctuality() -> dict:
             "newest_artifact": newest, "artifact_age_days": age_days,
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            # Consumption is a DIFFERENT fact from publication: a task can finish
+            # correctly and publish nothing (producer removed, [no-send] by design).
+            "completion_today": any(d == now.strftime("%Y-%m-%d") for d, _ in completions),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # Dispatch is the schedule's own evidence: it is what "on time"
             # means, and it is what an output mtime cannot report.
