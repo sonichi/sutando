@@ -73,7 +73,8 @@ being addressed selects a *candidate*, it does not confer ownership.
 its beat is fresh *and* the core's sweep has not declared it wedged under §3 rule 6
 (the oldest unclaimed task addressed to it — by any route, not the pin alone —
 older than `stand_in_after_s` while it holds no claimed task). A wedged target is treated exactly as a stale one:
-the pin is unclaimable, so it falls through to rule 3 and the core stands in.
+the pin is unclaimable, so the task stays PENDING — it does not fall through to
+rule 3, and nothing else claims it.
 Without this, rules 1 and 2 suppress on liveness alone and a handler that keeps
 beating without ever claiming holds its pinned tasks unclaimed indefinitely —
 the precise state §3 rule 6 promises the core will take over.
@@ -589,8 +590,8 @@ claiming, which is the case that hurts.
 
 1. `requested_worker` names this instance: claim, then emit to this session.
    Names another instance whose beat is fresh: **suppress**.
-   Names an instance whose beat is stale: the core claims and emits (stand-in),
-   workers suppress.
+   Names an instance whose beat is stale: the task stays PENDING — no instance,
+   the core included, claims it.
 2. No field, and the room addresses this worker — it is **pinned** to it, or
    this is a **dedicated** worker's own room: claim, then emit. Pinned to a set whose
    `instances[0]` is this worker: the same — claim, then emit. Pinned to a set this worker
@@ -598,8 +599,9 @@ claiming, which is the case that hurts.
    FRESH instance that is not this one: **suppress**
    — the core included. A pin is addressing, so the core is a non-target here
    exactly as a worker is, and rule 3 must not be reached. Pinned to an instance
-   whose beat is stale: the pin is unclaimable, so it falls through to rule 3 and
-   the core stands in.
+   whose beat is stale: the pin is unclaimable, so the task stays PENDING. It does
+   NOT fall through to rule 3 — rule 3 is for work addressed to nobody, and this
+   work is addressed.
 3. The task is addressed to no live instance: the core emits and workers suppress.
 
 **Suppress means: take no claim, emit nothing, queue nothing, and leave the task
@@ -805,44 +807,42 @@ rooms must be kept off the same worker:
 
   | event | what v1 does |
   |---|---|
-  | a worker's beat goes stale past `stand_in_after_s` | the core **revokes the worker's admission, waits out the bound below, and only then stands in** for its rooms, kickstarting the plist |
+  | a worker's beat goes stale past `stand_in_after_s` | **nothing claims for those rooms.** The core kickstarts the plist; the work stays pending until the worker returns or an owner re-binds |
   | the worker comes back | it re-reads the binding, finds itself still `instances[0]`, and resumes. Nothing was reassigned, so nothing has to be revoked |
-  | the owner wants a different worker on that room | an explicit re-bind command, applied over the **same revocation boundary**. Responsive is not quiescent: an answer says the worker was alive when it answered, not that it will not claim next tick |
+  | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** (`launchctl bootout` on its plist) before the new binding is written. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
 
-  **The two rows above used to claim they needed no fencing at all, and that was wrong on this
-  document's own evidence.** The stale row read "the core is a single arbiter, so there is never a
-  second live claimant"; the rebind row said a responsive worker can simply be told to stop. Both
-  are check-then-act. A worker samples its eligibility, passes, and claims task X while the core —
-  having just crossed `stand_in_after_s` — claims task Y for the same room. The per-task claims do
-  not contend, and the measurement is already in this section, four paragraphs up: *different task
-  keys, same room -> 0, 0* (both won). The argument used there to reject the group-lease
-  alternative applies unchanged to the core, and an earlier revision exempted the core from it.
-  Responsiveness fails the same way: the empty answer describes the instant it was written, and
-  nothing in it forbids the next claim.
+  **The two rows above once claimed they needed no fencing, then tried to buy one with a timer.
+  Both were wrong, and the second is the more instructive.** The stale row said the core is a single
+  arbiter so a second live claimant cannot arise; the rebind row said a responsive worker can simply
+  be told to stop. Both are check-then-act, and this section's own measurement four paragraphs up
+  says so: *different task keys, same room -> 0, 0* (both won). A worker samples its eligibility,
+  passes, and claims task X while the core — having just crossed `stand_in_after_s` — claims task Y
+  for the same room. The per-task claims never contend.
 
-  **The revocation boundary.** One durable record, one writer, a bounded wait instead of an
-  acknowledgement — because a dead worker cannot acknowledge:
+  The first repair was a durable admission record plus a wait: mark the worker revoked, wait one
+  beat interval plus one claim window, then stand in. **A wall-clock interval is not a fence.** A
+  worker reads its admission, is suspended past any interval you name (scheduling delay, I/O stall,
+  a stopped process resuming), and claims afterwards. Calling an interval a bound does not make it
+  one; the only thing that would is a generation or token the *claim path itself* validates at the
+  ownership boundary — which is precisely the group-admission machinery this section exists to say
+  v1 does not have.
 
-  - **state** — `admission` under the same `state/pool-status.json` record, per instance, values
-    `admitted` | `revoked`, carried by the existing `version` field.
-  - **writer** — the core, and only the core, over the same single-writer atomic path the table
-    above specifies. A worker never writes it, so the record is never contended.
-  - **reader** — every worker, immediately before each claim. `revoked`, absent, or unreadable all
-    mean *do not claim*; a worker that cannot read its own admission has lost the right to act on
-    the room, which is the fail-closed direction.
-  - **ordering** — write `revoked`, then wait one full beat interval plus one claim window, then
-    stand in. The wait is what bounds an in-flight check-then-act: any read that already passed
-    must reach its claim inside that window or not at all, so after it no admitted claimant exists.
-    This is a bound, not a lease — nothing is renewed and nothing expires.
+  **So v1 does not stand in at all.** There is no second claimant to fence because there is never a
+  second claimant: an ineligible worker's rooms simply stop admitting new work. This is the move the
+  section already makes for worker-to-worker failover one level up — *the unsafe operation was
+  removed rather than guarded* — finally applied to the core, which two earlier revisions kept
+  exempting from their own argument.
 
-  **What it costs, stated plainly:** the room is unserved for that bounded interval on every
-  stand-in and every re-bind. v1 takes serial unavailability over a second live claimant, the same
-  trade this section already makes one level up.
+  **What it costs, stated plainly, and it is larger than the previous revision claimed:** a dead
+  worker's rooms stay unserved until that worker returns or a human re-binds. Not for a bounded
+  interval — until someone acts. Work already claimed is still reclaimed behind the done flag, so
+  nothing in flight is lost; what is given up is throughput, not correctness. A design that cannot
+  say which of the two it is trading has not made the trade.
 
   So `instances[1:]` is an **owner-facing preference list**, read by a human deciding whom to
-  re-bind to. It is not a runtime path and nothing consults it automatically. No generation, lease
-  or drain protocol is required — but a revocation boundary is, and the earlier claim that nothing
-  at all was needed did not survive this document's own measurement.
+  re-bind to. It is not a runtime path and nothing consults it automatically. No generation, lease,
+  drain protocol or admission record is required — because after this revision there is no
+  operation left for one to guard.
 
   What this costs, stated plainly: a dead worker's rooms are served by the core rather than by a
   standby worker, so they lose worker-level parallelism until an owner re-binds or the worker
@@ -978,14 +978,20 @@ not justify a timer of their own, so no `proactive-loop-pool` skill ships.
 4. **Reclaim:** the core, in its sweep, reclaims a task claimed by a worker
    whose beat is stale and one claimed with no result evidence, behind the
    done-flag. Workers reclaim nothing.
-5. **Stand-in:** while a pinned worker is ineligible — beat stale, or wedged
-   under rule 6 — the core claims that room's tasks itself, and stops when the
-   worker is eligible again. A fresh beat alone does not end a stand-in; rule 6
-   is what says whether beating counts. The pin is not changed; nothing is
-   loaned or re-bound.
+5. **No stand-in:** while a pinned worker is ineligible — beat stale, or wedged
+   under rule 6 — new work for its rooms stays PENDING. The core does not claim
+   it, and neither does any other worker. Work the ineligible worker had ALREADY
+   CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost;
+   what is refused is ADMITTING NEW work on its behalf. A fresh beat alone does
+   not restore eligibility; rule 6 is what says whether beating counts. The pin is
+   not changed; nothing is loaned or re-bound.
+
+   The room is therefore unserved until the worker returns or the owner
+   explicitly redirects or cancels the work. That availability gap is deliberate:
+   there is no second claimant to fence because there is never a second claimant.
 6. **Busy is not hung.** A worker with a fresh beat and a claimed, unfinished
-   task is busy, and the core leaves its rooms alone. The core stands in for a
-   fresh-beat worker only when the oldest unclaimed task ADDRESSED TO IT is
+   task is busy, and the core leaves its rooms alone. A fresh-beat worker becomes
+   INELIGIBLE only when the oldest unclaimed task ADDRESSED TO IT is
    older than `stand_in_after_s` (default 300) **and** the worker holds no
    claimed task, plus one sweep of grace after its last finish. "Addressed to
    it" is every route in the routing rule, not the pin alone: a
@@ -1005,10 +1011,10 @@ process whose absence stops work, which is already true of every install today.
 | phase | owner | trigger | state left on disk / user-visible effect |
 |---|---|---|---|
 | create | core | owner command (`spawn N`) | one plist per worker, the config dir and model captured in it |
-| start / stop one worker | launchd, revived by the core | `launchctl kickstart` (launchd defers non-demand spawns, so KeepAlive and timers do not bring a worker back) | on SIGTERM the worker unlinks its `.alive`, so the core stands in at once |
+| start / stop one worker | launchd, revived by the core | `launchctl kickstart` (launchd defers non-demand spawns, so KeepAlive and timers do not bring a worker back) | on SIGTERM the worker unlinks its `.alive`, so its rooms go unserved at once |
 | shutdown of the pool | core | owner command (`resize to 0`) | workers stop; their claimed-but-unfinished tasks are reclaimed by the core, never dropped |
 | resume after host sleep | core | beats return | a host sleep is not N dead workers; the core waits for beats before reclaiming (#3782) |
-| death of a worker | core | beat stale past the window | the core stands in for its rooms and kickstarts the plist; nothing is lost silently |
+| death of a worker | core | beat stale past the window | the core kickstarts the plist; its rooms stay pending until it returns or an owner re-binds. Claimed-but-unfinished work is reclaimed behind the done flag, so nothing in flight is lost |
 
 ## Order of claiming
 
@@ -1037,8 +1043,8 @@ worker that stopped, carried from #3604's operations section:
 |---|---|---|
 | auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
 | timeouts, 5xx | transport | back off and retry; do not touch the session |
-| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the core stands in for the room; the kick script un-wedges an idle prompt |
-| beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets and the core stands in. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and the stand-in never fires. Measured live: four seats beating normally at zero throughput |
+| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the room stops admitting new work; the kick script un-wedges an idle prompt so the worker itself resumes |
+| beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets, and its rooms stay pending meanwhile. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and never becomes visible as stuck. Measured live: four seats beating normally at zero throughput |
 | beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
 

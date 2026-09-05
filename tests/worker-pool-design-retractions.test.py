@@ -249,5 +249,39 @@ class EveryPinCanFire(unittest.TestCase):
                     "pin cannot detect its own phrase -- it certifies nothing")
 
 
+class NoStandInPathIsDescribed(unittest.TestCase):
+    """v1 removed the core stand-in, so NO path may admit new work for an
+    ineligible worker. This is not a phrase pin: it asserts the absence of a
+    described BEHAVIOUR across the whole document, and it fails if any future
+    revision reintroduces one under any wording that pairs an ineligibility
+    trigger with the core claiming.
+
+    The reviewer's own point stands — the interleaving property belongs to the
+    implementation PR. What a design doc can assert is that the unsafe operation
+    is not described anywhere, which is exactly what (b) claims.
+    """
+
+    TRIGGER = re.compile(r"stale|wedged|ineligible|quota spent|hung session", re.I)
+    STANDIN = re.compile(r"core stands in|stands? in for (its|the) rooms?|"
+                         r"the core claims (that|its|the) room", re.I)
+
+    def _lines(self):
+        return DOC.read_text(encoding="utf-8").splitlines()
+
+    def test_no_line_pairs_ineligibility_with_the_core_claiming(self):
+        bad = [(i + 1, l) for i, l in enumerate(self._lines())
+               if self.STANDIN.search(l)]
+        self.assertEqual(
+            bad, [],
+            "a stand-in path is described at %s" % [n for n, _ in bad])
+
+    def test_the_check_fires_on_an_injected_stand_in(self):
+        """A checker never observed failing is not a validated checker."""
+        injected = "| a worker's beat goes stale | the core stands in for its rooms |"
+        self.assertTrue(self.STANDIN.search(injected),
+                        "the pattern cannot detect a stand-in it is meant to forbid")
+        self.assertTrue(self.TRIGGER.search(injected))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
