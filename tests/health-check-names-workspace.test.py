@@ -10,7 +10,7 @@ import io
 import json
 import os
 import sys
-import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -93,16 +93,11 @@ class RevertedSourceControl(unittest.TestCase):
     """
 
     def _import_mutant(self, source):
-        # Written beside the original so `Path(__file__).parent.parent` still
-        # resolves to the repo and the sibling imports keep working.
-        fd, path = tempfile.mkstemp(prefix=".hc-mutant-", suffix=".py",
-                                    dir=os.path.join(ROOT, "src"))
-        self.addCleanup(os.unlink, path)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(source)
-        spec = importlib.util.spec_from_file_location("health_check_mutant", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        # No file on disk: a temp module under src/ is traced by coverage and then
+        # deleted, and the run fails with "No source for code" after the tests pass.
+        mod = types.ModuleType("health_check_mutant")
+        mod.__file__ = SRC
+        exec(compile(source, "<hc-mutant>", "exec"), mod.__dict__)
         return mod
 
     def _source(self):
