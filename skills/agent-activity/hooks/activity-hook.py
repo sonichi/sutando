@@ -2,9 +2,11 @@
 """Claude Code hook: turns this session's tool calls and turn-end narration into activity rows.
 
 Reads the hook payload on stdin ({hook_event_name, session_id, transcript_path, tool_name, tool_input}).
-- PreToolUse on a Bash call that runs `activity.py append --kind processing` for a task BINDS that
-  task to this session (state/agent-activity.sessions.json); every later PreToolUse in this session
-  becomes a `working` row for the task bound to it (Read/Glob/Grep/TodoWrite skipped).
+- PreToolUse whose input names a task file (tasks/task-….txt) BINDS that task to this session
+  (state/agent-activity.sessions.json) and writes its `processing` row from the task's own headers;
+  every later PreToolUse in this session becomes a `working` row for the task bound to it
+  (Read/Glob/Grep/TodoWrite skipped). A PreToolUse that writes results/task-….txt writes `done`.
+  The agent's own `activity.py append --kind processing` still binds (and is never a row).
 - Stop reads the last assistant text of THIS session's transcript (complete lines only) -> `thinking`.
 No bound open task -> nothing is written: a row is never attached to a task another session owns.
 Always exits 0; a hook that fails must not block the tool it observed.
@@ -109,6 +111,39 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
     os.replace(tmp, p["bind"])
 
 
+TASK_FILE = re.compile(r"tasks/(task-[0-9a-f]{6,})\.txt\b")  # tasks/archive/… has no direct match
+RESULT_FILE = re.compile(r"results/(task-[0-9a-f]{6,})\.txt\b")
+
+
+def task_file_refs(text: str) -> list[str]:
+    """Task ids of task files a tool input names (tasks/<id>.txt, not results/ or archive paths)."""
+    return list(dict.fromkeys(TASK_FILE.findall(text)))
+
+
+def result_file_refs(text: str) -> list[str]:
+    return list(dict.fromkeys(RESULT_FILE.findall(text)))
+
+
+def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:
+    """({id, from, text}, room) from the task file, or None when it is not readable."""
+    for d in ("tasks", os.path.join("tasks", "archive")):
+        p = ws / d / f"{task_id}.txt"
+        if not p.exists():
+            continue
+        fields: dict = {}
+        for l in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            k, _, v = l.partition(":")
+            if k in ("user_id", "task", "channel_id") and k not in fields:
+                fields[k] = v.strip()
+        task = {"id": task_id}
+        if fields.get("user_id"):
+            task["from"] = fields["user_id"]
+        if fields.get("task"):
+            task["text"] = fields["task"][:160]
+        return task, fields.get("channel_id") or None
+    return None
+
+
 def working_line(tool_name: str, tool_input) -> str | None:
     if tool_name in SKIP_TOOLS or not isinstance(tool_input, dict):
         return None
@@ -146,7 +181,10 @@ def last_narration(transcript: Path) -> str | None:
 
 
 def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run) -> None:
-    cmd = [sys.executable, str(WRITER), "append", line, "--kind", kind, "--task-id", task["id"], "--workspace", str(ws)]
+    if kind == "done":
+        cmd = [sys.executable, str(WRITER), "done", line, "--task-id", task["id"], "--workspace", str(ws)]
+    else:
+        cmd = [sys.executable, str(WRITER), "append", line, "--kind", kind, "--task-id", task["id"], "--workspace", str(ws)]
     if isinstance(task.get("from"), str):
         cmd += ["--from", task["from"]]
     if isinstance(task.get("text"), str):
@@ -173,6 +211,29 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
                 return out  # the processing row itself is the agent's; no working row for writing it
             if "activity.py" in cmd:
                 return out
+        blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
+        binds = load_json(p["bind"], {})
+        # First touch of a task file by this session: bind it and write its processing row from the
+        # task's own headers — the agent never has to remember to.
+        for tid in task_file_refs(blob):
+            if tid in binds:
+                continue
+            found = task_header(p["ws"], tid)
+            if not found:
+                continue
+            task, room = found
+            bind(p, tid, sid)
+            emit("processing", "picked up", task, room, p["ws"], run)
+            out.append(("processing", "picked up"))
+        # Writing the result file closes the task, whichever session claimed it (a result is a reply).
+        opened = open_tasks(p["log"])
+        for tid in result_file_refs(blob):
+            if tid in opened and binds.get(tid) == sid:
+                task, room = opened[tid]["task"], opened[tid]["room"]
+                emit("done", "replied", task, room, p["ws"], run)
+                out.append(("done", "replied"))
+        if out:
+            return out
         line = working_line(tool, inp) if isinstance(tool, str) else None
         if line:
             task, room = bound_task(p, sid)

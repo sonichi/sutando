@@ -36,8 +36,8 @@ python3 $S/activity.py done "the drawer is one rolling line" --task-id task-…
 Prefer `--task-file <workspace>/tasks/task-….txt`: it fills the task id, `from`, `text` and the room
 from the task's own headers, so a row is always tagged with the room the message came from. Without
 it, `--room` defaults to the room of the owner's latest AG2 Space message (`state/last-owner-activity.json`).
-Write the `processing` row the moment a message is picked up and the `done` row when its result
-is written; a message with neither never appears in the drawer.
+With the hook installed, `processing` and `done` are written for you (see below); hand-written rows
+are for anything extra the owner asks to see.
 
 ## Working and Thinking rows, automatically (hooks)
 
@@ -45,9 +45,12 @@ The skill declares two Claude Code hooks in `manifest.json` (`./hooks/activity-h
 `PreToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
 skill hook. The hook never depends on the agent remembering anything:
 
-- **Binding.** When a `PreToolUse` sees the agent run `activity.py append … --kind processing
-  --task-file …` (or `--task-id …`), it binds that task to the hook's own `session_id` in
-  `state/agent-activity.sessions.json`. That is the only way a task gets a session.
+- **Processing, automatically.** The first `PreToolUse` in a session whose input names a task file
+  (`tasks/task-….txt`, a Read or a shell command) binds that task to the hook's own `session_id` in
+  `state/agent-activity.sessions.json` and writes its `processing` row from the task's headers (room,
+  sender, text). The agent's own `activity.py append --kind processing` still binds, for hand-written rows.
+- **Done, automatically.** A `PreToolUse` that writes `results/task-….txt` (Write, or a shell redirect)
+  writes the task's `done` row, only from the session the task is bound to.
 - **Working.** Every later `PreToolUse` in that session (Read/Glob/Grep/TodoWrite skipped) becomes a
   `working` row for the open task bound to it: the description's first sentence, 100 characters.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
@@ -57,5 +60,5 @@ skill hook. The hook never depends on the agent remembering anything:
 - The hook exits 0 on every path; it must not block the tool it observed.
 
 The private thinking blocks in the transcript hold a signature and no text; narration is the
-nearest available signal. The agent still writes `processing` (on pick-up), `done` (on reply) and
-any `thinking`/`notice` it wants to add by hand; those are the personalisation surface.
+nearest available signal. The agent writes nothing it can forget: `processing` and `done` come from the hook. Hand-written
+`thinking`/`notice` rows remain the personalisation surface.

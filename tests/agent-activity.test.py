@@ -203,6 +203,34 @@ class Hook(unittest.TestCase):
         (self.ws / "fence.jsonl").write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "```\ncode\n```"}]}}) + "\nnot json\n")
         self.assertIsNone(hook.last_narration(self.ws / "fence.jsonl"))
 
+    def test_first_touch_of_a_task_file_binds_and_writes_processing_from_its_headers(self):
+        (self.ws / "tasks" / "task-abc123.txt").write_text(
+            "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
+        out = hook.handle(self.pre("S1", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run)
+        self.assertEqual(out, [("processing", "picked up")])
+        cmd = self.runs[-1]
+        self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--from") + 1]), ("append", "task-abc123", "!team:s", "@q:s"))
+        self.assertEqual(cmd[cmd.index("--text") + 1], "Read the latest discussion in this room.")
+        self.assertEqual(hook.load_json(self.p["bind"], {}), {"task-abc123": "S1"})
+        # a second touch (grep of the same file) neither rebinds nor repeats the row
+        self.assertEqual(hook.handle(self.pre("S1", "Bash", {"command": "grep task tasks/task-abc123.txt", "description": "Read it again"}), self.p, self.run), [])
+        # an archived task or a results path is not a task-file touch
+        self.assertEqual(hook.task_file_refs("cat tasks/archive/task-abc123.txt results/task-abc123.txt"), [])
+        self.assertEqual(hook.task_file_refs("cat tasks/task-abc999.txt tasks/task-abc999.txt"), ["task-abc999"])
+        # a task file that does not exist binds nothing
+        self.assertEqual(hook.handle(self.pre("S1", "Read", {"file_path": "tasks/task-000000.txt"}), self.p, self.run), [])
+
+    def test_writing_the_result_file_closes_the_task_for_its_own_session_only(self):
+        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "task-abc123", "from": "@q:s", "text": "x"}, "line": "picked up"})
+        hook.bind(self.p, "task-abc123", "S1")
+        # another session writing the same result path closes nothing
+        self.assertEqual(hook.handle(self.pre("S-other", "Write", {"file_path": str(self.ws / "results" / "task-abc123.txt"), "content": "reply"}), self.p, self.run), [])
+        out = hook.handle(self.pre("S1", "Bash", {"command": "cat > \"$WS/results/task-abc123.txt\" << EOF", "description": "Reply"}), self.p, self.run)
+        self.assertEqual(out, [("done", "replied")])
+        cmd = self.runs[-1]
+        self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1]), ("done", "task-abc123", "!dm:s"))
+        self.assertEqual(hook.result_file_refs("results/task-abc123.txt and results/task-abc123.txt"), ["task-abc123"])
+
     def test_payload_without_session_or_with_unknown_event_writes_nothing(self):
         self.assertEqual(hook.handle({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"description": "x"}}, self.p, self.run), [])
         self.assertEqual(hook.handle({"hook_event_name": "Notification", "session_id": "S1"}, self.p, self.run), [])
