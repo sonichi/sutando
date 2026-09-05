@@ -249,7 +249,6 @@ class TestHeartbeatWrite(unittest.TestCase):
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "exported-tmux"), "PATH": str(self.tmp)}):
             b3 = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
         self.assertEqual((b3["tmux_binary"], b3["tmux_version"], b3["tmux_server_version"], b3["tmux_verified"]), (None, None, None, False))
-        core_heartbeat._tmux_backend(refresh=True)  # back to this host's real answer
 
     def test_tmux_backend_verifies_the_observed_session_not_the_env_claim(self):
         # The verifier must use the OBSERVED session write_beat records, not the env's claim:
@@ -263,33 +262,30 @@ class TestHeartbeatWrite(unittest.TestCase):
         core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
         try:
             with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "lie", "SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
-                core_heartbeat._TMUX_BACKEND = None
                 core_heartbeat.write_beat()
         finally:
             core_heartbeat._observed_session, core_heartbeat.core_pid = _obs, _pid
-            core_heartbeat._tmux_backend(refresh=True)
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         self.assertEqual((data["session"], data["tmux_verified"], data["tmux_binary"], data["tmux_server_version"]), ("real", True, str(f), "3.6b"))
 
-    def test_tmux_backend_never_memoizes_a_failure(self):
-        # yixuan on e95ed74: a cold-boot miss must not become permanent nulls.
+    def test_tmux_backend_is_reverified_every_beat_so_a_replaced_server_is_seen(self):
+        # yixuan: a memoized failure made a cold-boot miss permanent. Codex: a memoized success
+        # survived a server replacement. Neither is cached now — every call asks the live server.
         import core_heartbeat
         f = self.tmp / "tmux"
-        gate = self.tmp / "server-up"
-        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *display-message*) [ -e '%s' ] && echo '3.6b' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % gate)
+        ver = self.tmp / "server-version"
+        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo \"tmux $(cat '%s' 2>/dev/null || echo none)\";;\n  *display-message*) [ -s '%s' ] && cat '%s' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % (ver, ver, ver))
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
-            core_heartbeat._TMUX_BACKEND = None
-            first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")   # server not up yet
+            first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")        # cold boot: no server yet
             self.assertFalse(first["tmux_verified"])
-            self.assertIsNone(core_heartbeat._TMUX_BACKEND)                 # nothing cached
-            gate.write_text("up")
-            second = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")  # same call, no refresh
-            self.assertTrue(second["tmux_verified"])
-            self.assertEqual(second["tmux_server_version"], "3.6b")
-            third = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")   # success IS memoized
-            self.assertIs(third, second)
-        core_heartbeat._tmux_backend(refresh=True)
+            ver.write_text("3.5a")
+            second = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")       # server up → heals, no refresh needed
+            self.assertEqual((second["tmux_verified"], second["tmux_server_version"]), (True, "3.5a"))
+            ver.write_text("3.6b")                                                # server replaced between beats
+            third = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+            self.assertEqual(third["tmux_server_version"], "3.6b")
+            self.assertIsNot(third, second)
 
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —

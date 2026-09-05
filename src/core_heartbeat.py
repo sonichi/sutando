@@ -115,9 +115,6 @@ def _socket_path() -> str:
     return os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
 
 
-_TMUX_BACKEND: dict | None = None
-
-
 def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | None = None) -> dict:
     """Which tmux can talk to THIS core's server, verified, plus the server's own
     version. A socket path alone is not a connection descriptor: a client of
@@ -126,12 +123,13 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
     launchers run) and SUTANDO_TMUX_BIN (what the app exports); the first that
     can `display-message` the recorded socket+session is recorded as
     `tmux_binary` with its `-V` as `tmux_version`, and the server answers
-    `tmux_server_version` itself. Nothing speaks → nulls, never a guess — and a
-    failure is never memoized, so a cold-boot miss heals on the next beat.
-    Verified against the OBSERVED session (the recorded one), not the env's claim."""
-    global _TMUX_BACKEND
-    if _TMUX_BACKEND is not None and not refresh:
-        return _TMUX_BACKEND
+    `tmux_server_version` itself. Nothing speaks → nulls, never a guess.
+    Re-verified on EVERY beat (one bounded display-message, ~ms): a memo would
+    survive a server replacement between beats and advertise a dead
+    compatibility fact — the exact upgrade/restart case these fields diagnose.
+    Verified against the OBSERVED session (the recorded one), not the env's claim.
+    `refresh` is accepted for callers that used it; there is nothing to refresh."""
+    del refresh
     sock = sock or _socket_path()
     sess = sess or _observed_session(sock)
     seen: list[str] = []
@@ -159,12 +157,9 @@ def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | No
                 version = out.split()[-1] if out.lower().startswith("tmux") else out
         except Exception:
             version = None
-    result = {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
-              "tmux_server_version": server_version, "tmux_verified": chosen is not None,
-              "tmux_candidates": seen}
-    # Only a verified answer is worth keeping; an unverified one is re-probed next beat.
-    _TMUX_BACKEND = result if chosen else None
-    return result
+    return {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
+            "tmux_server_version": server_version, "tmux_verified": chosen is not None,
+            "tmux_candidates": seen}
 
 
 def core_session() -> str:
