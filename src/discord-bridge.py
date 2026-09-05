@@ -163,7 +163,7 @@ from policy.egress.result import guard_result_for_tier, resolve_access_tier as _
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, readable_attachments, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3753,7 +3753,9 @@ async def _handle_discord_message(message, force=False):
                 # dropped — only the reply's own (often empty) attachment
                 # set was scanned above. Same save + sanitized-basename +
                 # image-vision pattern as the primary loop.
-                for att in getattr(ref_msg, "attachments", []):
+                # A forwarded parent keeps its files in message_snapshots, so
+                # a plain ref_msg.attachments read is empty for exactly that shape.
+                for att in readable_attachments(ref_msg):
                     p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                     try:
                         await att.save(p_path)

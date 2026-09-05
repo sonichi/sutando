@@ -66,6 +66,53 @@ def format_reply_chain_ids(ids: Sequence) -> str:
     return "reply_chain_ids: " + ",".join(reversed(clean)) + "\n"
 
 
+def forwarded_payload(msg):
+    """The forwarded message a Discord message carries, or ``None``.
+
+    A forward's body and attachments live in ``message_snapshots[0].message``,
+    never on the message itself, so reading the message directly sees an empty one.
+    """
+    snaps = getattr(msg, "message_snapshots", None) or []
+    if not snaps:
+        return None
+    first = snaps[0]
+    return getattr(first, "message", first)
+
+
+def readable_content(msg) -> str:
+    """``msg``'s body, including the forwarded payload it carries.
+
+    A forwarded PARENT rendered as an empty reply-context block: the bridge read
+    ``ref_msg.content``, which a forward leaves empty. Labelled rather than
+    inlined — attributing a quoted message to the forwarder is its own misreading.
+    """
+    own = (getattr(msg, "content", "") or "").strip()
+    snap = forwarded_payload(msg)
+    if snap is None:
+        return own
+    fwd = (getattr(snap, "content", "") or "").strip()
+    names = [f"<attachment: {getattr(a, 'filename', None) or '?'}>"
+             for a in (getattr(snap, "attachments", None) or [])]
+    inner = " ".join(x for x in (fwd, *names) if x)
+    if not inner:
+        return own
+    return f"{own} [forwarded] {inner}".strip()
+
+
+def readable_attachments(msg) -> list:
+    """``msg``'s attachments, including those inside a forwarded payload.
+
+    The parent-attachment download read ``ref_msg.attachments`` only, which is
+    empty for a forward — so a forwarded file acted on via an @-mention reply
+    reached no disk path at all.
+    """
+    atts = list(getattr(msg, "attachments", None) or [])
+    snap = forwarded_payload(msg)
+    if snap is not None:
+        atts.extend(getattr(snap, "attachments", None) or [])
+    return atts
+
+
 def should_fetch_reply_context(has_reference: bool, has_message_id: bool,
                                is_forward: bool) -> bool:
     """Whether the bridge should fetch the referenced message for reply context.
@@ -229,7 +276,7 @@ async def walk_reply_chain(
     while cur is not None and depth < max_ids_depth:
         cid = getattr(cur, "id", None)
         if depth < max_content_depth:
-            content = (getattr(cur, "content", "") or "").strip()
+            content = readable_content(cur)
             if strip_mention:
                 content = content.replace(strip_mention, "")
             created = getattr(cur, "created_at", None)
