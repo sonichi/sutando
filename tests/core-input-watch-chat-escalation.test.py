@@ -239,6 +239,17 @@ class TestDrive(unittest.TestCase):
         self.assertEqual(r.kind, "permission")
         self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
 
+    def test_a_numbered_trust_dialog_through_classify_gets_no_button(self):
+        """End to end through the monitor's own classifier: this pane is labelled
+        `selection` (caret row nearest the bottom) and must still not offer Yes."""
+        TRUST = ("  Do you trust the files in this folder?\n  ❯ 1. Yes, proceed\n"
+                 "    2. No, exit\n  Enter to confirm · Esc to cancel")
+        state, detail, prompt, kind = M.compose_state(TRUST, "working", True)
+        self.assertEqual(kind, "selection", "fixture no longer reproduces the label collision")
+        r = M.escalate(_mgr(), state, detail, kind, prompt, "s")
+        self.assertEqual(r.kind, "core-blocked")
+        self.assertEqual([a.label for a in r.actions], ["Open terminal"])
+
     def test_a_permission_gate_carries_no_yes_buttons_not_ack(self):
         r = self._blocked(_mgr())
         self.assertEqual(r.kind, "permission")

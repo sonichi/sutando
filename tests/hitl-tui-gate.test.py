@@ -176,6 +176,16 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
             self.assertEqual([a.id for a in r.actions], ["open_terminal"], gate)
             self.assertIsNone(G.keys_for(clicked(r, "opt1"), prompt, "blocked-human"), gate)
 
+    def test_a_trust_dialog_labelled_selection_still_gets_no_button(self):
+        """The classifier picks the match nearest the bottom, so a numbered trust dialog is
+        labelled `selection`; the text, not the label, must keep the button off it."""
+        for gate in ("selection", "permission", "unknown"):
+            r = req(gate, TRUST)
+            self.assertEqual(r.kind, G.FALLBACK_KIND, gate)
+            self.assertEqual([a.id for a in r.actions], ["open_terminal"], gate)
+            r = req(gate, BYPASS)
+            self.assertEqual([a.id for a in r.actions], ["open_terminal"], gate)
+
     def test_the_allowlist_is_the_only_way_in(self):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
 

@@ -16,6 +16,10 @@ DID_NOT_TAKE_NOTE = "The answer did not take. Open the terminal to finish it."
 # Only these gates may carry a one-click button; trust, bypass and credit-spending
 # dialogs keep the blocked card however their text is rendered.
 SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
+# The classifier names the gate nearest the bottom, so a trust or credit dialog rendered
+# as a numbered list arrives labelled `selection`; the TEXT still says what it is.
+_NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|Yes, I accept|"
+                              r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
@@ -100,7 +104,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if gate is not None and gate not in SEMANTIC_GATES and state != "logged-out":
+    if _NEVER_ONE_CLICK.search(prompt or "") or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"):
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
     elif gate == "login" or state == "logged-out":
         kind, title = "auth", "Claude needs to be reconnected"
