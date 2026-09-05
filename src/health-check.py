@@ -7101,9 +7101,8 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = bool(arts) and launchd
         # Last resort, and the only lane needing no per-job config: a job that
         # publishes nothing dated still leaves a task-cron result when it finishes.
-        # Computed ALWAYS, not only as the no-artifact fallback below. A job that
-        # published artifacts and then lost its producer keeps its history, so the
-        # fallback never runs and its real completion record stays invisible.
+        # Unconditional, not the no-artifact fallback below: a job that published
+        # artifacts then lost its producer keeps history, hiding its completion.
         completions = _daily_task_record_minutes(ws / "results", jname)
         if not arts:
             arts = completions
