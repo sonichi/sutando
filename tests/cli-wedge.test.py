@@ -277,11 +277,27 @@ class IoEdge(unittest.TestCase):
         entries = [e(3600.0 * i) for i in range(6)]
         v = w.classify_window(entries, (True, "1 queued task(s)"), 3600.0 * 5 + 10)
         self.assertEqual((v["kind"], v["warn"], v["observation_runs"], v["run_samples"]), ("cadence-too-sparse", False, 6, 1))
-        self.assertEqual(v["window_median_gap_s"], 3600.0)
+        self.assertEqual((v["window_median_gap_s"], v["recent_gap_s"]), (3600.0, 3600.0))
         self.assertIn("cannot be observed at this rate", v["reason"])
         # the same pane sampled inside the limit is a plain case-1 warning
         dense = [e(1800.0 * i) for i in range(6)]
         self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "static-with-work")
+
+    def test_a_cadence_change_is_judged_on_the_recent_gaps_not_the_window_median(self):
+        # Codex on 8ada45a: 15 half-hourly samples then 5 hourly ones kept the window median
+        # at 1800 s, so the verdict stayed "unknown" for half the window. Recent gaps decide.
+        e = lambda ts: {"ts": ts, "state": "a", "raw_state": "a", "patterns": []}
+        dense = [e(1800.0 * i) for i in range(15)]
+        t0 = dense[-1]["ts"]
+        sparse = [e(t0 + 3600.0 * i) for i in range(1, 6)]
+        v = w.classify_window(dense + sparse, (True, "x"), sparse[-1]["ts"] + 10)
+        self.assertEqual(v["kind"], "cadence-too-sparse")
+        self.assertEqual(v["window_median_gap_s"], 1800.0)   # the window still remembers the dense era…
+        self.assertEqual(v["recent_gap_s"], 3600.0)          # …but the decision reads the recent one
+        self.assertEqual(v["observation_runs"], 6)
+        # two hourly samples after the dense era are not yet a cadence (one gap is a gap)
+        v2 = w.classify_window(dense + sparse[:2], (True, "x"), sparse[1]["ts"] + 10)
+        self.assertEqual(v2["kind"], "unknown")
 
     def test_a_new_pane_identity_starts_a_new_run(self):
         e = lambda ts, pane: {"ts": ts, "state": "a", "raw_state": "a", "patterns": [], "pane": pane}

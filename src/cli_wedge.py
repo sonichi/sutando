@@ -407,12 +407,20 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     if now - run[-1]["ts"] > th["continuity_gap_s"]:
         v = classify_ids([], False, [], work[0], 0.0, work[1], th)
         return {**v, **meta, "reason": f"last sample {now - run[-1]['ts']:.0f}s ago — no current observation"}
-    # The caller's cadence decides whether a run ever reaches two samples. Sampled
-    # slower than the continuity limit, case 1 is unreachable: say so, do not say "nothing".
-    if len(run) < 2 and len(entries) >= 3 and meta.get("window_median_gap_s", 0) >= th["continuity_gap_s"]:
+    # The caller's cadence decides whether a run ever reaches two samples. Judge the
+    # RECENT cadence — the gaps behind the trailing singleton runs — not the whole
+    # window, or a 30-min→hourly change stays "unknown" until the old gaps age out.
+    singletons = 0
+    for r in reversed(runs):
+        if len(r) != 1:
+            break
+        singletons += 1
+    if len(run) < 2 and singletons >= 3:
+        recent = sorted(b[0]["ts"] - a[0]["ts"] for a, b in zip(runs[-singletons:], runs[-singletons + 1:]))
+        meta["recent_gap_s"] = round(recent[len(recent) // 2], 1)
         v = classify_ids([], False, [], work[0], 0.0, work[1], th)
         return {**v, **meta, "kind": "cadence-too-sparse",
-                "reason": f"samples arrive every ~{meta['window_median_gap_s']:.0f}s, past the {th['continuity_gap_s']}s continuity limit — a static pane cannot be observed at this rate"}
+                "reason": f"the last {singletons} samples arrived ~{meta['recent_gap_s']:.0f}s apart, past the {th['continuity_gap_s']}s continuity limit — a static pane cannot be observed at this rate"}
     gaps = [b["ts"] - a["ts"] for a, b in zip(run, run[1:])]
     ids = [e["state"] for e in run]
     raws = [e.get("raw_state") for e in run]
