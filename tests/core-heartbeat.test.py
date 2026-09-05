@@ -397,9 +397,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
     def test_recording_the_writer_pid_never_creates_the_cores_dir(self):
-        # A harness that stubs write_beat() must leave no state/cores behind: a later reader takes an
-        # EMPTY cores dir as "every core offline" (signal_room_tasks.core_is_alive), so the pid record
-        # waits for the first beat to bring the directory into existence.
+        # An EMPTY state/cores reads as "every core offline" to signal_room_tasks.core_is_alive, so a
+        # harness that stubs write_beat() must leave none behind: the record waits for the first beat.
         import core_heartbeat
         with tempfile.TemporaryDirectory() as d:
             cores = Path(d) / "state" / "cores"
@@ -421,7 +420,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script, "not-a-writer"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}   # no core → publishes nothing
-        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)  # a host that ran before; the record waits for the dir
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)
         old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()), "the writer did not record its pid")
@@ -592,9 +591,9 @@ class TestHeartbeatCli(unittest.TestCase):
         # An old writer (argv names this checkout's script) is still running; --stop must end it and
         # wait, then a fresh --once beat carries schema 4. No pkill pattern kills another checkout's.
         script = ROOT / "src" / "core_heartbeat.py"
-        # A REAL old writer (it records its own pid before its first beat), plus a bystander whose argv
-        # merely mentions the script path — the shape a pgrep sweep would have killed.
-        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)  # a host that ran before; the record waits for the dir
+        # A REAL old writer that records its pid, plus a bystander whose argv merely mentions the script
+        # path — the shape a pgrep sweep would have killed.
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)
         old = subprocess.Popen([sys.executable, str(script), "--interval", "60"],
                                env={**self.env, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")},
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
