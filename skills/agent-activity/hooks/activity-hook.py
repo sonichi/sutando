@@ -13,9 +13,11 @@ Always exits 0; a hook that fails must not block the tool it observed.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -28,7 +30,8 @@ WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # l
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
 TEXT_MAX = 240
-TASK_REF = re.compile(r"\btask-[0-9a-f]{6,}\b")
+TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w-]*"  # chat tasks in, bookkeeping out
+TASK_REF = re.compile(rf"\b{TASK_ID}\b")
 
 
 def paths(workspace: Path | None = None) -> dict:
@@ -71,7 +74,7 @@ def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     """The open task this session is bound to; None when none is (fail closed)."""
     binds = load_json(p["bind"], {})
     opened = open_tasks(p["log"])
-    for tid in reversed(list(opened)):  # newest open task first
+    for tid in opened:  # open_tasks() yields newest first; the newest open task wins
         if binds.get(tid) == session_id:
             return opened[tid]["task"], opened[tid]["room"]
     return None, None
@@ -103,16 +106,23 @@ def processing_task_id(command: str, ws: Path) -> str | None:
 
 
 def bind(p: dict, task_id: str, session_id: str) -> None:
-    binds = load_json(p["bind"], {})
-    binds[task_id] = session_id
+    """One writer at a time (flock on a sidecar), a per-process temp name, atomic replace; entries of
+    tasks that have a done row are pruned so the file does not grow forever."""
     p["bind"].parent.mkdir(parents=True, exist_ok=True)
-    tmp = p["bind"].with_suffix(".tmp")
-    tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
-    os.replace(tmp, p["bind"])
+    lock = p["bind"].with_suffix(".lock")
+    with open(lock, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        binds = load_json(p["bind"], {})
+        binds[task_id] = session_id
+        alive = open_tasks(p["log"])
+        binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
+        tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+        tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
+        os.replace(tmp, p["bind"])
 
 
-TASK_FILE = re.compile(r"tasks/(task-[0-9a-f]{6,})\.txt\b")  # tasks/archive/… has no direct match
-RESULT_FILE = re.compile(r"results/(task-[0-9a-f]{6,})\.txt\b")
+TASK_FILE = re.compile(rf"tasks/({TASK_ID})\.txt\b")  # tasks/archive/… has no direct match
+RESULT_FILE = re.compile(rf"results/({TASK_ID})\.txt\b")
 
 
 def task_file_refs(text: str) -> list[str]:
@@ -150,7 +160,7 @@ def working_line(tool_name: str, tool_input) -> str | None:
     desc = tool_input.get("description")
     if not isinstance(desc, str) or not desc.strip():
         return None
-    return re.split(r"(?<=[.;])\s", desc.strip(), 1)[0][:MAXLEN]
+    return re.split(r"(?<=[.;])\s", desc.strip(), maxsplit=1)[0][:MAXLEN]
 
 
 def last_narration(transcript: Path) -> str | None:
@@ -178,6 +188,13 @@ def last_narration(transcript: Path) -> str | None:
                     return t.split("\n", 1)[0][:TEXT_MAX]
         return None
     return None
+
+
+NO_SEND = re.compile(r"\[(no-send|REPLIED|deduped:[^\]]*)\]")
+
+
+def done_text(tool_input_json: str) -> str:
+    return "closed, no message sent from here" if NO_SEND.search(tool_input_json) else "replied"
 
 
 def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run) -> None:
@@ -225,13 +242,15 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             bind(p, tid, sid)
             emit("processing", "picked up", task, room, p["ws"], run)
             out.append(("processing", "picked up"))
-        # Writing the result file closes the task, whichever session claimed it (a result is a reply).
+        # Writing the result file closes the task, from the session that claimed it only. The text says
+        # what the result did: a [no-send]/[REPLIED]/[deduped:] body reached nobody from here.
         opened = open_tasks(p["log"])
         for tid in result_file_refs(blob):
             if tid in opened and binds.get(tid) == sid:
                 task, room = opened[tid]["task"], opened[tid]["room"]
-                emit("done", "replied", task, room, p["ws"], run)
-                out.append(("done", "replied"))
+                text = done_text(blob)
+                emit("done", text, task, room, p["ws"], run)
+                out.append(("done", text))
         if out:
             return out
         line = working_line(tool, inp) if isinstance(tool, str) else None

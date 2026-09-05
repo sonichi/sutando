@@ -69,7 +69,27 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:  # O_APPEND: one row per write, never rewritten
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    rotate(path)
     return rec
+
+
+LIVE_ROWS = 400
+
+
+def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
+    """The live file keeps the newest `keep` rows; older rows move to <name>.archive.jsonl, so every
+    reader that re-parses the live file per event stays bounded."""
+    try:
+        rows = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(rows) <= keep:
+        return
+    with open(path.with_name(path.stem + ".archive.jsonl"), "a", encoding="utf-8") as arch:
+        arch.write("\n".join(rows[:-keep]) + "\n")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(rows[-keep:]) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def main(argv: list[str] | None = None) -> int:

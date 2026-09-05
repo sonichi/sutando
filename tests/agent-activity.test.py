@@ -32,6 +32,12 @@ card = load("activity")
 hook = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
 
 
+def _bind_in_process(ws, task_id, sid):
+    import pathlib as _pl
+    h = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
+    h.bind(h.paths(_pl.Path(ws)), task_id, sid)
+
+
 class Writer(unittest.TestCase):
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
@@ -57,6 +63,14 @@ class Writer(unittest.TestCase):
     def test_unknown_kind_is_refused(self):
         with self.assertRaises(ValueError):
             card.append("x", kind="verbose", room=None, workspace=self.ws)
+
+    def test_the_live_log_rotates_to_an_archive(self):
+        for i in range(card.LIVE_ROWS + 3):
+            card.append(f"row {i}", kind="notice", room=None, workspace=self.ws)
+        live = card.log_path(self.ws).read_text().splitlines()
+        arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
+        self.assertEqual((len(live), len(arch)), (card.LIVE_ROWS, 3))
+        self.assertIn('"row 0"', arch[0]); self.assertIn(f'"row {card.LIVE_ROWS + 2}"', live[-1])
 
     def test_default_room_is_the_owners_latest_ag2space_room(self):
         st = self.ws / "state"
@@ -230,6 +244,39 @@ class Hook(unittest.TestCase):
         cmd = self.runs[-1]
         self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1]), ("done", "task-abc123", "!dm:s"))
         self.assertEqual(hook.result_file_refs("results/task-abc123.txt and results/task-abc123.txt"), ["task-abc123"])
+
+    def test_two_open_tasks_in_one_session_the_newest_wins(self):
+        # Review blocker: an abandoned older task must not keep receiving the session's rows.
+        self.log({"ts": 1, "room": "!r1:s", "task": {"id": "task-aaa111", "from": "@q:s", "text": "old"}, "line": "a"},
+                 {"ts": 2, "room": "!r2:s", "task": {"id": "task-bbb222", "from": "@q:s", "text": "new"}, "line": "b"})
+        hook.bind(self.p, "task-aaa111", "S1")
+        hook.bind(self.p, "task-bbb222", "S1")
+        task, room = hook.bound_task(self.p, "S1")
+        self.assertEqual((task["id"], room), ("task-bbb222", "!r2:s"))
+
+    def test_bind_survives_concurrent_writers_and_prunes_closed_tasks(self):
+        # Review blocker: the production writer, N processes, one workspace — every binding must land.
+        import multiprocessing as mp
+        self.log(*[{"ts": i, "room": "!r:s", "task": {"id": f"task-c{i:06d}", "text": "x"}, "line": "a"} for i in range(8)])
+        ws = str(self.ws)
+        with mp.get_context("fork").Pool(8) as pool:
+            pool.starmap(_bind_in_process, [(ws, f"task-c{i:06d}", f"S{i}") for i in range(8)])
+        binds = hook.load_json(self.p["bind"], {})
+        self.assertEqual(sorted(binds), [f"task-c{i:06d}" for i in range(8)], binds)
+        self.assertFalse(list((self.ws / "state").glob(".agent-activity.sessions.json.*.tmp")), "no temp files left")
+        # a task with a done row is pruned on the next bind
+        self.log({"ts": 9, "task": {"id": "task-c000000"}, "line": "done", "done": True})
+        hook.bind(self.p, "task-c000001", "S1")
+        self.assertNotIn("task-c000000", hook.load_json(self.p["bind"], {}))
+
+    def test_task_id_scope_includes_chat_tasks_and_excludes_bookkeeping(self):
+        self.assertEqual(hook.task_file_refs("tasks/task-chat-1779570142563.txt tasks/task-cron-x.txt tasks/task-bench-1.txt tasks/task-workstream-grouping-2.txt"), ["task-chat-1779570142563"])
+        self.assertEqual(hook.result_file_refs("results/task-abc123.txt results/task-project-grouping-9.txt"), ["task-abc123"])
+
+    def test_done_text_says_when_nothing_was_sent(self):
+        self.assertEqual(hook.done_text('{"content": "[no-send]\\n"}'), "closed, no message sent from here")
+        self.assertEqual(hook.done_text('{"content": "[deduped: task-1]"}'), "closed, no message sent from here")
+        self.assertEqual(hook.done_text('{"content": "Done, here it is"}'), "replied")
 
     def test_payload_without_session_or_with_unknown_event_writes_nothing(self):
         self.assertEqual(hook.handle({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"description": "x"}}, self.p, self.run), [])

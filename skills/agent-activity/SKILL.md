@@ -55,6 +55,12 @@ skill hook. The hook never depends on the agent remembering anything:
   `working` row for the open task bound to it: the description's first sentence, 100 characters.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
   (complete lines only, so a row mid-write is never split) and writes it as `thinking`.
+- **Scope of task ids.** `task-<hex>` and `task-chat-…` files are tasks; `task-cron-*`, `task-bench-*`,
+  `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.
+  A result whose body starts with `[no-send]`, `[REPLIED]` or `[deduped: …]` closes the task with
+  "closed, no message sent from here", never "replied".
+- **Bounded.** The live log keeps the newest 400 rows (older rows move to `agent-activity.archive.jsonl`),
+  and the session bindings file drops a task once its done row exists, so the per-tool-call reads stay small.
 - **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
   is never written to, so narration cannot cross rooms. The writer's own calls never become rows.
 - The hook exits 0 on every path; it must not block the tool it observed.
