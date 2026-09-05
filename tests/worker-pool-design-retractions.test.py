@@ -508,6 +508,45 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class TheFenceSummaryAgreesWithItsOwnBody(unittest.TestCase):
+    """Three sites disagreed about the SAME transition set: a heading saying every transition
+    fences, a subsection saying first-pin does not, and a trace performing a live/live repin
+    the fence supersedes. Each was internally coherent; the document was not.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_heading_does_not_claim_every_transition_fences(self):
+        f = self._flat()
+        self.assertNotRegex(f, r"\*\*Every transition fences its outgoing claimant",
+                            "the heading contradicted its own subsection for three revisions")
+        self.assertRegex(f, r"Every transition NAMES its outgoing claimant; TWO OF THE THREE FENCE IT")
+
+    def test_the_heading_names_first_pin_as_the_exception(self):
+        f = self._flat()
+        self.assertRegex(f, r"first-pin\s+deliberately does not — it accepts a bounded overlap instead")
+
+    def test_the_cross_reference_follows_the_rename(self):
+        """A renamed heading with a stale pointer sends the reader to a section that no
+        longer exists under that name."""
+        f = self._flat()
+        self.assertNotIn('see "Every transition fences its outgoing claimant"', f)
+        self.assertIn('see "Every transition NAMES its outgoing claimant"', f)
+
+    def test_the_overlap_cardinality_is_every_claimed_task_not_one(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"its cardinality is EVERY TASK ALREADY CLAIMED WHEN THE PIN LANDS, not one",
+            "'one task' is the re-read rule's scope, not the window's")
+        self.assertRegex(f, r"no new task enters the window after the pin lands",
+                         "state what IS bounded, or the correction reads as unbounded")
+
+    def test_trace_b_is_marked_historical_not_normative(self):
+        f = self._flat()
+        self.assertRegex(f, r"Trace B .{0,80}HISTORICAL: this trace is what the\s+re-bind fence SUPERSEDES")
+
+
 class EveryExecutorOwesTheAcceptWriteEvenWithoutASkipRule(unittest.TestCase):
     """The Claude exemption was stated over the whole executor because its consumer has no
     claim-skip rule. The accept WRITE is a different obligation: the recovery table keys on

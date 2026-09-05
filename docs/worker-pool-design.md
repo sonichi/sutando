@@ -846,7 +846,12 @@ This is a SUBTRACTION from the claim's justification, not an addition to it. Tra
 longer shows the claim is load-bearing, because nothing contends in it. Trace B does, and
 carries that weight alone.
 
-**Trace B — an atomic repin between two evaluations.** Each watcher independently
+**Trace B — an atomic repin between two evaluations. HISTORICAL: this trace is what the
+re-bind fence SUPERSEDES, and it is kept because it is the argument for the fence, not a
+mechanism to implement.** It performs a live/live repin and arbitrates with claims; the fence
+below requires the outgoing worker STOPPED before the binding is rewritten, which is the opposite
+mechanism, and an implementer reading the trace as normative would build the race the fence
+exists to remove. Read it as the measurement that produced the fence. Each watcher independently
 re-reads mutable `bindings.json`, so an atomic replacement still hands two readers
 two different valid versions:
 
@@ -991,8 +996,7 @@ rooms must be kept off the same worker:
 
   So the re-bind fence is: stop the wrapper, remove or disable the plist so `kick-pool` cannot
   revive it, end the tmux session, clear the beat — then write the new binding. **This fence is
-  stated for worker-to-worker, and two other binding transitions need one too — see "Every
-  transition fences its outgoing claimant" below.** Restarting the
+  stated for worker-to-worker, and two other binding transitions need one too — see "Every transition NAMES its outgoing claimant" below.** Restarting the
   worker afterwards is `launchctl bootstrap`, NOT `kickstart`: `kickstart` targets an already-loaded
   job and cannot restore one `bootout` removed. Every `kickstart` elsewhere in this document
   describes reviving a worker whose plist is still loaded, which is a different operation from this
@@ -1023,8 +1027,11 @@ rooms must be kept off the same worker:
   process — is the right shape and is out of v1 scope, because it needs an admission check the
   worker consults per claim rather than a supervisor boundary.
 
-  **Every transition fences its outgoing claimant, and for two of the three that claimant is
-  the CORE.** The fence above stops a worker. It does not cover the other two ways a binding changes,
+  **Every transition NAMES its outgoing claimant; TWO OF THE THREE FENCE IT, and first-pin
+  deliberately does not — it accepts a bounded overlap instead.** The heading said "every
+  transition fences" for three revisions while the first-pin subsection two hundred lines below
+  said the opposite in as many words, so the summary and its own body disagreed; the body is
+  right. For two of the three the outgoing claimant is the CORE. The fence above stops a worker. It does not cover the other two ways a binding changes,
   and both have the same check-then-act shape this section spent three revisions removing:
 
   | transition | outgoing claimant | incoming claimant |
@@ -1066,8 +1073,14 @@ rooms must be kept off the same worker:
 
   **So v1 states the overlap as accepted, and this is consistent rather than a concession:** the
   owner's equal-members ruling already admits two members driving two different tasks in one room at
-  once. First-pin's window is strictly smaller than that standing condition — one task, one
-  transition, self-clearing as soon as the losing claimant finishes — so a design that accepts the
+  once. First-pin's window is bounded by that same standing condition rather than being
+  narrower than it: **its cardinality is EVERY TASK ALREADY CLAIMED WHEN THE PIN LANDS, not one.**
+  An earlier revision wrote "one task" here and in the trace summary, which is the claim-then-re-read
+  rule's scope (that rule serializes one task) mistaken for the window's scope. The two differ
+  whenever more than one task is in flight in the room at pin time, which is exactly the case the
+  equal-members ruling makes ordinary. What IS bounded: one transition, and self-clearing as soon as
+  the claimants in flight at pin time finish — no new task enters the window after the pin lands. So
+  a design that accepts the
   larger case cannot coherently claim to fence the smaller one.
 
   What the rule below IS: a cheap **narrowing**, not a boundary. It removes the case where a claimant
@@ -1236,7 +1249,7 @@ that a verified command still executes, or the matrix is prose that never ran.
 
 | command | effect |
 |---|---|
-| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim. **Neither is a bare write** — a first-pin is NOT fenced — v1 accepts a bounded cross-task overlap and the claim-then-re-read rule only narrows it (the pin itself needs no drain), an unpin takes the full re-bind fence; see "Every transition fences its outgoing claimant" |
+| pin room R to worker W / to set {W…} · unpin room R | the core rewrites the pin table; workers read it on every claim. **Neither is a bare write** — a first-pin is NOT fenced — v1 accepts a bounded cross-task overlap and the claim-then-re-read rule only narrows it (the pin itself needs no drain), an unpin takes the full re-bind fence; see "Every transition NAMES its outgoing claimant" |
 | spawn N · set model of W | the core runs the installer (`spawn-worker`) |
 | resize to N (shrinking) · remove worker W | an ORDERED transition — see "Removing a worker" below — because the installer alone leaves the departing worker's bindings pointing at an instance that can never return |
 
