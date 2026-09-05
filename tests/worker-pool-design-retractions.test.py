@@ -472,6 +472,42 @@ class WedgedVerdictHasACommandedExit(unittest.TestCase):
             "who cannot see the cost cannot re-open the decision")
 
 
+class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
+    """The section diagnoses a deadlock whose proximate cause is the Codex consumer's
+    unconditional claim-skip, then lists three OTHER functions as "must change in the
+    implementing PR". A cause that appears only in the diagnosis does not get fixed: the
+    accept record would ship and the adapter would still skip before consulting it.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_skip_rule_function_is_an_obligation(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"`next_pending_task` the FOURTH function the implementing PR must change",
+            "the deadlock's cause must be listed as a change, not only cited as evidence")
+
+    def test_the_required_behaviour_is_stated_not_just_the_defect(self):
+        f = self._flat()
+        self.assertIn("consult the accept record before skipping", f,
+                      "name what it must do, or the row is a complaint")
+
+    def test_key_change_and_skip_change_are_bound_together(self):
+        """Either alone makes the adapter worse: the key alone stops suppressing
+        handler-owned work, the skip alone looks up a key that is not there."""
+        f = self._flat()
+        self.assertRegex(
+            f, r"key change and the skip change land together or the adapter gets worse",
+            "an unbound migration has a failure mode in each direction")
+
+    def test_the_unsafe_direction_of_a_key_mismatch_is_named(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"a miss reads as \"no claim\", which un-skips a genuinely handler-owned task",
+            "say which way a mismatch fails; 'they must match' does not")
+
+
 class TheStopFenceStatesItsOwnInverse(unittest.TestCase):
     """The fence lets the implementer DISABLE or REMOVE the plist. `bootstrap` undoes
     neither on its own: a disabled label refuses to load, and a removed one has no path to

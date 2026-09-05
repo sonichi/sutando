@@ -473,6 +473,26 @@ consults no claims directory — so the deadlock is specific to the Codex consum
 executors reading the same emission under different rules is what let this ship: the design was
 checked against the one that has no rule to violate.
 
+**Which makes `next_pending_task` the FOURTH function the implementing PR must change, and naming
+it here is the point.** The three above are named as obligations; this one was cited only as
+*evidence* of the deadlock (`:408`), and a cause that appears solely in the diagnosis does not get
+fixed. Publishing the accept record while that skip rule is untouched leaves the deadlock exactly
+where it was: the claim is still present at wake time, the candidate is still skipped
+unconditionally and BEFORE any other file is consulted, and the accept record nothing reads changes
+nothing.
+
+| | contract |
+|---|---|
+| today | `[ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue` — presence of a claim means "not yours", with no way to express "offered TO you" |
+| required | consult the accept record before skipping: a claim whose line 4 addresses THIS instance and that carries no accept yet is a candidate to ACCEPT, not one to skip. A claim addressed elsewhere, or already accepted by another instance, is still skipped |
+| the key must match | `$candidate` is a raw basename today while the claim key is the canonical task id (`task_archive.task_id_for`). Both sides must compute the same key or the lookup misses in the safe-looking direction — a miss reads as "no claim", which un-skips a genuinely handler-owned task. **The key change and the skip change land together or the adapter gets worse, not better** |
+
+That last row is why this is a migration rather than an edit. A reviewer's control on the shipped
+function showed the two adjacent cases already diverge — a raw-filename claim suppresses the
+candidate while a canonical-id claim does not — so shipping the canonical key alone would silently
+stop suppressing handler-owned work, and shipping the skip change alone would look up a key that is
+not there.
+
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
 revision had the ticker count "claims made this pass" and add that to the directory count. That
 was wrong three ways at once, and the first is the one this section had already condemned in
