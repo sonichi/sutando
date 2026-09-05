@@ -39,15 +39,23 @@ it, `--room` defaults to the room of the owner's latest AG2 Space message (`stat
 Write the `processing` row the moment a message is picked up and the `done` row when its result
 is written; a message with neither never appears in the drawer.
 
-## Working and Thinking rows, automatically
+## Working and Thinking rows, automatically (hooks)
 
-```bash
-python3 skills/agent-activity/scripts/activity-tail.py --daemon
-```
+The skill declares two Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
+`PreToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
+skill hook. The hook never depends on the agent remembering anything:
 
-follows the newest Claude Code transcript under `<workspace>/.claude-sutando/projects/` and emits
-a `working` row per tool call (its one-line description; Read/Glob/Grep/TodoWrite skipped; a call
-that names a task file gains `from <sender>: <first 20 chars>`) and a `thinking` row per line of
-narration, attached to the open task. With no open task it emits nothing. The transcript's
-thinking blocks hold a signature and no text, so narration is the closest available signal.
-Pidfile `state/activity-tail.pid`; log `state/activity-tail.log`.
+- **Binding.** When a `PreToolUse` sees the agent run `activity.py append … --kind processing
+  --task-file …` (or `--task-id …`), it binds that task to the hook's own `session_id` in
+  `state/agent-activity.sessions.json`. That is the only way a task gets a session.
+- **Working.** Every later `PreToolUse` in that session (Read/Glob/Grep/TodoWrite skipped) becomes a
+  `working` row for the open task bound to it: the description's first sentence, 100 characters.
+- **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
+  (complete lines only, so a row mid-write is never split) and writes it as `thinking`.
+- **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
+  is never written to, so narration cannot cross rooms. The writer's own calls never become rows.
+- The hook exits 0 on every path; it must not block the tool it observed.
+
+The private thinking blocks in the transcript hold a signature and no text; narration is the
+nearest available signal. The agent still writes `processing` (on pick-up), `done` (on reply) and
+any `thinking`/`notice` it wants to add by hand; those are the personalisation surface.

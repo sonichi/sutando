@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for skills/agent-activity: the row writer and the transcript tailer's pure parts."""
+"""Tests for skills/agent-activity: the row writer and the session-bound hook."""
 from __future__ import annotations
 
 import contextlib
@@ -17,15 +17,19 @@ REPO = Path(__file__).parent.parent
 SCRIPTS = REPO / "skills" / "agent-activity" / "scripts"
 
 
-def load(name):
-    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), SCRIPTS / f"{name}.py")
+def load_at(path):
+    spec = importlib.util.spec_from_file_location(path.stem.replace("-", "_"), path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
+def load(name):
+    return load_at(SCRIPTS / f"{name}.py")
+
+
 card = load("activity")
-tail = load("activity-tail")
+hook = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
 
 
 class Writer(unittest.TestCase):
@@ -81,63 +85,6 @@ class TaskFile(unittest.TestCase):
         self.assertTrue((ws / "state" / "agent-activity.jsonl").exists(), "the row must land in the given workspace")
 
 
-class Tailer(unittest.TestCase):
-    def setUp(self):
-        self.ws = Path(tempfile.mkdtemp())
-        (self.ws / "state").mkdir()
-        (self.ws / "tasks").mkdir()
-        self.log = self.ws / "state" / "agent-activity.jsonl"
-
-    def write(self, *rows):
-        self.log.write_text("".join(json.dumps(r) + "\n" for r in rows))
-
-    def test_open_task_is_the_last_task_without_a_later_done(self):
-        self.write(
-            {"ts": 1, "room": "!a:s", "task": {"id": "t1", "from": "@q:s", "text": "one"}, "line": "a"},
-            {"ts": 2, "room": "!a:s", "task": {"id": "t2", "from": "@q:s", "text": "two"}, "line": "b"},
-            {"ts": 3, "task": {"id": "t2"}, "line": "c", "done": True},
-        )
-        task, room = tail.open_task(self.log)
-        self.assertEqual((task["id"], room), ("t1", "!a:s"))
-        self.write({"ts": 3, "task": {"id": "t1"}, "line": "c", "done": True})
-        self.assertEqual(tail.open_task(self.log), (None, None))
-        self.assertEqual(tail.open_task(self.ws / "nope.jsonl"), (None, None))
-
-    def assistant(self, *blocks):
-        return json.dumps({"type": "assistant", "message": {"content": list(blocks)}})
-
-    def test_tool_descriptions_become_working_rows_and_reads_are_skipped(self):
-        line = self.assistant(
-            {"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List files"}},
-            {"type": "tool_use", "name": "Read", "input": {"file_path": "/x", "description": "Read x"}},
-            {"type": "tool_use", "name": "Bash", "input": {"command": "true"}},
-        )
-        self.assertEqual(list(tail.rows_from(line, self.ws)), [("working", "List files")])
-
-    def test_narration_becomes_a_thinking_row_and_code_fences_do_not(self):
-        line = self.assistant({"type": "text", "text": "Checking the log first.\nmore"},
-                              {"type": "text", "text": "```\ncode\n```"},
-                              {"type": "thinking", "thinking": "", "signature": "x"})
-        self.assertEqual(list(tail.rows_from(line, self.ws)), [("thinking", "Checking the log first.")])
-
-    def test_non_assistant_and_malformed_lines_yield_nothing(self):
-        self.assertEqual(list(tail.rows_from("not json", self.ws)), [])
-        self.assertEqual(list(tail.rows_from(json.dumps({"type": "user", "message": {"content": []}}), self.ws)), [])
-
-    def test_a_task_file_named_in_a_call_adds_sender_and_a_20_char_quote(self):
-        (self.ws / "tasks" / "task-abc123.txt").write_text(
-            "id: task-abc123\ntask: Reading the newest task please\nsender_name: qingyun\n")
-        ctx = tail.task_context('cat "$WS/tasks/task-abc123.txt"', self.ws)
-        self.assertEqual(ctx, "from qingyun: Reading the newest t…")
-        self.assertEqual(tail.task_context("ls", self.ws), "")
-        (self.ws / "tasks" / "task-def456.txt").write_text("task: [Photo attached: /p.png]\nsender_name: q\n")
-        self.assertEqual(tail.task_context("task-def456", self.ws), "from q: Photo attached")
-        line = self.assistant({"type": "tool_use", "name": "Bash",
-                               "input": {"command": "grep task tasks/task-abc123.txt", "description": "Read the newest task"}})
-        self.assertEqual(list(tail.rows_from(line, self.ws)),
-                         [("working", "Read the newest task: from qingyun: Reading the newest t…")])
-
-
 class WriterCli(unittest.TestCase):
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
@@ -170,84 +117,111 @@ class WriterCli(unittest.TestCase):
         self.assertEqual((rec["task"]["id"], rec["task"]["from"], rec["room"]), ("task-cli", "@q:s", "!team:s"))
 
 
-class TailerRuntime(unittest.TestCase):
+class Hook(unittest.TestCase):
+    """The PreToolUse/Stop hook: rows bind to the session that claimed the task, or nothing is written."""
+
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
-        self.p = tail.paths(self.ws)
         (self.ws / "state").mkdir()
-        (self.p["projects"] / "proj").mkdir(parents=True)
-        self.transcript = self.p["projects"] / "proj" / "s1.jsonl"
-        self.transcript.write_text("")
+        (self.ws / "tasks").mkdir()
+        self.p = hook.paths(self.ws)
+        self.runs = []
+        self.run = lambda cmd, **kw: self.runs.append(cmd)
 
-    def assistant(self, *blocks):
-        return json.dumps({"type": "assistant", "message": {"content": list(blocks)}}) + "\n"
+    def log(self, *rows):
+        with open(self.p["log"], "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
 
-    def test_paths_and_newest_transcript(self):
-        self.assertEqual(tail.newest_transcript(self.p["projects"]), self.transcript)
-        self.assertIsNone(tail.newest_transcript(self.ws / "none"))
-        self.assertEqual(self.p["log"], self.ws / "state" / "agent-activity.jsonl")
+    def pre(self, sid, tool, inp):
+        return {"hook_event_name": "PreToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp}
 
-    def test_follower_emits_only_new_lines_for_the_open_task_and_dedups(self):
-        self.transcript.write_text(self.assistant({"type": "text", "text": "old history"}))
-        emitted = []
-        f = tail.Follower(self.p, emit_fn=lambda *a: emitted.append(a))
-        self.assertEqual(f.step(), 0, "history before start is not news")
-        with open(self.transcript, "a") as t:
-            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
-        self.assertEqual(f.step(), 0, "no open task: nothing emitted")
-        self.p["log"].write_text(json.dumps({"ts": 1, "room": "!r:s", "task": {"id": "t1", "from": "@q:s", "text": "hi"}, "line": "a"}) + "\n")
-        with open(self.transcript, "a") as t:
-            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
-            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
-            t.write(self.assistant({"type": "text", "text": "Deciding.\nmore"}))
-        self.assertEqual(f.step(), 2)
-        self.assertEqual([(e[0], e[1], e[2]["id"], e[3]) for e in emitted], [("working", "List", "t1", "!r:s"), ("thinking", "Deciding.", "t1", "!r:s")])
-        newer = self.p["projects"] / "proj" / "s2.jsonl"
-        newer.write_text(self.assistant({"type": "text", "text": "new session"}))
-        os.utime(newer, (self.transcript.stat().st_mtime + 5,) * 2)
-        self.assertEqual(f.step(), 1, "a newer transcript is followed from its start")
-        self.assertEqual(f.path, newer)
+    def test_open_tasks_skips_malformed_rows_and_closed_tasks(self):
+        self.log({"ts": 1, "room": "!a:s", "task": {"id": "t1", "text": "one"}, "line": "a"},
+                 {"ts": 2, "task": [], "line": "bad shape"},
+                 {"ts": 3, "task": {"id": 7}, "line": "bad id"},
+                 {"ts": 4, "task": {"id": "t2"}, "line": "b"},
+                 {"ts": 5, "task": {"id": "t2"}, "line": "c", "done": True})
+        with open(self.p["log"], "a") as f:
+            f.write("not json\n")
+        self.assertEqual(list(hook.open_tasks(self.p["log"])), ["t1"])
+        self.assertEqual(hook.open_tasks(self.ws / "none.jsonl"), {})
 
-    def test_writer_argv_and_emit(self):
-        argv = tail.writer_argv("working", "x" * 300, {"id": "t1", "from": "@q:s", "text": "hi"}, "!r:s", self.ws)
-        self.assertEqual(argv[2:4], ["append", "x" * tail.MAXLEN])
-        self.assertEqual(argv[argv.index("--room") + 1], "!r:s")
-        self.assertEqual(argv[argv.index("--workspace") + 1], str(self.ws))
-        tail.emit("working", "hello", {"id": "t1"}, None, self.ws)
+    def test_processing_task_id_from_task_id_task_file_or_reference(self):
+        (self.ws / "tasks" / "task-abc123.txt").write_text("id: task-abc123\ntask: x\n")
+        self.assertEqual(hook.processing_task_id("python3 a/activity.py append 'x' --kind processing --task-id task-9", self.ws), "task-9")
+        self.assertEqual(hook.processing_task_id("python3 activity.py append x --kind processing --task-file tasks/task-abc123.txt", self.ws), "task-abc123")
+        self.assertEqual(hook.processing_task_id("python3 activity.py append x --kind processing --task-file tasks/task-zzz.txt", self.ws), "task-zzz")
+        self.assertEqual(hook.processing_task_id("python3 activity.py append x --kind processing task-def456 room", self.ws), "task-def456")
+        self.assertIsNone(hook.processing_task_id("python3 activity.py append x --kind notice", self.ws))
+        self.assertIsNone(hook.processing_task_id("ls", self.ws))
+        self.assertIsNone(hook.processing_task_id("python3 activity.py append 'unterminated --kind processing", self.ws))
+
+    def test_working_line_skips_reads_and_shortens(self):
+        self.assertIsNone(hook.working_line("Read", {"description": "Read x"}))
+        self.assertIsNone(hook.working_line("Bash", {"command": "ls"}))
+        self.assertIsNone(hook.working_line("Bash", "not a dict"))
+        self.assertEqual(hook.working_line("Bash", {"description": "First sentence. Second one"}), "First sentence.")
+        self.assertEqual(len(hook.working_line("Bash", {"description": "x" * 300})), 100)
+
+    def test_a_processing_append_binds_the_task_to_this_session_and_writes_no_working_row(self):
+        out = hook.handle(self.pre("S1", "Bash", {"command": "python3 activity.py append 'picked up' --kind processing --task-id task-1", "description": "Tag the task"}), self.p, self.run)
+        self.assertEqual((out, self.runs), ([], []))
+        self.assertEqual(hook.load_json(self.p["bind"], {}), {"task-1": "S1"})
+        out = hook.handle(self.pre("S1", "Bash", {"command": "python3 activity.py done 'x' --task-id task-1", "description": "Close"}), self.p, self.run)
+        self.assertEqual((out, self.runs), ([], []), "the writer's own calls never become rows")
+
+    def test_working_rows_go_only_to_the_task_bound_to_this_session(self):
+        self.log({"ts": 1, "room": "!team:s", "task": {"id": "t-team", "from": "@t:s", "text": "team task"}, "line": "a"},
+                 {"ts": 2, "room": "!dm:s", "task": {"id": "t-dm", "from": "@q:s", "text": "owner task"}, "line": "b"})
+        hook.bind(self.p, "t-team", "S-team")
+        hook.bind(self.p, "t-dm", "S-dm")
+        # the reviewer's control: a newer sidechain/other session must not reach the team room
+        self.assertEqual(hook.handle(self.pre("S-side", "Bash", {"command": "x", "description": "private owner narration"}), self.p, self.run), [])
+        self.assertEqual(self.runs, [])
+        out = hook.handle(self.pre("S-dm", "Bash", {"command": "x", "description": "Run the gates"}), self.p, self.run)
+        self.assertEqual(out, [("working", "Run the gates")])
+        cmd = self.runs[-1]
+        self.assertEqual((cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--workspace") + 1]), ("t-dm", "!dm:s", str(self.ws)))
+        self.assertEqual(cmd[cmd.index("--from") + 1], "@q:s")
+        out = hook.handle(self.pre("S-team", "Edit", {"file_path": "/x", "description": "Edit the doc"}), self.p, self.run)
+        self.assertEqual((out, self.runs[-1][self.runs[-1].index("--room") + 1]), ([("working", "Edit the doc")], "!team:s"))
+        self.log({"ts": 3, "task": {"id": "t-dm"}, "line": "done", "done": True})
+        self.assertEqual(hook.handle(self.pre("S-dm", "Bash", {"command": "x", "description": "After done"}), self.p, self.run), [], "a closed task takes no more rows")
+
+    def test_stop_writes_this_sessions_last_narration_from_complete_lines_only(self):
+        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
+        hook.bind(self.p, "t1", "S1")
+        tp = self.ws / "s1.jsonl"
+        rows = [json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}),
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Checking the log first.\nmore"}, {"type": "tool_use", "name": "Bash", "input": {}}]}})]
+        tp.write_text("\n".join(rows) + "\n" + '{"type": "assistant", "message": {"content": [{"type": "text", "text": "HALF WRIT')
+        out = hook.handle({"hook_event_name": "Stop", "session_id": "S1", "transcript_path": str(tp)}, self.p, self.run)
+        self.assertEqual(out, [("thinking", "Checking the log first.")])
+        self.assertEqual(hook.handle({"hook_event_name": "Stop", "session_id": "S-other", "transcript_path": str(tp)}, self.p, self.run), [], "another session's transcript never reaches this task")
+        self.assertIsNone(hook.last_narration(self.ws / "missing.jsonl"))
+        (self.ws / "fence.jsonl").write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "```\ncode\n```"}]}}) + "\nnot json\n")
+        self.assertIsNone(hook.last_narration(self.ws / "fence.jsonl"))
+
+    def test_payload_without_session_or_with_unknown_event_writes_nothing(self):
+        self.assertEqual(hook.handle({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"description": "x"}}, self.p, self.run), [])
+        self.assertEqual(hook.handle({"hook_event_name": "Notification", "session_id": "S1"}, self.p, self.run), [])
+        self.assertEqual(self.runs, [])
+
+    def test_main_reads_stdin_and_always_exits_zero(self):
+        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
+        hook.bind(self.p, "t1", "S1")
+        payload = json.dumps(self.pre("S1", "Bash", {"command": "ls", "description": "List files"}))
+        self.assertEqual(hook.main(io.StringIO(payload), self.ws), 0)
         rows = [json.loads(l) for l in self.p["log"].read_text().splitlines()]
-        self.assertEqual((rows[0]["kind"], rows[0]["line"], rows[0]["task"]["id"]), ("working", "hello", "t1"))
-
-    def test_follow_stops_without_a_transcript_and_polls_with_one(self):
-        empty = Path(tempfile.mkdtemp())
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            tail.follow(tail.paths(empty))
-        self.assertIn("no transcript", err.getvalue())
-        calls = []
-
-        def sleep(_):
-            calls.append(1)
-            if len(calls) == 2:
-                raise KeyboardInterrupt
-        with self.assertRaises(KeyboardInterrupt):
-            tail.follow(self.p, sleep=sleep)
-        self.assertEqual(len(calls), 2)
-
-    def test_main_daemon_uses_the_pidfile_and_foreground_follows(self):
-        spawned = []
-
-        class Child:
-            pid = 4242
-        rc = tail.main(["--daemon", "--workspace", str(self.ws)], popen=lambda *a, **k: (spawned.append(a[0]), Child())[1])
-        self.assertEqual((rc, self.p["pid"].read_text(), "--workspace" in spawned[0]), (0, "4242", True))
-        self.p["pid"].write_text(str(os.getpid()))  # alive: a second start refuses
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            tail.main(["--daemon", "--workspace", str(self.ws)], popen=lambda *a, **k: self.fail("must not spawn"))
-        self.assertIn("already running", out.getvalue())
-        followed = []
-        self.assertEqual(tail.main(["--workspace", str(self.ws)], run_follow=lambda p: followed.append(p["ws"])), 0)
-        self.assertEqual(followed, [self.ws])
+        self.assertEqual((rows[-1]["kind"], rows[-1]["line"], rows[-1]["task"]["id"]), ("working", "List files", "t1"))
+        self.assertEqual(hook.main(io.StringIO("not json"), self.ws), 0)
+        self.assertEqual(hook.main(io.StringIO("[1, 2]"), self.ws), 0)
+        self.assertEqual(hook.main(io.StringIO(""), self.ws), 0)
+        self.assertEqual(hook.emit.__name__, "emit")
+        hook.emit("notice", "x", {"id": "t1", "from": 5, "text": None}, None, self.ws)
+        rows = [json.loads(l) for l in self.p["log"].read_text().splitlines()]
+        self.assertEqual((rows[-1]["kind"], "room" in rows[-1], rows[-1]["task"]), ("notice", False, {"id": "t1"}))
 
 
 if __name__ == "__main__":
