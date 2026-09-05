@@ -4,6 +4,7 @@ window, the I/O edge with fakes, and the record/replay/probe CLI end to end."""
 import contextlib
 import io
 import json
+import argparse
 import os
 import stat
 import subprocess
@@ -405,6 +406,25 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     return script
+
+
+class Identity(unittest.TestCase):
+    # Outside Cli: that class pins _local_host_label to 'host' for every probe.
+
+    def test_local_host_label_comes_from_util_paths_or_the_short_hostname(self):
+        # Coverage of the resolver itself (the class pins it elsewhere): the shared helper when it
+        # imports, the short hostname when it cannot.
+        import socket
+        self.assertIsInstance(w._local_host_label(), str)
+        with patch.dict(sys.modules, {"util_paths": None}):
+            self.assertEqual(w._local_host_label(), socket.gethostname().split(".")[0])
+
+    def test_an_unreadable_pane_is_an_unknown_verdict_for_that_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; (ws / "state" / "cores").mkdir(parents=True)
+            with patch.object(w, "capture_pane", return_value=None):
+                v = w.probe_one(argparse.Namespace(socket="/s", tmux="tmux", workspace=str(ws), work_file=None, work_outstanding=None, now=None, warn_after=None, sample=None), ws, "=core-9:0", "worker")
+            self.assertEqual((v["kind"], v["reason"], v["role"]), ("unknown", "pane not readable", "worker"))
 
 
 class Cli(unittest.TestCase):
