@@ -173,7 +173,7 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
     clock-only | static-with-work | retry-loop | provider-limit | low-novelty |
-    unknown; the four before unknown are warnings. `raw_static` is case 1's
+    unknown (or, from the window, cadence-too-sparse); the four before unknown are warnings. `raw_static` is case 1's
     input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
         raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
@@ -399,11 +399,20 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
         return classify_ids([], False, [], work[0], 0.0, work[1], th)
     runs = observation_runs(entries, th["continuity_gap_s"])
     run = runs[-1]
+    all_gaps = sorted(b["ts"] - a["ts"] for a, b in zip(entries, entries[1:]))
     meta = {"observation_runs": len(runs), "run_started": run[0]["ts"], "run_samples": len(run),
             "window_samples": len(entries), "last_sample_age_s": round(max(0.0, now - run[-1]["ts"]), 1)}
+    if all_gaps:
+        meta["window_median_gap_s"] = round(all_gaps[len(all_gaps) // 2], 1)
     if now - run[-1]["ts"] > th["continuity_gap_s"]:
         v = classify_ids([], False, [], work[0], 0.0, work[1], th)
         return {**v, **meta, "reason": f"last sample {now - run[-1]['ts']:.0f}s ago — no current observation"}
+    # The caller's cadence decides whether a run ever reaches two samples. Sampled
+    # slower than the continuity limit, case 1 is unreachable: say so, do not say "nothing".
+    if len(run) < 2 and len(entries) >= 3 and meta.get("window_median_gap_s", 0) >= th["continuity_gap_s"]:
+        v = classify_ids([], False, [], work[0], 0.0, work[1], th)
+        return {**v, **meta, "kind": "cadence-too-sparse",
+                "reason": f"samples arrive every ~{meta['window_median_gap_s']:.0f}s, past the {th['continuity_gap_s']}s continuity limit — a static pane cannot be observed at this rate"}
     gaps = [b["ts"] - a["ts"] for a, b in zip(run, run[1:])]
     ids = [e["state"] for e in run]
     raws = [e.get("raw_state") for e in run]

@@ -270,6 +270,19 @@ class IoEdge(unittest.TestCase):
         self.assertEqual(v["kind"], "unknown")
         self.assertIn("no current observation", v["reason"])
 
+    def test_sampling_slower_than_the_continuity_limit_is_named_not_silent(self):
+        # TustinOC: at hourly sampling every sample is its own run and case 1 is unreachable;
+        # the verdict must say "undetectable here", not "nothing to report".
+        e = lambda ts: {"ts": ts, "state": "a", "raw_state": "a", "patterns": []}
+        entries = [e(3600.0 * i) for i in range(6)]
+        v = w.classify_window(entries, (True, "1 queued task(s)"), 3600.0 * 5 + 10)
+        self.assertEqual((v["kind"], v["warn"], v["observation_runs"], v["run_samples"]), ("cadence-too-sparse", False, 6, 1))
+        self.assertEqual(v["window_median_gap_s"], 3600.0)
+        self.assertIn("cannot be observed at this rate", v["reason"])
+        # the same pane sampled inside the limit is a plain case-1 warning
+        dense = [e(1800.0 * i) for i in range(6)]
+        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "static-with-work")
+
     def test_a_new_pane_identity_starts_a_new_run(self):
         e = lambda ts, pane: {"ts": ts, "state": "a", "raw_state": "a", "patterns": [], "pane": pane}
         entries = [e(0.0, "100:1"), e(60.0, "100:1"), e(120.0, "200:2"), e(180.0, "200:2")]
