@@ -715,5 +715,76 @@ check "...and a partial destination with no usable source keeps its intent and w
       '[ -f "$_INT" ] && [ "$_rc16e" -eq 3 ]'
 rm -f "$_stg" "$_INT"
 
+echo "17. the WRITER DIES mid-replace: a signal exit is an UNKNOWN outcome, verified, never pushed as whole"
+# The shim runs the real interpreter on the --replace mode with one call patched to SIGKILL the
+# process: after the real truncate (destination now EMPTY), or before it (destination untouched).
+# The caller then sees exit 137, not the 3 that names a partial write. `--rollforward` may be
+# limited to one block so the same-tick recovery also stops short.
+_kill_shim() {
+    _kz="$(mktemp -d)"
+    if [ "$1" = after-truncate ]; then
+        printf '%s\n' 'import os, signal' '_t = os.ftruncate' \
+            'def _k(fd, n):' '    _t(fd, n); os.fsync(fd); os.kill(os.getpid(), signal.SIGKILL)' \
+            'os.ftruncate = _k' > "$_kz/patch.py"
+    else
+        printf '%s\n' 'import os, signal, fcntl' \
+            'def _k(fd, op): os.kill(os.getpid(), signal.SIGKILL)' 'fcntl.flock = _k' > "$_kz/patch.py"
+    fi
+    cat > "$_kz/python3" <<SHIM
+#!/bin/bash
+case "\$2" in
+    --replace) { cat "$_kz/patch.py"; cat; } | "$(command -v python3)" "\$@"; exit \$? ;;
+    --rollforward) [ "${2:-}" = short-rollforward ] && ulimit -S -f 1 ;;
+esac
+exec "$(command -v python3)" "\$@"
+SHIM
+    chmod +x "$_kz/python3"; printf '%s' "$_kz"
+}
+
+# (a) killed AFTER the truncate: the destination is empty on disk, the child exits 137.
+_arm_big_root
+_kz="$(_kill_shim after-truncate)"
+SYNC_PY="$_kz/python3" _snapshot_per_host_config > "$SB/17a.out" 2>&1; _rc17a=$?
+rm -rf "$_kz"
+check "a) control: the shim really killed the writer (something other than 0/2/3 reached the caller is logged)" \
+      'grep -q "writer exit 137" "$LOG"'
+check "...the destination is NOT the empty file the truncate left" '[ -s "$_DST" ]'
+check "...it holds the WHOLE root (rolled forward from the staged copy in the same tick)" \
+      'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST"'
+check "...provenance records the whole bytes" '[ "$(cat "$_SIG")" = "$(_root_sha)" ]'
+check "...no staged copy or intent is left behind" \
+      '[ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...and the function reports success only because the copy is complete" '[ "$_rc17a" -eq 0 ]'
+
+# (b) killed BEFORE the truncate (in the lock): nothing was mutated, and that is VERIFIED, not assumed.
+_arm_big_root
+_kz="$(_kill_shim before-truncate)"
+SYNC_PY="$_kz/python3" _snapshot_per_host_config > "$SB/17b.out" 2>&1; _rc17b=$?
+rm -rf "$_kz"
+check "b) the destination still holds its OLD bytes" \
+      '[ "$(cat "$_DST")" = "owned baseline" ]'
+check "...the signature still names them" \
+      '[ "$(cat "$_SIG")" = "$(printf "owned baseline\n" | shasum -a 256 | cut -d" " -f1)" ]'
+check "...staged copy and intent are discarded (nothing to recover)" \
+      '[ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...the function reports success (the tick has nothing to withhold)" '[ "$_rc17b" -eq 0 ]'
+check "...and the log says the destination was verified untouched" \
+      'grep -q "before touching the destination" "$LOG"'
+
+# (c) killed AFTER the truncate AND the same-tick roll-forward stops short: the tick withholds the
+# push (rc 3) with the evidence kept, and the next unlimited tick completes it.
+_arm_big_root
+_kz="$(_kill_shim after-truncate short-rollforward)"
+SYNC_PY="$_kz/python3" _snapshot_per_host_config > "$SB/17c.out" 2>&1; _rc17c=$?
+rm -rf "$_kz"
+check "c) the destination is a strict PREFIX of root (not empty, not whole)" '_dst_is_strict_prefix_of_root'
+check "...the staged copy and the intent are KEPT" \
+      '[ -f "$_INT" ] && [ -n "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...the function returns 3 so the push is withheld" '[ "$_rc17c" -eq 3 ]'
+check "...and the operator is told on stderr" 'grep -q "PARTIAL" "$SB/17c.out"'
+_snapshot_per_host_config > "$SB/17c2.out" 2>&1; _rc17c2=$?
+check "...the next tick rolls forward to the WHOLE root and promotes" \
+      'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST" && [ "$(cat "$_SIG")" = "$(_root_sha)" ] && [ "$_rc17c2" -eq 0 ]'
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

@@ -789,6 +789,19 @@ _enforce_carrier_set_pre() {
 # depth; the exclude file is config, this is policy). File-level refusal,
 # not run-level: dying here would wedge every future tick behind one bad
 # path — silent staleness, the exact failure mode sync exists to prevent.
+# The reserved snapshot temps stay out of every commit whatever the exclude file says: an
+# operator-edited file is kept as-is (refused refresh), so it may predate the built-in denies.
+_unstage_reserved_temps() {
+    local _p _n=0
+    while IFS= read -r -d '' _p; do
+        git rm -q --cached -- "$_p" >/dev/null 2>&1 || true
+        _n=$((_n + 1))
+    done < <(git diff --cached --name-only -z --diff-filter=AM -- \
+        'hosts/*/build_log.md.snap.??????' 'hosts/*/.build_log.snapshot-sha.repair.??????' 2>/dev/null)
+    [ "$_n" -gt 0 ] && log "_unstage_reserved_temps: kept $_n reserved snapshot temp(s) out of the commit"
+    return 0
+}
+
 _refuse_staged_secrets() {
     local _secret_hits=0 _sf
     while IFS= read -r -d '' _sf; do
@@ -865,9 +878,9 @@ _refuse_foreign_host_deletions() {
 # reader prefer a stale snapshot over the live root file.
 #
 # Secret-safe: copies ONLY access.json, never the sibling .env (bot tokens).
-# Config copies are best-effort (return 0). The build_log snapshot is not: a
-# per-host copy left PARTIAL by a failed write returns 3 and the caller withholds
-# that tick's push rather than vault a truncated log.
+
+# Config copies are best-effort (return 0). A PARTIAL build_log copy returns 3 and the
+# caller withholds that tick's push rather than vault a truncated log.
 _snapshot_per_host_config() {
     local _cfg
     _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
@@ -1160,18 +1173,31 @@ PY
                     if ! _fsync_path_and_dir "$_tmp"; then
                         rm -f "$_tmp" 2>/dev/null || true
                         warn_operator "snapshot refused: could not make the staged copy of hosts/$(_host)/build_log.md durable; per-host copy and provenance left unchanged"
+                        _rrc=1
                     elif ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
                         ! _fsync_path_and_dir "$_int"; then
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
                         warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
-                    elif _replace_in_place --replace "$_tmp" "$_dst" "$_cur" || {
-                            _rrc=$?
-                            # Partial destination: finish from the durable copy now, not next tick.
-                            [ "$_rrc" -eq 3 ] && _replace_in_place --rollforward "$_tmp" "$_dst" && {
+                        _rrc=1
+                    else
+                        _replace_in_place --replace "$_tmp" "$_dst" "$_cur" || _rrc=$?
+                        if [ "$_rrc" -ne 0 ] && [ "$_rrc" -ne 2 ]; then
+                            # Anything but a clean refusal is an UNKNOWN outcome (a killed writer exits by signal,
+                            # not 3): verify the destination, else roll forward from the staged copy; never assume.
+                            local _after=""
+                            [ -f "$_dst" ] && _after="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                            if [ "$_after" = "$_cur" ]; then
+                                log "snapshot: in-place replace of hosts/$(_host)/build_log.md failed (rc $_rrc) before touching the destination; temp removed, per-host copy and provenance left unchanged"
+                                _rrc=4
+                            elif _replace_in_place --rollforward "$_tmp" "$_dst"; then
+                                log "snapshot: in-place write of hosts/$(_host)/build_log.md stopped short; rolled forward from the staged copy in the same tick (writer exit $_rrc)"
                                 _rrc=0
-                                log "snapshot: in-place write of hosts/$(_host)/build_log.md stopped short; rolled forward from the staged copy in the same tick"
-                            }
-                        }; then
+                            else
+                                _rrc=3
+                            fi
+                        fi
+                    fi
+                    if [ "$_rrc" -eq 0 ]; then
                         rm -f "$_tmp" 2>/dev/null || true
                         # The destination must be durable BEFORE the signature claims it; if it is not,
                         # leave the intent for the next tick to verify or discard.
@@ -1194,14 +1220,10 @@ PY
                         # The staged copy is vault-excluded and the intent names it: both stay so the
                         # next tick's recovery rolls forward. Returning 3 keeps this tick from pushing.
                         _partial=3
-                        warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL — the in-place write failed after the truncate and the roll-forward also failed; staged copy and intent kept for the next tick, this sync will not push it"
-                    else
+                        warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL — the in-place write did not complete and the roll-forward also failed; staged copy and intent kept for the next tick, this sync will not push it"
+                    elif [ "$_rrc" -ne 1 ]; then
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
-                        if [ "$_rrc" -eq 2 ]; then
-                            warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
-                        else
-                            log "snapshot: in-place replace of hosts/$(_host)/build_log.md failed; temp removed, per-host copy and provenance left unchanged"
-                        fi
+                        [ "$_rrc" -eq 2 ] && warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
                     fi
                 else
                     rm -f "$_tmp" 2>/dev/null || true
@@ -1791,6 +1813,7 @@ _push_only_impl() {
     _migrate_flat_anchor
     _enforce_carrier_set_pre
     git add -A
+    _unstage_reserved_temps
     _refuse_staged_secrets
     if ! _refuse_foreign_host_deletions; then
         return 1

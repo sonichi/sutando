@@ -472,6 +472,34 @@ check "the carve-out recognizer runs on the WIDENED content" \
 check "the widened temp file is removed on every return path" \
     test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
 
+
+# An OPERATOR-edited exclude file is kept as-is (refused refresh), so it may predate the built-in
+# denies. The reserved temp families must still stay out of the index: real git add -A, then the
+# push path's guard, loaded from the script (a missing guard leaves the stub, which keeps nothing out).
+_unstage_reserved_temps() { :; }
+eval "$(sed -n '/^_unstage_reserved_temps() {/,/^}$/p' "$SYNC_SH")"
+log() { :; }
+OPS="$TEST_ROOT/operator-rule-staging"
+seed_older_install "$OPS" "$BI_RULE" 'hosts/*/.build_log.snapshot-sha.repair.??????'
+echo '!my/operator/rule' >> "$OPS/.git/info/exclude"
+git init -q "$OPS"
+mkdir -p "$OPS/hosts/H"
+printf 'log\n'  > "$OPS/hosts/H/build_log.md"
+printf 'temp\n' > "$OPS/hosts/H/build_log.md.snap.AB12cd"
+printf 'sha\n'  > "$OPS/hosts/H/.build_log.snapshot-sha.repair.CD34ef"
+upgrade_rc "$OPS" >/dev/null || true
+check "operator-edited: the refresh is refused, so the built-in deny never lands (the exposure)" \
+    test "$(builtin_in "$OPS")" -eq 0
+(cd "$OPS" && git add -A >/dev/null 2>&1) || true
+check "operator-edited: a real git add -A stages BOTH reserved temps (the defect)" \
+    test "$(git -C "$OPS" ls-files --cached -- hosts/H/build_log.md.snap.AB12cd hosts/H/.build_log.snapshot-sha.repair.CD34ef | wc -l | tr -d ' ')" -eq 2
+(cd "$OPS" && _unstage_reserved_temps) || true
+check "...the push-path guard keeps both out of the index regardless of the exclude file" \
+    test "$(git -C "$OPS" ls-files --cached -- hosts/H/build_log.md.snap.AB12cd hosts/H/.build_log.snapshot-sha.repair.CD34ef | wc -l | tr -d ' ')" -eq 0
+check "...while the real build_log beside them stays staged" \
+    test "$(git -C "$OPS" ls-files --cached hosts/H/build_log.md | wc -l | tr -d ' ')" -eq 1
+check "...and the guard runs in the push path right after git add -A" \
+    bash -c 'grep -A1 -E "^    git add -A$" <<< "$1" | grep -q "_unstage_reserved_temps"' _ "$SYNC_CODE"
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ]
