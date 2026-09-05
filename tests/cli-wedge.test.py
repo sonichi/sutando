@@ -527,6 +527,29 @@ class Cli(unittest.TestCase):
             self.assertFalse(w.window_path(ws).exists())
             self.assertTrue(w.window_path(ws, "=w1:1").exists() and w.window_path(ws, "=w2:1").exists())
 
+    def test_a_named_session_is_a_worker_not_the_core(self):
+        # Probing workers by --session used to share the core's window and borrow its queue, silently.
+        # A named session is a worker (own slot, no borrowed signal); only the unnamed default is the core.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            (ws / "tasks").mkdir(parents=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            counts = []
+            for sess in ("core-2", "core-4", "core-2", "core-4"):
+                rc, out = self.run_main(*base, "--session", sess)
+                v = json.loads(out); counts.append(v["sample_count"])
+                self.assertFalse(v["work_outstanding"], v)
+                self.assertIn("no work signal", v["work_detail"])
+            self.assertEqual(counts, [1, 1, 2, 2])
+            self.assertFalse(w.window_path(ws).exists(), "a named session must not write the core's window")
+            rc, out = self.run_main(*base)   # the unnamed default IS the core: shared window, its own queue
+            v = json.loads(out)
+            self.assertTrue(w.window_path(ws).exists())
+            self.assertIn("queued task", v["work_detail"])
+
     def test_work_signal_precedence(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d); wf = Path(d) / "w.json"

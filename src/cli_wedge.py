@@ -600,7 +600,8 @@ def main(argv: Optional[list] = None) -> int:
     for name in ("record", "probe"):
         p = sub.add_parser(name)
         p.add_argument("--socket", required=True)
-        p.add_argument("--session", default=os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION))
+        p.add_argument("--session", default=None,
+                       help="a NAMED session is a worker: its own window, no borrowed work signal (default: the core's)")
         p.add_argument("--target", default=None, help="override the resolved =<session>:<window> target")
         if name == "probe":
             p.add_argument("--targets", default=None, help="comma-separated explicit targets, one verdict each (worker panes)")
@@ -635,14 +636,17 @@ def main(argv: Optional[list] = None) -> int:
             out[t] = probe_one(a, ws, t)
         print(json.dumps({"socket": a.socket, "targets": out}, indent=1))
         return 0
-    target = a.target or core_target(a.socket, a.session, a.tmux)
+    # Only the unnamed default is the core's own pane; a named session is a worker like an explicit target.
+    explicit = bool(a.target) or a.session is not None
+    session = a.session or os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION)
+    target = a.target or core_target(a.socket, session, a.tmux)
     if target is None:
-        print(json.dumps({"kind": "unknown", "warn": False, "reason": f"session {a.session!r} not found on {a.socket}"}))
+        print(json.dumps({"kind": "unknown", "warn": False, "reason": f"session {session!r} not found on {a.socket}"}))
         return 0
     if a.cmd == "record":
         print(record(a, lambda: capture_pane(a.socket, target, a.tmux)))
         return 0
-    print(json.dumps(probe_one(a, ws, target, explicit=bool(a.target)), indent=1))
+    print(json.dumps(probe_one(a, ws, target, explicit=explicit), indent=1))
     return 0
 
 
