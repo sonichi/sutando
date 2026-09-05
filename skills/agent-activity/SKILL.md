@@ -41,16 +41,17 @@ are for anything extra the owner asks to see.
 
 ## Working and Thinking rows, automatically (hooks)
 
-The skill declares two Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
-`PreToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
+The skill declares three Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
+`PreToolUse`, `PostToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
 skill hook. The hook never depends on the agent remembering anything:
 
 - **Processing, automatically.** The first `PreToolUse` in a session whose input names a task file
   (`tasks/task-….txt`, a Read or a shell command) binds that task to the hook's own `session_id` in
   `state/agent-activity.sessions.json` and writes its `processing` row from the task's headers (room,
   sender, text). The agent's own `activity.py append --kind processing` still binds, for hand-written rows.
-- **Done, automatically.** A `PreToolUse` that writes `results/task-….txt` (Write, or a shell redirect)
-  writes the task's `done` row, only from the session the task is bound to.
+- **Done, automatically.** A `PostToolUse` whose input wrote `results/task-….txt` (Write, or a shell
+  redirect) writes the task's `done` row, only from the session the task is bound to and only if the
+  result file exists once the tool has run: a denied or failed write closes nothing.
 - **Working.** Every later `PreToolUse` in that session (Read/Glob/Grep/TodoWrite skipped) becomes a
   `working` row for the open task bound to it: the description's first sentence, 100 characters.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`

@@ -234,12 +234,24 @@ class Hook(unittest.TestCase):
         # a task file that does not exist binds nothing
         self.assertEqual(hook.handle(self.pre("S1", "Read", {"file_path": "tasks/task-000000.txt"}), self.p, self.run), [])
 
-    def test_writing_the_result_file_closes_the_task_for_its_own_session_only(self):
+    def post(self, sid, tool, inp):
+        return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
+
+    def test_done_is_written_after_the_result_write_and_only_if_the_file_exists(self):
         self.log({"ts": 1, "room": "!dm:s", "task": {"id": "task-abc123", "from": "@q:s", "text": "x"}, "line": "picked up"})
         hook.bind(self.p, "task-abc123", "S1")
-        # another session writing the same result path closes nothing
-        self.assertEqual(hook.handle(self.pre("S-other", "Write", {"file_path": str(self.ws / "results" / "task-abc123.txt"), "content": "reply"}), self.p, self.run), [])
-        out = hook.handle(self.pre("S1", "Bash", {"command": "cat > \"$WS/results/task-abc123.txt\" << EOF", "description": "Reply"}), self.p, self.run)
+        rpath = self.ws / "results" / "task-abc123.txt"
+        write = {"file_path": str(rpath), "content": "reply"}
+        # PreToolUse: the write is only proposed — no done row, and not a working row either
+        self.assertEqual(hook.handle(self.pre("S1", "Write", dict(write, description="Reply")), self.p, self.run), [])
+        # PostToolUse with the file absent (denied, or the tool failed): still nothing
+        self.assertEqual(hook.handle(self.post("S1", "Write", write), self.p, self.run), [])
+        self.assertEqual(self.runs, [])
+        # the tool ran and produced the artifact: now the task closes
+        rpath.parent.mkdir(exist_ok=True); rpath.write_text("reply")
+        # another session's PostToolUse on the same path closes nothing
+        self.assertEqual(hook.handle(self.post("S-other", "Write", write), self.p, self.run), [])
+        out = hook.handle(self.post("S1", "Bash", {"command": "cat > \"$WS/results/task-abc123.txt\" << EOF"}), self.p, self.run)
         self.assertEqual(out, [("done", "replied")])
         cmd = self.runs[-1]
         self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1]), ("done", "task-abc123", "!dm:s"))

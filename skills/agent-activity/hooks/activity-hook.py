@@ -5,7 +5,9 @@ Reads the hook payload on stdin ({hook_event_name, session_id, transcript_path, 
 - PreToolUse whose input names a task file (tasks/task-….txt) BINDS that task to this session
   (state/agent-activity.sessions.json) and writes its `processing` row from the task's own headers;
   every later PreToolUse in this session becomes a `working` row for the task bound to it
-  (Read/Glob/Grep/TodoWrite skipped). A PreToolUse that writes results/task-….txt writes `done`.
+  (Read/Glob/Grep/TodoWrite skipped). A PostToolUse whose input named results/task-….txt writes
+  `done` — only after the tool ran and only if the result file now exists (a denied or failed write
+  closes nothing).
   The agent's own `activity.py append --kind processing` still binds (and is never a row).
 - Stop reads the last assistant text of THIS session's transcript (complete lines only) -> `thinking`.
 No bound open task -> nothing is written: a row is never attached to a task another session owns.
@@ -252,23 +254,29 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             bind(p, tid, sid)
             emit("processing", "picked up", task, room, p["ws"], run)
             out.append(("processing", "picked up"))
-        # Writing the result file closes the task, from the session that claimed it only. The text says
-        # what the result did: a [no-send]/[REPLIED]/[deduped:] body reached nobody from here.
-        opened = open_tasks(p["log"])
-        for tid in result_file_refs(blob):
-            if tid in opened and binds.get(tid) == sid:
-                task, room = opened[tid]["task"], opened[tid]["room"]
-                text = done_text(blob)
-                emit("done", text, task, room, p["ws"], run)
-                out.append(("done", text))
         if out:
             return out
+        if result_file_refs(blob):
+            return out  # the result write itself is not "working"; PostToolUse decides whether it closed the task
         line = working_line(tool, inp) if isinstance(tool, str) else None
         if line:
             task, room = bound_task(p, sid)
             if task:
                 emit("working", line, task, room, p["ws"], run)
                 out.append(("working", line))
+    elif event == "PostToolUse":
+        inp = payload.get("tool_input")
+        blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
+        binds = load_json(p["bind"], {})
+        opened = open_tasks(p["log"])
+        # The result write closes the task only once the file exists: the tool ran, was not denied,
+        # and produced the artifact. The text says what the result did (a marker body reached nobody).
+        for tid in result_file_refs(blob):
+            if tid in opened and binds.get(tid) == sid and (p["ws"] / "results" / f"{tid}.txt").exists():
+                task, room = opened[tid]["task"], opened[tid]["room"]
+                text = done_text(blob)
+                emit("done", text, task, room, p["ws"], run)
+                out.append(("done", text))
     elif event == "Stop":
         tp = payload.get("transcript_path")
         task, room = bound_task(p, sid)
