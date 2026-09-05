@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""The report must name the workspace it measured.
+"""The human report must name the workspace it measured.
 
-Every probe resolves against `WORKSPACE_DIR`, which `resolve_workspace()`
-derives from the working directory. On a host with two checkouts the same
-command produces two different verdicts and says nothing about which tree it
-read — measured: 10 warnings from one, 19 from the other, seconds apart, and
-NOT a superset (nine names appear, two disappear). The dangerous cell was
-`task-watcher`: `⚠ ... wrote no PID sentinel` against one workspace and
-`✓ streaming watcher alive` against the other, for the SAME pid. The proactive
-loop reads that probe to decide whether to stop or start a watcher.
-
-Every assertion here reads RENDERED OUTPUT, never the source text. A source
-substring stays green when the line is present but unreachable — the reverted-
-source control at the bottom is what proves these tests can fail at all.
+Assertions read rendered output, never source text: a source substring
+stays green when the line is present but unreachable.
 """
 import contextlib
 import importlib.util
@@ -98,10 +88,8 @@ class HumanReportTests(unittest.TestCase):
 class RevertedSourceControl(unittest.TestCase):
     """Proves the tests above discriminate.
 
-    Deleting the line is the weak mutation — a source-substring test catches
-    that one too. This control also runs the `if False:` form, where the text
-    survives and only the BEHAVIOR is gone; that is the mutation a source
-    assertion cannot see, and it is why this file asserts on output.
+    Both mutations, because deleting the line is the weak one: `if False:`
+    leaves the text intact and removes only the behavior.
     """
 
     def _import_mutant(self, source):
