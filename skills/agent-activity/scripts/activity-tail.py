@@ -107,7 +107,7 @@ def rows_from(line: str, ws: Path):
                 yield "thinking", t.split("\n", 1)[0]
 
 
-def emit(kind: str, line: str, task: dict, room: str | None) -> None:
+def writer_argv(kind: str, line: str, task: dict, room: str | None, workspace: Path | None = None) -> list[str]:
     cmd = [sys.executable, str(WRITER), "append", line[:MAXLEN], "--kind", kind, "--task-id", task["id"]]
     if task.get("from"):
         cmd += ["--from", task["from"]]
@@ -115,39 +115,63 @@ def emit(kind: str, line: str, task: dict, room: str | None) -> None:
         cmd += ["--text", task["text"]]
     if room:
         cmd += ["--room", room]
-    subprocess.run(cmd, capture_output=True)
+    if workspace:
+        cmd += ["--workspace", str(workspace)]
+    return cmd
 
 
-def follow(p: dict) -> None:
-    path = newest_transcript(p["projects"])
-    if not path:
-        print("no transcript yet", file=sys.stderr)
-        return
-    pos = path.stat().st_size  # start at the end: history is not news
-    last = None
-    while True:
-        cand = newest_transcript(p["projects"])
-        if cand and cand != path:
-            path, pos = cand, 0
-        with open(path, encoding="utf-8", errors="replace") as f:
-            f.seek(pos)
+def emit(kind: str, line: str, task: dict, room: str | None, workspace: Path | None = None) -> None:
+    subprocess.run(writer_argv(kind, line, task, room, workspace), capture_output=True)
+
+
+class Follower:
+    """One transcript cursor; step() reads what is new and emits rows for the open task."""
+
+    def __init__(self, p: dict, emit_fn=emit):
+        self.p = p
+        self.emit = emit_fn
+        self.path = newest_transcript(p["projects"])
+        self.pos = self.path.stat().st_size if self.path else 0  # start at the end: history is not news
+        self.last: str | None = None
+
+    def step(self) -> int:
+        cand = newest_transcript(self.p["projects"])
+        if cand and cand != self.path:
+            self.path, self.pos = cand, 0
+        if not self.path:
+            return 0
+        with open(self.path, encoding="utf-8", errors="replace") as f:
+            f.seek(self.pos)
             chunk = f.read()
-            pos = f.tell()
+            self.pos = f.tell()
+        n = 0
         for line in chunk.splitlines():
-            for kind, text in rows_from(line, p["ws"]):
-                if text == last:
+            for kind, text in rows_from(line, self.p["ws"]):
+                if text == self.last:
                     continue
-                task, room = open_task(p["log"])
+                task, room = open_task(self.p["log"])
                 if not task:
                     continue
-                emit(kind, text, task, room)
-                last = text
-        time.sleep(POLL_S)
+                self.emit(kind, text, task, room, self.p["ws"])
+                self.last = text
+                n += 1
+        return n
 
 
-def main(argv: list[str] | None = None) -> int:
+def follow(p: dict, sleep=time.sleep) -> None:
+    f = Follower(p)
+    if not f.path:
+        print("no transcript yet", file=sys.stderr)
+        return
+    while True:
+        f.step()
+        sleep(POLL_S)
+
+
+def main(argv: list[str] | None = None, popen=subprocess.Popen, run_follow=follow) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    p = paths()
+    ws = Path(argv[argv.index("--workspace") + 1]) if "--workspace" in argv else None  # tests only
+    p = paths(ws)
     if "--daemon" in argv:
         try:
             pid = int(p["pid"].read_text().strip())
@@ -158,13 +182,13 @@ def main(argv: list[str] | None = None) -> int:
             pass
         p["out"].parent.mkdir(parents=True, exist_ok=True)
         with open(p["out"], "a") as out:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve())], stdout=out,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
+            child = popen([sys.executable, str(Path(__file__).resolve())] + (["--workspace", str(ws)] if ws else []),
+                          stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         p["pid"].write_text(str(child.pid))
         print(f"started {child.pid}")
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    follow(p)
+    run_follow(p)
     return 0
 
 

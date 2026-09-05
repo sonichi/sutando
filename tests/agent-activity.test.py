@@ -2,8 +2,11 @@
 """Tests for skills/agent-activity: the row writer and the transcript tailer's pure parts."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -133,6 +136,118 @@ class Tailer(unittest.TestCase):
                                "input": {"command": "grep task tasks/task-abc123.txt", "description": "Read the newest task"}})
         self.assertEqual(list(tail.rows_from(line, self.ws)),
                          [("working", "Read the newest task: from qingyun: Reading the newest t…")])
+
+
+class WriterCli(unittest.TestCase):
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+
+    def run_main(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = card.main([*argv, "--workspace", str(self.ws)])
+        return rc, json.loads(out.getvalue())
+
+    def test_append_and_done_through_the_cli(self):
+        rc, rec = self.run_main("append", "picked up", "--kind", "processing", "--task-id", "task-1",
+                                "--from", "@q:s", "--text", "x" * 200, "--room", "!r:s")
+        self.assertEqual(rc, 0)
+        self.assertEqual((rec["kind"], rec["room"], rec["task"]["from"], len(rec["task"]["text"])), ("processing", "!r:s", "@q:s", 160))
+        rc, rec = self.run_main("done", "finished", "--task-id", "task-1")
+        self.assertTrue(rec["done"] and rec["kind"] == "done" and "room" not in rec)
+        rc, rec = self.run_main("append", "CI green")
+        self.assertEqual((rec["kind"], "task" in rec), ("notice", False))
+        self.assertEqual(len(card.log_path(self.ws).read_text().splitlines()), 3)
+
+    def test_done_without_a_task_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            card.main(["done", "finished", "--workspace", str(self.ws)])
+
+    def test_task_file_plus_task_id_override(self):
+        p = self.ws / "t.txt"
+        p.write_text("id: task-file\nchannel_id: !team:s\nuser_id: @q:s\ntask: hello\n")
+        rc, rec = self.run_main("append", "x", "--task-file", str(p), "--task-id", "task-cli")
+        self.assertEqual((rec["task"]["id"], rec["task"]["from"], rec["room"]), ("task-cli", "@q:s", "!team:s"))
+
+
+class TailerRuntime(unittest.TestCase):
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        self.p = tail.paths(self.ws)
+        (self.ws / "state").mkdir()
+        (self.p["projects"] / "proj").mkdir(parents=True)
+        self.transcript = self.p["projects"] / "proj" / "s1.jsonl"
+        self.transcript.write_text("")
+
+    def assistant(self, *blocks):
+        return json.dumps({"type": "assistant", "message": {"content": list(blocks)}}) + "\n"
+
+    def test_paths_and_newest_transcript(self):
+        self.assertEqual(tail.newest_transcript(self.p["projects"]), self.transcript)
+        self.assertIsNone(tail.newest_transcript(self.ws / "none"))
+        self.assertEqual(self.p["log"], self.ws / "state" / "agent-activity.jsonl")
+
+    def test_follower_emits_only_new_lines_for_the_open_task_and_dedups(self):
+        self.transcript.write_text(self.assistant({"type": "text", "text": "old history"}))
+        emitted = []
+        f = tail.Follower(self.p, emit_fn=lambda *a: emitted.append(a))
+        self.assertEqual(f.step(), 0, "history before start is not news")
+        with open(self.transcript, "a") as t:
+            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
+        self.assertEqual(f.step(), 0, "no open task: nothing emitted")
+        self.p["log"].write_text(json.dumps({"ts": 1, "room": "!r:s", "task": {"id": "t1", "from": "@q:s", "text": "hi"}, "line": "a"}) + "\n")
+        with open(self.transcript, "a") as t:
+            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
+            t.write(self.assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List"}}))
+            t.write(self.assistant({"type": "text", "text": "Deciding.\nmore"}))
+        self.assertEqual(f.step(), 2)
+        self.assertEqual([(e[0], e[1], e[2]["id"], e[3]) for e in emitted], [("working", "List", "t1", "!r:s"), ("thinking", "Deciding.", "t1", "!r:s")])
+        newer = self.p["projects"] / "proj" / "s2.jsonl"
+        newer.write_text(self.assistant({"type": "text", "text": "new session"}))
+        os.utime(newer, (self.transcript.stat().st_mtime + 5,) * 2)
+        self.assertEqual(f.step(), 1, "a newer transcript is followed from its start")
+        self.assertEqual(f.path, newer)
+
+    def test_writer_argv_and_emit(self):
+        argv = tail.writer_argv("working", "x" * 300, {"id": "t1", "from": "@q:s", "text": "hi"}, "!r:s", self.ws)
+        self.assertEqual(argv[2:4], ["append", "x" * tail.MAXLEN])
+        self.assertEqual(argv[argv.index("--room") + 1], "!r:s")
+        self.assertEqual(argv[argv.index("--workspace") + 1], str(self.ws))
+        tail.emit("working", "hello", {"id": "t1"}, None, self.ws)
+        rows = [json.loads(l) for l in self.p["log"].read_text().splitlines()]
+        self.assertEqual((rows[0]["kind"], rows[0]["line"], rows[0]["task"]["id"]), ("working", "hello", "t1"))
+
+    def test_follow_stops_without_a_transcript_and_polls_with_one(self):
+        empty = Path(tempfile.mkdtemp())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            tail.follow(tail.paths(empty))
+        self.assertIn("no transcript", err.getvalue())
+        calls = []
+
+        def sleep(_):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            tail.follow(self.p, sleep=sleep)
+        self.assertEqual(len(calls), 2)
+
+    def test_main_daemon_uses_the_pidfile_and_foreground_follows(self):
+        spawned = []
+
+        class Child:
+            pid = 4242
+        rc = tail.main(["--daemon", "--workspace", str(self.ws)], popen=lambda *a, **k: (spawned.append(a[0]), Child())[1])
+        self.assertEqual((rc, self.p["pid"].read_text(), "--workspace" in spawned[0]), (0, "4242", True))
+        self.p["pid"].write_text(str(os.getpid()))  # alive: a second start refuses
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tail.main(["--daemon", "--workspace", str(self.ws)], popen=lambda *a, **k: self.fail("must not spawn"))
+        self.assertIn("already running", out.getvalue())
+        followed = []
+        self.assertEqual(tail.main(["--workspace", str(self.ws)], run_follow=lambda p: followed.append(p["ws"])), 0)
+        self.assertEqual(followed, [self.ws])
 
 
 if __name__ == "__main__":
