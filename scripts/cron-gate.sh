@@ -50,7 +50,7 @@ shift
 # task-workstream-grouping-* / task-project-grouping-* are emitted only while
 # the core is idle and declare access_tier: owner, so the tier filter misses them.
 # Tier filter: a task that EXPLICITLY declares a non-owner access_tier (team /
-# other / ambient) is peer or public traffic, not the human-owner DMs/voice this
+# guest / collaborator, or a legacy spelling) is peer or public traffic, not the human-owner DMs/voice this
 # gate exists to yield to. Deferring on it starves the cron for as long as peers
 # keep talking -- observed 2026-08-03: both pending-questions and sync-workspace
 # deferred on two #bot2bot notices, with 6 team-tier tasks arriving in one hour.
@@ -64,7 +64,7 @@ owner_task_queued() {
     [ -n "$f" ] || continue
     tier="$(sed -n 's/^access_tier:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '[:space:]')"
     case "$tier" in
-      team|other|guest|ambient) continue ;;   # explicitly not the owner -> ignore
+      team|other|guest|ambient|collaborator) continue ;;   # explicitly not the owner -> ignore
       *) return 0 ;;                    # owner, or unstated -> yield
     esac
   done <<EOF

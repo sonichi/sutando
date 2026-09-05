@@ -37,7 +37,9 @@ def test_taskify_promotes_ambient_task():
     r = EventConsumer(inbox, h).drain()
     check(len(r["promoted"]) == 1, "consumer: threshold reached → 1 task promoted")
     body = open(r["promoted"][0]).read()
-    check("access_tier: ambient" in body, "consumer: promoted task is ambient tier (never owner)")
+    check("access_tier: guest" in body, "consumer: promoted task is guest tier (never owner)")
+    check("origin: promoted" in body, "consumer: provenance rides its own header")
+    check("access_tier: ambient" not in body, "consumer: the retired ambient spelling is not stamped")
     check("SUTANDO SYSTEM INSTRUCTIONS" in body and "source: events-promotion" in body,
           "consumer: in-band DiD block + events-promotion provenance present")
     check(os.path.basename(r["promoted"][0]).startswith("task-taskify-"),

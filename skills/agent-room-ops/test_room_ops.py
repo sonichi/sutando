@@ -1151,7 +1151,8 @@ class EventAccumulatorTests(unittest.TestCase):
         self.assertEqual(lines[4], f"channel_id: {ROOM}")
         self.assertEqual(lines[5], "priority: low")          # never outranks humans
         self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        self.assertEqual(lines[7], "access_tier: guest")  # trust boundary: never owner
+        self.assertEqual(lines[8], "origin: promoted")  # provenance, not authorization
         prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
         prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])

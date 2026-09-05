@@ -9105,11 +9105,13 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
     try:
         import itertools
 
-        from local_task_protocol import (ACCESS_TIERS, iter_archived_tasks,
+        from local_task_protocol import (ACCESS_TIERS, canonical_access_tier,
+                                         iter_archived_tasks,
                                          parse_task_headers_trusted)
     except Exception:  # noqa: BLE001 — a probe never breaks the run
         return None
-    non_owner = frozenset(ACCESS_TIERS) - {"owner"}
+    # A collaborator is engaged in the live core, never via the codex sandbox.
+    non_owner = frozenset(ACCESS_TIERS) - {"owner", "collaborator"}
 
     if channels_dir is None:
         channels_dir = claude_home_path("channels")
@@ -9170,7 +9172,8 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
                     "cannot be ruled out")
         scanned += 1
         try:
-            tier = parse_task_headers_trusted(task_file.read_text()).get("access_tier")
+            tier = canonical_access_tier(
+                parse_task_headers_trusted(task_file.read_text()).get("access_tier"))
         except Exception:  # noqa: BLE001 — an unreadable task is not evidence
             continue
         if tier in non_owner:

@@ -77,6 +77,7 @@ class EmitChannelTest(unittest.TestCase):
         cases = {
             "owner": "owner",
             "team": "team",
+            "collaborator": "team",
             "guest": "public",
             "other": "public",
             "public": "public",

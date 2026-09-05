@@ -8,7 +8,7 @@ meaningful events into ONE task file in tasks/, which the existing Core task
 watcher then processes through the normal path (so no new Core runtime wiring).
 
 Trust boundary (sonichi/sutando#2292 P1-1, carried here): a promoted task is
-`access_tier: ambient` — NEVER owner. Its body is an OBSERVATION of room activity
+`access_tier: guest` with `origin: promoted` — NEVER owner. Its body is an OBSERVATION of room activity
 (anyone in the room could have produced it), so it must not authorize privileged
 ops; the Core fails it closed to the sandbox path. priority=low, model_hint=
 efficient, and a deterministic id keyed on the source event_ids (idempotent — a
@@ -146,7 +146,8 @@ class TaskifyHandler:
             f"channel_id: {room}",
             "priority: low",
             "model_hint: efficient",
-            "access_tier: ambient",
+            "access_tier: guest",
+            "origin: promoted",
             "",
             "events (UNTRUSTED, observed verbatim):",
             *summaries,
@@ -177,7 +178,7 @@ class TaskifyHandler:
             task_processed("events-promotion")
         except Exception:
             pass
-        self._log(f"event-consumer: promoted {n} events → {task_id} (ambient)")
+        self._log(f"event-consumer: promoted {n} events → {task_id} (guest, promoted)")
         return path
 
 
