@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""cli_wedge: normalization, novelty, the advisory classifier, the persisted
+window, the I/O edge with fakes, and the record/replay/probe CLI end to end."""
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
+import cli_wedge as w  # noqa: E402
+
+IDLE = "❯ \n⏵⏵ bypass permissions on · 1 monitor · esc to interrupt\n"
+
+
+def idle_with_clock(i):
+    return f"❯ \n⏵⏵ bypass permissions on · 12:0{i % 10}:0{i % 6} PM · 1 monitor\n"
+
+
+def retry_frame(i):
+    return f"Connection error. Retrying in {3 * (i % 3)}s… (attempt {i}/10) 04:2{i % 10}:11\n"
+
+
+def working_frame(i):
+    return f"● step: wrote {'abcdefghijklmnopqrstuvwxyz'[i]}.ts\n  editing hunk\n"
+
+
+class Normalization(unittest.TestCase):
+    def test_volatile_fields_collapse_to_one_state(self):
+        frames = [idle_with_clock(i) for i in range(12)]
+        self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+
+    def test_each_volatile_class_is_replaced(self):
+        n = w.normalize("2026-09-05T04:20:01Z 12:34 PM took 3.5s 12.3k tokens 3/10 45% ⠋ loading... ───── run 42")
+        for token in ("<ts>", "<clock>", "<dur>", "<tokens>", "<count>", "<pct>", "<spin>", "<dots>", "<rule>", "#"):
+            self.assertIn(token, n, token)
+        self.assertNotRegex(n, r"\d")
+
+    def test_real_content_change_is_a_new_state(self):
+        self.assertNotEqual(w.state_id(working_frame(0)), w.state_id(working_frame(1)))
+
+    def test_blank_lines_and_trailing_space_do_not_count(self):
+        self.assertEqual(w.state_id("a  \n\n\nb\n"), w.state_id("a\nb"))
+
+
+class NoveltyStats(unittest.TestCase):
+    def test_static(self):
+        nov = w.novelty([IDLE] * 5)
+        self.assertEqual((nov.sample_count, nov.novel_state_count, nov.static), (5, 1, True))
+        self.assertAlmostEqual(nov.novelty_rate, 0.2)
+
+    def test_all_novel(self):
+        nov = w.novelty([working_frame(i) for i in range(10)])
+        self.assertEqual((nov.novel_state_count, nov.novelty_rate, nov.static), (10, 1.0, False))
+
+    def test_cycling_states_are_counted_once(self):
+        frames = [f"state {'ABC'[i % 3]}\n" for i in range(12)]
+        nov = w.novelty(frames)
+        self.assertEqual(nov.novel_state_count, 3)
+        self.assertAlmostEqual(nov.novelty_rate, 0.25)
+
+    def test_empty(self):
+        self.assertEqual(w.novelty([]).novelty_rate, 0.0)
+
+
+class Classifier(unittest.TestCase):
+    def test_idle_when_static_and_nothing_outstanding(self):
+        v = w.classify([idle_with_clock(i) for i in range(6)], False, 30)
+        self.assertEqual((v["kind"], v["warn"]), ("idle", False))
+
+    def test_case1_static_with_work_warns_low_then_high(self):
+        frames = [idle_with_clock(i) for i in range(6)]
+        low = w.classify(frames, True, 60, "core-status running")
+        high = w.classify(frames, True, 900, "core-status running")
+        self.assertEqual((low["kind"], low["warn"], low["confidence"]), ("static-with-work", True, "low"))
+        self.assertEqual(high["confidence"], "high")
+        self.assertIn("core-status running", high["reason"])
+
+    def test_case2_retry_loop_when_only_counters_move(self):
+        v = w.classify([retry_frame(i) for i in range(20)], True, 60)
+        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("retry-loop", True, "high"))
+        self.assertIn("retrying", v["matched_patterns"])
+        self.assertEqual(v["novel_state_count"], 1)
+
+    def test_case2_retry_loop_over_cycling_states(self):
+        frames = [f"rate limit hit, backing off ({'ABC'[i % 3]})\n" for i in range(12)]
+        v = w.classify(frames, True, 60)
+        self.assertEqual(v["kind"], "retry-loop")
+        self.assertIn("rate-limit", v["matched_patterns"])
+
+    def test_retry_text_with_few_samples_is_medium_confidence(self):
+        v = w.classify([retry_frame(i) for i in range(4)], True, 10)
+        self.assertEqual((v["kind"], v["confidence"]), ("retry-loop", "medium"))
+
+    def test_low_novelty_without_retry_text_is_a_soft_warning(self):
+        frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
+        v = w.classify(frames, True, 60)
+        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
+
+    def test_working_is_not_a_warning(self):
+        v = w.classify([working_frame(i) for i in range(20)], True, 60)
+        self.assertEqual((v["kind"], v["warn"]), ("working", False))
+        v2 = w.classify([working_frame(i // 3) for i in range(12)], True, 60)
+        self.assertEqual((v2["kind"], v2["confidence"]), ("working", "medium"))
+
+    def test_too_few_samples_is_unknown_not_a_warning(self):
+        v = w.classify([IDLE], True, 5)
+        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("unknown", False, "none"))
+
+    def test_thresholds_are_reported_and_overridable(self):
+        v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
+                       thresholds={"min_samples": 4, "low_novelty_rate": 0.5})
+        self.assertEqual(v["kind"], "low-novelty")
+        self.assertEqual(v["thresholds"]["min_samples"], 4)
+        # the same frames under the provisional thresholds read as working (2/6 = 0.33 > 0.25)
+        self.assertEqual(w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60)["kind"], "working")
+        self.assertTrue(v["advisory"])
+        self.assertIn("not a health guarantee", v["note"])
+
+
+class IoEdge(unittest.TestCase):
+    def test_capture_pane_returns_stdout_on_success_none_otherwise(self):
+        ok = w.capture_pane("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="frame\n"))
+        bad = w.capture_pane("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+
+        def boom(*a, **k):
+            raise OSError("no tmux")
+
+        self.assertEqual(ok, "frame\n")
+        self.assertIsNone(bad)
+        self.assertIsNone(w.capture_pane("/s", "core", "tmux", runner=boom))
+
+    def test_work_outstanding_reads_core_status_and_task_queue(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "state").mkdir()
+            (ws / "tasks").mkdir()
+            self.assertEqual(w.work_outstanding(ws), (False, ""))
+            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
+            self.assertEqual(w.work_outstanding(ws), (True, "core-status running"))
+            (ws / "state" / "core-status.json").write_text("{not json")
+            (ws / "tasks" / "task-abc.txt").write_text("task: x\n")
+            self.assertEqual(w.work_outstanding(ws), (True, "1 queued task(s)"))
+
+    def test_window_persists_and_measures_the_static_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "tasks").mkdir()
+            (ws / "state").mkdir()
+            (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
+            entries = w.append_window(ws, working_frame(0), 1000.0)
+            entries = w.append_window(ws, idle_with_clock(1), 1100.0)
+            entries = w.append_window(ws, idle_with_clock(2), 1400.0)
+            self.assertEqual(len(entries), 3)
+            v = w.classify_window(entries, w.work_outstanding(ws), 1500.0)
+            # the static run started at 1100 (the working frame before it does not count)
+            self.assertEqual(v["duration"], 400.0)
+            self.assertEqual(v["kind"], "static-with-work")
+            self.assertEqual(v["trailing_static_samples"], 2)
+            self.assertEqual(v["sample_count"], 3)  # the window is still reported whole
+            # a corrupt line is skipped, not fatal; the cap holds
+            with w.window_path(ws).open("a") as fh:
+                fh.write("{not json\n")
+            for i in range(30):
+                entries = w.append_window(ws, working_frame(i % 26), 2000.0 + i, keep=20)
+            self.assertEqual(len(entries), 20)
+            self.assertEqual(w.classify_window([], (False, ""), 0.0)["kind"], "unknown")
+
+
+def fake_tmux(dir_: Path, frames_file: Path) -> Path:
+    """A stand-in tmux binary: each capture-pane prints the next frame from a file."""
+    script = dir_ / "tmux"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, pathlib\n"
+        f"ff = pathlib.Path({str(frames_file)!r}); idx = pathlib.Path({str(frames_file)!r} + '.idx')\n"
+        "frames = ff.read_text().split('\\n===\\n')\n"
+        "i = int(idx.read_text()) if idx.exists() else 0\n"
+        "idx.write_text(str(i + 1))\n"
+        "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script
+
+
+class Cli(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "src" / "cli_wedge.py"), *args], capture_output=True, text=True)
+
+    def test_record_then_replay_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(retry_frame(i) for i in range(12)))
+            tmux = fake_tmux(Path(d), frames)
+            r = self.run_cli("record", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws),
+                             "--label", "retry", "--seconds", "5", "--interval", "0", "--max-samples", "12", "--keep-raw")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            trace = Path(r.stdout.strip())
+            self.assertTrue(trace.exists() and trace.name.startswith("retry-"))
+            lines = [json.loads(l) for l in trace.read_text().splitlines()]
+            self.assertEqual(len(lines), 13)  # 12 samples + summary
+            self.assertTrue(lines[-1]["summary"])
+            self.assertIn("raw", lines[0])
+            rep = self.run_cli("replay", str(trace), "--work-outstanding")
+            self.assertEqual(rep.returncode, 0, rep.stderr)
+            verdict = json.loads(rep.stdout)
+            self.assertEqual(verdict["kind"], "retry-loop")
+
+    def test_probe_persists_a_window_and_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            (ws / "tasks").mkdir(parents=True)
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE, IDLE, IDLE]))
+            tmux = fake_tmux(Path(d), frames)
+            out = None
+            for _ in range(3):
+                r = self.run_cli("probe", "--socket", "/x", "--tmux", str(tmux), "--workspace", str(ws))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = json.loads(r.stdout)
+            self.assertEqual(out["kind"], "idle")
+            self.assertEqual(out["sample_count"], 3)
+            self.assertTrue(w.window_path(ws).exists())
+
+    def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self.run_cli("probe", "--socket", "/x", "--tmux", "/nonexistent/tmux", "--workspace", d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout)["kind"], "unknown")
+
+    def test_record_sampler_none_frames_are_skipped(self):
+        args = SimpleNamespace(workspace=tempfile.mkdtemp(), label="idle", seconds=3, interval=0, max_samples=5, keep_raw=False)
+        t = [0.0]
+
+        def clock():
+            t[0] += 1.0
+            return t[0]
+
+        calls = [None, IDLE, IDLE]
+        path = w.record(args, lambda: calls.pop(0) if calls else IDLE, clock=clock, sleep=lambda s: None)
+        lines = [json.loads(l) for l in path.read_text().splitlines()]
+        self.assertTrue(lines[-1]["summary"])
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertNotIn("raw", lines[0])
+
+    def test_replay_skips_corrupt_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.jsonl"
+            p.write_text("{bad\n" + json.dumps({"ts": 1, "normalized": "a"}) + "\n")
+            self.assertEqual(w.replay(p)["kind"], "unknown")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

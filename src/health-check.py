@@ -752,6 +752,40 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
     return sorted(found)
 
 
+
+def check_cli_wedge() -> dict:
+    """Advisory CLI progress detector over the core's tmux pane (src/cli_wedge.py).
+
+    Case 1: normalized pane unchanged while work is outstanding. Case 2: the
+    pane moves but revisits states already seen (retry loop). It reads the
+    pane, not the process — a green here is not core health — and it only
+    ever warns: nothing keys recovery off this check.
+    """
+    check = {"name": "cli-wedge", "status": "ok", "detail": ""}
+    try:
+        import cli_wedge  # src/ is on sys.path (see the workspace_default import)
+    except Exception as e:  # noqa: BLE001 — a missing detector is a detail, not a failure
+        check["detail"] = f"detector unavailable: {e}"
+        return check
+    socket = _local_core_socket()
+    if not socket:
+        check["detail"] = "no local core pane to read (no fresh heartbeat on this host)"
+        return check
+    res = _run_tmux(socket, "capture-pane", "-p", "-t", "=sutando-core")
+    if res is None or getattr(res, "returncode", 1) != 0:
+        check["detail"] = "pane not readable — no reading, not a verdict"
+        return check
+    now = time.time()
+    entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now)
+    verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR), now)
+    check["status"] = "warn" if verdict.get("warn") else "ok"
+    check["detail"] = (f"{verdict['kind']} ({verdict['confidence']}): {verdict['reason']}"
+                       " — advisory; reads the pane, not the process")
+    check["evidence"] = {k: verdict.get(k) for k in
+                         ("duration", "sample_count", "novel_state_count", "novelty_rate",
+                          "matched_patterns", "work_outstanding")}
+    return check
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -11324,6 +11358,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
+    # Advisory CLI progress detector (pane static with work outstanding / retry
+    # loop); reads the pane, never the process, and drives no recovery.
+    checks.append(check_cli_wedge())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
