@@ -1,0 +1,11 @@
+{
+  "name": "wizard",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "The /wizard short tour: five or six sentences on what matters most, plus the desktop app's tour card whose buttons open the key pages.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
