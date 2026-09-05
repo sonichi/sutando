@@ -126,6 +126,18 @@ check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
 check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
 go, why = tsc.should_run({"tools_mtime": 5.0, "ran_at": 0.0}, 5.0, 3600, 7200.0)
 check("unchanged but older than --max-age -> run", (go, "last run was" in why), (True, True))
+
+# A red run stamps `ran_at`/`tools_mtime` like any other, so without reading the
+# recorded failure list the next call reports fresh and exits 0 on a red tree.
+go, why = tsc.should_run(
+    {"tools_mtime": 5.0, "ran_at": 90.0, "failed": ["a.test.py"]}, 5.0, 3600, 100.0)
+check("a previous run with FAILURES re-runs, though nothing changed",
+      (go, "failing" in why), (True, True))
+check("CONTROL: the same state with an EMPTY failed list is fresh",
+      tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0, "failed": []},
+                     5.0, 3600, 100.0)[0], False)
+check("CONTROL: and with no `failed` key at all it is still fresh",
+      tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
 with tempfile.TemporaryDirectory() as td:
     check("no scripts/ dir -> exit 2", tsc.main(["--workspace", td]), 2)
     (Path(td) / "scripts").mkdir()

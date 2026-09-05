@@ -154,6 +154,10 @@ def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple
         return True, "no previous run recorded"
     if newest > state.get("tools_mtime", 0.0):
         return True, "a tool or suite changed since the last green run"
+    # The failure list is recorded on every run; without this it was written
+    # and never read, so one red pass reported and the next skipped it.
+    if state.get("failed"):
+        return True, f"previous run left {len(state['failed'])} suite(s) failing"
     age = now - state.get("ran_at", 0.0)
     if age > max_age:
         return True, f"last run was {age/3600:.1f}h ago (> {max_age/3600:.0f}h)"
