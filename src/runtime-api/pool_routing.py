@@ -122,8 +122,18 @@ def load_config(state_dir: Path) -> RoutingConfig:
     return RoutingConfig(
         policy=str(data.get("policy") or DEFAULT_POLICY),
         rules=rules if isinstance(rules, list) else [],
-        allow_delegation=bool(data.get("allow_delegation", False)),
+        allow_delegation=data.get("allow_delegation", False) is True,
         source=str(p), roots=roots)
+
+
+def _selector_ids(value):
+    """`only`/`exclude` take a str or list of str, normalized like `to`. A raw
+    str would otherwise do SUBSTRING membership; anything else is unusable."""
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return set(value)
+    return None
 
 
 # ── built-in policies ─────────────────────────────────────────────────────
@@ -260,11 +270,15 @@ class Router:
                 if rule.get("to"):
                     to = rule["to"] if isinstance(rule["to"], list) else [rule["to"]]
                     cand = [w for w in cand if w.id in to]
-                if rule.get("only"):
-                    cand = [w for w in cand if w.id in rule["only"]]
-                if rule.get("exclude"):
-                    cand = [w for w in cand if w.id not in rule["exclude"]]
                 name = str(rule.get("policy") or "least-loaded")
+                for field, keep in (("only", True), ("exclude", False)):
+                    if not rule.get(field):
+                        continue
+                    ids = _selector_ids(rule[field])
+                    if ids is None:
+                        return Decision(None, name, i,
+                                        reason=f"rule {field!r} is not a str or list of str")
+                    cand = [w for w in cand if (w.id in ids) is keep]
                 if not cand:
                     return Decision(None, name, i, reason="rule narrowed to no live worker")
                 got = self._run(name, task, cand, affinity)

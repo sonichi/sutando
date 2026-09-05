@@ -141,6 +141,51 @@ class Rules(Base):
         self.assertIn("no live worker", t["reason"])
 
 
+class MalformedConfigMustNotFailOpen(Base):
+    """A false-looking value must not open delegation, and a scalar selector
+    must not do substring membership — both routed outside the declared set."""
+
+    def test_string_false_does_not_open_delegation(self):
+        self.routing(allow_delegation="false")
+        cfg = load_config(self.state)
+        self.assertIs(cfg.allow_delegation, False,
+                      "JSON allow_delegation='false' opened delegation")
+
+    def test_literal_true_still_opens_delegation(self):
+        self.routing(allow_delegation=True)
+        self.assertIs(load_config(self.state).allow_delegation, True,
+                      "control: a literal JSON true must still open it")
+
+    def test_scalar_only_does_not_substring_match(self):
+        self.pool = ["core-1", "core-10", "core-2"]
+        self.routing(rules=[{"match": {"source": "slack"}, "only": "core-10"}])
+        self.write("task-1.txt", task())
+        self.lead().sweep()
+        self.assertEqual(self.assigned()["task-1.txt"], "core-10",
+                         "a scalar 'only' substring-matched core-1 out of 'core-10'")
+
+    def test_scalar_exclude_does_not_substring_match(self):
+        self.pool = ["core-1", "core-10"]
+        self.routing(rules=[{"match": {"source": "slack"}, "exclude": "core-10"}])
+        self.write("task-1.txt", task())
+        self.lead().sweep()
+        self.assertEqual(self.assigned()["task-1.txt"], "core-1")
+        # The worker alone does not discriminate: at the parent BOTH ids are
+        # substring-excluded, the rule empties, and the fallback also picks core-1.
+        t = self.trace("routed")[0]
+        self.assertFalse(t["fallback"],
+                         "a scalar 'exclude' emptied the rule and forced a fallback")
+
+    def test_unusable_selector_type_falls_back_with_a_reason(self):
+        self.routing(rules=[{"match": {"source": "slack"}, "only": {"id": "core-1"}}])
+        self.write("task-1.txt", task())
+        self.lead().sweep()
+        self.assertIn(self.assigned()["task-1.txt"], self.pool)
+        t = self.trace("routed")[0]
+        self.assertTrue(t["fallback"])
+        self.assertIn("not a str or list of str", t["reason"])
+
+
 class BrokenPolicyDegrades(Base):
     def test_custom_that_raises_falls_back(self):
         mod = Path(self.tmp.name) / "bad.py"
