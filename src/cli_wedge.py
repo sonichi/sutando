@@ -401,18 +401,27 @@ def work_signal(target: Optional[str], workspace: Path, now: float, work_file: O
     return work_outstanding(workspace, now)
 
 
+def _local_host_label() -> str:
+    """The label the heartbeat writes its file under (util_paths is the single source of truth)."""
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:
+        import socket as _socket
+        return _socket.gethostname().split(".")[0]
+
+
 def core_identity(workspace: Path) -> tuple:
     """(socket, session) of THIS host's core as its heartbeat records it; the configured default
-    when no record is readable. The record is the authority — an env value is only a claim."""
+    when no record is readable. Only this host's file counts: a shared workspace holds peers' too,
+    and the environment names a pane to probe, never who the core is."""
     try:
-        recs = sorted((workspace / "state" / "cores").glob("*.alive"), key=lambda q: q.stat().st_mtime, reverse=True)
-        for q in recs:
-            r = json.loads(q.read_text())
-            if isinstance(r.get("session"), str) and r.get("session"):
-                return (r.get("socket") or None, r["session"])
+        r = json.loads((workspace / "state" / "cores" / f"{_local_host_label()}.alive").read_text())
+        if isinstance(r, dict) and isinstance(r.get("session"), str) and r.get("session"):
+            return (r.get("socket") or None, r["session"])
     except (OSError, ValueError, AttributeError):
         pass
-    return (None, os.environ.get("SUTANDO_TMUX_SESSION", DEFAULT_SESSION))
+    return (None, DEFAULT_SESSION)
 
 
 def window_slot(socket_path: str, target: str) -> str:

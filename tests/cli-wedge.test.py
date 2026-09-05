@@ -528,9 +528,29 @@ class Cli(unittest.TestCase):
             self.assertFalse(w.window_path(ws).exists())
             self.assertTrue(w.window_path(ws, w.window_slot("/s", "=w1:1")).exists() and w.window_path(ws, w.window_slot("/s", "=w2:1")).exists())
 
+    def setUp(self):
+        super().setUp()
+        p = patch.object(w, "_local_host_label", return_value="host"); p.start(); self.addCleanup(p.stop)
+
     def _alive(self, ws: Path, session: str, socket: str = "/s") -> None:
         cores = ws / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
         (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": socket, "session": session, "schema_version": 4}))
+
+    def test_core_identity_reads_this_hosts_heartbeat_only(self):
+        # A shared workspace holds other hosts' heartbeats; a fresher peer record must not become the
+        # local core, and with no local record the identity is the configured default, never the env.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": "/s", "session": "sutando-core"}))
+            (cores / "peer.alive").write_text(json.dumps({"host": "peer", "socket": "/p", "session": "core-9"}))
+            os.utime(cores / "host.alive", (1, 1))  # the peer's record is the newer one
+            with patch.object(w, "_local_host_label", return_value="host"):
+                self.assertEqual(w.core_identity(ws), ("/s", "sutando-core"))
+                (cores / "host.alive").unlink()
+                with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                    self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
+                (cores / "host.alive").write_text("not json")
+                self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
 
     def test_role_comes_from_identity_not_from_how_the_session_was_spelled(self):
         # The heartbeat record names the core's session. Naming that session explicitly is still the
@@ -559,10 +579,14 @@ class Cli(unittest.TestCase):
             v = json.loads(out); self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False))
             rc, out = self.run_main(*base, "--target", "=core-9:0", "--role", "core")
             self.assertEqual(json.loads(out)["role"], "core")
-            # no heartbeat record: the configured default is the core, a named other session a worker
+            # no heartbeat record: the configured default is the core, a named other session a worker,
+            # and a session named only by the environment is a worker too (never promoted to core)
             (ws / "state" / "cores" / "host.alive").unlink()
             rc, out = self.run_main(*base); self.assertEqual(json.loads(out)["role"], "core")
             rc, out = self.run_main(*base, "--session", "core-3"); self.assertEqual(json.loads(out)["role"], "worker")
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                rc, out = self.run_main(*base)
+            v = json.loads(out); self.assertEqual((v["role"], v["target"]), ("worker", "=core-2:0"), v)
 
     def test_windows_are_keyed_by_socket_as_well_as_target(self):
         # Two tmux servers on one host can both hold =core-2:1; the same target on two sockets must not
