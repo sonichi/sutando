@@ -420,7 +420,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
             self.assertTrue(core_heartbeat._pid_running(os.getpid()))   # unknown state reads as running
         # main(--stop) with nothing to stop still answers, and never raises
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = core_heartbeat.main(["--stop"])
@@ -432,6 +433,40 @@ class TestHeartbeatWrite(unittest.TestCase):
         core_heartbeat._pidfile().write_text(f"424242 {script}\n")
         with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
             self.assertEqual(core_heartbeat.stop_other_writers(), 0)              # cannot verify → left alone
+
+    def test_handoff_edge_paths_are_covered_in_process(self):
+        # Records: an absent pidfile and a .alive naming a heartbeat_pid; argv with no script at all;
+        # a pid that vanishes between ps and SIGTERM; a pid that ignores SIGTERM and takes the SIGKILL path.
+        import core_heartbeat
+        script = str(Path(core_heartbeat.__file__).resolve())
+        cores = self.tmp / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
+        core_heartbeat._pidfile().unlink(missing_ok=True)
+        (cores / f"{_short_host()}.alive").write_text(json.dumps({"heartbeat_pid": 777001}))
+        self.assertEqual(core_heartbeat._recorded_writer_pids(), [777001])
+        (cores / f"{_short_host()}.alive").write_text("not json")
+        self.assertEqual(core_heartbeat._recorded_writer_pids(), [])
+        self.assertFalse(core_heartbeat._is_writer_argv("bash -c sleep 60", script))
+        quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}
+        old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()))
+            # vanished between ps and SIGTERM: counted as handled, nothing raised
+            with patch("core_heartbeat.os.kill", side_effect=ProcessLookupError), patch("core_heartbeat._pid_running", return_value=False):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.5), 1)
+            self.assertIsNone(old.poll())      # the patch swallowed the signal; the writer is still there
+            # ignores SIGTERM (simulated by _pid_running staying True): the SIGKILL path runs and ends it
+            with patch("core_heartbeat._pid_running", return_value=True):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.3), 1)
+            self.assertIsNotNone(old.wait(timeout=5))
+            # SIGKILL on a pid that is already gone is not an error
+            core_heartbeat._pidfile().write_text(f"{old.pid} {script}\n")
+            with patch("core_heartbeat.subprocess.run", return_value=subprocess.CompletedProcess([], 0, f"python3 {script} --interval 60", "")), \
+                 patch("core_heartbeat._pid_running", return_value=True), \
+                 patch("core_heartbeat.os.kill", side_effect=[None, ProcessLookupError]):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.2), 1)
+        finally:
+            if old.poll() is None:
+                old.kill(); old.wait()
 
     def test_client_and_socket_helpers_fail_closed_on_errors(self):
         import core_heartbeat
