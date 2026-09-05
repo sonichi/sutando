@@ -27,6 +27,7 @@ from task_archive import find_task_file  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from delivery.publication import publish_result  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -91,10 +92,10 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def atomic_text(path: Path, value: str) -> None:
+    # Publication policy has one owner; this keeps only the mkdir the
+    # scheduler's own paths need before it.
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(value)
-    os.replace(tmp, path)
+    publish_result(path, value)
 
 
 @contextmanager
@@ -241,7 +242,9 @@ def _task_body(
     prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
     if job.get("delivery") == "proactive":
         prompt += (
-            f" Write the concise owner-facing result to {proactive_path}, then write "
+            f" Publish the concise owner-facing result as {proactive_path}: write "
+            f"{proactive_path.parent}/.{proactive_path.name}.tmp, then `mv` it to the final "
+            f"name (never write the final name in place; a bridge claims it on sight). Then write "
             f"[no-send] to {result_path} so this scheduled task is archived without a duplicate reply."
         )
     elif job.get("_silent_result"):

@@ -135,9 +135,9 @@ class _FenceProxy:
     def claim(self, path):
         return self._real.claim(path)
 
-    def confirm(self, claim):
+    def confirm(self, claim, delivered=None):
         self._calls.append("confirm")
-        return self._real.confirm(claim)
+        return self._real.confirm(claim, delivered)
 
     def drop(self, claim, reason):
         self._calls.append("drop")
@@ -171,6 +171,10 @@ def _run_proactive_pass(db, results_dir: Path) -> tuple[list[str], list[str]]:
     routing = types.ModuleType("proactive_routing")
     routing.should_claim_proactive_file = lambda *_a, **_k: True
     routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
+    # The poll path re-checks routing on the body it SENDS, so the stub must
+    # carry the real guard or that runtime import fails under the stub.
+    routing.proactive_body_guard = _real_proactive_routing_module.proactive_body_guard
+    routing.proactive_destination = _real_proactive_routing_module.proactive_destination
     sys.modules["proactive_routing"] = routing
 
     delivered: list[str] = []

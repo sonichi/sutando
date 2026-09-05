@@ -125,7 +125,10 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # Note: used with `.match()` below, which always anchors at string start —
 # no MULTILINE flag needed (re.MULTILINE only affects `^`/`$` in scan-style
 # methods like `.search()` / `.finditer()`).
-_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]*)\]\s*\n?")
+# The value may carry ONE bracketed segment (`!r:[2001:db8::1]:8448` — Matrix
+# bracketed-IPv6 hosts); a first-`]` cut truncated those mid-address.
+_REDIRECT_RE = re.compile(
+    r"^\s*\[channel:\s*([^\]\[]*(?:\[[^\]]*\][^\]\[]*)?)\]\s*\n?")
 
 # D7 reply-header pattern (owner directive 2026-05-19) — pool cores prepend
 # `**[core: N]**` plus an optional italic `_(...)_` sub-line to every

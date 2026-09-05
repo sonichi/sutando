@@ -44,8 +44,10 @@ class TestSchedulerWriterGolden(unittest.TestCase):
             "priority: low\n"
             "schedule_name: morning-briefing\n"
             "schedule_slot: 2026-08-07T06:00:00Z\n"
-            "task: /morning-briefing Write the concise owner-facing result to "
-            "/ws/results/proactive-morning-briefing-1786082400.txt, then write "
+            "task: /morning-briefing Publish the concise owner-facing result as "
+            "/ws/results/proactive-morning-briefing-1786082400.txt: write "
+            "/ws/results/.proactive-morning-briefing-1786082400.txt.tmp, then `mv` it to the final "
+            "name (never write the final name in place; a bridge claims it on sight). Then write "
             "[no-send] to /ws/results/task-cron-morning-briefing-1786082400.txt "
             "so this scheduled task is archived without a duplicate reply.\n"))
 

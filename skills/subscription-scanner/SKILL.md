@@ -69,7 +69,7 @@ Monthly: 1st of every month at 08:13 (off-peak minute) — see `skills/schedule-
 {
   "name": "subscription-scan",
   "cron": "13 8 1 * *",
-  "prompt": "Run the monthly paid-subscription scan. Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim. Update skills/subscription-scanner/state/subscriptions.json with the latest list, snapshot the previous version to state/history/, and write a proactive Telegram notification to results/proactive-{ts}.txt only if subscriptions were added, removed, or had price changes since the previous scan. Stay silent if nothing changed."
+  "prompt": "Run the monthly paid-subscription scan. Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim. Update skills/subscription-scanner/state/subscriptions.json with the latest list, snapshot the previous version to state/history/, and publish a proactive Telegram notification as results/proactive-{ts}.txt (write results/.proactive-{ts}.txt.tmp, then mv it to the final name; never write the final name in place) only if subscriptions were added, removed, or had price changes since the previous scan. Stay silent if nothing changed."
 }
 ```
 

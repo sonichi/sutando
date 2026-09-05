@@ -35,7 +35,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from proactive_routing import should_claim_proactive  # noqa: E402
+from proactive_routing import (should_claim_proactive,  # noqa: E402
+                               should_claim_proactive_file)
 
 
 def _with_state(content, fn):
@@ -220,6 +221,70 @@ def test_bridge_channels_set_is_documented():
     )
 
 
+def test_body_leg_discord_claims_its_own_target():
+    """A [channel: <discord-id>] body is claimable by discord even when
+    activity routing points elsewhere — the 2026-08-23 deadlock fix."""
+    body = "[channel: 1535008729106485288]\nhello"
+    def fn(state):
+        assert should_claim_proactive_file(
+            "proactive-1.txt", state, "discord",
+            body_reader=lambda: body) is True
+        assert should_claim_proactive_file(
+            "proactive-1.txt", state, "telegram",
+            body_reader=lambda: body) is False
+    _with_state({"ts": 9999999999, "channel": "ag2space"}, fn)
+
+
+def test_body_leg_fallbacks_and_precedence():
+    def fn(state):
+        # empty body -> activity routing (ag2space active -> discord declines)
+        assert should_claim_proactive_file(
+            "proactive-1.txt", state, "discord",
+            body_reader=lambda: "") is False
+        # unreadable body -> activity routing, never raises
+        def boom():
+            raise OSError("gone")
+        assert should_claim_proactive_file(
+            "proactive-1.txt", state, "discord", body_reader=boom) is False
+        # filename destination tag outranks the body target
+        assert should_claim_proactive_file(
+            "proactive-1.to-telegram.txt", state, "telegram",
+            body_reader=lambda: "[channel: 1535008729106485288]\nx") is True
+        # dm-only disarms the redirect -> body leg abstains -> activity routing
+        assert should_claim_proactive_file(
+            "proactive-1.txt", state, "ag2space",
+            body_reader=lambda: "[dm-only]\n[channel: 1535008729106485288]\nx"
+        ) is True
+    _with_state({"ts": 9999999999, "channel": "ag2space"}, fn)
+
+
+def test_delivery_guard_shares_the_claim_gates_precedence():
+    """proactive_body_guard: filename outranks the body's redirect, so the
+    delivery-time re-check can never reverse the claim decision (kewei P1)."""
+    from proactive_routing import proactive_body_guard
+    disc = "[channel: 1535008729106485288]\nx"
+    room = "[channel: !r:ag2.space]\nx"
+    # destined file: the body's foreign redirect is overridden, both modes
+    assert proactive_body_guard("p.to-telegram.txt", disc, "telegram") is True
+    assert proactive_body_guard("p.to-slack.txt", disc, "slack") is True
+    assert proactive_body_guard("p.to-discord.txt", room, "discord",
+                                strict=True) is True
+    # a foreign filename blocks delivery even when the body matches
+    assert proactive_body_guard("p.to-discord.txt",
+                                "[channel: C0123ABCD]\nx", "slack") is False
+    # undestined: pre-existing body rules apply unchanged
+    assert proactive_body_guard("p.txt", disc, "telegram") is False
+    assert proactive_body_guard("p.txt", "[channel: garbage]\nx",
+                                "telegram") is True
+    assert proactive_body_guard("p.txt", "no marker", "telegram") is True
+    # strict (default destination): unrecognised is foreign, own id is not
+    assert proactive_body_guard("p.txt", "[channel: garbage]\nx", "discord",
+                                strict=True) is False
+    assert proactive_body_guard("p.txt", disc, "discord", strict=True) is True
+    assert proactive_body_guard("p.txt", "no marker", "discord",
+                                strict=True) is True
+
+
 def main():
     test_discord_active_routes_to_discord()
     test_telegram_active_routes_to_telegram()
@@ -233,6 +298,9 @@ def main():
     test_github_commits_channel_defaults_to_discord()
     test_unrecognized_channel_defaults_to_discord()
     test_bridge_channels_set_is_documented()
+    test_body_leg_discord_claims_its_own_target()
+    test_body_leg_fallbacks_and_precedence()
+    test_delivery_guard_shares_the_claim_gates_precedence()
     print("All proactive-routing tests passed.")
 
 

@@ -1336,6 +1336,9 @@ def _engine_desc() -> str:
         return "DeliveryCore(unbuilt)"
     return (f"DeliveryCore({type(c.backend).__name__}"
             f"->{type(c.provider).__name__})")
+# Host-injected "the FILENAME destines this file here" (name -> bool): filename
+# outranks a foreign body redirect. None (standalone default): no override.
+PROACTIVE_DESTINED_HERE: Callable[[str], bool] | None = None
 # Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
 # event_id: trust the bare ok as delivered (at-least-once beats never).
 _PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
@@ -3107,12 +3110,15 @@ _PROACTIVE_MAX_BODY_B = 48 * 1024
 
 # Destination FORMAT validation is this bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
-_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+# Room IDS only — no alias resolution exists (room-ID-only contract); server
+# names may carry a port or a bracketed IPv6 host.
+_MATRIX_ROOM_RE = re.compile(
+    r"^![^\s:]+:(?:\[[0-9A-Fa-f:.]+\]|[^\s:\[\]]+)(?::\d+)?$")
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
-    ('drop', None, '').
+    """('send', room_or_None, stripped-body) | ('foreign', None, stripped-body)
+    | ('drop', None, '').
 
     Marker grammar comes SOLELY from parse_markers() (no private parser —
     CLAUDE.md result-marker contract); this function only applies the actions
@@ -3121,6 +3127,12 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
       * [dm-only]      → parse_markers already suppressed any redirect, so the
                          body falls through to the default (owner) room
       * [channel: !r:s]→ 'send' to that room, marker stripped
+      * [channel: #a:s]→ 'foreign' — NOT executable here: the backend sends
+                         the value verbatim as Matrix {roomId} with no alias
+                         resolution (room-ID-only contract), so claiming an
+                         alias would retry-and-park a nudge that can never
+                         land. The stripped body still rides the tuple for a
+                         host whose filename rule overrides the foreign call.
       * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
                          blocker: claiming it here would leak the raw body)
       * attach markers → stripped by the parser; uploads are unsupported on
@@ -3134,7 +3146,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
         dest = redirect.value
         if _MATRIX_ROOM_RE.match(dest):
             return ("send", dest, parsed.body)
-        return ("foreign", None, "")
+        return ("foreign", None, parsed.body)
     return ("send", None, parsed.body)
 
 
@@ -3217,6 +3229,17 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             pass
 
 
+def _destined_here(name: str) -> bool:
+    """True iff the host's filename rule destines this file to this bridge.
+    Fail-closed: no injection, or a raising one, means no override."""
+    if PROACTIVE_DESTINED_HERE is None:
+        return False
+    try:
+        return bool(PROACTIVE_DESTINED_HERE(name))
+    except Exception:
+        return False
+
+
 def _resolve_send_failure(claim, original, exc) -> str:
     """Bounded retry: decision AND file moves are the shared policy's
     (send_failure_policy.resolve_failed_send). This binder passes sparrow's
@@ -3255,10 +3278,16 @@ def _post_proactive() -> None:
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         try:
             route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
-        except OSError:
-            continue  # racing consumer already claimed it
+        # UnicodeDecodeError = partial write mid-character; skipping keeps the
+        # docstring's fail-open contract (one bad file never blocks the drain)
+        except (OSError, UnicodeDecodeError):
+            continue  # racing consumer, or a writer mid-flight
         if route == "foreign":
-            continue
+            if not _destined_here(f.name):
+                continue
+            # filename outranks the body's foreign redirect (shared
+            # precedence): deliver here, to the default room
+            route, peek_room = "send", None
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not PROACTIVE_ROOM:
@@ -3281,7 +3310,9 @@ def _post_proactive() -> None:
         try:
             route, room_override, routed_body = _proactive_route(
                 claim.read_text(encoding="utf-8"))
-        except OSError as exc:
+        # same tuple as the peek: a decode error post-claim must take the
+        # restore path below, never strand the claim under a live pid
+        except (OSError, UnicodeDecodeError) as exc:
             # A TRANSIENT post-claim read failure must not strand the nudge: the
             # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
             try:
@@ -3291,6 +3322,9 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
+        if route == "foreign" and _destined_here(f.name):
+            # same filename-over-body precedence as the pre-claim peek
+            route, room_override = "send", None
         if route == "foreign" or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
             # Hand back rather than eat: a foreign target seen only post-claim,

@@ -125,7 +125,7 @@ Otherwise:
 
 4. Apply step 3c bomb-guard (see below) to decide whether to truncate the preview list.
 
-5. Write `<workspace>/results/proactive-orphan-recovery-${ts}.txt`:
+5. Publish `<workspace>/results/proactive-orphan-recovery-${ts}.txt` (write `results/.proactive-orphan-recovery-${ts}.txt.tmp`, then `mv` it to the final name):
 
    ```
    Orphan recovery — N stale tasks from a prior session (oldest <Nm>, newest <Nm>, no completion markers).

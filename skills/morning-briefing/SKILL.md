@@ -52,7 +52,7 @@ python3 src/morning-briefing.py
 `src/morning-briefing.py` already writes `results/proactive-<ts>.txt` (spoken by voice) and sends a Discord DM for the base data. If you gathered email in steps 1–3, append it as a follow-up proactive file:
 
 ```bash
-echo "📧 Email: [count] unread. [summary]" > "$WORKSPACE/results/proactive-$(date +%s).txt"
+_out="$WORKSPACE/results/proactive-$(date +%s).txt"; echo "📧 Email: [count] unread. [summary]" > "$_out.tmp" && mv "$_out.tmp" "$_out"
 ```
 
 ## Calendar source (Google Workspace) — activation

@@ -289,7 +289,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - **Discord bridge** (`src/discord-bridge.py`) writes tasks from Discord DMs and channel @mentions (+ file attachments)
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
-- Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
+- Proactive messages: publish `results/proactive-{ts}.txt` to speak to the user — write `results/.proactive-{ts}.txt.tmp`, then `mv` it to the final name (never write the final name in place; a bridge claims it on sight)
 - To send files in replies, include `[file: /path/to/file]` in the result text
 
 **Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones. Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":

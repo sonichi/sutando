@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 # Imported before the stub replaces sys.modules: it hands back the real gate.
 from proactive_routing import redirect_target_is_foreign as _real_redirect_target_is_foreign  # noqa: E402
+from proactive_routing import proactive_body_guard as _real_proactive_body_guard  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -103,8 +104,10 @@ def _run_one_pass(results: Path, send):
     routing.should_claim_proactive = lambda *_a, **_k: True
     routing.should_claim_proactive_file = lambda *_a, **_k: True
     routing.proactive_destination = lambda *_a, **_k: None
-    # Stubbed routing claims every file; redirect_target_is_foreign stays REAL.
+    # Stubbed routing claims every file; redirect_target_is_foreign and the
+    # delivery guard stay REAL.
     routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
+    routing.proactive_body_guard = _real_proactive_body_guard
     sys.modules["proactive_routing"] = routing
 
     class _DM:
@@ -198,9 +201,16 @@ def main() -> int:
     # send, so a `*.txt` glob cannot tell "deleted" from "claimed and left" —
     # it reported success against a mutation that removed the unlink entirely.
     # (@john-the-dev's over-broad mutation on #2628 is what sent me looking.)
-    _left = [q.name for q in box2.rglob("proactive-*") if q.is_file()]
-    check("a SUCCESSFUL send still removes the file", not _left,
+    # A confirmed send RETIRES the claim (moved under retired/ with a delivered
+    # marker), so nothing claimable remains in the box and nothing was unlinked.
+    _left = [q.name for q in box2.rglob("proactive-*") if q.is_file()
+             and q.parent.name != "retired"]
+    check("a SUCCESSFUL send leaves nothing claimable in the box", not _left,
           f"success path stopped cleaning up — left {_left}; every message would re-send forever")
+    _retired = sorted(q.name for q in (box2 / "retired").glob("proactive-*")) if (box2 / "retired").is_dir() else []
+    check("  ...and the claim was retired with its delivered marker, not destroyed",
+          any(n.endswith(".sending") for n in _retired) and any(n.endswith(".delivered") for n in _retired),
+          f"retired/ holds {_retired}")
     check("  ...and it really was sent", bool(sent), "no send recorded")
 
     # --- LAST RESORT: even the quarantine fails ----------------------------

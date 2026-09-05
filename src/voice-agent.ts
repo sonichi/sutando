@@ -30,7 +30,7 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { inlineTools, personalSkillSetups } from './inline-tools.js';
 import { runSkillSetups } from './skill-setup-runner.js';
@@ -1383,7 +1383,10 @@ async function main() {
 				const body = c.userActionUrl
 					? `${c.userMessage} ${c.userActionUrl}`
 					: c.userMessage;
-				writeFileSync(path, body);
+				// Publish atomically: a consumer must never observe a partial body.
+				const tmp = `${path}.tmp-${process.pid}`;
+				writeFileSync(tmp, body);
+				renameSync(tmp, path);
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}

@@ -63,7 +63,7 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
         pinned an implementation; the delegate plus its behaviour pins the point.
         """
         self.assertIn(
-            'body_claimable_by(peek, "telegram")', SRC,
+            'proactive_body_guard(f.name, peek, "telegram")', SRC,
             "the peek must delegate to proactive_routing, not spell its own grammar")
         self.assertNotRegex(
             SRC, r"\\d\{17,20\}",
@@ -109,7 +109,7 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
 
         # Anchor on the gate CALL, not on the string "[channel:" — that literal
         # appears elsewhere in a 3k-line file and silently moved this assertion.
-        gate_pos = SRC.find('body_claimable_by(peek, "telegram")', proactive_block_start)
+        gate_pos = SRC.find('proactive_body_guard(f.name, peek, "telegram")', proactive_block_start)
         self.assertGreater(gate_pos, 0, "delegated peek gate not found in the proactive block")
         guard_continue_pos = SRC.find("continue", gate_pos)
         rename_pos = _claim_pos(SRC, proactive_block_start)

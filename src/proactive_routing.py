@@ -137,11 +137,26 @@ def proactive_destination(name) -> "str | None":
 
 
 def should_claim_proactive_file(name, state_file_path: Path,
-                                this_channel: str) -> bool:
-    """Per-FILE claim decision: destination outranks activity routing."""
+                                this_channel: str,
+                                body_reader=None) -> bool:
+    """Per-FILE claim decision: filename tag, then the BODY's own redirect,
+    then activity routing. The body leg closes the cross-bridge deadlock:
+    a [channel: <discord-id>] body was foreign to the claiming gateway
+    (hand back) yet invisible to discord's activity-routed gate (skip)."""
     dest = proactive_destination(name)
     if dest is not None:
         return dest == this_channel
+    if body_reader is not None:
+        try:
+            body = body_reader()
+        # readiness.read_ready_result's tuple: unreadable includes a partial
+        # write mid-character, not only a missing or permission-denied file
+        except (OSError, UnicodeDecodeError):
+            body = None
+        if body:
+            kind = body_target_channel(body)
+            if kind is not None:
+                return kind == this_channel
     return should_claim_proactive(state_file_path, this_channel)
 
 
@@ -156,11 +171,16 @@ def fallback_claims_name(name, this_channel: str) -> bool:
 # The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
 # implication is what each adapter re-derived — two of them Discord-only.
 
-# Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
-# a substring match would classify `#room:server` off its leading character.
+# ONE owner of "executable Matrix target": room IDS only — no alias resolution
+# exists (room-ID-only contract); server may be name[:port] or [IPv6][:port].
+MATRIX_TARGET_RE = re.compile(
+    r"![^\s:]+:(?:\[[0-9A-Fa-f:.]+\]|[^\s:\[\]]+)(?::\d+)?\Z")
+
+# Discord snowflake / Matrix room id / Slack channel id. Anchored whole: a
+# substring match would classify `!room:server` off its leading character.
 _TARGET_KINDS = (
     ("discord", re.compile(r"\d{17,20}\Z")),
-    ("ag2space", re.compile(r"[!#][^\s:]+:[^\s:]+\Z")),
+    ("ag2space", MATRIX_TARGET_RE),
     ("slack", re.compile(r"[CDG][A-Z0-9]{6,}\Z")),
 )
 
@@ -209,6 +229,31 @@ def body_claimable_by(body, this_channel: str) -> bool:
     return kind is None or kind == this_channel
 
 
+def proactive_body_guard(name, body, this_channel: str,
+                         strict: bool = False) -> bool:
+    """Delivery-time re-check with the claim gate's OWN precedence: an explicit
+    .to-<channel> filename outranks the body's redirect. Reversing that here is
+    what stranded a destined file whose body named another bridge — the claim
+    honoured the filename, then the body guard refused delivery.
+
+    strict is the default destination's rule (see redirect_target_is_foreign):
+    a redirect target not positively this bridge's address blocks delivery.
+    """
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    from result_markers import parse_markers  # noqa: PLC0415 — see module note
+    redirect = next(
+        (a for a in parse_markers(str(body or "")).actions
+         if a.kind == "redirect"), None)
+    if redirect is None:
+        return True
+    kind = target_channel_kind(redirect.value)
+    if strict:
+        return kind == this_channel
+    return kind is None or kind == this_channel
+
+
 def redirect_target_is_foreign(target, this_channel: str) -> bool:
     """Strict form: anything not POSITIVELY this bridge's address is foreign.
 
@@ -216,3 +261,21 @@ def redirect_target_is_foreign(target, this_channel: str) -> bool:
     into the default's delivery, or every malformed marker lands in one DM.
     """
     return target_channel_kind(target) != this_channel
+
+
+def body_redirect_executes(name, target, this_channel: str) -> bool:
+    """The SINK's leg of filename-over-body: may this file's `[channel:]`
+    redirect actually move the send?
+
+    The claim gate honouring the filename is only half the decision — a sink
+    that re-parses the body and re-routes anyway undoes it, and the file is
+    posted to another bridge's address, refused, released and retried forever.
+
+    A `.to-<channel>` filename fixes the BRIDGE, so a target that is not
+    positively this bridge's own address never executes. Within the destined
+    bridge a redirect is a ROOM selection and still executes. An undestined
+    name keeps each sink's existing behaviour unchanged.
+    """
+    if proactive_destination(name) is None:
+        return True
+    return not redirect_target_is_foreign(target, this_channel)

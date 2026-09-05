@@ -13,7 +13,7 @@
  * it carries only control/durable-work traffic into the session.
  */
 
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
@@ -133,7 +133,10 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 					const proactiveTs = Math.floor(Date.now() / 1000);
 					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
 					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
-					writeFileSync(proactivePath, dmBody);
+					// Publish atomically: a consumer must never observe a partial body.
+					const proactiveTmp = `${proactivePath}.tmp-${process.pid}`;
+					writeFileSync(proactiveTmp, dmBody);
+					renameSync(proactiveTmp, proactivePath);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
 				}

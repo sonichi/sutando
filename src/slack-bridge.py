@@ -64,7 +64,8 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import (  # noqa: E402
+    body_redirect_executes, fallback_claims_name, proactive_body_guard)
 
 
 def _slack_claims_name(name: str) -> bool:
@@ -82,7 +83,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result, retire_claim_if_unchanged, sweep_retired  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
@@ -1421,7 +1422,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> bool:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown", delivery_name: str | None = None) -> bool:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1460,6 +1461,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     redirected = False
     for action in parsed.actions:
         if action.kind == "redirect":
+            # A `.to-slack` filename already fixed this bridge; re-routing on
+            # the body here would undo that decision at the last step.
+            if delivery_name is not None and not body_redirect_executes(
+                    delivery_name, action.value, "slack"):
+                break
             channel = action.value
             thread_ts = None
             redirected = True
@@ -1640,6 +1646,16 @@ def _check_task_timeouts() -> None:
         print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
 
 
+
+def _sweep_retired_pass():
+    """Republish bytes appended to a retired claim after its delivery; the
+    remainder becomes an ordinary proactive file this poller claims next pass."""
+    try:
+        for late in sweep_retired(RESULTS_DIR):
+            print(f"  [proactive] late remainder republished as {late.name}", flush=True)
+    except Exception as e:
+        print(f"  [proactive] retired sweep skipped: {e}", flush=True)
+
 def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
@@ -1649,6 +1665,7 @@ def result_watcher():
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
 
+            _sweep_retired_pass()
             # Replies to pending tasks
             with pending_replies_lock:
                 pending_ids = list(pending_replies.keys())
@@ -1715,16 +1732,16 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: a body addressed to another bridge
-                    # is delivered by that bridge, not dumped here as literal text.
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
+                        continue
+                    # Peek before claiming: a body addressed to another bridge is
+                    # delivered there — unless the FILENAME destines it here.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if not body_claimable_by(peek, "slack"):
-                        continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    if not proactive_body_guard(f.name, peek, "slack"):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.
@@ -1742,15 +1759,27 @@ def result_watcher():
                     if text is None:
                         release_claim(claim)
                         continue
+                    # The claim hard-links then unlinks, so a producer still
+                    # holding the original fd keeps writing THIS inode.
+                    if not proactive_body_guard(f.name, text, "slack"):
+                        release_claim(claim)
+                        continue
                     if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            if _send_reply(dm_channel, None, text, access_tier="owner"):
-                                mark_proactive_delivered(STATE_DIR, delivery_id)
+                            if _send_reply(dm_channel, None, text, access_tier="owner",
+                                           delivery_name=delivery_id):
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
-                                claim.unlink(missing_ok=True)
+                                # The receipt covers the delivered prefix; bytes appended
+                                # later are republished by sweep_retired, never marooned.
+                                if retire_claim_if_unchanged(claim, text):
+                                    mark_proactive_delivered(STATE_DIR, delivery_id)
+                                else:
+                                    # Producer appended after the read. Leave the
+                                    # rest unsuppressed or no pass can ever send it.
+                                    release_claim(claim)
                             else:
                                 # Slack refused WITHOUT raising, which is the ordinary
                                 # failure; the except below never sees it.

@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result, retire_claim_if_unchanged, sweep_retired  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -726,6 +726,16 @@ def log_privacy_setting(get_me):
     )
 
 
+
+def _sweep_retired_pass():
+    """Republish bytes appended to a retired claim after its delivery; the
+    remainder becomes an ordinary proactive file this poller claims next pass."""
+    try:
+        for late in sweep_retired(RESULTS_DIR):
+            print(f"  [proactive] late remainder republished as {late.name}", flush=True)
+    except Exception as e:
+        print(f"  [proactive] retired sweep skipped: {e}", flush=True)
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
@@ -1057,6 +1067,7 @@ def main():  # pragma: no cover
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
+        _sweep_retired_pass()
 
         # Check for proactive messages to send to owner.
         # Presenter-mode: retain files (don't unlink, don't send) so they
@@ -1066,7 +1077,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import (body_claimable_by,
+        from proactive_routing import (proactive_body_guard,
                                        should_claim_proactive_file)
         try:
             if not presenter_mode_active(REPO):
@@ -1083,18 +1094,19 @@ def main():  # pragma: no cover
                     # Destination outranks activity routing, uniformly;
                     # discord's DM fallback stays the after-grace catch-all.
                     return should_claim_proactive_file(
-                        name, OWNER_ACTIVITY_FILE, "telegram")
+                        name, OWNER_ACTIVITY_FILE, "telegram",
+                        body_reader=lambda _n=name: read_ready_result(RESULTS_DIR / _n))
 
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
                             and f.suffix == ".txt" and _tg_claims(f.name):
-                        # Peek before claiming: a body addressed to another bridge
-                        # is delivered by that bridge, not sent here as literal text.
+                        # Peek before claiming: a body addressed to another bridge is
+                        # delivered there — unless the FILENAME destines it here.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if not body_claimable_by(peek, "telegram"):
+                        if not proactive_body_guard(f.name, peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.
@@ -1118,6 +1130,12 @@ def main():  # pragma: no cover
                         if text is None:
                             release_claim(f)
                             continue
+                        # The claim hard-links then unlinks, so a producer still
+                        # holding the original fd keeps writing THIS inode.
+                        if not proactive_body_guard(
+                                f.with_suffix(".txt").name, text, "telegram"):
+                            release_claim(f)
+                            continue
                         try:
                             _s = send_reply(int(owner_id), text)
                             if _s["text_chunks"] or _s["files_sent"]:
@@ -1131,7 +1149,10 @@ def main():  # pragma: no cover
                                 )
                             if _s.get("ok"):
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}")
-                                f.unlink(missing_ok=True)
+                                if not retire_claim_if_unchanged(f, text):
+                                    # Producer appended after the read; releasing
+                                    # keeps the rest for a pass that sends it whole.
+                                    release_claim(f)
                             else:
                                 # send_reply reports refusal by returning ok=False
                                 # without raising; the except below never sees it.

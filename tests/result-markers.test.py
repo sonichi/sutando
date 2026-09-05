@@ -86,6 +86,14 @@ class TestRedirectMarker(unittest.TestCase):
         self.assertEqual(r.actions[0].value, "1499520683267592432")
         self.assertEqual(r.body, "RFC announcement")
 
+    def test_redirect_bracketed_ipv6_room_id_kept_whole(self):
+        # Matrix room ids may carry a bracketed-IPv6 host; a first-`]` cut
+        # truncated the address mid-value and left a stray `]` in the body.
+        r = parse_markers("[channel: !r:[2001:db8::1]:8448]\nnudge")
+        self.assertEqual(r.actions[0].kind, "redirect")
+        self.assertEqual(r.actions[0].value, "!r:[2001:db8::1]:8448")
+        self.assertEqual(r.body, "nudge")
+
     def test_redirect_only_at_start(self):
         # An attach-style marker in middle of body doesn't get parsed as redirect
         r = parse_markers("body talking about [channel: 12345] inline")

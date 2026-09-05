@@ -878,7 +878,10 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						const dmBody = taskSnippet
 							? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
 							: `⏱ Task ${taskId} timed out after ${minutes}m.`;
-						writeFileSync(proactivePath, dmBody);
+						// Publish atomically: a consumer must never observe a partial body.
+						const proactiveTmp = `${proactivePath}.tmp-${process.pid}`;
+						writeFileSync(proactiveTmp, dmBody);
+						renameSync(proactiveTmp, proactivePath);
 						console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
 					} catch (e) {
 						console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);
@@ -1006,7 +1009,10 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						try {
 							const proactiveTs = Math.floor(Date.now() / 1000);
 							const proactivePath = join(RESULT_DIR, `proactive-result-${taskId}-${proactiveTs}.txt`);
-							writeFileSync(proactivePath, result);
+							// Publish atomically: a consumer must never observe a partial body.
+							const proactiveTmp = `${proactivePath}.tmp-${process.pid}`;
+							writeFileSync(proactiveTmp, result);
+							renameSync(proactiveTmp, proactivePath);
 							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
 							_deliveredResults.add(file);
 							_pendingTasks.delete(taskId);

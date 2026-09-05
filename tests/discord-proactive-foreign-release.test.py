@@ -104,6 +104,15 @@ try:
     asyncio.run(one_pass())
     check(not native.exists(),
           "a DISCORD-shaped target is still claimed (the check does not over-fire)")
+
+    # CONFLICT: a .to-discord FILENAME outranks the body's Matrix redirect —
+    # releasing it re-strands a file every other bridge refuses by its tag.
+    conflict = results / "proactive-c.to-discord.txt"
+    conflict.write_text("[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
+    asyncio.run(one_pass())
+    check(not conflict.exists(),
+          "a destined .to-discord file with a Matrix body is NOT released — "
+          "the filename decision carries through the delivery guard")
 finally:
     if prior is None:
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
