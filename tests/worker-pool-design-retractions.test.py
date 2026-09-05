@@ -30,6 +30,14 @@ RETRACTED = [
      "true only of the handler-fallback exit. A direct exit with no prior "
      "receipt performs fresh admission -- which of the two applies is a "
      "property of the exit, not of the design."),
+    ("still unclaimed on disk, so it is re-admitted normally",
+     "mtime cannot tell receipt-before-emit from emit-before-ack, so re-admitting "
+     "on age alone duplicates an in-flight task. The ticker decides on the receipt's "
+     "phase and lease, never on age."),
+    ("only the first may be filled in by handler affinity",
+     "the design retires handler affinity and deletes the file; rooms bind only "
+     "by an explicit pin. Absent and empty both route to the core, and neither is "
+     "ever filled by affinity."),
 ]
 
 

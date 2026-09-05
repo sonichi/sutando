@@ -305,8 +305,36 @@ any component reporting a fault.
 | owner | the process holding the receipt — the core or worker whose exit created or transitioned it. Never a third party, never the ticker on a live holder |
 | trigger | the task reaches a terminal state: a result is written and archived, **or** the claim is released after a failure. Both paths release; only the terminal state differs |
 | signal | the holder unlinks its own file under `direct/`, in the same step that writes the result |
-| crash | the holder dies holding it. The receipt is orphaned, and the **reconciliation ticker** is its only reclaimer: past `stale_after_s` measured from the receipt's own mtime, it unlinks the receipt. The task itself is untouched — still unclaimed on disk, so it is re-admitted normally |
+| crash | the holder dies holding it. The **reconciliation ticker** is its only reclaimer, and it decides on the receipt's own PHASE — never on age alone. See the table below |
 | failure | unlink is best-effort and idempotent. A double release is not an error, and a failed unlink must not fail the task — the ticker is the backstop |
+
+**An mtime is not a phase, and reclaiming on age alone duplicates work.** A receipt that is
+merely old cannot say whether the holder died *before* publishing the task or *after* — and those
+need opposite handling. Unlinking and re-admitting in both cases means a watcher restart after
+`TASK_FILE:` publication, or any direct task outliving `stale_after_s`, re-runs an owner task that
+is already in flight. So the receipt carries its own phase and lease:
+
+```json
+{"task_id": "<id>", "holder": "<instance>", "phase": "admitted|emitted",
+ "lease_until": "<iso>"}
+```
+
+The **holder is the sole writer**, transitions are one-way (`admitted` -> `emitted` -> unlinked),
+`admitted` is written **before** the task file is published and `emitted` **after** the publish
+returns, and the holder renews `lease_until` on the same beat as its `.alive`.
+
+| phase | lease | task file | the ticker |
+|---|---|---|---|
+| any | live | — | not orphaned. Leave it; a live holder owns its own receipt |
+| `admitted` | expired | absent | the publish never happened, so nothing is in flight. Unlink and re-admit |
+| `admitted` | expired | **present** | the publish landed and the phase write did not. **Believe the task, not the phase** — treat as `emitted` |
+| `emitted` | expired | any | the task is in flight or already done. **Never re-admit.** Release only once the task is terminal (result written and archived); until then the receipt stands and its slot stays consumed |
+
+**The write order is what makes this decidable.** Phase-before-publish leaves exactly one ambiguous
+state — *phase says `admitted`, the task exists* — and disk resolves it, because the task's presence
+is the stronger evidence. Publishing first would leave *phase says `emitted`, no task*, which
+nothing on disk can tell apart from a completed-and-archived task, and the ticker would have to
+guess. A contract that needs a guess at its only ambiguous point is not a contract.
 
 **The admitted count is derived by listing `direct/`, never held in a counter**, so removing the
 file *is* the decrement and there is no second number to drift out of step. This is the same defect
@@ -753,9 +781,11 @@ rooms must be kept off the same worker:
   bind command that would violate it, and a worker re-checks at claim time and declines
   rather than trusting the file it just read; a stale read must not be able to merge two
   contexts that were deliberately separated.
-- **An empty `instances` is not the same as an absent room.** Absent means unbound;
-  empty means deliberately bound to nobody, and both route to the core — but only the
-  first may be filled in by handler affinity.
+- **Absent and empty both route to the core, and neither is ever filled by handler
+  affinity** — rooms bind only by an explicit pin, and the affinity file is retired and
+  deleted rather than consulted. The distinction is a record of intent, not a routing
+  rule: an absent room was never bound, an empty one was deliberately bound to nobody,
+  and an owner command is the only thing that changes either.
 - A legacy `"instance": "<name>"` string reads as a one-element `instances` for one
   release, so the retired affinity file can be migrated without a flag day.
 
