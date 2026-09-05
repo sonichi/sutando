@@ -572,6 +572,18 @@ class Cli(unittest.TestCase):
                 (cores / "host.alive").write_text("not json")
                 self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
 
+    def test_a_malformed_socket_in_the_heartbeat_is_an_unreadable_record(self):
+        # One bad shared-state record must not crash the diagnostic at realpath().
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            with patch.object(w, "_local_host_label", return_value="host"):
+                for bad in (["/s"], {"path": "/s"}, 7, True):
+                    (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": bad, "session": "core-2"}))
+                    self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION), bad)
+                for absent in ({"host": "host", "session": "core-2"}, {"host": "host", "socket": None, "session": "core-2"}, {"host": "host", "socket": "", "session": "core-2"}):
+                    (cores / "host.alive").write_text(json.dumps(absent))
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), absent)
+
     def test_role_comes_from_identity_not_from_how_the_session_was_spelled(self):
         # The heartbeat record names the core's session. Naming that session explicitly is still the
         # core; a worker reached through the environment with no flag is still a worker.

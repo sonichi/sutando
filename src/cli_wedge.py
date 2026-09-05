@@ -417,8 +417,10 @@ def core_identity(workspace: Path) -> tuple:
     and the environment names a pane to probe, never who the core is."""
     try:
         r = json.loads((workspace / "state" / "cores" / f"{_local_host_label()}.alive").read_text())
-        if isinstance(r, dict) and isinstance(r.get("session"), str) and r.get("session"):
-            return (r.get("socket") or None, r["session"])
+        sock = r.get("socket") if isinstance(r, dict) else None
+        # A socket of any type but a string is not a record this reader understands.
+        if isinstance(r, dict) and isinstance(r.get("session"), str) and r["session"] and (sock is None or isinstance(sock, str)):
+            return (sock or None, r["session"])
     except (OSError, ValueError, AttributeError):
         pass
     return (None, DEFAULT_SESSION)
