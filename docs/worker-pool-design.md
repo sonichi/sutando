@@ -66,8 +66,8 @@ carry their own), at the handler's probe, before any claim:
 **Every emitter claims first.** An instance that decides it may emit acquires the
 task-specific claim (a hard link in `state/task-event-handler-claims/`, keyed on the
 task's CANONICAL ID — see below) and emits only if it wins; a loser suppresses. This holds for the
-named target, the pinned target, the room's bound instance and the core stand-in alike —
-being addressed selects a *candidate*, it does not confer ownership.
+named target, the pinned target, the room's bound instance, and the core on an unbound
+room alike — being addressed selects a *candidate*, it does not confer ownership.
 
 **"Fresh" below means ELIGIBLE, not merely beating.** A target is eligible when
 its beat is fresh *and* the core's sweep has not declared it wedged under §3 rule 6
@@ -82,8 +82,8 @@ the precise state §3 rule 6 promises the core will take over.
 Eligibility is **one value, computed once**: the core evaluates it in its sweep
 (it is the only instance that can see a room's oldest unclaimed task) and publishes
 it alongside the pool status. **WORKER handlers read that verdict to gate
-themselves; the core's handler never does** — it routes on beats, and the core's
-stand-in decision belongs to the sweep that wrote the verdict. Who reads what, and
+themselves; the core's handler never does** — it routes on beats, and the eligibility
+decision belongs to the sweep that wrote the verdict. Who reads what, and
 why one reader per decision is load-bearing rather than tidy, is set out under the
 record's contract below; this rule is step 3's, and step 2 routes on beats alone.
 
@@ -556,8 +556,8 @@ the staging otherwise leaves open, and it is forced by how routing actually runs
 `SUTANDO_TASK_EVENT_HANDLER` is invoked as an EXTERNAL PROCESS per event
 (`src/watch-tasks-stream.sh:370-383`), so a handler cannot see an in-memory value the
 sweep computed — a design that has the core "read the verdict it just computed" is
-not implementable in a per-event subprocess. So in step 3 the core's stand-in
-decision is made by the sweep, which holds the verdict it just wrote; the core's
+not implementable in a per-event subprocess. So in step 3 the eligibility verdict
+is made by the sweep, which holds the value it just wrote; the core's
 event handler keeps routing on beats exactly as in step 2 and never consults the
 record. Workers read the record to gate THEMSELVES. One reader per decision, and the
 one party that could disagree with the file is the party that wrote it.
@@ -578,14 +578,19 @@ neither replaces the other.
 tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
 2 letting the named worker, the pinned worker, a dedicated worker and the room's bound
 instance claim unconditionally — so an instance the core has recorded `wedged` can still
-win the claim and strand the task, which is the exact state the stand-in exists to
-rescue. So each branch below is read as: **act only if my own beat is fresh AND the record
-says `eligible` or says nothing about me; a stale beat OR a `wedged` verdict
-suppresses** and lets rule 3 reach the core. Gating on `wedged` alone leaves the
-other half of the eligibility predicate ungated, so a stale-beat named or pinned
-worker would still claim unconditionally and beat the core's stand-in to the task —
-the stand-in exists precisely because that worker is stale. A wedged instance that
-claims nothing is unaffected — this only binds the one that is wedged and still
+win the claim and strand the task. So each branch below is read as: **act only if my own
+beat is fresh AND the record says `eligible` or says nothing about me; a stale beat OR a
+`wedged` verdict suppresses**, and the room's work then stays pending until that instance
+returns or an owner re-binds the room. It does NOT fall through to rule 3: the room is
+bound, and v1 has no second claimant for a bound room.
+
+Suppressing is still strictly better than claiming, and that is the whole reason to gate
+both halves of the predicate rather than one. A wedged instance that claims **strands** the
+task — claimed, undeliverable, and invisible until someone goes looking. Suppressing leaves
+it pending, which is visible and clears by the two paths that already exist. Gating on
+`wedged` alone leaves the other half ungated, so a stale-beat named or pinned worker would
+still claim unconditionally and strand the task in exactly the same way. A wedged instance
+that claims nothing is unaffected — this only binds the one that is wedged and still
 claiming, which is the case that hurts.
 
 1. `requested_worker` names this instance: claim, then emit to this session.
@@ -683,13 +688,18 @@ which all instances agree on it:
 
 | t | instance | reads | claim | emits |
 |---|---|---|---|---|
-| 89.9s | worker-2 | my own beat; `requested_worker` names me | **wins** | yes |
-| 90.1s | core | worker-2's beat now stale -> I am the stand-in | **loses** | no, suppresses |
+| 89.9s | worker-2 | my own beat is fresh; `requested_worker` names me | **wins** | yes |
+| 90.1s | core | worker-2's beat now stale; the room is bound to worker-2 | **does not contend** | no |
 
-Without the claim both emit and the task is delivered twice. With it the core's
-`link()` fails against worker-2's existing entry, so the stand-in stands down.
-The reverse interleaving is equally fine and is the point: whichever runs first
-wins, and the loser suppresses rather than deciding it was wrong to be a candidate.
+Under v1 this is no longer a race, and the reason is worth stating exactly: the core
+does not claim a bound room whatever the beat says, so the second claimant an earlier
+revision arbitrated against does not exist. Either interleaving leaves at most one
+contender. Had worker-2 suppressed instead — its own gate finding a stale beat or a
+`wedged` verdict — the task would stay pending rather than pass to the core.
+
+This is a SUBTRACTION from the claim's justification, not an addition to it. Trace A no
+longer shows the claim is load-bearing, because nothing contends in it. Trace B does, and
+carries that weight alone.
 
 **Trace B — an atomic repin between two evaluations.** Each watcher independently
 re-reads mutable `bindings.json`, so an atomic replacement still hands two readers
@@ -705,26 +715,26 @@ Neither read is torn and neither instance is wrong; atomic replacement rules out
 malformed read, not two valid versions selecting two targets. Only the claim
 arbitrates, and it does so without either watcher having to observe the repin.
 
-**The stale-target stand-in is Trace A**: the core reaches rule 1's stand-in branch
-or rule 3 exactly when a worker's beat has aged out, which is the transition the
-table above schedules against. It carries no exemption — the core takes the same
-claim on the same key and suppresses on a loss.
+**A stale target does not hand the room to the core.** When a bound worker's beat ages
+out, rule 3 is not reached: the room is bound, so its work stays pending until that
+worker returns or an owner re-binds. The transition the table above schedules against
+therefore changes who is waiting, never who claims.
 
-In all three schedules the task file is consumed exactly once, by whichever
-instance holds the claim, and every loser leaves the file untouched.
+In each schedule the task file is consumed at most once — by whichever instance holds the
+claim, if any — and every loser leaves the file untouched. "At most" rather than "exactly"
+is the honest form under v1: a bound room whose only eligible instance has suppressed
+consumes nothing until it becomes eligible again, and that pending file is the visible,
+recoverable state this design prefers to a stranded claim.
 
-With worker-2's beat STALE the second column falls through for everyone, rule 3
-selects the core, and the workers suppress. The same adversarial ordering holds —
-both workers suppress without taking a claim, the core then takes the claim on
-that key, wins it uncontested, and consumes exactly once. The stand-in is not
-exempt from the claim; it is simply the only instance contending for it here.
+Rule 3 still selects the core, unchanged, for work addressed to nobody — an unbound room,
+or an unreadable bindings file. That case never had a second claimant to race.
 
 A repin is the one place the claim arbitrates target-against-target, and only for
 the bounded window in which an outgoing and an incoming `instances[0]` both read
 themselves as bound; a set's later members are standby and never claimants, so
 there is no steady-state target-against-target. Elsewhere the claim is still
-load-bearing — Trace A is target-against-stand-in — but only ever between one
-target and the core.
+load-bearing only in that repin window: with the stand-in gone, target-against-target is
+the sole contention v1 has left.
 
 A task is eligible to exactly one instance: the room's `instances[0]`.
 There is no bound set to race over — see the binding table. A later form of addressing (an app control, a room command, a
@@ -1203,8 +1213,8 @@ production-path tests; the staged list below marks which those are.
    has never been there — so there is nothing to fix ahead of time; the failure
    is a Telegram-addressed task silently reading as unbound the first time
    someone pins a chat, and step 2's suite carries that case.
-3. core side: the pin table writer, the sweep (reclaim, stand-in, revive,
-   status line, timing record), with claim and liveness tests; **and the worker
+3. core side: the pin table writer, the sweep (reclaim, revive, status line,
+   timing record — no stand-in), with claim and liveness tests; **and the worker
    side of the same step: the eligibility reader and its self-gate, which ship
    WITH the publisher rather than ahead of it** — a reader that lands first is a
    consumer with no producer, and one that never lands leaves the sweep publishing
