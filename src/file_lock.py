@@ -38,11 +38,11 @@ def unlock_fd(fd: int) -> None:
 
 
 @contextmanager
-def locked_file(path: Path):
+def locked_file(path: Path, *, create_mode: int = 0o644):
     """Hold a blocking exclusive lock for the duration of a transaction."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, create_mode)
     try:
         lock_fd(fd)
         yield fd

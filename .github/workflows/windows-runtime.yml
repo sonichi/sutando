@@ -136,6 +136,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'health-check-live-tree-drift.test.py failed' }
           python tests/health-check-held-no-consumer.test.py
           if ($LASTEXITCODE -ne 0) { throw 'health-check-held-no-consumer.test.py failed' }
+          python tests/cli-wedge.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cli-wedge.test.py failed' }
+          python tests/cli-wedge-health-probe.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cli-wedge-health-probe.test.py failed' }
           python tests/single-instance.test.py
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
@@ -209,5 +213,6 @@ jobs:
           src/screen-capture-server.py
           src/sutando_platform.py
           src/health-check.py
+          src/cli_wedge.py
           src/file_lock.py
           src/task_workstreams.py
