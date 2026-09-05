@@ -26,18 +26,40 @@ RETRACTED = [
     ("and the only one left",
      "two staged PRs remain, not one: the membership prerequisite lands ahead "
      "of the reconciliation ticker."),
+    ("is not a new admission at all",
+     "true only of the handler-fallback exit. A direct exit with no prior "
+     "receipt performs fresh admission -- which of the two applies is a "
+     "property of the exit, not of the design."),
 ]
 
 
 def live_hits(text, phrase):
-    """Lines asserting `phrase`, excluding those narrating its retraction."""
-    out = []
+    """Lines asserting `phrase`, excluding those narrating its retraction.
+
+    Matches over whitespace-flattened PARAGRAPHS, not raw lines: a pin written
+    as one sentence does not match a doc that wrapped it, so the assertion
+    passes on a phrase that was never present and the pin certifies nothing.
+    The paragraph is also the unit the retraction narration lives in, so the
+    HISTORICAL exemption is evaluated over the same span it is written across.
+    """
+    out, start, buf = [], 1, []
+
+    def flush(start, buf):
+        if not buf:
+            return
+        flat = " ".join(" ".join(buf).split())
+        if phrase in flat and not any(h in flat.lower() for h in HISTORICAL):
+            out.append(start)
+
     for i, line in enumerate(text.splitlines(), 1):
-        if phrase not in line:
-            continue
-        if any(h in line.lower() for h in HISTORICAL):
-            continue
-        out.append(i)
+        if line.strip():
+            if not buf:
+                start = i
+            buf.append(line)
+        else:
+            flush(start, buf)
+            buf = []
+    flush(start, buf)
     return out
 
 
@@ -87,7 +109,7 @@ class ChosenContractIsPinned(unittest.TestCase):
 
     def test_the_pin_can_fail(self):
         """Control: reconstruct the flagged state and confirm it is caught."""
-        bad = DOC.read_text(encoding="utf-8") + "\ndispatch_task reports which of four things happened.\n"
+        bad = DOC.read_text(encoding="utf-8") + "\n\ndispatch_task reports which of four things happened.\n"
         self.assertNotEqual(live_hits(bad, "four things happened"), [],
                             "the pin cannot detect the state qingyun-wu flagged")
 
@@ -121,6 +143,27 @@ class RetractedClaimsStayRetracted(unittest.TestCase):
         for phrase, _ in RETRACTED:
             self.assertEqual(
                 live_hits(f"an earlier revision said {phrase} here", phrase), [])
+
+
+class EveryPinCanFire(unittest.TestCase):
+    """A pin that cannot produce a positive certifies nothing.
+
+    The wrapped-phrase bug was invisible because the assertion passed on text
+    absent from BOTH versions. Injecting each phrase proves the matcher would
+    see it if the doc ever asserted it again.
+    """
+
+    def test_each_phrase_is_detectable_when_injected(self):
+        base = DOC.read_text(encoding="utf-8")
+        pins = [g for _, g, _ in CONTRACT] + [ph for ph, _ in RETRACTED]
+        self.assertGreater(len(pins), 4)
+        for phrase in pins:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(live_hits(base, phrase), [],
+                                 "phrase is asserted in the live doc")
+                self.assertNotEqual(
+                    live_hits(base + "\n\n" + phrase + "\n", phrase), [],
+                    "pin cannot detect its own phrase -- it certifies nothing")
 
 
 if __name__ == "__main__":
