@@ -158,6 +158,7 @@ jobs:
           timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
@@ -225,6 +226,13 @@ jobs:
               fi
             else
               echo "$output" | grep -E 'FAIL|^Summary' || true
+              # A listed suite that PASSES is a stale entry, and a stale entry
+              # un-gates a suite nobody thinks is un-gated. Fail so the list
+              # cannot silently outlive the failures it excuses.
+              if grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
+                echo "✖ stale allowlist entry: $f passed — delete its line from $known_failures_file"
+                failed=1
+              fi
             fi
           done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
           exit "$failed"
@@ -263,49 +271,40 @@ jobs:
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
         run: |
+          # Records are collected per file and replayed SERIALLY in sorted
+          # order below, so `failed_files` keeps its order.
           failed=0
           failed_files=()
+          WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          RECDIR="$(mktemp -d)"
+          trap 'rm -rf "$RECDIR"' EXIT
+          export RECDIR
+          find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
+          # alike, letting one worker's failing rc be overwritten.
+          N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
+          # Per-file cap: without it one hung suite burns the job budget and
+          # the job is CANCELED mid-suite.
+
+          # Shared scheduler: one SERIAL worker per worktree, so a slot can never
+          # hold two suites — and the regression drives this same script.
+          bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
+            timeout -k 5 120 python3
+          _idx=0
           while IFS= read -r f; do
             echo "→ $f"
-            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
-            # default for run: steps) while still capturing output + status. A bare
-            # `output=$(python3 "$f")` aborts the whole step the instant a test
-            # fails — before the `echo "$output"` below ever runs — so the failing
-            # test's traceback is DISCARDED, every later test is skipped, and the
-            # log shows only the bare `→ <file>` line. The shell-test step below
-            # already uses this idiom for exactly this reason; this step was
-            # missed. (Observed on a real CI run: a failure printed no output at
-            # all, making it undiagnosable from the log.)
-            # `cmd && rc=0 || rc=$?` exempts the command from `bash -e` (GitHub's
-            # default for run: steps) while capturing BOTH output and the real exit
-            # status. A bare `output=$(python3 "$f")` aborts the whole step the
-            # instant a test fails — before the `echo "$output"` below ever runs —
-            # so the failing test's traceback is DISCARDED, every later test is
-            # skipped, and the log shows only the bare `→ <file>` line. The
-            # shell-test step below already uses this idiom for exactly this reason;
-            # this step was missed. (Observed on a real CI run: a failure printed no
-            # output at all, making it undiagnosable from the log.)
-            # `timeout -k 5 120` mirrors the shell loop below. Without it a single
-            # hanging Python suite burns the job's whole timeout-minutes budget and
-            # gets the job CANCELED mid-suite — the exact failure the shell loop's
-            # comment says its own bound exists to prevent. This loop never had one,
-            # so the guard was asymmetric. On overrun timeout SIGTERMs (SIGKILL after
-            # 5s) and returns 124, failing that suite loudly and in isolation.
-            output=$(timeout -k 5 120 python3 "$f" 2>&1) && rc=0 || rc=$?
-            # Always show FAIL lines and summary
+            _idx=$((_idx + 1))
+            rec="$RECDIR/$_idx"
+            rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
+            output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ "$rc" -ne 0 ]; then
-              # NAME THE FILE. A test that exits non-zero with NO output — sys.exit(1),
-              # an uncaught SystemExit, a bare `raise` in a helper — was previously
-              # invisible: the log showed only its `→` line, byte-identical to a
-              # passing test, and the step exited 1 with nothing to point at. Measured
-              # 2026-07-30 on a red `tsc + tests`: the whole step held 24 non-arrow
-              # lines and every `Results:` line was a pass, so the failing file could
-              # not be identified from the log at all.
-              echo "::error::FAILED: $f (exit $rc)"
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "::error::TIMED OUT (>120s): $f"
+              else
+                echo "::error::FAILED: $f (exit $rc)"
+              fi
               if [ -n "$output" ]; then
-                # Emit full output (PASS + FAIL + traceback) so debugging info isn't
-                # dropped on ImportError / uncaught exception.
                 echo "$output"
               else
                 echo "  (this test produced NO output — exited $rc silently)"
@@ -313,7 +312,7 @@ jobs:
               failed_files+=("$f")
               failed=1
             fi
-          done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+          done < "$RECDIR/files"
           if [ "$failed" -ne 0 ]; then
             # `::notice::`, not `::error::` — the per-file lines above are the real
             # annotations. Making the summary an error too would double every failure

@@ -60,11 +60,13 @@ def _srv(tmp: Path) -> "rt.RuntimeServer":
 
 def _resolve_ha(srv, request_id, answers):
     aid = ha_action_id(request_id)
-    srv.ha.store.resolve(aid, answers, "@owner:hs")
+    srv.ha.resolve(aid, answers, "@owner:hs")
 
 
 def main() -> int:  # noqa: PLR0915 — one linear conformance script
     tmp = Path(tempfile.mkdtemp(prefix="rt-srv-"))
+    # instance lock + run dir must not collide with a live daemon's default
+    os.environ["SUTANDO_RUN_DIR"] = str(tmp / "run")
     srv = _srv(tmp)
 
     # ── protocol codec ──────────────────────────────────────────────────────
@@ -94,9 +96,9 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                          "resource": {"roomId": "!r:hs"}, "reason": "why"}))
     check(ra["status"] == "pending", "approval.request issues pending")
     ha_file = tmp / "ha" / (ha_action_id(ra["requestId"]) + ".json")
-    rec = json.loads(ha_file.read_text())
-    check("Approve: message.send" in rec["questions"][0]["question"]
-          and "Reason: why" in rec["questions"][0]["question"],
+    rec = json.loads(ha_file.read_text())["requirement"]
+    check("Approve: message.send" in rec["message"]
+          and "Reason: why" in rec["message"],
           "ha mirror carries action + reason in the card question")
     for bad_params, frag in (
             ({"question": "q", "type": "bogus"}, "type must be"),
@@ -112,7 +114,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                          {"question": "Which?", "type": "multi_select",
                           "options": ["a", "b", "c"]}))
     rec1 = json.loads((tmp / "ha" / (ha_action_id(re1["requestId"]) + ".json")).read_text())
-    check(rec1["questions"][0].get("multiSelect") is True,
+    check(rec1["requirement"]["subject"].get("multi_select") is True,
           "multi_select sets the multiSelect card flag")
     try:
         run(srv.dispatcher.handle("no.such", {}))
@@ -256,7 +258,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     rx = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
     xf = tmp / "ha" / (ha_action_id(rx["requestId"]) + ".json")
     xr = json.loads(xf.read_text())
-    xr["expires_at"] = time.time() - 5
+    xr["requirement"]["expires_at"] = time.time() - 5
     xf.write_text(json.dumps(xr))
     srv.dispatcher._settle(rx["requestId"])
     check(srv.store.get(rx["requestId"])["status"] == "expired",
@@ -301,6 +303,56 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     check(bad_f.get("error", {}).get("code") == -32700,
           "serve(): malformed frame answers a parse error")
 
+    # ── negative control: an ordinary Unix client cannot approve its own ────
+    # governed action (P1 — the requester must never be its own approver)
+    async def drive_self_approval():
+        sdir = tempfile.mkdtemp(prefix="rt", dir="/tmp")
+        sock = f"{sdir}/g.sock"
+        side_effects = []
+        s6 = rt.RuntimeServer(socket_path=sock, db_path=str(tmp / "s6.sqlite"),
+                              ha_dir=str(tmp / "ha6"))
+        s6.dispatcher.executors = {
+            "message.send": lambda p: side_effects.append("SEND") or {"executed": True}}
+        task = asyncio.ensure_future(s6.serve())
+        await asyncio.sleep(0.3)
+        r, w = await asyncio.open_unix_connection(sock)
+
+        async def rpc(i, method, params):
+            w.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                 "params": params}) + "\n").encode())
+            await w.drain()
+            return json.loads((await r.readline()).decode())
+
+        req = await rpc("g1", "approval.request", {"action": "message.send"})
+        rid = req["result"]["requestId"]
+        resp = await rpc("g2", "approval.respond",
+                         {"requestId": rid, "decision": "approve"})
+        execu = await rpc("g3", "capability.execute",
+                          {"action": "message.send",
+                           "resource": {"roomId": "!r:x"},
+                           "input": {"body": "hi"},
+                           "approvalRequestId": rid})
+        row = s6.store.get(rid)
+        w.close()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        Path(sock).unlink(missing_ok=True)
+        return resp, execu, row, side_effects
+
+    resp_f, exec_f, row_f, effects = run(drive_self_approval())
+    check(resp_f.get("error", {}).get("code") == -32601
+          and "grant" in resp_f.get("error", {}).get("message", ""),
+          "unix client: approval.respond is not callable (no grant)")
+    check(row_f["status"] == "pending",
+          "unix client: the approval remains pending after the respond attempt")
+    check("error" in exec_f,
+          "unix client: governed execute without approval is refused")
+    check(effects == [],
+          "unix client: the executor is never called (no side effect)")
+
     # main() wiring (env → construction), run patched out
     os.environ["SUTANDO_RUNTIME_SOCKET"] = str(tmp / "m.sock")
     os.environ["SUTANDO_RUNTIME_DB"] = str(tmp / "m.sqlite")
@@ -319,15 +371,15 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     ad = HumanActionAdapter(str(tmp / "ha4"))
     aid = ad.open_elicitation({"requestId": "elicitation-cafe01234567",
                                "params": {"type": "confirmation", "question": "Go?"}})
-    got = ad.store.get(aid)
-    check([o["label"] for o in got["questions"][0]["options"]] == ["Yes", "No"],
+    got = ad.manager.get(aid)
+    check([a.label for a in got.actions] == ["Yes", "No"],
           "confirmation without options defaults Yes/No")
     check(ad.poll_resolution("ha_missing000000") is None,
           "poll: unknown action → None")
     check(ad.poll_resolution(aid) is None, "poll: pending → None")
-    rec = ad.store.get(aid)
-    rec["expires_at"] = time.time() - 1
-    ad.store.update(rec)
+    rec = ad.manager.get(aid)
+    rec.expires_at = time.time() - 1
+    ad.manager.store.save(rec)
     check(ad.poll_resolution(aid)[0] == "expired", "poll: past deadline → expired")
     opts = [{"label": "A"}, {"label": "B"}]
     check(HumanActionAdapter.first_answer({"1": [2, 99]}, opts) == ["B"],
@@ -543,7 +595,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                               "input": {"body": "benign"}}))
         card = json.loads((tmp / "ha" / (ha_action_id(rbi["requestId"]) + ".json"))
                           .read_text())
-        check("benign" in card["questions"][0]["question"],
+        check("benign" in card["requirement"]["message"],
               "approval card shows the governed input")
         _resolve_ha(srv, rbi["requestId"], {"1": [1]})
         run(srv.dispatcher.handle("request.wait", {"requestId": rbi["requestId"], "timeoutS": 5}))

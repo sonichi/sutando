@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-08-13"
+   "last_verified": "2026-08-26"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -270,6 +270,16 @@
    "canonical_for": "Slack bridge setup and behavior",
    "last_verified": null
   },
+  "docs/sparrow-delivery-identity.md": {
+   "title": "Sparrow delivery identity — frozen definitions (B, slice 1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the five delivery/agent-boundary identities (delivery_id, task_id, attempt_id, idempotency_key, incarnation_id) and the three identity ratchets that gate B's format changes",
+   "last_verified": "2026-08-22"
+  },
   "docs/sparrow-v1-contract.md": {
    "title": "ag2-sparrow v1 — the frozen delivery contract",
    "audience": [
@@ -403,6 +413,46 @@
    "status": "canonical",
    "canonical_for": "workspace synchronization mechanics",
    "last_verified": null
+  },
+  "docs/benchmarks/gaia-100-2026-08-26.md": {
+   "title": "GAIA-100 benchmark run (2026-08-26)",
+   "audience": [
+    "maintainers",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "the 76/100 blind-scored GAIA validation result and how to rebuild the suite without republishing the answer key",
+   "last_verified": "2026-08-27"
+  },
+  "docs/graceful-shutdown.md": {
+   "title": "Graceful shutdown — sentinel paths",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "which restart path leaves the shutdown sentinel set, and why plain restart clears it",
+   "last_verified": "2026-08-19"
+  },
+  "docs/core-pool-standing-sessions.md": {
+   "title": "Core pool + standing sessions: how they compose",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
+   "last_verified": "2026-08-25"
+  },
+  "docs/proactive-loop-rationale.md": {
+   "title": "Proactive loop — rationale and measurements",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
+   "last_verified": "2026-09-04"
   }
  }
 }

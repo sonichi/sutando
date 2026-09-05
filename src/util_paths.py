@@ -25,6 +25,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The sibling import must resolve both top-level (src/ on sys.path) and
+# package-style (`src.util_paths`), where src/ itself is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sutando_config import config_get, config_get_env_first  # noqa: E402
+
 def _memory_dir_env() -> str | None:
     """Return the resolved memory-dir env value, preferring the new name.
 
@@ -36,7 +41,7 @@ def _memory_dir_env() -> str | None:
 
     Returns the raw env value (caller must `os.path.expanduser` if needed),
     or None when neither is set."""
-    new = os.environ.get("SUTANDO_MEMORY_DIR")
+    new = config_get_env_first("SUTANDO_MEMORY_DIR")
     if new:
         return new
     legacy = os.environ.get("SUTANDO_PRIVATE_DIR")
@@ -125,7 +130,7 @@ def _host_label() -> str:
     `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
     conventions stay in lockstep. Kept in lockstep with `_host()` in
     sync-workspace.sh (same precedence)."""
-    env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    env = config_get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
     # Strip before testing: a blank-but-set override (`SUTANDO_HOST_LABEL=" "`,
     # trivially produced by an unquoted expansion in a launcher) is truthy in
     # Python, so `if env:` returned the whitespace itself as the label. That
@@ -325,7 +330,7 @@ def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     """
     ccd_env = None if vanilla else os.environ.get("CLAUDE_CONFIG_DIR")
     home_env = (os.environ.get("SOURCE_CLAUDE_CONFIG_DIR") if vanilla
-                else os.environ.get("CLAUDE_HOME"))
+                else config_get_env_first("CLAUDE_HOME"))
     if ccd_env:
         base = Path(os.path.expanduser(ccd_env))
     elif home_env:
@@ -355,37 +360,16 @@ def claude_project_slug(path: str | Path) -> str:
 
 
 def channel_access_path(source: str) -> Path:
-    """Resolve `channels/<source>/access.json` with the ~30-day legacy fallback.
+    """Resolve `channels/<source>/access.json` inside the configured Claude home.
 
-    Prefer the canonical claude_home_path() location. If that file does NOT
-    exist but the pre-migration `~/.claude/channels/<source>/access.json`
-    does, return the legacy path and emit a one-line stderr deprecation
-    warning — per the CLAUDE.md migration policy (readers prefer canonical,
-    fall back to legacy for ~30 days).
-
-    Why this exists: bridges restarted under a fresh $CLAUDE_CONFIG_DIR
-    before the channel-bridge migrate step copies channels/ would otherwise
-    see no access.json at all — Telegram/Slack then re-arm TOFU onboarding
-    and the next DM sender auto-enrolls as owner. Falling back to the
-    populated legacy allowlist keeps access control continuous across the
-    migration window. Writers (TOFU onboarding, /discord:access) use the
-    same resolved path, so the legacy file stays the single source of truth
-    until it is actually migrated.
+    The pre-migration `~/.claude/channels/<source>/access.json` fallback shipped
+    2026-06-21 for a ~30-day window and is retired: it let any process whose
+    canonical file was absent — a bridge under a fresh $CLAUDE_CONFIG_DIR, or a
+    test that isolated one — read and WRITE the operator's real home. An absent
+    canonical file is now a migration to run (`scripts/sutando-migrate.sh`), not
+    a reason to reach outside the configured home.
     """
-    canonical = claude_home_path("channels", source, "access.json")
-    if canonical.exists():
-        return canonical
-    legacy = Path.home() / ".claude" / "channels" / source / "access.json"
-    if legacy != canonical and legacy.exists():
-        print(
-            f"[util_paths] DEPRECATION: using legacy {legacy} — canonical "
-            f"{canonical} missing. Run the channel-bridge migrate step "
-            f"(scripts/sutando-migrate.sh) to relocate; this fallback is "
-            f"removed ~30 days post-migration.",
-            file=sys.stderr,
-        )
-        return legacy
-    return canonical
+    return claude_home_path("channels", source, "access.json")
 
 
 # ---------------------------------------------------------------------------

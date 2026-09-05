@@ -20,9 +20,12 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Agent instruction detail (relocated from CLAUDE.md, 2026-08-17 context diet)
 
 - [Channel access control](access-control.md) — per-channel tier rules and gates.
+- [Core pool + standing sessions](core-pool-standing-sessions.md) — how the lead-follower pool composes with standing sessions; design record, not yet implemented.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
+- [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
@@ -31,6 +34,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Community use cases](community-use-cases/README.md)
   - [Self-healing install](community-use-cases/self-healing-install.md)
 - [Set up automatic wire-list regeneration](regen-wire-list-setup.md)
+- [GAIA-100 benchmark run (2026-08-26)](benchmarks/gaia-100-2026-08-26.md) — 76/100 blind-scored, and how to rebuild the suite.
 
 ## Operations
 
@@ -58,6 +62,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
+- [Sparrow delivery identity — frozen definitions](sparrow-delivery-identity.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

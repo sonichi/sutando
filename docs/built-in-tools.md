@@ -85,10 +85,14 @@ python3 skills/x-twitter/x-post.py post "With video" --media /path/to.mp4  # wit
 python3 skills/x-twitter/x-post.py search "query"                          # search recent
 python3 skills/x-twitter/x-post.py read 123456789                          # read tweet
 python3 skills/x-twitter/x-post.py mentions                                # recent @mentions
-python3 skills/x-twitter/x-post.py timeline                                # your tweets
+python3 skills/x-twitter/x-post.py timeline                                # YOUR tweets (OAuth1)
+python3 skills/x-twitter/x-post.py user-timeline <handle>                  # ANOTHER account (bearer)
 python3 skills/x-twitter/x-post.py engagement 123456789                    # likes/rt/views
 ```
-Requires X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET in .env.
+`post`/`mentions`/`timeline` need X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET.
+`search`/`read`/`user-timeline` run on X_BEARER_TOKEN alone. `timeline` resolves `users/me` and is
+OAuth1-only; `user-timeline` reads the same endpoint by handle over bearer, so it works where
+`timeline` cannot. Its `--limit` is 5..100 (`search`'s is 10..100 — different endpoints).
 Always confirm post content with user before publishing.
 
 **Reminders** — read/write macOS Reminders (to-do list):
@@ -197,3 +201,19 @@ open "https://github.com"           # open URL in default browser
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
 The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.
+
+## Model switch (no CLI needed)
+
+```bash
+bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
+bash scripts/switch-model.sh fable --dry-run        # prints what it would do, changes nothing
+bash scripts/switch-model.sh opus --confirm         # a warm core asks to confirm; this answers it (owner instruction)
+```
+
+Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
+to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
+A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
+dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
+`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
+pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+The capability lives in `skills/model-switch/`.

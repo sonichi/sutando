@@ -83,12 +83,14 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
+from policy.egress.unfurl import should_unfurl  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -538,8 +540,13 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
         _atomic_write_pending_replies(dict(pending_replies))
 
 
-def _dedup_recover(task_id: str, holder_id, target) -> None:
-    """Route the shared dedup-recovery plan; Slack owns only the send."""
+def _dedup_recover(task_id: str, holder_id, target) -> str:
+    """Route the shared dedup-recovery plan; Slack owns only the send.
+
+    Returns the shared disposition: "archive" once the exchange is terminal,
+    "retain" when the asker was never told and a later pass must retry.
+    """
+    action, delivered = "defer", None
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
@@ -548,11 +555,15 @@ def _dedup_recover(task_id: str, holder_id, target) -> None:
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
         elif action == "report" and target:
-            _send_reply(target["channel"], target.get("thread_ts"), payload,
-                        task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+            # The boolean is the whole point: an unsent report tells the asker
+            # nothing, so retiring on the attempt loses the question.
+            delivered = bool(_send_reply(
+                target["channel"], target.get("thread_ts"), payload,
+                task_id=task_id, access_tier=target.get("access_tier", "unknown")))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - never block the skip path
+    except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return report_disposition(action, delivered)
 
 
 def _pop_pending_reply(task_id: str):
@@ -594,7 +605,7 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
 # may have hit a limit" reply so the failure is visible instead of silent.
 # The pending entry is KEPT after notifying, so if the core later recovers and
 # writes a result, the real answer still gets delivered. 0 disables.
-TASK_TIMEOUT_SEC = int(os.environ.get("SLACK_TASK_TIMEOUT_SEC", "600"))
+TASK_TIMEOUT_SEC = int(config_get("SLACK_TASK_TIMEOUT_SEC", "600"))
 
 # Username cache — users.info is rate-limited (Tier 4 = 100/min). One
 # cache lookup per known user saves a network hop on every DM. Cache
@@ -613,6 +624,95 @@ _event_count_lock = threading.Lock()
 
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
 app = App(token=BOT_TOKEN)
+
+# Handler reference so the heartbeat writer can read LIVE socket state; the
+# heartbeat thread starts first, so main() wires this just before handler.start().
+_socket_handler = None
+
+
+def _socket_connected() -> bool:
+    """True only when the Socket Mode WSS connection is actually up.
+
+    A wedged socket (the BrokenPipeError reconnect-fail loop) reports False, so
+    gating the heartbeat write on this makes the heartbeat file go stale during
+    a wedge — the exact signal health-check needs to tell 'wedged' (process
+    alive but deaf) apart from 'process alive and healthy'. Before the handler
+    is wired (early boot) this returns False and the heartbeat simply starts a
+    beat or two late; health-check's staleness threshold is generous enough
+    that the short boot gap never reads as a wedge.
+    """
+    handler = _socket_handler
+    try:
+        client = getattr(handler, "client", None)
+        return bool(client is not None and client.is_connected())
+    except Exception:
+        return False
+
+
+# A wedge can hold is_connected() True while thrashing sessions, so CHURN is the
+# discriminator: >= _CHURN_MAX_SESSIONS id changes in _CHURN_WINDOW_S is unhealthy.
+_CHURN_WINDOW_S = 300
+_CHURN_MAX_SESSIONS = 3
+_session_changes: deque = deque()  # timestamps of observed session-id changes
+_last_session_id = None
+_churn_logged = False
+
+
+def _note_session_sample(now=None):
+    """Sample the live socket's session id; record a change timestamp.
+
+    Called from the result_watcher loop (~1s cadence), so sampling is far
+    faster than the ~9s session lifetime seen in the wedge repro. A None id
+    (between sessions, or handler not wired yet) is skipped rather than
+    counted — only id -> different-id transitions are churn. The first
+    observed id after boot is baseline, not churn.
+    """
+    global _last_session_id
+    handler = _socket_handler
+    try:
+        client = getattr(handler, "client", None)
+        sid = client.session_id() if client is not None else None
+    except Exception:
+        sid = None
+    if sid is None:
+        return
+    if now is None:
+        now = time.time()
+    if _last_session_id is not None and sid != _last_session_id:
+        _session_changes.append(now)
+    _last_session_id = sid
+
+
+def _reconnect_churning(now=None) -> bool:
+    """True when the socket is thrashing through sessions (wedge shape #2)."""
+    global _churn_logged
+    if now is None:
+        now = time.time()
+    while _session_changes and now - _session_changes[0] > _CHURN_WINDOW_S:
+        _session_changes.popleft()
+    churning = len(_session_changes) >= _CHURN_MAX_SESSIONS
+    if churning and not _churn_logged:
+        print(
+            f"[Slack] reconnect churn: {len(_session_changes)} new socket "
+            f"sessions in {_CHURN_WINDOW_S}s — suppressing heartbeat so "
+            "health-check flags the wedge",
+            flush=True,
+        )
+        _churn_logged = True
+    elif not churning and _churn_logged:
+        print("[Slack] reconnect churn subsided — heartbeat resumes", flush=True)
+        _churn_logged = False
+    return churning
+
+
+def _socket_healthy() -> bool:
+    """Heartbeat gate: the socket is up AND not thrashing through sessions.
+
+    Both wedge shapes must suppress the heartbeat: is_connected() False
+    (half-open socket, the original repro) and is_connected() True under
+    reconnect churn (the 2026-07-31 repro).
+    """
+    return _socket_connected() and not _reconnect_churning()
 
 
 def _download_slack_file(file_dict: dict) -> str | None:
@@ -1035,15 +1135,16 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"{_identity_note}{_context_note}"
     )
     if access_tier != "owner":
-        user_task_text = (
-            f"{user_task_text}\n\n"
-            f"===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            f"This Slack task is from a {access_tier.upper()} tier sender, NOT the owner. "
-            f"You MUST delegate to a sandboxed agent (e.g. `codex exec --sandbox read-only`) "
-            f"and NEVER process it with full core-agent capabilities. "
-            f"For 'team' tier: information lookups OK, no system mutations. "
-            f"For 'other' tier: information-only replies about Sutando itself. "
-            f"Write the sandboxed output to `results/{{task_id}}.txt` as the user-facing reply.\n"
+        # One owner for this policy; only the tier scope is Slack-specific.
+        from policy.guardrail import sandboxed_delegation_lines  # noqa: E402
+        _scope = ("For 'team' tier: information lookups OK, no system mutations. "
+                  "For 'other' tier: information-only replies about Sutando itself.")
+        user_task_text = "{}\n{}\n".format(
+            user_task_text,
+            "\n".join(sandboxed_delegation_lines(
+                "Slack", f"from a {access_tier.upper()} tier sender", "`results/{task_id}.txt`",
+                _scope,
+            )),
         )
 
     ts = int(time.time() * 1000)
@@ -1379,8 +1480,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # at each boundary so every chunk renders as a well-formed block.
     if clean_text:
         all_chunks_sent = True
+        # Decided on the whole body, not per chunk: a digest split at 4000
+        # chars must not unfurl piecewise just because a chunk holds one link.
+        unfurl = should_unfurl(clean_text)
         for chunk in chunk_message(clean_text, 4000):
-            kwargs = {"channel": channel, "text": chunk}
+            kwargs = {"channel": channel, "text": chunk,
+                      "unfurl_links": unfurl, "unfurl_media": unfurl}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
@@ -1567,7 +1672,11 @@ def result_watcher():
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
                     if _skip_action.value == "deduped":
-                        _dedup_recover(task_id, _skip_action.extra, target)
+                        if _dedup_recover(task_id, _skip_action.extra,
+                                          target) == "retain":
+                            print(f"  [dedup] report not delivered for {task_id} "
+                                  f"— keeping for retry", flush=True)
+                            continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.
@@ -1653,9 +1762,11 @@ def result_watcher():
                             print(f"  [proactive] failed, releasing {claim.name}: {e}", flush=True)
                             release_claim(claim)
 
-            # Heartbeat (used by health-check.py)
+            # Written ONLY while the socket is up and not churning: this thread is independent
+            # of the WSS loop, so an unconditional write would stay fresh through a wedge.
+            _note_session_sample()
             now = time.time()
-            if now - last_heartbeat >= 60:
+            if now - last_heartbeat >= 60 and _socket_healthy():
                 try:
                     heartbeat_file.write_text(str(int(now)))
                     last_heartbeat = now
@@ -1735,6 +1846,8 @@ def main():  # pragma: no cover
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
+    global _socket_handler
+    _socket_handler = handler  # let the heartbeat thread read live socket state
     handler.start()  # blocks
 
 
