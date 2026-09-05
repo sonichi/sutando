@@ -350,6 +350,13 @@ class IoEdge(unittest.TestCase):
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%8", tmux_env="/s,1,0", ancestors=[99]))
         bad = lambda *a, **k: SimpleNamespace(returncode=1, stdout="")
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=bad, tmux_pane="%7", ancestors=[4242]))
+        # The error path must stay falsy: a raising tmux, or an unparsable answer, is unknown provenance, never a skip.
+        def boom(*a, **k):
+            raise OSError("no tmux")
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=boom, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[4242]))
+        junk = lambda *a, **k: SimpleNamespace(returncode=0, stdout="garbage\n")
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=junk, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[4242]))
+        self.assertEqual(w._pid_ancestors(pid=777, runner=boom), [777])
         self.assertIn(os.getppid(), w._pid_ancestors())
 
     def test_pane_identity_probe(self):
