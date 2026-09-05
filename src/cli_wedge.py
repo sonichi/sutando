@@ -391,7 +391,10 @@ def work_signal(target: Optional[str], workspace: Path, now: float, work_file: O
             return (False, f"work file unreadable ({type(e).__name__}) — no work signal")
         rec = data.get(target) if isinstance(data, dict) and target in data else data
         if isinstance(rec, dict) and "outstanding" in rec and (target in data or "outstanding" in data):
-            return (bool(rec.get("outstanding")), str(rec.get("detail") or ("work file: outstanding" if rec.get("outstanding") else "work file: nothing outstanding")))
+            val = rec.get("outstanding")
+            if type(val) is not bool:  # "false", 0, 1, null: a malformed record is a missing signal, never a verdict input
+                return (False, f"work file: 'outstanding' for {target!r} is not a boolean ({val!r}) — no work signal")
+            return (val, str(rec.get("detail") or ("work file: outstanding" if val else "work file: nothing outstanding")))
         return (False, f"no work signal for {target!r} in the work file")
     if target:
         return (False, "no work signal for an explicit --target")

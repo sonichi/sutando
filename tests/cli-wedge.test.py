@@ -536,6 +536,15 @@ class Cli(unittest.TestCase):
             self.assertEqual(w.work_signal("=t:1", ws, 0.0), (False, "no work signal for an explicit --target"))
             wf.write_text("{not json")
             self.assertIn("unreadable", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
+            # `outstanding` is a JSON boolean or it is no signal: nothing is coerced.
+            for val, want in (("false", False), ("true", False), (0, False), (1, False), (None, False), (True, True), (False, False)):
+                wf.write_text(json.dumps({"=t:1": {"outstanding": val}}))
+                got = w.work_signal("=t:1", ws, 0.0, work_file=str(wf))
+                self.assertEqual(got[0], want, (val, got))
+                if type(val) is not bool:
+                    self.assertIn("is not a boolean", got[1], (val, got))
+            wf.write_text(json.dumps({"=t:1": {"detail": "no key"}}))
+            self.assertIn("no work signal", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
 
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:
