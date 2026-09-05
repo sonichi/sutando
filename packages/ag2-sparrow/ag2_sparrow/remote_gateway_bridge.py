@@ -1114,18 +1114,24 @@ def _retry_review_control_results() -> None:
 
 
 _WORKER_PIN_PREFIX = "worker-pin-"
+# Full documented grammar. A prefix test alone classifies ordinary work
+# (e.g. worker-pin-user-message) as control and silently closes it.
+_WORKER_PIN_RE = re.compile(r"worker-pin-[0-9]+-[0-9a-fA-F]+\Z")
 
 
 def _consume_worker_pin(task: dict) -> bool:
     """The broker's pin route enqueues a `worker-pin-<ms>-<hex>` compat task: a
     control message for this seat, never user work. It writes no task file
-    (the watcher only sees task-*.txt, so one would sit in flight until the
-    lease expired); it is acked and its lease closed [no-send]. False = not a pin."""
+    (the watcher globs *.txt, so one would sit in flight until the lease
+    expired); it is acked and its lease closed [no-send]. False = not a pin."""
     tid = str(task.get("id") or "").strip()
-    if not tid.startswith(_WORKER_PIN_PREFIX) or not _valid_tid(tid):
+    if not _WORKER_PIN_RE.fullmatch(tid) or not _valid_tid(tid):
         return False
+    # ACK, journal path, payload and status check must see ONE id, or a
+    # deferred close reports itself archived under a path nothing wrote.
+    pinned = dict(task, id=tid)
     _post_task_ack(_local_tid(tid))
-    _queue_review_control_result(task)
+    _queue_review_control_result(pinned)
     _retry_review_control_results()
     if _control_result_path(tid).is_file():
         _log(f"worker-pin {tid}: lease close deferred — next poll retries")

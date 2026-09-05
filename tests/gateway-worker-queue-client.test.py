@@ -317,6 +317,32 @@ def main() -> int:
     check(target in logs, f"log line matches the live-run target: {[l for l in logs if 'pin' in l]}")
     print(f"     result payload: {json.dumps(STATE['results'][0], sort_keys=True)}")
 
+    # ── 6. pin classifier: full grammar, and ONE normalized id ──────────────
+    print("6. pin classifier rejects look-alikes and normalizes the id once")
+    ws6 = root / "ws6"; ws6.mkdir()
+    seat6 = _load("wqc_pin_edge", ws6, port, SUTANDO_WORKER_ID="cloud-1",
+                  SUTANDO_WORKER_LOCATION="cloud")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    look_alike = {"id": "worker-pin-user-message", "task": "an ordinary ask",
+                  "timestamp": "2026-09-03T00:00:01Z", "source": "remote-gateway"}
+    check(seat6._consume_worker_pin(look_alike) is False,
+          "worker-pin-user-message is ordinary work, not a control message")
+    check(STATE["acks"] == [] and STATE["results"] == [],
+          f"the look-alike was neither acked nor closed: {STATE['acks']} {STATE['results']}")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    check(seat6._consume_worker_pin({"id": " worker-pin-123-abc ", "task": "pin"}) is True,
+          "a padded pin id is still a pin")
+    check(STATE["acks"] == [("/v1/tasks/worker-pin-123-abc/ack",
+                             {"id": "worker-pin-123-abc"})],
+          f"ack uses the normalized id: {STATE['acks']}")
+    check(STATE["results"] == [{"id": "worker-pin-123-abc", "body": "[no-send]"}],
+          f"lease close uses the normalized id: {STATE['results']}")
+    left = sorted(p.name for p in
+                  (seat6._STATE / "withheld-review-control-results").glob("*.json"))
+    check(left == [], f"no journal file stranded under a raw-id path: {left}")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
