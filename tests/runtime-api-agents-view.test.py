@@ -190,5 +190,55 @@ class ASupersededGhostIsAnnotatedNotHidden(unittest.TestCase):
         self.assertEqual(st.get("supersededBy"), "new-label")
 
 
+class AMalformedHeartbeatCannotBreakEnumeration(unittest.TestCase):
+    """`_entry()` passes payload values through verbatim, so a stale or hand-edited
+    .alive can carry any JSON type. Identity keying must not turn that into a
+    TypeError that takes down agent.list AND every agent.status lookup."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cores = Path(self.tmp) / "cores"
+        self.cores.mkdir()
+
+    def _raw(self, label, payload, age_s):
+        f = self.cores / f"{label}.alive"
+        f.write_text(json.dumps(payload))
+        t = time.time() - age_s
+        os.utime(f, (t, t))
+        return f
+
+    def test_unhashable_started_at_does_not_raise(self):
+        # The exact payload from the review: (1, []) is an unhashable tuple.
+        self._raw("bad", {"pid": 1, "started_at": []}, 1)
+        self._raw("good", {"pid": 2, "started_at": 100.0}, 1)
+        got = {a["agentId"] for a in AgentsView(self.tmp).list_agents()["agents"]}
+        self.assertEqual(got, {"bad", "good"})
+
+    def test_unhashable_pid_does_not_raise(self):
+        self._raw("bad", {"pid": {"a": 1}, "started_at": 100.0}, 1)
+        self.assertEqual(len(AgentsView(self.tmp).list_agents()["agents"]), 1)
+
+    def test_agent_status_still_answers_when_a_sibling_is_malformed(self):
+        # status builds from the same _entries(); one bad file must not blind it.
+        self._raw("bad", {"pid": 1, "started_at": []}, 1)
+        self._raw("good", {"pid": 2, "started_at": 100.0}, 1)
+        self.assertIsNotNone(AgentsView(self.tmp).agent_status("good"))
+
+    def test_malformed_values_are_not_identity_evidence(self):
+        # A dead and a live file both carrying junk must NOT be collapsed:
+        # equal-but-invalid values are not proof of the same process.
+        self._raw("ghost", {"pid": "x", "started_at": "y"}, 10_000)
+        self._raw("live", {"pid": "x", "started_at": "y"}, 1)
+        by = {a["agentId"]: a for a in AgentsView(self.tmp).list_agents()["agents"]}
+        self.assertNotIn("supersededBy", by["ghost"])
+
+    def test_bool_pid_is_rejected_even_though_bool_is_an_int(self):
+        # isinstance(True, int) is True in Python; True must not key to pid 1.
+        self._raw("ghost", {"pid": True, "started_at": 100.0}, 10_000)
+        self._raw("live", {"pid": 1, "started_at": 100.0}, 1)
+        by = {a["agentId"]: a for a in AgentsView(self.tmp).list_agents()["agents"]}
+        self.assertNotIn("supersededBy", by["ghost"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

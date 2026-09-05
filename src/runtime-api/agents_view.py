@@ -44,8 +44,14 @@ class AgentsView:
     @staticmethod
     def _identity_key(entry: dict):
         # Absent start time is not evidence of sameness: pid alone recycles.
+        # Only the writer's scalar types qualify: an unhashable payload value
+        # must not reach a dict key and take enumeration down with it.
         pid, started = entry.get("pid"), entry.get("started_at")
-        return None if pid is None or started is None else (pid, started)
+        if isinstance(pid, bool) or isinstance(started, bool):
+            return None
+        if not isinstance(pid, int) or not isinstance(started, (int, float)):
+            return None
+        return (pid, started)
 
     def _annotate_superseded(self, agents: list) -> None:
         """A dead heartbeat whose (pid, started_at) matches a LIVE one is the
