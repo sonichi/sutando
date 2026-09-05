@@ -207,10 +207,25 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertTrue(c["detail"].startswith("skipped — sampled from inside the pane it watches"), c["detail"])
         self.assertFalse((self.ws / "state" / "cli-wedge" / "window.jsonl").exists(), "a skipped sample must not be recorded")
 
-    def test_tmux_pane_naming_the_target_is_skipped(self):
-        with patch.dict(os.environ, {"TMUX_PANE": "%987654"}):
+    def test_tmux_pane_naming_the_target_on_the_core_server_is_skipped(self):
+        # $TMUX names the socket the pane id belongs to; here it is the core's own.
+        with patch.dict(os.environ, {"TMUX_PANE": "%987654", "TMUX": "/tmp/fake.sock,123,0"}):
             c = self.check()
         self.assertTrue(c["detail"].startswith("skipped — sampled from inside the pane it watches"), c["detail"])
+        self.assertFalse((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())
+
+    def test_same_pane_id_on_another_tmux_server_still_samples(self):
+        # Pane ids are per server: %987654 on a different socket is not the core pane.
+        with patch.dict(os.environ, {"TMUX_PANE": "%987654", "TMUX": "/tmp/other.sock,999,0"}):
+            c = self.check()
+        self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
+        self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())
+
+    def test_tmux_pane_without_a_server_binding_does_not_skip(self):
+        with patch.dict(os.environ, {"TMUX_PANE": "%987654"}, clear=False):
+            os.environ.pop("TMUX", None)
+            c = self.check()
+        self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
 
     def test_an_outside_caller_still_samples(self):
         with patch.dict(os.environ, {"TMUX_PANE": "%1"}):

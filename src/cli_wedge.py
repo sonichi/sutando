@@ -308,9 +308,16 @@ def _pid_ancestors(pid: Optional[int] = None, runner: Callable = subprocess.run,
     return chain
 
 
+def _same_tmux_server(socket_path: str, tmux_env: str) -> bool:
+    """$TMUX is `socket_path,server_pid,session_index`; pane ids only mean anything on that server."""
+    sock = (tmux_env or "").split(",", 1)[0]
+    return bool(sock) and os.path.realpath(sock) == os.path.realpath(socket_path)
+
+
 def sampled_from_inside(socket_path: str, target: str, tmux_bin: str = "tmux",
                         runner: Callable = subprocess.run, env: Optional[dict] = None,
-                        tmux_pane: Optional[str] = None, ancestors: Optional[list] = None) -> Optional[str]:
+                        tmux_pane: Optional[str] = None, tmux_env: Optional[str] = None,
+                        ancestors: Optional[list] = None) -> Optional[str]:
     """Why the caller must NOT sample `target` (it runs inside that pane), else None.
     Own output always moves, so a self-sample can never accumulate the static case."""
     try:
@@ -324,8 +331,9 @@ def sampled_from_inside(socket_path: str, target: str, tmux_bin: str = "tmux",
         return None
     pane_id, pane_pid = m.group(1), int(m.group(2))
     tmux_pane = os.environ.get("TMUX_PANE") if tmux_pane is None else tmux_pane
-    if tmux_pane and tmux_pane == pane_id:
-        return f"TMUX_PANE {pane_id} is the target pane"
+    tmux_env = os.environ.get("TMUX", "") if tmux_env is None else tmux_env
+    if tmux_pane and tmux_pane == pane_id and _same_tmux_server(socket_path, tmux_env):
+        return f"TMUX_PANE {pane_id} is the target pane on this server"
     chain = _pid_ancestors() if ancestors is None else list(ancestors)
     if pane_pid in chain:
         return f"caller pid chain reaches the pane shell (pid {pane_pid})"

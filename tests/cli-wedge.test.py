@@ -339,9 +339,15 @@ class IoEdge(unittest.TestCase):
 
     def test_sampled_from_inside_guard(self):
         ok = lambda *a, **k: SimpleNamespace(returncode=0, stdout="%7:4242\n")
-        self.assertIn("TMUX_PANE", w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%7", ancestors=[1]))
+        self.assertIn("TMUX_PANE", w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[1]))
+        # Pane ids are per tmux server: the same %7 under another socket, or unbound, is not the target.
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%7", tmux_env="/other,1,0", ancestors=[1]))
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%7", tmux_env="", ancestors=[1]))
+        self.assertTrue(w._same_tmux_server("/tmp/s.sock", "/tmp/s.sock,4242,0"))
+        self.assertFalse(w._same_tmux_server("/tmp/s.sock", "/tmp/t.sock,4242,0"))
+        self.assertFalse(w._same_tmux_server("/tmp/s.sock", ""))
         self.assertIn("pid chain", w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="", ancestors=[99, 4242]))
-        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%8", ancestors=[99]))
+        self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=ok, tmux_pane="%8", tmux_env="/s,1,0", ancestors=[99]))
         bad = lambda *a, **k: SimpleNamespace(returncode=1, stdout="")
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=bad, tmux_pane="%7", ancestors=[4242]))
         self.assertIn(os.getppid(), w._pid_ancestors())
