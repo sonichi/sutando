@@ -105,17 +105,25 @@ decision belongs to the sweep that wrote the verdict. Who reads what, and
 why one reader per decision is load-bearing rather than tidy, is set out under the
 record's contract below; this rule is step 3's, and step 2 routes on beats alone.
 
-**That publisher is a step-3 component, and the handler ships in step 2** — so the
-wedge path has a window with a consumer and no producer, which is a latent no-op at
-best and a silent misroute at worst. It is resolved by a stated default rather than
-by ordering luck: **when the record is absent, unreadable, or stale, every
-fresh-beat target is eligible** — exactly the behaviour before this rule existed, so
-step 2 is a no-regression change and the wedge path simply does not fire until step
-3 lands the sweep. Defaulting the other way would divert healthy pinned work to the
+**That publisher is a step-3 component, and so is its reader — so across the step-2
+window the wedge feature is ABSENT, not defaulted.** An earlier revision of this
+paragraph called step 2 "a consumer with no producer" and then, eleven lines later,
+said step 2 ships no reader at all. Both cannot hold: a stage with no reader is not
+a consumer, and the two descriptions imply different failures — a consumer with no
+producer is a latent no-op that could misroute, while an absent feature cannot fire
+at all. The second is the true one and it is the weaker claim, which is why the
+first survived: it sounds like the more careful statement. **Nothing reads the
+record until step 3**, so across the window every fresh-beat target is eligible
+because that is the ONLY rule present, not because a default was chosen over a
+reading. Behaviour is exactly what it was before this rule existed, so step 2 is a
+no-regression change and the wedge path simply does not fire until step 3 lands the
+sweep and its reader together. Defaulting the other way would divert healthy pinned work to the
 core for the whole window, breaking the pin contract to fix a case that cannot yet
-be detected. Step 2 ships **no reader at all** — the default is its whole rule, so
-there is nothing to test absent-or-corrupt against yet; the reader and those cases
-arrive together in step 3, listed in its scope below. Step 3's suite pins absent,
+be detected. Step 2 ships **no reader at all**, which is the same fact the
+paragraph opens with rather than a second one: with nothing reading, there is no
+absent-or-corrupt case to test yet, and **the absent / unreadable / stale default
+matrix belongs WITH the step-3 reader**, not to this window. The reader and those
+cases arrive together in step 3, listed in its scope below. Step 3's suite pins absent,
 corrupt, stale, future-clock and the old/new transition.
 
 The record's contract, because a routing-critical shared file without one drifts:

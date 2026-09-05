@@ -508,6 +508,31 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class TheStepTwoWindowHasOneShapeNotTwo(unittest.TestCase):
+    """The window was described as BOTH "a consumer with no producer" (a latent no-op that
+    could misroute) and "ships no reader at all" (the feature is absent). A stage with no
+    reader is not a consumer, and the two imply different failures.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_window_is_absent_not_a_dangling_consumer(self):
+        f = self._flat()
+        self.assertNotRegex(
+            f, r"the\s+wedge path has a window with a consumer and no producer",
+            "a stage with no reader cannot be a consumer")
+        self.assertRegex(f, r"the wedge feature is ABSENT, not defaulted")
+
+    def test_eligibility_is_the_only_rule_present_not_a_chosen_default(self):
+        f = self._flat()
+        self.assertRegex(f, r"because that is the ONLY rule present, not because a default was\s+chosen over a reading")
+
+    def test_the_default_matrix_is_assigned_to_the_step_three_reader(self):
+        f = self._flat()
+        self.assertRegex(f, r"default\s+matrix belongs WITH the step-3 reader")
+
+
 class OneComponentBelongsToOneStage(unittest.TestCase):
     """Step 2 was assigned "the eligibility reader" while three hundred lines earlier the
     same document says step 2 routes on BEATS ALONE and consults no record. One phrase
