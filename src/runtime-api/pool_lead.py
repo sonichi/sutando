@@ -20,6 +20,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
@@ -475,20 +476,33 @@ class PoolLead:
         return w, m, du
 
     def _save_wake_evidence(self, wall: float, mono: float,
-                            defer_until: "float | None" = None) -> None:
-        # Best-effort: losing the sample costs one grace window, while
-        # raising here would abort the reclaim sweep that called us.
+                            defer_until: "float | None" = None) -> bool:
+        """Publish this lead's wake sample. False = not published, so a caller
+        can observe the loss instead of trusting a silent best-effort write."""
+        p = self._wake_evidence_path()
+        payload = {"wall": wall, "mono": mono}
+        if defer_until is None:
+            # A deadline-free sample must not ERASE an open one: the window
+            # belongs to the host's wake event, not to whoever ticked last.
+            prior = self._load_wake_evidence()
+            if prior is not None and prior[2] is not None and mono < prior[2]:
+                payload["defer_until"] = prior[2]
+        else:
+            payload["defer_until"] = defer_until
+        # Per-writer temp name, as pool_status does: briefly overlapping leads
+        # are supported, and a shared temp lets one consume the other's bytes.
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
         try:
-            p = self._wake_evidence_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
-            payload = {"wall": wall, "mono": mono}
-            if defer_until is not None:
-                payload["defer_until"] = defer_until
             tmp.write_text(json.dumps(payload))
             os.replace(tmp, p)
+            return True
         except OSError:
-            pass
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
 
     def _host_gap_defers_reclaim(self) -> bool:
         """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's

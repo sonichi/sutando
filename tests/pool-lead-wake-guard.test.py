@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -64,6 +65,72 @@ class WakeGuardBase(unittest.TestCase):
             self.mono += 2          # awake: both clocks advance together
             outs += fn()
         return outs
+
+
+class TheWakeRecordHasOneWriterContract(WakeGuardBase):
+    """Overlapping leads are production-supported (TOCTOU pgrep + KeepAlive),
+    so the shared record needs collision-safe staging and merge semantics."""
+
+    def _open_deadline(self):
+        self.lead._save_wake_evidence(self.clock, self.mono, self.mono + LEAD_STALE_S)
+        return self.mono + LEAD_STALE_S
+
+    def test_concurrent_writers_never_publish_a_torn_record(self):
+        # NON-DISCRIMINATING on this platform: in-process threads did not
+        # reproduce the tear at the parent. Kept as a non-regression guard.
+        want = self._open_deadline()
+        start = threading.Barrier(4)
+
+        def writer(n):
+            start.wait()
+            for i in range(40):
+                # Variable-length payloads tear a shared temp name; mono stays
+                # <= the reader's, since a future mono reads as a reboot.
+                self.lead._save_wake_evidence(self.clock + n, self.mono - n,
+                                              want if i % 2 else None)
+        ts = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        got = self.lead._load_wake_evidence()
+        self.assertIsNotNone(got, "concurrent writers published a torn record")
+        self.assertEqual(len(got), 3)
+
+    def test_a_deadline_free_sample_does_not_erase_an_open_deadline(self):
+        want = self._open_deadline()
+        self.lead._save_wake_evidence(self.clock, self.mono, None)
+        got = self.lead._load_wake_evidence()
+        self.assertIsNotNone(got)
+        self.assertEqual(got[2], want,
+                         "a deadline-free sample erased the open grace window")
+
+    def test_a_torn_record_would_reach_the_reclaim_decision(self):
+        # CONTROL for the consequence: a successor seeding from the record must
+        # still defer, which is what keeps a live claim from being repooled.
+        want = self._open_deadline()
+        self.lead._save_wake_evidence(self.clock, self.mono, None)
+        successor = self.lead
+        for attr in ("_last_reclaim_tick", "_last_reclaim_mono", "_reclaim_defer_until"):
+            if hasattr(successor, attr):
+                delattr(successor, attr)
+        self.assertTrue(successor._host_gap_defers_reclaim(),
+                        "successor lost the grace and would repool a live claim")
+        self.assertLess(self.mono, want)
+
+    def test_publication_failure_is_observable(self):
+        real = Path.write_text
+
+        def boom(self_p, *a, **k):
+            raise OSError("disk full")
+        Path.write_text = boom
+        try:
+            ok = self.lead._save_wake_evidence(self.clock, self.mono, None)
+        finally:
+            Path.write_text = real
+        # `is False`, not assertFalse: the parent returns None, which is falsy
+        # and would pass — a check that cannot fail certifies nothing.
+        self.assertIs(ok, False, "a failed publication reported success")
 
 
 class SuspensionAfterTheEntryGuard(WakeGuardBase):
