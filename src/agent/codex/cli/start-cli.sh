@@ -305,6 +305,8 @@ ensure_codex_scheduler
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+  # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
+  python3 "$REPO/src/core_heartbeat.py" --stop >/dev/null 2>&1 || true
 elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
   # Sessions created before runtime markers existed are Claude sessions. Never
   # attach a selected Codex launcher to an unknown/foreign canonical session.

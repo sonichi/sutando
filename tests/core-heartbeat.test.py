@@ -23,6 +23,14 @@ def _short_host() -> str:
     return socket.gethostname().split(".")[0]
 
 
+# A stand-in tmux must prove it talked to THIS server: echo the socket and session it was asked about.
+_ARGV_PARSE = ('#!/bin/sh\nsock=""; sess=""; prev=""\nfor a in "$@"; do\n  case "$prev" in -S) sock="$a";; -t) sess="${a#=}";; esac\n'
+               '  prev="$a"\ndone\n')
+
+
+EXPORTED_CLIENT = 'case "$*" in\n  *-V*) echo \'tmux 3.5a\';;\n  *has-session*) [ "$sess" = real ] && exit 0 || { echo "no such session: $sess" >&2; exit 1; };;\n  *list-sessions*) case "$*" in *socket_path*) echo "$sock";; *) echo real;; esac;;\n  *list-panes*) [ "$sess" = real ] && echo 4242 || exit 1;;\n  *display-message*) [ "$sess" = real ] && echo "3.5a|$sock|real" || { echo "no such session" >&2; exit 1; };;\n  *) exit 1;;\nesac\n'
+
+
 class TestHeartbeatWrite(unittest.TestCase):
     def setUp(self):
         self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
@@ -224,8 +232,9 @@ class TestHeartbeatWrite(unittest.TestCase):
     def _fake_tmux(self, name, speaks, version="3.6b"):
         # display-message succeeds only when `speaks`; -V always answers.
         f = self.tmp / name
-        body = "#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % (
-            version, ("echo '%s'" % version) if speaks else "echo 'protocol version mismatch (client 8, server 9)' >&2; exit 1")
+        refuse = "echo 'protocol version mismatch (client 8, server 9)' >&2; exit 1"
+        body = (_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *list-sessions*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n") % (
+            version, ('echo "$sock"' if speaks else refuse), (('echo "%s|$sock|$sess"' % version) if speaks else refuse))
         f.write_text(body); f.chmod(0o755); return str(f)
 
     def test_tmux_backend_records_a_client_verified_against_the_socket(self):
@@ -234,7 +243,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         exported = self._fake_tmux("exported-tmux", speaks=False, version="3.5a")
         # The mixed case: the app exported one binary, the launcher ran the PATH one.
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported, "PATH": str(self.tmp)}):
-            b = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+            b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
         self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
                          (path_tmux, "3.6b", "3.6b", True))
         self.assertEqual(b["tmux_candidates"], [path_tmux, exported])
@@ -242,12 +251,12 @@ class TestHeartbeatWrite(unittest.TestCase):
         path_tmux2 = self._fake_tmux("tmux", speaks=False, version="3.6b")
         exported2 = self._fake_tmux("exported-tmux", speaks=True, version="3.5a")
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported2, "PATH": str(self.tmp)}):
-            b2 = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+            b2 = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
         self.assertEqual((b2["tmux_binary"], b2["tmux_version"], b2["tmux_server_version"]), (exported2, "3.5a", "3.5a"))
         # nothing speaks → nulls and verified False, never a guess
         self._fake_tmux("tmux", speaks=False); self._fake_tmux("exported-tmux", speaks=False)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "exported-tmux"), "PATH": str(self.tmp)}):
-            b3 = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
+            b3 = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
         self.assertEqual((b3["tmux_binary"], b3["tmux_version"], b3["tmux_server_version"], b3["tmux_verified"]), (None, None, None, False))
 
     def test_tmux_backend_verifies_the_observed_session_not_the_env_claim(self):
@@ -255,7 +264,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         # a lying SUTANDO_TMUX_SESSION left the payload unverified with a compatible client present.
         import core_heartbeat
         f = self.tmp / "tmux"
-        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *'-t =real'*) echo '3.6b';;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n")
+        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *'-t =real'*) echo \"3.6b|$sock|real\";;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n")
         f.chmod(0o755)
         _obs, _pid = core_heartbeat._observed_session, core_heartbeat.core_pid
         core_heartbeat._observed_session = lambda sock: "real"
@@ -275,7 +284,9 @@ class TestHeartbeatWrite(unittest.TestCase):
         f = self.tmp / "tmux"
         ver = self.tmp / "server-version"
         # PATH is pinned to the temp dir below, so the stand-in must use absolute tool paths.
-        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *-V*) echo \"tmux $(/bin/cat '%s' 2>/dev/null || echo none)\";;\n  *display-message*) [ -s '%s' ] && /bin/cat '%s' || { echo 'no server running' >&2; exit 1; };;\nesac\n" % (ver, ver, ver))
+        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo \"tmux $(/bin/cat '%s' 2>/dev/null || echo none)\";;\n"
+                     "  *display-message*) [ -s '%s' ] && echo \"$(/bin/cat '%s')|$sock|$sess\" || { echo 'no server running' >&2; exit 1; };;\n"
+                     "  *) exit 1;;\nesac\n" % (ver, ver, ver))
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
             first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")        # cold boot: no server yet
@@ -286,7 +297,6 @@ class TestHeartbeatWrite(unittest.TestCase):
             ver.write_text("3.6b")                                                # server replaced between beats
             third = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
             self.assertEqual(third["tmux_server_version"], "3.6b")
-            self.assertIsNot(third, second)
 
     def test_tmux_backend_tolerates_a_missing_or_vanishing_binary(self):
         # A candidate that cannot be executed is skipped (not raised); a binary that speaks
@@ -296,11 +306,72 @@ class TestHeartbeatWrite(unittest.TestCase):
             b = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
         self.assertEqual((b["tmux_verified"], b["tmux_candidates"]), (False, [str(self.tmp / "absent")]))
         f = self.tmp / "tmux"
-        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *display-message*) echo '3.6b'; /bin/rm -f \"$0\";;\n  *) exit 1;;\nesac\n")
+        f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *display-message*) echo \"3.6b|$sock|$sess\"; /bin/rm -f \"$0\";;\n  *) exit 1;;\nesac\n")
         f.chmod(0o755)
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
             b2 = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
         self.assertEqual((b2["tmux_verified"], b2["tmux_binary"], b2["tmux_server_version"], b2["tmux_version"]), (True, str(f), "3.6b", None))
+
+    def test_tmux_backend_rejects_a_runnable_wrong_binary_and_malformed_success(self):
+        # Exit 0 with output is not "verified": /bin/echo answers anything. The proof is the server's
+        # own socket path and the session name coming back; a -V that is not tmux records no version.
+        import core_heartbeat
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": "/bin/echo", "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/definitely-no-server.sock", sess="nope")
+        self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
+                         (None, None, None, False), b)
+        for name, out in (("bare-version", "echo '3.6b'"), ("other-socket", "echo \"3.6b|/tmp/other.sock|$sess\""),
+                          ("other-session", "echo \"3.6b|$sock|someone-else\"")):
+            f = self.tmp / name
+            f.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % out)
+            f.chmod(0o755)
+            with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
+                b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
+            self.assertFalse(b["tmux_verified"], (name, b))
+        g = self.tmp / "odd-version"   # speaks, but its -V is not a tmux banner
+        g.write_text(_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'something 9.9';;\n  *display-message*) echo \"3.6b|$sock|$sess\";;\n  *) exit 1;;\nesac\n")
+        g.chmod(0o755)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(g), "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
+        self.assertEqual((b["tmux_verified"], b["tmux_server_version"], b["tmux_version"]), (True, "3.6b", None))
+
+    def test_unpatched_beat_discovers_the_session_through_the_compatible_client(self):
+        # PATH tmux is protocol-refused, the exported client speaks, the env names a session that does
+        # not exist: the FULL write_beat (no seams patched) must find `real` through the exported client.
+        import core_heartbeat
+        bindir = self.tmp / "bin"; bindir.mkdir()
+        (bindir / "tmux").write_text("#!/bin/sh\necho 'protocol version mismatch (client 8, server 9)' >&2; exit 1\n")
+        (bindir / "ps").write_text("#!/bin/sh\necho 'claude --name real --resume'\n")
+        (bindir / "pgrep").write_text("#!/bin/sh\necho 4242\n")
+        exported = self.tmp / "exported-tmux"
+        exported.write_text(_ARGV_PARSE + EXPORTED_CLIENT)
+        for f in (bindir / "tmux", bindir / "ps", bindir / "pgrep", exported):
+            f.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(bindir), "SUTANDO_TMUX_BIN": str(exported),
+                                     "SUTANDO_TMUX_SESSION": "lie", "SUTANDO_TMUX_SOCKET": "/tmp/unpatched.sock"}):
+            core_heartbeat._CLIENT_CACHE.clear()
+            core_heartbeat.write_beat()
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual((data["session"], data["tmux_binary"], data["tmux_verified"], data["tmux_server_version"], data["pid"], data["socket"]),
+                         ("real", str(exported), True, "3.5a", 4242, "/tmp/unpatched.sock"), data)
+
+    def test_write_beat_is_a_noop_once_the_signal_handler_ran(self):
+        # The handler unlinks .alive; a beat already in flight must not republish it.
+        import core_heartbeat
+        core_heartbeat._SIGNALLED = True
+        try:
+            core_heartbeat.write_beat()
+        finally:
+            core_heartbeat._SIGNALLED = False
+        self.assertFalse((self.tmp / "state" / "cores" / f"{_short_host()}.alive").exists())
+
+    def test_restart_paths_hand_the_heartbeat_over(self):
+        # Both launchers stop the running writer before starting one; startup only starts when none runs.
+        restart = (ROOT / "src" / "restart.sh").read_text()
+        codex = (ROOT / "src" / "agent" / "codex" / "cli" / "start-cli.sh").read_text()
+        self.assertIn('core_heartbeat.py" --stop', restart)
+        self.assertIn('core_heartbeat.py" --stop', codex)
+        self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
@@ -371,6 +442,26 @@ class TestHeartbeatCli(unittest.TestCase):
         self.assertTrue(alive.is_file())
         data = json.loads(alive.read_text())
         self.assertEqual(data["status"], "smoke")
+
+    def test_stop_hands_over_from_an_old_writer_to_a_schema_4_singleton(self):
+        # An old writer (argv names this checkout's script) is still running; --stop must end it and
+        # wait, then a fresh --once beat carries schema 4. No pkill pattern kills another checkout's.
+        script = ROOT / "src" / "core_heartbeat.py"
+        old = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(script.resolve())],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.3)
+            r = subprocess.run([sys.executable, str(script), "--stop"], env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("stopped 1 writer(s)", r.stdout)
+            self.assertIsNotNone(old.wait(timeout=5), "the old writer must be gone before --stop returns")
+        finally:
+            if old.poll() is None:
+                old.kill(); old.wait()
+        r2 = subprocess.run([sys.executable, str(script), "--once"], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual(data["schema_version"], 4)
 
     def test_sigterm_cleans_up_alive_file(self):
         """Graceful shutdown removes the .alive file so peers see the core

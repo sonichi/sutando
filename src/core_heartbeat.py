@@ -115,44 +115,72 @@ def _socket_path() -> str:
     return os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
 
 
-def _tmux_backend(refresh: bool = False, sock: str | None = None, sess: str | None = None) -> dict:
-    """A tmux client VERIFIED to speak to this core's server, plus the server's own
-    version. Recorded so a reader can start from a compatible client instead of
-    guessing: tmux versions with incompatible protocols cannot talk to each other,
-    and a probe that cannot connect looks like an absent core. Candidates are the
-    PATH tmux (what both launchers run) and SUTANDO_TMUX_BIN (what the app exports);
-    the first that can `display-message` the recorded socket and the OBSERVED
-    session is `tmux_binary` (its `-V` is `tmux_version`), and the server answers
-    `tmux_server_version` itself. This is a compatible client, not the server's
-    creator. Nothing speaks → nulls, never a guess; nothing is memoized, so a
-    cold-boot miss or a server replacement is seen on the next beat. `refresh` is
-    accepted for callers that used it; there is nothing to refresh."""
-    del refresh
-    sock = sock or _socket_path()
-    sess = sess or _observed_session(sock)
+_MAX_FIELD = 64
+_CLIENT_TTL_S = 10.0
+_CLIENT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _tmux_candidates() -> list[str]:
     seen: list[str] = []
     for c in (shutil.which("tmux"), os.environ.get("SUTANDO_TMUX_BIN")):
         if c and c not in seen:
             seen.append(c)
+    return seen
+
+
+def _same_socket(reported: str, sock: str) -> bool:
+    try:
+        return bool(reported) and os.path.realpath(reported) == os.path.realpath(sock)
+    except Exception:
+        return False
+
+
+def _client_for(sock: str) -> str | None:
+    """The first candidate that PROVABLY talked to this server: it must list the server's own
+    socket path back. A hit is kept for one beat; a miss is retried on every call."""
+    hit = _CLIENT_CACHE.get(sock)
+    if hit and time.monotonic() - hit[0] < _CLIENT_TTL_S:
+        return hit[1]
+    for binary in _tmux_candidates():
+        try:
+            r = subprocess.run([binary, "-S", sock, "list-sessions", "-F", "#{socket_path}"],
+                               capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if r.returncode == 0 and lines and all(_same_socket(ln, sock) for ln in lines):
+            _CLIENT_CACHE[sock] = (time.monotonic(), binary)
+            return binary
+    return None
+
+
+def _tmux_backend(sock: str | None = None, sess: str | None = None) -> dict:
+    """A client verified to speak to THIS server about the OBSERVED session — it must answer
+    with the server's socket path and the session name, so exit 0 alone proves nothing."""
+    sock = sock or _socket_path()
+    sess = sess or _observed_session(sock)
+    seen = _tmux_candidates()
     chosen, server_version = None, None
     for binary in seen:
         try:
             # Bounded: two candidates on a 30 s beat must not spend 10 s on a hung binary.
-            r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}", "#{version}"],
+            r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}",
+                                "#{version}|#{socket_path}|#{session_name}"],
                                capture_output=True, text=True, timeout=2)
         except Exception:
             continue
-        out = (r.stdout or "").strip()
-        if r.returncode == 0 and out:
-            chosen, server_version = binary, out
+        parts = (r.stdout or "").strip().split("|")
+        if (r.returncode == 0 and len(parts) == 3 and parts[0] and " " not in parts[0]
+                and _same_socket(parts[1], sock) and parts[2] == sess):
+            chosen, server_version = binary, parts[0][:_MAX_FIELD]
             break
     version = None
     if chosen:
         try:
             r = subprocess.run([chosen, "-V"], capture_output=True, text=True, timeout=2)
             out = (r.stdout or r.stderr or "").strip()
-            if r.returncode == 0 and out:
-                version = out.split()[-1] if out.lower().startswith("tmux") else out
+            if r.returncode == 0 and out.lower().startswith("tmux "):
+                version = out.split(None, 1)[1][:_MAX_FIELD]
         except Exception:
             version = None
     return {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
@@ -192,10 +220,14 @@ def _observed_session(sock: str) -> str:
 
 
 def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
+    """Every probe goes through the client that can reach this server; only when none can is
+    the PATH tmux used, so its refusal is classified rather than mistaken for an absent core."""
+    binary = _client_for(sock) or "tmux"
     try:
-        return subprocess.run(["tmux", "-S", sock, *args],
+        return subprocess.run([binary, "-S", sock, *args],
                               capture_output=True, text=True, timeout=5)
     except Exception:
+        _CLIENT_CACHE.pop(sock, None)
         return None
 
 
@@ -418,11 +450,14 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
 def write_beat(status: str = "running") -> None:
     """Write one heartbeat record. Atomic-via-tmp-then-rename so a concurrent
     reader never sees a partial file."""
+    if _SIGNALLED:
+        return  # the handler already unlinked .alive; a beat in flight must not republish it
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     target = _alive_path()
-    cpid = core_pid()
-    sock = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+    sock = _socket_path()
     observed_session = _observed_session(sock)
+    # The pid of the session the record NAMES, not of whatever the env claims.
+    cpid = core_pid(sock, observed_session)
     payload = {
         "host": _hostname(),
         # The CORE's pid — what this file has always claimed to carry. Falls
@@ -440,7 +475,7 @@ def write_beat(status: str = "running") -> None:
         # launch env (e.g. `sutando-config.sh runtime` invoked by the desktop
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
-        "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        "socket": sock,
         # Same runtime-authored argument as `socket`, but the env cannot be
         # trusted here: the Claude launcher hardcodes the session, so ask tmux.
         "session": observed_session,
@@ -460,14 +495,16 @@ def write_beat(status: str = "running") -> None:
 
 _STARTED_AT: float = time.time()
 _SHUTDOWN_REQUESTED = False
+_SIGNALLED = False  # set only by the signal handler; the loop flag alone is also set by harnesses
 
 
 def _handle_signal(signum: int, frame) -> None:
     """Mark shutdown so the loop exits at the top of the next sleep; also
     unlink the .alive file so peers see this core leave immediately rather
     than wait for mtime staleness."""
-    global _SHUTDOWN_REQUESTED
+    global _SHUTDOWN_REQUESTED, _SIGNALLED
     _SHUTDOWN_REQUESTED = True
+    _SIGNALLED = True
     try:
         # Tombstone BEFORE the unlink: recover-core must not read a graceful
         # stop as death and relaunch a core someone stopped on purpose (#2160).
@@ -542,7 +579,55 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
         while slept < interval and not _SHUTDOWN_REQUESTED:
             time.sleep(slice_s)
             slept += slice_s
+    if _SIGNALLED:
+        try:
+            # A beat that was mid-write when the signal landed may have republished the file.
+            _alive_path().unlink(missing_ok=True)
+        except Exception:  # pragma: no cover — best-effort
+            pass
     return 0
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        return not (st.stdout or "").strip().startswith("Z")
+    except Exception:
+        return True
+
+
+def stop_other_writers(timeout_s: float = 5.0) -> int:
+    """SIGTERM every other heartbeat writer of THIS checkout and wait for it to exit (SIGKILL past
+    the timeout): a restart hands .alive over to the new writer instead of leaving the old one."""
+    me, parent = os.getpid(), os.getppid()
+    try:
+        r = subprocess.run(["pgrep", "-f", str(Path(__file__).resolve())], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return 0
+    pids = [int(p) for p in (r.stdout or "").split() if p.isdigit() and int(p) not in (me, parent)]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout_s
+    left = list(pids)
+    while left and time.monotonic() < deadline:
+        left = [p for p in left if _pid_running(p)]
+        if left:
+            time.sleep(0.1)
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return len(pids)
 
 
 def mark_stopped() -> None:
@@ -566,6 +651,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--once", action="store_true", help="write a single beat and exit (for tests/debugging)")
     p.add_argument("--mark-stopped", action="store_true",
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
+    p.add_argument("--stop", action="store_true",
+                   help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
     return p.parse_args(argv)
 
 
@@ -573,6 +660,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.mark_stopped:
         mark_stopped()
+        return 0
+    if args.stop:
+        print(f"core_heartbeat: stopped {stop_other_writers()} writer(s)", flush=True)
         return 0
     if args.once:
         write_beat(status=args.status)

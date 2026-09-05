@@ -59,6 +59,13 @@ fi
 # window as ours, not a crash, so the owner is not alerted for every restart.
 _WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null)"
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
+# The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
+# startup.sh only starts one when none is running, and an old writer keeps its old schema.
+if [ -n "${_VOICE_PY:-}" ]; then
+    "$_VOICE_PY" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null || true
+else
+    pkill -f "$REPO/src/core_heartbeat.py" 2>/dev/null
+fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
@@ -117,7 +124,7 @@ STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
     "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
-    "conversation-server" "ngrok" "src/Sutando/Sutando"
+    "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
 for _ in $(seq 1 30); do
     still=0
