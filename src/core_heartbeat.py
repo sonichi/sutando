@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import shutil
@@ -535,6 +536,7 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # a failed boot as healthy. Keep waiting (so a late core can still arm the
     # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
+    _record_writer_pid()
     try:
         # A new run supersedes any prior graceful-stop tombstone.
         _alive_path().with_suffix(".stopped").unlink(missing_ok=True)
@@ -602,15 +604,65 @@ def _pid_running(pid: int) -> bool:
         return True
 
 
-def stop_other_writers(timeout_s: float = 5.0) -> int:
-    """SIGTERM every other heartbeat writer of THIS checkout and wait for it to exit (SIGKILL past
-    the timeout): a restart hands .alive over to the new writer instead of leaving the old one."""
-    me, parent = os.getpid(), os.getppid()
+def _pidfile() -> Path:
+    return _alive_path().with_suffix(".heartbeat.pid")
+
+
+def _record_writer_pid() -> None:
+    """The writer's own record of itself, written before the first beat so a restart can find it
+    even when no .alive has been published yet."""
     try:
-        r = subprocess.run(["pgrep", "-f", str(Path(__file__).resolve())], capture_output=True, text=True, timeout=5)
+        CORES_DIR.mkdir(parents=True, exist_ok=True)
+        _pidfile().write_text(f"{os.getpid()} {Path(__file__).resolve()}\n")
+    except Exception:  # pragma: no cover — best-effort
+        pass
+
+
+def _recorded_writer_pids() -> list[int]:
+    """Pids this checkout's records name: the pidfile and .alive's heartbeat_pid. Never a sweep."""
+    pids: list[int] = []
+    try:
+        head, _, path = _pidfile().read_text().strip().partition(" ")
+        if head.isdigit() and path == str(Path(__file__).resolve()):
+            pids.append(int(head))
     except Exception:
-        return 0
-    pids = [int(p) for p in (r.stdout or "").split() if p.isdigit() and int(p) not in (me, parent)]
+        pass
+    try:
+        hp = json.loads(_alive_path().read_text()).get("heartbeat_pid")
+        if isinstance(hp, int) and hp not in pids:
+            pids.append(hp)
+    except Exception:
+        pass
+    return pids
+
+
+def _is_writer_argv(args: str, script: str) -> bool:
+    """`<python> <this script> [flags]` and nothing else: a `-c` program that mentions the path is not a writer."""
+    i = args.find(script)
+    if i < 0:
+        return False
+    prefix = args[:i].rstrip()
+    after = args[i + len(script):]
+    return (bool(re.search(r"python[0-9.]*$", prefix)) and " -c" not in f" {prefix}"
+            and (after == "" or after[0] == " "))
+
+
+def stop_other_writers(timeout_s: float = 5.0) -> int:
+    """SIGTERM the heartbeat writer(s) this checkout's own records name — after proving each pid is an
+    interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
+    is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
+    me, parent = os.getpid(), os.getppid()
+    script = str(Path(__file__).resolve())
+    pids = []
+    for pid in _recorded_writer_pids():
+        if pid in (me, parent) or pid <= 1:
+            continue
+        try:
+            r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+        if r.returncode == 0 and _is_writer_argv((r.stdout or "").strip(), script):
+            pids.append(pid)
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)

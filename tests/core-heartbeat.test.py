@@ -31,6 +31,19 @@ _ARGV_PARSE = ('#!/bin/sh\nsock=""; sess=""; prev=""\nfor a in "$@"; do\n  case 
 EXPORTED_CLIENT = 'case "$*" in\n  *-V*) echo \'tmux 3.5a\';;\n  *has-session*) [ "$sess" = real ] && exit 0 || { echo "no such session: $sess" >&2; exit 1; };;\n  *list-sessions*) case "$*" in *socket_path*) echo "$sock";; *) echo real;; esac;;\n  *list-panes*) [ "$sess" = real ] && echo 4242 || exit 1;;\n  *display-message*) [ "$sess" = real ] && echo "3.5a|$sock|real" || { echo "no such session" >&2; exit 1; };;\n  *) exit 1;;\nesac\n'
 
 
+def _wait_file(path, deadline_s=5.0):
+    end = time.monotonic() + deadline_s
+    while time.monotonic() < end:
+        try:
+            txt = path.read_text()
+            if txt.strip():
+                return txt
+        except FileNotFoundError:
+            pass
+        time.sleep(0.02)
+    return None
+
+
 class TestHeartbeatWrite(unittest.TestCase):
     def setUp(self):
         self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
@@ -377,17 +390,29 @@ class TestHeartbeatWrite(unittest.TestCase):
         # Coverage runs in-process: the handoff itself, not only its CLI wrapper, must be exercised here.
         import core_heartbeat
         script = str(Path(core_heartbeat.__file__).resolve())
-        old = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Selection is from the RECORD, identity from argv: a recorded pid that is not a writer is left alone.
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script, "not-a-writer"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}   # no core → publishes nothing
+        old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            time.sleep(0.3)
+            self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()), "the writer did not record its pid")
+            core_heartbeat._pidfile().write_text(f"{bystander.pid} {script}\n")          # a record naming a non-writer
+            self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=2.0), 0)
+            self.assertIsNone(bystander.poll())
+            core_heartbeat._pidfile().write_text(f"{old.pid} {script}\n")                # the real writer's record
             self.assertTrue(core_heartbeat._pid_running(old.pid))
-            n = core_heartbeat.stop_other_writers(timeout_s=5.0)
-            self.assertGreaterEqual(n, 1)
+            self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=5.0), 1)
             self.assertIsNotNone(old.wait(timeout=5))
+            self.assertIsNone(bystander.poll())
+            self.assertFalse(core_heartbeat._is_writer_argv(f"python3 -c import time; time.sleep(60) {script} not-a-writer", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(f"/opt/py/bin/python3.12 {script} --interval 60", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"bash {script}", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"python3 {script}x", script))
         finally:
-            if old.poll() is None:
-                old.kill(); old.wait()
+            for pr in (old, bystander):
+                if pr.poll() is None:
+                    pr.kill(); pr.wait()
         self.assertFalse(core_heartbeat._pid_running(old.pid))   # reaped: lookup fails or state is Z
         self.assertTrue(core_heartbeat._pid_running(os.getpid()))
         with patch("core_heartbeat.os.kill", side_effect=PermissionError):
@@ -401,8 +426,12 @@ class TestHeartbeatWrite(unittest.TestCase):
             rc = core_heartbeat.main(["--stop"])
         self.assertEqual(rc, 0)
         self.assertIn("core_heartbeat: stopped", buf.getvalue())
-        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no pgrep")):
+        core_heartbeat._pidfile().write_text(f"{os.getpid()} {script}\n")   # a record naming THIS process is skipped
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
             self.assertEqual(core_heartbeat.stop_other_writers(), 0)
+        core_heartbeat._pidfile().write_text(f"424242 {script}\n")
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
+            self.assertEqual(core_heartbeat.stop_other_writers(), 0)              # cannot verify → left alone
 
     def test_client_and_socket_helpers_fail_closed_on_errors(self):
         import core_heartbeat
@@ -498,17 +527,26 @@ class TestHeartbeatCli(unittest.TestCase):
         # An old writer (argv names this checkout's script) is still running; --stop must end it and
         # wait, then a fresh --once beat carries schema 4. No pkill pattern kills another checkout's.
         script = ROOT / "src" / "core_heartbeat.py"
-        old = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(script.resolve())],
+        # A REAL old writer (it records its own pid before its first beat), plus a bystander whose argv
+        # merely mentions the script path — the shape a pgrep sweep would have killed.
+        old = subprocess.Popen([sys.executable, str(script), "--interval", "60"],
+                               env={**self.env, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")},
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(script.resolve()), "not-a-writer"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            time.sleep(0.3)
+            pidfile = self.tmp / "state" / "cores" / f"{_short_host()}.heartbeat.pid"
+            self.assertIsNotNone(_wait_file(pidfile), "the writer did not record its pid")
             r = subprocess.run([sys.executable, str(script), "--stop"], env=self.env, capture_output=True, text=True, timeout=20)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("stopped 1 writer(s)", r.stdout)
             self.assertIsNotNone(old.wait(timeout=5), "the old writer must be gone before --stop returns")
+            time.sleep(0.2)
+            self.assertIsNone(bystander.poll(), "a process that only mentions the path must not be touched")
         finally:
-            if old.poll() is None:
-                old.kill(); old.wait()
+            for pr in (old, bystander):
+                if pr.poll() is None:
+                    pr.kill(); pr.wait()
         r2 = subprocess.run([sys.executable, str(script), "--once"], env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(r2.returncode, 0, r2.stderr)
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
