@@ -10,9 +10,8 @@ from pathlib import Path
 
 
 def find_presenter(start: Path) -> Path | None:
-    # The desktop app ships local-card.py one level above the engine checkout
-    # (engine/local-card.py beside engine/sutando/); walk up so a symlinked or
-    # relocated checkout still finds it.
+    # The desktop app ships engine/local-card.py beside engine/sutando/; walking
+    # up finds it from a symlinked or relocated checkout as well.
     for parent in start.resolve().parents:
         candidate = parent / "local-card.py"
         if candidate.is_file():
