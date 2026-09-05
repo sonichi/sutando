@@ -232,7 +232,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         import core_heartbeat
         path_tmux = self._fake_tmux("tmux", speaks=True, version="3.6b")
         exported = self._fake_tmux("exported-tmux", speaks=False, version="3.5a")
-        # Codex's mixed case: the app exported one binary, the launcher ran the PATH one.
+        # The mixed case: the app exported one binary, the launcher ran the PATH one.
         with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported, "PATH": str(self.tmp)}):
             b = core_heartbeat._tmux_backend(refresh=True, sock="/tmp/x.sock", sess="sutando-core")
         self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
@@ -269,8 +269,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual((data["session"], data["tmux_verified"], data["tmux_binary"], data["tmux_server_version"]), ("real", True, str(f), "3.6b"))
 
     def test_tmux_backend_is_reverified_every_beat_so_a_replaced_server_is_seen(self):
-        # yixuan: a memoized failure made a cold-boot miss permanent. Codex: a memoized success
-        # survived a server replacement. Neither is cached now — every call asks the live server.
+        # A memoized failure would make a cold-boot miss permanent and a memoized success would
+        # survive a server replacement; nothing is cached — every call asks the live server.
         import core_heartbeat
         f = self.tmp / "tmux"
         ver = self.tmp / "server-version"
