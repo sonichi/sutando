@@ -33,6 +33,7 @@ import contextlib
 import importlib.util
 import io
 import inspect
+import subprocess
 import json
 import shutil
 import stat
@@ -112,9 +113,64 @@ class SandboxPromptPath(unittest.TestCase):
     def test_handler_source_carries_no_tmp_path_and_logs_a_failed_write(self):
         src = inspect.getsource(db_bridge._handle_discord_message)
         self.assertNotIn("/tmp/sutando-", src)
-        self.assertIn("write_sandbox_prompt(", src)
-        self.assertIn("[task-write] FAILED", src.split("write_sandbox_prompt(", 1)[1][:400])
+        self.assertIn("write_sandbox_prompt_or_log(", src)
+        self.assertIn("[task-write] FAILED", inspect.getsource(db_bridge.write_sandbox_prompt_or_log))
         self.assertNotIn("/tmp/sutando-", inspect.getsource(db_bridge))
+
+    def test_archive_failure_keeps_the_prompt_for_the_retry(self):
+        db_bridge.write_sandbox_prompt("task-8", "x")
+        task = db_bridge.TASKS_DIR / "task-8.txt"; task.write_text("id: task-8\n")
+        old = db_bridge._shared_archive_file
+        db_bridge._shared_archive_file = lambda *a, **k: False
+        try:
+            self.assertFalse(db_bridge.archive_file(task, "tasks", "task-8"))
+        finally:
+            db_bridge._shared_archive_file = old
+        self.assertTrue(db_bridge.sandbox_prompt_path("task-8").exists())
+
+    def test_sweep_keeps_the_prompt_of_a_claimed_task(self):
+        p = db_bridge.write_sandbox_prompt("task-9", "x")
+        (db_bridge.TASKS_DIR / "task-9.claimed-core-1.txt").write_text("id: task-9\n")
+        old = time.time() - 3600; os.utime(p, (old, old))
+        self.assertEqual(db_bridge.sweep_sandbox_prompts(max_age_s=600), 0)
+        self.assertTrue(p.exists())
+
+    def test_removing_an_absent_prompt_is_false_not_an_error(self):
+        self.assertFalse(db_bridge.remove_sandbox_prompt("task-absent"))
+
+    def test_a_failed_write_logs_and_returns_none(self):
+        db_bridge.SANDBOX_PROMPTS_DIR = self.d / "not-a-dir"
+        db_bridge.SANDBOX_PROMPTS_DIR.write_text("file in the way")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertIsNone(db_bridge.write_sandbox_prompt_or_log("task-10", "x", "someone"))
+        self.assertIn("[task-write] FAILED for @someone", buf.getvalue())
+
+    def test_guarded_sweep_logs_and_never_raises(self):
+        old = db_bridge.sweep_sandbox_prompts
+        db_bridge.sweep_sandbox_prompts = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(db_bridge.sweep_sandbox_prompts_guarded(), -1)
+        finally:
+            db_bridge.sweep_sandbox_prompts = old
+        self.assertIn("sweep failed: boom", buf.getvalue())
+
+    def test_launch_consumes_the_prompt_before_the_sandbox_can_read_it(self):
+        p = db_bridge.write_sandbox_prompt("task-11", "the secret request")
+        arg = db_bridge.sandbox_prompt_argument(p)
+        # The stand-in sandbox receives the argument exactly as codex would, then tries the path.
+        script = ("sandbox(){ printf '%s\\n' \"$1\"; cat " + str(p)
+                  + " 2>/dev/null && echo READABLE || echo GONE; }; sandbox " + arg)
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual(out, ["the secret request", "GONE"])
+        self.assertFalse(p.exists())
+
+    def test_instruction_tells_the_core_how_to_rebuild_a_consumed_prompt(self):
+        src = inspect.getsource(db_bridge._handle_discord_message)
+        self.assertIn("sandbox_prompt_argument(", src)
+        self.assertEqual(src.count("an earlier launch consumed it"), 2)
 
     def test_archiving_the_task_removes_its_prompt(self):
         db_bridge.write_sandbox_prompt("task-2", "x")
