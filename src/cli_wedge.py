@@ -49,9 +49,8 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("reconnecting", r"\breconnect(ing)?\b"),
         ("connection-error", r"\bconnection (error|reset|refused)\b"),
         ("timeout", r"\btimed? ?out\b"),
-        # A CLI told to stop by its provider: every turn ends the same way while the
-        # clock keeps moving, so only the text tells this from real work.
-        # A limit HIT, not a limit mentioned: Codex's idle banner says "usage limit resets available".
+        # A CLI told to stop by its provider: every turn ends the same way while the clock
+        # moves; only text tells this from work — and it must be a limit HIT, not one mentioned.
         ("quota-limit", r"\b(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|\b(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
     )
 )
