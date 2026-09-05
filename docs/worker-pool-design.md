@@ -406,25 +406,53 @@ is still present at wake time, the candidate is skipped, and the later release f
 event. The task stays durable and unsubmitted — not lost, but never delivered, which is worse than
 lost because every surface reports it as pending.
 
-**The transition, and it is a field that already exists rather than a new file.** `acquire_task_claim`
-writes a FOUR-LINE record — pid, watcher id, task path, disposition — and publishes it by hard link
-(`:129-146`). Line 4 is already `must-handle` | `fallback`. The Codex consumer reads none of the
-four. So:
+**The transition is a SECOND record written by the EXECUTOR, not a field in the watcher's claim.**
+An earlier revision of this section put the accepting executor's name on line 4 of the claim and
+called that the handoff. It is not: **the claim is written by the watcher BEFORE the emit, so every
+byte of it is identical whether or not anyone ever received the wake.** A name written by the sender
+is an ADDRESS; acceptance is an OBSERVATION, and only the receiver can make it. The two crash
+windows below are indistinguishable in the claim, however line 4 is spelled.
+
+The shipped lifecycle makes that concrete, and it refuses two things the earlier revision asserted:
+
+- `claim_is_live()` keys on **line 1, the WATCHER's pid** (`src/watch-tasks-stream.sh:101-109`), so
+  a claim goes "dead" when the watcher exits even if an executor is mid-task on it, and
+  `retire_stale_claim()` (`:116-124`) then removes it.
+- `release_task_claim()` requires `owner_id == WATCHER_ID` (`:150-160`). An accepting executor
+  **structurally cannot release**, so "release is the accepting executor's" was not a rule the code
+  could obey.
+
+**The offered -> accepted transition, with its writer, key and authority named.** A second directory,
+`state/task-event-handler-accepts/<canonical task id>`, published by hard link exactly as the claim
+is — same atomicity, same never-clobber semantics:
+
+```
+<accepting executor's pid>
+<accepting executor's instance id>
+<watcher id it accepted from>
+<accepted_at>
+```
 
 | | contract |
 |---|---|
-| the claim is | a HANDOFF RECORD, never a "someone else has this" flag. Its line-4 disposition says who must act |
-| direct exit writes | a disposition naming the accepting executor, durable BEFORE the `TASK_FILE:` emit — this is obligation 1 (`receipt-before-emit`), not a new rule |
-| the executor's test | changes from *a claim exists* to **a claim exists AND is not addressed to me**. One `sed -n '4p'` at `task-notifier.sh:188`, the same read the watcher's own `claim_disposition` (`:169-178`) already performs |
-| release | is the ACCEPTING EXECUTOR's, on completion — not the watcher's. This is also what closes the no-second-event hole: the party that releases is the party that acted |
-| acceptance is durable | or the startup stale-claim sweep (`:210-215`, `claim_is_live` / `retire_stale_claim`) races an executor that has already taken the work. **A claim an executor has accepted is not stale merely because its writing watcher died** |
+| writer | the **accepting executor**, exactly once, after it has the task in hand and before it submits. One writer per file; a hard link that loses means another executor accepted first and this one suppresses |
+| what the claim now means | OFFERED, addressed by line 4. Not taken. It is the sender's record |
+| what the accept means | TAKEN. It is the receiver's record, and it is the only evidence that the wake was received |
+| **the liveness key CHANGES HANDS** | unaccepted, liveness is the claim's watcher pid; accepted, it is the accept record's executor pid. `claim_is_live()` must consult the accept file before answering, or it keeps reporting a live task dead |
+| release authority | the claim's `WATCHER_ID` **or** the instance named in the accept record. `release_task_claim`'s single-owner test has to widen to exactly that pair — no wider |
+| this is a CODE CHANGE | not a restatement. `claim_is_live`, `retire_stale_claim` and `release_task_claim` are all named above because all three must change in the implementing PR. Saying so is the difference between a contract and a wish |
 
-**Both watcher-death windows, stated as the different recoveries they are.** Death BEFORE publish:
-the claim is durable and no wake ever fires, so nothing is running — the next watcher's startup
-sweep quarantines the dead owner's record and the task is re-admitted normally. Death AFTER publish:
-the consumer woke, read the disposition, and owns the work and its release — so the sweep must
-observe acceptance and leave the claim alone. Collapsing these is the failure: the first needs the
-claim retired, the second needs it preserved, and only the acceptance record tells them apart.
+**Now the two windows are different states rather than different stories.**
+
+| observed | means | recovery |
+|---|---|---|
+| claim live (watcher pid), no accept | in flight, nobody has taken it yet | leave it |
+| claim dead (watcher pid), **no accept** | watcher died at or before publish; nobody received the wake | retire the claim, re-admit normally |
+| claim dead (watcher pid), **accept present, executor live** | watcher died after publish; the executor owns the work | **do not retire** — this is the case the shipped sweep gets wrong today |
+| accept present, executor dead | the executor died mid-task | reclaim both records behind the done flag |
+
+The earlier revision could not express row 3 at all, which is why it had to ask the sweep to
+"observe acceptance" that nothing wrote.
 
 **Claude's wiring needs no change and that is a finding, not an omission.** Its consumer is this
 document's own `Monitor`-driven reader, which acts on the emitted `TASK_FILE:` line directly and

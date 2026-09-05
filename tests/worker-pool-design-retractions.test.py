@@ -524,6 +524,56 @@ class EveryBindingTransitionFencesItsOutgoingClaimant(unittest.TestCase):
                          "cannot see from the command name")
 
 
+class AcceptanceIsWrittenByTheReceiver(unittest.TestCase):
+    """An address is written by the sender before delivery; an acceptance is written by the
+    receiver after it. The previous revision conflated them -- line 4 of the watcher's claim
+    named the executor, and the claim bytes are then identical in both crash windows.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_acceptance_writer_is_the_executor_not_the_watcher(self):
+        f = self._flat()
+        self.assertIn("task-event-handler-accepts", f, "no acceptance record is defined")
+        self.assertRegex(f, r"writer \| the \*\*accepting executor\*\*")
+        self.assertNotRegex(
+            f, r"a disposition naming the accepting executor, durable BEFORE the `TASK_FILE:` emit",
+            "a name the SENDER writes before delivery cannot evidence receipt")
+
+    def test_the_liveness_key_changes_hands(self):
+        """claim_is_live() keys on the watcher pid, so an accepted task reads dead the moment
+        the watcher exits. Without this the sweep retires work that is running."""
+        f = self._flat()
+        self.assertRegex(f, r"the liveness key CHANGES HANDS")
+        self.assertIn("claim_is_live", f)
+
+    def test_release_authority_is_widened_to_exactly_the_pair(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"the claim's `WATCHER_ID` \*\*or\*\* the instance named in the accept record")
+        self.assertRegex(f, r"no wider",
+                         "an unbounded release authority is a different defect")
+
+    def test_the_four_observed_states_are_distinguishable(self):
+        """The point of the second record: the two watcher-death windows must differ in
+        BYTES, not in narration."""
+        f = self._flat()
+        for phrase in ("claim dead (watcher pid), **no accept**",
+                       "claim dead (watcher pid), **accept present, executor live**"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(re.sub(r"\s+"," ",phrase), f)
+        self.assertRegex(f, r"do not retire\*\* — this is the case the shipped sweep gets wrong")
+
+    def test_it_says_this_requires_a_code_change(self):
+        """Naming the three shipped functions is what makes it a contract rather than a wish."""
+        f = self._flat()
+        self.assertRegex(f, r"this is a CODE CHANGE")
+        for fn in ("claim_is_live", "retire_stale_claim", "release_task_claim"):
+            with self.subTest(fn=fn):
+                self.assertIn(fn, f)
+
+
 class CrossReferencesResolve(unittest.TestCase):
     """`see "X"` must name a heading that exists. Written after two anchors in one day
     pointed at nothing: a section titled with OUTGOING while its references said
@@ -567,29 +617,32 @@ class DirectHandoffNamesAnAcceptance(unittest.TestCase):
                       "the no-other-trigger half is what makes the skip terminal; without "
                       "it a reader assumes a later poll recovers")
 
-    def test_acceptance_is_a_value_the_executor_reads(self):
+    def test_the_claim_is_an_offer_the_executor_can_read(self):
+        """Superseded: the earlier form asserted the claim IS the handoff. It is the OFFER
+        half; the accept record is the other. Both halves must still be readable."""
         f = self._flat()
-        self.assertRegex(
-            f, r"a claim exists AND is not addressed to me",
-            "an ownership handoff the executor cannot read is the presence-flag it replaces")
+        self.assertRegex(f, r"what the claim now means \| OFFERED, addressed by line 4")
+        self.assertRegex(f, r"what the accept means \| TAKEN")
 
-    def test_release_belongs_to_the_accepting_executor(self):
+    def test_release_is_not_the_watchers_alone(self):
+        """Superseded once: this asserted release belongs to the accepting executor, which
+        the shipped `release_task_claim` cannot express (it tests owner_id == WATCHER_ID).
+        The contract is the PAIR, and the widening is bounded."""
         f = self._flat()
         self.assertRegex(
-            f, r"the party that releases is the party that acted",
-            "watcher-side release fires no second event, so the skipped task is never "
-            "re-offered")
+            f, r"the claim's `WATCHER_ID` \*\*or\*\* the instance named in the accept record")
+        self.assertNotRegex(
+            f, r"release \| is the ACCEPTING EXECUTOR's, on completion — not the watcher's",
+            "executor-only release contradicts release_task_claim's owner test")
 
-    def test_both_death_windows_get_opposite_recoveries(self):
-        """The point of separating them: one needs the claim retired, the other needs it
-        preserved. A section naming only 'watcher death' has not answered either."""
+    def test_both_death_windows_are_distinguishable_in_BYTES(self):
+        """Superseded: the earlier form accepted PROSE naming the two windows. qingyun's
+        finding is that prose was all it was -- the claim bytes were identical in both.
+        The assertion is now that the observed STATES differ."""
         f = self._flat()
-        for phrase in ("Death BEFORE publish", "Death AFTER publish"):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, f)
-        self.assertRegex(
-            f, r"the first needs the claim retired, the second needs it preserved",
-            "the recoveries must be stated as opposite, or the sweep races acceptance")
+        self.assertRegex(f, r"claim dead \(watcher pid\), \*\*no accept\*\*")
+        self.assertRegex(f, r"claim dead \(watcher pid\), \*\*accept present, executor live\*\*")
+        self.assertRegex(f, r"different states rather than different stories")
 
     def test_the_claude_side_is_stated_as_a_finding_not_a_gap(self):
         f = self._flat()
