@@ -472,6 +472,41 @@ class WedgedVerdictHasACommandedExit(unittest.TestCase):
             "who cannot see the cost cannot re-open the decision")
 
 
+class TheStopFenceStatesItsOwnInverse(unittest.TestCase):
+    """The fence lets the implementer DISABLE or REMOVE the plist. `bootstrap` undoes
+    neither on its own: a disabled label refuses to load, and a removed one has no path to
+    consume. A restore naming only `bootstrap` therefore leaves the worker down under both
+    branches it offers -- so the doc must answer the choice it created.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_bootstrap_is_not_offered_as_the_whole_restore(self):
+        f = self._flat()
+        self.assertRegex(
+            f, r"`bootstrap` alone does not undo either stop form",
+            "the restore must say that bootstrap by itself is insufficient")
+
+    def test_both_stop_forms_get_an_ordered_restore(self):
+        f = self._flat()
+        for phrase, why in [
+            ("launchctl enable", "a disabled label needs enable before bootstrap"),
+            ("re-render the plist to its destination, then `bootstrap`",
+             "a removed plist must exist before bootstrap consumes its path"),
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, f, why)
+
+    def test_the_restore_is_tied_to_the_stop_form_not_stated_once_generically(self):
+        """A single generic sentence would pass the two checks above while still leaving a
+        reader to guess which step belongs to which branch."""
+        f = self._flat()
+        self.assertRegex(
+            f, r"the restore is the INVERSE of whichever\s+one was used",
+            "state the correspondence, not two loose steps")
+
+
 class EveryBindingTransitionFencesItsOutgoingClaimant(unittest.TestCase):
     """A binding changes three ways, and only worker-to-worker had a fence. For first-pin
     the outgoing claimant is the CORE serving R under rule 3; for unpin the INCOMING one

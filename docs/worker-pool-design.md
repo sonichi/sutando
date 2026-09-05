@@ -942,6 +942,22 @@ rooms must be kept off the same worker:
   describes reviving a worker whose plist is still loaded, which is a different operation from this
   one.
 
+  **`bootstrap` alone does not undo either stop form, so the restore is the INVERSE of whichever
+  one was used — the fence offers a choice and the restore must answer it.** Naming only
+  `bootstrap` leaves the worker down under both branches, and the rooms whose process-wide outage
+  is acknowledged above stay dark rather than clearing:
+
+  | stop form used | why bare `bootstrap` fails | ordered restore |
+  |---|---|---|
+  | plist **disabled** | `disable` persists in the service database; a disabled label refuses to load, so `bootstrap` fails while the file is present and correct | `launchctl enable <service-target>`, then `bootstrap` |
+  | plist **removed** | `bootstrap` consumes a service *path*; the file is gone, so there is nothing to load | re-render the plist to its destination, then `bootstrap` |
+
+  The removed branch is the repo's existing idiom, not a new one: every installer here
+  (`src/install-*-launchd.sh`) writes `$DEST` and only then runs `launchctl bootstrap "$DOMAIN"
+  "$DEST"`. The disabled branch has no in-repo precedent because nothing here calls `disable` — which
+  is the argument for preferring **remove** as the fence's default stop form, and for stating the
+  `enable` step explicitly wherever an implementation chooses `disable` instead.
+
   **And state the scope honestly, because it is process-wide while a re-bind is per-room.** A worker
   may hold more than one room — nothing forbids that — so stopping it to re-bind ONE room also
   stops its other rooms and any work in flight for
