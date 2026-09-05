@@ -10,6 +10,9 @@ change routing or attribution. A seat with no done-flag (a cloud seat, or the
 home seat outside a pool) attributes to its OWN worker id — the seat that
 POSTs the result answered it — so no result ever leaves unattributed.
 
+`metadata` is an OPTIONAL extension: the client sends it only once the broker
+advertises `worker-metadata` (see gateway-worker-queue-client.test.py section 8).
+
 Run: python3 tests/gateway-result-worker-attribution.test.py
 """
 from __future__ import annotations
@@ -54,6 +57,9 @@ class WorkerAttribution(unittest.TestCase):
     def _seat(self, **seat: str):
         self.mod = _load(**seat)
         self.mod._STATE = Path(self.tmp)
+        # Attribution is a negotiated extension; this suite is about WHICH
+        # worker is named, so grant the capability the broker would advertise.
+        self.mod._broker_worker_metadata = True
         seen = self.seen
 
         class _Backend:
