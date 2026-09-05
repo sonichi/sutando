@@ -86,6 +86,20 @@ def _reply_context(msg, clip=REPLY_CLIP):
            f"↳ replying to {author}: (no readable body)"
 
 
+def _attachment_marks(atts):
+    """``<attachment: name url>`` for each attachment, name-only if it has no url.
+
+    The url is the ONLY retrievable handle the API gives; dropping it left a
+    reader that can name a file and can never open it.
+    """
+    out = []
+    for a in atts or []:
+        name = a.get("filename") or "?"
+        url = a.get("url") or ""
+        out.append(f"<attachment: {name} {url}>" if url else f"<attachment: {name}>")
+    return out
+
+
 def _render(msg, clip=CLIP):
     """One message's readable body, INCLUDING forwarded content.
 
@@ -110,12 +124,15 @@ def _render(msg, clip=CLIP):
     body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:
-        return body[:clip] if clip is not None else body
+        # A top-level attachment lives outside `content`, so a file-only message
+        # rendered as a BLANK LINE — the forward bug, one branch over.
+        marks = _attachment_marks(msg.get("attachments"))
+        body = body[:clip] if clip is not None else body
+        return " ".join(x for x in (body, *marks) if x)
     fwd = (snaps[0].get("message") or {})
     fwd_body = (fwd.get("content") or "").strip()
     extra = []
-    for a in fwd.get("attachments") or []:
-        extra.append(f"<attachment: {a.get('filename', '?')}>")
+    extra.extend(_attachment_marks(fwd.get("attachments")))
     for e in fwd.get("embeds") or []:
         extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
     # Redact the COMPOSED inner: filenames and embed titles are user-supplied too.
