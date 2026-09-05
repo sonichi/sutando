@@ -781,10 +781,11 @@ rooms must be kept off the same worker:
 - **A room has exactly ONE bound instance at a time; the rest of `instances` is a failover
   ORDER the CORE consults, never a set workers race over.** `instances[0]` is the binding.
   A worker claims a room's task only if it reads itself as `instances[0]`; the later entries
-  are not eligible and do not race. Failover is a **binding rewrite**: when the core declares
-  a worker dead it moves that name out of position 0 and `os.replace`s the file — the same
-  single-writer, atomic path the table above already specifies. No lease is required, and none
-  is defined, because nothing is ever contended.
+  are not eligible and do not race. The binding is rewritten by exactly ONE event, and death is
+  not it: an **owner re-bind**, which moves a name into position 0 and `os.replace`s the file
+  over the same single-writer, atomic path the table above specifies. A worker going dead
+  rewrites nothing — see the lifecycle answer below. No lease is required, and none is defined,
+  because nothing is ever contended.
 
   This is chosen over the alternative — a set with a group lease — because the lease is the
   part v1 does not have. Two members claiming two different tasks for one room would each win

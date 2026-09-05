@@ -63,6 +63,10 @@ RETRACTED = [
      "still executes under a stale generation, and reconcile cannot unsend an "
      "external effect. The fence is per repin CAUSE — self-fencing on beat age for "
      "death, drain-before-rewrite for an owner command."),
+    ("a worker dead it moves that name out of position 0",
+     "death rewrites NO binding in v1. The only rewrite is an owner re-bind, applied "
+     "while the outgoing worker is responsive; on death the core stands in and the "
+     "returning worker still reads itself as instances[0]."),
     ("the outgoing worker **fences itself**",
      "self-fencing on beat age is still check-then-act: age advances between the "
      "check and the execution. v1 removes the automatic worker-to-worker repin "
