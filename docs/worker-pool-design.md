@@ -475,7 +475,25 @@ is — same atomicity, same never-clobber semantics:
 The earlier revision could not express row 3 at all, which is why it had to ask the sweep to
 "observe acceptance" that nothing wrote.
 
-**Claude's wiring needs no change and that is a finding, not an omission.** Its consumer is this
+**Claude's SKIP RULE needs no change; its ACCEPT WRITE does. Those are different halves and an
+earlier revision exempted the whole executor on the strength of the first.** The exemption is real
+but narrow: the skip rule is what deadlocks, and Claude has none to fix. **Publishing acceptance is
+NOT part of the skip rule and is required of EVERY executor, Claude included** — the four-row table
+above keys recovery on the accept record, so an executor that never writes one collapses rows 2 and
+3 into each other: a watcher that died *after* Claude began work is byte-identical to one that died
+*before* anyone was told, and the recovery for those is opposite (leave it alone versus re-admit).
+Re-admitting there re-runs an external effect that already happened. So the exemption covers reading
+claims and nothing else; a consumer with no skip rule still owes the write that makes its own death
+distinguishable.
+
+The same asymmetry reaches the third artifact. The `direct/` receipt is owned and renewed by its
+original holder, so it stays counted against the admission bound when an accepting executor dies
+while that holder is still live — the slot leaks with every record individually consistent.
+**Ownership of the receipt transfers on accept, and reclaim takes receipt + claim + accept together
+behind the done flag**, never one of the three; the implementing PR pins both death windows
+(watcher-after-publish and executor-mid-task) rather than only the one the table already names.
+
+Its consumer is this
 document's own `Monitor`-driven reader, which acts on the emitted `TASK_FILE:` line directly and
 consults no claims directory — so the deadlock is specific to the Codex consumer's skip rule. Two
 executors reading the same emission under different rules is what let this ship: the design was

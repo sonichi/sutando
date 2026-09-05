@@ -508,6 +508,37 @@ class TheDeadlockCauseIsNamedAsAnObligationNotOnlyAsEvidence(unittest.TestCase):
             "say which way a mismatch fails; 'they must match' does not")
 
 
+class EveryExecutorOwesTheAcceptWriteEvenWithoutASkipRule(unittest.TestCase):
+    """The Claude exemption was stated over the whole executor because its consumer has no
+    claim-skip rule. The accept WRITE is a different obligation: the recovery table keys on
+    the accept record, so an executor that never writes one makes its own death
+    indistinguishable from a pre-delivery death, and those recover oppositely.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_exemption_is_scoped_to_the_skip_rule(self):
+        f = self._flat()
+        self.assertNotRegex(f, r"\*\*Claude's wiring needs no change and that is a finding",
+                            "a whole-executor exemption drops the accept write")
+        self.assertRegex(f, r"Claude's SKIP RULE needs no change; its ACCEPT WRITE does")
+
+    def test_the_accept_write_is_required_of_every_executor(self):
+        f = self._flat()
+        self.assertRegex(f, r"required of EVERY executor, Claude included")
+
+    def test_the_collapsed_rows_and_their_opposite_recoveries_are_named(self):
+        """Say WHY the write matters, or the next revision re-drops it as bookkeeping."""
+        f = self._flat()
+        self.assertRegex(f, r"collapses rows 2 and\s+3 into each other")
+        self.assertRegex(f, r"leave it alone versus re-admit")
+
+    def test_the_receipt_transfers_on_accept_and_reclaim_is_atomic(self):
+        f = self._flat()
+        self.assertRegex(f, r"Ownership of the receipt transfers on accept, and reclaim takes receipt \+ claim \+ accept together")
+
+
 class TheStepTwoWindowHasOneShapeNotTwo(unittest.TestCase):
     """The window was described as BOTH "a consumer with no producer" (a latent no-op that
     could misroute) and "ships no reader at all" (the feature is absent). A stage with no
@@ -932,11 +963,21 @@ class DirectHandoffNamesAnAcceptance(unittest.TestCase):
         self.assertRegex(f, r"different states rather than different stories")
 
     def test_the_claude_side_is_stated_as_a_finding_not_a_gap(self):
+        """RESCOPED, and the rescoping is the lesson. This used to pin the literal phrase
+        "no change and that is a finding" over the WHOLE executor. A reviewer falsified the
+        broad reading: Claude has no skip rule to fix, but it still owes the accept write,
+        and a test pinning the old wording made the doc unable to say so. The finding
+        survives -- 'the other executor's consumer has no rule to violate' is still why
+        this shipped -- but it is scoped to the skip rule now.
+        """
         f = self._flat()
         self.assertRegex(
-            f, r"no change and that is a finding",
-            "'the other executor is fine' is the reason this shipped; it belongs in the "
-            "document rather than in the reviewer's head")
+            f, r"SKIP RULE needs no change",
+            "'the other executor's consumer has no rule to violate' is the reason this "
+            "shipped; it belongs in the document rather than in the reviewer's head")
+        self.assertRegex(
+            f, r"The exemption is real\s+but narrow",
+            "state that it is narrow, or the next reader widens it back")
 
 
 class OwnerRulingsOnMembershipAndReporting(unittest.TestCase):
