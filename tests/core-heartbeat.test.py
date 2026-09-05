@@ -389,8 +389,11 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIn('core_heartbeat.py" --stop', codex)
         self.assertNotIn('pkill -f "$REPO/src/core_heartbeat.py"', restart)   # no argv sweep as a fallback
         self.assertIn('"$PY_BIN" "$REPO/src/core_heartbeat.py" --stop', restart)
-        self.assertNotIn('python3 "$REPO/src/core_heartbeat.py" --stop', codex)  # resolver, not bare python3
+        self.assertNotIn('python3 "$REPO/src/core_heartbeat.py"', codex)  # never a bare python3, start OR stop
         self.assertIn('resolve_python "$REPO"', codex[:codex.index('core_heartbeat.py" --stop')])
+        doc = (ROOT / "docs" / "claude-md-moved-detail.md").read_text()
+        self.assertIn("has-session -t =<session>", doc)
+        self.assertNotIn("answers with the **server's own socket path and that session name**", doc)
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
 
     def test_stop_other_writers_in_process_ends_a_stand_in_and_reports_it(self):
