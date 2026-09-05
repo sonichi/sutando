@@ -652,10 +652,9 @@ claiming, which is the case that hurts.
    Names an instance whose beat is stale: the task stays PENDING — no instance,
    the core included, claims it.
 2. No field, and the room addresses this worker — it is **pinned** to it, or
-   this is a **dedicated** worker's own room: claim, then emit. Pinned to a set whose
-   `instances[0]` is this worker: the same — claim, then emit. Pinned to a set this worker
-   is in but NOT at position 0: **suppress** (it is standby, not a claimant). Pinned to a
-   FRESH instance that is not this one: **suppress**
+   this is a **dedicated** worker's own room: claim, then emit. Pinned to a set CONTAINING this
+   worker: the same — claim, then emit, at any position; the per-task claim settles which member
+   wins. Pinned to a set or instance this worker is NOT in: **suppress**
    — the core included. A pin is addressing, so the core is a non-target here
    exactly as a worker is, and rule 3 must not be reached. Pinned to an instance
    whose beat is stale: the pin is unclaimable, so the task stays PENDING. It does
@@ -784,14 +783,14 @@ Rule 3 still selects the core, unchanged, for work addressed to nobody — an un
 or an unreadable bindings file. That case never had a second claimant to race.
 
 A repin is the one place the claim arbitrates target-against-target, and only for
-the bounded window in which an outgoing and an incoming `instances[0]` both read
-themselves as bound; a set's later members are standby and never claimants, so
-there is no steady-state target-against-target. Elsewhere the claim is still
+the bounded window in which an outgoing and an incoming member both read themselves as bound.
+Contention between members of ONE set is expected and settled by the per-task claim; what the
+repin window adds is contention between a set being replaced and its replacement. Elsewhere the claim is still
 load-bearing only in that repin window: with the stand-in gone, target-against-target is
 the sole contention v1 has left.
 
-A task is eligible to exactly one instance: the room's `instances[0]`.
-There is no bound set to race over — see the binding table. A later form of addressing (an app control, a room command, a
+A task is eligible to every member of the room's `instances` set, and the per-task claim
+decides which member takes it — see the binding table. A later form of addressing (an app control, a room command, a
 skill that binds a task to a worker at mint time) enters at the same point: it
 either sets `requested_worker` or writes the pin table, and the rule above is
 unchanged. There is no least-loaded fallback, no automatic binding of a
@@ -838,28 +837,32 @@ rooms must be kept off the same worker:
 ```json
 {
   "version": 1,
-  "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}},
-  "exclusions": [{"group": "<label>", "rooms": ["<room>", "..."],
-                  "rule": "distinct-instance"}]
+  "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}}
 }
 ```
 
-- **A room has exactly ONE bound instance at a time; the rest of `instances` is a failover
-  ORDER the CORE consults, never a set workers race over.** `instances[0]` is the binding.
-  A worker claims a room's task only if it reads itself as `instances[0]`; the later entries
-  are not eligible and do not race. The binding is rewritten by exactly ONE event, and death is
-  not it: an **owner re-bind**, which moves a name into position 0 and `os.replace`s the file
-  over the same single-writer, atomic path the table above specifies. A worker going dead
-  rewrites nothing — see the lifecycle answer below. No lease is required, and none is defined,
-  because nothing is ever contended.
+- **`instances` is an UNORDERED MEMBERSHIP SET. Every member is an equal claimant; position
+  carries no meaning.** A worker claims a room's task if it reads itself anywhere in that room's
+  set, and the per-task claim decides which member gets which task. There is no primary, no
+  standby and no failover order, so a member going dead demotes nobody and promotes nobody: the
+  remaining members simply keep claiming. The set is rewritten by exactly ONE event, and death is
+  not it: an **owner re-bind**, which `os.replace`s the file over the same single-writer, atomic
+  path the table above specifies.
 
-  This is chosen over the alternative — a set with a group lease — because the lease is the
-  part v1 does not have. Two members claiming two different tasks for one room would each win
-  their task-specific claim and then drive one room's context concurrently, which
-  `distinct-instance` cannot prevent: that rule separates rooms ACROSS workers and says nothing
-  about two workers INSIDE one. Measured against the production claim: *different task keys,
-  same room -> 0, 0* (both won), against a control *one group key -> 0, 1*. Making that safe
-  needs group identity, group admission, group release and a multi-room story; a single bound
+  **An earlier revision made this an ordered list — `instances[0]` was the binding and the rest a
+  failover order — and the owner corrected it: *"they don't always have an order and not always
+  failover. They can be unordered equal participants."*** The correction is recorded rather than
+  silently applied, because it TRADES something a later reader must be able to see: with equal
+  members, two of them can hold two DIFFERENT tasks for one room at the same time. The per-task
+  claim stops two workers driving the same TASK; it does not stop two turns inside one ROOM. That
+  concurrency is what a single bound instance was buying, and it is now accepted by choice. A set
+  of one — the common case — has neither the cost nor the question.
+
+  **What equal membership costs, measured rather than asserted.** Two members claiming two
+  different tasks for one room each win their task-specific claim and then drive one room's
+  context concurrently. Against the production claim: *different task keys, same room -> 0, 0*
+  (both won), against a control *one group key -> 0, 1*. Serialising that would need group
+  identity, group admission, group release and a multi-room story; a single bound
   instance needs none of it.
 
   **v1 does not repin a room to another worker at all, and that is what closes this class.**
@@ -872,7 +875,7 @@ rooms must be kept off the same worker:
   | event | what v1 does |
   |---|---|
   | a worker's beat goes stale past `stand_in_after_s` | **nothing claims for those rooms.** The core kickstarts the plist; the work stays pending until the worker returns or an owner re-binds |
-  | the worker comes back | it re-reads the binding, finds itself still `instances[0]`, and resumes. Nothing was reassigned, so nothing has to be revoked |
+  | the worker comes back | it re-reads the binding, finds itself still a member, and resumes. Nothing was reassigned, so nothing has to be revoked |
   | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** before the new binding is written — see "What stopping a worker actually takes" below, because `launchctl bootout` alone does NOT stop it. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
 
   **What stopping a worker actually takes, and what it costs.** An earlier revision named
@@ -899,8 +902,8 @@ rooms must be kept off the same worker:
   one.
 
   **And state the scope honestly, because it is process-wide while a re-bind is per-room.** A worker
-  may hold more than one room — `distinct-instance` only forbids two rooms from the same exclusion
-  group — so stopping it to re-bind ONE room also stops its other rooms and any work in flight for
+  may hold more than one room — nothing forbids that — so stopping it to re-bind ONE room also
+  stops its other rooms and any work in flight for
   them. v1 takes that trade deliberately: those other rooms' bindings go pending under the same
   no-stand-in rule as everywhere else, and clear when the worker is bootstrapped back. The
   alternative — a room-scoped admission boundary that fences one binding without touching the
@@ -918,7 +921,7 @@ rooms must be kept off the same worker:
   | **unpin** R from W | worker W | **the core**, under rule 3 |
 
   First-pin: the core reads R unbound and claims task X, is suspended, the owner pins R to W, W
-  reads itself `instances[0]` and claims task Y. Different task keys, same room — the per-task
+  reads itself a member of R's set and claims task Y. Different task keys, same room — the per-task
   claims do not contend, so **both win**, which is the identical measurement this section already
   quotes (*0, 0*). Unpin is that race mirrored.
 
@@ -969,9 +972,9 @@ rooms must be kept off the same worker:
   nothing in flight is lost; what is given up is throughput, not correctness. A design that cannot
   say which of the two it is trading has not made the trade.
 
-  So `instances[1:]` is an **owner-facing preference list**, read by a human deciding whom to
-  re-bind to. It is not a runtime path and nothing consults it automatically. No generation, lease,
-  drain protocol or admission record is required — because after this revision there is no
+  So `instances` carries no owner-facing ordering either: it is a membership set, and a human
+  deciding whom to re-bind to reads the pool status, not a position in this list. No generation,
+  lease, drain protocol or admission record is required — because after this revision there is no
   operation left for one to guard.
 
   What this costs, stated plainly: a dead worker's rooms stay pending until an owner re-binds them
@@ -984,11 +987,6 @@ rooms must be kept off the same worker:
   eligible again or an owner re-binds. This is NOT the unbound case — a room with no binding still
   falls to the core under rule 3. A binding exists to stop scatter; honouring it while every entry
   is ineligible costs latency, and the alternative costs a second claimant.
-- **`distinct-instance`** means no single worker may hold bindings for two rooms in the
-  same group — the rooms' contexts must not meet inside one session. The core rejects a
-  bind command that would violate it, and a worker re-checks at claim time and declines
-  rather than trusting the file it just read; a stale read must not be able to merge two
-  contexts that were deliberately separated.
 - **Absent and empty both route to the core, and neither is ever filled by handler
   affinity** — rooms bind only by an explicit pin, and the affinity file is retired and
   deleted rather than consulted. The distinction is a record of intent, not a routing
@@ -1163,7 +1161,7 @@ itself to a room whose worker might still come back.
    older than `stand_in_after_s` (default 300) **and** the worker holds no
    claimed task, plus one sweep of grace after its last finish. "Addressed to
    it" is every route in the routing rule, not the pin alone: a
-   `requested_worker` task, a task in a room whose `instances[0]` is it, and a
+   `requested_worker` task, a task in a room whose `instances` set contains it, and a
    dedicated worker's own room. Scoping this to pinned rooms
    would leave the other three routes with a wedged target that is never
    ineligible, so rules 1 and 2 suppress on it forever. This is the claim-only
@@ -1259,7 +1257,7 @@ like every other pool file:
 
 | | contract |
 |---|---|
-| writer | **the worker itself, and only it.** It is the process holding the failing turn, and writing a local file needs no quota. One file per instance, so one writer per file — the core never writes here, which is what keeps this off the shared-mutable-state path |
+| writer | **the CORE, and only it — never the worker.** Owner ruling: *"quota or other blocking error should be reported but not by the worker itself."* The worker OBSERVES the failure (it holds the failing turn) and surfaces it as ordinary output; the core writes the durable record. An earlier revision made the worker the writer because a local write needs no quota — true, and an answer to the wrong question: a worker too broken to write its own record is exactly the one whose outage must still be reported, so self-reporting fails in the case it exists for. One writer, one file per instance, and the writer is the party still working |
 | the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. A worker too broken to write its own record is simply never eligible — the quiesce record makes that visible sooner, it does not change who serves the room |
 | routing exclusion | a quiesced instance is skipped in `instances` order at claim time. A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |
 | reset | the worker unlinks the file on its first successful turn. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again |

@@ -599,5 +599,60 @@ class DirectHandoffNamesAnAcceptance(unittest.TestCase):
             "document rather than in the reviewer's head")
 
 
+class OwnerRulingsOnMembershipAndReporting(unittest.TestCase):
+    """Two owner rulings, 2026-09-05. Pinned because the existing 35 tests all PASSED
+    across the change that inverted the set semantics -- none of them touched ordering,
+    so a suite that is green says nothing about whether this stayed decided.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_instances_is_unordered_membership_not_a_failover_order(self):
+        f = self._flat()
+        self.assertIn("UNORDERED MEMBERSHIP SET", f)
+        self.assertNotRegex(
+            f, r"`instances\[0\]` is the binding",
+            "the ordered form was retracted: members are equal participants")
+        self.assertNotRegex(
+            f, r"the rest of `instances` is a failover ORDER",
+            "no failover order survives the ruling")
+
+    def test_position_confers_nothing(self):
+        f = self._flat()
+        self.assertRegex(f, r"Every member is an equal claimant; position carries no meaning")
+        self.assertNotRegex(
+            f, r"suppress\*\* \(it is standby, not a claimant\)",
+            "a later member is no longer standby; it claims like any other")
+
+    def test_the_concurrency_that_was_traded_is_stated(self):
+        """Equal members means two turns can run in one room. The per-task claim does not
+        prevent it. A ruling whose cost is invisible gets re-litigated as a bug report."""
+        f = self._flat()
+        self.assertRegex(
+            f, r"does not stop two turns inside one ROOM",
+            "the trade must be legible where the decision is recorded")
+
+    def test_the_quiesce_writer_is_not_the_worker(self):
+        f = self._flat()
+        self.assertRegex(f, r"the CORE, and only it — never the worker")
+        self.assertNotRegex(
+            f, r"writer \| \*\*the worker itself, and only it",
+            "owner ruling: a blocking error is not reported by the party it blocks")
+
+    def test_the_no_quota_argument_is_answered_not_deleted(self):
+        """The old writer had a true argument (a local write needs no quota). Deleting it
+        invites its return; naming why it answers the wrong question does not."""
+        f = self._flat()
+        self.assertRegex(f, r"self-reporting fails in the case it exists for")
+
+    def test_exclusions_is_gone_entirely(self):
+        f = self._flat()
+        for token in ("distinct-instance", '"exclusions"', "exclusion group"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, f, "cut by owner ruling; a residue re-creates "
+                                           "the contradiction it was cut to remove")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
