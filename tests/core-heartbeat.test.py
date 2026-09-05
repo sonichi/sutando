@@ -288,6 +288,20 @@ class TestHeartbeatWrite(unittest.TestCase):
             self.assertEqual(third["tmux_server_version"], "3.6b")
             self.assertIsNot(third, second)
 
+    def test_tmux_backend_tolerates_a_missing_or_vanishing_binary(self):
+        # A candidate that cannot be executed is skipped (not raised); a binary that speaks
+        # and then disappears before -V still yields the verified client with version None.
+        import core_heartbeat
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "absent"), "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+        self.assertEqual((b["tmux_verified"], b["tmux_candidates"]), (False, [str(self.tmp / "absent")]))
+        f = self.tmp / "tmux"
+        f.write_text("#!/bin/sh\ncase \"$*\" in\n  *display-message*) echo '3.6b'; /bin/rm -f \"$0\";;\n  *) exit 1;;\nesac\n")
+        f.chmod(0o755)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
+            b2 = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+        self.assertEqual((b2["tmux_verified"], b2["tmux_binary"], b2["tmux_server_version"], b2["tmux_version"]), (True, str(f), "3.6b", None))
+
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
         a concurrent reader at the destination path never sees a half-file."""
