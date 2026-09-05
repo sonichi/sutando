@@ -160,8 +160,8 @@ with tempfile.TemporaryDirectory() as td:
 
 # --- raw payload vs display, and session runnability -----------------------
 
-# keweichen r6 P1-1: schedule.list stripped the target while both executors ran
-# it verbatim, so the API advertised a different command from the one that fires.
+# schedule.list must advertise the same command the executors run: a tidied
+# target here means the API promises one action while another fires.
 with tempfile.TemporaryDirectory() as td:
     cfg = write(Path(td), [{**CODEX, "name": "pad", "prompt_skill": " morning \n"}])
     row = {r["name"]: r for r in dash.list_schedules(cfg)}["pad"]
@@ -180,8 +180,8 @@ with tempfile.TemporaryDirectory() as td:
     check(row["prompt_or_skill"] == "\n  preserve leading\ntrailing  \n\n",
           "a tuned prompt body must reach the API verbatim, whitespace included")
 
-# keweichen r6 P1-2: a shell-carrying record must not suppress step 4's fallback
-# while nothing registers a driver — that leaves the session with no loop at all.
+# A shell-carrying record must not suppress step 4's fallback while nothing
+# registers a driver, or the session is left with no loop at all.
 MIXED = {"name": "main-loop", "cron": "*/5 * * * *",
          "shell_command": "echo hi", "prompt_skill": "proactive-loop"}
 with tempfile.TemporaryDirectory() as td:
@@ -246,11 +246,35 @@ check(recon.launchd_eligible(LOOP_MIXED),
 check(not recon.launchd_eligible(LOOP_PLAIN),
       "the ordinary loop record is still exempt from launchd")
 
-# Delegation, not a fourth copy: every site resolves to the owner's function.
-from cron_execution_form import launchd_eligible as _owner_eligible  # noqa: E402
-check(recon.launchd_eligible(LOOP_MIXED) == _owner_eligible(LOOP_MIXED)
-      and recon.launchd_eligible(LOOP_PLAIN) == _owner_eligible(LOOP_PLAIN),
-      "reconcile_launchd must delegate to the shared predicate")
+import cron_execution_form as _owner  # noqa: E402
+
+# Comparing outputs cannot show delegation: a private copy agreeing on these
+# records passes. Each control matches how that consumer binds the owner.
+_real = _owner.launchd_eligible
+recon._shared_launchd_eligible = lambda entry: "SENTINEL"
+try:
+    check(recon.launchd_eligible(LOOP_MIXED) == "SENTINEL",
+          "reconcile_launchd must CALL the shared predicate, not re-derive it")
+finally:
+    recon._shared_launchd_eligible = _real
+
+# The Codex scheduler binds the owner's function directly; identity is the pin.
+check(sched.select_for_executor is _owner.select_for_executor,
+      "codex-scheduler must bind the owner's select_for_executor, not a copy")
+
+# The health probe imports at call time, so patch the owner and watch it move.
+_owner.launchd_eligible = lambda entry: True
+try:
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        write(ws, [LOOP_PLAIN]).parent.rename(ws / "hosts" / "H")
+        r = hc.check_cron_runner(workspace_dir=ws, host_label="H", runtime="codex",
+                                 launchd_check=lambda *a, **k: {"running": True, "exit": 0})
+    check(r["status"] == "down",
+          "the health probe must READ the shared predicate (got "
+          f"{r['status']!r} when the owner called every record eligible)")
+finally:
+    _owner.launchd_eligible = _real
 
 # Health must say the configuration is unowned, not report ok.
 for label, entry, want in (("mixed", LOOP_MIXED, "down"), ("plain", LOOP_PLAIN, "ok")):
