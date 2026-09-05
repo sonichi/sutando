@@ -356,16 +356,25 @@ class RemovalUnbindsBeforeTheInstaller(unittest.TestCase):
             "remove/resize listed as an installer call leaves bindings naming a worker "
             "that cannot return")
 
-    def test_unbind_step_precedes_the_installer_step(self):
+    def test_the_worker_is_fenced_before_anything_is_reclaimed_or_rewritten(self):
+        """The previous version of this test asserted rewrite-before-installer, which
+        PINNED an unsafe order: a suspended worker resumes and claims on a stale
+        eligibility read. Stopping the process is the only fence."""
         t = self._text()
+        i_fence = t.find("FENCE W FIRST")
+        i_drain = t.find("Drain what it holds")
         i_rewrite = t.find("REWRITE THE BINDINGS")
-        i_installer = t.find("run the installer to remove the plist")
-        self.assertNotEqual(i_rewrite, -1, "no binding-rewrite step is described")
-        self.assertNotEqual(i_installer, -1, "no installer step is described")
-        self.assertLess(
-            i_rewrite, i_installer,
-            "the plist must go AFTER the bindings, or there is a window where the "
-            "plist is gone and the bindings still name it")
+        for name, i in (("fence", i_fence), ("drain", i_drain), ("rewrite", i_rewrite)):
+            self.assertNotEqual(i, -1, "no %s step is described" % name)
+        self.assertLess(i_fence, i_drain, "reclaiming before the worker is stopped lets "
+                                          "the reclaimed path and W run the same task")
+        self.assertLess(i_fence, i_rewrite, "publishing a new binding before W is stopped "
+                                            "lets W claim against its stale view")
+
+    def test_ineligibility_is_not_offered_as_the_fence(self):
+        t = self._text()
+        self.assertIn("Marking W ineligible is NOT a substitute", t,
+                      "a read-gated flag cannot fence a process already past the read")
 
     def test_resize_to_zero_reaches_core_by_rule_three(self):
         t = self._text()

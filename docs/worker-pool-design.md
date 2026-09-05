@@ -1033,13 +1033,24 @@ would strand those rooms forever and `resize to 0` could not restore core-only m
 installer-only path at the command table has no step that rewrites a binding, which is exactly the
 gap. So removing W runs in this order, and the order is the contract:
 
-1. **Stop admitting.** W is marked ineligible first, so it takes no new claims while the rest runs.
+1. **FENCE W FIRST — the same fence the re-bind row uses**, and for the same reason: stop the
+   wrapper, remove or disable the plist so `kick-pool` cannot revive it, end the tmux session, clear
+   the beat. Only after this can W neither claim nor execute.
 2. **Drain what it holds.** W's already-CLAIMED work is reclaimed behind the done flag, per rule 5 —
-   this is the one reclamation no-stand-in has always permitted, and it is why `resize to 0` can
-   promise that in-flight work is not lost.
+   the one reclamation no-stand-in has always permitted, and why `resize to 0` can promise that
+   in-flight work is not lost. Safe only after step 1: reclaiming work a live W may still be running
+   lets the reclaimed path and W drive the same task at once.
 3. **REWRITE THE BINDINGS.** W is removed from every room's `instances`. A room left with no entries
    is UNBOUND, and unbound work reaches the core under rule 3 — the ordinary path, not a stand-in.
-4. **Then** run the installer to remove the plist, and stop the process per the fence above.
+4. **Then** the installer records the removal.
+
+**Marking W ineligible is NOT a substitute for step 1, and an earlier revision of this list made
+exactly that mistake.** Eligibility is a value the worker READS before claiming (`:85-91`), so a W
+that read `eligible` and then suspended can resume after the verdict flips and claim against its
+stale view. A read-gated flag cannot fence a process that is already past the read; only stopping the
+process can. That ordering also contradicted the re-bind fence above, which has always ended the
+worker session BEFORE publishing a new binding — the two paths must not disagree about what stops a
+worker.
 
 Steps 3 and 4 in that order is the whole point: reversed, there is a window in which the plist is
 gone and the bindings still name it. `resize to 0` is this transition applied to every worker, which
