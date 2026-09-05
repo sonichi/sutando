@@ -1130,9 +1130,19 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
+    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
+    attach_roots: tuple = ()
+    if tier == "team":
+        _delivery_for_media = _delivery_tid(tid)
+        _media_modes = _load_task_media() if _delivery_for_media is not None else None
+        if (_media_modes is not None
+                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
+                == "task-media"):
+            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
-        scan_sensitive_data=scan_sensitive_data)
+        scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
     is_leak = verdict.kind == "leak"
     agent_id = _reenroll_identity()
     verdict = materialize(
@@ -2645,6 +2655,25 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
     return _record_task_media(tid, task)
 
 
+
+# Signal Room tasks (5G ⑤a-cap), AG2 Space adapter edge: names the ONE directory a
+# Team result may attach from; `attach_markers_confined` withholds anything else.
+def _signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    output_q = shlex.quote(f"{media_dir}/<name>.png")  # a workspace path may hold spaces
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {output_q}), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]
+
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -2799,6 +2828,10 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        # A relay-stamped Signal task may attach from ITS OWN output directory only;
+        # name it here (absolute) so the marker written is the one the guard confines.
+        if isinstance(task.get("signal"), dict):
+            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
         lines.extend(sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", f"results/{tid}.txt",

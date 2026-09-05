@@ -154,11 +154,140 @@ class QuarantineRecord(unittest.TestCase):
         self.assertEqual(rec["withheld_body"], "body text")
         self.assertEqual(rec["task_id"], "task-1")
 
-    def test_an_unwritable_state_dir_costs_the_record_not_the_withhold(self):
+    def test_a_state_path_that_is_not_a_directory_costs_the_record_not_the_withhold(self):
         # Best-effort by contract: a failed record must return False, never raise
         # into the delivery loop that already withheld the attachment.
+        blocked = pathlib.Path(tempfile.mkdtemp(prefix="qrec-blocked-")) / "file"
+        blocked.write_text("not a directory")
         self.assertFalse(
-            guard.journal_quarantined_attachment("b", "/dev/null/nope", "task-2", now=1700000000))
+            guard.journal_quarantined_attachment("b", blocked, "task-2", now=1700000000))
+
+
+
+class TaskScopedAttachRoots(unittest.TestCase):
+    """Signal Room 5G ⑤a-cap: a Team result may attach ONLY files under the
+    task's own output root. Narrower than allow_attach, which trusts the
+    channel; this trusts a directory, realpath'd on both sides."""
+
+    def setUp(self):
+        self.sd = pathlib.Path(tempfile.mkdtemp(prefix="ca-"))
+        self.results = pathlib.Path(tempfile.mkdtemp(prefix="results-"))
+        self.root = self.results / "task-signal-1"
+        self.root.mkdir()
+        self.inside = self.root / "chart.png"
+        self.inside.write_bytes(b"png")
+        self.outside = self.results / "task-signal-2"
+        self.outside.mkdir()
+        (self.outside / "other.png").write_bytes(b"png")
+
+    def _guard(self, body, task_id="ts1", **kw):
+        return guard.guard_result_for_tier(
+            body, "team", REPO, suppress_journal=(self.sd, task_id),
+            attach_roots=(str(self.root),), **kw)
+
+    def test_in_root_absolute_marker_passes_byte_identical(self):
+        body = f"here is the chart\n[file: {self.inside}]"
+        out, why = self._guard(body)
+        self.assertEqual(out, body)
+        self.assertIsNone(why)
+        self.assertFalse((self.sd / guard.SUPPRESSED_RESULT_DIR).exists(),
+                         "a delivered in-root attachment leaves no quarantine")
+
+    def test_sibling_task_dir_is_out_of_root(self):
+        out, why = self._guard(f"x [file: {self.outside / 'other.png'}]", "ts2")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+        self.assertTrue(guard.quarantined_attachment_path(self.sd, "ts2").is_file(),
+                        "an out-of-root attach-only withhold is still quarantined for owner release")
+
+    def test_prefix_sharing_dir_is_out_of_root(self):
+        # /results/task-signal-1 must not admit /results/task-signal-10/…
+        sneaky = self.results / "task-signal-10"
+        sneaky.mkdir()
+        (sneaky / "a.png").write_bytes(b"png")
+        out, _ = self._guard(f"x [file: {sneaky / 'a.png'}]", "ts3")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_symlink_escaping_the_root_is_out_of_root(self):
+        link = self.root / "escape.png"
+        os.symlink(self.outside / "other.png", link)
+        out, _ = self._guard(f"x [file: {link}]", "ts4")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_relative_marker_is_not_confined(self):
+        out, _ = self._guard("x [file: task-signal-1/chart.png]", "ts5")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_tilde_marker_is_not_confined_even_when_home_is_the_root(self):
+        home = pathlib.Path(os.path.expanduser("~")).resolve()
+        out, _ = guard.guard_result_for_tier(
+            "x [file: ~/inside.png]", "team", REPO, suppress_journal=(self.sd, "ts5b"),
+            attach_roots=(str(home),))
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_relative_or_tilde_marker_is_refused_even_when_cwd_is_the_root(self):
+        """Pins isabs. The pair above withhold for the REALPATH reason, not this one:
+        `os.path.realpath` does not expand `~`, so both resolve under CWD, and with cwd
+        outside the root they land outside it whether or not isabs runs. Moving cwd AND
+        HOME inside the root makes realpath land INSIDE, so only isabs still withholds.
+        Credit: john-the-dev, who found it by mutation on #3911 — deleting isabs left
+        all 57 tests green."""
+        cwd, home = os.getcwd(), os.environ.get("HOME")
+        os.chdir(self.root)
+        os.environ["HOME"] = str(self.root)
+        try:
+            self.assertFalse(guard.attach_markers_confined(
+                "x\n[file: chart.png]", (str(self.root),)))
+            self.assertFalse(guard.attach_markers_confined(
+                "x\n[file: ~/chart.png]", (str(self.root),)))
+        finally:
+            os.chdir(cwd)
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
+
+    def test_marker_naming_the_root_itself_is_confined_but_not_sendable(self):
+        # The guard confines by LOCATION; the upload path independently requires a
+        # regular file, so a marker naming the directory is refused there.
+        out, why = self._guard(f"x [file: {self.root}]", "ts5c")
+        self.assertEqual((out, why), (f"x [file: {self.root}]", None))
+        sys.path.insert(0, "packages/ag2-sparrow")
+        from ag2_sparrow.send_allowlist import is_path_sendable
+        self.assertFalse(is_path_sendable(str(self.root)))
+
+    def test_one_stray_marker_withholds_the_whole_result(self):
+        body = f"x [file: {self.inside}]\n[file: {self.outside / 'other.png'}]"
+        out, _ = self._guard(body, "ts6")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_redirect_is_never_admitted_by_the_allowance(self):
+        out, _ = self._guard(f"[channel: #elsewhere]\n[file: {self.inside}]", "ts7")
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_empty_roots_change_nothing(self):
+        out, _ = guard.guard_result_for_tier(
+            f"x [file: {self.inside}]", "team", REPO, suppress_journal=(self.sd, "ts8"),
+            attach_roots=())
+        self.assertEqual(out, guard.TEAM_LEAK_RESULT_MARKER)
+
+    def test_allow_attach_still_admits_any_path(self):
+        body = f"x [file: {self.outside / 'other.png'}]"
+        out, _ = self._guard(body, "ts9", allow_attach=True)
+        self.assertEqual(out, body)
+
+    def test_owner_tier_is_untouched(self):
+        body = "x [file: /anywhere/at/all.png]"
+        out, why = guard.guard_result_for_tier(body, "owner", REPO, attach_roots=(str(self.root),))
+        self.assertEqual((out, why), (body, None))
+
+    def test_confinement_predicate_directly(self):
+        conf = guard.attach_markers_confined
+        self.assertTrue(conf(f"[file: {self.inside}]", (str(self.root),)))
+        self.assertFalse(conf("no markers here", (str(self.root),)))
+        self.assertFalse(conf(f"[file: {self.inside}]", ()))
+        self.assertFalse(conf(f"[file: {self.inside}]", ("",)))
+        self.assertTrue(conf(f"[file: {self.inside}]", (str(self.root) + "/",)),
+                        "a trailing slash on the root is tolerated")
 
 
 if __name__ == "__main__":
