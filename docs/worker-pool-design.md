@@ -819,7 +819,37 @@ rooms must be kept off the same worker:
   |---|---|
   | a worker's beat goes stale past `stand_in_after_s` | **nothing claims for those rooms.** The core kickstarts the plist; the work stays pending until the worker returns or an owner re-binds |
   | the worker comes back | it re-reads the binding, finds itself still `instances[0]`, and resumes. Nothing was reassigned, so nothing has to be revoked |
-  | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** (`launchctl bootout` on its plist) before the new binding is written. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
+  | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** before the new binding is written — see "What stopping a worker actually takes" below, because `launchctl bootout` alone does NOT stop it. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
+
+  **What stopping a worker actually takes, and what it costs.** An earlier revision named
+  `launchctl bootout` on the plist as the enforcer. Measured against the reference implementation at
+  #3604's pinned `6c0b416e`, that is insufficient in three independent ways, and
+  `scripts/uninstall-core-pool.sh` says so in its own header: *removing a core is three steps, not
+  one*. Its `remove_core()` runs `bootout`, then `rm` on the plist, then `tmux kill-session`, then
+  removes `state/cores/core-<N>.alive`. Each of the three extra steps closes a distinct hole:
+
+  - the **persistent-form follower session outlives the wrapper**, so the outgoing worker is still
+    running after `bootout` and can still claim against the room it was just unbound from — the
+    original race, surviving the fence meant to close it;
+  - the **plist remains installed**, and `kick-pool` revives any installed plist whose session is
+    gone, so the fence can be undone by the pool's own liveness path without anyone acting;
+  - a **stale beat file** keeps the lead assigning work to a worker that is no longer there.
+
+  So the re-bind fence is: stop the wrapper, remove or disable the plist so `kick-pool` cannot
+  revive it, end the tmux session, clear the beat — then write the new binding. Restarting the
+  worker afterwards is `launchctl bootstrap`, NOT `kickstart`: `kickstart` targets an already-loaded
+  job and cannot restore one `bootout` removed. Every `kickstart` elsewhere in this document
+  describes reviving a worker whose plist is still loaded, which is a different operation from this
+  one.
+
+  **And state the scope honestly, because it is process-wide while a re-bind is per-room.** A worker
+  may hold more than one room — `distinct-instance` only forbids two rooms from the same exclusion
+  group — so stopping it to re-bind ONE room also stops its other rooms and any work in flight for
+  them. v1 takes that trade deliberately: those other rooms' bindings go pending under the same
+  no-stand-in rule as everywhere else, and clear when the worker is bootstrapped back. The
+  alternative — a room-scoped admission boundary that fences one binding without touching the
+  process — is the right shape and is out of v1 scope, because it needs an admission check the
+  worker consults per claim rather than a supervisor boundary.
 
   **The two rows above once claimed they needed no fencing, then tried to buy one with a timer.
   Both were wrong, and the second is the more instructive.** The stale row said the core is a single
