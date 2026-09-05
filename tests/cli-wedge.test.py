@@ -271,7 +271,8 @@ class Cli(unittest.TestCase):
     def test_entry_point_runs_as_a_script(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "t.jsonl"
-            p.write_text(json.dumps({"ts": 1, "normalized": "a"}) + "\n" + json.dumps({"ts": 2, "normalized": "b"}) + "\n")
+            p.write_text(json.dumps({"ts": 1, "state": "s1", "raw_state": "r1", "patterns": []}) + "\n"
+                         + json.dumps({"ts": 2, "state": "s2", "raw_state": "r2", "patterns": []}) + "\n")
             r = subprocess.run([sys.executable, str(REPO / "src" / "cli_wedge.py"), "replay", str(p)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(json.loads(r.stdout)["kind"], "working")
@@ -294,8 +295,90 @@ class Cli(unittest.TestCase):
     def test_replay_skips_corrupt_lines(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "t.jsonl"
-            p.write_text("{bad\n" + json.dumps({"ts": 1, "normalized": "a"}) + "\n")
+            p.write_text("{bad\n" + json.dumps({"ts": 1, "state": "s1", "patterns": []}) + "\n")
             self.assertEqual(w.replay(p)["kind"], "unknown")
+
+    def test_record_stores_no_text_unless_asked(self):
+        args = SimpleNamespace(workspace=tempfile.mkdtemp(), label="idle", seconds=3, interval=0, max_samples=3, keep_raw=False)
+        t = [0.0]
+
+        def clock():
+            t[0] += 1.0
+            return t[0]
+
+        path = w.record(args, lambda: IDLE, clock=clock, sleep=lambda s: None)
+        first = json.loads(path.read_text().splitlines()[0])
+        self.assertEqual(sorted(first), ["patterns", "raw_state", "state", "ts"])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        args2 = SimpleNamespace(**{**vars(args), "keep_normalized": True})
+        path2 = w.record(args2, lambda: IDLE, clock=clock, sleep=lambda s: None)
+        self.assertIn("normalized", json.loads(path2.read_text().splitlines()[0]))
+
+    def test_replay_classifies_a_hash_only_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.jsonl"
+            lines = [json.dumps({"ts": float(i), "state": "same", "raw_state": f"r{i}", "patterns": ["retrying"]}) for i in range(12)]
+            p.write_text("\n".join(lines) + "\n")
+            self.assertEqual(w.replay(p, work=True)["kind"], "retry-loop")
+
+
+class Confidentiality(unittest.TestCase):
+    """The rolling window never carries pane text and every file is owner-only."""
+
+    def test_window_entries_carry_hashes_and_patterns_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            entries = w.append_window(Path(d), retry_frame(1), 1.0)
+            self.assertEqual(sorted(entries[-1]), ["patterns", "raw_state", "state", "ts"])
+            text = w.window_path(Path(d)).read_text()
+            self.assertNotIn("Retrying", text)
+            self.assertNotIn("attempt", text)
+
+    def test_files_are_owner_only_under_a_permissive_umask(self):
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                w.append_window(Path(d), IDLE, 1.0)
+                path = w.window_path(Path(d))
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+                # a pre-existing wide mode is normalized on the next write
+                os.chmod(path, 0o644)
+                w.append_window(Path(d), IDLE, 2.0)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        finally:
+            os.umask(old)
+
+    def test_classify_from_ids_matches_classify_from_frames(self):
+        frames = [retry_frame(i) for i in range(12)]
+        a = w.classify(frames, True, 60)
+        b = w.classify_ids([w.state_id(f) for f in frames], False, w.matched_patterns(frames), True, 60)
+        self.assertEqual((a["kind"], a["novel_state_count"], a["novelty_rate"]), (b["kind"], b["novel_state_count"], b["novelty_rate"]))
+
+
+class FailureBoundary(unittest.TestCase):
+    """Malformed persisted state is skipped, never raised; unwritable state raises at the
+    library edge (the health probe turns that into 'no reading')."""
+
+    def test_valid_json_but_malformed_entries_are_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = w.window_path(Path(d))
+            path.parent.mkdir(parents=True)
+            path.write_text("[]\n" + json.dumps({"ts": "not-a-number", "state": "s"}) + "\n" + json.dumps({"ts": 1.0, "state": 5}) + "\n"
+                            + json.dumps({"ts": 1.0, "state": "ok", "patterns": []}) + "\n" + "{bad\n")
+            entries = w.load_window(path)
+            self.assertEqual([e["state"] for e in entries], ["ok"])
+            v = w.classify_window([[], {"ts": "x", "state": "s"}, {"ts": 2.0, "state": "ok", "patterns": []}], (False, ""), 3.0)
+            self.assertEqual(v["kind"], "unknown")  # one valid entry: too few to compare, no crash
+
+    def test_unwritable_window_raises_at_the_library_edge(self):
+        # A read-only dir the process owns is simply re-opened (0700); what cannot be
+        # healed is the window path being occupied by a directory — the replace fails.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            w.window_path(ws).mkdir(parents=True)
+            with self.assertRaises(OSError):
+                w.append_window(ws, IDLE, 1.0)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ of nothing (ok), a static pane with work outstanding warns, a retry loop warns,
 and idle never does. The tmux and heartbeat seams are replaced with fakes."""
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -56,6 +57,19 @@ class CliWedgeProbe(unittest.TestCase):
                 sys.modules["cli_wedge"] = saved
         self.assertEqual(c["status"], "ok")
         self.assertIn("detector unavailable", c["detail"])
+
+    def test_unwritable_window_is_no_reading_not_a_crash(self):
+        (self.ws / "state" / "cli-wedge" / "window.jsonl").mkdir(parents=True)  # path occupied: the write must fail
+        c = hc.check_cli_wedge()
+        self.assertEqual(c["status"], "ok")
+        self.assertIn("no reading", c["detail"])
+
+    def test_malformed_window_lines_do_not_crash_the_check(self):
+        (self.ws / "state" / "cli-wedge").mkdir()
+        (self.ws / "state" / "cli-wedge" / "window.jsonl").write_text("[]\n" + json.dumps({"ts": "x", "state": "s"}) + "\n{bad\n")
+        c = hc.check_cli_wedge()
+        self.assertIn(c["status"], ("ok", "warn"))
+        self.assertIn(c["name"], ("cli-wedge",))
 
     def test_no_local_core_is_ok_and_says_so(self):
         hc._local_core_socket = lambda *a, **k: None

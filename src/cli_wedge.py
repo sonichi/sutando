@@ -15,6 +15,10 @@ them. Nothing here restarts, kills or fails anything over: it warns.
 
 Thresholds are PROVISIONAL (V1 is instrumentation): `record` writes real traces
 under <workspace>/state/cli-wedge/traces/ so they can be tuned from behaviour.
+
+Privacy: the rolling window persists hashes and pattern names only, never pane
+text; traces carry text only with --keep-normalized / --keep-raw. Every file
+this module writes is owner-only from birth (0600 in a 0700 directory).
 """
 from __future__ import annotations
 
@@ -119,6 +123,17 @@ def novelty(frames: list) -> Novelty:
     return Novelty(n, novel, (novel / n) if n else 0.0, n >= 2 and novel == 1, ids)
 
 
+def novelty_of_ids(state_ids: list) -> Novelty:
+    seen = set()
+    novel = 0
+    for sid in state_ids:
+        if sid not in seen:
+            seen.add(sid)
+            novel += 1
+    n = len(state_ids)
+    return Novelty(n, novel, (novel / n) if n else 0.0, n >= 2 and novel == 1, list(state_ids))
+
+
 def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
@@ -126,11 +141,18 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
     clock-only | static-with-work | retry-loop | low-novelty | unknown; the
     last three before unknown are warnings. `raw_static` is case 1's input
     (frame-for-frame equality); when None it is computed from `frames`."""
-    th = {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}
-    nov = novelty(frames)
-    pats = matched_patterns(frames)
     if raw_static is None:
         raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
+    return classify_ids([state_id(f) for f in frames], raw_static, matched_patterns(frames),
+                        work_outstanding, duration_s, work_detail, thresholds)
+
+
+def classify_ids(state_ids: list, raw_static: bool, pats: list, work_outstanding: bool,
+                 duration_s: float, work_detail: str = "", thresholds: Optional[dict] = None) -> dict:
+    """The verdict from hashes and pattern names alone — what the persisted
+    window carries, so no pane text is needed (or stored) to classify."""
+    th = {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}
+    nov = novelty_of_ids(state_ids)
     clock_only = (not raw_static) and nov.static
     base = {
         "advisory": True,
@@ -205,38 +227,68 @@ def window_path(workspace: Path) -> Path:
     return workspace / "state" / "cli-wedge" / "window.jsonl"
 
 
+def _private_dir(path: Path) -> None:
+    """Owner-only directory, created or normalized (a permissive umask must not widen it)."""
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Atomic replace through an owner-only temp file; the target ends 0600."""
+    _private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _valid_entry(e) -> bool:
+    return (isinstance(e, dict) and isinstance(e.get("ts"), (int, float))
+            and isinstance(e.get("state"), str) and isinstance(e.get("patterns", []), list))
+
+
+def load_window(path: Path) -> list:
+    """Persisted entries that pass validation; anything else is skipped, never raised."""
+    entries = []
+    if not path.exists():
+        return entries
+    for line in path.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if _valid_entry(e):
+            entries.append(e)
+    return entries
+
+
 def append_window(workspace: Path, frame: str, now: float, keep: int = 20) -> list:
     """Persist one sample into the rolling window so the statistic spans
     health-check passes; returns the window (oldest first)."""
     path = window_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    entries = []
-    if path.exists():
-        for line in path.read_text().splitlines():
-            try:
-                entries.append(json.loads(line))
-            except ValueError:
-                continue
+    entries = load_window(path)
+    # Hashes and pattern names only — no pane text is ever persisted here.
     entries.append({"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
-                    "normalized": normalize(frame), "patterns": matched_patterns([frame])})
+                    "patterns": matched_patterns([frame])})
     entries = entries[-keep:]
-    tmp = path.with_suffix(".jsonl.tmp")
-    tmp.write_text("".join(json.dumps(e) + "\n" for e in entries))
-    os.replace(tmp, path)
+    _write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
     return entries
 
 
 def classify_window(entries: list, work: tuple, now: float) -> dict:
-    """Classify persisted samples; the duration is that of the trailing run of
-    one state, which is what "static for N seconds" means."""
-    frames = [e.get("normalized", "") for e in entries]
+    """Classify persisted samples (hashes only). Case 2 looks at the whole
+    window; case 1 at the TRAILING run of one RAW state, since earlier
+    different frames only say the pane moved before it stopped."""
+    entries = [e for e in entries if _valid_entry(e)]
     if not entries:
-        return classify([], work[0], 0.0, work[1])
+        return classify_ids([], False, [], work[0], 0.0, work[1])
+    ids = [e["state"] for e in entries]
     raws = [e.get("raw_state") for e in entries]
+    pats = sorted({p for e in entries for p in e.get("patterns", []) if isinstance(p, str)})
     whole_raw_static = len(entries) >= 2 and all(raws) and len(set(raws)) == 1
-    # Case 2 looks at the whole window; case 1 at the TRAILING run of one RAW
-    # state, since earlier different frames only say the pane moved before it stopped.
-    whole = classify(frames, work[0], max(0.0, now - entries[0]["ts"]), work[1], raw_static=whole_raw_static)
+    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - entries[0]["ts"]), work[1])
     if whole["kind"] in ("retry-loop", "low-novelty"):
         return whole
     last = entries[-1].get("raw_state")
@@ -246,7 +298,8 @@ def classify_window(entries: list, work: tuple, now: float) -> dict:
             break
         run.append(e)
     if len(run) >= 2:
-        trailing = classify([e.get("normalized", "") for e in run], work[0], max(0.0, now - run[-1]["ts"]), work[1], raw_static=True)
+        run_pats = sorted({p for e in run for p in e.get("patterns", []) if isinstance(p, str)})
+        trailing = classify_ids([e["state"] for e in run], True, run_pats, work[0], max(0.0, now - run[-1]["ts"]), work[1])
         if trailing["kind"] in ("idle", "static-with-work"):
             return {**trailing, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
                     "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(run)}
@@ -263,18 +316,22 @@ def record(args, sampler: Callable, clock=time.time, sleep=time.sleep) -> Path:
     """Sample the pane every `interval` seconds for `seconds`, one JSON line per
     sample plus a summary line; the file is the tuning evidence."""
     out_dir = Path(args.workspace) / "state" / "cli-wedge" / "traces"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _private_dir(out_dir)
     started = clock()
     path = out_dir / f"{args.label}-{int(started)}.jsonl"
     frames = []
-    with path.open("w") as fh:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
         while clock() - started < args.seconds and len(frames) < args.max_samples:
             frame = sampler()
             if frame is not None:
                 frames.append(frame)
+                # Text is opt-in: hashes and pattern names are enough to tune thresholds.
                 entry = {"ts": clock(), "state": state_id(frame), "raw_state": raw_state_id(frame),
-                         "normalized": normalize(frame), "patterns": matched_patterns([frame])}
-                if args.keep_raw:
+                         "patterns": matched_patterns([frame])}
+                if getattr(args, "keep_normalized", False):
+                    entry["normalized"] = normalize(frame)
+                if getattr(args, "keep_raw", False):
                     entry["raw"] = frame
                 fh.write(json.dumps(entry) + "\n")
             sleep(args.interval)
@@ -284,20 +341,11 @@ def record(args, sampler: Callable, clock=time.time, sleep=time.sleep) -> Path:
 
 
 def replay(path: Path, work: bool = False) -> dict:
-    frames, ts, raws = [], [], []
-    for line in Path(path).read_text().splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("summary"):
-            continue
-        frames.append(e.get("raw") or e.get("normalized", ""))
-        ts.append(e.get("ts", 0))
-        raws.append(e.get("raw_state"))
+    entries = [e for e in load_window(Path(path)) if not e.get("summary")]
+    ts = [e["ts"] for e in entries]
     duration = (max(ts) - min(ts)) if len(ts) >= 2 else 0.0
-    raw_static = (len(raws) >= 2 and all(raws) and len(set(raws)) == 1) if any(raws) else None
-    return classify(frames, work, duration, "replay flag" if work else "", raw_static=raw_static)
+    return classify_window(entries, (work, "replay flag" if work else ""), max(ts) if ts else 0.0) if entries else \
+        classify_ids([], False, [], work, 0.0, "replay flag" if work else "")
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -314,7 +362,8 @@ def main(argv: Optional[list] = None) -> int:
             p.add_argument("--seconds", type=float, default=60)
             p.add_argument("--interval", type=float, default=3)
             p.add_argument("--max-samples", type=int, default=200)
-            p.add_argument("--keep-raw", action="store_true")
+            p.add_argument("--keep-normalized", action="store_true", help="also store normalized frame text (opt-in)")
+            p.add_argument("--keep-raw", action="store_true", help="also store the raw frame (opt-in)")
     r = sub.add_parser("replay")
     r.add_argument("path")
     r.add_argument("--work-outstanding", action="store_true")

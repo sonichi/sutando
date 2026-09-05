@@ -756,10 +756,11 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
 def check_cli_wedge() -> dict:
     """Advisory CLI progress detector over the core's tmux pane (src/cli_wedge.py).
 
-    Case 1: normalized pane unchanged while work is outstanding. Case 2: the
+    Case 1: the RAW pane unchanged while work is outstanding. Case 2: the
     pane moves but revisits states already seen (retry loop). It reads the
     pane, not the process — a green here is not core health — and it only
-    ever warns: nothing keys recovery off this check.
+    ever warns: nothing keys recovery off this check, and no failure inside
+    it may escape (an unwritable or corrupt window is "no reading").
     """
     check = {"name": "cli-wedge", "status": "ok", "detail": ""}
     try:
@@ -776,8 +777,12 @@ def check_cli_wedge() -> dict:
         check["detail"] = "pane not readable — no reading, not a verdict"
         return check
     now = time.time()
-    entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now)
-    verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR), now)
+    try:
+        entries = cli_wedge.append_window(WORKSPACE_DIR, res.stdout, now)
+        verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR), now)
+    except Exception as e:  # noqa: BLE001 — an advisory check must never abort the run
+        check["detail"] = f"no reading — window state unusable ({type(e).__name__}: {e})"
+        return check
     check["status"] = "warn" if verdict.get("warn") else "ok"
     check["detail"] = (f"{verdict['kind']} ({verdict['confidence']}): {verdict['reason']}"
                        " — advisory; reads the pane, not the process")
