@@ -38,6 +38,10 @@ RETRACTED = [
      "the design retires handler affinity and deletes the file; rooms bind only "
      "by an explicit pin. Absent and empty both route to the core, and neither is "
      "ever filled by affinity."),
+    ("Believe the task, not the phase",
+     "the task file is written BEFORE the notification, so its presence is true on "
+     "both sides of the emit and cannot prove publication. The ticker branches on the "
+     "task's CLAIM state, never on its existence."),
 ]
 
 

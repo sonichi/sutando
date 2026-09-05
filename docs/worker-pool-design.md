@@ -323,18 +323,26 @@ The **holder is the sole writer**, transitions are one-way (`admitted` -> `emitt
 `admitted` is written **before** the task file is published and `emitted` **after** the publish
 returns, and the holder renews `lease_until` on the same beat as its `.alive`.
 
-| phase | lease | task file | the ticker |
+| phase | lease | the task's own CLAIM state | the ticker |
 |---|---|---|---|
 | any | live | — | not orphaned. Leave it; a live holder owns its own receipt |
-| `admitted` | expired | absent | the publish never happened, so nothing is in flight. Unlink and re-admit |
-| `admitted` | expired | **present** | the publish landed and the phase write did not. **Believe the task, not the phase** — treat as `emitted` |
-| `emitted` | expired | any | the task is in flight or already done. **Never re-admit.** Release only once the task is terminal (result written and archived); until then the receipt stands and its slot stays consumed |
+| any | expired | task absent, or present and **unclaimed** | nothing is executing it, so re-admission cannot duplicate. Unlink and re-admit |
+| any | expired | **claimed, unfinished** | a worker holds it. **Never re-admit.** The receipt stands until the task reaches a terminal state |
+| any | expired | **terminal** (result written and archived) | the work is done. Release the receipt; its slot returns |
 
-**The write order is what makes this decidable.** Phase-before-publish leaves exactly one ambiguous
-state — *phase says `admitted`, the task exists* — and disk resolves it, because the task's presence
-is the stronger evidence. Publishing first would leave *phase says `emitted`, no task*, which
-nothing on disk can tell apart from a completed-and-archived task, and the ticker would have to
-guess. A contract that needs a guess at its only ambiguous point is not a contract.
+**The discriminator is the task's claim state, NOT the task file's existence.** An earlier revision of
+this table keyed the ambiguous row on *task present* and read that as proof the publish had landed.
+It is not: the task file is written **before** the notification, so it is present on both sides of the
+emit and a crash in between takes the "already emitted" branch — the receipt then consumes a slot
+forever for a task nobody ever received. Measured on the production `dispatch_task` by a reviewer:
+`before emit: task_present=True phase=admitted emitted=0` / `after emit: task_present=True phase=admitted
+emitted=1`, with the task and receipt bytes identical in both.
+
+Claim state does not have that defect, because it answers the question the bound actually cares about.
+Duplication is only possible when something is **executing** the task; an unclaimed task can be
+re-admitted safely no matter which side of the publish the holder died on. So the phase field stops
+being a decision input and becomes provenance — useful for an operator reading the record, never the
+thing the ticker branches on.
 
 **The admitted count is derived by listing `direct/`, never held in a counter**, so removing the
 file *is* the decrement and there is no second number to drift out of step. This is the same defect
@@ -768,6 +776,18 @@ rooms must be kept off the same worker:
 }
 ```
 
+- **A room's set is a FAILOVER order, not a concurrency grant — v1 admits one worker per
+  room at a time.** Two members claiming two different tasks for the same room would each win
+  their task-specific claim and then drive one room's context concurrently, which
+  `distinct-instance` does not prevent: that rule separates rooms across workers, and says
+  nothing about two workers inside one room. Measured by a reviewer against the production
+  claim: *different task keys, same room -> claim results 0, 0* (both won), against a control
+  *using one group key -> 0, 1* (one won). Making concurrency safe needs a group-scoped lease
+  keyed on the room — group identity, group admission, group release, and a story for
+  multi-room groups — and none of that is in v1. So it is **scoped out explicitly** rather
+  than left implied: a room's second and later `instances` entries are STANDBY, eligible only
+  when no earlier member holds the room's lease. A later PR may add true fan-out; until it
+  does, a set is redundancy, not parallelism.
 - **`instances` is a membership set, and the claim settles which member takes a given
   task** — the same rule the routing section states for a bound set. Nothing hands out
   turns, so a strict preference order between racing workers is not enforceable and must
