@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """CLI progress detector for the core's tmux pane — advisory only.
 
-Two cases a heartbeat and a liveness probe both miss: (1) the pane is static
-while work is outstanding; (2) the pane moves but revisits the same states (a
-retry loop). Frames are NORMALIZED before comparison — clocks, durations,
-counters, spinners and token counts are volatile and would fake novelty — so
-"static" means "nothing but volatile fields changed".
+Two cases a heartbeat and a liveness probe both miss: (1) the RAW pane is
+static while work is outstanding — pure static, no normalization, per the
+spec; (2) the pane moves but revisits the same states (a retry loop), measured
+as novelty over NORMALIZED frames — clocks, durations, counters, spinners and
+token counts would fake novelty. A pane whose only motion is a clock is
+neither verdict: it is reported as `clock_only` so traces can settle it.
 
 This reads the CLI, not the process. A green result here is not evidence the
 core is healthy; it complements `.alive` and the runtime probes, never replaces
@@ -82,6 +83,11 @@ def state_id(frame: str) -> str:
     return hashlib.sha1(normalize(frame).encode("utf-8")).hexdigest()[:12]
 
 
+def raw_state_id(frame: str) -> str:
+    """Identity of the frame as displayed — what case 1 compares."""
+    return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
+
+
 def matched_patterns(frames: list) -> list:
     text = "\n".join(frames)
     return [name for name, rx in RETRY_PATTERNS if rx.search(text)]
@@ -113,13 +119,18 @@ def novelty(frames: list) -> Novelty:
 
 
 def classify(frames: list, work_outstanding: bool, duration_s: float,
-             work_detail: str = "", thresholds: Optional[dict] = None) -> dict:
+             work_detail: str = "", thresholds: Optional[dict] = None,
+             raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    static-with-work | retry-loop | low-novelty | unknown; the last three
-    before unknown are warnings."""
+    clock-only | static-with-work | retry-loop | low-novelty | unknown; the
+    last three before unknown are warnings. `raw_static` is case 1's input
+    (frame-for-frame equality); when None it is computed from `frames`."""
     th = {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}
     nov = novelty(frames)
     pats = matched_patterns(frames)
+    if raw_static is None:
+        raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
+    clock_only = (not raw_static) and nov.static
     base = {
         "advisory": True,
         "note": "CLI progress detector — reads the pane, not the process; not a health guarantee",
@@ -130,6 +141,8 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
         "matched_patterns": pats,
         "work_outstanding": work_outstanding,
         "work_detail": work_detail,
+        "raw_static": bool(raw_static),
+        "clock_only": clock_only,
         "thresholds": th,
     }
     if nov.sample_count < 2:
@@ -137,19 +150,23 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
                 "reason": "fewer than 2 samples — nothing to compare"}
     # Retry text decides first: a loop whose only motion is counters/clocks
     # normalizes to ONE state and would otherwise read as merely static.
-    if pats and (nov.static or (nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"])):
+    if pats and (raw_static or nov.static or (nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"])):
         return {**base, "kind": "retry-loop", "confidence": "high" if nov.sample_count >= th["min_samples"] else "medium", "warn": True,
                 "reason": f"{nov.novel_state_count} distinct state(s) over {nov.sample_count} samples and retry text present ({', '.join(pats)})"}
-    if nov.static:
+    # Case 1 is pure static on the RAW pane (spec): no normalization here.
+    if raw_static:
         if work_outstanding:
             high = duration_s >= th["static_high_conf_s"]
             return {**base, "kind": "static-with-work", "confidence": "high" if high else "low", "warn": True,
-                    "reason": f"pane unchanged (after normalization) for {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
+                    "reason": f"pane unchanged for {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
         return {**base, "kind": "idle", "confidence": "high", "warn": False,
                 "reason": "pane unchanged and nothing outstanding"}
-    if nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"]:
+    if clock_only and not work_outstanding:
+        return {**base, "kind": "clock-only", "confidence": "none", "warn": False,
+                "reason": "only volatile fields (clock/counters) change and nothing is outstanding — recorded for the harness, not judged"}
+    if work_outstanding and nov.sample_count >= th["min_samples"] and nov.novelty_rate <= th["low_novelty_rate"]:
         return {**base, "kind": "low-novelty", "confidence": "low", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples, no retry text — repetitive, cause unknown"}
+                "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples with work outstanding, no retry text — repetitive, cause unknown"}
     return {**base, "kind": "working", "confidence": "medium" if nov.novelty_rate < 0.6 else "high", "warn": False,
             "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples"}
 
@@ -199,8 +216,8 @@ def append_window(workspace: Path, frame: str, now: float, keep: int = 20) -> li
                 entries.append(json.loads(line))
             except ValueError:
                 continue
-    entries.append({"ts": now, "state": state_id(frame), "normalized": normalize(frame),
-                    "patterns": matched_patterns([frame])})
+    entries.append({"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
+                    "normalized": normalize(frame), "patterns": matched_patterns([frame])})
     entries = entries[-keep:]
     tmp = path.with_suffix(".jsonl.tmp")
     tmp.write_text("".join(json.dumps(e) + "\n" for e in entries))
@@ -214,22 +231,24 @@ def classify_window(entries: list, work: tuple, now: float) -> dict:
     frames = [e.get("normalized", "") for e in entries]
     if not entries:
         return classify([], work[0], 0.0, work[1])
-    # Case 2 looks at the whole window; case 1 at the TRAILING run of one state,
-    # since earlier different frames only say the pane moved before it stopped.
-    whole = classify(frames, work[0], max(0.0, now - entries[0]["ts"]), work[1])
+    raws = [e.get("raw_state") for e in entries]
+    whole_raw_static = len(entries) >= 2 and all(raws) and len(set(raws)) == 1
+    # Case 2 looks at the whole window; case 1 at the TRAILING run of one RAW
+    # state, since earlier different frames only say the pane moved before it stopped.
+    whole = classify(frames, work[0], max(0.0, now - entries[0]["ts"]), work[1], raw_static=whole_raw_static)
     if whole["kind"] in ("retry-loop", "low-novelty"):
         return whole
-    last = entries[-1]["state"]
+    last = entries[-1].get("raw_state")
     run = []
     for e in reversed(entries):
-        if e["state"] != last:
+        if not last or e.get("raw_state") != last:
             break
         run.append(e)
     if len(run) >= 2:
-        trailing = classify([e.get("normalized", "") for e in run], work[0], max(0.0, now - run[-1]["ts"]), work[1])
+        trailing = classify([e.get("normalized", "") for e in run], work[0], max(0.0, now - run[-1]["ts"]), work[1], raw_static=True)
         if trailing["kind"] in ("idle", "static-with-work"):
             return {**trailing, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
-                    "novelty_rate": whole["novelty_rate"], "trailing_static_samples": len(run)}
+                    "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(run)}
     return whole
 
 
@@ -252,8 +271,8 @@ def record(args, sampler: Callable, clock=time.time, sleep=time.sleep) -> Path:
             frame = sampler()
             if frame is not None:
                 frames.append(frame)
-                entry = {"ts": clock(), "state": state_id(frame), "normalized": normalize(frame),
-                         "patterns": matched_patterns([frame])}
+                entry = {"ts": clock(), "state": state_id(frame), "raw_state": raw_state_id(frame),
+                         "normalized": normalize(frame), "patterns": matched_patterns([frame])}
                 if args.keep_raw:
                     entry["raw"] = frame
                 fh.write(json.dumps(entry) + "\n")
@@ -264,7 +283,7 @@ def record(args, sampler: Callable, clock=time.time, sleep=time.sleep) -> Path:
 
 
 def replay(path: Path, work: bool = False) -> dict:
-    frames, ts = [], []
+    frames, ts, raws = [], [], []
     for line in Path(path).read_text().splitlines():
         try:
             e = json.loads(line)
@@ -274,8 +293,10 @@ def replay(path: Path, work: bool = False) -> dict:
             continue
         frames.append(e.get("raw") or e.get("normalized", ""))
         ts.append(e.get("ts", 0))
+        raws.append(e.get("raw_state"))
     duration = (max(ts) - min(ts)) if len(ts) >= 2 else 0.0
-    return classify(frames, work, duration, "replay flag" if work else "")
+    raw_static = (len(raws) >= 2 and all(raws) and len(set(raws)) == 1) if any(raws) else None
+    return classify(frames, work, duration, "replay flag" if work else "", raw_static=raw_static)
 
 
 def main(argv: Optional[list] = None) -> int:

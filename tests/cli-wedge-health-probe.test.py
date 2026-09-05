@@ -18,7 +18,7 @@ try:
 except SystemExit:
     pass
 
-IDLE = "❯ \n⏵⏵ bypass permissions on · 12:01:05 PM · 1 monitor\n"
+IDLE = "❯ \n⏵⏵ bypass permissions on · 1 monitor\n"
 
 
 class CliWedgeProbe(unittest.TestCase):

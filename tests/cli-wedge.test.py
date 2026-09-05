@@ -71,17 +71,31 @@ class NoveltyStats(unittest.TestCase):
 
 
 class Classifier(unittest.TestCase):
-    def test_idle_when_static_and_nothing_outstanding(self):
-        v = w.classify([idle_with_clock(i) for i in range(6)], False, 30)
-        self.assertEqual((v["kind"], v["warn"]), ("idle", False))
+    def test_idle_when_raw_static_and_nothing_outstanding(self):
+        v = w.classify([IDLE] * 6, False, 30)
+        self.assertEqual((v["kind"], v["warn"], v["raw_static"]), ("idle", False, True))
 
-    def test_case1_static_with_work_warns_low_then_high(self):
-        frames = [idle_with_clock(i) for i in range(6)]
-        low = w.classify(frames, True, 60, "core-status running")
-        high = w.classify(frames, True, 900, "core-status running")
+    def test_case1_is_pure_raw_static_with_work(self):
+        low = w.classify([IDLE] * 6, True, 60, "core-status running")
+        high = w.classify([IDLE] * 6, True, 900, "core-status running")
         self.assertEqual((low["kind"], low["warn"], low["confidence"]), ("static-with-work", True, "low"))
         self.assertEqual(high["confidence"], "high")
         self.assertIn("core-status running", high["reason"])
+
+    def test_clock_only_pane_is_not_case1(self):
+        # Spec: case 1 is pure static, no normalization. A ticking clock is motion.
+        frames = [idle_with_clock(i) for i in range(6)]
+        v = w.classify(frames, True, 900)
+        self.assertNotEqual(v["kind"], "static-with-work")
+        self.assertFalse(v["raw_static"])
+        self.assertTrue(v["clock_only"])
+        # ...and without work it is recorded, not judged
+        q = w.classify(frames, False, 900)
+        self.assertEqual((q["kind"], q["warn"]), ("clock-only", False))
+        # with work, over enough samples, case 2's novelty statistic notices it softly
+        many = [idle_with_clock(i) for i in range(12)]
+        s = w.classify(many, True, 900)
+        self.assertEqual((s["kind"], s["warn"], s["confidence"]), ("low-novelty", True, "low"))
 
     def test_case2_retry_loop_when_only_counters_move(self):
         v = w.classify([retry_frame(i) for i in range(20)], True, 60)
@@ -99,10 +113,11 @@ class Classifier(unittest.TestCase):
         v = w.classify([retry_frame(i) for i in range(4)], True, 10)
         self.assertEqual((v["kind"], v["confidence"]), ("retry-loop", "medium"))
 
-    def test_low_novelty_without_retry_text_is_a_soft_warning(self):
+    def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
         v = w.classify(frames, True, 60)
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
+        self.assertEqual(w.classify(frames, False, 60)["kind"], "working")
 
     def test_working_is_not_a_warning(self):
         v = w.classify([working_frame(i) for i in range(20)], True, 60)
@@ -113,6 +128,11 @@ class Classifier(unittest.TestCase):
     def test_too_few_samples_is_unknown_not_a_warning(self):
         v = w.classify([IDLE], True, 5)
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("unknown", False, "none"))
+
+    def test_raw_state_id_differs_where_normalized_does_not(self):
+        a, b = idle_with_clock(1), idle_with_clock(2)
+        self.assertEqual(w.state_id(a), w.state_id(b))
+        self.assertNotEqual(w.raw_state_id(a), w.raw_state_id(b))
 
     def test_thresholds_are_reported_and_overridable(self):
         v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
@@ -156,8 +176,8 @@ class IoEdge(unittest.TestCase):
             (ws / "state").mkdir()
             (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running"}))
             entries = w.append_window(ws, working_frame(0), 1000.0)
-            entries = w.append_window(ws, idle_with_clock(1), 1100.0)
-            entries = w.append_window(ws, idle_with_clock(2), 1400.0)
+            entries = w.append_window(ws, IDLE, 1100.0)
+            entries = w.append_window(ws, IDLE, 1400.0)
             self.assertEqual(len(entries), 3)
             v = w.classify_window(entries, w.work_outstanding(ws), 1500.0)
             # the static run started at 1100 (the working frame before it does not count)
@@ -165,6 +185,10 @@ class IoEdge(unittest.TestCase):
             self.assertEqual(v["kind"], "static-with-work")
             self.assertEqual(v["trailing_static_samples"], 2)
             self.assertEqual(v["sample_count"], 3)  # the window is still reported whole
+            # a clock-only trailing run is NOT a static run (raw ids differ)
+            for i in range(3):
+                entries = w.append_window(ws, idle_with_clock(i), 1500.0 + i)
+            self.assertNotEqual(w.classify_window(entries, w.work_outstanding(ws), 1600.0)["kind"], "static-with-work")
             # a corrupt line is skipped, not fatal; the cap holds
             with w.window_path(ws).open("a") as fh:
                 fh.write("{not json\n")
