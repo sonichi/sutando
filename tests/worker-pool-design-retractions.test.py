@@ -514,18 +514,40 @@ class EveryBindingTransitionFencesItsOutgoingClaimant(unittest.TestCase):
         self.assertRegex(f, r"DETACHED background process",
                          "name the mechanism, not just the verdict")
 
-    def test_the_fence_is_claim_then_reread(self):
+    def test_first_pin_overlap_is_ACCEPTED_not_fenced(self):
+        """Superseded. The re-read was called a fence; the claim serializes ONE task while
+        the defect is concurrency between DIFFERENT tasks in one room. A rule whose stated
+        success case IS the overlap is not fencing it."""
+        f = self._flat()
+        self.assertRegex(f, r"v1 does not fence first-pin\. It ACCEPTS a bounded overlap")
+        self.assertNotRegex(
+            f, r"the claim is the serialization point",
+            "two atomic operations are not one ordering point")
+        self.assertRegex(
+            f, r"Claim first, then RE-READ the bindings, and release without executing",
+            "the rule stays — as a narrowing, not as a boundary")
+
+    def test_what_the_narrowing_does_NOT_remove_is_stated(self):
+        f = self._flat()
+        self.assertRegex(f, r"What it does NOT remove, stated so no reader has to derive it")
+
+    def test_accepting_the_overlap_is_argued_from_the_owner_ruling(self):
+        """An accepted race needs a reason, or the next reader reads it as an oversight."""
         f = self._flat()
         self.assertRegex(
-            f, r"Claim first, then RE-READ the bindings, and release without executing")
-        self.assertRegex(f, r"the claim is the serialization point")
+            f, r"a design that accepts the larger case cannot coherently claim to fence the smaller")
 
-    def test_it_is_distinguished_from_the_rejected_token(self):
-        """This section rejects a generation/token below. A fence that IS one, unlabelled,
-        would contradict that -- so the difference has to be argued, not assumed."""
+    def test_the_token_distinction_is_now_the_REASON_it_is_not_a_fence(self):
+        """Superseded. The old form used "not a token" to defend calling the re-read a
+        fence. Inverted: a token is what a fence at this boundary WOULD require, so not
+        being one is exactly why it cannot be a fence."""
         f = self._flat()
-        self.assertRegex(f, r"NOT the generation/token this section rejects")
-        self.assertRegex(f, r"makes a stale read impossible to act on instead")
+        self.assertRegex(f, r"that is precisely WHY it cannot be a fence")
+        self.assertRegex(
+            f, r"A token is what a fence at this boundary would require")
+        self.assertNotRegex(
+            f, r"makes a stale read impossible to act on instead",
+            "that claim was the overstatement the reviewer falsified")
 
     def test_the_new_cost_is_stated_and_the_old_one_withdrawn(self):
         f = self._flat()
@@ -621,12 +643,18 @@ class QuiesceHasOneOwnerEndToEnd(unittest.TestCase):
         self.assertRegex(f, r"NOT a substitute for the reset",
                          "fail-toward-eligibility bounds the damage; it does not clear it")
 
-    def test_the_report_transport_is_named(self):
-        """'the sidecar records it' is not a design until the error can reach the sidecar
-        without the failing session having to succeed at anything."""
+    def test_the_transport_names_ONE_owner_and_admits_it_is_unbuilt(self):
+        """Superseded: the earlier text said the sidecar 'already tails' the session log.
+        Measured: core_heartbeat.py probes tmux metadata and writes .alive; it captures no
+        pane output, and /tmp/core-heartbeat.log is the heartbeat's own stdout."""
         f = self._flat()
-        self.assertRegex(f, r"the report transport, named")
-        self.assertRegex(f, r"nothing the failing session has to successfully DO")
+        self.assertRegex(f, r"the WRAPPER that owns the tmux session, via `tmux pipe-pane`")
+        self.assertIn('One owner, not "sidecar or wrapper"', f)
+        self.assertNotRegex(
+            f, r"the log the sidecar already tails for the beat",
+            "a producer asserted from plausibility, not from the code")
+        self.assertRegex(f, r"does NOT do this today")
+        self.assertRegex(f, r"(?i)nothing the failing session has to successfully DO")
 
     def test_no_residue_of_the_worker_writer_justification(self):
         f = self._flat()

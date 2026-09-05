@@ -974,27 +974,44 @@ rooms must be kept off the same worker:
   processes. Draining the core's work fences nothing the watcher is about to do, and the watcher can
   pass its routing read before the binding write and publish its claim after it.
 
-  The fence uses the two atomic primitives that already exist and are visible to BOTH processes —
-  the per-task claim (a hard link that only one acquirer wins) and the bindings write (`os.replace`).
-  It orders them:
+  **v1 does not fence first-pin. It ACCEPTS a bounded overlap, and calling the rule below a fence
+  was wrong.** The reviewer's objection is exact and I am recording it rather than answering it with
+  a third mechanism: *the claim serializes only ONE task, while the defect is concurrency between
+  DIFFERENT tasks in the same room.* The per-task hard link and the bindings write are two atomic
+  operations, not one ordering point, so the losing interleaving survives — the core claims task X,
+  re-reads R as unbound, pauses; the pin publishes R -> W; W claims task Y; both execute. My own
+  sentence *"the claimant already holds the only claim for that task and finishes it"* **accepts**
+  that state. A rule whose stated success case is the overlap is not fencing the overlap.
+
+  Closing it properly needs a room- or binding-generation admission boundary validated at EXECUTION
+  time — which is the token machinery this section says v1 does not have, and saying it a fourth way
+  would not create it.
+
+  **So v1 states the overlap as accepted, and this is consistent rather than a concession:** the
+  owner's equal-members ruling already admits two members driving two different tasks in one room at
+  once. First-pin's window is strictly smaller than that standing condition — one task, one
+  transition, self-clearing as soon as the losing claimant finishes — so a design that accepts the
+  larger case cannot coherently claim to fence the smaller one.
+
+  What the rule below IS: a cheap **narrowing**, not a boundary. It removes the case where a claimant
+  executes for a room it demonstrably no longer serves, using two atomic primitives visible to BOTH
+  processes — the per-task claim (a hard link only one acquirer wins) and the bindings write
+  (`os.replace`):
 
   > **Claim first, then RE-READ the bindings, and release without executing if the room is no longer
   > yours.** Any instance that acquires a claim for a task in room R re-reads `bindings.json` before
   > it does any work, and verifies it is still an eligible claimant for R — the core that it is still
   > unbound, a worker that it is still a member. If not, it releases the claim and suppresses.
 
-  Why this closes what draining could not: the claim is the serialization point, and it is a file
-  both processes see. If the pin lands before the re-read, the claimant observes it and stands down.
-  If the pin lands after, the claimant already holds the only claim for that task and finishes it —
-  one task, already admitted, which is the bounded case. **There is no interval to be suspended
-  past**, because the check is not "has enough time elapsed" but "what does the file say now, after I
-  won". A suspended claimant re-reads on resumption and sees the newer table.
+  What it removes: a claimant that observes the pin before it starts work stands down instead of
+  serving a room it no longer serves. **What it does NOT remove, stated so no reader has to derive
+  it:** a claimant that wins its claim before the pin lands executes that task while the newly bound
+  worker executes a different one. That is the accepted overlap above. It is bounded to the tasks
+  already claimed at the moment of the pin, and it clears without intervention.
 
-  It is also NOT the generation/token this section rejects below. Nothing is stamped into the claim
-  and nothing validates a version; the claimant re-reads the same authoritative file every other
-  reader uses, at a point where it holds exclusive rights to the one task in question. The rejected
-  mechanism was a token that would let a claimant PROVE its stale read was current; this makes a
-  stale read impossible to act on instead.
+  It is not the generation/token this section rejects below — nothing is stamped, nothing validates a
+  version — and that is precisely WHY it cannot be a fence. A token is what a fence at this boundary
+  would require. Calling a re-read a fence was substituting the cheap thing for the thing that works.
 
   **Unpin takes the re-bind fence unchanged, because it IS a re-bind — to nobody.** The outgoing
   claimant is a separate process, so by this section's own argument the enforcer is the process
@@ -1325,7 +1342,7 @@ like every other pool file:
 | writer | **a process that makes NO MODEL CALLS — the per-instance heartbeat sidecar (`src/core_heartbeat.py`) or the wrapper that owns the tmux session. Never the worker, and never the core.** The rule it follows: *the reporter of a resource exhaustion must not depend on that resource.* Quota is per-ACCOUNT, so every model session on it — the core included — goes dark together; a core-written record fails in exactly the outage it exists to describe. Owner, 2026-09-05, on my second attempt: *"I don't think the core owns that either. When there's quota issue all the CLI sessions may stop responding."* Two earlier revisions got this wrong in the same shape — first the worker (because a local write needs no quota, true and beside the point), then the core (because the worker might be too broken, also true and beside the point). Both named a party that the outage can take with it |
 | the three roles, kept apart | the SESSION hits the error and lets it surface in its output — that is the error appearing, not a report. The SIDECAR, which costs no quota and outlives the session it watches, turns that into the durable record. The CORE only READS it, as a peer that may itself be dark |
 | the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with "a worker too broken to write its own record is simply never eligible" — a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |
-| the report transport, named | the session's provider error reaches the sidecar through the session's own **output stream** — the tmux pane the wrapper already owns, and the log the sidecar already tails for the beat. No new channel, and nothing the failing session has to successfully DO. If the sidecar cannot read that stream on some runtime, that runtime has no quiesce detection and the design must say so rather than assume one |
+| the report transport, named — and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not "sidecar or wrapper". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it "already tails" anything** — it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO — the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |
 | routing exclusion | a quiesced instance is skipped at claim time (not "in `instances` order" — the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |
 | reset — SOLE authorized transition | **the sidecar that wrote it, and only that sidecar, unlinks it.** An earlier revision assigned the unlink to the worker "on its first successful turn", which is absorbing in exactly the way §3 rule 6's wedged verdict was: a quiesced instance is excluded from claims by the row above, so it can never produce that turn, and the record clears only by expiring — at which point the unlink it was waiting for is moot. One writer, one deleter, same process. `until` is the provider's **own** reported reset time, never an estimate; a record whose `until` has passed reads as expired and the instance is eligible again, which is the fail-toward-eligibility below and NOT a substitute for the reset |
 | attribution | `window` and `source` are what let an operator tell quota-spent from hung. Without them both look like "beat fresh, nothing claimed" |
