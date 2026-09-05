@@ -772,7 +772,6 @@ rooms must be kept off the same worker:
 ```json
 {
   "version": 1,
-  "generation": 7,
   "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}},
   "exclusions": [{"group": "<label>", "rooms": ["<room>", "..."],
                   "rule": "distinct-instance"}]
@@ -796,47 +795,29 @@ rooms must be kept off the same worker:
   needs group identity, group admission, group release and a multi-room story; a single bound
   instance needs none of it.
 
-  **A repin is fenced by a generation, because the per-task claim alone does not cover it.**
-  Two earlier revisions of this section called the repin window "bounded and benign" and pointed
-  at the claim. That is true for ONE task — Trace B — and false for two: an outgoing instance
-  still reading itself as `instances[0]` can claim a *different* task than the incoming one, and
-  two different tasks each win their own claim. The result is exactly the one-room concurrency
-  this section forbids, so "benign" was asserted rather than shown.
+  **v1 does not repin a room to another worker at all, and that is what closes this class.**
+  Three revisions tried to make an automatic worker-to-worker failover safe — first calling the
+  window "benign", then a `generation`, then fencing by cause — and each left a residual
+  check-then-act, because a time-based check cannot be made atomic in prose. The right move was
+  not a fourth mechanism: it was to notice that **the lifecycle table already answers death**
+  (`:999`) and the answer is not another worker.
 
-  So `bindings.json` carries a monotonic `generation`, incremented by the core on every write:
-
-  ```json
-  {"version": 1, "generation": 7,
-   "bindings": {"<room>": {"instances": ["<name>", "..."], "pinned": true}}, "exclusions": [...]}
-  ```
-
-  | step | rule |
+  | event | what v1 does |
   |---|---|
-  | read | a worker reads `generation` in the same read that tells it it is `instances[0]` |
-  | claim | it claims as usual — the claim is unchanged and still first-rename-wins |
-  | **revalidate** | **after winning and BEFORE emitting or executing, it re-reads `generation`. Changed → release the claim and suppress.** The task returns to unclaimed and the incoming instance takes it |
-  | reconcile | the core releases any claim held by an instance that is no longer `instances[0]`, so a worker that died inside the window does not strand the task |
+  | a worker's beat goes stale past `stand_in_after_s` | **the core stands in for its rooms** and kickstarts the plist. The core is a single arbiter, so there is never a second live claimant and nothing to fence |
+  | the worker comes back | it re-reads the binding, finds itself still `instances[0]`, and resumes. Nothing was reassigned, so nothing has to be revoked |
+  | the owner wants a different worker on that room | an explicit re-bind command, applied while the outgoing worker is **responsive** — the core can simply tell it to stop and wait for the answer, because a live worker can answer |
 
-  **Revalidation alone is check-then-act, and moving the check closer never closes it.** A worker
-  that re-reads `generation`, sees no change, and is repinned before it emits has still executed
-  under a stale authorization; the reconcile row recovers the CLAIM afterwards but cannot unsend
-  an external effect. So the generation is not the fence on its own — it records the repin, and
-  the fence is that **a repin only ever happens in one of two states, and each carries its own
-  guarantee**:
+  So `instances[1:]` is an **owner-facing preference list**, read by a human deciding whom to
+  re-bind to. It is not a runtime path, nothing consults it automatically, and no generation,
+  lease or drain protocol is required to make it safe — because the unsafe operation was
+  removed rather than guarded.
 
-  | repin cause | why no live worker is executing under the old generation |
-  |---|---|
-  | **death** — beat stale past `stand_in_after_s` (`:988`, the only automatic cause) | the outgoing worker **fences itself**: before executing, it compares its OWN last successful beat write against the same `stand_in_after_s`, and refuses if it is older. Core and worker then decide on the same fact with the same threshold, so "the core thinks it is dead while it thinks it is alive" is not a reachable disagreement — the worker reaches the same verdict from local, monotonic state, with no agreement protocol |
-  | **owner command** — an explicit repin of a live worker | the worker is by definition responsive, so the core **drains before it rewrites**: it stops the outgoing instance claiming, waits for it to report no in-flight task, and only then increments `generation`. A repin that cannot drain is refused and surfaced, not forced |
-
-  Self-fencing is what makes the death case safe without distributed agreement: the dangerous
-  interleaving is exactly *core says dead, worker says alive*, and both sides are reading the
-  worker's own beat age against one constant. Draining is what makes the owner case safe, and it
-  is affordable precisely because a live worker can answer.
-
-  This is the fencing token, not a lease: no one acquires or holds anything, and a crash needs
-  no expiry. Group identity, group admission, group release and a multi-room story are still
-  out of scope, and still what true fan-out would require.
+  What this costs, stated plainly: a dead worker's rooms are served by the core rather than by a
+  standby worker, so they lose worker-level parallelism until an owner re-binds or the worker
+  returns. That is a throughput property, not a correctness one, and v1 takes it deliberately.
+  True fan-out — and automatic failover with it — needs group identity, group admission, group
+  release and a multi-room story, and remains out of scope.
 - **Every entry ineligible is not an error**: the room falls to the core, exactly as an
   unreadable file does. A binding exists to stop scatter, never to stop work.
 - **`distinct-instance`** means no single worker may hold bindings for two rooms in the
