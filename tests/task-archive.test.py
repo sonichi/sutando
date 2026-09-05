@@ -483,5 +483,60 @@ class TaskIdFromFilename(unittest.TestCase):
             self.assertEqual(find_task_file(tasks, task_id), claimed)
 
 
+class BodyTextCannotForgeTheId(unittest.TestCase):
+    """A task file whose body starts at byte zero still ends the header there."""
+
+    def _write(self, text):
+        d = Path(tempfile.mkdtemp())
+        f = d / "task-real.txt"
+        f.write_text(text)
+        return f
+
+    def test_leading_task_line_stops_the_header(self):
+        # No "\ntask:" precedes a body on line zero, so the old delimiter
+        # missed it and the id: search ran on into attacker-controlled text.
+        f = self._write("task: summarize\n\nid: task-FORGED\n")
+        self.assertIsNone(declared_task_id(f))
+        self.assertEqual(task_id_for(f), "task-real")
+
+    def test_body_id_after_a_normal_header_is_still_ignored(self):
+        f = self._write("id: task-real\ntask: go\n\nid: task-FORGED\n")
+        self.assertEqual(declared_task_id(f), "task-real")
+
+    def test_real_header_id_is_still_authoritative(self):
+        f = self._write("id: task-declared\ntask: go\n")
+        self.assertEqual(declared_task_id(f), "task-declared")
+
+
+class BareNameIsNotAnIdentity(unittest.TestCase):
+    """One id's bare name is another id's legal claimed name."""
+
+    def setUp(self):
+        self.tasks = Path(tempfile.mkdtemp()) / "tasks"
+        self.tasks.mkdir()
+        # Short task task-a, claimed by the pool. Its filename is byte-for-byte
+        # the bare name of the separately legal gateway id below.
+        self.short = self.tasks / "task-a.claimed-core-1.txt"
+        self.short.write_text("id: task-a\ntask: unrelated discord work\n")
+
+    def test_foreign_id_does_not_adopt_the_bare_file(self):
+        self.assertIsNone(find_task_file(self.tasks, "task-a.claimed-core-1"))
+
+    def test_the_owning_id_still_resolves(self):
+        found = find_task_file(self.tasks, "task-a")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.name, self.short.name)
+
+    def test_an_unclaimed_bare_file_still_resolves(self):
+        plain = self.tasks / "task-b.txt"
+        plain.write_text("id: task-b\ntask: go\n")
+        self.assertEqual(find_task_file(self.tasks, "task-b"), plain)
+
+    def test_a_gateway_id_owning_its_own_file_resolves(self):
+        owned = self.tasks / "task-c.claimed-core-1.txt"
+        owned.write_text("id: task-c.claimed-core-1\ntask: go\n")
+        self.assertEqual(find_task_file(self.tasks, "task-c.claimed-core-1"), owned)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

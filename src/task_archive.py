@@ -28,6 +28,10 @@ _STATE_SUFFIX = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+$")
 _NOT_A_RECORD = re.compile(r"^(.+)\.txt(?:\.\d+|\.archive-failed.*)$")
 _DECLARED_ID = re.compile(r"^id:[ \t]*(\S+)[ \t]*$", re.M)
 
+# Anchored per-line, so a body starting at byte zero still ends the header:
+# "\ntask:" cannot match there, and the id: search would reach user text.
+_TASK_BODY = re.compile(r"^task:", re.M)
+
 
 def _stem_of(name: str) -> str | None:
     if name.endswith(".txt"):
@@ -71,7 +75,7 @@ def declared_task_id(path: Path) -> str | None:
         text = Path(path).read_text(errors="replace")
     except OSError:
         return None
-    head = text.split("\ntask:", 1)[0]
+    head = _TASK_BODY.split(text, maxsplit=1)[0]
     m = _DECLARED_ID.search(head)
     return m.group(1) if m else None
 
@@ -102,7 +106,9 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     variant outranks a quarantine; ties fall to the first lexicographic name.
     """
     bare = tasks_dir / f"{task_id}.txt"
-    if bare.exists():
+    # The bare name of one id is a legal claimed name of another, so the
+    # fast path answers only when the file's own id agrees.
+    if bare.exists() and task_id_for(bare) == task_id:
         return bare
     matches = sorted(
         (p for p in tasks_dir.glob(f"{task_id}.*")
