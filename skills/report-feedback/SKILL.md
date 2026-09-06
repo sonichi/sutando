@@ -28,25 +28,29 @@ python3 skills/report-feedback/report-feedback.py \
 ## Ask first (`--ask`, or `askFirst` in the owner's prefs)
 
 The owner's approval step for automatic reports. Instead of filing, the report is parked as a draft under
-`<workspace>/state/feedback-drafts/<id>.json` and the owner gets a `space.ag2.hitl` card in the room you
-name — **File this bug report · File without logs · Skip** — with the same text as a plain fallback body.
+`<workspace>/state/feedback-drafts/<id>.json` and registered in the engine's HITL store (`src/hitl`) as a
+`HumanRequirement`: the gateway bridge projects it as the owner's card — **File this bug report · File
+without logs · Skip** — into its proactive room, and applies the click with the same stale-revision guard
+every other card gets. Nothing is posted by this script, so it needs no gateway env.
 
 ```bash
 # ask (also what --auto does when feedback-prefs.json has "askFirst": true):
-python3 skills/report-feedback/report-feedback.py --auto --title "..." --body "..." --room '<owner DM room id>'
-# the owner's click arrives as an ordinary message whose text is the card label; apply it:
-python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_no_logs|skip
+python3 skills/report-feedback/report-feedback.py --auto --title "..." --body "..."
+# after the owner answers (the click is durable in the HITL store): run the clicked choices
+python3 skills/report-feedback/report-feedback.py --apply
 python3 skills/report-feedback/report-feedback.py --drafts        # pending drafts, oldest first
+python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_no_logs|skip   # by hand
 ```
 
-- `--room` wins; else `askRoom` from `feedback-prefs.json`; with neither the ask exits 3 and parks nothing —
-  the card must reach the owner, never a shared room. Pass the owner's DM room id (the `channel_id` of
-  their DM tasks).
-- The reply task's text is the label, optionally `label — note`. Map it with the labels above (or
-  `decision_for_reply()`); with one pending draft in that room it is the newest `--drafts` entry.
-  `file` attaches logs only if `sendLogs` is on; `file_no_logs` never does; `skip` drops the draft.
-- Dedupe and the daily cap apply when the card is asked; a filed decision is what records the report.
-- Needs the gateway env (`set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a`) to post the card.
+- `--apply` also registers any parked draft whose card was never created (a store write that failed
+  at ask time exits 3 and keeps the draft), then files or drops every draft the owner clicked and
+  resolves its card. A decision that cannot complete (signed out, API error) keeps the draft and the
+  card stays in progress for the next `--apply`. Run it on each proactive pass while `--drafts` is non-empty.
+- `file` attaches logs only if `sendLogs` is on; `file_no_logs` never does; `skip` drops the draft.
+  Logs are gathered only after the choice — the card carries the title only.
+- The ask is the throttled event: dedupe and the daily cap are checked and **recorded** when the card
+  is asked, and the off-switch applies to `--ask` as well as `--auto`.
+- Draft ids are `fb_` + 10 lowercase hex; anything else is refused before any read or unlink.
 
 ## Automatic reports (`--auto`)
 

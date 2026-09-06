@@ -53,6 +53,8 @@ PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
 # Ask-first: an automatic report is parked as a draft and the owner gets a card
 # (File / File without logs / Skip) instead of a filing; the reply files or drops it.
 DRAFTS_DIR = "feedback-drafts"
+DRAFT_ID_RE = re.compile(r"^fb_[0-9a-f]{10}$")  # the writer's grammar; anything else never becomes a path
+HITL_RUNTIME = "report-feedback"
 ASK_ACTIONS = [
     {"id": "file", "kind": "confirmation", "label": "File this bug report"},
     {"id": "file_no_logs", "kind": "confirmation", "label": "File without logs"},
@@ -269,8 +271,6 @@ def read_prefs(ws: Path) -> dict:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
         # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
-        if isinstance(d.get("askRoom"), str) and d["askRoom"].strip():
-            prefs["askRoom"] = d["askRoom"].strip()
     except Exception:
         pass
     return prefs
@@ -280,12 +280,12 @@ def _drafts_dir(ws: Path) -> Path:
     return ws / "state" / DRAFTS_DIR
 
 
-def write_draft(ws: Path, payload: dict, room: str, now: float | None = None) -> str:
+def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
     """Park a report the owner has not approved yet; returns the draft id."""
     d = _drafts_dir(ws)
     d.mkdir(parents=True, exist_ok=True)
     draft_id = f"fb_{uuid.uuid4().hex[:10]}"
-    rec = {"id": draft_id, "room": room, "created": now if now is not None else time.time(), "payload": payload}
+    rec = {"id": draft_id, "created": now if now is not None else time.time(), "payload": payload}
     tmp = d / f".{draft_id}.tmp"
     tmp.write_text(json.dumps(rec, indent=2) + "\n")
     os.replace(tmp, d / f"{draft_id}.json")
@@ -303,16 +303,22 @@ def list_drafts(ws: Path) -> list:
     return out
 
 
+def _draft_path(ws: Path, draft_id: str) -> Path:
+    if not DRAFT_ID_RE.match(draft_id or ""):
+        raise ValueError(f"not a draft id: {draft_id!r}")
+    return _drafts_dir(ws) / f"{draft_id}.json"
+
+
 def load_draft(ws: Path, draft_id: str) -> dict | None:
     try:
-        return json.loads((_drafts_dir(ws) / f"{draft_id}.json").read_text())
+        return json.loads(_draft_path(ws, draft_id).read_text())
     except Exception:
         return None
 
 
 def drop_draft(ws: Path, draft_id: str) -> None:
     try:
-        (_drafts_dir(ws) / f"{draft_id}.json").unlink()
+        _draft_path(ws, draft_id).unlink()
     except FileNotFoundError:
         pass
 
@@ -326,36 +332,57 @@ def decision_for_reply(text: str) -> str | None:
     return None
 
 
-def card_payload(room: str, draft_id: str, title: str, device: str) -> dict:
-    """The space.ag2.hitl card the desktop renders; the plain body is the fallback text."""
-    hitl_id = f"hitl_{draft_id}"
-    requirement = {
-        "id": hitl_id, "kind": "confirmation", "runtime": "core", "status": "pending",
-        "revision": 1, "guard": "", "device": {"name": device},
-        "title": "File a bug report?",
-        "message": f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
-        "actions": ASK_ACTIONS,
-    }
-    return {
-        "op": "message", "room_id": room,
-        "body": f"I hit what looks like a Sutando/AG2 Space defect: {title}. Reply \"File this bug report\", \"File without logs\" or \"Skip\".",
-        "dedupe_key": f"hitl:{hitl_id}:1",
-        "extra_content": {"space.ag2.hitl": requirement},
-    }
+def hitl_manager(ws: Path):
+    """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
+
+    return HitlManager(HitlStore(default_store(ws)))
 
 
-def post_card(payload: dict) -> int:
-    """Send the card through the gateway's room op; the env comes from the channel .env."""
-    url = os.environ.get("REMOTE_TASK_URL", "").rstrip("/")
-    tok = os.environ.get("REMOTE_TASK_TOKEN", "")
-    if not url or not tok:
-        raise RuntimeError("gateway env missing (REMOTE_TASK_URL/REMOTE_TASK_TOKEN)")
-    req = urllib.request.Request(
-        url + "/v1/room", data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json", "authorization": f"Bearer {tok}",
-                 "User-Agent": "sutando-gateway-client/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.status
+def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
+    """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
+    from hitl.schema import Action, HumanRequirement  # type: ignore
+
+    req = HumanRequirement(
+        kind="choice", runtime=HITL_RUNTIME, title="File a bug report?",
+        message=f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
+        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
+        subject={"draft_id": draft_id, "title": title},
+    )
+    return hitl_manager(ws).create(req).id
+
+
+def requirement_for_draft(manager, draft_id: str):
+    for req in manager.active():
+        if req.runtime == HITL_RUNTIME and req.guard == draft_id:
+            return req
+    return None
+
+
+def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
+    """Register parked drafts that have no card yet, then run every choice the owner clicked.
+    A decision that cannot complete (signed out, API down) stays in progress for the next run."""
+    out = {"registered": [], "applied": [], "kept": [], "cancelled": []}
+    manager = hitl_manager(ws)
+    for rec in list_drafts(ws):
+        if requirement_for_draft(manager, rec["id"]) is None:
+            out["registered"].append(register_ask(ws, rec["id"], rec["payload"]["title"], device))
+    for req in manager.active():
+        if req.runtime != HITL_RUNTIME or req.status != "in_progress" or not req.chosen_action:
+            continue
+        draft_id = str((req.subject or {}).get("draft_id") or req.guard)
+        if load_draft(ws, draft_id) is None:
+            manager.cancel(req.id)  # the draft is gone (decided by hand, or never valid): nothing to run
+            out["cancelled"].append(req.id)
+            continue
+        if decide(ws, prefs, draft_id, req.chosen_action) == 0:
+            manager.resolve(req.id)
+            out["applied"].append(req.id)
+        else:
+            out["kept"].append(req.id)
+    return out
 
 
 def _auto_state_path(ws: Path) -> Path:
@@ -465,23 +492,24 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
         return post_feedback(nxt, payload, token, _hops + 1)
 
 
-def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> None:
-    """The owner answered the card: file (with logs per prefs), file without logs, or skip."""
+def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
+    """The owner answered the card: file (with logs per prefs), file without logs, or skip.
+    Returns the exit code; every failure keeps the draft parked."""
     if choice not in ("file", "file_no_logs", "skip"):
         print(f"ERROR: choice must be file | file_no_logs | skip, got {choice!r}.")
-        sys.exit(1)
+        return 1
     rec = load_draft(ws, draft_id)
     if not rec:
         print(f"ERROR: no parked draft {draft_id}.")
-        sys.exit(1)
+        return 1
     if choice == "skip":
         drop_draft(ws, draft_id)
         print(f"SKIPPED: draft {draft_id} dropped at the owner's request.")
-        return
+        return 0
     base, token = read_cloud_auth(ws)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry --decide.")
-        sys.exit(2)
+        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry.")
+        return 2
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
                  "auto": bool(d.get("auto")), "owner_approved": True}
@@ -498,16 +526,15 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> None:
     payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
-        if d.get("auto"):
-            record_auto_report(ws, d["title"])
-        drop_draft(ws, draft_id)
-        print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
-        sys.exit(1)
+        return 1
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}")
-        sys.exit(1)
+        return 1
+    drop_draft(ws, draft_id)  # the ledger was written when the card was asked
+    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
+    return 0
 
 
 def main() -> None:
@@ -525,29 +552,42 @@ def main() -> None:
         "setting and is deduped/rate-limited. Exits 3 (SKIPPED) when gated.",
     )
     ap.add_argument("--ask", action="store_true",
-                    help="Park the report as a draft and post a File / File without logs / Skip card instead of filing.")
-    ap.add_argument("--room", default="", help="Room for the ask-first card (default: prefs askRoom).")
+                    help="Park the report as a draft and ask with a File / File without logs / Skip card instead of filing.")
+    ap.add_argument("--apply", action="store_true",
+                    help="Register parked drafts that have no card yet and run the choices the owner clicked.")
     ap.add_argument("--decide", nargs=2, metavar=("DRAFT_ID", "CHOICE"),
-                    help="Apply the owner's card reply to a parked draft: file | file_no_logs | skip.")
+                    help="Apply a choice to a parked draft by hand: file | file_no_logs | skip.")
     ap.add_argument("--drafts", action="store_true", help="List parked drafts as JSON and exit.")
     a = ap.parse_args()
 
     ws = resolve_workspace()
     prefs = read_prefs(ws)
 
+    device = platform.node().split(".")[0]
     if a.drafts:
         print(json.dumps(list_drafts(ws), indent=2))
         return
+    if a.apply:
+        out = apply_clicks(ws, prefs, device)
+        print("APPLIED: " + json.dumps(out))
+        return
     if a.decide:
-        decide(ws, prefs, a.decide[0], a.decide[1])
+        rc = decide(ws, prefs, a.decide[0], a.decide[1])
+        if rc == 0:
+            manager = hitl_manager(ws)
+            req = requirement_for_draft(manager, a.decide[0])
+            if req is not None:
+                manager.resolve(req.id)  # the card follows the hand-made decision
+        if rc:
+            sys.exit(rc)
         return
 
     if not a.title.strip():
         print("ERROR: --title is required (a short one-line summary).")
         sys.exit(1)
-    if a.auto:
+    if a.auto or a.ask:
         if not prefs["autoReport"]:
-            print("SKIPPED: automatic bug reports are disabled (Settings → Agent → Bug reports).")
+            print("SKIPPED: automatic bug reports are disabled (Settings → Bug reports).")
             sys.exit(3)
         ok, reason = check_auto_gate(ws, a.title)
         if not ok:
@@ -555,20 +595,18 @@ def main() -> None:
             sys.exit(3)
 
     if a.ask or (a.auto and prefs["askFirst"]):
-        room = a.room.strip() or prefs.get("askRoom", "")
-        if not room:
-            print("SKIPPED: ask-first needs a room — pass --room <owner DM room id> or set askRoom in feedback-prefs.json.")
-            sys.exit(3)
         draft = {"kind": a.kind, "severity": a.severity, "title": a.title.strip(),
                  "body": a.body.strip() or a.title.strip(), "auto": bool(a.auto), "no_logs": bool(a.no_logs)}
-        draft_id = write_draft(ws, draft, room)
+        draft_id = write_draft(ws, draft)
+        # The ask is the throttled event: a card is the more intrusive channel, so it
+        # counts toward the dedupe window and the daily cap whether or not it is later filed.
+        record_auto_report(ws, draft["title"])
         try:
-            post_card(card_payload(room, draft_id, draft["title"], platform.node().split(".")[0]))
+            req_id = register_ask(ws, draft_id, draft["title"], device)
         except Exception as e:  # noqa: BLE001
-            drop_draft(ws, draft_id)
-            print(f"ERROR: could not post the card ({e}); nothing filed, draft dropped.")
-            sys.exit(1)
-        print(f"ASKED: draft {draft_id} parked; card posted to {room}. On the reply run --decide {draft_id} file|file_no_logs|skip.")
+            print(f"PARKED: draft {draft_id} kept, card not registered yet ({e}); --apply retries it.")
+            sys.exit(3)
+        print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
         return
 
     base, token = read_cloud_auth(ws)

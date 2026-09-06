@@ -267,7 +267,7 @@ class TestPrefs(unittest.TestCase):
 
 
 class TestAskFirst(unittest.TestCase):
-    """Ask-first parks the report and posts a card; the reply files or drops it."""
+    """Ask-first parks the report and registers its card in the HITL store; the click files or drops it."""
 
     def _run(self, argv):
         with mock.patch.object(sys, "argv", ["report-feedback.py", *argv]):
@@ -279,48 +279,10 @@ class TestAskFirst(unittest.TestCase):
             (ws / "state" / "feedback-prefs.json").write_text(json.dumps(prefs))
         return ws
 
-    def test_prefs_read_ask_first_and_room(self):
-        with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td, {"askFirst": True, "askRoom": "!dm:x", "autoReport": True})
-            p = report_feedback.read_prefs(ws)
-            self.assertTrue(p["askFirst"]); self.assertEqual(p["askRoom"], "!dm:x")
-            self.assertNotIn("askRoom", report_feedback.read_prefs(self._ws(tempfile.mkdtemp())))
-
-    def test_auto_with_ask_first_posts_a_card_and_files_nothing(self):
-        posted = []
-        def _capture(req, timeout=None):
-            posted.append((req.full_url, json.loads(req.data.decode()))); return _FakeResp()
-        with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td, {"askFirst": True, "askRoom": "!dm:x"})
-            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
-                    mock.patch.dict(os.environ, {"REMOTE_TASK_URL": "https://gw", "REMOTE_TASK_TOKEN": "t"}), \
-                    mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture), \
-                    mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not file")):
-                self._run(["--title", "gateway dropped the relay", "--auto"])
-            self.assertEqual(len(posted), 1)
-            url, body = posted[0]
-            self.assertEqual(url, "https://gw/v1/room")
-            self.assertEqual(body["room_id"], "!dm:x")
-            card = body["extra_content"]["space.ag2.hitl"]
-            self.assertEqual([a["id"] for a in card["actions"]], ["file", "file_no_logs", "skip"])
-            drafts = report_feedback.list_drafts(ws)
-            self.assertEqual(len(drafts), 1)
-            self.assertEqual(drafts[0]["payload"]["title"], "gateway dropped the relay")
-            self.assertEqual(card["id"], "hitl_" + drafts[0]["id"])
-
-    def test_ask_without_a_room_skips_and_parks_nothing(self):
-        with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td)
-            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
-                    self.assertRaises(SystemExit) as cm:
-                self._run(["--title", "x", "--ask"])
-            self.assertEqual(cm.exception.code, 3)
-            self.assertEqual(report_feedback.list_drafts(ws), [])
-
     def test_decide_skip_drops_the_draft_without_filing(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "medium", "title": "t", "body": "b", "auto": True}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "medium", "title": "t", "body": "b", "auto": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not file")):
                 self._run(["--decide", did, "skip"])  # the documented form: no --title
@@ -332,7 +294,7 @@ class TestAskFirst(unittest.TestCase):
             posted.append((req.full_url, json.loads(req.data.decode()))); return _FakeResp()
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td, {"sendLogs": False})
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
@@ -342,12 +304,11 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
             self.assertTrue(body["context"]["logs_opted_out"])
             self.assertEqual(report_feedback.list_drafts(ws), [])
-            self.assertFalse(report_feedback.check_auto_gate(ws, "relay down")[0], "filing must count toward the dedupe window")
 
     def test_drafts_runs_without_a_title_and_lists_what_is_parked(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
             buf = io.StringIO()
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     contextlib.redirect_stdout(buf):
@@ -365,19 +326,16 @@ class TestAskFirst(unittest.TestCase):
     def test_draft_store_tolerates_junk_and_absence(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
             (report_feedback._drafts_dir(ws) / "fb_corrupt.json").write_text("{not json")
             self.assertEqual([d["id"] for d in report_feedback.list_drafts(ws)], [did])
-            self.assertIsNone(report_feedback.load_draft(ws, "fb_missing"))
-            report_feedback.drop_draft(ws, "fb_missing")  # absent is the dropped state, not an error
-            with mock.patch.dict(os.environ, {"REMOTE_TASK_URL": "", "REMOTE_TASK_TOKEN": ""}):
-                with self.assertRaises(RuntimeError):
-                    report_feedback.post_card({"op": "message"})
+            self.assertIsNone(report_feedback.load_draft(ws, "fb_0123456789"))
+            report_feedback.drop_draft(ws, "fb_0123456789")  # absent is the dropped state, not an error
 
     def test_decide_refuses_a_bad_choice_a_missing_draft_and_a_signed_out_host(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
                 with self.assertRaises(SystemExit) as cm:
                     self._run(["--decide", did, "maybe"])
@@ -397,8 +355,8 @@ class TestAskFirst(unittest.TestCase):
             posted.append(json.loads(req.data.decode())); return _FakeResp()
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td, {"sendLogs": True})
-            d1 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "with logs", "body": "b", "auto": False}, "!dm:x")
-            d2 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "no logs on disk", "body": "b", "auto": False}, "!dm:x")
+            d1 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "with logs", "body": "b", "auto": False})
+            d2 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "no logs on disk", "body": "b", "auto": False})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
@@ -414,7 +372,7 @@ class TestAskFirst(unittest.TestCase):
     def test_decide_file_reports_api_and_transport_errors_and_keeps_the_draft(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True}, "!dm:x")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True})
             http_err = urllib.error.HTTPError("https://x/api/feedback", 500, "boom", {}, io.BytesIO(b"server said no"))
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")):
@@ -428,15 +386,152 @@ class TestAskFirst(unittest.TestCase):
                     self.assertEqual(cm.exception.code, 1)
             self.assertEqual(len(report_feedback.list_drafts(ws)), 1, "a failed filing keeps the draft for a retry")
 
-    def test_ask_drops_the_draft_when_the_card_cannot_be_posted(self):
+    def _hitl(self, ws):
+        return report_feedback.hitl_manager(ws)
+
+    def test_auto_with_ask_first_registers_a_card_in_the_hitl_store_and_files_nothing(self):
         with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td, {"askRoom": "!dm:x"})
+            ws = self._ws(td, {"askFirst": True, "autoReport": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
-                    mock.patch.object(report_feedback, "post_card", side_effect=RuntimeError("gateway env missing")), \
+                    mock.patch.dict(os.environ, {"REMOTE_TASK_URL": "", "REMOTE_TASK_TOKEN": ""}), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=AssertionError("nothing is posted")), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not file")):
+                self._run(["--title", "gateway dropped the relay", "--auto"])
+            drafts = report_feedback.list_drafts(ws)
+            self.assertEqual(len(drafts), 1)
+            reqs = self._hitl(ws).active()
+            self.assertEqual(len(reqs), 1)
+            req = reqs[0]
+            self.assertEqual((req.runtime, req.kind, req.guard, req.status), ("report-feedback", "choice", drafts[0]["id"], "pending"))
+            self.assertEqual([a.id for a in req.actions], ["file", "file_no_logs", "skip"])
+            self.assertEqual(req.subject["draft_id"], drafts[0]["id"])
+            # the ask is the throttled event: the ledger is written now, not at filing
+            self.assertFalse(report_feedback.check_auto_gate(ws, "gateway dropped the relay")[0])
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    self.assertRaises(SystemExit) as cm:
+                self._run(["--title", "gateway dropped the relay", "--auto"])
+            self.assertEqual(cm.exception.code, 3, "an identical ask is deduped")
+            self.assertEqual(len(self._hitl(ws).active()), 1, "no second card")
+
+    def test_bare_ask_honours_the_off_switch_and_the_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"autoReport": False})
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     self.assertRaises(SystemExit) as cm:
                 self._run(["--title", "x", "--ask"])
-            self.assertEqual(cm.exception.code, 1)
-            self.assertEqual(report_feedback.list_drafts(ws), [], "nothing parked when the owner never saw a card")
+            self.assertEqual(cm.exception.code, 3)
+            self.assertEqual(report_feedback.list_drafts(ws), [])
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            for i in range(report_feedback.AUTO_DAILY_CAP):
+                report_feedback.record_auto_report(ws, f"bug {i}")
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    self.assertRaises(SystemExit) as cm:
+                self._run(["--title", "one more", "--ask"])
+            self.assertEqual(cm.exception.code, 3)
+            self.assertEqual(report_feedback.list_drafts(ws), [], "a capped ask parks nothing")
+
+    def test_a_failed_registration_keeps_the_draft_and_apply_retries_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "register_ask", side_effect=OSError("store locked")), \
+                    self.assertRaises(SystemExit) as cm:
+                self._run(["--title", "kept", "--ask"])
+            self.assertEqual(cm.exception.code, 3, "retryable, not an error")
+            self.assertEqual(len(report_feedback.list_drafts(ws)), 1, "the report is not lost")
+            self.assertEqual(self._hitl(ws).active(), [])
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--apply"])
+            self.assertEqual(len(self._hitl(ws).active()), 1, "--apply registered the parked draft")
+
+    def test_draft_ids_outside_the_grammar_never_become_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            victim = ws / "victim.json"
+            victim.write_text(json.dumps({"id": "x", "payload": {"title": "t"}}))
+            # The drafts dir must exist for `..` to resolve through it: without it every path fails
+            # ENOENT and the traversal is masked, not refused (a control that cannot go red).
+            good = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            for bad in ("../../victim", "../victim", "fb_../victim", "fb_ABCDEF0123", "fb_short", "", "hitl_deadbeef00"):
+                self.assertIsNone(report_feedback.load_draft(ws, bad), bad)
+                self.assertEqual(report_feedback.decide(ws, {}, bad, "skip"), 1, bad)
+                with self.assertRaises(ValueError):
+                    report_feedback.drop_draft(ws, bad)
+            self.assertTrue(victim.exists(), "a traversal id must not read or unlink outside the drafts dir")
+            self.assertRegex(good, r"^fb_[0-9a-f]{10}$")
+            self.assertEqual(report_feedback.decide(ws, {}, good, "skip"), 0)
+
+    def test_a_relay_click_is_applied_by_the_bridge_and_apply_files_the_draft(self):
+        """The real round trip: ask → requirement in the store → the bridge's task-relay click
+        handler applies the click → --apply files the parked report and resolves the card."""
+        import importlib
+        for pth in (str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"),):
+            if pth not in sys.path:
+                sys.path.insert(0, pth)
+        posted = []
+        def _capture(req, timeout=None):
+            posted.append((req.full_url, json.loads(req.data.decode()))); return _FakeResp()
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"askFirst": True, "sendLogs": False})
+            (ws / "tasks").mkdir(); (ws / "results").mkdir()
+            from ag2_sparrow._dirs import set_dirs
+            set_dirs(task_dir=ws / "tasks", result_dir=ws / "results", state_dir=ws / "state")
+            rgb = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+            owner = "@owner:ag2.space"
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.dict(os.environ, {"SPARROW_HA_OWNER": owner}):
+                self._run(["--title", "relay down", "--body", "details", "--severity", "high", "--auto"])
+                req = self._hitl(ws).active()[0]
+                click = {"id": "task-click1", "channel_id": "!dm:ag2.space", "user_id": owner, "source_message_id": "$c",
+                         "task": "File this bug report",
+                         "hitl_action": {"hitl_id": req.id, "expected_revision": req.revision, "action_id": "file", "guard": req.guard}}
+                with mock.patch.object(rgb, "_STATE", ws / "state"):
+                    out = rgb._handle_hitl_action(click)
+                self.assertEqual(out, "applied")
+                after = self._hitl(ws).get(req.id)
+                self.assertEqual((after.status, after.chosen_action), ("in_progress", "file"))
+                # a stranger's click on the same card is ignored and changes nothing
+                stranger = dict(click, user_id="@someone:ag2.space", id="task-click2")
+                with mock.patch.object(rgb, "_STATE", ws / "state"):
+                    self.assertEqual(rgb._handle_hitl_action(stranger), "ignored")
+                with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                        mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
+                    self._run(["--apply"])
+            self.assertEqual(posted[0][0], "https://x/api/feedback")
+            body = posted[0][1]
+            self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
+            self.assertEqual(report_feedback.list_drafts(ws), [])
+            self.assertEqual(self._hitl(ws).get(req.id).status, "resolved")
+            self.assertEqual(len(report_feedback._read_auto_state(ws)), 1, "asked once, filed once: one ledger entry")
+
+    def test_apply_keeps_a_click_it_cannot_complete_and_cancels_one_whose_draft_is_gone(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True})
+            m = self._hitl(ws)
+            rid = report_feedback.register_ask(ws, did, "t", "host")
+            from hitl.schema import ActionReply
+            m.apply_action(ActionReply(hitl_id=rid, expected_revision=1, action_id="file", guard=did))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=(None, None)):
+                self._run(["--apply"])
+            self.assertEqual(m.get(rid).status, "in_progress", "signed out: the click waits")
+            self.assertEqual(len(report_feedback.list_drafts(ws)), 1)
+            report_feedback.drop_draft(ws, did)  # decided by hand meanwhile
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--apply"])
+            self.assertEqual(m.get(rid).status, "cancelled")
+
+    def test_decide_by_hand_resolves_the_card(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True})
+            rid = report_feedback.register_ask(ws, did, "t", "host")
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--decide", did, "skip"])  # a clean decision returns; only failures exit
+            self.assertEqual(self._hitl(ws).get(rid).status, "resolved")
+            self.assertEqual(report_feedback.list_drafts(ws), [])
 
     def test_reply_labels_map_to_decisions(self):
         f = report_feedback.decision_for_reply
