@@ -176,15 +176,29 @@ of the same closed set, and the mapping to the wire `mode` is fixed:
 | `elicitation.request`, `type: multi_select` | `multi_select` | shipped |
 | `elicitation.request`, `type: confirmation` | `confirm` | shipped |
 | `elicitation.request`, `type: free_text` | `form` (one text field) | rejected by the dispatcher in v0 (`dispatcher.py` "free_text elicitation is not supported"); `form` has no runtime producer yet |
+| `human_action.request` | *(none — outside the closed set)* | shipped; `protocol.py:39,84` and `dispatcher.py:204` issue it durably, and `ha_adapter.py` maps it to `external_action` (Done / Decline), NOT to a semantic mode |
 
 The compiler described above consumes the validated runtime request. It is
 downstream of the dispatcher, never a parallel entry point.
 
+**`human_action.request` is deliberately outside the compiler's closed scope.**
+It asks a human to act in the world and report back, so its reply is a
+completion signal (`external_action`: Done / Decline), not a value the agent
+consumes as input. It keeps the HITL lifecycle and the stale-response gate
+like any other requirement; it simply has no semantic `mode`, and a compiler
+must not invent one for it.
+
 **Lifecycle and delivery: `space.ag2.hitl` is the durable envelope, and it stays.**
 `src/hitl/schema.py` (`RuntimeEvent -> HumanRequirement -> space.ag2.hitl ->
-RequirementCard`) owns interaction state: `revision` and `guard` advance on
-every transition, a card projected from an older revision is stale, and a
-response carrying a stale guard is refused (`StaleRequirementError`).
+RequirementCard`) owns interaction state, and the two tokens do NOT
+move together. `transition()` bumps `revision` on every legal move but sets
+`guard` only when one is supplied; `refresh_guard()` is the separate operation
+that rotates the guard (new guard, new revision, same status) when the
+underlying runtime interaction changes. Validation compares them
+independently: a card projected from an older `revision` is stale, and a reply
+whose `guard` differs from the requirement's is refused
+(`StaleRequirementError`). Implementing a stale-response gate that rotates
+`guard` per transition would rotate the wrong token.
 `src/hitl/projector.py` posts each revision as one Matrix event with the
 wire under `space.ag2.hitl` and a text `fallback_body`. In this contract the
 compiler's A2UI payload is a *projection inside that envelope* — the
@@ -195,13 +209,14 @@ from the HITL store rather than re-implemented.
 **Migration boundary.** Until the compiler exists, the shipped wires *are* the
 transport: runtime approvals and elicitations render through
 `packages/ag2-sparrow/ag2_sparrow/human_action.py` (a markdown card with the
-decision grammar in the text), and runtime requirements (`auth`, `permission`,
-`billing`, ...) through the HITL requirement card. The compiler replaces how a
+decision grammar in the text). Runtime requirements (`auth`, `permission`,
+`billing`, ...) are *modelled* on the HITL requirement card, but as the status
+table below records, that path is not yet driven in production. The compiler replaces how a
 revision is *rendered*; it never replaces how a request is *issued* (runtime
 API) or how its state is *kept* (HITL). A change to either of those is a
 change to this document.
 
-## Current implementation status (this instance, 2026-09-03)
+## Current implementation status (this instance, 2026-09-06)
 
 Two columns, because they differ:
 
@@ -210,11 +225,13 @@ Two columns, because they differ:
 | Client A2UI kit (`A2UIButtonsCard` = confirm / single-choice / approval; `choice-group`, `form`) | yes | **no** — the deployed web client does not render `space.ag2.a2ui`: it shows an unclickable "Room App" chip and hides the text fallback (observed live 2026-07-24) |
 | `human_action.py` `CardPoster` A2UI block | yes, opt-in (`SPARROW_HA_A2UI`) | **off by default**; `packages/ag2-sparrow/tests/test_human_action.py` pins "plain text card, NO a2ui block" |
 | `say.py` raw card seam (`SUTANDO_WORKER_A2UI`) | yes, opt-in | off; `skills/agent-room-ops/SKILL.md` forbids attaching an `a2ui` block until the client renderer ships; `tests/room-ops-say.test.py` pins that an empty option list attaches nothing |
-| `space.ag2.hitl` requirement card | yes | **yes** — the lifecycle envelope above |
+| `space.ag2.hitl` requirement card | yes — schema, manager, projector, supervisor | **no** — nothing drives it in production: `supervise_once()` has no caller outside `tests/hitl-supervisor.test.py`, the manager keeps requirements under `state/hitl/requirements` (`manager.py:51`) while the default composition points the legacy dir at `<state>/human-actions` (`server.py:510`), and that poster only scans `ha_*` names (`human_action.py:118`) — the adapter mints `hitl_` ids (`ha_adapter.py:56`) |
 | Markdown text (decision grammar in the body) | yes | **yes** — the path that reaches a human today |
 
-So the renderable paths today are markdown text and the HITL requirement
-card. A tap on a rendered button, where a client renders one, sends the
+So the only path that reaches a human today is markdown text. The HITL
+envelope is the *intended* lifecycle and is fully written, but it is not yet
+wired end to end, so this document describes it as the contract's destination,
+not as current behaviour. A tap on a rendered button, where a client renders one, sends the
 option's action text as an ordinary message — buttons are pre-typed replies.
 Next slice: the `interactions` module exposing the V1 verbs with schema
 validation behind the runtime API, then capability discovery on the
