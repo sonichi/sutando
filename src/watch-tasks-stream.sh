@@ -193,6 +193,8 @@ publish_terminal_failure() {
   # Reading then mutating a path a provider can still claim has no safe ordering.
   if ln "$temporary" "$result" 2>/dev/null; then
     rc=0
+    # The scheduler's FAILED: the task ends here, whatever a provider observed.
+    ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$TASKS_DIR/$filename" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
   elif handler_result_exists "$filename"; then
     rc=0
   else

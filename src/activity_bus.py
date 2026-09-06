@@ -17,12 +17,15 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from activity_rows import append as append_row
+from activity_rows import task_from_file
 from workspace_default import resolve_workspace
 
 PHASES = ("RECEIVED", "QUEUED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED")
@@ -136,10 +139,19 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
         if key in state.applied:
             return state, rows
         frm = item.from_phase or state.phase
+        if (item.to_phase == "QUEUED" and state.phase in ("RUNNING", "WAITING") and item.from_phase is None
+                and state.started_at is not None and now <= state.started_at and "queued" not in state.applied):
+            # QUEUED and RUNNING are emitted by independent processes and can land out of order: an
+            # earlier-stamped QUEUED is history — row written, phase kept, a replay of it a no-op.
+            state.applied += ["queued", key]
+            rows.append(_row(state, "notice", "queued", now))
+            return state, rows
         if frm != state.phase or state.phase in TERMINAL or item.to_phase not in TRANSITIONS.get(state.phase, frozenset()):
             # Not a valid move from where the task is: a stale or replayed transition. Telemetry only.
             state.telemetry += 1
             return state, rows
+        if item.to_phase == "QUEUED":
+            state.applied.append("queued")
         for f in ("message_event_id", "room", "sender", "text", "worker", "into"):
             v = getattr(item, f)
             if v:
@@ -192,6 +204,66 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
     # Heartbeat, ToolFinished, RuntimeStopped: liveness only. A provider that stops is not a
     # failure; the scheduler decides FAILED, never an observation's absence.
     return state, rows
+
+
+CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._-]+)")
+
+
+def cancel_target(task_text: str | None) -> str | None:
+    """The task a CANCEL_INSTRUCTION names, else None: the scheduler marks it CANCELLED on arrival."""
+    m = CANCEL_RE.search(task_text or "")
+    return m.group(1) if m else None
+
+
+def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
+                         worker: str | None = None, ws: Path | None = None, ts: float | None = None) -> LifecycleTransition:
+    task, room = task_from_file(task_file)
+    into = None
+    if into_task:
+        for d in ("tasks", os.path.join("tasks", "archive")):
+            p = (ws or resolve_workspace()) / d / f"{into_task}.txt"
+            if p.exists():
+                into = task_from_file(p)[0].get("event")
+                break
+    return LifecycleTransition(task["id"], to_phase, reason=reason, message_event_id=task.get("event"),
+                               room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`transition <PHASE> (--task-file P | --task-id ID) [--reason R] [--into-task ID] [--worker W]`
+    and `event <task_id> <kind> --session S --seq N [--text T]`. Exits 0 on every path: a caller in
+    the delivery path must never fail because the card could not be updated."""
+    import argparse
+    ap = argparse.ArgumentParser(description="activity bus CLI")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("transition"); t.add_argument("to_phase", choices=PHASES)
+    t.add_argument("--task-file"); t.add_argument("--task-id"); t.add_argument("--reason", default="")
+    t.add_argument("--into-task"); t.add_argument("--worker"); t.add_argument("--workspace")
+    t.add_argument("--ts", type=float, default=None, help="when this transition happened (epoch); default now")
+    e = sub.add_parser("event"); e.add_argument("task_id"); e.add_argument("kind", choices=EVENT_KINDS)
+    e.add_argument("--session", required=True); e.add_argument("--seq", type=int, required=True)
+    e.add_argument("--text", default=""); e.add_argument("--workspace")
+    try:
+        a = ap.parse_args(argv)
+        ws = Path(a.workspace) if a.workspace else None
+        store = ActivityStore(ws)
+        if a.cmd == "transition":
+            if a.task_file:
+                item = transition_from_file(a.to_phase, Path(a.task_file), reason=a.reason, into_task=a.into_task,
+                                            worker=a.worker, ws=ws, ts=a.ts)
+            elif a.task_id:
+                item = LifecycleTransition(a.task_id, a.to_phase, reason=a.reason, worker=a.worker, ts=a.ts)
+            else:
+                return 0
+            state = store.apply(item)
+        else:
+            state = store.apply(RuntimeEvent(a.task_id, a.session, a.seq, a.kind, text=a.text))
+        print(json.dumps({"task_id": state.task_id, "phase": state.phase, "generation": state.generation, "seq": state.seq}))
+    except SystemExit:
+        return 0
+    except Exception as exc:  # noqa: BLE001 - never fail the delivery path
+        print(f"activity_bus: {exc}", file=sys.stderr)
+    return 0
 
 
 class ActivityStore:
@@ -255,3 +327,7 @@ class ActivityStore:
                 return
             state.pending = state.pending[1:]
             self.save(state)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

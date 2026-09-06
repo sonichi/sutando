@@ -228,3 +228,20 @@ def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text("\n".join(rows[-keep:]) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def task_from_file(path: Path) -> tuple[dict, str | None]:
+    """({id, from, text}, room) read from a task file's headers; text is the first task: line."""
+    fields: dict = {}
+    for l in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        k, _, v = l.partition(":")
+        if k in ("id", "user_id", "task", "channel_id", "source_message_id") and k not in fields:
+            fields[k] = v.strip()
+    task = {"id": fields.get("id") or path.stem}
+    if fields.get("user_id"):
+        task["from"] = fields["user_id"]
+    if fields.get("task"):
+        task["text"] = fields["task"][:TEXT_MAX]
+    if fields.get("source_message_id"):
+        task["event"] = fields["source_message_id"]  # the client mounts the card under this message
+    return task, fields.get("channel_id") or None

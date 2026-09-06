@@ -342,6 +342,98 @@ class IdempotentProjection(unittest.TestCase):
         card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i2:1:2")
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "one summary")
         self.assertEqual(self.rows(), ["picked up", "replied"])
+class Wiring(unittest.TestCase):
+    """The scheduler's emit points reach the bus: the CLI from shell, the manager and the outbox in-process."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "state").mkdir(); (self.ws / "tasks").mkdir()
+        (self.ws / "tasks" / "task-w1.txt").write_text(
+            "id: task-w1\nchannel_id: !r:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Fix it\nsource_message_id: $m1\nsource: ag2space\n")
+
+    def rows(self):
+        return [json.loads(l) for l in card.log_path(self.ws).read_text().splitlines()]
+
+    def test_cli_transitions_from_a_task_file_carry_room_sender_text_and_event(self):
+        for to in ("QUEUED", "RUNNING"):
+            self.assertEqual(bus.main(["transition", to, "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--workspace", str(self.ws)]), 0)
+        st = ActivityStore(self.ws).load("task-w1")
+        self.assertEqual((st.phase, st.room, st.sender, st.text, st.message_event_id), ("RUNNING", "!r:s", "@q:s", "Fix it", "$m1"))
+        self.assertEqual([(r["kind"], r["line"], r["task"]["event"]) for r in self.rows()],
+                         [("notice", "queued", "$m1"), ("processing", "picked up", "$m1")])
+
+    def test_cli_never_fails_the_caller(self):
+        self.assertEqual(bus.main(["transition", "RUNNING", "--task-file", "/nonexistent/task-x.txt", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(bus.main(["transition", "RUNNING", "--workspace", str(self.ws)]), 0)
+
+    def test_a_cancel_instruction_names_its_target(self):
+        self.assertEqual(bus.cancel_target("CANCEL_INSTRUCTION: stop processing task-abc12 if still in flight."), "task-abc12")
+        self.assertIsNone(bus.cancel_target("please cancel my subscription"))
+
+    def test_a_consolidated_completion_resolves_the_holder_event_from_its_task_file(self):
+        (self.ws / "tasks" / "task-h1.txt").write_text("id: task-h1\nchannel_id: !r:s\ntask: holder\nsource_message_id: $holder\n")
+        bus.main(["transition", "RUNNING", "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--workspace", str(self.ws)])
+        bus.main(["transition", "COMPLETED", "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--into-task", "task-h1", "--workspace", str(self.ws)])
+        self.assertEqual((self.rows()[-1]["line"], self.rows()[-1]["task"]["into"]), ("consolidated", "$holder"))
+
+    def test_a_queued_that_lands_after_its_running_is_history_not_a_regression(self):
+        # The emitter's QUEUED and RUNNING are independent processes: RUNNING (stamped later) can take
+        # the lock first. The earlier-stamped QUEUED still writes its row and never regresses the phase.
+        store = ActivityStore(self.ws)
+        st = store.apply(T("task-w1", "RUNNING", ts=10.0, message_event_id="$m1", room="!r:s"))
+        st = store.apply(T("task-w1", "QUEUED", ts=9.0))
+        self.assertEqual((st.phase, st.generation), ("RUNNING", 1))
+        self.assertEqual([(r["kind"], r["line"]) for r in self.rows()], [("processing", "picked up"), ("notice", "queued")])
+        st = store.apply(T("task-w1", "QUEUED", ts=9.0))  # replay: once
+        self.assertEqual(len(self.rows()), 2)
+        st = store.apply(T("task-w1", "QUEUED", ts=11.0))  # a later QUEUED is a replay by key: no row, no regression
+        self.assertEqual((st.phase, len(self.rows())), ("RUNNING", 2))
+
+    def test_the_hitl_manager_stays_silent_for_a_policy_answered_requirement(self):
+        import hitl.manager as hm
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase))
+        class Req:
+            blocked_task_ids = ["task-w1"]; kind = "permission"; status = "in_progress"; decided_by = hm.POLICY_DECIDER
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            if Req.decided_by != hm.POLICY_DECIDER and Req.status not in hm.TERMINAL_STATUSES:
+                hm._activity(Req.blocked_task_ids, "WAITING", Req.kind)
+        self.assertEqual(calls, [], "policy answered it: nobody is waiting")
+        src = open(os.path.join(_SRC, "hitl", "manager.py")).read()
+        self.assertIn("if req.decided_by != POLICY_DECIDER and req.status not in TERMINAL_STATUSES:", src)
+
+    def test_the_emitter_and_the_watcher_route_through_the_bus(self):
+        emit = open(os.path.join(_SRC, "task-emit.sh")).read()
+        watcher = open(os.path.join(_SRC, "watch-tasks-stream.sh")).read()
+        for phase in ("QUEUED", "RUNNING", "CANCELLED"):
+            self.assertIn(phase, emit, f"task-emit.sh does not transition {phase}")
+        self.assertIn("activity_bus.py", emit)
+        self.assertIn("transition FAILED", watcher)
+        self.assertNotIn("( python3 ", emit + watcher, "the watcher's resolved interpreter, never PATH's python3")
+        self.assertIn("--ts", emit, "each transition is stamped so ordering survives independent processes")
+        self.assertNotIn("activity.py", emit, "the emitter must not write rows around the bus")
+
+    def test_the_hitl_manager_marks_waiting_and_running(self):
+        import hitl.manager as hm
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase, item.reason))
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            hm._activity(["task-w1"], "WAITING", "selection")
+            hm._activity(["task-w1"], "RUNNING", "resolved")
+            hm._activity([], "WAITING", "none")
+        self.assertEqual(calls, [("task-w1", "WAITING", "selection"), ("task-w1", "RUNNING", "resolved")])
+
+    def test_the_outbox_marks_completed_for_task_results_only(self):
+        import outbox
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase))
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            outbox._activity_completed("task-w1")
+            outbox._activity_completed("proactive-123")
+        self.assertEqual(calls, [("task-w1", "COMPLETED")])
 
 
 if __name__ == "__main__":
