@@ -172,11 +172,8 @@ def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
         f"    memory-index-budget.py --record <abs path to the MEMORY.md this session loads>\n"
         f"    (writes {ptr}, validated and atomic)\n"
         f"(or set SUTANDO_MEMORY_DIR, or pass --index for a one-off.)")
-    # Refusing here makes the guard inert on every multi-corpus host, which costs
-    # more than an answer carrying its own caveat. Only a MISSING default refuses.
-    if default.is_file():
-        return default, (ambiguity + f"\nANSWERING FROM THE DEFAULT {default} — it may not be "
-                         f"the corpus this session loads; the number below is unverified.")
+    # Callers gate on the exit code, so an answer with a caveat attached is still
+    # an answer. --record is the cure that did not exist when this answered instead.
     return None, "CANNOT ANSWER: " + ambiguity
 
 
@@ -218,7 +215,20 @@ def record_pointer(projects: Path, repo: Path, target: Path,
             f.write(str(resolved) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, ptr)
+        if force:
+            os.replace(tmp, ptr)
+        else:
+            # link() fails if ptr exists, so concurrent bootstraps cannot both win.
+            os.link(tmp, ptr)
+            os.unlink(tmp)
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        try:
+            cur = ptr.read_text(encoding="utf-8").strip()
+        except OSError:
+            cur = "<unreadable>"
+        return 2, (f"REFUSED: {ptr} already records {cur!r} (published concurrently). "
+                   "Pass --force to retarget an existing pointer deliberately.")
     except BaseException:
         try:
             tmp.unlink()
