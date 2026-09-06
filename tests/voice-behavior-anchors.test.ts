@@ -141,6 +141,15 @@ test('instructions: injected seams land where tuned', () => {
 	assert.ok(instructions.includes('- Google Search for current-info queries'), 'googleSearch=true line');
 });
 
+test('instructions: idle-core delegation guardrail present', () => {
+	assert.ok(instructions.includes('CORE STATUS IS NOT A DEAD-END:'),
+		'idle-core guardrail line');
+	assert.ok(instructions.includes('An idle core means it is AVAILABLE and READY to take the task'),
+		'idle = available, not unavailable');
+	assert.ok(instructions.includes('get_core_status is for your own awareness only'),
+		'get_core_status is not user-facing');
+});
+
 test('instructions: googleSearch=false omits the search line (capability honesty)', () => {
 	const off = cfg.buildInstructions(ctx({ googleSearch: false }), OVERRIDES);
 	assert.ok(!off.includes('- Google Search for current-info queries'));

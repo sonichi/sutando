@@ -44,7 +44,9 @@ describe('get_core_status inline tool', () => {
 		writeFileSync(CORE_STATUS_PATH, JSON.stringify({ status: 'idle', ts: Math.floor(Date.now() / 1000) }));
 		const result = await invoke();
 		assert.equal(result.status, 'idle');
+		assert.equal(result.ready, true, 'idle must signal ready:true (available to delegate)');
 		assert.match(result.description, /idle/i);
+		assert.match(result.description, /available and ready to accept a delegated task via work/);
 	});
 
 	it('returns status:idle when running file is older than 600s (TTL)', async () => {
@@ -65,7 +67,8 @@ describe('get_core_status inline tool', () => {
 		try { unlinkSync(CORE_STATUS_PATH); } catch { /* already gone */ }
 		const result = await invoke();
 		assert.equal(result.status, 'idle');
-		assert.match(result.description, /not currently running/i);
+		assert.equal(result.ready, true, 'missing status file = idle/ready, not a dead-end');
+		assert.match(result.description, /available and ready to accept a delegated task via work/);
 	});
 
 	it('returns status:unknown when core-status.json is malformed JSON', async () => {
