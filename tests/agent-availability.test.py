@@ -53,10 +53,25 @@ class PerRoom(unittest.TestCase):
         narrow = lambda room, v: "busy_unavailable" if room == "!engineering:s" and v == "busy_accepting" else v
         self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow)["availability"], "busy_unavailable")
         self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow)["availability"], "busy_accepting")
-        widen = lambda room, v: "available"  # a policy cannot invent a value outside the contract either
         self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs")["availability"],
                          "busy_accepting", "an off-contract value is ignored, never leaked")
-        self.assertIn(av.availability_projection(s, "air", "!x:s", widen)["availability"], av.AVAILABILITY)
+        # Widening is refused, not merely kept inside the enum: the true value stands.
+        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "available")["availability"], "busy_accepting")
+        full = S(runtime_healthy=True, active_runs=4, max_concurrency=4)
+        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "busy_accepting")["availability"], "busy_unavailable")
+        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "unknown")["availability"], "unknown", "less is allowed")
+        self.assertEqual(av.availability_projection(S(runtime_healthy=False), "air", "!x:s", lambda r, v: "available")["availability"], "offline",
+                         "a known fact is never relabelled available")
+        for true, allowed in av.NARROWING.items():
+            self.assertIn(true, allowed); self.assertIn("unknown", allowed)
+            if true != "available":
+                self.assertNotIn("available", allowed)
+
+    def test_a_restricted_snapshot_never_widens_to_room(self):
+        for aud in ("owner", "selected_members", "system"):
+            self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": aud})["audience"], aud)
+        self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": "room"})["audience"], "room")
+        self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING"})["audience"], "room", "no label: room, the lifecycle default")
 
 
 class ThisHost(unittest.TestCase):

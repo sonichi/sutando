@@ -19,6 +19,12 @@ from pathlib import Path
 from workspace_default import resolve_workspace
 
 AVAILABILITY = ("available", "busy_accepting", "busy_unavailable", "offline", "unknown")
+# What a room policy may turn each true value into: the same, something less available, or
+# unknown. Never more available, never a different known fact (offline is a fact, not a level).
+NARROWING = {"available": frozenset({"available", "busy_accepting", "busy_unavailable", "unknown"}),
+             "busy_accepting": frozenset({"busy_accepting", "busy_unavailable", "unknown"}),
+             "busy_unavailable": frozenset({"busy_unavailable", "unknown"}),
+             "offline": frozenset({"offline", "unknown"}), "unknown": frozenset({"unknown"})}
 ACTIVE_PHASES = frozenset({"RUNNING", "WAITING"})
 HEARTBEAT_MAX_AGE_S = 90.0  # matches the core liveness rule: younger than ~90 s is alive
 
@@ -58,7 +64,7 @@ def availability_projection(state: AgentRuntimeState, worker: str | None = None,
     value = availability(state)
     if room_policy is not None:
         narrowed = room_policy(room_id, value)
-        if narrowed in AVAILABILITY:
+        if narrowed in NARROWING[value]:  # a policy may only say less; anything else is ignored
             value = narrowed
     return {"worker": worker, "room": room_id, "availability": value, "audience": "room",
             "projection": "AVAILABILITY", "ts": time.time()}
@@ -72,7 +78,7 @@ def task_projection(snapshot: dict, now: float | None = None) -> dict:
     return {"task_id": snapshot.get("task_id"), "message_event_id": snapshot.get("message_event_id"),
             "worker": snapshot.get("worker"), "phase": snapshot.get("phase"),
             "since_s": (max(0.0, now - started) if isinstance(started, (int, float)) else None),
-            "audience": "room", "projection": "TASK_STATUS"}
+            "audience": snapshot.get("audience") or "room", "projection": "TASK_STATUS"}
 
 
 def this_host() -> str:
