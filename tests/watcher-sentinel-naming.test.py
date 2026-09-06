@@ -120,11 +120,44 @@ class NamingContract(unittest.TestCase):
             try:
                 with self.assertRaises(RuntimeError):
                     up.watcher_sentinel_path(self.d)
-                os.environ["SUTANDO_INSTANCE_ID"] = "default"
-                self.assertEqual(up.watcher_sentinel_path(self.d).name,
-                                 "watch-tasks-stream.pid")
             finally:
                 os.environ.pop("SUTANDO_INSTANCE_ID", None)
+
+    def test_a_non_default_actor_refuses_too_not_only_a_non_default_instance(self):
+        """The measured hole: the refusal read ONLY the instance, so a
+        non-default ACTOR on the default instance took the historic name and two
+        actors shared one sentinel silently. AGENT_MXID is routinely set."""
+        with unittest.mock.patch.object(up, "_runtime_identity",
+                                        return_value=None):
+            for var in ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
+                os.environ.pop("SUTANDO_INSTANCE_ID", None)
+                os.environ[var] = "@sutando-yixuan:ag2.space"
+                try:
+                    with self.assertRaises(RuntimeError, msg=var):
+                        up.watcher_sentinel_path(self.d)
+                finally:
+                    os.environ.pop(var, None)
+
+    def test_an_unreadable_runtime_answers_only_an_explicit_canonical_pair(self):
+        """POSITIVE CONTROL for the inversion: a caller that states both halves
+        and names the canonical tuple still gets the historic path, so the
+        refusal is about what cannot be READ, not a blanket outage."""
+        with unittest.mock.patch.object(up, "_runtime_identity",
+                                        return_value=None):
+            self.assertEqual(
+                up.watcher_sentinel_path(self.d, instance="default",
+                                         agent=up._DEGRADED_CANONICAL_ACTOR).name,
+                "watch-tasks-stream.pid")
+            with self.assertRaises(RuntimeError):
+                up.watcher_sentinel_path(self.d, instance="second",
+                                         agent=up._DEGRADED_CANONICAL_ACTOR)
+
+    def test_the_degraded_default_actor_matches_rundir(self):
+        """The one constant this module restates. A drift here would make the
+        canonical case above refuse on a healthy host."""
+        ident = up._runtime_identity()
+        self.assertIsNotNone(ident, "runtime-api must import in this checkout")
+        self.assertEqual(up._DEGRADED_CANONICAL_ACTOR, ident[0].DEFAULT_ACTOR)
 
 
 class Enumeration(unittest.TestCase):

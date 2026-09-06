@@ -461,6 +461,10 @@ def write_private_text(path: "Path", text: str) -> None:
 # and a test asserts the two namers agree.
 WATCHER_SENTINEL_STEM = "watch-tasks-stream"
 
+# `rundir.DEFAULT_ACTOR`, needed only on the path where rundir itself did not
+# import; a mismatch is caught by test_the_degraded_default_actor_matches_rundir.
+_DEGRADED_CANONICAL_ACTOR = "local-agent"
+
 
 def _runtime_identity():
     """`(rundir, instance_key)` from src/runtime-api, or None when unavailable.
@@ -501,14 +505,19 @@ def instance_scope_key(state_dir, instance=None, agent=None) -> str:
     """
     ident = _runtime_identity()
     if ident is None:
-        # A default install has one runtime and the historic paths are right. A
-        # non-default instance without the encoder would ALIAS, so refuse.
-        asked = instance if instance is not None else os.environ.get("SUTANDO_INSTANCE_ID")
-        if asked and asked != "default":
+        # NEITHER half is readable here, so "" would claim canonical identity
+        # rather than read it; only an explicit caller-stated pair is answerable.
+        if instance is None or agent is None:
             raise RuntimeError(
                 "cannot resolve a per-instance path: "
-                "src/runtime-api/{instance_key,rundir}.py did not import")
-        return ""
+                "src/runtime-api/{instance_key,rundir}.py did not import, so "
+                "neither the instance nor the actor can be read — pass both "
+                "explicitly to name a path in this state")
+        if instance == "default" and agent == _DEGRADED_CANONICAL_ACTOR:
+            return ""
+        raise RuntimeError(
+            "cannot encode a per-instance path: "
+            "src/runtime-api/instance_key.py did not import")
     rundir, ikey = ident
     inst = instance if instance is not None else rundir.instance_id()
     who = agent if agent is not None else rundir.agent_id(state_dir)
