@@ -29,6 +29,8 @@ services, and lets startup recreate the managed task notifier.
 
 ### Step 1 — Pull + durable restart handoff (mechanical)
 
+Before pulling, the script consults `<workspace>/hosts/<host>/witness-owed/` (`src/witness_owed.py check`): if the target head newly contains a merged live-path PR whose post-restart witness is still owed (REVIEW.md lesson 15), it exits 4 and leaves HEAD alone. Post the round trip and `close` the record, or on the host that owes it pass `--canary owner/repo#N`, which marks the record for this host only and proceeds.
+
 Run the helper. It aborts safely on a dirty tree or a non-fast-forward, pulls
 `--ff-only`, and launches `src/restart.sh` in the persistent
 **`sutando-services` tmux session**:
@@ -36,10 +38,13 @@ Run the helper. It aborts safely on a dirty tree or a non-fast-forward, pulls
 ```bash
 bash skills/self-upgrade/scripts/upgrade.sh          # origin/main
 # bash skills/self-upgrade/scripts/upgrade.sh --no-restart   # pull only
+# bash skills/self-upgrade/scripts/upgrade.sh --canary owner/repo#N   # activate a head that still owes a witness, on the owing host only
 ```
 
 Exit `0` = upgraded (or already latest); exit `2` = aborted (dirty tree /
-not a fast-forward) — surface the reason and stop.
+not a fast-forward); exit `4` = refused by the witness-owed gate, or the gate
+could not run (unresolvable workspace, python, repository or fleet freshness) —
+surface the reason and stop.
 
 If the diff touched `package*.json` / `tsconfig` / `*.swift` / `requirements`
 (the script prints this), a rebuild may be needed. For `*.swift`, rebuild the

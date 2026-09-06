@@ -78,7 +78,7 @@ and "After opening the PR" sections. The short checklist:
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
 - **Paste before/after evidence** — the actual command output at the parent commit and at HEAD, not a description of it. This is the #1 change-request on this repo. Every claim in the body must be checkable from the diff or that output.
-- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
+- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these. If no witness target can be provisioned, file the owed witness with `src/witness_owed.py open` (REVIEW.md lesson 15) — `self-upgrade` refuses to activate a head that still owes one.
 - **Stacked PR?** Name the parent and merge order; after the parent lands, rebase/update the child and rerun its full checks.
 - Scan added lines for hardcoded host paths and inline path fallbacks; production code must use the repo's path helpers.
 - `license/cla` missing after a push or `update-branch`? It is SHA-bound and the auto-recheck comment is unreliable — **close+reopen the PR** is the retry that works. Full ABSENT-vs-FAILING triage: `CONTRIBUTING.md` → "Check the CLA status"
