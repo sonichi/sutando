@@ -758,6 +758,18 @@ if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   brew install tmux 2>&1 | tail -3
 fi
 
+publish_active_runtime() {
+  # Only callers that have VERIFIED the session may call this; the exec path
+  # cannot, so it publishes optimistically and says so at its call site.
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/state" 2>/dev/null || true
+  printf '{"runtime":"claude","session":"%s","started_at":%s}\n' \
+    "${SESSION:-sutando-core}" "$(date +%s)" \
+    > "$ws/state/core-runtime.json" 2>/dev/null || true
+}
+
 # Stamp the core session start into an append-only per-boot log. One JSONL
 # line per launch; consecutive entries bound each session's lifetime, which
 # is what session-recap tooling needs to pick the right transcript (owner
@@ -860,6 +872,7 @@ else
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  publish_active_runtime   # verified live above; a failed launch exits before here
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal

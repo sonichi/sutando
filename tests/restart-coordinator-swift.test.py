@@ -165,6 +165,15 @@ case "invocation-rehearse-off":
     print(GracefulRestartInvocation.args(script: "/s/gr.sh",
           env: ["SUTANDO_RESTART_REHEARSE": "0"]).joined(separator: " "))
 
+case "invocation-extra":
+    print(GracefulRestartInvocation.args(script: "/s/gr.sh", env: [:],
+          extra: ["--runtime", "codex"]).joined(separator: " "))
+
+case "invocation-extra-rehearse":
+    print(GracefulRestartInvocation.args(script: "/s/gr.sh",
+          env: ["SUTANDO_RESTART_REHEARSE": "1"],
+          extra: ["--runtime", "claude"]).joined(separator: " "))
+
 case "outcome-messages":
     for st: Int32 in [0, 3, 4, 5, 143, 9] {
         print("\(st)=" + (GracefulRestartInvocation.outcomeMessage(for: st) ?? "<nil>"))
@@ -269,6 +278,24 @@ class TestRestartCoordinator(unittest.TestCase):
         self.assertIn("launch1=failed(boom)", out)
         self.assertIn("phase=idle", out)
         self.assertIn("claim2=accepted(2)", out)
+
+    def test_runtime_switch_rides_after_the_forwarding_separator(self):
+        """A switch must reach start-cli.sh through graceful-restart, not around it."""
+        out = self.run_scenario("invocation-extra")
+        self.assertEqual(out[0], "/s/gr.sh -- --runtime codex --visible")
+
+    def test_runtime_switch_still_honors_rehearse(self):
+        out = self.run_scenario("invocation-extra-rehearse")
+        self.assertEqual(out[0], "/s/gr.sh --dry-run -- --runtime claude --visible")
+
+    def test_switch_runtime_does_not_bypass_the_coordinator(self):
+        """Source-tied: switchRuntime must not shell start-cli.sh directly."""
+        src = (Path(__file__).resolve().parent.parent
+               / "src" / "Sutando" / "main.swift").read_text(encoding="utf-8")
+        i = src.index("func switchRuntime(_ runtime: String)")
+        body = src[i:src.index("\n    }", i)]
+        self.assertIn("beginGracefulRestart", body)
+        self.assertNotIn("start-cli.sh", body)
 
     def test_default_invocation_has_no_dry_run(self):
         out = self.run_scenario("invocation-default")

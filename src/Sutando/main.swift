@@ -353,6 +353,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modelItem.submenu = modelSubmenu
         menu.addItem(modelItem)
         menu.addItem(NSMenuItem.separator())
+        // Each item goes through switchRuntime, i.e. the graceful restart path;
+        // the runtime from sutando-config.sh core-runtime gets the ● checkmark.
+        let currentRuntime = (runShell("/bin/bash",
+            [repoRoot + "/scripts/sutando-config.sh", "core-runtime"]) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let runtimeSubmenu = NSMenu()
+        for (label, value) in [("Claude", "claude"), ("Codex", "codex")] {
+            let ri = NSMenuItem(title: label, action: #selector(switchRuntimeMenu(_:)), keyEquivalent: "")
+            ri.target = self
+            ri.representedObject = value
+            ri.state = (value == currentRuntime) ? .on : .off
+            runtimeSubmenu.addItem(ri)
+        }
+        let runtimeItem = NSMenuItem(title: "Core Runtime", action: nil, keyEquivalent: "")
+        runtimeItem.submenu = runtimeSubmenu
+        menu.addItem(runtimeItem)
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
@@ -2401,6 +2417,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let graceful = RestartCoordinator()
 
     @objc func restartCore() {
+        beginGracefulRestart(extra: [], label: "Core restart",
+                             startMessage: "Restarting Core CLI — waiting for a safe moment…",
+                             successOverride: nil)
+    }
+
+    /// One graceful-restart path. A runtime switch IS a restart, so it shares the
+    /// coordinator: same quiet gate, same overlap refusal, same phase stream.
+    private func beginGracefulRestart(extra: [String], label: String,
+                                      startMessage: String, successOverride: String?) {
         let epoch: Int
         switch graceful.claimRestart() {
         case .rejectedPastKill:
@@ -2413,14 +2438,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             epoch = claimed
         }
 
-        notify("Sutando", "Restarting Core CLI — waiting for a safe moment…")
+        notify("Sutando", startMessage)
         let script = repoRoot + "/src/agent/graceful-restart.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         // SUTANDO_RESTART_REHEARSE=1 exercises this AppKit path with the kill skipped.
         // NOT side-effect-free: --dry-run still runs prep, including a real sync.
         proc.arguments = GracefulRestartInvocation.args(
-            script: script, env: ProcessInfo.processInfo.environment)
+            script: script, env: ProcessInfo.processInfo.environment, extra: extra)
         // stdout is the phase stream, not noise: on a busy core it is the only
         // sign the click did anything. stderr stays for the failure preview.
         let outPipe = Pipe()
@@ -2445,7 +2470,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case .aborted:
                 return                      // cancelled before we ever launched
             case .failed(let reason):
-                self.notify("Sutando", "Core restart failed to start: \(reason)")
+                self.notify("Sutando", "\(label) failed to start: \(reason)")
                 return
             case .launched:
                 break
@@ -2473,15 +2498,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // 143 = cancelled by Force Restart: the TERM trap released the lock
             // before any kill, so it is intended and stays silent.
-            if let outcome = GracefulRestartInvocation.outcomeMessage(for: status) {
+            if status == 0, let ok = successOverride {
+                self.notify("Sutando", ok)
+            } else if let outcome = GracefulRestartInvocation.outcomeMessage(for: status) {
                 self.notify("Sutando", outcome)
             } else if status != 143 {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let errStr = String(data: errData, encoding: .utf8) ?? ""
                 let preview = String(errStr.prefix(200))
-                self.notify("Sutando", "Core restart failed (exit \(status)): \(preview)")
+                self.notify("Sutando", "\(label) failed (exit \(status)): \(preview)")
             }
         }
+    }
+
+    /// Menu action for the Core Runtime picker items. The chosen runtime rides
+    /// on representedObject (set at build time) so one selector serves both.
+    @objc func switchRuntimeMenu(_ sender: NSMenuItem) {
+        guard let runtime = sender.representedObject as? String else { return }
+        switchRuntime(runtime)
+    }
+
+    /// Switch the persistent core runtime (claude|codex) and restart into it.
+    /// Re-selecting the already-active runtime is a no-op-safe write + restart.
+    func switchRuntime(_ runtime: String) {
+        beginGracefulRestart(extra: ["--runtime", runtime], label: "Runtime switch",
+                             startMessage: "Switching core runtime to \(runtime) — waiting for a safe moment…",
+                             successOverride: "Core runtime switched to \(runtime). Attach via Open Core CLI in menu.")
     }
 
     /// Map a script log line to a user-facing phase, or nil. Matches the script's
