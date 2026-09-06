@@ -151,6 +151,55 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.capabilities("nonsense"), frozenset())
 
 
+class WorkSignal(unittest.TestCase):
+    """Chi's rule: core-status and the heartbeat are liveness, not work — a wedged core keeps both
+    fresh. The CLI wedge detector's reading is the primary input; the heartbeat is the fallback."""
+
+    def test_verdict_kinds_fold_to_the_three_signals(self):
+        for kind, sig in (("working", "working"), ("clock-only", "working"), ("idle", "idle"),
+                          ("static-with-work", "wedged"), ("retry-loop", "wedged"), ("provider-limit", "wedged"),
+                          ("low-novelty", "wedged"), ("unknown", "unknown"), ("cadence-too-sparse", "unknown")):
+            self.assertEqual(av.work_signal_from_verdict({"kind": kind, "confidence": "high"}), sig, kind)
+        self.assertEqual(av.work_signal_from_verdict(None), "unknown")
+        self.assertEqual(av.work_signal_from_verdict("garbage"), "unknown")
+
+    def test_a_wedged_core_is_busy_unavailable_even_with_a_fresh_heartbeat(self):
+        s = S(runtime_healthy=True, active_runs=0, last_heartbeat_at=1000.0, work_signal="wedged")
+        self.assertEqual(av.availability(s, 1001.0), "busy_unavailable", "fresh heartbeat, no work: not available")
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0, work_signal="wedged"), 1000.0),
+                         "busy_unavailable", "a stale heartbeat does not demote a pane reading to unknown")
+        self.assertEqual(av.availability(S(disconnected=True, work_signal="wedged")), "offline", "a known disconnect wins")
+
+    def test_idle_and_working_readings_outrank_the_heartbeat(self):
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0, work_signal="idle"), 1000.0), "available")
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0, work_signal="idle", queue_depth=2), 1000.0),
+                         "busy_accepting", "idle at the prompt with a queue is about to be busy")
+        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=1, max_concurrency=2, work_signal="working"), 5.0),
+                         "busy_accepting")
+        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=1, max_concurrency=1, work_signal="working"), 5.0),
+                         "busy_unavailable")
+        self.assertEqual(av.availability(S(accepting_work=False, work_signal="idle")), "busy_unavailable")
+
+    def test_no_reading_falls_back_to_the_heartbeat_rule(self):
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1000.0), 1001.0), "available")
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0), 1000.0), "unknown", "stale is unknown")
+
+    def test_read_runtime_state_takes_the_probe_and_survives_its_failure(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+        self.assertEqual(av.read_runtime_state(ws, host="h", work_probe=lambda w, n: {"kind": "static-with-work"}).work_signal, "wedged")
+        self.assertEqual(av.read_runtime_state(ws, host="h", work_probe=lambda w, n: None).work_signal, "unknown")
+        def boom(w, n):
+            raise RuntimeError("tmux gone")
+        self.assertEqual(av.read_runtime_state(ws, host="h", work_probe=boom).work_signal, "unknown")
+        self.assertEqual(av.read_runtime_state(ws, host="h").work_signal, "unknown", "no detector window here: unknown, never a crash")
+
+    def test_the_work_signal_never_reaches_a_room_payload(self):
+        s = S(runtime_healthy=True, last_heartbeat_at=1000.0, work_signal="wedged")
+        p = av.availability_projection(s, "air", "!eng:s", now=1000.0)
+        self.assertNotIn("work_signal", p); self.assertIn("work_signal", av.FORBIDDEN_IN_ROOM)
+        self.assertEqual(p["availability"], "busy_unavailable")
+
+
 class ThisHost(unittest.TestCase):
     """state/cores/ is synced across hosts, so a glob lets a PEER's heartbeat answer for this agent.
     Only this host's file counts."""

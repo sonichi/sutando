@@ -15,6 +15,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from workspace_default import resolve_workspace
 
@@ -23,6 +24,31 @@ ACTIVE_PHASES = frozenset({"RUNNING", "WAITING"})
 HEARTBEAT_MAX_AGE_S = 90.0  # matches the core liveness rule: younger than ~90 s is alive
 # A live run keeps writing its snapshot (events, transitions); one silent this long is a leftover.
 ACTIVE_SNAPSHOT_MAX_AGE_S = 1800.0
+WORK_SIGNALS = ("working", "idle", "wedged", "unknown")
+# The CLI wedge detector reads the pane, not the process: its verdict kinds fold to the three the
+# room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown.
+_WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": "idle",
+                         "static-with-work": "wedged", "retry-loop": "wedged", "provider-limit": "wedged",
+                         "low-novelty": "wedged"}
+
+
+def work_signal_from_verdict(verdict) -> str:
+    kind = verdict.get("kind") if isinstance(verdict, dict) else None
+    return _WEDGE_KIND_TO_SIGNAL.get(kind, "unknown")
+
+
+def wedge_window_verdict(ws: Path, now: float | None = None):
+    """The latest verdict from the window the health probe already writes; never a new pane sample
+    here. No window, an unreadable one, or an engine without the detector reads as None."""
+    try:
+        import cli_wedge
+        now = now if now is not None else time.time()
+        entries = cli_wedge.load_window(cli_wedge.window_path(ws))
+        if not entries:
+            return None
+        return cli_wedge.classify_window(entries, cli_wedge.work_outstanding(ws, now), now)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @dataclass
@@ -37,6 +63,7 @@ class AgentRuntimeState:
     last_heartbeat_at: float | None = None
     last_runtime_update_at: float | None = None
     disconnected: bool = False  # an explicit, known disconnect: offline, never merely unknown
+    work_signal: str = "unknown"  # the wedge detector's reading: working | idle | wedged | unknown
 
 
 def is_fresh(state: AgentRuntimeState, now: float | None = None, max_age_s: float = HEARTBEAT_MAX_AGE_S) -> bool:
@@ -50,6 +77,15 @@ def availability(state: AgentRuntimeState, now: float | None = None) -> str:
     Never derived from 'has a running task' alone: 2 of 4 runs active is busy_accepting."""
     if state.disconnected:
         return "offline"
+    # A heartbeat and a status file stay fresh on a wedged core; the pane reading outranks them.
+    if state.work_signal == "wedged":
+        return "busy_unavailable"
+    if state.work_signal in ("working", "idle"):
+        if not state.accepting_work:
+            return "busy_unavailable"
+        if state.work_signal == "idle" and state.queue_depth <= 0:
+            return "available"
+        return "busy_accepting" if state.active_runs < max(state.max_concurrency, 1) else "busy_unavailable"
     if state.runtime_healthy is None or not is_fresh(state, now):
         return "unknown"
     if not state.runtime_healthy:
@@ -68,7 +104,8 @@ ROOM_TASK_STATUS_FIELDS = frozenset({"task_id", "message_event_id", "worker", "p
                                      "audience", "projection"})
 # Never in a room payload, by key: what a server log, a sync or another client could otherwise read.
 FORBIDDEN_IN_ROOM = frozenset({"summary", "thinking", "tool", "command", "private_room_id", "active_runs",
-                               "capacity", "max_concurrency", "queue_depth", "reason", "seq", "activity_session_id"})
+                               "capacity", "max_concurrency", "queue_depth", "reason", "seq", "activity_session_id",
+                               "work_signal", "verdict", "confidence"})
 
 
 def room_payload(payload: dict, allowed: frozenset[str]) -> dict:
@@ -141,12 +178,19 @@ def snapshot_is_live(written_at: float, now: float, task_file_present: bool, ses
 
 
 def read_runtime_state(workspace: Path | None = None, host: str | None = None,
-                       max_concurrency: int = 1, now: float | None = None) -> AgentRuntimeState:
-    """The private numbers from what the engine already writes: task snapshots under state/activity
-    (active runs), the tasks/ directory (queue depth), and THIS host's core heartbeat (health)."""
+                       max_concurrency: int = 1, now: float | None = None,
+                       work_probe: Callable[[Path, float], object] | None = None) -> AgentRuntimeState:
+    """The private numbers from what the engine already writes: the wedge detector's window (the
+    work signal), task snapshots under state/activity (active runs), the tasks/ directory (queue
+    depth), and THIS host's core heartbeat (health, the fallback when there is no work signal)."""
     ws = workspace or resolve_workspace()
     host = host or this_host()
     now = now if now is not None else time.time()
+    try:
+        verdict = (work_probe or wedge_window_verdict)(ws, now)
+    except Exception:  # noqa: BLE001
+        verdict = None
+    signal = work_signal_from_verdict(verdict)
     session_started_at = _session_started_at(ws)
     active = 0
     for p in (ws / "state" / "activity").glob("task-*.json"):
@@ -177,4 +221,4 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
     # accepting_work: the scheduler's pause control sets it later; this reader never does.
     return AgentRuntimeState(active_runs=active, max_concurrency=max_concurrency, queue_depth=queue,
                              runtime_healthy=healthy, accepting_work=True, last_heartbeat_at=beat_at,
-                             disconnected=disconnected)
+                             disconnected=disconnected, work_signal=signal)
