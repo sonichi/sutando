@@ -67,6 +67,33 @@ class CompletedButUnpublished(unittest.TestCase):
         d = hc._interpret_daily_punctuality([job(completion_today=True)])
         self.assertNotEqual(d["status"], "ok")
 
+    def test_a_stale_corpus_does_not_assert_a_drift_it_has_evidence_against(self):
+        """The fix above has a SHELF LIFE without this arm (found by @TustinOC).
+
+        `naming_stale` is tested first and continues, so once the newest artifact
+        ages past DAILY_ARTIFACT_STALE_DAYS the corrected message is unreachable and
+        the drifted wording returns — asserting a filename drift while THIS RUN holds
+        a completion record saying the job ran. Measured at e3aad750: the
+        completion_today=True and =False details were byte-identical.
+        """
+        stale = dict(artifacts=[("2026-08-29", DUE + 1)],
+                     newest_artifact="2026-08-29", artifact_age_days=11,
+                     naming_stale=True)
+        ran = hc._interpret_daily_punctuality([job(completion_today=True, **stale)])["detail"]
+        not_ran = hc._interpret_daily_punctuality([job(completion_today=False, **stale)])["detail"]
+        self.assertNotEqual(ran, not_ran, "the completion record must change the message")
+        self.assertIn("did run", ran)
+        self.assertNotIn("has drifted off this job's output", ran)
+
+    def test_a_genuinely_drifted_job_keeps_the_drift_wording(self):
+        """Precision control: rerouting the bucket was the wrong fix. With no
+        completion record, `drifted` is exactly the right verdict and must survive."""
+        d = hc._interpret_daily_punctuality([job(
+            completion_today=False, artifacts=[("2026-08-29", DUE + 1)],
+            newest_artifact="2026-08-29", artifact_age_days=11, naming_stale=True)])
+        self.assertIn("has drifted off this job's output", d["detail"])
+        self.assertNotIn("did run", d["detail"])
+
     def test_a_healthy_job_is_still_ok(self):
         """Deliberately GREEN: without it, an always-warn probe reads as vigilance."""
         d = hc._interpret_daily_punctuality([job(today_seen=True, completion_today=True)])

@@ -6851,7 +6851,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         # missed-today verdict would blame it for the probe's own blind spot.
         if j.get("naming_stale"):
             drifted.append((j["name"], j.get("newest_artifact") or "?",
-                            j.get("artifact_age_days")))
+                            j.get("artifact_age_days"),
+                            bool(j.get("completion_today"))))
             continue
         # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
         # -1417 early. The filename date is logical, often a day off the mtime.
@@ -6919,12 +6920,20 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
                     f"no output {m} min past due — the schedule fired and the task was "
                     f"never consumed, so this is the consumer, not the cron")
-    for n, newest, age in sorted(drifted):
+    for n, newest, age, ran in sorted(drifted):
         age_txt = f", {age}d ago" if age is not None else ""
-        bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
-                    f"probe's filename match has drifted off this job's output; "
-                    f"punctuality cannot be scored and a missed-today verdict would "
-                    f"blame the job for the probe's own blind spot")
+        if ran:
+            # A completion record dates TODAY, so "the match drifted" cannot be
+            # asserted: this run holds evidence the job ran. Name both candidates.
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, but a "
+                        f"task-cron completion record exists TODAY, so the job did run; "
+                        f"either the probe's filename match drifted off its output or it "
+                        f"published nothing. Punctuality cannot be scored either way")
+        else:
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
+                        f"probe's filename match has drifted off this job's output; "
+                        f"punctuality cannot be scored and a missed-today verdict would "
+                        f"blame the job for the probe's own blind spot")
     for n, m, dm, c in sorted(trailing):
         bits.append(f"{n}: dispatches on time (median {dm:+g} min); output trails by "
                     f"median {m:+g} min over {c} run(s) — latency, not the schedule")
