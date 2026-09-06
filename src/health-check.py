@@ -8232,6 +8232,50 @@ def _is_watcher_argv(argv: str) -> bool:
             and script.endswith("watch-tasks-stream.sh"))
 
 
+def _pid_instance_id(pid: str):
+    """`SUTANDO_INSTANCE_ID` from THAT process's environment, or None if unreadable.
+
+    Tri-state on purpose: None is "cannot read", never "default" -- naming a
+    sentinel from THIS process's env is how a named watcher gets the canonical file.
+    """
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:  # noqa: BLE001  -- not linux, or not permitted
+        try:
+            out = subprocess.run(["ps", "-Eww", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        # `ps -E` prints ARGV then the environment, so take the LAST match: a
+        # process whose own argv mentions the variable is otherwise misread.
+        toks = out.stdout.split()
+        hits = [k for k in toks if k.startswith("SUTANDO_INSTANCE_ID=")]
+        if hits:
+            return hits[-1].split("=", 1)[1]
+        # A miss means default ONLY if the environment was printed at all. Keying
+        # that on a SUTANDO_ prefix would be a correlated field, not the answer.
+        printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
+        return "" if printed_env else None
+    for raw in environ.split(b"\0"):
+        if raw.startswith(b"SUTANDO_INSTANCE_ID="):
+            return raw.split(b"=", 1)[1].decode("utf-8", "replace")
+    return ""
+
+
+def _watcher_sentinel_target(state_dir, pid):
+    """The sentinel path for the watcher at `pid`, or None when its identity is
+    not authoritative. A guess here is published as a repair target."""
+    inst = _pid_instance_id(pid)
+    if inst is None:
+        return None
+    try:
+        return watcher_sentinel_path(state_dir, instance=(inst or None))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
     """Map root PID -> set of PIDs for each distinct watcher TREE running.
 
@@ -8327,9 +8371,21 @@ def check_task_watcher() -> dict:
                 # no second tree to duplicate work. Killing it is what opens a gap.
                 # `--fix` re-stamps the sentinel instead: the pid is a live watcher,
                 # so naming it restores Stop-hook cleanup without the restart.
+                # The target comes from the WATCHER's identity, never this process's:
+                # the canonical path claims the wrong instance for a named watcher.
+                target = _watcher_sentinel_target(WORKSPACE_DIR / "state", roots[0])
+                if target is None:
+                    return {"name": name, "status": "warn",
+                            "_sentinel_restamp_pid": roots[0],
+                            "detail": f"watcher pid {roots[0]} runs under a live session "
+                                      f"(ppid {parents[roots[0]]}) but wrote no PID sentinel, "
+                                      "and its own SUTANDO_INSTANCE_ID is unreadable from here, "
+                                      "so the repair target cannot be named without guessing "
+                                      "which instance owns it. Do NOT stop it — it IS draining "
+                                      "tasks/. Restart it cleanly when tasks/ is empty."}
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
-                        "_sentinel_restamp_path": str(pid_file),
+                        "_sentinel_restamp_path": str(target),
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "

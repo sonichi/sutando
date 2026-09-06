@@ -29,8 +29,13 @@ except SystemExit:
 WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
 
-def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True) -> dict:
-    """`sentinels` maps filename -> contents; `trees` maps root pid -> members."""
+def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
+        parent="1", pid_instance=None) -> dict:
+    """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
+
+    `pid_instance` is what the WATCHER's own environment yields: a string names
+    its instance, "" is the default, and None means unreadable.
+    """
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
         (ws / "state" / "cores").mkdir(parents=True)
@@ -39,18 +44,21 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True) -> dic
         for fn, text in sentinels.items():
             (ws / "state" / fn).write_text(text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record)
+                 hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
+                 hc._pid_instance_id)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = (argv if callable(argv) else (lambda pid: argv))
             hc._watcher_trees = lambda *a, **k: trees
             hc._ps_snapshot = lambda *a, **k: ""
-            hc._pid_parent = lambda pid, ps=None: "1"
+            hc._pid_parent = lambda pid, ps=None: parent
             hc._fresh_local_core_record = lambda *a, **k: ({} if core_alive else None)
+            hc._pid_instance_id = lambda pid: pid_instance
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
+             hc._pid_instance_id) = saved
 
 
 class PoolHost(unittest.TestCase):
@@ -186,6 +194,45 @@ class SingleInstanceUnchanged(unittest.TestCase):
         r = run({"watch-tasks-stream.pid": "100\n"}, {}, argv="")
         self.assertEqual(r["status"], "warn")
         self.assertIn("is dead", r["detail"])
+
+
+class TheRestampTargetComesFromTheWATCHERsIdentity(unittest.TestCase):
+    """A sentinel-less watcher is re-stamped at ITS path, never at this process's.
+
+    The probe runs with the host's ambient environment. Deriving the repair target
+    from that names the canonical file for a NAMED watcher: the wrong instance is
+    claimed, and the watcher's own exit trap removes a different filename, leaving
+    the bare sentinel stale and pointing at a pid that is not the canonical core's.
+    """
+
+    SUPERVISED = {"trees": {"901": {"901"}}, "parent": "900"}
+
+    def test_a_named_watcher_is_re_stamped_at_its_own_path(self):
+        r = run({}, **self.SUPERVISED, pid_instance="worker-7")
+        self.assertEqual(r["status"], "warn")
+        target = Path(r["_sentinel_restamp_path"]).name
+        self.assertNotEqual(target, "watch-tasks-stream.pid",
+                            "the canonical name claims the wrong instance")
+        self.assertIn("worker-7", target)
+
+    def test_the_default_watcher_still_gets_the_canonical_path(self):
+        # The fix must not refuse the case it was already handling correctly.
+        r = run({}, **self.SUPERVISED, pid_instance="")
+        self.assertEqual(Path(r["_sentinel_restamp_path"]).name, "watch-tasks-stream.pid")
+
+    def test_an_unreadable_identity_offers_NO_repair_target(self):
+        r = run({}, **self.SUPERVISED, pid_instance=None)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("_sentinel_restamp_path", r,
+                         "a guessed target is published as a repair instruction")
+        self.assertIn("_sentinel_restamp_pid", r, "the pid is still reported")
+        self.assertIn("unreadable", r["detail"])
+
+    def test_the_watcher_is_never_prescribed_for_stopping_in_any_of_them(self):
+        for inst in ("worker-7", "", None):
+            with self.subTest(instance=inst):
+                r = run({}, **self.SUPERVISED, pid_instance=inst)
+                self.assertIn("Do NOT stop it", r["detail"])
 
 
 if __name__ == "__main__":
