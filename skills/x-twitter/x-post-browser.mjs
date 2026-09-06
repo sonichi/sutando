@@ -360,7 +360,17 @@ try {
     const seen = new Map();
     // Scroll until the page stops yielding new posts: a virtualised timeline
     // drops what scrolls past, so collect on every pass, not at the end.
-    for (let pass = 0; pass < 40 && seen.size < want; pass++) {
+    // Patience is configurable because the old constants could not tell a slow
+    // timeline from a finished one, and defaulted to the wrong answer. Measured
+    // 2026-09-06: the SAME command run twice returned 23 posts (back to 05-05) and
+    // 55 (back to 04-02) — depth decided by network timing, not by how much X would
+    // serve. Both were SHALLOWER than the 104-post index already on disk, and both
+    // exited 0.
+    const MAXPASS = parseInt(process.env.X_TIMELINE_PASSES || '', 10) || 120;
+    const STALL   = parseInt(process.env.X_TIMELINE_STALL_PASSES || '', 10) || 6;
+    const WAITMS  = parseInt(process.env.X_TIMELINE_WAIT_MS || '', 10) || 1800;
+    let stalled = 0;
+    for (let pass = 0; pass < MAXPASS && seen.size < want; pass++) {
       const batch = await page.$$eval('article[data-testid="tweet"]', (arts) => arts.map((a) => {
         const link = a.querySelector('a[href*="/status/"]');
         const time = a.querySelector('time');
@@ -373,9 +383,14 @@ try {
       }).filter(Boolean));
       const before = seen.size;
       for (const t of batch) if (!seen.has(t.id)) seen.set(t.id, t);
-      if (seen.size === before && pass > 2) break;   // exhausted, not merely slow
+      // A virtualised timeline loads AS YOU SCROLL, so a barren pass is the normal
+      // shape of "slow", not evidence of the end. Requiring several CONSECUTIVE barren
+      // passes is what makes those two distinguishable; `pass > 2` ruled after two,
+      // which one slow network moment satisfies.
+      if (seen.size === before) { if (++stalled >= STALL && pass > 2) break; }
+      else stalled = 0;
       await page.mouse.wheel(0, 3000);
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(WAITMS);
     }
     // A pinned post sits first in the DOM regardless of age, so DOM order is not
     // chronological. Sort before slicing or `--limit` keeps the wrong ones.
@@ -383,6 +398,14 @@ try {
       .sort((a, b) => (b.at || '').localeCompare(a.at || ''))
       .slice(0, want);
     if (!out.length) { console.error('timeline: no posts extracted — UNKNOWN, not an empty account'); process.exit(3); }
+    // Name the terminating condition. "23 posts" means something different when the
+    // scroll ran out of patience than when the account ran out of posts, and the caller
+    // cannot tell those apart from the count — which is how a short crawl gets mistaken
+    // for a complete one and overwrites a fuller index.
+    console.error(`timeline: ${out.length} post(s); stopped because ` +
+      (seen.size >= want ? `--limit ${want} was reached`
+       : stalled >= STALL ? `${stalled} consecutive passes added nothing (may be INCOMPLETE — raise X_TIMELINE_STALL_PASSES / X_TIMELINE_WAIT_MS)`
+       : `the ${MAXPASS}-pass ceiling was hit (may be INCOMPLETE — raise X_TIMELINE_PASSES)`));
     console.log(JSON.stringify(out, null, 2));
     process.exit(0);
   }
