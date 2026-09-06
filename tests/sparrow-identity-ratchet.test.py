@@ -112,6 +112,17 @@ def scan_task_mints(root: Path) -> dict:
 
         # A template may be bound in ANY lexical scope: resolve innermost
         # first; a name rebound here to a non-template shadows an outer one.
+        def _binds_task_literal(sub) -> bool:
+            # A loop target takes each element in turn and a walrus takes its value, so
+            # either can carry the template a literal assignment would have been caught on.
+            if isinstance(sub, ast.NamedExpr):
+                return _is_task_literal(sub.value)
+            if isinstance(sub, (ast.For, ast.AsyncFor)):
+                it = sub.iter
+                if isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+                    return any(_is_task_literal(e) for e in it.elts)
+            return False
+
         def _bindings(scope) -> dict:
             out = {}
             def _bind(target, value):
@@ -142,9 +153,9 @@ def scan_task_mints(root: Path) -> dict:
                                           ast.withitem, ast.NamedExpr)):
                         tg = getattr(sub, "target", None) or getattr(sub, "optional_vars", None)
                         if isinstance(tg, ast.Name):
-                            # setdefault, not assignment: these forms bind a non-template, but
-                            # under MAY they must not erase a template bound on another branch.
-                            out.setdefault(tg.id, False)
+                            # These forms bind a value like any other, so recording them as
+                            # non-templates without reading it certifies a restart-unstable mint.
+                            out[tg.id] = out.get(tg.id, False) or _binds_task_literal(sub)
             return out
 
         scopes = [_bindings(tree)]
@@ -475,31 +486,48 @@ def _certified_nodes(tree, bindings: set) -> set:
             for node in nodes:
                 step(node)
 
+        def _assigned_in(nodes):
+            # Names this statement list may bind, excluding nested scopes, which bind
+            # their own locals rather than this one's.
+            names = set()
+            def walk(n):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef, ast.Lambda)):
+                    return
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    names.add(n.id)
+                for ch in ast.iter_child_nodes(n):
+                    walk(ch)
+            for n in nodes:
+                walk(n)
+            return names
+
         def _arms_of(node):
-            # Every construct whose branches are ALTERNATIVES, not a sequence. `finally`
-            # is excluded on purpose: it runs on every path, so it is not an arm.
+            # Every construct whose branches are ALTERNATIVES, not a sequence, as
+            # (statements, names to invalidate first). `finally` runs on every path.
             if isinstance(node, ast.If):
                 visit_expr(node.test)
-                return [node.body, node.orelse or []]
+                return [(node.body, ()), (node.orelse or [], ())]
             if isinstance(node, ast.Try):
                 for h in node.handlers:
                     if h.type is not None:
                         visit_expr(h.type)
-                return ([node.body + (node.orelse or [])]
-                        + [h.body for h in node.handlers])
+                # A handler is entered after an arbitrary PREFIX of the body, so it cannot
+                # start from the pre-try state: keep the body's binds, none of its results.
+                partial = tuple(_assigned_in(node.body))
+                return ([(node.body + (node.orelse or []), ())]
+                        + [(h.body, partial) for h in node.handlers])
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
                 # A loop body may run ZERO times, so "body ran" and "body did not"
                 # are alternatives; orelse runs on both.
                 visit_expr(node.iter if hasattr(node, "iter") else node.test)
-                if hasattr(node, "target"):
-                    for nm in (n.id for n in ast.walk(node.target)
-                               if isinstance(n, ast.Name)):
-                        shadow(nm)
+                tgt = tuple(n.id for n in ast.walk(node.target)
+                            if isinstance(n, ast.Name)) if hasattr(node, "target") else ()
                 rest = node.orelse or []
-                return [node.body + rest, rest]
+                return [(node.body + rest, tgt), (rest, ())]
             visit_expr(node.subject)
-            cases = [c.body for c in node.cases]
-            return cases if _match_is_exhaustive(node) else cases + [[]]
+            cases = [(c.body, ()) for c in node.cases]
+            return cases if _match_is_exhaustive(node) else cases + [([], ())]
 
         def branch_merge(node):
             # Alternatives cannot both execute: certification survives only where EVERY
@@ -507,9 +535,13 @@ def _certified_nodes(tree, bindings: set) -> set:
             base_c, base_s = set(cert), set(shadowed)
             arms = _arms_of(node)
             results = []
-            for arm in arms:
+            for arm, pre_shadow in arms:
                 cert.clear(); cert.update(base_c)
                 shadowed.clear(); shadowed.update(base_s)
+                # Applied per arm, AFTER the reset to base: invalidation computed while
+                # building the arms would otherwise be discarded by that reset.
+                for nm in pre_shadow:
+                    shadow(nm)
                 run(_scope_nodes(ast.Module(body=arm, type_ignores=[])))
                 results.append((set(cert), set(shadowed)))
             merged_c = set.intersection(*(c for c, _ in results)) if results else base_c
@@ -915,6 +947,99 @@ class BranchCertificationIsPerPath(unittest.TestCase):
                    '    if flag:\n        d = "raw"\n    return {"delivery_id": d}\n')
         self.assertEqual(self._d(rebound), {("probe.py", "mint"): 1},
                          "a rebind inside one arm must revoke certification made before it")
+
+
+class HandlerAndLoopTargetInvalidation(unittest.TestCase):
+    """A handler runs after an arbitrary prefix of its try body, and a loop target
+    rebinds the name it iterates into. Neither may leave a raw value certified."""
+
+    def _d(self, source: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "probe.py").write_text(source)
+            return scan_delivery_id_sites(Path(tmp))
+
+    def _t(self, source: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "probe.py").write_text(source)
+            return scan_task_mints(Path(tmp))
+
+    TRY = ("import time\n"
+           "from ag2_sparrow.identity import delivery_id, TaskId\n\n"
+           "def mint(task, fail):\n"
+           "    d = delivery_id(TaskId(task), 'gw')\n"
+           "    try:\n"
+           "        d = f'd:{time.time_ns()}'\n"
+           "        if fail:\n"
+           "            raise RuntimeError('boom')\n"
+           "        d = delivery_id(TaskId(task), 'gw')\n"
+           "    except RuntimeError:\n"
+           "        pass\n"
+           "    return {'delivery_id': d}\n")
+
+    LOOP = ("from ag2_sparrow.identity import delivery_id, TaskId\n\n"
+            "def mint(task, items):\n"
+            "    d = delivery_id(TaskId(task), 'gw')\n"
+            "    rec = {'delivery_id': d}\n"
+            "    for d in items:\n"
+            "        rec['delivery_id'] = d\n"
+            "    return rec\n")
+
+    def _run(self, src: str, call: str) -> str:
+        """Out of process: an in-process exec trips the hermetic-bridge lint."""
+        body = "\n".join(l for l in src.splitlines()
+                          if not l.startswith("from ag2_sparrow"))
+        driver = ("def delivery_id(item, gw):\n    return 'CANON'\n"
+                  "def TaskId(v):\n    return v\n" + body
+                  + f"\nprint({call}['delivery_id'])\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "fixture.py"
+            f.write_text(driver)
+            out = subprocess.run([sys.executable, str(f)], capture_output=True,
+                                 text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def test_handler_entered_mid_body_leaves_the_raw_value_counted(self):
+        self.assertEqual(self._d(self.TRY), {("probe.py", "mint"): 1},
+                         "a handler reached after a raw assignment scanned as certified")
+
+    def test_handler_fixture_really_returns_the_raw_value(self):
+        self.assertTrue(self._run(self.TRY, "mint('t', True)").startswith("d:"),
+                        "runtime control: the failing path must return the raw id")
+        self.assertEqual(self._run(self.TRY, "mint('t', False)"), "CANON",
+                         "runtime control: the non-failing path must return the canonical id")
+
+    def test_loop_target_invalidation_survives_the_arm_merge(self):
+        self.assertEqual(self._d(self.LOOP), {("probe.py", "mint"): 1},
+                         "a loop target rebinding the certified name scanned as certified")
+
+    def test_loop_fixture_really_returns_the_raw_value(self):
+        self.assertEqual(self._run(self.LOOP, "mint('t', ['raw'])"), "raw",
+                         "runtime control: a non-empty loop returns the iterated value")
+        self.assertEqual(self._run(self.LOOP, "mint('t', [])"), "CANON",
+                         "runtime control: a zero-iteration loop keeps the canonical id")
+
+    def test_loop_and_walrus_bound_templates_are_still_templates(self):
+        for label, src in (
+            ("for", "import time\ndef mint():\n    for p in ['task-']:\n"
+                    "        return f'{p}{time.time_ns()}'\n"),
+            ("walrus", "import time\ndef mint():\n    (p := 'task-')\n"
+                       "    return f'{p}{time.time_ns()}'\n"),
+        ):
+            with self.subTest(binding=label):
+                self.assertEqual(self._t(src), {("probe.py", "mint"): 1},
+                                 f"a {label}-bound template scanned as a non-template")
+
+    def test_a_non_template_binding_of_those_forms_is_still_exempt(self):
+        for label, src in (
+            ("for", "import time\ndef mint():\n    for p in ['job-']:\n"
+                    "        return f'{p}{time.time_ns()}'\n"),
+            ("walrus", "import time\ndef mint():\n    (p := 'job-')\n"
+                       "    return f'{p}{time.time_ns()}'\n"),
+        ):
+            with self.subTest(binding=label):
+                self.assertEqual(self._t(src), {},
+                                 f"a {label}-bound NON-template was counted as a mint")
 
 
 class DeliveryGateHostileControls(unittest.TestCase):
