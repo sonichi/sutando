@@ -60,11 +60,19 @@ def main() -> int:
     snap_path.write_text(json.dumps(blob))
     check(rtc._maybe_push_workers_snapshot() is True,
           "new snapshot pushes")
-    # The pushing seat stamps itself onto the lead's file (worker-aware brokers
-    # key workers by seat); an unconfigured process is the home seat.
-    check(calls == [("POST", "/v1/workers",
-                     {**blob, "worker_id": "home", "location": "local"})],
-          "pushed the blob + this seat's worker_id/location to POST /v1/workers")
+    # Seat identity is NEGOTIATED: un-advertised, the push is the exact parent
+    # envelope, so a strict relay cannot 422 it and back the push off an hour.
+    check(calls == [("POST", "/v1/workers", blob)],
+          "un-advertised: pushes the lead's blob verbatim, no seat keys")
+    rtc._broker_worker_routing = True
+    snap_path.write_text(json.dumps({**blob, "ts": 99}))
+    os.utime(snap_path, (time.time() + 1, time.time() + 1))
+    check(rtc._maybe_push_workers_snapshot() is True
+          and calls[-1] == ("POST", "/v1/workers",
+                            {**blob, "ts": 99, "worker_id": "home", "location": "local"}),
+          "once worker-routing is advertised, the seat rides the snapshot")
+    rtc._broker_worker_routing = False
+    calls[:] = calls[:1]
     check(rtc._maybe_push_workers_snapshot() is False and len(calls) == 1,
           "unchanged snapshot never re-posts")
 
