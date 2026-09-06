@@ -134,7 +134,10 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         fcntl.flock(lk, fcntl.LOCK_EX)
         binds = load_json(p["bind"], {})
         binds[task_id] = session_id
+        # The same open set completion uses: the live log plus the writer's index, so a task whose
+        # rows rotated out keeps its binding while another session picks up the next task.
         alive = open_tasks(p["log"])
+        alive.update(indexed_open_tasks(p["ws"]))
         binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
         tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
         tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")

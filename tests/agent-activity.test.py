@@ -319,6 +319,29 @@ class MessageEvent(unittest.TestCase):
         self.assertEqual(out, [("done", "replied")])
         self.assertEqual((runs[-1][2], runs[-1][runs[-1].index("--event") + 1]), ("done", "$evr"))
 
+    def test_a_second_sessions_pickup_keeps_the_binding_of_a_task_whose_rows_rotated_out(self):
+        # A bound BEFORE rotation, 4 rows evict it from the live log, another session binds B:
+        # A's binding must survive the prune and A's later result write must still close it.
+        p = hook.paths(self.ws); runs = []
+        self._task("task-a2", event="$eva"); self._task("task-b2", event="$evb")
+        card.append("picked up", kind="processing", room="!r:s", task={"id": "task-a2", "event": "$eva"}, workspace=self.ws, live_rows=2)
+        hook.bind(p, "task-a2", "S1")
+        for i in range(4):
+            card.append(f"noise {i}", kind="notice", room=None, workspace=self.ws, live_rows=2)
+        self.assertNotIn("task-a2", hook.open_tasks(p["log"]), "precondition: A left the live log")
+        card.append("picked up", kind="processing", room="!r:s", task={"id": "task-b2", "event": "$evb"}, workspace=self.ws, live_rows=2)
+        hook.bind(p, "task-b2", "S2")
+        self.assertEqual(hook.load_json(p["bind"], {}).get("task-a2"), "S1", "A's binding survived B's pickup")
+        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-a2.txt").write_text("done.\n")
+        out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.ws / "results" / "task-a2.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        self.assertEqual(out, [("done", "replied")])
+        # The stubbed emit did not write; the real writer's done row closes A in the index, and the
+        # next bind prunes it while keeping B.
+        card.append("replied", kind="done", room="!r:s", task={"id": "task-a2", "event": "$eva"}, done=True, workspace=self.ws, live_rows=2)
+        hook.bind(p, "task-b2", "S2")
+        self.assertEqual(sorted(hook.load_json(p["bind"], {})), ["task-b2"])
+
     def test_a_dedup_pointer_result_closes_as_consolidated_into_the_holder_message(self):
         p = hook.paths(self.ws); runs = []
         self._task("task-x1", event="$evx"); self._task("task-h1", event="$evh")
