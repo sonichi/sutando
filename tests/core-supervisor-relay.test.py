@@ -193,6 +193,25 @@ class TestComposeMessage(unittest.TestCase):
         for noise in ("╭", "───", "https://", "code_challenge"):
             self.assertNotIn(noise, m)
 
+    def test_the_excerpt_falls_back_to_the_first_line_when_the_filter_cannot_load(self):
+        # The notice is the owner's only channel: a missing filter module must not drop it.
+        pane = "╭─ rule ─╮\nBrowser didn't open? Use the url below to sign in:\n"
+        with patch.dict(sys.modules, {"prompt_excerpt": None}):
+            m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("╭─ rule ─╮", m)  # the old first-non-empty line, degraded but delivered
+
+    def test_the_filter_is_found_from_the_relays_own_directory(self):
+        # Run as a script, sys.path[0] is not src/: the relay must add its own directory.
+        src_dir = os.path.dirname(_SRC)
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(src_dir)]
+            sys.modules.pop("prompt_excerpt", None)
+            m = compose_message(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
+        finally:
+            sys.path[:] = saved
+        self.assertIn("Use the url below to sign in", m)
+
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
         self.assertIn("not authenticated", m)
