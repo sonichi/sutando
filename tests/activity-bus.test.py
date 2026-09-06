@@ -506,33 +506,37 @@ class IdempotentProjection(unittest.TestCase):
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "one summary")
         self.assertEqual(self.rows(), ["picked up", "replied"])
 class Visibility(unittest.TestCase):
-    """Audience is decided in the bus: lifecycle rows are the room's, observations are the owner's,
-    and the two projections of one TaskRun carry only what their audience may see."""
+    """Two fields, two questions: audience is who may receive, projection is what they see. Lifecycle
+    rows are the room's TASK_STATUS, observations are the owner's RUNTIME_DETAIL."""
 
-    def test_lifecycle_rows_are_room_scoped_and_observations_owner_scoped(self):
+    def test_lifecycle_rows_are_the_rooms_task_status_and_observations_the_owners_detail(self):
         s = TaskActivityState("t")
         s, r1 = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m"))
         s, r2 = reduce(s, E("t", "S1", 1, "Thinking", text="checking", ts=2))
         s, r3 = reduce(s, E("t", "S1", 2, "InteractionRequired", text="pick one", ts=3))
-        self.assertEqual([r["scope"] for r in r1 + r2], ["room", "owner"])
-        self.assertEqual([r["scope"] for r in r3], ["room"], "the WAITING transition an observation caused is still lifecycle")
+        self.assertEqual([(r["audience"], r["projection"]) for r in r1 + r2],
+                         [("room", "TASK_STATUS"), ("owner", "RUNTIME_DETAIL")])
+        self.assertEqual([(r["audience"], r["projection"]) for r in r3], [("room", "TASK_STATUS")],
+                         "the WAITING transition an observation caused is still lifecycle")
 
     def test_the_shared_projection_carries_no_summary_and_the_private_one_does(self):
         s = TaskActivityState("t")
         s, _ = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m", worker="air"))
         s, _ = reduce(s, E("t", "S1", 1, "Working", text="Running tests", ts=2))
         shared, private = bus.shared_projection(s), bus.private_projection(s)
-        self.assertEqual((shared["phase"], shared["worker"], shared["scope"]), ("RUNNING", "air", "room"))
+        self.assertEqual((shared["phase"], shared["worker"], shared["audience"], shared["projection"]),
+                         ("RUNNING", "air", "room", "TASK_STATUS"))
         self.assertNotIn("summary", shared)
-        self.assertEqual((private["summary"], private["seq"], private["scope"]), ("Running tests", 1, "owner"))
+        self.assertEqual((private["summary"], private["seq"], private["audience"], private["projection"]),
+                         ("Running tests", 1, "owner", "RUNTIME_DETAIL"))
 
-    def test_the_writer_persists_the_scope_on_the_row(self):
+    def test_the_writer_persists_audience_and_projection_on_the_row(self):
         ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
         ActivityStore(ws).apply(T("t", "QUEUED", ts=1, room="!r:s", message_event_id="$m"))
         row = json.loads(card.log_path(ws).read_text().splitlines()[-1])
-        self.assertEqual(row["scope"], "room")
+        self.assertEqual((row["audience"], row["projection"]), ("room", "TASK_STATUS"))
         rec = card.append("x", kind="working", room=None, workspace=ws)
-        self.assertNotIn("scope", rec, "a row with no stated audience carries none: the client's rule applies")
+        self.assertNotIn("audience", rec, "a row with no stated audience carries none: the client's rule applies")
 
 
 class Wiring(unittest.TestCase):

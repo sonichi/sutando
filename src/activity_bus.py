@@ -38,11 +38,12 @@ TRANSITIONS: dict[str, frozenset[str]] = {
 }
 EVENT_KINDS = ("Status", "Thinking", "Working", "ToolStarted", "ToolFinished",
                "InteractionRequired", "Heartbeat", "RuntimeStarted", "RuntimeStopped")
-# Audience is a property of the projection, decided here, enforced by the transport that carries it:
-# the lifecycle is what a room may know (someone is on it), telemetry is the owner's alone.
-SCOPES = ("owner", "room", "participants")
-LIFECYCLE_SCOPE = "room"
-TELEMETRY_SCOPE = "owner"
+# Two questions, two fields: AUDIENCE is who may receive (enforced by the transport that carries it),
+# PROJECTION is what they see. Lifecycle is the room's TASK_STATUS; telemetry is the owner's RUNTIME_DETAIL.
+AUDIENCES = ("owner", "room", "selected_members", "system")
+PROJECTIONS = ("TASK_STATUS", "RUNTIME_DETAIL", "AVAILABILITY")
+LIFECYCLE_AUDIENCE = "room"
+TELEMETRY_AUDIENCE = "owner"
 
 
 @dataclass
@@ -65,7 +66,7 @@ class TaskActivityState:
     summary: str = ""
     into: str | None = None  # a consolidated reply: the holder message's event id
     pending: list[dict] = field(default_factory=list)  # rows reduced but not yet projected
-    visibility: dict = field(default_factory=lambda: {"lifecycle": LIFECYCLE_SCOPE, "telemetry": TELEMETRY_SCOPE})
+    visibility: dict = field(default_factory=lambda: {"lifecycle": LIFECYCLE_AUDIENCE, "telemetry": TELEMETRY_AUDIENCE})
     applied: list[str] = field(default_factory=list)
     sessions: dict[str, int] = field(default_factory=dict)
     telemetry: int = 0
@@ -118,25 +119,27 @@ def _task_dict(state: TaskActivityState) -> dict:
 
 
 def _row(state: TaskActivityState, kind: str, line: str, ts: float, done: bool = False,
-         scope: str | None = None) -> dict:
+         audience: str | None = None, projection: str = "RUNTIME_DETAIL") -> dict:
     # The pid rides in the snapshot's pending list, so a replay projects the same identity again
     # and the row writer applies it once.
     state.emitted += 1
     return {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done, "pid": f"{state.task_id}:{state.generation}:{state.emitted}",
-            "scope": scope or state.visibility.get("telemetry", TELEMETRY_SCOPE)}
+            "audience": audience or state.visibility.get("telemetry", TELEMETRY_AUDIENCE), "projection": projection}
 
 
 def shared_projection(state: TaskActivityState) -> dict:
     """What the room may see: who is on it and where it stands. No summary text, no steps."""
     return {"task_id": state.task_id, "message_event_id": state.message_event_id, "worker": state.worker,
             "phase": state.phase, "generation": state.generation, "started_at": state.started_at,
-            "last_activity_at": state.last_activity_at, "scope": state.visibility.get("lifecycle", LIFECYCLE_SCOPE)}
+            "last_activity_at": state.last_activity_at, "audience": state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
+            "projection": "TASK_STATUS"}
 
 
 def private_projection(state: TaskActivityState) -> dict:
     """What only the owner's own clients receive: the shared fields plus the summary and the sequence."""
     return dict(shared_projection(state), summary=state.summary, seq=state.seq,
-                activity_session_id=state.activity_session_id, scope=state.visibility.get("telemetry", TELEMETRY_SCOPE))
+                activity_session_id=state.activity_session_id, audience=state.visibility.get("telemetry", TELEMETRY_AUDIENCE),
+                projection="RUNTIME_DETAIL")
 
 
 _PHASE_ROW = {
@@ -191,7 +194,7 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
         elif item.reason and item.to_phase in TERMINAL:
             line = f"{line}: {item.reason}" if item.to_phase != "COMPLETED" else item.reason
         rows.append(_row(state, kind, line, now, done=item.to_phase in TERMINAL,
-                         scope=state.visibility.get("lifecycle", LIFECYCLE_SCOPE)))
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
         return state, rows
     # a runtime observation
     last = state.sessions.get(item.activity_session_id, 0)
@@ -298,7 +301,7 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws, scope=row.get("scope"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1)
+                   workspace=self.ws, audience=row.get("audience"), projection=row.get("projection"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1)
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"

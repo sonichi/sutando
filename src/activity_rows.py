@@ -173,7 +173,7 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
-           scope: str | None = None,
+           audience: str | None = None, projection: str | None = None,
            pid: str | None = None, ts: float | None = None, replay: bool = False) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
@@ -182,8 +182,10 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     rec: dict = {"ts": ts if ts is not None else time.time(), "line": line.strip(), "kind": kind}
     if pid:
         rec["pid"] = pid
-    if scope:
-        rec["scope"] = scope
+    if audience:
+        rec["audience"] = audience
+    if projection:
+        rec["projection"] = projection
     if room:
         rec["room"] = room
     if task:
