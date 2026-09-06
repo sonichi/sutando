@@ -1832,5 +1832,34 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
             nr._streams = orig
 
 
+class AVanishedRosterRowAdmitsNoComponent(unittest.TestCase):
+    """`main()` reloads the roster between selection and reservation.
+
+    If the selected row is gone by then, its component root is None. The membership
+    test read `root is not None and r != root`, so the `continue` never fired and
+    EVERY other row joined the component -- one ask associated with every remaining
+    reviewer, and their reservations parked behind it.
+    """
+
+    ROSTER = {"alice": {"discord_id": "1", "stand": "@a:x"},
+              "bob": {"discord_id": "2", "stand": "@b:x"}}
+
+    def test_a_present_row_admits_only_its_own_component(self):
+        # The positive control: without it, a fix that admits nothing always passes.
+        tags = nr.component_tags(self.ROSTER, "alice")
+        self.assertIn(nr._tag("actor", "alice"), tags)
+        self.assertNotIn(nr._tag("actor", "bob"), tags)
+
+    def test_a_MISSING_row_admits_nobody_else(self):
+        tags = nr.component_tags(self.ROSTER, "carol")
+        self.assertNotIn(nr._tag("actor", "alice"), tags)
+        self.assertNotIn(nr._tag("actor", "bob"), tags)
+        self.assertEqual(tags, {nr._tag("actor", "carol")},
+                         "a vanished row must carry only itself")
+
+    def test_an_empty_roster_admits_only_the_candidate(self):
+        self.assertEqual(nr.component_tags({}, "alice"), {nr._tag("actor", "alice")})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

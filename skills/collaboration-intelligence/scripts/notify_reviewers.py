@@ -1171,7 +1171,9 @@ def component_tags(roster, name: str) -> set:
     root = comp.get(name)
     tags = {_tag("actor", actor_of.get(name, name))}
     for other, r in comp.items():
-        if root is not None and r != root:
+        # No root means the row vanished between roster reads. Admitting every
+        # component there associates one ask with every remaining reviewer.
+        if root is None or r != root:
             continue
         tags.add(_tag("actor", actor_of.get(other, other)))
         endpoint = durable_endpoint((roster or {}).get(other) or {})

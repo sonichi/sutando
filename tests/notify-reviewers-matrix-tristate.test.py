@@ -68,6 +68,18 @@ class NotifierMapsTheTriState(unittest.TestCase):
              patch("sys.argv", argv):
             return self.mod.main(), sends["n"]
 
+    def _mention_result(self, code):
+        """What mention() actually returns for an HTTP <code>, not what we wish it did."""
+        from urllib.error import HTTPError
+        m = _load(MENTION, f"mn{code}")
+        with patch.object(m, "http_json", side_effect=HTTPError("u", code, "e", None, None)), \
+                patch.object(m, "gateway", return_value=("http://x", {})), \
+                patch.object(m, "load_gate", return_value={}), \
+                patch.object(m, "gate_allows", return_value=True), \
+                patch.object(m, "resolve_user",
+                             return_value={"ok": True, "mxid": "@m-stand:x", "candidates": []}):
+            return m.mention("@m-stand:x", "body", "!r:x", gate={})
+
     def _outcomes(self):
         return [json.loads(l)["outcome"] for l in self.led.read_text().splitlines() if l.strip()]
 
@@ -93,6 +105,22 @@ class NotifierMapsTheTriState(unittest.TestCase):
         rc2, s2 = self._invoke(payload)
         self.assertEqual((s1, s2), (1, 1), "a proven non-delivery releases the park")
         self.assertEqual(self._outcomes().count("failed"), 2)
+
+    def test_a_5xx_parks_and_the_second_invocation_does_not_resend(self):
+        # The state is taken from mention() rather than written here: a hand-set
+        # `unknown` would pass while the classifier still answered `failed`.
+        payload = dict(self._mention_result(500))
+        rc1, s1 = self._invoke(payload)
+        rc2, s2 = self._invoke(payload)
+        self.assertEqual((s1, s2), (1, 0), "a 5xx may have applied the write; do not repeat it")
+        self.assertIn("unknown", self._outcomes())
+        self.assertNotIn("failed", self._outcomes())
+
+    def test_the_classifier_splits_4xx_from_5xx(self):
+        self.assertEqual(self._mention_result(403)["state"], "failed")
+        self.assertEqual(self._mention_result(404)["state"], "failed")
+        self.assertEqual(self._mention_result(500)["state"], "unknown")
+        self.assertEqual(self._mention_result(503)["state"], "unknown")
 
     def test_the_control_an_event_id_is_confirmed(self):
         rc, s = self._invoke({"ok": True, "event_id": "$e", "state": "confirmed"})
