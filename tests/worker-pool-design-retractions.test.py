@@ -1198,5 +1198,28 @@ class QuiesceOwnerIsONEComponentEverywhere(unittest.TestCase):
         self.assertRegex(w, r"a rule is not an owner")
 
 
+
+class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
+    """Rule 5 and the binding schema must not demand opposite outcomes for {W1 stale, W2 live}.
+
+    The positive whole-set wording existing is not enough: it coexisted with the
+    per-member wording for a whole review round while all tests passed. This is the
+    NEGATIVE half — the per-member phrasing must be ABSENT from the document.
+    """
+
+    def _flat(self):
+        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
+
+    def test_the_per_member_wording_is_gone(self):
+        # "neither does any other worker" makes an eligible bound peer suppress too,
+        # which leaves a room dark that the schema says is served.
+        self.assertNotIn("neither does any other worker", self._flat())
+
+    def test_rule_five_names_the_whole_set_quantifier(self):
+        self.assertIn("only when EVERY bound member is ineligible", self._flat())
+
+    def test_an_unbound_worker_is_what_is_refused_not_a_bound_peer(self):
+        self.assertIn("no UNBOUND worker stands in", self._flat())
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

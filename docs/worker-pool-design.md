@@ -1325,17 +1325,20 @@ rather than by a stand-in exception.
 explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping
 itself to a room whose worker might still come back.
 
-5. **No stand-in:** while a pinned worker is ineligible — beat stale, or wedged
-   under rule 6 — new work for its rooms stays PENDING. The core does not claim
-   it, and neither does any other worker. Work the ineligible worker had ALREADY
-   CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost;
-   what is refused is ADMITTING NEW work on its behalf. A fresh beat alone does
-   not restore eligibility; rule 6 is what says whether beating counts. The pin is
-   not changed; nothing is loaned or re-bound.
+5. **No stand-in:** the rule is quantified over the room's binding SET, never
+   over one member. An ineligible member — beat stale, or wedged under rule 6 —
+   suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New
+   work stays PENDING only when EVERY bound member is ineligible. The core does
+   not claim it, and no UNBOUND worker stands in. Work an ineligible worker had
+   ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is
+   lost; what is refused is ADMITTING NEW work to a set with no eligible member. A
+   fresh beat alone does not restore eligibility; rule 6 is what says whether
+   beating counts. The pin is not changed; nothing is loaned or re-bound.
 
-   The room is therefore unserved until the worker returns or the owner
-   explicitly redirects or cancels the work. That availability gap is deliberate:
-   there is no second claimant to fence because there is never a second claimant.
+   A room whose every bound member is ineligible is therefore unserved until one
+   returns or the owner explicitly redirects or cancels the work. That
+   availability gap is deliberate: there is no second claimant to fence because an
+   unbound worker is never a claimant.
 6. **Busy is not hung.** A worker with a fresh beat and a claimed, unfinished
    task is busy, and the core leaves its rooms alone. A fresh-beat worker becomes
    INELIGIBLE only when the oldest unclaimed task ADDRESSED TO IT is
