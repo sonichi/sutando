@@ -36,6 +36,68 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(hc, "WORKSPACE_DIR", orig))
         return ws
 
+    def _gateway_sidecar(self, ws, *, age_s: float):
+        """Write the gateway sidecar with last_ok_ts age_s seconds in the past."""
+        import time
+        (ws / "state").mkdir(exist_ok=True)
+        (ws / "state" / "gateway-status.json").write_text(
+            json.dumps({"connected": True, "ts": time.time(),
+                        "last_ok_ts": time.time() - age_s}))
+
+    def test_gateway_row_refuted_by_a_live_sidecar_is_reported_as_stale(self):
+        import time
+        ws = self._with_workspace({
+            "updated_at": int(time.time()) - 3600,
+            "rows": {"gateway": {"state": "todo",
+                                 "detail": "gateway process up, relay not connected"}},
+        })
+        self._gateway_sidecar(ws, age_s=5)
+        r = hc.check_onboarding_status()
+        # Still a warn, but about the MIRROR — never repeating its false claim.
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("Console mirror is stale", r["detail"])
+        self.assertNotIn("user-facing setup incomplete", r["detail"])
+
+    def test_unrecognised_gateway_detail_is_flagged_not_passed_on_as_fact(self):
+        """A reworded Console detail must announce itself, not silently stop matching."""
+        import time
+        ws = self._with_workspace({
+            "updated_at": int(time.time()) - 3600,
+            "rows": {"gateway": {"state": "todo",
+                                 "detail": "relay link is down"}},   # NOT "not connected"
+        })
+        self._gateway_sidecar(ws, age_s=5)
+        r = hc.check_onboarding_status()
+        self.assertEqual(r["status"], "warn")
+        # The row still shows (we cannot prove it wrong), but never as bare fact.
+        self.assertIn("relay link is down", r["detail"])
+        self.assertIn("not one this check recognises", r["detail"])
+
+    def test_unrecognised_gateway_detail_is_silent_when_the_relay_is_not_live(self):
+        """No local evidence, no disagreement — the row stands plainly."""
+        import time
+        ws = self._with_workspace({
+            "updated_at": int(time.time()) - 3600,
+            "rows": {"gateway": {"state": "todo", "detail": "relay link is down"}},
+        })
+        self._gateway_sidecar(ws, age_s=4000)
+        r = hc.check_onboarding_status()
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("not one this check recognises", r["detail"])
+
+    def test_gateway_row_stands_when_the_sidecar_is_also_stale(self):
+        import time
+        ws = self._with_workspace({
+            "updated_at": int(time.time()) - 3600,
+            "rows": {"gateway": {"state": "todo",
+                                 "detail": "gateway process up, relay not connected"}},
+        })
+        self._gateway_sidecar(ws, age_s=6000)
+        r = hc.check_onboarding_status()
+        # No live evidence to refute it, so the row is taken at its word.
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("user-facing setup incomplete", r["detail"])
+
     def _core_heartbeat(self, ws, *, fresh: bool):
         """Write this host's core heartbeat; fresh=False makes it look dead."""
         import os

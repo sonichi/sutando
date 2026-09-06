@@ -2761,6 +2761,9 @@ def _fetch_age_phrase(age_s) -> str:
     return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
 
 
+ONBOARDING_GATEWAY_FRESH_S = 300
+
+
 def check_onboarding_status() -> "dict | None":
     """Read the desktop checklist's agent surface (onboarding v2 spec,
     ag2space-cinny-desktop#165 S4).
@@ -2799,6 +2802,21 @@ def check_onboarding_status() -> "dict | None":
         stale_core = "core" in todo_keys and _down and _fresh_local_core_record() is not None
         if stale_core:
             todo_keys.remove("core")
+        # The mirror is write-on-change, so a Console that stopped leaves its last
+        # row asserting forever. Refute the gateway row the way core is refuted.
+        _gw = rows.get("gateway") if isinstance(rows.get("gateway"), dict) else {}
+        _gw_age_h = _gateway_last_ok_age_h()
+        # Liveness is local evidence and carries no wording; only the claim being
+        # refuted is matched by text, so a reword narrows the match, not the proof.
+        _gw_live = (_gw_age_h is not None
+                    and _gw_age_h * 3600.0 <= ONBOARDING_GATEWAY_FRESH_S)
+        _gw_disconnected = "not connected" in str(_gw.get("detail") or "").lower()
+        stale_gateway = "gateway" in todo_keys and _gw_disconnected and _gw_live
+        if stale_gateway:
+            todo_keys.remove("gateway")
+        # A todo row this check cannot interpret, while the relay is demonstrably up,
+        # is a disagreement; passing it on as fact is how a reword would hide itself.
+        unverified_gateway = "gateway" in todo_keys and _gw_live and not _gw_disconnected
         todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k
                 for k in todo_keys]
         # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
@@ -2807,20 +2825,29 @@ def check_onboarding_status() -> "dict | None":
         age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
-    if stale_core:
+    unverified = ("; the gateway row's detail is not one this check recognises, yet the "
+                  "relay sidecar polled OK moments ago \u2014 treat that row as unverified, and "
+                  "if the Console reworded it this check has stopped refuting it"
+                  ) if unverified_gateway else ""
+    if stale_core or stale_gateway:
         rest = f"; still todo: {', '.join(todo)}" if todo else ""
+        refuted = " and ".join(
+            x for x in (("its core row says 'not running' but this host's heartbeat is live"
+                         if stale_core else None),
+                        ("its gateway row says 'relay not connected' but the gateway sidecar "
+                         "polled OK moments ago" if stale_gateway else None)) if x)
         return {
             "name": name,
             "status": "warn",
-            "detail": (f"Console mirror is stale — its core row says 'not running' but this "
-                       f"host's heartbeat is live; mirror last written {_age_phrase(age_s)}"
-                       f"{rest}"),
+            "detail": (f"Console mirror is stale — {refuted}; mirror last written "
+                       f"{_age_phrase(age_s)}{rest}{unverified}"),
         }
     if todo:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"user-facing setup incomplete: {', '.join(todo)} ({_age_phrase(age_s)})",
+            "detail": (f"user-facing setup incomplete: {', '.join(todo)} "
+                       f"({_age_phrase(age_s)}){unverified}"),
         }
     return {"name": name, "status": "ok",
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
