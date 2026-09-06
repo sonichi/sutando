@@ -549,6 +549,25 @@ with tempfile.TemporaryDirectory() as d:
           rc_s == 2 and "cannot stage" in msg_s, msg_s)
     check("record: ...and a failed stage records no pointer at all", not ptr.exists())
 
+    # The CLI is the only caller in production, and it derives `projects` from
+    # health-check's MEMORY_DIR rather than taking it as an argument.
+    ptr.unlink(missing_ok=True)
+    class _Mod:
+        MEMORY_DIR = str(third)
+    _hc = mib._health_check
+    try:
+        mib._health_check = lambda repo: _Mod()
+        rc_cli = mib.main(["--record", str(third / "MEMORY.md"), "--repo", str(REPO)])
+    finally:
+        mib._health_check = _hc
+    check("record: the CLI --record path records through the same guard", rc_cli == 0 and ptr.exists(), rc_cli)
+    try:
+        mib._health_check = lambda repo: _Mod()
+        rc_cli2 = mib.main(["--record", str(third / "MEMORY.md"), "--repo", str(REPO)])
+    finally:
+        mib._health_check = _hc
+    check("record: ...and a SECOND CLI record refuses, exactly as the function does", rc_cli2 == 2, rc_cli2)
+
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
