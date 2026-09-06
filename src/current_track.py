@@ -12,7 +12,7 @@ before the head is replaced, so a crash leaves a duplicate, never a gap.
 
     append(path, text)                -> None
     replace(path, text)               -> None   (create or rewrite the whole head)
-    rotate(path, keep_bytes) -> RotateResult(head, archived, oversized)
+    rotate(path, keep_bytes, pin) -> RotateResult(head, archived, oversized)
 
 An entry that alone exceeds keep_bytes is never truncated: rotate() keeps it,
 archives everything older, and reports oversized=True so a caller can refuse
@@ -27,8 +27,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-ENTRY = re.compile(r"^(##+ |### )", re.M)
+ENTRY = re.compile(r"^##+ ", re.M)
 DEFAULT_KEEP = 32 * 1024
+
+#: Entries other tools read as LIVE STATE, kept at any age: an owner hold that
+#: ages out reads as "not held" to every consumer that greps this file.
+PIN_DEFAULT = re.compile(
+    r"\bHOLD\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
+    r"|\bin force until\b|\bawait(?:ing)? (?:the )?owner\b|⛔",
+    re.I,
+)
 
 
 def lock_path(path: Path) -> Path:
@@ -77,33 +85,47 @@ def _size(s: str) -> int:
 class RotateResult:
     head: str
     archived: str
-    oversized: bool          # the newest entry alone exceeds the budget; kept, never cut
+    oversized: bool          # head still over budget; nothing was cut to get there
+    pinned_bytes: int = 0    # of the head, held by pinned entries — the usual cause
+    pinned_count: int = 0
 
 
-def plan(text: str, keep_bytes: int) -> RotateResult:
-    """Keep the preamble and the newest entries under keep_bytes; the rest is archived."""
+def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
+    """Keep the preamble, every PINNED entry, and the newest of the rest.
+
+    Pinned entries are kept at any age and in their original order. An owner
+    hold is an ordinary heading, so age-only rotation moved it to the archive
+    and every consumer that greps the head then read "not held" — a silent
+    lift, with nothing to notice. `pin=None` restores age-only behaviour.
+    """
     if _size(text) <= keep_bytes:
         return RotateResult(text, "", False)
     preamble, entries = split(text)
     if not entries:
         return RotateResult(text, "", True)
-    budget = keep_bytes - _size(preamble)
-    kept: list[str] = []
-    for e in reversed(entries):
-        if kept and _size(e) + sum(_size(k) for k in kept) > budget:
+    pinned = {i for i, e in enumerate(entries) if pin and pin.search(e)}
+    budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in pinned)
+    keep = set(pinned)
+    used = 0
+    for i in range(len(entries) - 1, -1, -1):
+        if i in pinned:
+            continue
+        if keep and used + _size(entries[i]) > budget:
             break
-        kept.insert(0, e)
-    archived = "".join(entries[: len(entries) - len(kept)])
-    head = preamble + "".join(kept)
-    return RotateResult(head, archived, _size(head) > keep_bytes)
+        keep.add(i)
+        used += _size(entries[i])
+    head = preamble + "".join(entries[i] for i in sorted(keep))
+    archived = "".join(entries[i] for i in range(len(entries)) if i not in keep)
+    pinned_bytes = sum(_size(entries[i]) for i in pinned)
+    return RotateResult(head, archived, _size(head) > keep_bytes, pinned_bytes, len(pinned))
 
 
 def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
-           _between_read_and_replace=None) -> RotateResult:
+           pin=PIN_DEFAULT, _between_read_and_replace=None) -> RotateResult:
     """Rotate under the writer lock. `_between_read_and_replace` is a test seam."""
     with locked(path):
         text = path.read_text(encoding="utf-8")
-        r = plan(text, keep_bytes)
+        r = plan(text, keep_bytes, pin)
         if _between_read_and_replace:
             _between_read_and_replace()
         if dry_run or not r.archived:

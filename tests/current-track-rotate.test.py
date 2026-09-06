@@ -3,6 +3,7 @@
 oversized newest entry is refused loudly instead of reported as nothing to do."""
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,89 @@ class Plan(unittest.TestCase):
         self.assertTrue(r.oversized)
         self.assertEqual(r.head, pre + big)              # kept whole, never cut
         self.assertEqual(r.archived, "".join(ents))      # everything older still leaves
+
+
+class PinnedEntries(unittest.TestCase):
+    """An owner hold must survive its own rotation; age-only rotation lifted it silently."""
+
+    HOLD = ("## 2026-01-01T00:00Z — HOLD: hands off #3166 and #3317, in force until 2026-09-08\n"
+            "owner instruction, oldest entry in the file\n\n")
+
+    def corpus(self, n=60, size=900):
+        pre, _ = fixture(0)
+        filler = "".join(f"## 2026-09-0{i%9+1}T0{i%9}:00Z — entry {i}\n" + ("x" * size) + "\n\n"
+                         for i in range(n))
+        return pre + self.HOLD + filler
+
+    def test_a_hold_survives_at_every_budget_the_defect_did_not(self):
+        text = self.corpus()
+        for keep in (8 * 1024, 16 * 1024, 32 * 1024):
+            r = ct.plan(text, keep)
+            self.assertIn("hands off #3166", r.head, f"hold archived at keep={keep}")
+            self.assertNotIn("hands off #3166", r.archived)
+            self.assertIn("entry 59", r.head)          # newest ordinary entry still kept
+            self.assertIn("entry 0", r.archived)       # ordinary old entries still rotate
+
+    def test_pin_none_reproduces_the_reported_loss(self):
+        r = ct.plan(self.corpus(), 8 * 1024, pin=None)
+        self.assertNotIn("hands off #3166", r.head)
+        self.assertIn("hands off #3166", r.archived)
+
+    def test_entries_keep_their_order_with_a_pinned_one_hoisted(self):
+        r = ct.plan(self.corpus(), 8 * 1024)
+        head = r.head
+        self.assertLess(head.index("hands off #3166"), head.index("entry 59"))
+
+    def test_a_custom_pin_replaces_the_default_vocabulary(self):
+        # Strip EVERY default-vocabulary token, or the default pin keeps it and
+        # the test proves nothing about --pin.
+        text = self.corpus().replace(
+            "HOLD: hands off #3166 and #3317, in force until 2026-09-08",
+            "KEEPME: quietly about #3166 and #3317")
+        self.assertNotIn("quietly", ct.plan(text, 8 * 1024).head)
+        r = ct.plan(text, 8 * 1024, pin=re.compile("KEEPME"))
+        self.assertIn("quietly", r.head)
+
+    def test_pinned_alone_over_budget_is_oversized_never_dropped(self):
+        big = "## 2026-01-01T00:00Z — HOLD: hands off\n" + ("y" * 40_000) + "\n\n"
+        pre, _ = fixture(0)
+        r = ct.plan(pre + big + self.corpus()[len(pre):], 32 * 1024)
+        self.assertTrue(r.oversized)
+        self.assertIn("hands off", r.head)
+
+    def test_the_refusal_names_the_cause_pins_or_one_giant_entry(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        pre, _ = fixture(0)
+        p = Path(d.name) / "current-track.md"
+        rot = Cli(load(ROTATE))
+        # Cause 1: many pinned entries, none of them individually huge.
+        holds = "".join(f"## 2026-0{i%9+1}-01T00:00Z — HOLD: hands off #{3000+i}\n" + ("h" * 900) + "\n\n"
+                        for i in range(12))
+        p.write_text(pre + holds + "".join(f"## 2026-09-0{i%9+1}T00:00Z — entry {i}\n" + ("x" * 500) + "\n\n"
+                                            for i in range(20)))
+        r = rot(p, "--keep-bytes", "4096")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("pinned entries", r.stderr)
+        self.assertNotIn("the newest entry alone", r.stderr)
+        # Cause 2: one giant unpinned entry, no pins at all.
+        p.write_text(pre + "## 2026-09-06T02:00Z — the giant\n" + ("y" * 40_000) + "\n")
+        r = rot(p, "--keep-bytes", "32768")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("the newest entry alone", r.stderr)
+        self.assertNotIn("pinned entries", r.stderr)
+
+    def test_cli_pin_flags(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())
+        rot = Cli(load(ROTATE))
+        r = rot(p, "--keep-bytes", "8192", "--dry-run"); self.assertEqual(r.returncode, 0)
+        r = rot(p, "--keep-bytes", "8192", "--pin", "KEEPME", "--no-pin"); self.assertEqual(r.returncode, 2)
+        r = rot(p, "--keep-bytes", "8192", "--pin", "([unclosed"); self.assertEqual(r.returncode, 2)
+        r = rot(p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0)
+        self.assertIn("hands off #3166", p.read_text())
+        p.write_text(self.corpus())
+        r = rot(p, "--keep-bytes", "8192", "--no-pin"); self.assertEqual(r.returncode, 0)
+        self.assertNotIn("hands off #3166", p.read_text())
 
 
 class RotateAndAppend(unittest.TestCase):
