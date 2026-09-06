@@ -115,24 +115,39 @@ def load_roster() -> dict:
     return roster_union(paths)
 
 
-def durable_endpoint(entry: dict) -> "str | None":
-    """The transport's immutable recipient id, or None if the entry has no
-    route. One owner: a second copy drifts from the one the park writes."""
+def durable_endpoints(entry: dict) -> set:
+    """EVERY immutable recipient id this row holds, for IDENTITY.
+
+    A row carrying both transports is one person on two routes; tagging only the
+    route we would send on let a second row for that person miss the match and
+    count as a separate reviewer.
+    """
     if not isinstance(entry, dict):
-        return None
+        return set()
     stand, room = entry.get("stand"), entry.get("room")
     dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
-    # A non-string becomes a hash key downstream, so ONE malformed row starves
-    # every requested reviewer — against resolve()'s one-bad-entry isolation.
     if not isinstance(stand, (str, type(None))):
         stand = None
     if not isinstance(dm_id, (str, int, type(None))):
         dm_id = None
+    out = set()
     if stand and room:
-        return stand
+        out.add(stand)
     if dm_id and entry.get("home_channel"):
-        return f"discord:{dm_id}"
-    return None
+        out.add(f"discord:{dm_id}")
+    return out
+
+
+def durable_endpoint(entry: dict) -> "str | None":
+    """The ONE route to send on, or None. Identity uses durable_endpoints().
+
+    Selects from the plural rather than re-deriving: a second copy of the
+    normalisation drifts from the one the park writes.
+    """
+    eps = durable_endpoints(entry)
+    # Matrix first, preserving the route these rows have always been sent on.
+    return next((e for e in sorted(eps) if not e.startswith("discord:")),
+                next(iter(sorted(eps)), None))
 
 
 def stated_reason(entry: dict) -> str:
@@ -1116,10 +1131,15 @@ def identity_components(roster) -> dict:
             if isinstance(v, dict) and not k.startswith("_")]
     for name, entry in rows:
         akey = ("actor", actor_of.get(name, name))
-        endpoint = durable_endpoint(entry)
+        # EVERY endpoint, not just the send route: a row holding both transports
+        # is the connector between its person's two rows.
+        endpoints = sorted(durable_endpoints(entry))
         # An off-allowlist or unroutable row still NAMES its person, so it still
         # carries the link; dropping it here is what let a connector disappear.
-        union(akey, ("endpoint", endpoint)) if endpoint else find(akey)
+        for endpoint in endpoints:
+            union(akey, ("endpoint", endpoint))
+        if not endpoints:
+            find(akey)
     return {name: find(("actor", actor_of.get(name, name))) for name, _ in rows}
 
 
@@ -1183,8 +1203,7 @@ def component_tags(roster, name: str) -> set:
         if root is None or r != root:
             continue
         tags.add(_tag("actor", actor_of.get(other, other)))
-        endpoint = durable_endpoint((roster or {}).get(other) or {})
-        if endpoint:
+        for endpoint in durable_endpoints((roster or {}).get(other) or {}):
             scheme, _, rest = endpoint.partition(":")
             tags.add(_tag("endpoint", "discord", rest)
                      if scheme == "discord" else _tag("endpoint", "mx", endpoint))
@@ -1209,8 +1228,7 @@ def component_resolver(roster):
         key = f"person:{root[0]}:{root[1]}"
         axes["name"][name] = key
         axes["actor"].setdefault(actor_of.get(name, name), key)
-        endpoint = durable_endpoint((roster or {}).get(name) or {})
-        if endpoint:
+        for endpoint in durable_endpoints((roster or {}).get(name) or {}):
             axes["endpoint"].setdefault(endpoint, key)
 
     def canon(w):
@@ -1299,16 +1317,15 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     # can hold different ones and either may be the recorded spelling.
     by_actor: dict = {}
     for k, v in (roster or {}).items():
-        ep = durable_endpoint(v)
-        if ep:
+        for ep in durable_endpoints(v):
             by_actor.setdefault(actor_of.get(k, k), set()).add(ep)
 
     def _ids(t):
         # From the ROSTER too: a caller may pass a bare {"name": ...} target,
         # and deriving from the dict alone left those on the name axis only.
         actor = actor_of.get(t["name"], t["name"])
-        got = {actor, t["name"], t.get("endpoint"),
-               durable_endpoint((roster or {}).get(t["name"]))}
+        got = {actor, t["name"], t.get("endpoint")}
+        got |= durable_endpoints((roster or {}).get(t["name"]) or {})
         got |= by_actor.get(actor, set())
         return {i for i in got if i}
 
@@ -1342,7 +1359,7 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         actor = actor_of.get(k, k)
         # The SAME component-wide set the verdict uses: this row's own endpoint
         # alone offered an already-asked person under an earlier-sorting alias.
-        ids = {actor, k, durable_endpoint(v)} | by_actor.get(actor, set())
+        ids = {actor, k} | durable_endpoints(v) | by_actor.get(actor, set())
         # keweichen is deliberately never offered as a widen target; the
         # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
         if (ids & prior) or k == "keweichen":
