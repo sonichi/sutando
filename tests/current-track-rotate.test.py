@@ -17,6 +17,34 @@ sys.path.insert(0, str(REPO / "src"))
 import current_track as ct  # noqa: E402
 
 
+def load(path):
+    """Import a hyphen-named script so its main() runs in-process (coverage sees it)."""
+    spec = importlib.util.spec_from_file_location(path.stem.replace("-", "_"), path)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+
+class Cli:
+    def __init__(self, mod, stdin=None):
+        self.mod, self.stdin = mod, stdin
+
+    def __call__(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        old_in = sys.stdin
+        try:
+            if self.stdin is not None:
+                sys.stdin = io.StringIO(self.stdin)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    rc = self.mod.main([str(a) for a in argv])
+                except SystemExit as e:
+                    rc = e.code
+        finally:
+            sys.stdin = old_in
+        return type("R", (), {"returncode": rc, "stdout": out.getvalue(), "stderr": err.getvalue()})()
+
+
 def fixture(n_entries=40, size=600):
     pre = "# current track\n\nMain goal: keep the loop honest.\n\n"
     entries = [f"## 2026-09-{i%30+1:02d}T{i%24:02d}:00Z — entry {i}\n" + ("x" * size) + "\n\n" for i in range(n_entries)]
@@ -105,21 +133,24 @@ class RotateAndAppend(unittest.TestCase):
         for i in range(3):
             self.assertEqual(text.count(f"from the CLI {i}"), 1)
 
-    def test_cli_exit_codes(self):
-        r = run(ROTATE, self.p, "--keep-bytes", "8192", "--dry-run"); self.assertEqual(r.returncode, 0); self.assertIn("would move", r.stdout)
-        r = run(ROTATE, self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("moved", r.stdout)
-        r = run(ROTATE, self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("nothing to do", r.stdout)
-        r = run(ROTATE, self.p, "--keep-bytes", "0"); self.assertEqual(r.returncode, 2)
-        r = run(ROTATE, self.p.with_name("absent.md")); self.assertEqual(r.returncode, 1); self.assertIn("cannot read", r.stderr)
+    def test_cli_exit_codes_in_process(self):
+        rot = Cli(load(ROTATE))
+        r = rot(self.p, "--keep-bytes", "8192", "--dry-run"); self.assertEqual(r.returncode, 0); self.assertIn("would move", r.stdout)
+        r = rot(self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("moved", r.stdout)
+        r = rot(self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("nothing to do", r.stdout)
+        r = rot(self.p, "--keep-bytes", "0"); self.assertEqual(r.returncode, 2)
+        r = rot(self.p.with_name("absent.md")); self.assertEqual(r.returncode, 1); self.assertIn("cannot read", r.stderr)
         self.p.write_text(self.pre + "## 2026-09-06T02:00Z — the giant\n" + "y" * 40_000 + "\n")
-        r = run(ROTATE, self.p, "--keep-bytes", "32768"); self.assertEqual(r.returncode, 3)
+        r = rot(self.p, "--keep-bytes", "32768"); self.assertEqual(r.returncode, 3)
         self.assertIn("REFUSING", r.stderr); self.assertIn("the giant", r.stderr)
-        r = run(ROTATE, self.p, "--keep-bytes", "32768", "--dry-run"); self.assertEqual(r.returncode, 3); self.assertIn("would keep", r.stderr)
-        r = run(APPEND, self.p, stdin="   \n"); self.assertEqual(r.returncode, 1)
-        r = run(APPEND, stdin="x"); self.assertEqual(r.returncode, 2)
-        r = run(APPEND, self.p, stdin="## 2026-09-06T02:30Z — no trailing newline"); self.assertEqual(r.returncode, 0)
+        r = rot(self.p, "--keep-bytes", "32768", "--dry-run"); self.assertEqual(r.returncode, 3); self.assertIn("would keep", r.stderr)
+        self.p.write_text("plain prose with no heading " * 2000)
+        r = rot(self.p, "--keep-bytes", "1024"); self.assertEqual(r.returncode, 3); self.assertIn("the preamble", r.stderr)
+        app = load(APPEND)
+        r = Cli(app, stdin="   \n")(self.p); self.assertEqual(r.returncode, 1)
+        r = Cli(app, stdin="x")(); self.assertEqual(r.returncode, 2)
+        r = Cli(app, stdin="## 2026-09-06T02:30Z — no trailing newline")(self.p); self.assertEqual(r.returncode, 0)
         self.assertTrue(self.p.read_text().endswith("no trailing newline\n"))
-
 
 if __name__ == "__main__":
     unittest.main()
