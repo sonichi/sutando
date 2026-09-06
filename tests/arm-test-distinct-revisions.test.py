@@ -112,10 +112,8 @@ class TestArming(unittest.TestCase):
         self.assertIn("rc=0", r.stdout)
 
     def test_whitespace_only_revisions_execute_their_own_bytes(self):
-        # @yixuan-ag2/@qingyun-wu on #3817: _git() stripped, so two blob ids wrote
-        # IDENTICAL bytes while the dupe guard keyed on the differing blob ids — the
-        # tool certified a comparison it never ran. Writing raw bytes closes that:
-        # these two arms genuinely differ, and the reported identity is what executed.
+        # Raw bytes make these arms genuinely differ; a stripped read made them
+        # identical while distinct blob ids passed the dupe guard.
         f = Path(self.tmp) / "src" / "m.py"
         f.write_text(f.read_text().rstrip("\n") + "\n\n\n")
         subprocess.run(["git", "-C", self.tmp, "commit", "-aqm", "ws"], check=True)

@@ -97,9 +97,8 @@ def main(argv=None) -> int:
             rc, summary = run_arm(a.test, rev)
             rows.append((rev, _git("rev-parse", rev) or "?", written[:9], rc, summary))
             seen.setdefault(written, []).append(rev)
-        # On a clean tree this arm's CONTENT is HEAD's, so adding it would trip the
-        # dupe refusal on a comparison nobody asked for. Compare the same identity
-        # `seen` is keyed on -- a blob id here would never match and never skip.
+        # Compare the identity `seen` is keyed on: a blob id never matches, so the
+        # clean-tree arm would never skip and would trip the dupe refusal.
         wt = hashlib.sha256(saved).hexdigest()
         if not a.no_worktree_arm and wt not in seen:
             target.write_bytes(saved)
