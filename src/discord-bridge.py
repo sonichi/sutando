@@ -1019,17 +1019,10 @@ def load_channel_context_blacklist(channel_id):
         pass
     return set()
 
-def _should_notify_owner_on_seed(sender_id, owner_ids):
-    """True iff a thread auto-seed should @-mention the owner.
-
-    Fires only when a NON-OWNER seeds the thread: an auto-opened thread can
-    otherwise quietly accumulate sandboxed (non-owner) replies the owner never
-    sees, because the @-mention is what reaches the owner's Discord client even
-    when they aren't following the thread. Owner-seeded threads need no ping —
-    the owner is already there. False when there is no owner to mention.
-    """
-    owners = {str(o) for o in (owner_ids or [])}
-    return bool(owners) and str(sender_id) not in owners
+def _should_notify_owner_on_seed(sender_id, owner_id):
+    """True iff a non-owner seeded the thread. Takes the CANONICAL owner, not
+    allowFrom: membership would suppress the notice for a team sender."""
+    return bool(owner_id) and str(sender_id) != str(owner_id)
 
 def _has_sibling_bots(access_data, self_id):
     """True iff this deployment declares sibling Sutando bots — other bots of
@@ -1058,13 +1051,39 @@ def _has_sibling_bots(access_data, self_id):
         return False
 
 def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
-    """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
+    """Owner-facing auto-seed notice, pure. The `<#thread_id>` mention is what
+    makes it self-locating in a DM, which is its only delivery path."""
     return (
-        f"<@{owner_id}> 🌱 Auto-seeded this thread to access.json "
+        f"<@{owner_id}> 🌱 Auto-seeded thread <#{thread_id_str}> to access.json "
         f"(first message from {author_mention}, parent {parent_label}). "
         f"Tier still resolves by sender identity — non-owners stay sandboxed. "
         f"`/discord:access group rm {thread_id_str}` to undo."
     )
+
+async def _maybe_notify_owner_of_seed(access_data, sender_id, sender_mention,
+                                      parent_label, thread_id_str):
+    """DM the canonical owner when a NON-owner seeds a thread. Never in-thread:
+    the notice names access-control internals and the thread may be public.
+    Resolves the owner rather than taking allowFrom[0], which is a member list."""
+    canonical_owner = discord_config.resolve_owner_id(access_data)
+    if not _should_notify_owner_on_seed(sender_id, canonical_owner):
+        return False
+    try:
+        await _send_seed_notice_to_owner(
+            canonical_owner,
+            _format_seed_notice(canonical_owner, sender_mention, parent_label, thread_id_str))
+        return True
+    except Exception as e:
+        print(f"  [thread-engage] owner-notice DM failed (no public fallback): {e}", flush=True)
+        return False
+
+
+async def _send_seed_notice_to_owner(owner_id, notice):
+    """Deliver the auto-seed notice to the owner's DM. No public fallback by
+    design: on failure, log only — it must never reach the seeded thread."""
+    user = await client.fetch_user(int(owner_id))
+    dm = await user.create_dm()
+    await dm.send(notice)
 
 def load_channel_auto_react(channel_id):
     """Return list of emoji strings to auto-react with on each new message in this
@@ -3349,7 +3368,10 @@ async def _handle_discord_message(message, force=False):
         # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
         # updates).
         if isinstance(message.channel, discord.Thread):
+            seed_access = {}
+
             def _thread_seed_mutator(access_data):
+                seed_access.update(access_data)
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
                 # Multi-bot fleets: seed only when THIS bot is addressed (avoids
@@ -3396,13 +3418,13 @@ async def _handle_discord_message(message, force=False):
                 print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
                 # First-seed owner-visibility ping — outside the lock deliberately,
                 # since we never hold it across a network await.
-                if _should_notify_owner_on_seed(message.author.id, owner_ids):
-                    try:
-                        parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
-                        await message.channel.send(
-                            _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
-                    except Exception as e:
-                        print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
+                # `.parent` is a property that reads `.guild`; it is now evaluated on
+                # every seed, not only when a notice goes out. Fall back to the id.
+                _parent = getattr(message.channel, "parent", None)
+                parent_label = f"#{_parent.name}" if _parent else str(parent_id_str)
+                await _maybe_notify_owner_of_seed(
+                    seed_access, message.author.id, message.author.mention,
+                    parent_label, thread_id_str)
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked
@@ -4729,6 +4751,52 @@ def _record_skip_audit(task_id: str, skip_value: str) -> None:
     result_audit.record(task_id, _disp, "discord")
 
 
+def _is_sandbox_fallback_result(body, is_dm):
+    """True iff this body is EXACTLY the Stage-2 sandbox sentinel and is bound for a
+    non-DM destination. Exact match: prose merely opening with it is real content."""
+    if is_dm:
+        return False
+    return is_sandbox_fallback_sentinel(body)
+
+
+async def _swallow_sandbox_fallback(channel, task_id, result_file, reply_text, is_dm):
+    """Archive a sandbox-fallback result instead of posting it to a guild channel.
+    Returns True when swallowed; a DM destination is delivered as before."""
+    if not _is_sandbox_fallback_result(reply_text, is_dm):
+        return False
+    print(f"  [sandbox-suppress] swallowed sandbox-fallback result for {task_id} (guild channel {channel.id})", flush=True)
+    _record_skip_audit(task_id, "no-send")
+    await _notify_owner_sandbox_suppressed(channel, task_id)
+    archive_file(result_file, "results", task_id)
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    return True
+
+
+async def _notify_owner_sandbox_suppressed(channel, task_id):
+    """Best-effort owner DM for a suppressed sentinel; the sender is NOT told.
+    Never raises: the archive + audit must complete even with no reachable owner."""
+    try:
+        try:
+            access_data = json.loads(ACCESS_FILE.read_text())
+        except Exception:
+            access_data = {}
+        owner_id = discord_config.resolve_owner_id(access_data)
+        if owner_id is None:
+            print(f"  [sandbox-suppress] no resolvable owner to notify for {task_id}", flush=True)
+            return
+        user = await client.fetch_user(int(owner_id))
+        dm = await user.create_dm()
+        await dm.send(
+            f"⚠️ Suppressed an internal \"{_LEGACY_SANDBOX_SENTINEL}\"-class fallback from "
+            f"posting publicly in <#{channel.id}> (task `{task_id}`). "
+            f"The non-owner sender received no reply."
+        )
+        print(f"  [sandbox-suppress] owner notified for {task_id}", flush=True)
+    except Exception as e:
+        print(f"  [sandbox-suppress] owner notice failed for {task_id}: {e}", flush=True)
+
+
 def _is_delivered(task_id: str) -> bool:
     """True iff the sentinel for `task_id` exists."""
     try:
@@ -5080,6 +5148,13 @@ async def poll_results():
                 # Strip all protocol markers from working text (channel, file,
                 # etc.) so downstream handling operates on clean content.
                 reply_text = _parsed.body
+
+                # The Stage-2 fallback sentinel is a result body like any other,
+                # so without this guard the loop posts it to a public channel.
+                if await _swallow_sandbox_fallback(
+                        channel, task_id, result_file, reply_text,
+                        isinstance(channel, discord.DMChannel)):
+                    continue
 
                 # Idempotency check: if the previous run already sent
                 # this reply (sentinel present) but crashed BEFORE the
