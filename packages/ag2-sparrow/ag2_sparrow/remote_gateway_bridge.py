@@ -1159,6 +1159,10 @@ _WORKER_PIN_PREFIX = "worker-pin-"
 # Full documented grammar. A prefix test alone classifies ordinary work
 # (e.g. worker-pin-user-message) as control and silently closes it.
 _WORKER_PIN_RE = re.compile(r"worker-pin-[0-9]+-[0-9a-fA-F]+\Z")
+# The broker, not the id shape, authorises closing a task unread: an id is
+# user-forgeable, this source stamp is written by the broker.
+_WORKER_PIN_SOURCE = "worker-picker"
+_pin_source_downgrade_logged = False
 
 
 def _consume_worker_pin(task: dict) -> bool:
@@ -1166,9 +1170,21 @@ def _consume_worker_pin(task: dict) -> bool:
     control message for this seat, never user work. It writes no task file
     (the watcher globs *.txt, so one would sit in flight until the lease
     expired); it is acked and its lease closed [no-send]. False = not a pin."""
+    global _pin_source_downgrade_logged
     tid = str(task.get("id") or "").strip()
     if not _WORKER_PIN_RE.fullmatch(tid) or not _valid_tid(tid):
         return False
+    # On id alone an ordinary task matching the grammar is closed [no-send]
+    # before reaching the task writer, losing the user's work silently.
+    src = str(task.get("source") or "").strip()
+    if src and src != _WORKER_PIN_SOURCE:
+        return False
+    if not src and not _pin_source_downgrade_logged:
+        # Bounded compat: a broker predating the stamp leaves only the id.
+        # One line per process — the residual window must stay diagnosable.
+        _pin_source_downgrade_logged = True
+        _log("broker sent a worker-pin with no source stamp; "
+             "falling back to id grammar alone for control classification")
     # ACK, journal path, payload and status check must see ONE id, or a
     # deferred close reports itself archived under a path nothing wrote.
     pinned = dict(task, id=tid)

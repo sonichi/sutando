@@ -354,8 +354,10 @@ def main() -> int:
                  SUTANDO_WORKER_LOCATION="cloud")
     for k in ("gets", "acks", "results", "heartbeats", "other"):
         STATE[k].clear()
+    # The live broker stamps worker-picker on the pin enqueue; the fixture
+    # said "remote-gateway", which no real pin task carries.
     STATE["task"] = {"id": "worker-pin-123-abc", "timestamp": "2026-09-03T00:00:01Z",
-                     "task": "pin cloud-1", "source": "remote-gateway",
+                     "task": "pin cloud-1", "source": "worker-picker",
                      "channel_id": "!room:example.org", "user_id": "@broker:example.org",
                      "access_tier": "owner", "priority": "normal"}
     STATE["serve_n"] = 1
@@ -406,6 +408,31 @@ def main() -> int:
           "worker-pin-user-message is ordinary work, not a control message")
     check(STATE["acks"] == [] and STATE["results"] == [],
           f"the look-alike was neither acked nor closed: {STATE['acks']} {STATE['results']}")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+
+    # The control above cannot fail: its id never matched the grammar. The
+    # hazard is an ordinary task whose id matches EXACTLY.
+    exact = {"id": "worker-pin-1756000000000-deadbeef", "task": "an ordinary ask",
+             "timestamp": "2026-09-03T00:00:01Z", "source": "ag2space"}
+    check(seat6._WORKER_PIN_RE.fullmatch(exact["id"]) is not None,
+          "PRECONDITION: the ordinary task's id really does match the pin grammar "
+          "(without this the control is vacuous, exactly like the one above)")
+    check(seat6._consume_worker_pin(exact) is False,
+          "an exact-grammar id from an ordinary source is USER WORK, not control")
+    check(STATE["acks"] == [] and STATE["results"] == [],
+          f"the exact-grammar user task was neither acked nor closed: "
+          f"{STATE['acks']} {STATE['results']}")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+
+    # Same id, broker's own stamp -> control. Pins the discriminator as the
+    # SOURCE, not the id: flip one field and the verdict flips with it.
+    stamped = dict(exact, source="worker-picker")
+    check(seat6._consume_worker_pin(stamped) is True,
+          "the same id WITH the broker's worker-picker stamp is control")
+    check(STATE["results"] == [{"id": exact["id"], "body": "[no-send]"}],
+          f"the stamped control was closed no-send: {STATE['results']}")
     for k in ("acks", "results"):
         STATE[k].clear()
     check(seat6._consume_worker_pin({"id": " worker-pin-123-abc ", "task": "pin"}) is True,
