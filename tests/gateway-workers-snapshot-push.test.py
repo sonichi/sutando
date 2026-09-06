@@ -72,6 +72,11 @@ def main() -> int:
                             {**blob, "ts": 99, "worker_id": "home", "location": "local"}),
           "once worker-routing is advertised, the seat rides the snapshot")
     rtc._broker_worker_routing = False
+    # Revocation changes the payload too, so it is a NEW snapshot: the seat
+    # keys must come off the wire or a strict legacy relay 422s them.
+    check(rtc._maybe_push_workers_snapshot() is True
+          and calls[-1] == ("POST", "/v1/workers", {**blob, "ts": 99}),
+          "revoking worker-routing re-pushes the legacy shape")
     calls[:] = calls[:1]
     check(rtc._maybe_push_workers_snapshot() is False and len(calls) == 1,
           "unchanged snapshot never re-posts")

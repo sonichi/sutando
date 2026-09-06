@@ -2323,6 +2323,7 @@ def _read_core_status() -> tuple[str | None, str | None]:
 
 _WORKERS_SNAPSHOT_FILE = _STATE / "pool-status.json"
 _workers_push_mtime = 0.0
+_workers_push_routing = False
 _workers_push_retry_at = 0.0
 
 
@@ -2331,7 +2332,7 @@ def _maybe_push_workers_snapshot() -> bool:
     picker's read path). No file = no pool = no-op; a broker without the
     endpoint (404) backs the push off an hour; nothing here may ever
     break the task loop."""
-    global _workers_push_mtime, _workers_push_retry_at
+    global _workers_push_mtime, _workers_push_routing, _workers_push_retry_at
     now = time.time()
     if now < _workers_push_retry_at:
         return False
@@ -2339,7 +2340,10 @@ def _maybe_push_workers_snapshot() -> bool:
         mtime = _WORKERS_SNAPSHOT_FILE.stat().st_mtime
     except OSError:
         return False
-    if mtime <= _workers_push_mtime:
+    # Half this payload's shape is the capability, so the already-sent key has
+    # to carry it too: the same file under a new routing mode is a new snapshot.
+    routing = bool(_broker_worker_routing)
+    if mtime <= _workers_push_mtime and routing == _workers_push_routing:
         return False
     try:
         snap = json.loads(_WORKERS_SNAPSHOT_FILE.read_text())
@@ -2349,7 +2353,7 @@ def _maybe_push_workers_snapshot() -> bool:
         return False
     # Third request body carrying seat identity; gated like heartbeat and poll
     # so a broker that never advertises sees the exact parent envelope.
-    if _broker_worker_routing:
+    if routing:
         snap = {**snap, "worker_id": WORKER_ID, "location": WORKER_LOCATION}
     try:
         _req("POST", "/v1/workers", snap, timeout=15)
@@ -2363,6 +2367,7 @@ def _maybe_push_workers_snapshot() -> bool:
         _log(f"workers-snapshot push failed, retrying in 5m: {e}")
         return False
     _workers_push_mtime = mtime
+    _workers_push_routing = routing
     _log("workers-snapshot pushed")
     return True
 
@@ -2420,10 +2425,16 @@ def _note_broker_capabilities(reply) -> None:
     """Re-read the broker's advertised capabilities from each heartbeat reply.
     Recomputed (not latched) so a downgraded broker turns the extension back off."""
     global _broker_worker_metadata, _broker_worker_routing, _routing_downgrade_logged
+    global _workers_push_retry_at
     caps = reply.get("capabilities") if isinstance(reply, dict) else None
     known = caps if isinstance(caps, list) else []
+    was_routing = _broker_worker_routing
     _broker_worker_metadata = "worker-metadata" in known
     _broker_worker_routing = "worker-routing" in known
+    if _broker_worker_routing and not was_routing:
+        # An endpoint backoff is evidence about the broker we polled BEFORE it
+        # advertised routing; a new advertisement makes that evidence stale.
+        _workers_push_retry_at = 0.0
     if not _broker_worker_routing and not _routing_downgrade_logged:
         # One line per process: silence makes a safe downgrade undiagnosable,
         # a per-heartbeat line would be noise.
