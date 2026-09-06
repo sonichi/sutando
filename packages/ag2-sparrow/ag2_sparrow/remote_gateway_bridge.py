@@ -1166,14 +1166,15 @@ _WORKER_PIN_RE = re.compile(r"worker-pin-[0-9]+-[0-9a-fA-F]+\Z")
 # user-forgeable, this source stamp is written by the broker.
 _WORKER_PIN_SOURCE = "worker-picker"
 _pin_source_downgrade_logged = False
-# Latched once a broker-stamped pin arrives: after that, id-only is not control.
+# Log-once only. It never promotes id-only to control: the stamp stays the sole
+# discriminator, because a process latch resets on restart.
 
 
 def _consume_worker_pin(task: dict) -> bool:
     """The broker's pin route enqueues a `worker-pin-<ms>-<hex>` compat task: a
-    control message for this seat, never user work. It writes no task file
-    (the watcher globs *.txt, so one would sit in flight until the lease
-    expired); it is acked and its lease closed [no-send]. False = not a pin."""
+    control message for this seat, never user work. It writes no task file: the
+    watcher globs *.txt, so one would be dispatched to the core as ordinary work.
+    It is acked and its lease closed [no-send]. False = not a pin."""
     global _pin_source_downgrade_logged
     tid = str(task.get("id") or "").strip()
     if not _WORKER_PIN_RE.fullmatch(tid) or not _valid_tid(tid):
