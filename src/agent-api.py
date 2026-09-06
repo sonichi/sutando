@@ -239,6 +239,24 @@ PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
 PQ_FIELD_RE = re.compile(r'\*\*(?:Status|Options|Asked|Question):\*\*')
 PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
+PQ_DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}(?::\d{2})?Z)?')
+
+
+def _parse_asked_date(title: str) -> tuple[str | None, datetime | None]:
+    """Leading date on a section's `## ` heading, e.g. '2026-08-22 — ...' or
+    '2026-08-20T02:20Z — ...'. (None, None) when the heading carries no date.
+    """
+    m = PQ_DATE_RE.match(title)
+    if not m:
+        return None, None
+    asked = m.group(0)
+    formats = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ") if m.group(2) else ("%Y-%m-%d",)
+    for fmt in formats:
+        try:
+            return asked, datetime.strptime(asked, fmt)
+        except ValueError:
+            continue
+    return None, None
 
 
 def parse_pending_questions(content: str) -> list[dict]:
@@ -278,10 +296,13 @@ def parse_pending_questions(content: str) -> list[dict]:
             continue
         # Whitespace-normalised so a reflow of the same prose keeps the id.
         qid = "Q" + hashlib.sha1(" ".join(section.split()).encode()).hexdigest()[:12]
+        asked, asked_dt = _parse_asked_date(title)
         q = {
             "id": qid,
             "text": title,
             "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
+            "asked": asked,
+            "age_days": (datetime.now() - asked_dt).days if asked_dt else None,
             "start": start,
             "end": end,
         }
@@ -459,10 +480,14 @@ def _pending_question_rows() -> list[dict]:
     pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
     if not pending_file.exists():
         return []
-    return [
+    rows = [
         {key: value for key, value in question.items() if key not in ("start", "end")}
         for question in parse_pending_questions(pending_file.read_text())
     ]
+    # Oldest first. An undated heading cannot be ranked by age and must sort LAST,
+    # never default to 0 — that would put it ahead of everything genuinely waiting.
+    rows.sort(key=lambda row: (row["age_days"] is None, -(row["age_days"] or 0)))
+    return rows
 
 
 def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
