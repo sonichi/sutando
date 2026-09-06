@@ -777,7 +777,15 @@ def set_task_stamper(fn) -> None:
 def write_task_file(tasks_dir: "Path | str", task_id: str,
                     headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
     """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
-    enters the Durable Work Model's `pending` state the moment this returns."""
+    enters the Durable Work Model's `pending` state the moment this returns.
+
+    A hard kill between staging and publish leaves the `.<task_id>.*.tmp`
+    behind, and nothing reaps it: the dot and the missing `.txt` that keep it
+    out of the watcher keep it out of every sweep too, and `find_task_file`'s
+    `{task_id}.*` glob cannot match a leading-dot name either. Bounded — one
+    small file per hard kill inside a sub-millisecond window — and deliberately
+    not reaped, because a reaper would race a live writer for the same names.
+    """
     if not valid_task_id(task_id):
         raise ValueError(f"not a canonical task id: {task_id!r}")
     hdrs = list(headers)
