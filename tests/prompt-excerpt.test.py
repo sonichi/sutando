@@ -52,8 +52,9 @@ class PromptExcerptTest(unittest.TestCase):
 
     def test_the_filter_has_one_home_and_both_adapters_delegate(self):
         # A private copy of the regex in either adapter is the defect this module removes.
-        watch = open(os.path.join(_SRC, "core-input-watch.py"), encoding="utf-8").read()
-        relay = open(os.path.join(_SRC, "core-supervisor-relay.py"), encoding="utf-8").read()
+        from pathlib import Path
+        watch = Path(_SRC, "core-input-watch.py").read_text(encoding="utf-8")
+        relay = Path(_SRC, "core-supervisor-relay.py").read_text(encoding="utf-8")
         for src, name in ((watch, "core-input-watch"), (relay, "core-supervisor-relay")):
             self.assertNotIn("code_challenge", src, f"{name} keeps a private copy of the filter")
             self.assertNotIn("_NOISE_LINE", src, f"{name} keeps a private copy of the filter")
