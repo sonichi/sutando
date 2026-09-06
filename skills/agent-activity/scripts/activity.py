@@ -30,6 +30,16 @@ def log_path(workspace: Path | None = None) -> Path:
     return (workspace or resolve_workspace()) / "state" / "agent-activity.jsonl"
 
 
+def summaries_path(workspace: Path | None = None) -> Path:
+    """One line per finished task: what the folded card shows after the task's rows have left the
+    live log. Never rotated; ~200 bytes a task."""
+    return (workspace or resolve_workspace()) / "state" / "agent-activity.summaries.jsonl"
+
+
+def day_of(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
 def default_room(workspace: Path | None = None) -> str | None:
     """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
     p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
@@ -76,8 +86,39 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         fcntl.flock(lk, fcntl.LOCK_EX)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if done and task and isinstance(task.get("id"), str):
+            summarize(path, rec, workspace)
         rotate(path, live_rows if live_rows is not None else LIVE_ROWS)
     return rec
+
+
+def summarize(path: Path, done_rec: dict, workspace: Path | None = None) -> dict:
+    """Append the task's durable summary: when it started, how many rows it had, and which archive
+    days hold them, so a card for an old message can be folded from this line and expanded from the
+    day files. Called with the writer lock held, before the rotation that may move the rows out."""
+    tid = done_rec["task"]["id"]
+    started, count = done_rec["ts"], 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            t = r.get("task") if isinstance(r, dict) else None
+            if isinstance(t, dict) and t.get("id") == tid and isinstance(r.get("ts"), (int, float)):
+                count += 1
+                started = min(started, r["ts"])
+    except OSError:
+        pass
+    days = sorted({day_of(started), day_of(done_rec["ts"])})
+    summary = {"ts": done_rec["ts"], "started": started, "rows": max(count, 1), "days": days,
+               "line": done_rec["line"], "task": done_rec["task"]}
+    if done_rec.get("room"):
+        summary["room"] = done_rec["room"]
+    sp = summaries_path(workspace)
+    with open(sp, "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    return summary
 
 
 LIVE_ROWS = 400
@@ -92,8 +133,20 @@ def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
         return
     if len(rows) <= keep:
         return
-    with open(path.with_name(path.stem + ".archive.jsonl"), "a", encoding="utf-8") as arch:
-        arch.write("\n".join(rows[:-keep]) + "\n")
+    # One archive file per UTC day of the row's own timestamp, so a reader expanding an old card
+    # fetches one small immutable file, not the whole history; a torn row goes to the undated file.
+    by_day: dict[str, list[str]] = {}
+    for line in rows[:-keep]:
+        try:
+            ts = json.loads(line).get("ts")
+            day = day_of(ts) if isinstance(ts, (int, float)) else None
+        except (ValueError, AttributeError):
+            day = None
+        by_day.setdefault(day, []).append(line)
+    for day, lines in by_day.items():
+        name = f"{path.stem}.archive.{day}.jsonl" if day else f"{path.stem}.archive.jsonl"
+        with open(path.with_name(name), "a", encoding="utf-8") as arch:
+            arch.write("\n".join(lines) + "\n")
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text("\n".join(rows[-keep:]) + "\n", encoding="utf-8")
     os.replace(tmp, path)

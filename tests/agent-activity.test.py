@@ -42,6 +42,14 @@ def _append_many(ws, writer, count, live_rows):
                  workspace=_pl.Path(ws), live_rows=live_rows)
 
 
+def _archived(ws):
+    """Every archived row, across the per-day files (and the undated one for torn rows)."""
+    out = []
+    for f in sorted(Path(ws, "state").glob("agent-activity.archive*.jsonl")):
+        out += f.read_text().splitlines()
+    return out
+
+
 def _bind_in_process(ws, task_id, sid):
     import pathlib as _pl
     h = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
@@ -78,7 +86,7 @@ class Writer(unittest.TestCase):
         for i in range(card.LIVE_ROWS + 3):
             card.append(f"row {i}", kind="notice", room=None, workspace=self.ws)
         live = card.log_path(self.ws).read_text().splitlines()
-        arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
+        arch = _archived(self.ws)
         self.assertEqual((len(live), len(arch)), (card.LIVE_ROWS, 3))
         self.assertIn('"row 0"', arch[0]); self.assertIn(f'"row {card.LIVE_ROWS + 2}"', live[-1])
 
@@ -90,7 +98,7 @@ class Writer(unittest.TestCase):
             pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
             pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         live = card.log_path(self.ws).read_text().splitlines()
-        arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
+        arch = _archived(self.ws)
         lines = [json.loads(l)["line"] for l in live + arch]
         expected = [f"w{i}-{j}" for i in range(8) for j in range(30)]
         self.assertEqual(sorted(lines), sorted(expected), f"lost={set(expected)-set(lines)} dup={len(lines)-len(set(lines))}")
@@ -154,6 +162,46 @@ class WriterCli(unittest.TestCase):
         p.write_text("id: task-file\nchannel_id: !team:s\nuser_id: @q:s\ntask: hello\n")
         rc, rec = self.run_main("append", "x", "--task-file", str(p), "--task-id", "task-cli")
         self.assertEqual((rec["task"]["id"], rec["task"]["from"], rec["room"]), ("task-cli", "@q:s", "!team:s"))
+
+
+class Durable(unittest.TestCase):
+    """A finished task leaves a summary line, and the archive is split by the rows' own day."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "state").mkdir()
+
+    def test_a_done_row_writes_a_summary_with_started_rows_and_days(self):
+        t = {"id": "task-s1", "event": "$ev", "from": "@q:s"}
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws)
+        card.append("Bash: tests", kind="working", room="!r:s", task=t, workspace=self.ws)
+        card.append("other task", kind="working", room="!r:s", task={"id": "task-s2"}, workspace=self.ws)
+        rec = card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws)
+        lines = card.summaries_path(self.ws).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        s = json.loads(lines[0])
+        first = json.loads(card.log_path(self.ws).read_text().splitlines()[0])["ts"]
+        self.assertEqual((s["task"], s["line"], s["room"], s["rows"], s["started"], s["ts"]),
+                         (t, "replied", "!r:s", 3, first, rec["ts"]))
+        self.assertEqual(s["days"], [card.day_of(rec["ts"])])
+
+    def test_a_done_row_without_a_task_leaves_no_summary(self):
+        card.append("closed", kind="done", room=None, done=True, workspace=self.ws)
+        self.assertFalse(card.summaries_path(self.ws).exists())
+
+    def test_rotation_splits_the_archive_by_the_rows_own_day(self):
+        path = card.log_path(self.ws)
+        rows = [{"ts": 1_700_000_000 + i * 86400, "line": f"day{i}", "kind": "notice"} for i in range(3)]
+        rows.append({"ts": rows[-1]["ts"] + 10, "line": "kept", "kind": "notice"})
+        text = "\n".join([json.dumps(rows[0]), "not json"] + [json.dumps(r) for r in rows[1:]]) + "\n"
+        path.write_text(text)
+        card.rotate(path, keep=1)
+        files = sorted(f.name for f in Path(self.ws, "state").glob("agent-activity.archive*.jsonl"))
+        self.assertEqual(files, ["agent-activity.archive.2023-11-14.jsonl", "agent-activity.archive.2023-11-15.jsonl",
+                                 "agent-activity.archive.2023-11-16.jsonl", "agent-activity.archive.jsonl"])
+        self.assertIn("day1", (self.ws / "state" / "agent-activity.archive.2023-11-15.jsonl").read_text())
+        self.assertEqual((self.ws / "state" / "agent-activity.archive.jsonl").read_text(), "not json\n")
+        self.assertEqual(path.read_text().strip(), json.dumps(rows[-1]))
 
 
 class MessageEvent(unittest.TestCase):
