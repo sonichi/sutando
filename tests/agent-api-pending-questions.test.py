@@ -25,7 +25,10 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -180,6 +183,116 @@ class TestParse(unittest.TestCase):
         self.assertEqual(api.parse_pending_questions(answered), [])
 
 
+    def test_dated_heading_parses_asked_and_age_days(self):
+        """`## YYYY-MM-DD — ...` gives a bare-date `asked` and a non-negative age."""
+        dated = "# Q\n\n## 2020-01-01 — sutando-life CI: something old\nBody.\n"
+        q = api.parse_pending_questions(dated)[0]
+        self.assertEqual(q["asked"], "2020-01-01")
+        expected_age = (datetime.now() - datetime(2020, 1, 1)).days
+        self.assertEqual(q["age_days"], expected_age)
+
+    def test_datetime_heading_t_z_form_parses_asked_and_age_days(self):
+        """`## YYYY-MM-DDTHH:MMZ — ...` is the other heading shape in the wild."""
+        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
+        q = api.parse_pending_questions(dated)[0]
+        self.assertEqual(q["asked"], "2020-01-01T02:20Z")
+        expected_age = (datetime.now() - datetime(2020, 1, 1, 2, 20)).days
+        self.assertEqual(q["age_days"], expected_age)
+
+    def test_undated_heading_gives_null_asked_and_age(self):
+        """No leading date on the heading — must not fabricate an age."""
+        q = api.parse_pending_questions(FREE_FORM)[0]
+        self.assertIsNone(q["asked"])
+        self.assertIsNone(q["age_days"])
+
+
+class TestPython39AndTimezones(unittest.TestCase):
+    """agent-api.py has no `from __future__ import annotations`, so annotations are
+    evaluated at def time — a PEP 604 union breaks import on the supported 3.9."""
+
+    def test_the_module_defines_its_helpers_on_python_39(self):
+        py39 = Path("/usr/bin/python3")
+        if not py39.exists():
+            self.skipTest("no system python3 to check the floor against")
+        ver = subprocess.run([str(py39), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                             capture_output=True, text=True).stdout.strip()
+        if ver != "3.9":
+            self.skipTest(f"system python3 is {ver}, not the 3.9 floor")
+        src = Path(api.__file__).read_text()
+        start = src.index("def _parse_asked_date")
+        end = src.index("\n\n", src.index("return None, None", start))
+        prog = ("from datetime import datetime, timezone\nfrom typing import Optional\nimport re\n"
+                "PQ_DATE_RE = re.compile(r'^(\\d{4}-\\d{2}-\\d{2})(T\\d{2}:\\d{2}(?::\\d{2})?Z)?')\n"
+                + src[start:end] + "\nprint(_parse_asked_date('2020-01-01T02:20Z x')[0])\n")
+        r = subprocess.run([str(py39), "-c", prog], capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, f"3.9 rejected the helper: {r.stderr[-300:]}")
+        self.assertEqual("2020-01-01T02:20Z", r.stdout.strip())
+
+    def test_a_shaped_but_impossible_date_is_not_an_age(self):
+        """`2026-13-45` matches the heading regex and no strptime format — the branch
+        must fall through to (None, None) rather than raise or invent an age."""
+        asked, dt = api._parse_asked_date("2026-13-45 — not a real date")
+        self.assertIsNone(asked)
+        self.assertIsNone(dt)
+        q = api.parse_pending_questions("# Q\n\n## 2026-13-45 — not a real date\nBody.\n")[0]
+        self.assertIsNone(q["asked"])
+        self.assertIsNone(q["age_days"])
+
+    def test_a_Z_heading_is_utc_not_local(self):
+        """Parsed naive and compared to a local now(), a just-asked question reports -1."""
+        _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
+        self.assertIsNotNone(dt.tzinfo, "a Z heading must parse as aware UTC")
+        self.assertEqual(0, dt.utcoffset().total_seconds())
+
+    def test_a_future_dated_heading_does_not_sort_first(self):
+        """Clock skew or a typo gives a negative age, which -(age) would rank ahead of all."""
+        ahead = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%MZ")
+        q = api.parse_pending_questions(f"# Q\n\n## {ahead} — from the future\nBody.\n")[0]
+        self.assertEqual(0, q["age_days"], "a future heading must clamp to 0, never go negative")
+
+
+class TestPendingQuestionRows(unittest.TestCase):
+    """`_pending_question_rows()` orders by age — oldest first — with undated
+    questions sorted last (never defaulted to age 0, which would put them
+    first instead)."""
+
+    def _rows(self, content: str) -> list[dict]:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "pending-questions.md"
+            pending.write_text(content)
+            with mock.patch.object(api, "personal_path", return_value=pending):
+                return api._pending_question_rows()
+
+    def test_rows_are_oldest_first_undated_sorts_last(self):
+        today = datetime.now()
+        just_now = today.strftime("%Y-%m-%d")  # age_days == 0
+        mid = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+        old = (today - timedelta(days=40)).strftime("%Y-%m-%d")
+        # Undated BEFORE the age-0 heading: the one order in which defaulting
+        # undated to 0 would survive a stable sort and pass anyway.
+        mixed = (
+            "# Pending Questions\n\n"
+            "## Undated question\nBody.\n\n"
+            f"## {just_now} — asked just now\nBody.\n\n"
+            f"## {old} — asked weeks ago\nBody.\n\n"
+            f"## {mid} — asked a while ago\nBody.\n"
+        )
+        texts = [row["text"] for row in self._rows(mixed)]
+        self.assertEqual(texts, [
+            f"{old} — asked weeks ago",
+            f"{mid} — asked a while ago",
+            f"{just_now} — asked just now",
+            "Undated question",
+        ])
+
+    def test_rows_carry_asked_and_age_days_after_stripping_offsets(self):
+        rows = self._rows("# Q\n\n## 2020-01-01 — old one\nBody.\n")
+        self.assertNotIn("start", rows[0])
+        self.assertNotIn("end", rows[0])
+        self.assertEqual(rows[0]["asked"], "2020-01-01")
+        self.assertIsInstance(rows[0]["age_days"], int)
+
+
 class TestAnswer(unittest.TestCase):
     def test_free_form_question_is_answerable(self):
         """The regression: listed by GET /status, then 404 on POST /answer."""
@@ -232,6 +345,8 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TestParse),
+        loader.loadTestsFromTestCase(TestPython39AndTimezones),
+        loader.loadTestsFromTestCase(TestPendingQuestionRows),
         loader.loadTestsFromTestCase(TestAnswer),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
