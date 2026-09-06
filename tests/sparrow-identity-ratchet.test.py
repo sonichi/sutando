@@ -341,6 +341,16 @@ def _import_bindings(node) -> set:
 _MATCH_NODES = (ast.Match,) if hasattr(ast, "Match") else ()
 
 
+def _match_is_exhaustive(node) -> bool:
+    # Only an unguarded irrefutable pattern (`case _:` / `case x:`) proves every
+    # subject is matched; anything else leaves a path where no arm runs.
+    for case in node.cases:
+        pat = case.pattern
+        if case.guard is None and isinstance(pat, ast.MatchAs) and pat.pattern is None:
+            return True
+    return False
+
+
 def _scope_nodes(body_node):
     """Nodes of ONE lexical scope in source order; nested scopes are pruned,
     so a sibling function's locals never certify this one's names."""
@@ -350,7 +360,8 @@ def _scope_nodes(body_node):
         # handled at the assignment, value before targets.
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
                               ast.ClassDef, ast.Assign, ast.AnnAssign, ast.If,
-                              ast.Try) + _MATCH_NODES):
+                              ast.Try, ast.For, ast.AsyncFor,
+                              ast.While) + _MATCH_NODES):
             continue
         yield from _scope_nodes(child)
 
@@ -474,8 +485,19 @@ def _certified_nodes(tree, bindings: set) -> set:
                         visit_expr(h.type)
                 return ([node.body + (node.orelse or [])]
                         + [h.body for h in node.handlers])
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                # A loop body may run ZERO times, so "body ran" and "body did not"
+                # are alternatives; orelse runs on both.
+                visit_expr(node.iter if hasattr(node, "iter") else node.test)
+                if hasattr(node, "target"):
+                    for nm in (n.id for n in ast.walk(node.target)
+                               if isinstance(n, ast.Name)):
+                        shadow(nm)
+                rest = node.orelse or []
+                return [node.body + rest, rest]
             visit_expr(node.subject)
-            return [c.body for c in node.cases]
+            cases = [c.body for c in node.cases]
+            return cases if _match_is_exhaustive(node) else cases + [[]]
 
         def branch_merge(node):
             # Alternatives cannot both execute: certification survives only where EVERY
@@ -496,7 +518,8 @@ def _certified_nodes(tree, bindings: set) -> set:
                 run(_scope_nodes(ast.Module(body=node.finalbody, type_ignores=[])))
 
         def step(node):
-            if isinstance(node, (ast.If, ast.Try) + _MATCH_NODES):
+            if isinstance(node, (ast.If, ast.Try, ast.For, ast.AsyncFor,
+                                 ast.While) + _MATCH_NODES):
                 branch_merge(node)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for name in _import_bindings(node):
@@ -809,6 +832,36 @@ class BranchCertificationIsPerPath(unittest.TestCase):
                          "source order of the two arms changed the census")
         self.assertEqual(self._arms(self.RAW, self.CANON), {("probe.py", "mint"): 1},
                          "a raw value on either arm must leave the use counted")
+
+    def test_a_construct_that_may_run_no_alternative_keeps_the_incoming_state(self):
+        """A loop body and a non-exhaustive match can execute ZERO alternatives, so
+        the incoming value survives. Certifying from the arms alone reports {} for
+        code that really does emit a raw id. Each case is checked against what the
+        fixture ACTUALLY does, so an equal census cannot pass with the wrong answer."""
+        C, R = "delivery_id(item, ts)", 'f"{item}#{ts}"'
+        FOR = ('def mint(items, item, ts, rec):\n    k = %s\n    for _i in items:\n'
+               '        k = %s\n    rec["delivery_id"] = k\n    return rec\n')
+        WHILE = ('def mint(flag, item, ts, rec):\n    k = %s\n    while flag:\n'
+                 '        k = %s\n        flag = False\n    rec["delivery_id"] = k\n    return rec\n')
+        MATCH = ('def mint(x, item, ts, rec):\n    k = %s\n    match x:\n        case 1:\n'
+                 '            k = %s\n    rec["delivery_id"] = k\n    return rec\n')
+        cases = [("for", FOR, ([],)), ("while", WHILE, (False,))]
+        if _MATCH_NODES:
+            cases.append(("match", MATCH, (2,)))
+        for name, tmpl, zero_arg in cases:
+            with self.subTest(construct=name):
+                src = tmpl % (R, C)
+                self.assertEqual(self._d(self.HDR + src), {("probe.py", "mint"): 1},
+                                 f"{name}: the zero-alternative path was not certified away")
+                # runtime control: the fixture really does emit the RAW id there
+                ns = {"delivery_id": lambda item, ts: "CANON"}
+                exec(compile(src, "<probe>", "exec"), ns)
+                got = ns["mint"](*zero_arg, "it", 7, {})["delivery_id"]
+                self.assertEqual(got, "it#7",
+                                 f"{name}: fixture does not exercise the zero path")
+                # and the all-canonical form must still certify, or this over-reports
+                self.assertEqual(self._d(self.HDR + (tmpl % (C, C))), {},
+                                 f"{name}: canonical on every path must stay certified")
 
     def test_every_alternative_construct_merges_per_path(self):
         """`if` is not the only place alternatives appear. try/except and match/case
