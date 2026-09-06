@@ -77,10 +77,29 @@ class TestMessage(unittest.TestCase):
         self.assertNotIn("```", b)
         self.assertIn("  Pick one:", b)
 
-    def test_an_all_chrome_pane_leaves_no_excerpt_section(self):
+    def test_an_all_chrome_pane_falls_back_to_the_raw_tail(self):
+        """Over-filtering and 'nothing was there' look the same from inside the filter, and this
+        card is the only thing that reaches the owner: fail noisy, never silent."""
         b = M.escalation_message("blocked-human", "d", "unknown",
                                  "──────── x ────────\nhttps://example.test/a?b=1\n")
-        self.assertNotIn("What the terminal is showing", b)
+        self.assertIn("What the terminal is showing", b)
+        self.assertIn("https://example.test/a?b=1", b)
+
+    def test_blank_lines_and_long_unbroken_tokens_are_dropped(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("keep me\n\nkeep me too"), ["keep me", "keep me too"])
+        self.assertEqual(pe("keep me\n" + "a1b2c3" * 16 + "\nkeep me too"), ["keep me", "keep me too"])
+
+    def test_a_prompt_that_mentions_the_footer_words_is_kept(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("Bypass permissions for this tool? (y/n)"), ["Bypass permissions for this tool? (y/n)"])
+        self.assertEqual(pe("Enable MCP for agents? [y/N]"), ["Enable MCP for agents? [y/N]"])
+        self.assertEqual(pe("  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\nreal"), ["real"])
+
+    def test_a_short_boxed_option_survives_the_rule_filter(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("╭──────╮\n│ Yes │\n╰──────╯"), ["Yes"])
+        self.assertEqual(pe("──── sutando-core ─\n❯ 1. Yes"), ["❯ 1. Yes"])
 
 
 class TestEscalate(unittest.TestCase):
