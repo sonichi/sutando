@@ -2448,8 +2448,14 @@ def _revoke_broker_capabilities() -> None:
     advertising reply, so dropping them cannot lose a result while keeping
     them can (a strict relay 422s an un-advertised key)."""
     global _broker_worker_metadata, _broker_worker_routing
+    global _workers_push_retry_at
+    was_routing = _broker_worker_routing
     _broker_worker_metadata = False
     _broker_worker_routing = False
+    if was_routing:
+        # EITHER transition invalidates a backoff: it is evidence about a payload
+        # shape we no longer send, and the other shape may well be accepted.
+        _workers_push_retry_at = 0.0
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:

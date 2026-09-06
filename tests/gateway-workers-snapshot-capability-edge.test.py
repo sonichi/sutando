@@ -111,6 +111,25 @@ def main() -> int:
     check(pushed is True and calls[-1] == ("POST", "/v1/workers", ROUTED),
           "a new advertisement retires a backoff earned before it")
 
+    # --- 2b. the RECIPROCAL transition: routed rejection -> withdrawal -> legacy push
+    m, snap = fresh(tmp)
+    calls = []
+    m._note_broker_capabilities(ADVERTISE)
+    m._req = recorder(calls)
+    check(m._maybe_push_workers_snapshot() is True and calls[-1][2] == ROUTED,
+          "routed snapshot goes out while routing is advertised")
+    snap.write_text(json.dumps({**BLOB, "ts": 2}))
+    os.utime(snap, (time.time() + 1, time.time() + 1))
+    m._req = recorder(calls, exc=lambda p: urllib.error.HTTPError(p, 422, "unprocessable", {}, None))
+    check(m._maybe_push_workers_snapshot() is False
+          and m._workers_push_retry_at > time.time() + 3000,
+          "a rejected ROUTED update earns the hour-long backoff")
+    m._revoke_broker_capabilities()          # no rewrite, no reset
+    m._req = recorder(calls)
+    pushed = m._maybe_push_workers_snapshot()
+    check(pushed is True and calls[-1][2] == {**BLOB, "ts": 2},
+          "withdrawing routing retires that backoff and the EXACT legacy payload goes out")
+
     # --- 3. the edge is an EDGE: a repeated advertisement never clears backoff
     m, _ = fresh(tmp)
     calls = []
@@ -123,6 +142,19 @@ def main() -> int:
     check(m._maybe_push_workers_snapshot() is False and len(calls) == 1,
           "control: an unchanged advertisement leaves the backoff intact "
           "(level-triggered clearing would hammer a 404 broker every beat)")
+
+    # --- 4. revocation is an EDGE too: a repeated withdrawal never clears backoff
+    m, _ = fresh(tmp)
+    calls = []
+    m._req = recorder(calls, exc=h404)          # routing already off: a LEGACY 404
+    check(m._maybe_push_workers_snapshot() is False
+          and m._workers_push_retry_at > time.time() + 3000,
+          "legacy 404 earns the backoff with routing already off")
+    m._revoke_broker_capabilities()             # SAME state — not a transition
+    m._req = recorder(calls)
+    check(m._maybe_push_workers_snapshot() is False and len(calls) == 1,
+          "control: revoking when routing was ALREADY off leaves the backoff intact "
+          "(level-triggered clearing would hammer an unchanged broker every beat)")
 
     print()
     print(("FAILED: " + "; ".join(FAILS)) if FAILS else "all green")
