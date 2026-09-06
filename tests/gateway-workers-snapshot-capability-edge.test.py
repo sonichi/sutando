@@ -130,6 +130,48 @@ def main() -> int:
     check(pushed is True and calls[-1][2] == {**BLOB, "ts": 2},
           "withdrawing routing retires that backoff and the EXACT legacy payload goes out")
 
+    # --- 2c. 2b drives the withdrawal through the revocation helper; a SUCCESSFUL
+    # reply takes _post_heartbeat instead, so fixing one leaves this branch broken.
+    m, snap = fresh(tmp)
+    calls = []
+    m._note_broker_capabilities(ADVERTISE)
+    m._req = recorder(calls)
+    check(m._maybe_push_workers_snapshot() is True and calls[-1][2] == ROUTED,
+          "routed snapshot goes out before the withdrawal")
+    snap.write_text(json.dumps({**BLOB, "ts": 3}))
+    os.utime(snap, (time.time() + 1, time.time() + 1))
+    m._req = recorder(calls, exc=lambda p: urllib.error.HTTPError(p, 422, "unprocessable", {}, None))
+    check(m._maybe_push_workers_snapshot() is False
+          and m._workers_push_retry_at > time.time() + 3000,
+          "a rejected ROUTED update earns the backoff (heartbeat path)")
+
+    def heartbeat_reply(caps):
+        def _req(method, path, payload=None, timeout=None):
+            calls.append((method, path, payload))
+            if path == "/v1/heartbeat":
+                return {"capabilities": caps}
+            return {}
+        return _req
+
+    m._req = heartbeat_reply([])              # SUCCESS, no advertisement
+    m._last_heartbeat_at = 0.0
+    m._post_heartbeat(set(), force=True)      # no rewrite, no utime, no reset
+    check(m._broker_worker_routing is False and m._workers_push_retry_at == 0.0,
+          "a SUCCESSFUL heartbeat that omits worker-routing retires the routed backoff")
+    m._req = recorder(calls)
+    pushed = m._maybe_push_workers_snapshot()
+    check(pushed is True and calls[-1][2] == {**BLOB, "ts": 3},
+          "and the EXACT legacy payload goes out on the next push")
+
+    # --- 2d. same-state control: an already-legacy broker keeps its backoff, so a
+    # non-advertising heartbeat every beat cannot hammer a rejecting endpoint.
+    m._workers_push_retry_at = time.time() + 3600
+    m._req = heartbeat_reply([])
+    m._last_heartbeat_at = 0.0
+    m._post_heartbeat(set(), force=True)
+    check(m._workers_push_retry_at > time.time() + 3000,
+          "control: a heartbeat omitting the capability when routing was ALREADY off keeps the backoff")
+
     # --- 3. the edge is an EDGE: a repeated advertisement never clears backoff
     m, _ = fresh(tmp)
     calls = []

@@ -2421,20 +2421,26 @@ def _maybe_push_agent_profile() -> bool:
     return True
 
 
+def _apply_broker_capabilities(metadata: bool, routing: bool) -> None:
+    """The one owner of a capability transition, so every path that changes
+    routing invalidates the same evidence in the same way."""
+    global _broker_worker_metadata, _broker_worker_routing, _workers_push_retry_at
+    was_routing = _broker_worker_routing
+    _broker_worker_metadata = metadata
+    _broker_worker_routing = routing
+    if routing != was_routing:
+        # EITHER edge: a backoff is evidence about a payload shape we no longer
+        # send, and the shape we now send may well be accepted.
+        _workers_push_retry_at = 0.0
+
+
 def _note_broker_capabilities(reply) -> None:
     """Re-read the broker's advertised capabilities from each heartbeat reply.
     Recomputed (not latched) so a downgraded broker turns the extension back off."""
-    global _broker_worker_metadata, _broker_worker_routing, _routing_downgrade_logged
-    global _workers_push_retry_at
+    global _routing_downgrade_logged
     caps = reply.get("capabilities") if isinstance(reply, dict) else None
     known = caps if isinstance(caps, list) else []
-    was_routing = _broker_worker_routing
-    _broker_worker_metadata = "worker-metadata" in known
-    _broker_worker_routing = "worker-routing" in known
-    if _broker_worker_routing and not was_routing:
-        # An endpoint backoff is evidence about the broker we polled BEFORE it
-        # advertised routing; a new advertisement makes that evidence stale.
-        _workers_push_retry_at = 0.0
+    _apply_broker_capabilities("worker-metadata" in known, "worker-routing" in known)
     if not _broker_worker_routing and not _routing_downgrade_logged:
         # One line per process: silence makes a safe downgrade undiagnosable,
         # a per-heartbeat line would be noise.
@@ -2447,15 +2453,7 @@ def _revoke_broker_capabilities() -> None:
     extension is supported; the keys are additive and return on the next
     advertising reply, so dropping them cannot lose a result while keeping
     them can (a strict relay 422s an un-advertised key)."""
-    global _broker_worker_metadata, _broker_worker_routing
-    global _workers_push_retry_at
-    was_routing = _broker_worker_routing
-    _broker_worker_metadata = False
-    _broker_worker_routing = False
-    if was_routing:
-        # EITHER transition invalidates a backoff: it is evidence about a payload
-        # shape we no longer send, and the other shape may well be accepted.
-        _workers_push_retry_at = 0.0
+    _apply_broker_capabilities(False, False)
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
