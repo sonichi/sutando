@@ -7044,8 +7044,14 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
     the two cases and the referenced path does.
     """
     cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
-    for ref in re.findall(r"(?:src|scripts|skills)/[\w\-./]+\.(?:py|sh|ts|mjs)", cmd):
-        if not (REPO_DIR / ref).exists():
+    # Only an INVOKED path counts: an interpreter must introduce it. Prose that
+    # merely names a file (or negates it) is not evidence the job cannot run.
+    for ref in re.findall(
+            r"(?:python3?|bash|sh|node|npx|tsx)\s+(\S+\.(?:py|sh|ts|mjs))", cmd):
+        # An absolute path resolves on its own; only a repo-relative one is
+        # judged against REPO_DIR, so a valid /tmp script is never "missing".
+        target = Path(ref) if ref.startswith("/") else REPO_DIR / ref
+        if not target.exists():
             return ref
     return None
 

@@ -99,6 +99,25 @@ check("CONTROL: identical fixture with the script PRESENT stays green",
       r_live["status"] == "ok",
       f"got {r_live['status']} — the check fires regardless of the script: {r_live['detail'][:120]}")
 
+# ---- an INVOKED path only: prose is not a dependency (qingyun-wu, #3672) ----
+# The detector matched `scripts/x.sh` inside a longer ABSOLUTE path and judged the
+# repo-relative remainder, so a working /tmp script read as missing.
+_t = tempfile.mkdtemp()
+os.makedirs(os.path.join(_t, "scripts"), exist_ok=True)
+_live = os.path.join(_t, "scripts", "live.sh")
+open(_live, "w").write("#!/bin/sh\necho job completed\n")
+_gone = os.path.join(_t, "scripts", "gone.sh")
+
+check("invoked: an absolute script that EXISTS is not missing",
+      hc._cron_missing_script({"prompt": f"bash {_live}"}) is None)
+check("invoked: prose naming a retired file is not an invocation",
+      hc._cron_missing_script({"prompt": "do not use scripts/retired-thing.py any more"}) is None)
+check("CONTROL: a genuinely missing invoked repo script still warns",
+      hc._cron_missing_script({"prompt": "python3 scripts/does-not-exist.py"})
+      == "scripts/does-not-exist.py")
+check("CONTROL: a missing ABSOLUTE invoked script still warns",
+      hc._cron_missing_script({"prompt": f"bash {_gone}"}) == _gone)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
