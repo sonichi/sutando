@@ -170,6 +170,10 @@ def _code_lines(text: str) -> set:
 # occurrences are DETECTED anywhere; only STANDALONE ones are stripped.
 _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 
+# [reply: <message-id>] — deliver this body as a reply to that message. 17-20
+# digits is a Discord snowflake; anything else is left in place, never eaten.
+_REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
+
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker
 #: ORDER (see the docstring). But removing every occurrence also removed
@@ -255,14 +259,24 @@ def parse_markers(text: str) -> ParseResult:
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
     # marker so it can't leak into the DM, but emit NO redirect action so the
     # private body stays in the owner's DM.
-    redirect_match = _REDIRECT_RE.match(body)
-    if redirect_match:
-        channel = redirect_match.group(1).strip()
-        if not dm_only and channel:
-            # Empty target = no action: value="" release-loops at the default
-            # sink (claimable yet foreign) and int("")s in Discord conversion.
-            actions.append(Action(kind="redirect", value=channel))
-        body = body[redirect_match.end():]
+    # 2. LEADING MARKERS — [channel:] and [reply:] in either order; order
+    # independence keeps an unparsed marker from reaching the user as text.
+    while True:
+        redirect_match = _REDIRECT_RE.match(body)
+        if redirect_match:
+            channel = redirect_match.group(1).strip()
+            if not dm_only and channel:
+                # Empty target = no action: "" release-loops at the default
+                # sink and raises in Discord's int() conversion.
+                actions.append(Action(kind="redirect", value=channel))
+            body = body[redirect_match.end():]
+            continue
+        reply_match = _REPLY_RE.match(body)
+        if reply_match:
+            actions.append(Action(kind="reply", value=reply_match.group(1)))
+            body = body[reply_match.end():]
+            continue
+        break
 
     # Restore D7 header so it appears in the user-facing body. (It was only
     # peeled off so it didn't shadow the marker regexes.)

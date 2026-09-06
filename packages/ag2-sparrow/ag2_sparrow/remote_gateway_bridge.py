@@ -1130,9 +1130,19 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
+    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
+    attach_roots: tuple = ()
+    if tier == "team":
+        _delivery_for_media = _delivery_tid(tid)
+        _media_modes = _load_task_media() if _delivery_for_media is not None else None
+        if (_media_modes is not None
+                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
+                == "task-media"):
+            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
-        scan_sensitive_data=scan_sensitive_data)
+        scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
     is_leak = verdict.kind == "leak"
     agent_id = _reenroll_identity()
     verdict = materialize(
@@ -1590,9 +1600,9 @@ _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
-                # Which worker the sender asked for. Ahead of "task" so it can never
-                # be read from under the untrusted body; copied verbatim, never derived.
-                "requested_worker",
+                # Both ahead of "task": the safe parser stops at the body, so a
+                # field written below it is invisible to every task-last reader.
+                "requested_worker", "priority",
                 "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -1604,7 +1614,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
-                "source_message_id", "user_id", "priority", "interaction_type",
+                "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card")
@@ -1622,9 +1632,8 @@ _INTERACTION_TYPES = frozenset({
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
-LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
-if LOCAL_TIER == "other":
-    LOCAL_TIER = "guest"
+LOCAL_TIER = local_task_protocol.canonical_access_tier(
+    _env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner")
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
 
@@ -1672,9 +1681,7 @@ _TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
 
 
 def _normalized_tier(value):
-    tier = str(value or "").strip().lower()
-    if tier == "other":
-        tier = "guest"
+    tier = local_task_protocol.canonical_access_tier(value)
     return tier if tier in _TIER_RANK else "guest"
 
 _TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
@@ -1706,9 +1713,9 @@ def _validate_tier_map(raw):
     tm = {}
     if isinstance(raw, dict):
         for who, tier in raw.items():
-            t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
-                tm[who.strip()] = _normalized_tier(t)
+            t = local_task_protocol.canonical_access_tier(tier)
+            if isinstance(who, str) and t in _TIER_RANK:
+                tm[who.strip()] = t
     return tm
 
 
@@ -2644,6 +2651,25 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
     return _record_task_media(tid, task)
 
 
+
+# Signal Room tasks (5G ⑤a-cap), AG2 Space adapter edge: names the ONE directory a
+# Team result may attach from; `attach_markers_confined` withholds anything else.
+def _signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    output_q = shlex.quote(f"{media_dir}/<name>.png")  # a workspace path may hold spaces
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {output_q}), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]
+
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -2798,6 +2824,10 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        # A relay-stamped Signal task may attach from ITS OWN output directory only;
+        # name it here (absolute) so the marker written is the one the guard confines.
+        if isinstance(task.get("signal"), dict):
+            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
         lines.extend(sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", f"results/{tid}.txt",

@@ -46,10 +46,9 @@ def resolve_discord_access_file() -> Path:
     so any writer (the bridge, or a skill-callable CLI in a separate process)
     resolves the identical file rather than duplicating the migration logic.
 
-    Before the first durable backup exists, preserve the transition-window
-    behavior: a missing canonical file may read/write the populated legacy
-    ``~/.claude`` file. Once the durable backup exists, a missing canonical
-    file is a wipe to restore — not a reason to resurrect legacy state.
+    A missing canonical file is a wipe to restore (durable backup) or a
+    migration to run — never a reason to reach the pre-migration home-directory file;
+    that fallback retired with its ~30-day window (shipped 2026-06-21).
     """
     if discord_access_backup_file().exists():
         return claude_home_path("channels", "discord", "access.json")

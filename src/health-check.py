@@ -20,6 +20,7 @@ Checks:
   - Notes directory
 """
 
+import ast
 import functools
 import hashlib
 import fnmatch
@@ -33,6 +34,7 @@ import shutil
 import tempfile
 import socket
 import subprocess
+import symtable
 import sys
 import time
 import urllib.request
@@ -749,6 +751,58 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
             found.add(exe)
     return sorted(found)
 
+
+
+def check_cli_wedge() -> dict:
+    """Advisory CLI progress detector over the core's tmux pane (src/cli_wedge.py).
+
+    Case 1: the RAW pane unchanged while work is outstanding. Case 2: the
+    pane moves but revisits states already seen (retry loop). It reads the
+    pane, not the process — a green here is not core health — and it only
+    ever warns: nothing keys recovery off this check, and no failure inside
+    it may escape (an unwritable or corrupt window is "no reading").
+    """
+    check = {"name": "cli-wedge", "status": "ok", "detail": ""}
+    try:
+        import cli_wedge  # src/ is on sys.path (see the workspace_default import)
+    except Exception as e:  # noqa: BLE001 — a missing detector is a detail, not a failure
+        check["detail"] = f"detector unavailable: {e}"
+        return check
+    record = _local_core_record()
+    socket = record.get("socket") if record else None
+    if not socket:
+        check["detail"] = "no local core pane to read (no fresh heartbeat on this host)"
+        return check
+    # Socket AND session from the SAME heartbeat record; the module's own
+    # capture/identity through the tmux binary and healed PATH every probe uses.
+    tmux_bin, env = _resolve_tmux_bin(), _resolve_launch_env()
+    session = record.get("session") or os.environ.get("SUTANDO_TMUX_SESSION", cli_wedge.DEFAULT_SESSION)
+    target = cli_wedge.core_target(socket, session, tmux_bin=tmux_bin, env=env)
+    # A core sampling the pane it runs in sees its own output move; the static case could never accumulate.
+    inside = cli_wedge.sampled_from_inside(socket, target, tmux_bin=tmux_bin, env=env) if target else None
+    if inside:
+        check["detail"] = f"skipped — sampled from inside the pane it watches ({inside})"
+        return check
+    frame = cli_wedge.capture_pane(socket, target, tmux_bin=tmux_bin, env=env) if target else None
+    if frame is None:
+        check["detail"] = f"pane not readable (session {session!r}) — no reading, not a verdict"
+        return check
+    now = time.time()
+    pane = cli_wedge.pane_identity(socket, target, tmux_bin=tmux_bin, env=env)
+    try:
+        entries = cli_wedge.append_window(WORKSPACE_DIR, frame, now, pane=pane)
+        verdict = cli_wedge.classify_window(entries, cli_wedge.work_outstanding(WORKSPACE_DIR, now), now)
+    except Exception as e:  # noqa: BLE001 — an advisory check must never abort the run
+        check["detail"] = f"no reading — window state unusable ({type(e).__name__}: {e})"
+        return check
+    check["status"] = "warn" if verdict.get("warn") else "ok"
+    check["detail"] = (f"{verdict['kind']} ({verdict['confidence']}): {verdict['reason']}"
+                       " — advisory; reads the pane, not the process")
+    check["evidence"] = {k: verdict.get(k) for k in
+                         ("duration", "sample_count", "novel_state_count", "novelty_rate",
+                          "matched_patterns", "current_patterns", "consecutive_pattern_samples",
+                          "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
+    return check
 
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
@@ -5039,6 +5093,14 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
     function). Returning None when this host has no fresh heartbeat is right:
     "no local core is running" is not evidence that a core bypasses the proxy.
     """
+    record = _local_core_record(workspace)
+    return record.get("socket") if record else None
+
+
+def _local_core_record(workspace: Optional[Path] = None) -> Optional[dict]:
+    """This HOST's freshest live heartbeat RECORD (multi-label, newest wins) — the
+    one object every consumer should take socket AND session from, so a probe
+    cannot pair one record's socket with another's session (or a default)."""
     if workspace is None:
         workspace = WORKSPACE_DIR
     cores_dir = workspace / "state" / "cores"
@@ -5046,7 +5108,7 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         return None
     labels = _local_host_labels()
     now = time.time()
-    best_mtime, best_socket = None, None
+    best_mtime, best = None, None
     for alive_file in cores_dir.glob("*.alive"):
         if alive_file.stem not in labels:
             continue                      # another machine's heartbeat
@@ -5061,8 +5123,8 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
-            best_mtime, best_socket = mtime, sock
-    return best_socket
+            best_mtime, best = mtime, payload
+    return best
 
 
 def core_env_has_proxy_url(
@@ -8041,7 +8103,7 @@ def _park_reason_tally(kept) -> str:
     names a cause for the other four states something no writer recorded.
     """
     counts = {}
-    for name, _age in kept:
+    for name, *_ in kept:
         reason = next((p for p in str(name).split(".") if p in PARK_REASONS),
                       "unlabelled")
         counts[reason] = counts.get(reason, 0) + 1
@@ -8085,7 +8147,7 @@ def check_proactive_quarantine() -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
-    kept: list[tuple[str, int]] = []
+    kept: list[tuple[str, int, int]] = []
     unreadable = 0
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
@@ -8093,7 +8155,11 @@ def check_proactive_quarantine() -> dict:
         try:
             if not path.is_file():
                 continue
-            age = now - path.stat().st_mtime
+            st = path.stat()
+            age = now - st.st_mtime
+            # Every writer here MOVES an existing inode (rename, link+unlink),
+            # which keeps mtime and refreshes ctime: ctime is the arrival.
+            arrived = now - st.st_ctime
         except OSError:
             unreadable += 1
             continue
@@ -8107,7 +8173,7 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age)))
+        kept.append((path.name, int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:
@@ -8115,7 +8181,11 @@ def check_proactive_quarantine() -> dict:
         return {"name": name, "status": status,
                 "detail": f"no quarantined proactive bodies{partial}"}
     kept.sort(key=lambda item: -item[1])
-    oldest_name, oldest_age = kept[0]
+    oldest_name, oldest_age, _ = kept[0]
+    # Oldest reads the same filling or inert; the newest ARRIVAL (ctime, not
+    # mtime — see the loop) is what separates them.
+    newest_arrival = min(item[2] for item in kept)
+    arrival = _quarantine_arrival_clause(newest_arrival, oldest_age)
     return {
         "name": name,
         "status": "warn",
@@ -8124,9 +8194,28 @@ def check_proactive_quarantine() -> dict:
         "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ "
                    f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
                    f"directory, so they stay until someone acts; oldest {oldest_name} "
-                   f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
-                   f"{partial}"),
+                   f"({_quarantine_age_label(oldest_age)})"
+                   f"{arrival}{partial}"),
     }
+
+
+def _quarantine_hm(seconds: int) -> str:
+    return f"{seconds // 3600}h{seconds % 3600 // 60}m"
+
+
+def _quarantine_age_label(age: int) -> str:
+    # Negative means the clock sits behind the file: skew, not a measurement.
+    return _quarantine_hm(age) if age >= 0 else f"future-dated by {_quarantine_hm(-age)}"
+
+
+def _quarantine_arrival_clause(newest_arrival: int, oldest_age: int) -> str:
+    if newest_arrival < 0:
+        return f"; newest is {_quarantine_age_label(newest_arrival)} (clock skew?)"
+    # Compare what is RENDERED: 7201s and 7200s both print 2h0m, and printing
+    # one duration twice is noise (bulk writes leave exactly that shape).
+    if _quarantine_hm(newest_arrival) == _quarantine_age_label(oldest_age):
+        return ""
+    return f"; newest arrived {_quarantine_hm(newest_arrival)} ago"
 
 
 def _ps_snapshot() -> "str | None":
@@ -9260,6 +9349,529 @@ def _file_digest(path: Path) -> str:
         return h.hexdigest()
     except OSError:
         return f"<unreadable:{path}>"
+
+
+# The workspace env var retired in v0.8 (#1440). A vendored resolver that still
+# reads it resolves a path nothing else agrees with.
+_REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
+# Callees whose result cannot smuggle an env read past the analysis: pure
+# constructors over arguments this pass already walks.
+_RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
+# ...but only where the SPELLING still means what it says. `from helper import Path`
+# rebinds the name to arbitrary code, so trust is per-file, not global.
+_CANONICAL_CALL_ORIGIN = {"Path": "pathlib.Path"}
+_BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
+# os.path member-by-member, not namespace-wide: expandvars() reads the environment,
+# and an unlisted member is unknown rather than assumed pure.
+_PURE_OSPATH = frozenset({"join", "dirname", "basename", "abspath", "normpath",
+                          "realpath", "split", "splitext", "isabs", "exists",
+                          "isfile", "isdir", "relpath", "expanduser"})
+_VAR_RE = re.compile(r"\$(\w+)|\$\{(\w+)\}")
+
+
+def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
+    """(verdict, why) for one workspace_default copy, WITHOUT importing it.
+
+    Verdicts: "honours" / "ignores" / "unknown". Static because detection must not
+    execute discovered source. "ignores" is asserted only for dataflow this
+    analysis fully resolved; an unresolved call or alias is "unknown", never clean.
+    """
+    try:
+        src = path.read_text()
+        tree = ast.parse(src)
+    except Exception as e:                       # noqa: BLE001 — unparseable is UNKNOWN
+        return "unknown", f"could not parse: {str(e)[:60]}"
+    # MODULE scope, not the whole file: a nested def of the same name would
+    # otherwise overwrite the one the runtime actually calls.
+    modfns = {n.name: n for n in _walk_outside_functions(tree)
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def sibling(dotted: "str"):
+        """One hop: `mod.fn` where mod.py sits beside this file. A delegate we
+        can read is analysed, not guessed at."""
+        mod, _, name = dotted.rpartition(".")
+        if not mod or "." in mod:
+            return None
+        sib = path.parent / f"{mod}.py"
+        if not sib.is_file():
+            return None
+        try:
+            sub = ast.parse(sib.read_text())
+        except Exception:                        # noqa: BLE001
+            return None
+        for n in _walk_outside_functions(sub):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+                return sib, n
+        return None
+
+    fn = modfns.get("resolve_workspace")
+    if fn is None:
+        return "unknown", "no resolve_workspace() to analyse"
+
+    # Which names PROVABLY are os and its members — from ONE module-scope,
+    # origin-preserving pass, so a name cannot borrow an identity from elsewhere.
+    provable = _import_provenance(tree)
+    if provable is None:
+        return "unknown", "a star import binds names this analysis cannot enumerate"
+
+    def _only(origin) -> set:
+        # Exactly one module-scope import AND it is the origin claimed. A nested
+        # `import os` never reaches here; `import helper as os` fails the origin.
+        return {nm for nm, o in provable.items() if o == [origin]}
+
+    os_names = _only("os")
+    getenv_names = _only("os.getenv")
+    environ_names = _only("os.environ")
+    expandvars_names = (_only("os.path.expandvars") | _only("posixpath.expandvars"))
+
+    # Binding revocation is delegated to CPython's OWN symbol table, not enumerated
+    # here: six hand-written rounds each shipped a form the next one found.
+    rebound = _rebound_names(src)
+    if rebound is None:
+        return "unknown", "symbol table refused this source"
+    # The trusted sets above are already module-scope and origin-checked, so the
+    # only thing left to revoke is a name symtable saw bound somewhere as well.
+    os_names -= rebound
+    getenv_names -= rebound
+    environ_names -= rebound
+    expandvars_names -= rebound
+
+    # env = os.environ: a .get on the alias is the same read, but only when the
+    # base is a name proven to be os. Collected through the taint pass's own model.
+    aliases = {nm for tgt, val in _bind_sites(tree)
+               for nm, v in _binding_pairs(tgt, val)
+               if _dots(v) in {f"{o}.environ" for o in os_names}}
+    aliases |= environ_names
+
+    def _is_getenv(d: str) -> bool:
+        return d in getenv_names or d in {f"{o}.getenv" for o in os_names}
+
+    def _is_environ_get(d: str) -> bool:
+        head, _, attr = d.rpartition(".")
+        return attr == "get" and (head in aliases
+                                  or head in {f"{o}.environ" for o in os_names})
+
+    def _is_environ_base(base: str) -> bool:
+        return base in aliases or base in {f"{o}.environ" for o in os_names}
+
+    def _is_expandvars(d: str) -> bool:
+        return d in expandvars_names or d in {f"{o}.path.expandvars" for o in os_names}
+
+    # Module scope is where a name can be bound once and read by every function
+    # below it, and a body-scoped walk cannot see any of it.
+    mod_binds = [pair for tgt, val in _bind_sites(tree, walker=_walk_outside_functions)
+                 for pair in _binding_pairs(tgt, val)]
+    imported = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                imported.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                imported.add(al.asname or al.name)
+
+    # Membership in `imported` proves a name was BOUND by an import, never what
+    # it holds; only these four sets carry a followed origin.
+    proven = os_names | getenv_names | environ_names | expandvars_names
+
+    # A pure-callee spelling is trusted only where nothing rebinds it: an import
+    # or assignment of the same name supplies a different callable entirely.
+    resolved_calls = {n for n in _RESOLVED_CALLS
+                      if n not in rebound
+                      and (n not in provable
+                           or provable[n] == [_CANONICAL_CALL_ORIGIN.get(n)])}
+
+    def _callee_base_nodes(expr) -> set:
+        """id() of the Name NODE at the base of each callee chain — node-specific,
+        because one identifier can be a followed callee and an opaque value at once."""
+        out = set()
+        for c in ast.walk(expr):
+            if not isinstance(c, ast.Call):
+                continue
+            f = c.func
+            while isinstance(f, ast.Attribute):
+                f = f.value
+            if isinstance(f, ast.Name):
+                out.add(id(f))
+        return out
+
+    def _keyed(node) -> bool:
+        return _const_str(node) == _REMOVED_WS_ENV
+
+    def _expandvars_names(n) -> "frozenset | None":
+        """Variables an expandvars() call expands, or None if unprovable."""
+        d = _dots(n.func)
+        if not _is_expandvars(d) or not n.args:
+            return None
+        lit = _const_str(n.args[0])
+        if lit is None:
+            return frozenset()                   # unresolved argument: caller decides
+        return frozenset(a or b for a, b in _VAR_RE.findall(lit))
+
+    def reads_env(node) -> bool:
+        """Any supported spelling of a read keyed by the removed env var."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                names = _expandvars_names(n)
+                if names and _REMOVED_WS_ENV in names:
+                    return True
+            if isinstance(n, ast.Subscript):
+                if _is_environ_base(_dots(n.value)) and _keyed(n.slice):
+                    return True
+            if isinstance(n, ast.Call):
+                d = _dots(n.func)
+                if (_is_getenv(d) or _is_environ_get(d)) and n.args and _keyed(n.args[0]):
+                    return True
+        return False
+
+    def murky_env_read(node) -> "str | None":
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and _is_expandvars(_dots(n.func)):
+                if _expandvars_names(n) == frozenset():
+                    return "an expandvars() whose argument is not a literal"
+        return _murky_env_read_keys(node)
+
+    def _murky_env_read_keys(node) -> "str | None":
+        """An environment read whose KEY this analysis did not resolve.
+
+        reads_env() recognizes a literal key only, so `os.getenv(KEY)` would
+        otherwise register as no env read at all — a clean bill for a resolver
+        that still returns the removed variable."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Subscript):
+                base = _dots(n.value)
+                if not _is_environ_base(base):
+                    # A subscript on imported-but-unproven code, dotted or bare;
+                    # no Call node exists for unresolved_call to catch either one.
+                    if base.split(".")[0] in imported:
+                        return f"a subscript on the unresolved {base}"
+                    continue
+                key = n.slice
+            elif isinstance(n, ast.Call):
+                d = _dots(n.func)
+                if not (_is_getenv(d) or _is_environ_get(d)):
+                    continue
+                if not n.args:
+                    return "an environment read with no key argument"
+                key = n.args[0]
+            else:
+                continue
+            if _const_str(key) is None:
+                return "an environment read whose key is not a literal"
+        return None
+
+    def unresolved_call(node) -> "str | None":
+        """Name the first call whose result this analysis cannot account for.
+
+        Bare AND dotted callees both count: `mystery()` and `config.workspace()`
+        can each return the removed value. Only module functions (followed
+        below), pure constructors, and os.path helpers are resolved.
+        """
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Call):
+                continue
+            d = _dots(n.func)
+            if d in modfns or d in resolved_calls:
+                continue
+            if d.startswith("os.path.") and d.rpartition(".")[2] in _PURE_OSPATH:
+                continue
+            if _is_getenv(d) or _is_environ_get(d) or _is_expandvars(d):
+                continue                         # a PROVEN env read: reads_env judges it
+            sib = sibling(d)
+            if _hops > 0 and sib is not None and sib[1].name == "resolve_workspace":
+                continue                         # same-name delegate: analysed below
+            return f"{d}()" if d else "<expr>"
+        return None
+
+    def verdict(node, seen: frozenset) -> "tuple[str, str] | None":
+        """honours/unknown for one function; None means nothing found here."""
+        if node.name in seen:
+            return None                          # recursion guard
+
+        def delegated(expr, who):
+            """A followed callee's verdict, for ANY expression holding one.
+
+            The return path and the binding fixpoint both need this; when only
+            the return path had it, `t = sibling.resolve_workspace(); return t`
+            lost the callee's verdict — the shape the canonical wrapper uses.
+            """
+            for c in ast.walk(expr):
+                if not isinstance(c, ast.Call):
+                    continue
+                d = _dots(c.func)
+                if d in modfns:
+                    deeper = verdict(modfns[d], seen)
+                    if deeper is not None:
+                        return deeper
+                    continue
+                sib = sibling(d)
+                if sib is not None and sib[1].name == who:
+                    if _hops <= 0:               # budget spent: mutual delegates
+                        return "unknown", (f"{who}() delegates to {d}() beyond "
+                                           f"the one-hop limit")
+                    sub, _ = _resolver_env_verdict(sib[0], _hops - 1)
+                    if sub != "ignores":
+                        return sub, f"{who}() delegates to {d}(), which is {sub}"
+            return None
+        seen = seen | {node.name}
+        binds = list(mod_binds) + [pair for tgt, val in _bind_sites(node)
+                                   for pair in _binding_pairs(tgt, val)]
+        tainted, murky = set(), {}
+        for nm, dflt in _param_binds(node):
+            if dflt is None:                 # caller-supplied: unprovable, so unknown
+                murky.setdefault(nm, f"the caller-supplied parameter {nm}")
+            else:
+                binds.append((nm, dflt))
+        bound = {nm for nm, _ in binds} | set(murky)
+
+        def opaque_import(expr) -> "str | None":
+            """An imported name read as a VALUE. Same edge as an unresolved call,
+            so it must run in the fixpoint too: one local hop hides it otherwise."""
+            callee = _callee_base_nodes(expr)
+            for n in ast.walk(expr):
+                if not isinstance(n, ast.Name) or id(n) in callee:
+                    continue
+                x = n.id
+                if (x in imported and x not in proven and x not in bound
+                        and x not in modfns and x not in resolved_calls):
+                    return f"the imported value {x}"
+            return None
+
+        changed = True
+        while changed:                           # two fixpoints, one walk
+            changed = False
+            for name, val in binds:
+                names = [x.id for x in ast.walk(val) if isinstance(x, ast.Name)]
+                dv = delegated(val, node.name)
+                env = (reads_env(val) or any(x in tainted for x in names)
+                       or (dv is not None and dv[0] == "honours"))
+                unk = (unresolved_call(val) or murky_env_read(val)
+                       or opaque_import(val)
+                       or next((murky[x] for x in names if x in murky), None)
+                       or (dv[1] if dv is not None and dv[0] == "unknown" else None))
+                if env and name not in tainted:
+                    tainted.add(name); changed = True
+                if unk and name not in murky:
+                    murky[name] = unk; changed = True
+        for n in ast.walk(node):
+            if not (isinstance(n, ast.Return) and n.value is not None):
+                continue
+            names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)]
+            if reads_env(n.value) or any(x in tainted for x in names):
+                return "honours", (f"a return in {node.name}() derives from the env "
+                                   f"(line {n.lineno})")
+            for c in ast.walk(n.value):          # follow calls we can read
+                if not isinstance(c, ast.Call):
+                    continue
+                pass
+            dv = delegated(n.value, node.name)
+            if dv is not None:
+                return dv
+            bad = (unresolved_call(n.value) or murky_env_read(n.value)
+                   or next((murky[x] for x in names if x in murky), None)
+                   or opaque_import(n.value)
+                   or next((f"the unbound name {x}" for x in names
+                            if x not in bound and x not in imported
+                            and x not in modfns and x not in resolved_calls
+                            and x not in _BUILTIN_NAMES), None))
+            if bad is not None:
+                return "unknown", (f"a return in {node.name}() flows through "
+                                   f"{bad}, which this analysis cannot resolve")
+        return None
+
+    found = verdict(fn, frozenset())
+    if found is not None:
+        return found
+    return "ignores", "no return derives from $SUTANDO_WORKSPACE"
+
+
+def _bind_sites(node, walker=ast.walk):
+    """(target, value) for every name-binding form the walker reaches.
+
+    Enumerated rather than matched statement by statement: a binding form the
+    taint pass does not model leaves its names untainted, which reads as clean.
+    """
+    for n in walker(node):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                yield t, n.value
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+            if n.value is not None:
+                yield n.target, n.value
+        elif isinstance(n, ast.NamedExpr):
+            yield n.target, n.value
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            yield n.target, n.iter
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for item in n.items:
+                if item.optional_vars is not None:
+                    yield item.optional_vars, item.context_expr
+
+
+def _walk_outside_functions(node):
+    """ast.walk minus function and class bodies — i.e. module scope only."""
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        n = stack.pop()
+        yield n
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(n))
+
+
+def _import_provenance(tree):
+    """{bound name: [origin, ...]} for MODULE-SCOPE imports; None on a star import.
+
+    Origin-preserving, because a COUNT cannot certify provenance: `import helper
+    as os` and `import os` are both one module-scope import of the name `os`.
+    """
+    origins: "dict[str, list]" = {}
+    for n in _walk_outside_functions(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                origins.setdefault(al.asname or al.name.split(".")[0], []).append(al.name)
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                if al.name == "*":
+                    return None
+                nm = al.asname or al.name
+                origins.setdefault(nm, []).append(f"{n.module}.{al.name}")
+    return origins
+
+
+def _rebound_names(src):
+    """Every name BOUND by something other than an import, per CPython itself.
+
+    symtable is the language's own answer, so no binding construct can be
+    forgotten — comprehension targets, parameters, `except as`, `with as`,
+    walrus, `global`, match captures included. It builds a table; it does not
+    execute the source, which the probe's first property requires.
+    """
+    out = set()
+
+    def walk(tbl, is_module):
+        for s in tbl.get_symbols():
+            if s.is_assigned() or s.is_parameter():
+                out.add(s.get_name())
+            # `global os; import helper as os` REPLACES the module binding, and
+            # CPython calls that imported+global in the child scope, never assigned.
+            elif not is_module and s.is_declared_global() and s.is_imported():
+                out.add(s.get_name())
+        for child in tbl.get_children():
+            walk(child, False)
+
+    try:
+        walk(symtable.symtable(src, "<resolver>", "exec"), True)
+    except (SyntaxError, ValueError):
+        return None                  # unknown-by-refusal, never an empty clean set
+    return out
+
+
+def _param_binds(fn):
+    """(name, default-or-None) for every parameter.
+
+    A parameter is a binding the body never shows. Its default is analysable;
+    a caller-supplied value is not, so None here means unknown, never clean.
+    """
+    a = fn.args
+    pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    out, covered = [], set()
+    if a.defaults:
+        for arg, d in zip(pos[len(pos) - len(a.defaults):], a.defaults):
+            out.append((arg.arg, d)); covered.add(arg.arg)
+    for arg, d in zip(a.kwonlyargs, a.kw_defaults):
+        if d is not None:
+            out.append((arg.arg, d)); covered.add(arg.arg)
+    rest = pos + list(a.kwonlyargs) + [x for x in (a.vararg, a.kwarg) if x]
+    return out + [(arg.arg, None) for arg in rest if arg.arg not in covered]
+
+
+def _binding_pairs(target, value):
+    """(name, value-node) for one binding.
+
+    A tuple target pairs element-wise with a tuple value of equal length; every
+    other shape binds the WHOLE value, which over-taints rather than under-taints.
+    """
+    if isinstance(target, ast.Name):
+        return [(target.id, value)]
+    if isinstance(target, ast.Starred):
+        return _binding_pairs(target.value, value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        elts = target.elts
+        if (isinstance(value, (ast.Tuple, ast.List))
+                and len(value.elts) == len(elts)
+                and not any(isinstance(e, ast.Starred) for e in elts + value.elts)):
+            return [pair for t, v in zip(elts, value.elts)
+                    for pair in _binding_pairs(t, v)]
+        return [pair for t in elts for pair in _binding_pairs(t, value)]
+    return [(x.id, value) for x in ast.walk(target) if isinstance(x, ast.Name)]
+
+
+def _dots(node) -> str:
+    """Dotted name for Attribute/Name chains; '' for anything else."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr); node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _const_str(node) -> "str | None":
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def check_vendored_resolver_env(workspace_dir: "Path | None" = None) -> "dict | None":
+    """A vendored `workspace_default` that still honours $SUTANDO_WORKSPACE.
+
+    v0.8 (#1440) removed that env var as a workspace source, so a copy predating
+    the change resolves elsewhere than every v0.8 consumer whenever it is set.
+
+    STATIC ONLY. Importing a copy — even in a subprocess — executes arbitrary
+    checked-out source with this process's environment. Nothing here runs the
+    files it inspects.
+
+    Three-valued on purpose: a copy that cannot be analysed is `unknown`, never
+    folded into a clean bill — an unmeasured offender is the case this exists for.
+    """
+    name = "vendored-resolver-env"
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    roots = [ws / "skill-repos", REPO_DIR / "packages", REPO_DIR / "skills"]
+    canonical = (REPO_DIR / "src" / "workspace_default.py").resolve()
+    copies, roots_seen = [], [str(r) for r in roots if r.is_dir()]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for f in root.rglob("workspace_default.py"):
+            if ".git" not in f.parts and f.resolve() != canonical:
+                copies.append(f)
+    if not copies:
+        return {"name": name, "status": "ok",
+                "detail": f"no vendored workspace_default under {len(roots_seen)} "
+                          f"root(s) ({', '.join(roots_seen) or 'none present'}) — "
+                          "zero copies scanned, so this is coverage, not a clean bill"}
+    honours, unknown = [], []
+    for f in sorted(set(copies)):
+        verdict, why = _resolver_env_verdict(f)
+        if verdict == "honours":
+            honours.append(f"{f} ({why})")
+        elif verdict == "unknown":
+            unknown.append(f"{f} ({why})")
+    if honours:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(honours)} vendored workspace_default still honour(s) "
+                          f"$SUTANDO_WORKSPACE, removed in v0.8: " + "; ".join(honours)
+                          + (f" · {len(unknown)} more could not be analysed: "
+                             + "; ".join(unknown) if unknown else "")}
+    if unknown:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(unknown)} of {len(set(copies))} vendored resolver(s) "
+                          "could NOT be analysed, so this is not a clean bill: "
+                          + "; ".join(unknown)}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(set(copies))} vendored resolver(s), all analysed, "
+                      "none honour $SUTANDO_WORKSPACE"}
 
 
 def check_legacy_notes_divergence() -> "dict | None":
@@ -10772,6 +11384,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
+    # Advisory CLI progress detector (pane static with work outstanding / retry
+    # loop); reads the pane, never the process, and drives no recovery.
+    checks.append(check_cli_wedge())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -10831,6 +11446,10 @@ def run_all_checks() -> list[dict]:
     _legacy_nd = check_legacy_notes_divergence()
     if _legacy_nd:
         checks.append(_legacy_nd)
+
+    _vre = check_vendored_resolver_env()
+    if _vre:
+        checks.append(_vre)
 
     # Memory sync
     checks.append(check_memory_sync())
@@ -12731,6 +13350,7 @@ def main():
     # Human-readable
     if not quiet:
         print("Sutando Health Check")
+        print(f"workspace: {WORKSPACE_DIR}")
         print("=" * 40)
 
         for c in checks:

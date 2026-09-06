@@ -168,10 +168,12 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             continue
         stand, room = entry.get("stand"), entry.get("room")
         why = stated_reason(entry)
-        # A caveat nobody prints is a note, not a step. Shared-login entries
-        # look like one actor from GitHub; surface it here, before the send.
-        if entry.get("identity_caveat"):
-            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
+        # A caveat nobody prints is a note, not a step. Derived from the entry:
+        # a named field list misses the next caveat silently.
+        for field in sorted(k for k in entry if k.endswith("_caveat")):
+            if entry.get(field):
+                label = field[: -len("_caveat")].upper().replace("_", " ")
+                print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
         dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
         channel = entry.get("home_channel")
         if stand and room:

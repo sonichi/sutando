@@ -70,16 +70,31 @@ def parse(text: str) -> dict:
         if not m:
             raise ValueError(f"no {win} window line in input")
         return int(m.group(1)) if what == "used" else int(m.group(2))
-    resets = re.findall(r"Resets: (.+)", text)
-    return {"used5": grab("5h", "used"), "rem5": grab("5h", "rem"),
-            "used7": grab("7d", "used"), "rem7": grab("7d", "rem"),
-            "resets": resets}
+    # Each `Resets:` belongs to the window line printed just above it, so the
+    # top-tier lane keeps ITS reset and never borrows the ordinary week's.
+    resets, by_win, cur = [], {}, None
+    for line in text.splitlines():
+        w = re.match(r"\s*(5h|7d-oi|7d) window", line)
+        if w:
+            cur = w.group(1); continue
+        r = re.match(r"\s*Resets: (.+)", line)
+        if r:
+            resets.append(r.group(1))
+            if cur and cur not in by_win: by_win[cur] = r.group(1)
+    out = {"used5": grab("5h", "used"), "rem5": grab("5h", "rem"),
+           "used7": grab("7d", "used"), "rem7": grab("7d", "rem"),
+           "resets": resets, "resets_by_window": by_win}
+    m = re.search(r"7d-oi window[^:]*: (\d+)% used, (\d+)% remaining", text)
+    if m:
+        out["used7oi"], out["rem7oi"] = int(m.group(1)), int(m.group(2))
+    return out
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reset5", help="5h reset, ISO or 'HH:MM Mon DD'")
     ap.add_argument("--reset7", help="7d reset, ISO")
+    ap.add_argument("--reset7oi", help="top-tier (7d_oi) weekly reset, ISO")
     a = ap.parse_args(argv)
     q = parse(sys.stdin.read())
     now = datetime.datetime.now()
@@ -97,15 +112,37 @@ def main(argv=None) -> int:
     m5 = (r5 - now).total_seconds() / 60
     s7 = r7 - datetime.timedelta(days=7)
     el = (now - s7).total_seconds() / (r7 - s7).total_seconds()
+    el_oi = None
+    if "rem7oi" in q:
+        # The top-tier lane is tiered against ITS OWN reset. Present utilization
+        # with no usable reset is a refusal, never a borrowed week.
+        try:
+            r7oi = (datetime.datetime.fromisoformat(a.reset7oi) if a.reset7oi
+                    else parse_reset(q["resets_by_window"]["7d-oi"], now, 8 * 24))
+        except (ValueError, KeyError) as e:
+            print(f"quota-tier: 7d-oi utilization is present but its reset is missing or invalid ({e}); "
+                  f"pass --reset7oi. Refusing to tier the top-tier lane against another window's week.",
+                  file=sys.stderr)
+            return 2
+        s7oi = r7oi - datetime.timedelta(days=7)
+        el_oi = (now - s7oi).total_seconds() / (r7oi - s7oi).total_seconds()
     t5, t7 = tier_5h(q["rem5"], m5), tier_7d(q["rem7"], el)
     burn = (q["used7"] / 100) / el if el > 0 else float("inf")
     head = (q["rem7"] / 100) / (1 - el) if el < 1 else float("inf")
-    sel = most_restrictive(t5, t7)
-    binding = "both" if t5 == t7 else ("5h" if sel == t5 else "7d")
+    tiers = {"5h": t5, "7d": t7}
+    if "rem7oi" in q:
+        tiers["7d-oi"] = tier_7d(q["rem7oi"], el_oi)
+    sel = most_restrictive(*tiers.values())
+    bound = [w for w, t in tiers.items() if t == sel]
+    binding = "both" if len(bound) == len(tiers) == 2 else "+".join(bound)
     print(f"5h  {q['rem5']}% rem, {m5:.0f} min -> retained "
           f"{q['rem5']/(m5/5):.2f} %/pass -> {t5}")
     print(f"7d  {q['rem7']}% rem, elapsed {el:.4f}, burn {burn:.2f}, "
           f"headroom {head:.3f} -> {t7}")
+    if "rem7oi" in q:
+        head_oi = (q["rem7oi"] / 100) / (1 - el_oi) if el_oi < 1 else float("inf")
+        print(f"7d-oi (top-tier models) {q['rem7oi']}% rem, elapsed {el_oi:.4f}, "
+              f"headroom {head_oi:.3f} -> {tiers['7d-oi']}")
     # burn guards its own denominator above and then BECOMES one here. A
     # just-reset window has used7 == 0, so the ratio is unbounded, not a number.
     ratio = (f"{head/burn:.2f}x CURRENT pace" if burn > 0

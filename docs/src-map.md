@@ -37,6 +37,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
+- **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
@@ -55,6 +56,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
+- **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
@@ -279,6 +281,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).
 - **`supervisor.py`** — Runtime supervisor pass: detector -> manager -> projector, one turn.
+- **`tui_gate.py`** — A TUI gate as a HumanRequirement with semantic actions, and the keys that answer it.
 
 ## `src/launchd/`
 
