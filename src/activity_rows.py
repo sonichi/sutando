@@ -82,6 +82,30 @@ def default_room(workspace: Path | None = None) -> str | None:
     return d.get("channel_id") if d.get("channel") == "ag2space" else None
 
 
+def acks_path(workspace: Path | None = None) -> Path:
+    """Projection ids the writer has applied, one per line: the sink's acknowledgement, kept apart
+    from the rotating live log so a replay after rotation is still recognised."""
+    return log_path(workspace).with_name("agent-activity.acks")
+
+
+def _pid_acked(path: Path, pid: str) -> bool:
+    try:
+        return pid in path.read_text(encoding="utf-8").split("\n")
+    except OSError:
+        return False
+
+
+def _ack(path: Path, pid: str, keep: int = 5000) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(pid + "\n")
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+        if len(lines) > keep + 1000:
+            path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _pid_in_log(path: Path, pid: str) -> bool:
     try:
         return any(json.loads(l).get("pid") == pid for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
@@ -111,9 +135,11 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     # an inode that a concurrent rotation replaces.
     with open(path.with_suffix(".lock"), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        if not (pid and _pid_in_log(path, pid)):
+        if not (pid and (_pid_acked(acks_path(workspace), pid) or _pid_in_log(path, pid))):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if pid:
+                _ack(acks_path(workspace), pid)
         if task and isinstance(task.get("id"), str):
             ip = index_path(workspace)
             idx = _load_index(ip)

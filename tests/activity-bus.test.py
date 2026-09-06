@@ -198,6 +198,31 @@ class IdempotentProjection(unittest.TestCase):
         self.assertEqual([(x["task"]["id"], x["rows"]) for x in sums], [("task-i1", 2)], "one summary, exact")
         self.assertNotIn("task-i1", card.open_task_index(self.ws))
 
+    def test_a_replay_after_rotation_is_still_applied_once(self):
+        # Reviewer's case: the owed row rotates into the day archive before recovery. The writer's
+        # acknowledgement ledger, not the rotating live log, is what recognises the replay.
+        import activity_rows
+        store = ActivityStore(self.ws)
+        store.apply(T("task-i3", "RUNNING", ts=1, message_event_id="$m"))
+        real = activity_rows._save_index; calls = {"n": 0}
+        def flaky(ip, idx):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("index disk full")
+            real(ip, idx)
+        with unittest.mock.patch.object(activity_rows, "_save_index", flaky):
+            store.apply(T("task-i3", "COMPLETED", ts=2))
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"noise {i}", kind="notice", room=None, workspace=self.ws)
+        live = card.log_path(self.ws).read_text()
+        self.assertNotIn("task-i3", live, "precondition: the task's rows rotated into the archive")
+        fresh = ActivityStore(self.ws)
+        fresh.apply(T("task-i3", "COMPLETED", ts=2))  # the public entry point performs the recovery
+        history = "".join(p.read_text() for p in (self.ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name)
+        self.assertEqual(history.count('"pid": "task-i3:1:2"'), 1, "the done row appears once across live + archive")
+        self.assertEqual(len(fresh.load("task-i3").pending), 0)
+        self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1)
+
     def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
         # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid
         # projected again must not count the row twice.
