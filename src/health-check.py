@@ -6840,7 +6840,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing = [], []
+    unconsumed, trailing, unpublished = [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
@@ -6852,7 +6852,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         # missed-today verdict would blame it for the probe's own blind spot.
         if j.get("naming_stale"):
             drifted.append((j["name"], j.get("newest_artifact") or "?",
-                            j.get("artifact_age_days")))
+                            j.get("artifact_age_days"),
+                            bool(j.get("completion_today"))))
             continue
         # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
         # -1417 early. The filename date is logical, often a day off the mtime.
@@ -6876,8 +6877,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             if fired is None:
                 missed.append((j["name"], j["minutes_since_due"]))
             else:
-                unconsumed.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed:
+                # A completion record means the consumer DID run; blaming it would
+                # send the reader to the wrong layer. Separate bucket, separate cause.
+                bucket = unpublished if j.get("completion_today") else unconsumed
+                bucket.append((j["name"], fired, j["minutes_since_due"]))
+    if not late and not missed and not drifted and not unconsumed and not unpublished:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6909,16 +6913,28 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
+    for n, fired, m in unpublished:
+        bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} and COMPLETED "
+                    f"(a task-cron result exists) but published no artifact {m} min past "
+                    f"due — the producer, not the consumer, and not the cron")
     for n, fired, m in unconsumed:
         bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
                     f"no output {m} min past due — the schedule fired and the task was "
                     f"never consumed, so this is the consumer, not the cron")
-    for n, newest, age in sorted(drifted):
+    for n, newest, age, ran in sorted(drifted):
         age_txt = f", {age}d ago" if age is not None else ""
-        bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
-                    f"probe's filename match has drifted off this job's output; "
-                    f"punctuality cannot be scored and a missed-today verdict would "
-                    f"blame the job for the probe's own blind spot")
+        if ran:
+            # A completion record dates TODAY, so "the match drifted" cannot be
+            # asserted: this run holds evidence the job ran. Name both candidates.
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, but a "
+                        f"task-cron completion record exists TODAY, so the job did run; "
+                        f"either the probe's filename match drifted off its output or it "
+                        f"published nothing. Punctuality cannot be scored either way")
+        else:
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
+                        f"probe's filename match has drifted off this job's output; "
+                        f"punctuality cannot be scored and a missed-today verdict would "
+                        f"blame the job for the probe's own blind spot")
     for n, m, dm, c in sorted(trailing):
         bits.append(f"{n}: dispatches on time (median {dm:+g} min); output trails by "
                     f"median {m:+g} min over {c} run(s) — latency, not the schedule")
@@ -7095,8 +7111,11 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = bool(arts) and launchd
         # Last resort, and the only lane needing no per-job config: a job that
         # publishes nothing dated still leaves a task-cron result when it finishes.
+        # Unconditional, not the no-artifact fallback below: a job that published
+        # artifacts then lost its producer keeps history, hiding its completion.
+        completions = _daily_task_record_minutes(ws / "results", jname)
         if not arts:
-            arts = _daily_task_record_minutes(ws / "results", jname)
+            arts = completions
             used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
@@ -7113,6 +7132,9 @@ def check_daily_cron_punctuality() -> dict:
             "newest_artifact": newest, "artifact_age_days": age_days,
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            # Consumption is a DIFFERENT fact from publication: a task can finish
+            # correctly and publish nothing (producer removed, [no-send] by design).
+            "completion_today": any(d == now.strftime("%Y-%m-%d") for d, _ in completions),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # Dispatch is the schedule's own evidence: it is what "on time"
             # means, and it is what an output mtime cannot report.
