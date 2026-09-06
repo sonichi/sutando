@@ -137,9 +137,8 @@ def main(argv=None) -> int:
         print(f"\n✗ REFUSE — this addition drops {len(r['dropped'])} row(s) that load today:")
         for e in r["dropped"][:10]:
             print(f"    {e[:100]}")
-        # Names no containment script: the one this line used to cite has never
-        # existed in the repo or the workspace, so the advice was unrunnable at
-        # the exact moment it mattered — on a refusal.
+        # Names no containment script: the one previously cited never existed,
+        # so the advice was unrunnable at the one moment it is read — a refusal.
         print("\n  Free room FIRST, and check the row is still reachable from its hub")
         print("  before removing it. health-check.py's memory-index probe reports the")
         print("  loaded prefix; which rows go is the owner's call.")
