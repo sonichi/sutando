@@ -74,6 +74,22 @@ def open_tasks(log: Path) -> dict[str, dict]:
     return out
 
 
+def indexed_open_tasks(ws: Path) -> dict[str, dict]:
+    """{task_id: {"task", "room"}} from the writer's index, in the shape open_tasks() returns."""
+    try:
+        sys.path.insert(0, str(WRITER.parent))
+        from activity import open_task_index
+        idx = open_task_index(ws)
+    except Exception:  # noqa: BLE001 - the hook never fails the tool it observed
+        return {}
+    out: dict[str, dict] = {}
+    for tid, e in idx.items():
+        t = e.get("task") if isinstance(e, dict) else None
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            out[tid] = {"task": t, "room": e.get("room") if isinstance(e.get("room"), str) else None}
+    return out
+
+
 def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     """The open task this session is bound to; None when none is (fail closed)."""
     binds = load_json(p["bind"], {})
@@ -118,7 +134,10 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         fcntl.flock(lk, fcntl.LOCK_EX)
         binds = load_json(p["bind"], {})
         binds[task_id] = session_id
+        # The same open set completion uses: the live log plus the writer's index, so a task whose
+        # rows rotated out keeps its binding while another session picks up the next task.
         alive = open_tasks(p["log"])
+        alive.update(indexed_open_tasks(p["ws"]))
         binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
         tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
         tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
@@ -324,6 +343,10 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])
+        # A long task's rows may have rotated out of the live log; the writer's index still holds it
+        # open, so its result write still closes it and still leaves a summary.
+        for tid, e in indexed_open_tasks(p["ws"]).items():
+            opened.setdefault(tid, e)
         # The result write closes the task only once the file exists: the tool ran, was not denied,
         # and produced the artifact. The text says what the result did (a marker body reached nobody).
         for tid in result_file_refs(blob):
