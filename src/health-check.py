@@ -6925,9 +6925,14 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing, unpublished = [], [], []
+    unconsumed, trailing, unpublished, dead = [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
+        # A deleted script still completes — the handler runs and writes a no-op —
+        # so every completion lane reports it on time and lateness is the wrong verdict.
+        if j.get("missing_script"):
+            dead.append((j["name"], j["missing_script"]))
+            continue
         if not j["artifacts"]:
             # `conditional` declares that absence is expected, so it cannot also
             # be the blind spot that pins this probe to warn with no path back.
@@ -6966,7 +6971,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 # send the reader to the wrong layer. Separate bucket, separate cause.
                 bucket = unpublished if j.get("completion_today") else unconsumed
                 bucket.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed and not unpublished:
+    if not late and not missed and not drifted and not unconsumed and not unpublished and not dead:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6995,6 +7000,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
                         f"— no dispatch record retained for this job, so a late "
                         f"schedule and a slow pickup cannot be told apart here")
+    for n, ref in sorted(dead):
+        bits.append(f"{n}: SCHEDULED BUT CANNOT RUN — {ref} does not exist. Its slot "
+                    f"still fires and the handler still writes a result, so every "
+                    f"completion lane reports it finishing on time; the schedule "
+                    f"entry outlived the script and needs removing or restoring")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
@@ -7073,6 +7083,39 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
+
+
+_CRON_NOT_A_RUN = re.compile(
+    r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
+
+
+def _cron_missing_script(entry: dict) -> Optional[str]:
+    """First script path a cron entry invokes that is not on disk, else None.
+
+    A job whose script was deleted still leaves a task-cron RESULT — the handler
+    runs, finds nothing, and writes a no-op — so every completion lane reports it
+    as finishing on time. Only the schedule's own command distinguishes "ran and
+    produced nothing" from "cannot run at all", which is why this is read here
+    and not inferred from a result body: `[no-send]` is also what a job writes
+    when it delivered by another route (a DM), so the marker does not separate
+    the two cases and the referenced path does.
+    """
+    cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
+    # Only an INVOKED path counts, and only when the reference is unambiguous:
+    # this verdict makes the operator delete a schedule, so doubt must read ok.
+    for m in re.finditer(r"\b(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
+        ref = m.group(1).strip("\"'").rstrip(";&|")
+        if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
+            continue
+        # A negation before the interpreter makes this a mention, not a run.
+        if _CRON_NOT_A_RUN.search(cmd[:m.start()]):
+            continue
+        # An absolute path resolves on its own; only a repo-relative one is
+        # judged against REPO_DIR, so a valid /tmp script is never "missing".
+        target = Path(ref) if ref.startswith("/") else REPO_DIR / ref
+        if not target.exists():
+            return ref
+    return None
 
 
 def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
@@ -7185,23 +7228,32 @@ def check_daily_cron_punctuality() -> dict:
         launchd = bool(e.get("launchd"))
         # Each lane is a preference, not a restriction: `launchd` says how a job is
         # SCHEDULED, which does not determine what dated evidence it leaves behind.
-        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
-                else _daily_artifact_minutes(ws / "results", stem))
-        used_artifact_lane = not launchd
-        # Both directions, so neither lane's absence reads as the job's silence:
-        # without the launchd arm a daily artifact reports "no dated artifact" forever.
-        if not arts:
-            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
-                    else _daily_completion_minutes(ws / "state", jname))
-            used_artifact_lane = bool(arts) and launchd
-        # Last resort, and the only lane needing no per-job config: a job that
-        # publishes nothing dated still leaves a task-cron result when it finishes.
-        # Unconditional, not the no-artifact fallback below: a job that published
-        # artifacts then lost its producer keeps history, hiding its completion.
+        # Lanes are a preference, but a lane that is merely STALE must not shadow a
+        # later one holding today: fall through on freshness, not just emptiness.
+        today_str = now.strftime("%Y-%m-%d")
+        lane_thunks = [
+            (lambda: (_daily_completion_minutes(ws / "state", jname) if launchd
+                      else _daily_artifact_minutes(ws / "results", stem)), not launchd),
+            (lambda: (_daily_artifact_minutes(ws / "results", stem) if launchd
+                      else _daily_completion_minutes(ws / "state", jname)), launchd),
+            (lambda: _daily_task_record_minutes(ws / "results", jname), False),
+        ]
+        # Lazy: a lane holding today stops the scan, so the common case still costs
+        # one lane. Only a job with no fresh record anywhere pays for all three.
+        arts, used_artifact_lane, fallback = [], False, None
+        for thunk, flag in lane_thunks:
+            rows = thunk()
+            if any(d == today_str for d, _ in rows):
+                arts, used_artifact_lane = rows, flag
+                break
+            if fallback is None and rows:
+                fallback = (rows, flag)
+        else:
+            if fallback:
+                arts, used_artifact_lane = fallback
+        # Unconditional: `completion_today` below reads it even when a fresher
+        # lane supplied `arts`, so it is not the thunk list's third lane.
         completions = _daily_task_record_minutes(ws / "results", jname)
-        if not arts:
-            arts = completions
-            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
@@ -7215,6 +7267,7 @@ def check_daily_cron_punctuality() -> dict:
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "newest_artifact": newest, "artifact_age_days": age_days,
+            "missing_script": _cron_missing_script(e),
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             # Consumption is a DIFFERENT fact from publication: a task can finish
