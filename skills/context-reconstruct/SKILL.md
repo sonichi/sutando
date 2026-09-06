@@ -16,6 +16,7 @@ description: Re-anchor on the durable record (current-track, live owner thread, 
 ## What to read — judgment, fit to the moment (not a checklist to run blindly)
 
 **Read the current-track record FIRST** — `<workspace>/hosts/<hostname>/current-track.md` (this skill owns it; see "Maintain" below).
+  **It is a bounded head, not the whole history.** Every pass pays this read, so the file is rotated: entries older than the newest ~32 KB live in `current-track-archive.md` beside it (`scripts/current-track-rotate.py`, run when health-check's `context-read-budget` probe warns; head + archive is the original, nothing is deleted). Read the head; open the archive only for a specific older referent.
   Resolve `<hostname>` with `bash scripts/sutando-config.sh host-label`, the same way `pending-questions.md` does. **Legacy fallback:** if that file is absent but `<workspace>/state/current-track.md` exists, read the legacy path and migrate it to the per-host path on the next write — the flat path was shared across hosts and is being retired (#2567).
  It's the fast anchor: the **current main-track goal**, the active sub-task, and the live open decisions. This is what's missing when "continue your main track" gets guessed — the goal must be a pinned record, not inferred from luck.
 
