@@ -483,9 +483,11 @@ class PoolLead:
         return w, m, du
 
     def _save_wake_evidence(self, wall: float, mono: float,
-                            defer_until: "float | None" = None) -> bool:
-        """Publish this lead's wake sample. False = not published, so a caller
-        can observe the loss instead of trusting a silent best-effort write."""
+                            defer_until: "float | None" = None
+                            ) -> "tuple[bool, float | None]":
+        """Publish this lead's wake sample; return (published, effective).
+        `effective` is the deadline the record now CARRIES, which may be
+        another lead's — decide from it, never from the pre-merge value."""
         p = self._wake_evidence_path()
         # Per-writer temp name, as pool_status does: briefly overlapping leads
         # are supported, and a shared temp lets one consume the other's bytes.
@@ -494,37 +496,42 @@ class PoolLead:
             # One lock across load..replace: unique temps stop a torn record,
             # not a stale write erasing a deadline opened since its load.
             with self._wake_lock():
-                payload = {"wall": wall, "mono": mono}
+                prior = self._load_wake_evidence()
+                # The loader bounds a deadline by the STORED mono, so an
+                # older sample beside a newer deadline voids grace on read.
+                if prior is not None and prior[1] > mono:
+                    wall, mono = prior[0], prior[1]
                 # The window belongs to the wake event, not to whoever ticked
                 # last, so the MAXIMUM still-open deadline survives.
-                prior = self._load_wake_evidence()
                 open_du = prior[2] if prior is not None else None
                 if open_du is not None and mono < open_du:
                     defer_until = (open_du if defer_until is None
                                    else max(defer_until, open_du))
+                payload = {"wall": wall, "mono": mono}
                 if defer_until is not None:
                     payload["defer_until"] = defer_until
                 p.parent.mkdir(parents=True, exist_ok=True)
                 tmp.write_text(json.dumps(payload))
                 os.replace(tmp, p)
-            return True
+            return True, defer_until
         except OSError:
             try:
                 tmp.unlink()
             except OSError:
                 pass
-            return False
+            return False, None
 
     def _publish_wake(self, wall: float, mono: float,
-                      defer_until: "float | None") -> bool:
+                      defer_until: "float | None") -> "tuple[bool, float | None]":
         """Publish the wake sample and REPORT a loss. A silent best-effort
         write is what let a failed publish renew the same window forever."""
-        if self._save_wake_evidence(wall, mono, defer_until):
-            return True
+        published, effective = self._save_wake_evidence(wall, mono, defer_until)
+        if published:
+            return True, effective
         print("pool-lead: wake evidence not published "
               f"(defer_until={defer_until}); grace cannot be bounded",
               file=sys.stderr, flush=True)
-        return False
+        return False, None
 
     def _host_gap_defers_reclaim(self) -> bool:
         """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's
@@ -569,7 +576,12 @@ class PoolLead:
             if followers and not any(self.alive_fn(f) for f in followers):
                 self._reclaim_defer_until = mono + LEAD_STALE_S
         du = getattr(self, "_reclaim_defer_until", None)
-        if not self._publish_wake(now, mono, du):
+        published, effective = self._publish_wake(now, mono, du)
+        # Decide from the COMMITTED deadline: a peer's open grace binds this
+        # lead too, and it is only visible in what the record actually holds.
+        if effective is not None and (du is None or effective > du):
+            self._reclaim_defer_until = du = effective
+        if not published:
             # The one-window bound lives IN the record a successor seeds from;
             # unpublished, every restart re-opens grace. Refuse, don't renew.
             self._reclaim_defer_until = None

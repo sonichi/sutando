@@ -132,7 +132,7 @@ class TheWakeRecordHasOneWriterContract(WakeGuardBase):
         def opener():
             loaded.wait(5)
             # production writer, the deadline-carrying half
-            opened.append(other._save_wake_evidence(self.clock, self.mono, want))
+            opened.append(other._save_wake_evidence(self.clock, self.mono, want)[0])
         t = threading.Thread(target=opener)
         t.start()
         # production writer, the deadline-FREE half that must not clobber
@@ -158,6 +158,77 @@ class TheWakeRecordHasOneWriterContract(WakeGuardBase):
         got = self.lead._load_wake_evidence()
         self.assertEqual(got[2], longer, "a shorter sample truncated the window")
 
+    def _seed_a_lead_with_no_window_of_its_own(self):
+        """Give the lead an in-process sample with followers ALIVE, so the
+        cold-lead fallback cannot fire and there is no skew. Without this the
+        lead opens its OWN window and the peer's deadline is never needed —
+        which is exactly how the first version of these tests was vacuous."""
+        self.alive = {i: True for i in self.pool}
+        self.assertFalse(self.lead._host_gap_defers_reclaim(),
+                         "seed opened a window — the lead is not neutral")
+        self.clock += 2
+        self.mono += 2          # awake seconds: both clocks move, no skew
+
+    def test_a_lagging_lead_adopts_the_grace_a_peer_committed(self):
+        """keweichen: the lock made the RECORD atomic, but the DECISION was
+        still read from the caller's PRE-merge value, so a lead that had just
+        merged a peer's open deadline still repooled a live claim. Drives the
+        production `reclaim_claimed()` post-liveness re-check."""
+        live = self.tasks / "task-live.claimed-core-2.txt"
+        live.write_text("x")
+        self._seed_a_lead_with_no_window_of_its_own()
+        other, opened = self._second_lead(), {}
+
+        def alive(_inst):
+            # core-2 is dead, and a PEER opens grace during this very
+            # liveness read — the window the re-check exists to catch.
+            if not opened:
+                self.clock += 2
+                self.mono += 2
+                du = self.mono + LEAD_STALE_S
+                other._reclaim_defer_until = du
+                other._save_wake_evidence(self.clock, self.mono, du)
+                opened["du"] = du
+            return False
+        self.lead.alive_fn = alive
+
+        got = self.lead.reclaim_claimed()
+
+        self.assertTrue(opened, "the peer never opened grace — probe never fired")
+        self.assertEqual(got, [], "repooled a live claim while a peer's grace was open")
+        self.assertTrue(live.exists(), "the live claim was renamed away")
+
+    def test_control_once_the_window_expires_the_same_path_DOES_reclaim(self):
+        """Stops the test above from passing by simply never reclaiming."""
+        live = self.tasks / "task-live.claimed-core-2.txt"
+        live.write_text("x")
+        self._seed_a_lead_with_no_window_of_its_own()
+        self.alive = {i: False for i in self.pool}
+        self.lead.alive_fn = lambda _i: False
+        got = self.lead.reclaim_claimed()
+        self.assertNotEqual(got, [],
+                            "with no peer grace open the path refused to reclaim — "
+                            "the deferral is not conditional at all")
+
+    def test_an_older_sample_never_replaces_a_newer_one(self):
+        """The loader bounds a deadline by the STORED mono, so publishing an
+        older mono beside a newer deadline VOIDS that grace on the next read —
+        the record stays writable while the protection silently disappears."""
+        other = self._second_lead()
+        self.clock += 4
+        self.mono += 4
+        du = self.mono + LEAD_STALE_S
+        other._save_wake_evidence(self.clock, self.mono, du)
+
+        ok, eff = self.lead._save_wake_evidence(self.clock - 4, self.mono - 4, None)
+
+        self.assertTrue(ok, "the lagging write did not publish")
+        rec = self.lead._load_wake_evidence()
+        self.assertIsNotNone(rec, "record unreadable after the lagging write")
+        self.assertEqual(rec[2], du,
+                         "an older sample voided the peer's open deadline on read")
+        self.assertEqual(eff, du, "the writer did not report the committed deadline")
+
     def test_an_unpublishable_window_is_refused_and_reported_not_renewed(self):
         """keweichen: `_save_wake_evidence` returning False was discarded at
         both call sites, so a failing publish let each restart re-open the same
@@ -167,7 +238,7 @@ class TheWakeRecordHasOneWriterContract(WakeGuardBase):
         self.lead._save_wake_evidence(self.clock, self.mono, None)
         self._sleep_whole_host(968)      # skew: wall jumps, mono does not
 
-        self.lead._save_wake_evidence = lambda *a, **k: False   # disk refuses
+        self.lead._save_wake_evidence = lambda *a, **k: (False, None)  # disk refuses
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             deferred = self.lead._host_gap_defers_reclaim()
@@ -208,7 +279,7 @@ class TheWakeRecordHasOneWriterContract(WakeGuardBase):
             raise OSError("disk full")
         Path.write_text = boom
         try:
-            ok = self.lead._save_wake_evidence(self.clock, self.mono, None)
+            ok, _eff = self.lead._save_wake_evidence(self.clock, self.mono, None)
         finally:
             Path.write_text = real
         # `is False`, not assertFalse: the parent returns None, which is falsy
