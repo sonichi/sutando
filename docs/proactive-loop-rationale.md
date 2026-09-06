@@ -602,10 +602,12 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    will later condemn — the drift that made the dedup checker worse than no checker. 13 tests,
    4 mutations verified red, including one that installs exactly that silent fallback.
 
-   **On a refusal, free room FIRST — and run `scripts/memory-hub-containment.py` before trimming**,
-   so a row you remove is still carried by its hub. Which rows may go is the owner's call
-   (`pending-questions.md` -> "MEMORY.md byte budget"); the guard's job is only to stop the write
-   that would decide it by accident.
+   **On a refusal, free room FIRST — and check the row is still reachable from its hub before
+   removing it.** This used to name a `memory-hub-containment` script; that path has never existed
+   in the repo, so the advice was unrunnable at the one moment it is read. `health-check.py`'s
+   `memory-index` probe reports the loaded prefix and is the coverage that does exist — do not build
+   a duplicate. Which rows may go is the owner's call (`pending-questions.md` -> "MEMORY.md byte
+   budget"); the guard's job is only to stop the write that would decide it by accident.
 
 8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
