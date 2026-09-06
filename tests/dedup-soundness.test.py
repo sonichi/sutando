@@ -140,6 +140,22 @@ class Problems(unittest.TestCase):
 
 
 class RefusesRatherThanGuesses(unittest.TestCase):
+    def test_dedup_target_of_None_is_None_not_a_crash(self):
+        """`result_path` returns None for a target with no result, and the body
+        read from it is None — so this is the ordinary path, not an edge case."""
+        self.assertIsNone(ds.dedup_target(None, SRC))
+
+    def test_markers_puts_src_on_the_path_when_absent(self):
+        saved_path, saved_cache = list(sys.path), ds._MARKERS
+        ds._MARKERS = None
+        sys.path[:] = [p for p in sys.path if p != str(SRC)]
+        try:
+            self.assertIsNotNone(ds.markers(SRC))
+            self.assertIn(str(SRC), sys.path, "markers() must make its own import reachable")
+        finally:
+            sys.path[:] = saved_path
+            ds._MARKERS = saved_cache
+
     def test_an_unimportable_grammar_owner_raises(self):
         saved, had = ds._MARKERS, sys.modules.get("result_markers")
         ds._MARKERS = None

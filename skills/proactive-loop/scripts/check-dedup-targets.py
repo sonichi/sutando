@@ -92,31 +92,6 @@ def _task_id(result_file: Path) -> str:
     return name.rsplit(".", 1)[-1]
 
 
-def resolve(ws: Path, tid: str) -> "str | None":
-    """None if the target delivered a real reply; else why it does not.
-
-    Kept as the by-target-id entry point, now delegating to
-    `src/dedup_soundness.py`. This file previously owned its own copy of the
-    marker regex, the result-path resolution and the verdict, and each was the
-    weaker one: a bare `{tid}*` archive glob matched `{tid}.too-old.<epoch>`, so
-    a dedup pointing at a QUARANTINED reply — never delivered — read as clean.
-    """
-    ds = _require_owner()
-    src = REPO / "src"
-    target_path = ds.result_path(ws / "results", tid.strip())
-    if target_path is None:
-        return "target result does not exist"
-    delivered, _ = ds.markers(src)
-    tb = ds.read(target_path)
-    if not delivered(tb):
-        nxt = ds.dedup_target(tb, src)
-        if nxt:
-            return (f"target is itself [deduped: {nxt}] — the bridge treats a chained "
-                    f"holder as not delivered and requeues; it does not walk the chain")
-        first = ((tb or "").strip().splitlines() or [""])[0][:40]
-        return f"target delivered nothing (canonical dedup_holder_delivered); it begins {first!r}"
-    return None
-
 def main(argv) -> int:
     if _owner() is None:
         print("cannot answer: src/dedup_soundness.py (or result_markers.py) is not importable — "

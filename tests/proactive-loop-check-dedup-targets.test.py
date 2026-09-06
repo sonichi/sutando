@@ -181,11 +181,22 @@ class Refusals(unittest.TestCase):
         self.assertEqual(cdt.check(ws, [ws / "results"]), [])   # a directory: OSError
 
     def test_without_the_policy_owner_the_checker_refuses(self):
-        # No local fallback rule: result_markers.py absent -> RuntimeError, never "clean".
+        # No local fallback rule: the owner absent -> raise, never "clean".
         ws = _ws({"a.txt": "[deduped: task-b]\n", "task-b.txt": "reply\n"})
         with mock.patch.object(cdt, "REPO", Path(tempfile.mkdtemp())):
             with self.assertRaises(RuntimeError):
-                cdt.resolve(ws, "task-b")
+                cdt.check(ws, [ws / "results" / "a.txt"])
+
+    def test_the_CLI_reports_a_missing_owner_as_2_not_1(self):
+        """Exit 1 is reserved for a real finding by every checker in the loop, so
+        a missing owner exiting 1 would read as 'dedups resolve to nothing'."""
+        ws = _ws({"a.txt": "[deduped: task-b]\n"})
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cdt, "REPO", Path(tempfile.mkdtemp())), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = cdt.main([str(ws / "results" / "a.txt")])
+        self.assertEqual(rc, 2)
+        self.assertIn("not importable", buf.getvalue() + err.getvalue())
 
 
 if __name__ == "__main__":
