@@ -1579,6 +1579,10 @@ _last_heartbeat_at = 0.0
 # Result `metadata` is an EXTENSION to the documented {id, body} envelope, so it
 # ships only once the broker advertises it; a strict relay 422s unknown keys.
 _broker_worker_metadata = False
+# A SEPARATE wire contract from result attribution: coupling them would let a
+# broker opt into routing merely by accepting result metadata.
+_broker_worker_routing = False
+_routing_downgrade_logged = False
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Routing keys the pool lead reads with a strict task-last
@@ -1645,7 +1649,12 @@ def _worker_identity() -> "tuple[str, str]":
 
 WORKER_ID, WORKER_LOCATION = _worker_identity()
 # The poll's query suffix, built once: `&worker=<seat>` after `wait=<sec>`.
-_SEAT_QS = f"&worker={urllib.parse.quote(WORKER_ID, safe='')}"
+def _seat_qs() -> str:
+    """Computed per call: advertisement and revocation both happen at runtime, so
+    an import-time constant would send `worker=` to a broker that never allowed it."""
+    if not _broker_worker_routing:
+        return ""
+    return f"&worker={urllib.parse.quote(WORKER_ID, safe='')}"
 
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
@@ -2357,9 +2366,16 @@ def _maybe_push_agent_profile() -> bool:
 def _note_broker_capabilities(reply) -> None:
     """Re-read the broker's advertised capabilities from each heartbeat reply.
     Recomputed (not latched) so a downgraded broker turns the extension back off."""
-    global _broker_worker_metadata
+    global _broker_worker_metadata, _broker_worker_routing, _routing_downgrade_logged
     caps = reply.get("capabilities") if isinstance(reply, dict) else None
-    _broker_worker_metadata = isinstance(caps, list) and "worker-metadata" in caps
+    known = caps if isinstance(caps, list) else []
+    _broker_worker_metadata = "worker-metadata" in known
+    _broker_worker_routing = "worker-routing" in known
+    if not _broker_worker_routing and not _routing_downgrade_logged:
+        # One line per process: silence makes a safe downgrade undiagnosable,
+        # a per-heartbeat line would be noise.
+        _routing_downgrade_logged = True
+        _log("broker did not advertise worker-routing; using legacy shared-queue polling")
 
 
 def _revoke_broker_capabilities() -> None:
@@ -2367,8 +2383,9 @@ def _revoke_broker_capabilities() -> None:
     extension is supported; the keys are additive and return on the next
     advertising reply, so dropping them cannot lose a result while keeping
     them can (a strict relay 422s an un-advertised key)."""
-    global _broker_worker_metadata
+    global _broker_worker_metadata, _broker_worker_routing
     _broker_worker_metadata = False
+    _broker_worker_routing = False
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -2389,11 +2406,14 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
-            "worker_id": WORKER_ID,
-            "location": WORKER_LOCATION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator"],
         }
+        # Legacy-safe first exchange: seat identity rides only after the broker
+        # advertises `worker-routing`, so a strict relay never sees a new key.
+        if _broker_worker_routing:
+            payload["worker_id"] = WORKER_ID
+            payload["location"] = WORKER_LOCATION
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
         if _status is not None:
@@ -4048,7 +4068,7 @@ def main() -> None:
             _retry_review_card_resolutions()
             _retry_review_control_results()
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_SEAT_QS}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_seat_qs()}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).

@@ -45,7 +45,11 @@ STATE = {"gets": [], "acks": [], "results": [], "heartbeats": [], "workers": [],
          # relay that REJECTS unknown result keys instead of ignoring them.
          "advertise": True, "strict": False, "rejected": [],
          # a 200 whose body is not JSON, and a 200 that explicitly declines
-         "heartbeat_garbage": False, "results_decline": False}
+         "heartbeat_garbage": False, "results_decline": False,
+         # strict_wire models a LEGACY relay that REJECTS (not ignores) unknown
+         # heartbeat keys and unknown query params.
+         "strict_wire": False, "advertise_routing": False,
+         "hb_keys": [], "get_qkeys": [], "wire_rejected": []}
 TASK = {"id": "task-CLOUD1", "timestamp": "2026-09-03T00:00:00Z",
         "task": "hello cloud seat", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -70,6 +74,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/v1/tasks"):
             STATE["gets"].append(self.path)
+            from urllib.parse import urlparse, parse_qs
+            qk = sorted(parse_qs(urlparse(self.path).query).keys())
+            STATE["get_qkeys"].append(qk)
+            _okq = {"wait"} | ({"worker"} if STATE["advertise_routing"] else set())
+            if STATE["strict_wire"] and set(qk) - _okq:
+                STATE["wire_rejected"].append(("get-query", qk))
+                self._json(400, {"error": "unknown query parameter"}); return
             served = STATE["serve_n"] > 0
             if served:
                 STATE["serve_n"] -= 1
@@ -96,13 +107,24 @@ class Handler(BaseHTTPRequestHandler):
                 _hb = STATE["heartbeat_404"]
                 self.send_response(404 if _hb is True else int(_hb))
                 self.end_headers(); return
-            STATE["heartbeats"].append(self._body())
+            _hb = self._body()
+            STATE["heartbeats"].append(_hb)
+            STATE["hb_keys"].append(sorted(_hb.keys()))
+            _legacy = {"client", "protocol_version", "provider", "tier",
+                       "inflight", "capabilities", "status", "step"}
+            if STATE["advertise_routing"]:      # advertising it means accepting it
+                _legacy |= {"worker_id", "location"}
+            if STATE["strict_wire"] and set(_hb) - _legacy:
+                STATE["wire_rejected"].append(("heartbeat", sorted(set(_hb) - _legacy)))
+                self._json(422, {"error": "unknown field"}); return
             if STATE["heartbeat_garbage"]:
                 raw = b"<html>not json</html>"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers(); self.wfile.write(raw); return
-            caps = {"capabilities": ["worker-metadata"]} if STATE["advertise"] else {}
+            _adv = (["worker-metadata"] if STATE["advertise"] else []) + \
+                   (["worker-routing"] if STATE["advertise_routing"] else [])
+            caps = {"capabilities": _adv} if _adv else {}
             self._json(200, caps); return
         if self.path == "/v1/workers":
             STATE["workers"].append(self._body()); self._json(200, {}); return
@@ -168,12 +190,22 @@ def main() -> int:
         check(False, "a path-shaped SUTANDO_WORKER_ID refuses at import")
     except SystemExit:
         check(True, "a path-shaped SUTANDO_WORKER_ID refuses at import")
-    check(home._SEAT_QS == "&worker=home" and named._SEAT_QS == "&worker=worker-9",
-          "the poll query suffix is &worker=<seat> (bare id for the legal charset)")
+    # The suffix is now NEGOTIATED, so assert the shape under an advertisement
+    # rather than at import; unconditional was keweichen's blocker 1.
+    check(home._seat_qs() == "" and named._seat_qs() == "",
+          "no advertisement -> the poll carries no seat (legacy shape)")
+    for _m in (home, named):
+        _m._note_broker_capabilities({"capabilities": ["worker-routing"]})
+    check(home._seat_qs() == "&worker=home" and named._seat_qs() == "&worker=worker-9",
+          "once advertised, the suffix is &worker=<seat> (bare id for the legal charset)")
+    for _m in (home, named):
+        _m._revoke_broker_capabilities()
 
     # ── 2. heartbeat + workers snapshot carry the seat ──────────────────────
     print("2. heartbeat / workers snapshot payloads")
     STATE["heartbeats"].clear()
+    STATE["advertise_routing"] = True          # identity is negotiated now
+    home._note_broker_capabilities({"capabilities": ["worker-routing"]})
     check(home._post_heartbeat({"task-A", "task-B"}, force=True)
           and STATE["heartbeats"][-1].get("worker_id") == "home"
           and STATE["heartbeats"][-1].get("location") == "local",
@@ -187,6 +219,8 @@ def main() -> int:
           "every pre-existing heartbeat field is byte-identical (additive change only)")
     print(f"     heartbeat payload (home): {json.dumps(hb, sort_keys=True)}")
     named._last_heartbeat_at = 0.0
+    # Identity is negotiated: teach this module the advertisement, then re-send.
+    named._note_broker_capabilities({"capabilities": ["worker-routing"]})
     named._post_heartbeat(set(), force=True)
     check(STATE["heartbeats"][-1].get("worker_id") == "worker-9"
           and STATE["heartbeats"][-1].get("location") == "cloud",
@@ -243,10 +277,12 @@ def main() -> int:
     check(calls["n"] == 5, "main: two full loop iterations ran")
     check(len(STATE["gets"]) == 2
           and all(g == "/v1/tasks?wait=0&worker=cloud-1" for g in STATE["gets"]),
-          f"poll URL carries the seat: {STATE['gets'][:1]}")
+          f"poll URL carries the seat once routing is advertised: {STATE['gets'][:1]}")
+    check(STATE["heartbeats"] and "worker_id" not in STATE["heartbeats"][0],
+          "the seat's FIRST heartbeat is legacy — it has not seen an advertisement yet")
     check(all(h.get("worker_id") == "cloud-1" and h.get("location") == "cloud"
-              for h in STATE["heartbeats"]) and STATE["heartbeats"],
-          "every heartbeat from the loop names the cloud seat")
+              for h in STATE["heartbeats"][1:]) and len(STATE["heartbeats"]) > 1,
+          "every heartbeat AFTER the advertising reply names the cloud seat")
     tfile = cloud.TASKS_DIR / "task-CLOUD1.txt"
     tfiles = sorted(p.name for p in cloud.TASKS_DIR.glob("task-CLOUD1*"))
     check(tfiles == ["task-CLOUD1.txt"], f"exactly one task file after redelivery: {tfiles}")
@@ -584,6 +620,68 @@ def main() -> int:
           f"the next drain closes it exactly once: {STATE['results']}")
     check(not d12._control_result_path(PIN12).is_file(),
           "and an ACCEPTED close does consume the journal")
+
+    # keweichen blocker 1: the worker-aware shape must be NEGOTIATED, never
+    # unconditional — a strict legacy relay rejects both requests otherwise.
+    print("\n13. worker routing is gated on the broker advertising `worker-routing`")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    for k in ("hb_keys", "get_qkeys", "wire_rejected"):
+        STATE[k].clear()
+    STATE["advertise"] = False; STATE["advertise_routing"] = False
+    STATE["heartbeat_404"] = False; STATE["heartbeat_garbage"] = False
+    STATE["strict_wire"] = True
+    ws13 = root / "ws13"; ws13.mkdir()
+    d13 = _load("routing13", ws13, port,
+                SUTANDO_WORKER_ID="cloud-9", SUTANDO_WORKER_LOCATION="cloud")
+
+    # (a) FIRST exchange must be byte-for-byte legacy against a rejecting relay
+    check(d13._post_heartbeat(set(), force=True) is True,
+          "first heartbeat is ACCEPTED by a relay that rejects unknown keys")
+    check(STATE["wire_rejected"] == [],
+          f"nothing was rejected on the first exchange: {STATE['wire_rejected']}")
+    check("worker_id" not in STATE["hb_keys"][0] and "location" not in STATE["hb_keys"][0],
+          f"first heartbeat carries NO seat identity: {STATE['hb_keys'][0]}")
+    check(d13._broker_worker_routing is False,
+          "no advertisement -> routing stays off")
+    check(d13._seat_qs() == "",
+          f"pre-advertisement poll suffix is empty: {d13._seat_qs()!r}")
+
+    # (b) broker advertises -> routing appears on BOTH surfaces
+    STATE["advertise_routing"] = True
+    check(d13._post_heartbeat(set(), force=True) is True, "second heartbeat sent")
+    check(d13._broker_worker_routing is True, "advertisement enables routing")
+    check("worker_id" not in STATE["hb_keys"][1],
+          "the ADVERTISING heartbeat is itself still legacy — the flag comes from its REPLY")
+    check(d13._post_heartbeat(set(), force=True) is True, "third heartbeat sent")
+    check("worker_id" in STATE["hb_keys"][2] and "location" in STATE["hb_keys"][2],
+          f"identity rides the request AFTER the advertisement: {STATE['hb_keys'][2]}")
+    check(d13._seat_qs().startswith("&worker="),
+          f"poll suffix carries the seat once advertised: {d13._seat_qs()!r}")
+
+    # (c) withdrawal returns BOTH shapes to legacy
+    STATE["advertise_routing"] = False
+    check(d13._post_heartbeat(set(), force=True) is False,
+          "the FIRST post-withdrawal heartbeat still carries identity and is 422'd")
+    check(("heartbeat", ["location", "worker_id"]) in STATE["wire_rejected"],
+          f"and the relay names exactly the routed keys: {STATE['wire_rejected']}")
+    check(d13._broker_worker_routing is False,
+          "that rejection REVOKES routing — one wasted round trip, then self-healed")
+    check(d13._seat_qs() == "", "poll suffix is back to legacy")
+    check(d13._post_heartbeat(set(), force=True) is True,
+          "and the next heartbeat is legacy-shaped and accepted again")
+
+    # (d) the two capabilities are INDEPENDENT, not aliases
+    STATE["advertise"] = True; STATE["advertise_routing"] = False
+    d13._post_heartbeat(set(), force=True)
+    check(d13._broker_worker_metadata is True and d13._broker_worker_routing is False,
+          "worker-metadata alone does NOT enable routing")
+    STATE["advertise"] = False; STATE["advertise_routing"] = True
+    d13._post_heartbeat(set(), force=True)
+    check(d13._broker_worker_metadata is False and d13._broker_worker_routing is True,
+          "worker-routing alone does NOT enable result metadata")
+    STATE["strict_wire"] = False
+    STATE["advertise"] = True; STATE["advertise_routing"] = False
 
     srv.shutdown()
     if FAILS:
