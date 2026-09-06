@@ -784,8 +784,9 @@ def main() -> int:
     check(prod._WITHHELD_CONTROL_DIR != dev._WITHHELD_CONTROL_DIR,
           f"the two instances resolve DIFFERENT control dirs: "
           f"{prod._WITHHELD_CONTROL_DIR.name} vs {dev._WITHHELD_CONTROL_DIR.name}")
-    check(prod._WITHHELD_DM_CACHE != dev._WITHHELD_DM_CACHE,
-          "the withheld-DM cache is per-instance too (same defect, unreported)")
+    check(prod._WITHHELD_DM_CACHE == dev._WITHHELD_DM_CACHE,
+          "the review-DM cache stays SHARED: it is owner-owned, already keyed by owner on "
+          "read, and a per-instance miss would create a duplicate owner DM room")
 
     tid15 = "worker-pin-909-d0d0"
     prod._queue_review_control_result({"id": tid15})

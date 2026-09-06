@@ -385,10 +385,12 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
-# Per-instance, like every other mutable state path here: two gateways sharing
-# one workspace must not drain or delete each other's deferred control records.
-_WITHHELD_DM_CACHE = _STATE / f"withheld-review-dm{_INST_SUFFIX}.json"
+# The JOURNAL is instance-owned, so it is namespaced: two gateways sharing one
+# workspace must not drain or delete each other's deferred control records.
 _WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results{_INST_SUFFIX}"
+# The review DM is OWNER-owned, not instance-owned, and is already keyed by
+# owner on read; namespacing it would create one duplicate room per instance.
+_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR_LEGACY = _STATE / "withheld-review-control-results"
 # Optional fence for instanced lanes: claim only rooms on this suffix
 GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
