@@ -26,6 +26,19 @@ import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 
+
+// The name people say to address this agent. Sourced from runtime identity, never
+// a literal: two hosts run this file under different names.
+function addressedName(): string {
+	const env = (process.env.SUTANDO_STAND_NAME || '').trim();
+	if (env) return env;
+	try {
+		const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8'));
+		if (si && typeof si.name === 'string' && si.name.trim()) return si.name.trim();
+	} catch { /* no identity file - fall through */ }
+	return 'Sutando';
+}
+
 const WORKSPACE_DIR = resolveWorkspace();
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
@@ -194,7 +207,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
 	const modeState = ctx.resolveCurrentMode();
 	if (modeState.isMeeting) {
-		return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]${modeState.marker}`;
+		return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "${addressedName()}" or "hey ${addressedName()}" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]${modeState.marker}`;
 	}
 	return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 }
@@ -276,13 +289,13 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'',
 		'CRITICAL RULES:',
 		(() => ctx.isMeetingActive()
-			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
+			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "' + addressedName() + '" or "hey ' + addressedName() + '." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "' + addressedName() + ' disconnect" or "' + addressedName() + ' bye". To exit: user says "' + addressedName() + ', active mode" → call switch_mode("active") and save_meeting_note(summary).'
 			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
 		)(),
 		'- PRESENTER MODE: Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call switch_mode("active") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. switch_mode("presenter") returns a "say" field; speak it verbatim as your FIRST utterance.',
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
-		'- LOW-CONFIDENCE WAKE-WORD / NO REQUEST: If you are NOT fully confident you heard your name (noisy audio, ambient speech that might just sound like "Sutando"), OR you heard your name clearly but the utterance is JUST a presence check with no actual ask ("are you there?", "hello?", standalone "Sutando", "hey Sutando"), respond with ONE short syllable — "mm?" or "yes?" — NOT a multi-sentence greeting. Do NOT say "Hey, I\'m right here. What can I do for you?" or any variation of "I\'m here, what\'s up". Save the full greeting for cases where the user clearly addressed you AND attached a real request or question. A wrong short ack is cheap; a wrong long greeting is annoying.',
+		'- LOW-CONFIDENCE WAKE-WORD / NO REQUEST: If you are NOT fully confident you heard your name (noisy audio, ambient speech that might just sound like "' + addressedName() + '"), OR you heard your name clearly but the utterance is JUST a presence check with no actual ask ("are you there?", "hello?", standalone "' + addressedName() + '", "hey ' + addressedName() + '"), respond with ONE short syllable — "mm?" or "yes?" — NOT a multi-sentence greeting. Do NOT say "Hey, I\'m right here. What can I do for you?" or any variation of "I\'m here, what\'s up". Save the full greeting for cases where the user clearly addressed you AND attached a real request or question. A wrong short ack is cheap; a wrong long greeting is annoying.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',

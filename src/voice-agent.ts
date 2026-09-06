@@ -485,7 +485,7 @@ const switchModeTool: ToolDefinition = {
 		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
 		'Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". ' +
 		'Call switch_mode("active") when user says "I need you", "come back", "active mode", "presenter mode off", "talk is done", or the meeting ends. ' +
-		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+		`In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("${addressedName()}" or "hey ${addressedName()}").`,
 	parameters: z.object({
 		mode: z.enum(['active', 'meeting', 'presenter']).describe('"meeting" = silent note-taker, "presenter" = on-stage co-presenter (mutes notifications), "active" = normal assistant'),
 	}),
@@ -685,6 +685,19 @@ function resetSessionGateState(): void {
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 
 import { wireSanitizerToTransport } from './output_sanitizer.js';
+
+// The name people say to address this agent. Sourced from runtime identity, never
+// a literal: two hosts run this file under different names.
+function addressedName(): string {
+	const env = (process.env.SUTANDO_STAND_NAME || '').trim();
+	if (env) return env;
+	try {
+		const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8'));
+		if (si && typeof si.name === 'string' && si.name.trim()) return si.name.trim();
+	} catch { /* no identity file - fall through */ }
+	return 'Sutando';
+}
+
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }

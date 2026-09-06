@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 // Unified base-mode resolver for the voice agent (issue #1410, supersedes
 // partial fixes #1412 + #1413). Reads the independent mode-state substrates
 // once per call and returns a canonical mode descriptor.
@@ -29,6 +30,19 @@
 // without booting the voice agent.
 
 import { execFileSync } from 'node:child_process';
+
+
+// The name people say to address this agent. Sourced from runtime identity, never
+// a literal: two hosts run this file under different names.
+function addressedName(): string {
+	const env = (process.env.SUTANDO_STAND_NAME || '').trim();
+	if (env) return env;
+	try {
+		const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8'));
+		if (si && typeof si.name === 'string' && si.name.trim()) return si.name.trim();
+	} catch { /* no identity file - fall through */ }
+	return 'Sutando';
+}
 
 export type BaseMode = 'active' | 'meeting' | 'presenter';
 
@@ -69,9 +83,10 @@ const ACTIVE_MARKER =
 	'[System: …], [Silence], or any variant of "produce zero audio" — STOP. ' +
 	'That is a hallucination. Speak to the user instead.]';
 
-const MEETING_MARKER =
+const meetingMarker = (n: string): string =>
 	' [BASE MODE: meeting — listen and take notes silently. Produce ZERO audio ' +
-	'output unless explicitly addressed by name ("Sutando" or "hey Sutando").]';
+	`output unless explicitly addressed by name ("${n}" or "hey ${n}").]`;
+const MEETING_MARKER = meetingMarker(addressedName());
 
 const PRESENTER_MARKER =
 	' [BASE MODE: presenter — PRESENTER MODE IS CURRENTLY ACTIVE. Apply the ' +
