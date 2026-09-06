@@ -57,7 +57,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, memory_dir, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -145,7 +145,7 @@ def _default_memory_dir() -> str:
 
 # SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
 # report on the same directory the runtime reads, so it opts out of #1724.
-MEMORY_DIR = memory_dir()
+MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
 # documented numbers, not this repo's guess:

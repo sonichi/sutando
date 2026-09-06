@@ -372,12 +372,12 @@ def default_memory_dir() -> Path:
 def memory_dir() -> Path:
     """The core-memory dir a reader should actually read.
 
-    Reads `SUTANDO_MEMORY_DIR` from `os.environ` directly, NOT via
-    `_memory_dir_env()`: this deliberately does not honor the legacy
-    `SUTANDO_PRIVATE_DIR` alias, preserving the pre-existing behavior of the
-    readers that call it. Unifying the two is a separate change.
+    Resolves through `_memory_dir_env()`, exactly as `personal_path()` and
+    `shared_personal_path()` do, so a host on the legacy `SUTANDO_PRIVATE_DIR`
+    alias reads its real corpus instead of an empty default path.
     """
-    return Path(os.environ.get("SUTANDO_MEMORY_DIR", str(default_memory_dir())))
+    root = _memory_dir_env()
+    return Path(os.path.expanduser(root)) if root else default_memory_dir()
 
 
 def channel_access_path(source: str) -> Path:

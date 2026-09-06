@@ -197,11 +197,17 @@ class MemoryDirResolver(unittest.TestCase):
     def test_unset_falls_back_to_default(self):
         self.assertEqual(util_paths.memory_dir(), util_paths.default_memory_dir())
 
-    def test_legacy_alias_is_deliberately_not_honored(self):
-        # Preserves the pre-existing reader behavior; `_memory_dir_env()` is the
-        # one that honors the alias. If this ever flips, it must flip on purpose.
+    def test_legacy_alias_is_honored_like_its_siblings(self):
+        # A legacy-alias host must not silently read an empty default path —
+        # that reproduces the very NONE-FOUND bug the corpus reader fixes.
         os.environ["SUTANDO_PRIVATE_DIR"] = "/tmp/legacy-corpus"
-        self.assertEqual(util_paths.memory_dir(), util_paths.default_memory_dir())
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(util_paths.memory_dir(), Path("/tmp/legacy-corpus"))
+
+    def test_canonical_var_still_wins_over_the_legacy_alias(self):
+        os.environ["SUTANDO_PRIVATE_DIR"] = "/tmp/legacy-corpus"
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/canonical-corpus"
+        self.assertEqual(util_paths.memory_dir(), Path("/tmp/canonical-corpus"))
 
 
 class HealthCheckDelegates(unittest.TestCase):
@@ -215,10 +221,11 @@ class HealthCheckDelegates(unittest.TestCase):
             self.assertNotIn(recomposed, body,
                              f"health-check re-composes the memory path ({recomposed})")
 
-    def test_memory_dir_constant_delegates(self):
+    def test_health_check_keeps_its_own_env_policy(self):
+        # health-check reads os.environ directly and does NOT honor the legacy
+        # alias. That divergence predates this change and is left untouched.
         src = (ROOT / "src" / "health-check.py").read_text()
-        self.assertIn("MEMORY_DIR = memory_dir()", src)
-        self.assertNotIn('os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir())', src)
+        self.assertIn('MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))', src)
 
 
 if __name__ == "__main__":
