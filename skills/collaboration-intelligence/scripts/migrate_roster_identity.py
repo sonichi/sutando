@@ -210,9 +210,10 @@ _PROSE_EVIDENCE_KEYS = frozenset({"stand_status"})
 
 # The ONLY intervening containers that may stand between a principal and a bare
 # `id`. Positive and bounded: an unanticipated object name is refused by default.
-_TRANSPARENT_CONTAINERS = frozenset({"account", "identity", "identities", "wrapper", "profile"})
-# Qualifier words the suite documents beside a principal (`secondary_agent`).
-_CONTAINER_QUALIFIERS = frozenset({"secondary", "primary", "other", "status", "profile"})
+_TRANSPARENT_CONTAINERS = frozenset({
+    "account", "identity", "identities", "wrapper", "profile",
+    "secondary_agent", "stand_status", "human_profile",
+})
 
 
 def _principal_slot(field: str) -> bool:
@@ -253,12 +254,13 @@ def _principal_container(segment: str) -> bool:
     words = {w.lower() for w in _WORDS.findall(str(segment))}
     if not words:
         return False
-    if str(segment).strip().lower() in _TRANSPARENT_CONTAINERS:
+    seg = str(segment).strip().lower()
+    if seg in _TRANSPARENT_CONTAINERS or seg in ri.WRITER_OWNED:
         return True
 
     # EVERY word must be allowed: one referent word does not licence the rest,
     # which is how `human_integration` laundered while `integration` refused.
-    return not (words - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS - _CONTAINER_QUALIFIERS)
+    return not (words - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS)
 
 
 def _identity_leaf(key: str) -> bool:

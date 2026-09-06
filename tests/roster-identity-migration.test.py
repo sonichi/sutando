@@ -2449,6 +2449,22 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
+    def test_a_bare_compatibility_QUALIFIER_is_not_a_container(self):
+        """qingyun-wu 5124973175 -> 5124983993: granting each qualifier word
+        independently let a segment made ONLY of qualifiers pass, with the outer
+        `human` supplying the referent. The measured compatible containers are
+        COMPLETE spellings (`secondary_agent`), never their parts."""
+        for obj in ("status", "primary", "other", "secondary",
+                    "primary_status", "other_profile"):
+            with self.subTest(container=obj):
+                _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("human_discord_id"), obj)
+
+    def test_the_measured_complete_spellings_still_pass(self):
+        # The paired positive: refusing the parts must not refuse the whole.
+        _rc, _e, rec = self._human({"discord": True, "account": {"id": self.R}})
+        self.assertEqual(rec.get("human_discord_id"), self.R)
+
     def test_an_object_NOBODY_anticipated_is_refused_by_default(self):
         """The control that separates a bounded allowlist from a longer denylist:
         a name in neither list, which no future provider noun can be added to."""
