@@ -7,10 +7,21 @@ has already failed.
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# `read_ready_result` stamps ordinary `task-*` results with `[task YYYYMMDD-NNN]`
+# at the delivery boundary, so a delivered body is the answer PLUS that prefix.
+_STAMP = re.compile(r"^\[task \d{8}-\d{3}\]\n\n")
+
+
+def _unstamped(body: str) -> str:
+    """Body as authored — lets these tests assert delivery, not the stamp."""
+    return _STAMP.sub("", body or "")
+
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
@@ -142,12 +153,12 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                 (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("the recovered answer")
                 self.gw._post_ready_results(inflight)          # pass 2: deliver
 
-                bodies = [p["payload"]["body"] for p in h.posts]
+                bodies = [_unstamped(p["payload"]["body"]) for p in h.posts]
                 self.assertIn(
                     "the recovered answer", bodies,
                     f"recovered answer was never delivered (posts={h.posts})")
                 ids = [p["payload"]["id"] for p in h.posts
-                       if p["payload"]["body"] == "the recovered answer"]
+                       if _unstamped(p["payload"]["body"]) == "the recovered answer"]
                 self.assertEqual(
                     ids, [self.gw._broker_tid(TID)],
                     "recovered answer POSTed under the re-ask id; the broker is "

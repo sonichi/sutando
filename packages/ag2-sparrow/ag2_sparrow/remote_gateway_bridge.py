@@ -304,7 +304,7 @@ from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
-from .result_ready import read_ready_result
+from .result_ready import read_ready_result, read_ready_result_for_delivery
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -3569,7 +3569,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        raw = read_ready_result(rfile)
+        raw = read_ready_result_for_delivery(rfile)
         if raw is None:
             continue
         # The guard honours suppression on every tier now, so there is no stub
@@ -3871,6 +3871,8 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
+        # PURE read: this body also feeds the quarantine branches below, and
+        # failing closed on stampability skips them instead of parking.
         raw = read_ready_result(rfile)
         if raw is None:
             continue

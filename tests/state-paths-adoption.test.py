@@ -147,6 +147,9 @@ ALLOWLIST = {
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",
     "src/runtime-cli/tui.py",
+    # The delivery boundary is vendored into ag2-sparrow, which resolves no
+    # workspace; its state/ path comes from the results dir the adapter bound.
+    "src/delivery/readiness.py",
     # workspace_layout cannot import the resolver it exists to repair; its
     # flagged tokens are JSON report field names, not runtime-state paths.
     "src/workspace_layout.py",

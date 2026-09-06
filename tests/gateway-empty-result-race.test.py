@@ -7,10 +7,21 @@ orphaning the real answer written moments later.
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# `read_ready_result` stamps ordinary `task-*` results with `[task YYYYMMDD-NNN]`
+# at the delivery boundary, so a delivered body is the answer PLUS that prefix.
+_STAMP = re.compile(r"^\[task \d{8}-\d{3}\]\n\n")
+
+
+def _unstamped(body: str) -> str:
+    """Body as authored — lets these tests assert delivery, not the stamp."""
+    return _STAMP.sub("", body or "")
+
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
@@ -137,7 +148,7 @@ class GatewayEmptyResultTest(unittest.TestCase):
         r = self._run(answer)
         self.assertEqual(len(r.posts), 1, f"expected exactly one POST, got {r.posts}")
         self.assertEqual(r.posts[0]["path"], "/v1/results")
-        self.assertEqual(r.posts[0]["payload"]["body"], answer)
+        self.assertEqual(_unstamped(r.posts[0]["payload"]["body"]), answer)
         self.assertNotIn(TID, r.inflight, "delivered task should leave the in-flight set")
         self.assertEqual(len(r.archived), 1, "delivered result should be archived")
 
@@ -157,7 +168,7 @@ class GatewayEmptyResultTest(unittest.TestCase):
                 rfile.write_text(answer)
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(len(h.posts), 1, "second pass did not deliver the answer")
-                self.assertEqual(h.posts[0]["payload"]["body"], answer)
+                self.assertEqual(_unstamped(h.posts[0]["payload"]["body"]), answer)
                 self.assertNotIn(TID, inflight)
 
     def test_missing_result_file_is_untouched(self):

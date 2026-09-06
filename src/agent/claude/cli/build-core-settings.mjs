@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-stamp-task-id-hook.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -104,6 +104,20 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
+// Task-ID stamping: an UNSCOPED matcher because the hook scans results/ after
+// any tool, so a result written by bash is stamped as well as one written by Write.
+const stampTaskIdHook = process.argv[6] || '';
+let stampTaskIdSettings = null;
+if (stampTaskIdHook.trim()) {
+	stampTaskIdSettings = {
+		hooks: {
+			PostToolUse: [{ matcher: '', hooks: [{ type: 'command', command: `python3 ${shq(stampTaskIdHook)}` }] }],
+		},
+	};
+}
+
 process.stdout.write(
-	JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings)),
+	JSON.stringify(
+		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, stampTaskIdSettings),
+	),
 );

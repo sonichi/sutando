@@ -274,7 +274,8 @@ def main() -> int:
     _grtc._post_ready_results(_mi)
     check(len(STATE["results"]) == _rb2 + 1
           and STATE["results"][-1]["id"] == _maxid
-          and STATE["results"][-1]["body"] == "maxlen answer",
+          and STATE["results"][-1]["body"].startswith("[task ")
+          and STATE["results"][-1]["body"].endswith("maxlen answer"),
           "max-length result POSTs with the broker id — not silently dropped from inflight")
     STATE["results"].pop(); STATE["acks"].pop()
     for _f in (f"{_mt}.txt",):
@@ -301,7 +302,8 @@ def main() -> int:
     _grtc._post_ready_results({"task-dev~task-COLLIDE"})
     check(len(STATE["results"]) == _rb + 1
           and STATE["results"][-1]["id"] == "task-COLLIDE"
-          and STATE["results"][-1]["body"] == "dev answer",
+          and STATE["results"][-1]["body"].startswith("[task ")
+          and STATE["results"][-1]["body"].endswith("dev answer"),
           "dev result POST translates back to the BROKER id on the wire")
     check(not (_lrtc.RESULTS_DIR / "task-COLLIDE.txt").exists(),
           "prod's result slot untouched — no cross-instance claim")
@@ -754,7 +756,8 @@ def main() -> int:
           "(the live-path evidence CONTRIBUTING asks for)")
     check(len(STATE["results"]) == _before + 1
           and STATE["results"][-1]["id"] == "task-CORE1"
-          and STATE["results"][-1]["body"] == "core answer"
+          and STATE["results"][-1]["body"].startswith("[task ")
+          and STATE["results"][-1]["body"].endswith("core answer")
           and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
           "ambiguous 502 resolved by the idempotent re-send in ONE pass "
           "(delivered + archived)")
@@ -859,7 +862,8 @@ def main() -> int:
     rtc._post_ready_results(_ifc)
     check(len(STATE["results"]) == _before + 1
           and STATE["results"][-1]["id"] == "task-CORE1"
-          and STATE["results"][-1]["body"] == "core answer"
+          and STATE["results"][-1]["body"].startswith("[task ")
+          and STATE["results"][-1]["body"].endswith("core answer")
           and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
           "ambiguous 502 resolved by the idempotent re-send in ONE pass "
           "(delivered + archived)")
@@ -919,8 +923,10 @@ def main() -> int:
     check(len(STATE["results"]) == _rb3 + 1, "result POSTed")
     if len(STATE["results"]) > _rb3:
         r = STATE["results"][_rb3]
-        check(r.get("id") == "task-MOCK1" and r.get("body") == "the reply",
-              "result payload correct (id + body)")
+        check(r.get("id") == "task-MOCK1"
+              and r.get("body", "").startswith("[task ")
+              and r.get("body", "").endswith("the reply"),
+              "result payload correct (id + stamped body)")
     check(not (rtc.RESULTS_DIR / "task-MOCK1.txt").exists(), "result file archived after POST")
     check(not (rtc.TASKS_DIR / "task-MOCK1.txt").exists()
           and (rtc.TASKS_DIR / "archive" / "task-MOCK1.txt").exists(),

@@ -176,6 +176,9 @@ def main() -> int:
         "src/dm-result.py",
         "src/telegram-bridge.py",
         "src/slack-bridge.py",
+        # Not a delivery bridge, but it DECIDES on marker position: it must not
+        # stamp a body whose markers a stamp would displace (#2125).
+        "src/delivery/readiness.py",
     )
     for rel in consumers:
         src = (REPO / rel).read_text()
@@ -191,6 +194,20 @@ def main() -> int:
                 'parse_markers() actions with kind == "attach" instead',
                 rel,
             )
+        # Same name-independent rule for the SKIP/REDIRECT grammar: a private copy
+        # of it drifted, matching a `[replied]` the canonical parser rejects.
+        for m in re.finditer(r"re\.compile\((.{0,160}?)\)", src, re.S):
+            literal = m.group(1)
+            hits = sum(tok in literal for tok in
+                       ("no-send", "deduped:", "REPLIED", "channel:", "dm-only"))
+            if hits >= 2:
+                return fail(
+                    f"{rel} compiles a local skip/redirect-marker regex "
+                    f"({literal.strip()[:70]}…) — that grammar belongs solely to "
+                    "src/result_markers.py; ask parse_markers() instead",
+                    rel,
+                )
+
         # Name-independent check. The two guards above only catch the grammar
         # when it is spelled with those exact identifiers; Telegram's drift was
         # an anonymous `file_pattern = re.compile(r'\[(?:file|send|attach)...')`,

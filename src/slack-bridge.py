@@ -82,7 +82,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result_for_delivery  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
@@ -1656,7 +1656,7 @@ def result_watcher():
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if not result_file.exists():
                     continue
-                reply_text = read_ready_result(result_file)
+                reply_text = read_ready_result_for_delivery(result_file)
                 if reply_text is None:
                     continue
                 with pending_replies_lock:
@@ -1738,7 +1738,7 @@ def result_watcher():
                     claim = claim_for_delivery(f, owner_id)
                     if claim is None:
                         continue
-                    text = read_ready_result(claim)
+                    text = read_ready_result_for_delivery(claim)
                     if text is None:
                         release_claim(claim)
                         continue

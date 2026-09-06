@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result_for_delivery  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -1114,7 +1114,7 @@ def main():  # pragma: no cover
                         if claim is None:
                             continue
                         f = claim
-                        text = read_ready_result(f)
+                        text = read_ready_result_for_delivery(f)
                         if text is None:
                             release_claim(f)
                             continue
@@ -1157,7 +1157,7 @@ def main():  # pragma: no cover
         for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
-                reply_text = read_ready_result(result_file)
+                reply_text = read_ready_result_for_delivery(result_file)
                 if reply_text is None:
                     continue
                 chat_id = pending_replies.pop(task_id)
