@@ -105,6 +105,110 @@ with tempfile.TemporaryDirectory() as td:
     )
 
 with tempfile.TemporaryDirectory() as td:
+    # 3b. MEMORY.md is the index every corpus ships with, so counting it makes a
+    #     bare project dir read as populated forever.
+    home = Path(td) / "claude"
+    projects = home / "projects"
+    live = seed(projects / "-repo-slug" / "memory", 42)
+    idx_only = projects / "-repo.slug" / "memory"
+    idx_only.mkdir(parents=True)
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\nDurable facts about the user, project, and references.\n"
+    )
+    hc_idx = load_hc(home, live)
+    r_idx = hc_idx.check_memory_dir_siblings()
+    check(
+        "index-only sibling is NOT reported as populated",
+        r_idx is None,
+        f"got: {(r_idx or {}).get('detail', '')[:140]}",
+    )
+
+    # 3c. CONTROL: index ENTRIES must still warn, or 3b would also pass for a
+    #     check that stopped reporting index-bearing corpora entirely.
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\n- [Some fact](some_fact.md) - a hook\n"
+    )
+    hc_entries = load_hc(home, live)
+    r_entries = hc_entries.check_memory_dir_siblings()
+    check(
+        "index WITH entries still warns (control)",
+        r_entries is not None and "-repo.slug" in r_entries["detail"],
+        f"got: {(r_entries or {}).get('detail', '')[:140]}",
+    )
+
+    # 3e. An index row may lead with a bold label before the link. A corpus whose
+    #     rows are all that shape must not read as empty (qingyun-air, #3778).
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\n- **Controls:** a control is [a claim](claim.md) - hook\n"
+    )
+    hc_bold = load_hc(home, live)
+    r_bold = hc_bold.check_memory_dir_siblings()
+    check(
+        "index row with a bold label before the link still warns",
+        r_bold is not None and "-repo.slug" in r_bold["detail"],
+        f"got: {(r_bold or {}).get('detail', '')[:140]}",
+    )
+
+    # 3f. A compacted index abbreviates entries and carries no link, so a rule
+    #     keyed on `](` calls a live corpus untouched and hides the split.
+    for abbrev in ("f:pronoun_she_her", "r:memory_index_budget", "p:some_project"):
+        (idx_only / "MEMORY.md").write_text(f"# Sutando memory index\n\n- {abbrev}\n")
+        hc_c = load_hc(home, live)
+        r_c = hc_c.check_memory_dir_siblings()
+        check(
+            f"compact index entry `{abbrev}` counts as an entry",
+            r_c is not None and "-repo.slug" in r_c["detail"],
+            f"got: {(r_c or {}).get('detail', '')[:140]}",
+        )
+
+    # 3g. CONTROL: an abbreviation matching inside a word would re-create 3b's
+    #     never-clearing warning by another route.
+    for noise in ("see conf:iguration notes", "f: ", "just prose, nothing referenced"):
+        (idx_only / "MEMORY.md").write_text(f"# Sutando memory index\n\n- {noise}\n")
+        hc_n = load_hc(home, live)
+        r_n = hc_n.check_memory_dir_siblings()
+        check(
+            f"a non-entry row `{noise.strip()}` is still NOT an entry",
+            r_n is None,
+            f"got: {(r_n or {}).get('detail', '')[:140]}",
+        )
+
+    # 3d. CONTROL: a real memory beside the empty index warns, so 3b cannot pass
+    #     merely because this corpus is unreachable.
+    (idx_only / "MEMORY.md").write_text("# Sutando memory index\n")
+    (idx_only / "user_profile.md").write_text("x")
+    hc_real = load_hc(home, live)
+    r_real = hc_real.check_memory_dir_siblings()
+    check(
+        "one real memory beside an empty index warns (control)",
+        r_real is not None and "2 .md" in r_real["detail"],
+        f"got: {(r_real or {}).get('detail', '')[:140]}",
+    )
+
+    # 3f. An UNREADABLE index must report, not vanish. A check that goes quiet
+    #     cannot be told from one that passed (yixuan-ag2 mutation, #3778).
+    (idx_only / "user_profile.md").unlink()
+    (idx_only / "MEMORY.md").chmod(0o000)
+    try:
+        try:
+            (idx_only / "MEMORY.md").read_text()
+            blocked = False
+        except OSError:
+            blocked = True
+        if not blocked:
+            check("unreadable index still warns (SKIPPED: fs ignores mode bits)", True)
+        else:
+            hc_unread = load_hc(home, live)
+            r_unread = hc_unread.check_memory_dir_siblings()
+            check(
+                "unreadable index still warns rather than vanishing",
+                r_unread is not None and "-repo.slug" in r_unread["detail"],
+                f"got: {(r_unread or {}).get('detail', '')[:140]}",
+            )
+    finally:
+        (idx_only / "MEMORY.md").chmod(0o600)
+
+with tempfile.TemporaryDirectory() as td:
     # 4. THE ONE THAT MATTERS: a symlinked twin is one corpus, not two.
     home = Path(td) / "claude"
     projects = home / "projects"

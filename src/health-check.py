@@ -1713,6 +1713,40 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+# The compact forms a compacted index uses for entries, shared by the two
+# readers below so a row cannot be an entry for one and invisible to the other.
+INDEX_ENTRY_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
+_INDEX_ROW_ENTRY = re.compile(
+    r"^\s*[-*] .*(?:\]\(|(?<![\w-])(?:"
+    + "|".join(re.escape(s) for s in INDEX_ENTRY_ABBREV.values())
+    + r")[\w-])"
+)
+
+
+def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
+    """True when a corpus holds memories rather than just an untouched index.
+
+    MEMORY.md is the index every corpus ships with, so counting it makes a bare
+    project dir read as populated forever. Nothing can be invisible there — the
+    corpus has no memories — and a warning that can never clear is the exact
+    failure this probe's scope filter already guards against elsewhere. An index
+    carrying entries still counts: that says something wrote here.
+    """
+    if any(p.name != "MEMORY.md" for p in mds):
+        return True
+    index = mem / "MEMORY.md"
+    if not index.is_file():
+        return False
+    try:
+        text = index.read_text(errors="replace")
+    except OSError:
+        return True  # unreadable: report rather than silently drop a real corpus
+
+    # Anchor on the bullet, not the link: a compacted index writes `- f:slug`.
+    return any(_INDEX_ROW_ENTRY.search(ln) for ln in text.splitlines())
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -1756,8 +1790,9 @@ def check_memory_dir_siblings() -> "dict | None":
             continue
         if _slug_derivation_key(entry.name) != live_key:
             continue  # unrelated project, not a slug split
-        count = len(list(mem.glob("*.md")))
-        if count == 0:
+        mds = list(mem.glob("*.md"))
+        count = len(mds)
+        if not _corpus_holds_memories(mem, mds):
             continue
         key = str(mem.resolve())  # collapse symlinked twins onto one entry
         if key not in seen or count > seen[key][1]:
@@ -2482,9 +2517,6 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
-    # An index that outgrows the load budget compacts its entries to prefix
-    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
-    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
 
     def _referenced_in(hay: str, name: str) -> bool:
         stem = name[:-3] if name.endswith(".md") else name
@@ -2492,7 +2524,7 @@ def check_memory_index_integrity() -> "dict | None":
             return True
         # Without this the probe calls an indexed file unindexed, and the
         # "fix" it invites — expanding the index — is what blows the read limit.
-        for full, short in _INDEX_ABBREV.items():
+        for full, short in INDEX_ENTRY_ABBREV.items():
             if not stem.startswith(full):
                 continue
             token = short + stem[len(full):]
