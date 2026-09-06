@@ -434,3 +434,148 @@ def write_private_text(path: "Path", text: str) -> None:
         raise
     with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
         fh.write(text)
+
+
+# Unset instance keeps the historic name; mirrored in src/watcher_sentinel.sh
+# and a test asserts the two namers agree.
+WATCHER_SENTINEL_STEM = "watch-tasks-stream"
+
+# `rundir.DEFAULT_ACTOR`, needed only on the path where rundir itself did not
+# import; a mismatch is caught by test_the_degraded_default_actor_matches_rundir.
+_DEGRADED_CANONICAL_ACTOR = "local-agent"
+
+
+def _runtime_identity():
+    """`(rundir, instance_key)` from src/runtime-api, or None when unavailable.
+
+    Imported lazily: util_paths is on the import path of probes that must not
+    acquire a runtime dependency merely to resolve a path.
+    """
+    import importlib.util
+    mods = {}
+    for name in ("instance_key", "rundir"):
+        src = Path(__file__).resolve().parent / "runtime-api" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"_wsent_{name}", src)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered only AFTER exec succeeds: a half-initialised module left in
+        # sys.modules poisons `rundir`'s own `from instance_key import ...`.
+        sys.modules[f"_wsent_{name}"] = mod
+        sys.modules.setdefault(name, mod)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:  # noqa: BLE001 — an absent runtime is not a path error
+            sys.modules.pop(f"_wsent_{name}", None)
+            if sys.modules.get(name) is mod:
+                del sys.modules[name]
+            return None
+        mods[name] = mod
+    return mods["rundir"], mods["instance_key"]
+
+
+def instance_scope_key(state_dir, instance=None, agent=None) -> str:
+    """This runtime's `(agent_id, instance_id)` key, or "" for the canonical
+    default — the ONE discriminator every per-instance path uses.
+
+    Identity comes from `rundir` and the encoding from `instance_key`, the same
+    owners the run dir and the durable registry use, so two instances cannot
+    alias here while staying distinct there.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        # NEITHER half is readable here, so "" would claim canonical identity
+        # rather than read it; only an explicit caller-stated pair is answerable.
+        if instance is None or agent is None:
+            raise RuntimeError(
+                "cannot resolve a per-instance path: "
+                "src/runtime-api/{instance_key,rundir}.py did not import, so "
+                "neither the instance nor the actor can be read — pass both "
+                "explicitly to name a path in this state")
+        if instance == "default" and agent == _DEGRADED_CANONICAL_ACTOR:
+            return ""
+        raise RuntimeError(
+            "cannot encode a per-instance path: "
+            "src/runtime-api/instance_key.py did not import")
+    rundir, ikey = ident
+    inst = instance if instance is not None else rundir.instance_id()
+    who = agent if agent is not None else rundir.agent_id(state_dir)
+    if inst == ikey.DEFAULT_INSTANCE and who == rundir.DEFAULT_ACTOR:
+        return ""
+    return ikey.instance_key(who, inst)
+
+
+def actor_env_names():
+    """The actor half's env precedence, from the module that defines it.
+
+    A consumer reading ANOTHER process's identity must use the same order the
+    owner uses, and a second copy of the list is how the two answer differently.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return ()
+    rundir, _ikey = ident
+    return tuple(rundir.ACTOR_ENV_NAMES)
+
+
+def stated_default_identity(state_dir):
+    """The (instance, agent) pair a process names when it sets NEITHER env var.
+
+    A caller naming ANOTHER process's path cannot pass None for an observed
+    default: None re-resolves from the CALLER's own environment, which is a
+    different identity. This returns the values to pass explicitly instead.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return None
+    rundir, ikey = ident
+    return ikey.DEFAULT_INSTANCE, (rundir.enrolled_agent_id(state_dir)
+                                   or rundir.DEFAULT_ACTOR)
+
+
+def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
+    """The sentinel THIS instance writes."""
+    key = instance_scope_key(state_dir, instance, agent)
+    suffix = f"-{key}" if key else ""
+    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
+
+
+def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
+    """Where THIS instance records "my optional handler declined this task".
+
+    That receipt is instance-local knowledge. Shared, another instance reads it
+    as its own and bypasses its handler, sending the task to its live core.
+    """
+    key = instance_scope_key(state_dir, instance, agent)
+    base = Path(state_dir) / "task-event-handler-fallbacks"
+    return base / key if key else base
+
+
+def watcher_sentinel_paths(state_dir) -> "list[Path]":
+    """Every sentinel present, historic name first.
+
+    A reader must consider all of them: asking about one file answers about one
+    watcher, and on a pool host the others are equally real.
+    """
+    state = Path(state_dir)
+    bare = state / f"{WATCHER_SENTINEL_STEM}.pid"
+    found = [bare] if bare.exists() else []
+    try:
+        rest = sorted(p for p in state.glob(f"{WATCHER_SENTINEL_STEM}-*.pid")
+                      if p.is_file())
+    except OSError:
+        rest = []
+    return found + rest
+
+
+if __name__ == "__main__":
+    # Path resolution for shell callers, so there is no second implementation
+    # of the identity encoding to keep in step with this one.
+    if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
+        print(watcher_sentinel_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
+        print(handler_fallbacks_dir(sys.argv[2]))
+    else:
+        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+              file=sys.stderr)
+        raise SystemExit(2)

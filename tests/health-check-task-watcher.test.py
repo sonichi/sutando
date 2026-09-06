@@ -88,6 +88,8 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
 
 
 def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None,
+              pid_instance: "str | None" = "",
+              pid_actor: "str | None" = "",
               trees: dict | None = None, parents: dict | None = None) -> dict:
     """Call check_task_watcher against a temp WORKSPACE_DIR. `argv` patches
     the _proc_argv probe: None = leave the real one (only used where no PID
@@ -101,7 +103,8 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+                 hc._pid_actor_id)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
@@ -109,10 +112,15 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             hc._watcher_trees = lambda *a, **k: (trees or {})
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
+            # A synthetic pid has no readable environment; the default instance is
+            # what these fixtures have always meant.
+            hc._pid_instance_id = lambda pid: pid_instance
+            hc._pid_actor_id = lambda pid: pid_actor
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+             hc._pid_actor_id) = saved
 
 
 @contextlib.contextmanager
@@ -127,17 +135,21 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
     with tempfile.TemporaryDirectory() as td:
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+                 hc._pid_actor_id)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda p, ps=None: "500"
+            hc._pid_instance_id = lambda p: ""
+            hc._pid_actor_id = lambda p: ""
             yield ws
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+             hc._pid_actor_id) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -454,6 +466,30 @@ def case_y_json_repair_line_goes_to_stderr() -> list[str]:
     return fails
 
 
+def case_z_an_unreadable_watcher_identity_offers_no_repair_target() -> list[str]:
+    """Every other case stubs the identity as the default, which is what these
+    fixtures have always meant. This one covers the state the stub hides."""
+    fails = []
+    res = run_check(core_alive=True, pid_text=None, trees={"901": {"901"}},
+                    parents={"901": "900"}, pid_instance=None)
+    if res.get("status") != "warn":
+        fails.append(f"z) expected a warn, got {res.get('status')!r}")
+    if "_sentinel_restamp_path" in res:
+        fails.append("z) a guessed repair target was published for an unreadable identity")
+    if "_sentinel_restamp_pid" not in res:
+        fails.append("z) the live pid must still be reported")
+    if "unreadable" not in (res.get("detail") or ""):
+        fails.append(f"z) the detail must say why: {res.get('detail')!r}")
+    if "Do NOT stop it" not in (res.get("detail") or ""):
+        fails.append("z) a draining watcher must never be prescribed for stopping")
+    # The positive control: the SAME shape with a readable identity does offer one.
+    ok = run_check(core_alive=True, pid_text=None, trees={"901": {"901"}},
+                   parents={"901": "900"}, pid_instance="")
+    if "_sentinel_restamp_path" not in ok:
+        fails.append("z) control: a readable identity must still name a target")
+    return fails
+
+
 def case_y2_private_keys_stay_out_of_the_json_payload() -> list[str]:
     """`_sentinel_restamp_pid` is the fix pass's internal channel, and whether it
     is present depends on the flags — so `--json` must not publish it."""
@@ -767,6 +803,7 @@ def main() -> int:
         ("x", case_x_fix_is_reachable_from_main),
         ("y", case_y_json_repair_line_goes_to_stderr),
         ("y2", case_y2_private_keys_stay_out_of_the_json_payload),
+        ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
     ]
     all_failures = []
     for label, fn in cases:

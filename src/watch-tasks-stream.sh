@@ -87,7 +87,9 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # of spawning an unbounded process fanout. Unhandled work still emits its
 # TASK_FILE event immediately, even while the provider queue is full.
 TASK_HANDLER_WORKERS=2
-SUTANDO_PY_BIN="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+# shellcheck source=../scripts/python-binary.sh
+. "$__REPO_ROOT/scripts/python-binary.sh"
+SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 DISPATCH_DIR=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -95,7 +97,12 @@ FSWATCH_PID=""
 CLEANING_UP=0
 GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-FALLBACKS_DIR="$WORKSPACE_DIR/state/task-event-handler-fallbacks"
+# Per instance: this receipt says "MY optional handler declined this task", and
+# a shared one makes another instance bypass its own handler. Owner: util_paths.
+FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+  echo "watch-tasks-stream: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 WATCHER_ID="$$-${RANDOM:-0}"
 
 claim_is_live() {
@@ -415,7 +422,9 @@ dispatch_task() {
 # env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
 STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
-PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# Per instance: N watchers on one host each stamped the same file, so the
+# readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
+PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"

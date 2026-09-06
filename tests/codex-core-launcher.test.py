@@ -74,6 +74,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/task_archive.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
+            # util_paths refuses without these: it can read neither half of
+            # the identity, so it will not hand out the shared historic name.
+            "src/runtime-api/instance_key.py",
+            "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
             "src/workspace_default.py",
             "src/sutando_config.py",

@@ -57,7 +57,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -8396,14 +8396,98 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
 _WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
 
 
+# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
+# and a mention inside a longer word cannot match.
+_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
+
+
 def _is_watcher_argv(argv: str) -> bool:
-    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+    """True for `<shell> <path>/watch-tasks-stream.sh [tasks-dir]`.
+
+    A field COUNT cannot decide this: the notifier execs the script WITH a tasks
+    directory, and an install path containing a space splits into more tokens
+    again -- both real shapes, both previously read as "not a watcher".
+    """
     parts = argv.split()
-    if len(parts) != 2:
+    if len(parts) < 2:
         return False
-    exe, script = parts
-    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
-            and script.endswith("watch-tasks-stream.sh"))
+    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
+        return False
+    # `<shell> -c ...` is a wrapper running something that merely mentions the
+    # script -- the self-match this predicate exists to exclude.
+    if parts[1].startswith("-"):
+        return False
+    return _WATCHER_SCRIPT.search(argv) is not None
+
+
+# Read from the module that defines the precedence; a copy here is how this
+# reader and `rundir.agent_id` come to disagree about the same process.
+
+
+def _pid_env_first(pid: str, names):
+    """First of `names` set in THAT process's environment, "" if it states none.
+
+    Tri-state on purpose: None is "cannot read", never "default" -- naming a
+    sentinel from THIS process's env is how a named watcher gets the canonical file.
+    """
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:  # noqa: BLE001  -- not linux, or not permitted
+        try:
+            out = subprocess.run(["ps", "-Eww", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        # `ps` concatenates argv and env with spaces, so a value containing one is
+        # UNRECOVERABLE: `worker 7` reads back as `worker`, a different sentinel.
+        toks = out.stdout.split()
+        printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
+        if not printed_env:
+            return None
+        if any(k.startswith(f"{name}=") for name in names for k in toks):
+            return None                               # present but not recoverable
+        return ""                                     # printed, and states none
+    seen = {}
+    for raw in environ.split(b"\0"):
+        for name in names:
+            prefix = name.encode() + b"="
+            if raw.startswith(prefix):
+                seen.setdefault(name, raw.split(b"=", 1)[1].decode("utf-8", "replace"))
+    for name in names:
+        if seen.get(name):
+            return seen[name]
+    return ""
+
+
+def _pid_instance_id(pid: str):
+    """The instance half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, ("SUTANDO_INSTANCE_ID",))
+
+
+def _pid_actor_id(pid: str):
+    """The actor half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, actor_env_names())
+
+
+def _watcher_sentinel_target(state_dir, pid):
+    """The sentinel path for the watcher at `pid`, or None when its identity is
+    not authoritative. A guess here is published as a repair target."""
+    inst = _pid_instance_id(pid)
+    actor = _pid_actor_id(pid)
+    if inst is None or actor is None:
+        return None
+    try:
+        # BOTH halves explicitly. None means "resolve from the caller", and the
+        # caller here is health-check -- a different actor than the watcher.
+        defaults = stated_default_identity(state_dir)
+        if defaults is None:
+            return None
+        return watcher_sentinel_path(state_dir, instance=(inst or defaults[0]),
+                                     agent=(actor or defaults[1]))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
@@ -8467,7 +8551,10 @@ def check_task_watcher() -> dict:
     as one that is always green.
     """
     name = "task-watcher"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # EVERY instance's sentinel: on a pool host each watcher writes its own, so
+    # a probe that reads one file classifies the other N-1 as untracked.
+    sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
+    pid_file = sentinels[0] if sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
     # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
     # so take the snapshot here: None is unavailable, "" is genuinely empty.
     ps_out = _ps_snapshot()
@@ -8498,8 +8585,21 @@ def check_task_watcher() -> dict:
                 # no second tree to duplicate work. Killing it is what opens a gap.
                 # `--fix` re-stamps the sentinel instead: the pid is a live watcher,
                 # so naming it restores Stop-hook cleanup without the restart.
+                # The target comes from the WATCHER's identity, never this process's:
+                # the canonical path claims the wrong instance for a named watcher.
+                target = _watcher_sentinel_target(WORKSPACE_DIR / "state", roots[0])
+                if target is None:
+                    return {"name": name, "status": "warn",
+                            "_sentinel_restamp_pid": roots[0],
+                            "detail": f"watcher pid {roots[0]} runs under a live session "
+                                      f"(ppid {parents[roots[0]]}) but wrote no PID sentinel, "
+                                      "and its own SUTANDO_INSTANCE_ID is unreadable from here, "
+                                      "so the repair target cannot be named without guessing "
+                                      "which instance owns it. Do NOT stop it — it IS draining "
+                                      "tasks/. Restart it cleanly when tasks/ is empty."}
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
+                        "_sentinel_restamp_path": str(target),
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
@@ -8512,34 +8612,75 @@ def check_task_watcher() -> dict:
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
-    try:
-        pid = int(pid_file.read_text().strip())
-    except Exception as e:  # noqa: BLE001
-        return {"name": name, "status": "warn",
-                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
-    argv = _proc_argv(pid)
-    if not argv:
+    # Classify EVERY sentinel, because each names a different watcher. The
+    # single-sentinel host takes exactly the branches it always did.
+    live, dead_pids, reused, unreadable = {}, [], [], []
+    for sp in sentinels:
+        try:
+            spid = int(sp.read_text().strip())
+        except Exception as e:  # noqa: BLE001
+            unreadable.append((sp, str(e)[:40]))
+            continue
+        sargv = _proc_argv(spid)
+        if not sargv:
+            dead_pids.append((spid, sp))
+        elif "watch-tasks-stream" not in sargv:
+            reused.append((spid, sargv, sp))
+        else:
+            live[spid] = sp
+
+    if not live:
+        if unreadable and not dead_pids and not reused:
+            return {"name": name, "status": "warn",
+                    "detail": f"unreadable PID sentinel ({unreadable[0][1]}) — restart the watcher"}
+        if reused and not dead_pids:
+            # PID reuse: the sentinel outlived the watcher and the OS handed the
+            # number to something else. `kill -0` alone would call this alive.
+            rpid, rargv, _rsp = reused[0]
+            return {"name": name, "status": "warn",
+                    "detail": f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}"}
+        pid = dead_pids[0][0] if dead_pids else 0
         if roots:
-            # The sentinel tracks only the MOST RECENT start, so a dead one does
-            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            # A dead sentinel does NOT mean nothing drains tasks/ — restarting
+            # here is what makes the duplicates.
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
                               f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
                               "stop them and restart one cleanly"}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
-    if "watch-tasks-stream" not in argv:
-        # PID reuse: the sentinel outlived the watcher and the OS handed the
-        # number to something else. `kill -0` alone would call this alive.
-        return {"name": name, "status": "warn",
-                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
-    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+
+    tracked = {str(p) for p in live}
+    extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
+        keep = ", ".join(str(p) for p in sorted(live))
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
+                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by any "
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
-    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+                          f"more than once. Keep the tracked one(s) ({keep}), stop the rest"}
+    alive = ", ".join(str(p) for p in sorted(live))
+    # An anomaly belongs to the instance whose sentinel carries it, so a live
+    # PEER is not evidence about a crashed one and must not discard its record.
+    faults = []
+    if dead_pids:
+        faults.append("crashed: " + ", ".join(
+            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
+    if reused:
+        faults.append("PID reuse: " + ", ".join(
+            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
+    if unreadable:
+        faults.append("unreadable: " + ", ".join(
+            f"{sp.name} ({err})" for sp, err in unreadable))
+    if faults:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(dead_pids) + len(reused) + len(unreadable)} sentinel(s) name no "
+                          f"live watcher — {'; '.join(faults)}. Each is a separate instance's "
+                          "record; a live peer does not clear it"}
+    if len(live) == 1:
+        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
@@ -8828,7 +8969,12 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
         return "no re-stampable watcher pid"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # The CHECK's path, not this process's ambient one: the two resolve from the
+    # environment and a repair that re-derives it can stamp another instance.
+    target = check.get("_sentinel_restamp_path")
+    if not target:
+        return "check named no sentinel path — not re-stamped"
+    pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
     if not _is_watcher_argv(_proc_argv(int(pid))):
