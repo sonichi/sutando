@@ -18,6 +18,12 @@ reason TO delegate, not to hand it back. If no mechanism is available, do it inl
 never report work as delegated when nothing was spawned.
 Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
 
+**Context state never grounds a decline or a deferral** (Chi 2026-09-06). Compaction is automatic
+and the session continues from its summary; what carries work across it is the durable record
+(current-track, a detached mechanism), never an agent's estimate of its remaining window. Do not
+decline, park, or tell the owner to compact or restart a core because context is "near its end":
+write the record and proceed.
+
 ## Architecture rules
 
 Rationale + worked examples for every boundary rule below (quoted section names) live in [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) — read the named section before working on that boundary.
