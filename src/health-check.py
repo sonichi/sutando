@@ -1713,6 +1713,280 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+def check_env_split(repo_env: "Path | None" = None,
+                    ws_env: "Path | None" = None) -> "dict | None":
+    """Warn when the SELECTED .env is missing keys the unselected one carries.
+
+    resolve_dotenv picks one file and nothing ever compares candidates — so a
+    1-key stub in the winning slot partial-loads with no warning while full
+    credentials sit in the loser. Key NAMES only; values never enter the message.
+
+    Returns None when no unselected candidate exists or the selected file is a
+    superset of every candidate it can be compared against.
+    """
+    repo_env = repo_env if repo_env is not None else REPO_DIR / ".env"
+    ws_env = ws_env if ws_env is not None else WORKSPACE_DIR / ".env"
+    # Selection must be resolved BEFORE any candidate-count gate: a third-tier
+    # pick with a single legacy file is exactly the split this probe warns on.
+    candidates = [p for p in (repo_env, ws_env) if p.is_file()]
+    if not candidates:
+        return None
+
+    def _keys(path: Path) -> "tuple[set[str] | None, str | None]":
+        # (keys, reason). None keys is UNKNOWN, never an empty set — collapsing
+        # it silences the probe. reason separates cannot-read from cannot-parse.
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            return None, "unreadable"
+        out = set()
+        class _Unmodelled(Exception):
+            """Raised with the reason token when a line's effect is not proven."""
+        _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        # Only `;` and `&&` are split. `||` short-circuits after a successful
+        # assignment, and `|`/`&` run their side in a subshell — unmodelled.
+        SPLIT_OPS = {";", "&&"}
+        REDIR_OPS = {">", ">>", "<", "<<", "<<<"}
+        PUNCT = set("();<>|&")
+
+        def _lex(line):
+            """bash word split that keeps quote evidence. Yields ("op", text) or
+            ("word", text, index of the first quoted char or None, has-subst)."""
+            toks, i, n = [], 0, len(line)
+            while i < n:
+                c = line[i]
+                if c in " \t":
+                    i += 1
+                    continue
+                if c in PUNCT:
+                    j = i
+                    while j < n and line[j] in PUNCT:
+                        j += 1
+                    toks.append(("op", line[i:j]))
+                    i = j
+                    continue
+                buf, qat, subst = [], None, False
+                while i < n and line[i] not in " \t" and line[i] not in PUNCT:
+                    c = line[i]
+                    if c == "'":
+                        j = line.find("'", i + 1)
+                        if j < 0:
+                            raise ValueError("unbalanced quote")
+                        qat = len(buf) if qat is None else qat
+                        buf.append(line[i + 1:j])
+                        i = j + 1
+                        continue
+                    if c == '"':
+                        qat = len(buf) if qat is None else qat
+                        i += 1
+                        while True:
+                            if i >= n:
+                                raise ValueError("unbalanced quote")
+                            c = line[i]
+                            if c == '"':
+                                i += 1
+                                break
+                            if c == "\\" and i + 1 < n and line[i + 1] in '"\\$`':
+                                buf.append(line[i + 1])
+                                i += 2
+                                continue
+                            subst = subst or c == "`" or line.startswith("$(", i)
+                            buf.append(c)
+                            i += 1
+                        continue
+                    if c == "\\":
+                        if i + 1 >= n:
+                            raise ValueError("line continuation")
+                        qat = len(buf) if qat is None else qat
+                        buf.append(line[i + 1])
+                        i += 2
+                        continue
+                    subst = subst or c == "`"
+                    buf.append(c)
+                    i += 1
+                toks.append(("word", "".join(buf), qat, subst))
+            return toks
+
+        def _assign(w):
+            text, qat = w[1], w[2]
+            name, sep, _ = text.partition("=")
+            # A quoted name or `=` makes bash run the word as a command.
+            if not sep or (qat is not None and qat <= len(name)):
+                return None
+            if name.endswith("+"):
+                name = name[:-1]                   # `B+=old` appends to B
+            if _IDENT.match(name):
+                return name
+            # bash runs `1BAD=old` as a COMMAND; under `set -e` the load
+            # aborts there, so it is never a key to advise merging.
+            raise _Unmodelled("invalid-identifier")
+
+        def _segment(words):
+            """One command's words -> (names bash provably persists, whether
+            its exit status is unproven: a `$(cmd)`/backtick value or a redirection)."""
+            names, i, unproven, in_export = [], 0, False, False
+            while i < len(words):
+                w = words[i]
+                if w[0] == "op":
+                    if w[1] not in REDIR_OPS:
+                        raise _Unmodelled("unparseable")
+                    unproven, i = True, i + 2      # `> target` may fail: status unproven
+                    continue
+                n = _assign(w)
+                if n is not None:
+                    names.append(n)
+                    unproven = unproven or w[3]
+                    i += 1
+                    continue
+                if w[1] == "export":
+                    # export's bare-name args only mark existing vars; assignments
+                    # among them persist; prefixes before it were temporary.
+                    names, in_export = [], True
+                    i += 1
+                    continue
+                nxt = words[i + 1] if i + 1 < len(words) else None
+                fd = (w[1].isdigit() and w[2] is None and nxt is not None
+                      and nxt[0] == "op" and nxt[1] in REDIR_OPS)
+                if in_export or fd:
+                    i += 1           # bare export arg, or the `[fd]` of `[fd]> target`
+                    continue
+                # Any command (`readonly X=1`, `false`, `A=1 cmd`) has an effect
+                # and an exit status this probe cannot prove: UNKNOWN, not empty.
+                raise _Unmodelled("unmodelled-command")
+            return set(names), unproven
+
+        segs = []                                  # file order, comments removed
+        for line in text.splitlines():
+            try:
+                toks = _lex(line)
+            except ValueError:
+                return None, "unparseable"  # unbalanced quote: never "absent"
+            words = []
+            for t in toks:
+                if t[0] == "word" and t[1].startswith("#") and t[2] != 0:
+                    break                          # only an UNQUOTED `#` opens a comment
+                if t[0] == "op" and t[1] in SPLIT_OPS:
+                    if words:
+                        segs.append(words)
+                    words = []
+                    continue
+                words.append(t)
+            if words:
+                segs.append(words)
+        try:
+            unproven = False
+            for words in segs:
+                if unproven:
+                    # A failed status skips the `&&` right side and, under
+                    # `set -e`, every later line — nothing after it is proven.
+                    raise _Unmodelled("status-bearing")
+                names, unproven = _segment(words)
+                out.update(names)
+        except _Unmodelled as exc:
+            return None, str(exc)
+        return out, None
+
+    # The canonical resolver owns selection; a re-derivation drifts.
+    from sutando_config import resolve_dotenv  # noqa: PLC0415
+    picked = resolve_dotenv(repo_env.parent, ws_env.parent)
+    if picked == repo_env and ws_env.is_file():
+        selected, other, sel_name, oth_name = repo_env, ws_env, "repo", "workspace"
+    elif picked == ws_env and repo_env.is_file():
+        selected, other, sel_name, oth_name = ws_env, repo_env, "workspace", "repo"
+    elif picked in candidates:
+        return None  # single candidate, and it is the selected one
+    else:
+        # A third-tier pick beside >=1 legacy candidate must not silence the
+        # probe: silence is the failure this probe exists to catch.
+        return {
+            "name": "env-split",
+            "status": "warn",
+            "detail": (
+                f"resolve_dotenv selected {picked}, outside both compared "
+                f"candidates ({repo_env}, {ws_env}) — env-split cannot compare "
+                f"key sets against the selected file; extend the probe to the "
+                f"new tier."
+            ),
+        }
+    (sel_keys, sel_why), (oth_keys, oth_why) = _keys(selected), _keys(other)
+    if sel_keys is None or oth_keys is None:
+        # Unknown outcome, not a clean comparison — WARN rather than fall
+        # through to a false "no missing".
+        blocked, causes = [], set()
+        for keys, why, label, path in (
+            (sel_keys, sel_why, f"selected {sel_name}", selected),
+            (oth_keys, oth_why, f"unselected {oth_name}", other),
+        ):
+            if keys is None:
+                blocked.append(f"{label} .env ({path}): {why}")
+                causes.add(why)
+        # Naming the wrong remedy sends the reader to file permissions for a
+        # quoting bug, so the fix has to follow the cause that actually fired.
+        fix = {
+            frozenset({"unreadable"}): "fix file permissions and re-run",
+            frozenset({"unparseable"}): (
+                "the file is readable but its shell syntax could not be "
+                "classified (unbalanced quote, or a list operator this probe "
+                "does not model) — fix the syntax or simplify the line"
+            ),
+            frozenset({"unmodelled-command"}): (
+                "a line runs a command rather than a plain assignment or export "
+                "(e.g. `readonly X=1`, `false; X=1`, `cmd && X=1`); what it sets, "
+                "and whether `set -e` lets the rest of the file load, are not "
+                "proven — put each credential on its own assignment line"
+            ),
+            frozenset({"status-bearing"}): (
+                "a line's assignment expands a command substitution or carries "
+                "a redirection, so its exit status — and whether bash reaches "
+                "the assignments after it (`&&` right side, later lines under "
+                "`set -e`) — is not proven; put each credential on its own "
+                "plain assignment line"
+            ),
+            frozenset({"invalid-identifier"}): (
+                "a line assigns to a name bash does not accept as a variable "
+                "(e.g. a leading digit); bash runs it as a command and `set -e` "
+                "aborts the load there — fix or remove that line first, and do "
+                "not merge it anywhere"
+            ),
+        }.get(frozenset(causes), "resolve the reported causes and re-run")
+        return {
+            "name": "env-split",
+            "status": "warn",
+            "detail": (
+                f"env-split comparison could not be completed — "
+                f"{'; '.join(blocked)}. A missing/partial load cannot be ruled "
+                f"out; {fix}."
+            ),
+        }
+    from sutando_config import DEPRECATED_ENV_KEYS  # noqa: PLC0415
+    diff = oth_keys - sel_keys
+    # A deprecated key present only in OTHER must not be advised as a merge —
+    # the migration deletes it; report it as delete-not-merge instead.
+    deprecated = sorted(diff & DEPRECATED_ENV_KEYS)
+    missing = sorted(diff - DEPRECATED_ENV_KEYS)
+    if not missing and not deprecated:
+        return None
+    parts = []
+    if missing:
+        parts.append(
+            f"the {sel_name} .env ({selected}) is the one loaders select, but it "
+            f"is missing {len(missing)} key(s) present in the {oth_name} .env: "
+            f"{', '.join(missing)}. Loads are silently partial until the keys are "
+            f"merged into {selected} (names compared only; values never read)."
+        )
+    if deprecated:
+        from sutando_config import DEPRECATED_ENV_KEY_REMEDIES  # noqa: PLC0415
+        fixes = "; ".join(
+            f"{k} — {DEPRECATED_ENV_KEY_REMEDIES[k]}" for k in deprecated
+        )
+        parts.append(
+            f"The {oth_name} .env also carries {len(deprecated)} key(s) the "
+            f"runtime no longer reads; do NOT merge them into {selected}. "
+            f"Each has its own remedy: {fixes}."
+        )
+    return {"name": "env-split", "status": "warn", "detail": " ".join(parts)}
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -11521,6 +11795,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _env_split = check_env_split()
+    if _env_split:
+        checks.append(_env_split)
 
     _mem_siblings = check_memory_dir_siblings()
     if _mem_siblings:
