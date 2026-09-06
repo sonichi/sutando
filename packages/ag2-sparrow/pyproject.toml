@@ -28,9 +28,12 @@ Source = "https://github.com/sonichi/sutando"
 
 [project.scripts]
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
+# Bee wearable watcher — a client-side event SOURCE (SSE from the Bee proxy/cloud),
+# runnable locally or in a hosted container; same package, config-selected.
+sutando-bee-watcher = "ag2_sparrow.bee_watcher:main"
 
 [tool.setuptools]
-packages = ["ag2_sparrow"]
+packages = ["ag2_sparrow", "ag2_sparrow.sources"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

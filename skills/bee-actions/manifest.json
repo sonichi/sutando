@@ -5,11 +5,20 @@
   "stability": "experimental",
   "enabled": true,
   "access_tier": "owner",
-  "description": "Tool half of the Bee integration (channels-vs-tools split): agent-callable actions on the owner's Bee — read todos/conversations/facts, complete/create/edit todos (the captured-todo closed loop), confirm-gated deletes. Works against the local `bee login` proxy or the Bee cloud API. Config-only manifest — run scripts/bee_actions.py <verb>.",
+  "description": "Tool half of the Bee integration (channels-vs-tools split): agent-callable actions on the owner's Bee — read todos/conversations/facts, complete/create/edit todos (the captured-todo closed loop), confirm-gated deletes. Works against the local `bee login` proxy or the Bee cloud API. Config-only manifest — run scripts/bee_actions.py <verb>. Also declares the channel half's watcher config (the BEE_* keys ag2-sparrow's sources/bee.py resolves as CLI > env > manifest/package default).",
   "config": {
     "BEE_PROXY_URL": "",
     "BEE_API_BASE": "",
     "BEE_API_TOKEN": "",
+    "BEE_CA_FILE": "",
+    "BEE_EVENTS_PATH": "",
+    "BEE_EVENT_TYPES": "",
+    "BEE_SINK": "",
+    "BEE_BROKER_URL": "",
+    "BEE_BROKER_TOKEN": "",
+    "BEE_AGENT_ID": "",
+    "BEE_CURSOR_FILE": "",
+    "BEE_INBOX_FILE": "",
     "BEE_ROOM_ID": "",
     "BEE_ROOM_OWNER": ""
   }
