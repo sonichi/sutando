@@ -336,6 +336,11 @@ def _import_bindings(node) -> set:
     return {a.asname or a.name.split(".")[0] for a in node.names}
 
 
+# match/case is 3.10+; the ratchet must keep running on the 3.9 floor, where
+# evaluating ast.Match at all raises AttributeError.
+_MATCH_NODES = (ast.Match,) if hasattr(ast, "Match") else ()
+
+
 def _scope_nodes(body_node):
     """Nodes of ONE lexical scope in source order; nested scopes are pruned,
     so a sibling function's locals never certify this one's names."""
@@ -345,7 +350,7 @@ def _scope_nodes(body_node):
         # handled at the assignment, value before targets.
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
                               ast.ClassDef, ast.Assign, ast.AnnAssign, ast.If,
-                              ast.Try, ast.Match)):
+                              ast.Try) + _MATCH_NODES):
             continue
         yield from _scope_nodes(child)
 
@@ -491,7 +496,7 @@ def _certified_nodes(tree, bindings: set) -> set:
                 run(_scope_nodes(ast.Module(body=node.finalbody, type_ignores=[])))
 
         def step(node):
-            if isinstance(node, (ast.If, ast.Try, ast.Match)):
+            if isinstance(node, (ast.If, ast.Try) + _MATCH_NODES):
                 branch_merge(node)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for name in _import_bindings(node):
@@ -814,7 +819,10 @@ class BranchCertificationIsPerPath(unittest.TestCase):
         MAT = (self.HDR + 'def mint(x, item, ts, rec):\n    match x:\n        case 1:\n'
                '            k = %s\n        case _:\n            k = %s\n'
                '    rec["delivery_id"] = k\n    return rec\n')
-        for name, tmpl in (("try/except", TRY), ("match/case", MAT)):
+        constructs = [("try/except", TRY)]
+        if _MATCH_NODES:                     # 3.10+: MAT parses
+            constructs.append(("match/case", MAT))
+        for name, tmpl in constructs:
             with self.subTest(construct=name):
                 self.assertEqual(self._d(tmpl % (C, R)), self._d(tmpl % (R, C)),
                                  f"{name}: arm order changed the census")
