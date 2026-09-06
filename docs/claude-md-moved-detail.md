@@ -35,7 +35,7 @@ api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
+{"host": "...", "pid": ..., "heartbeat_pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "session": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 3}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
