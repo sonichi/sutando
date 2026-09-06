@@ -386,15 +386,16 @@ def work_signal(target: Optional[str], workspace: Path, now: float, work_file: O
     if say is not None:
         return (bool(say), "caller says work outstanding" if say else "caller says nothing outstanding")
     if work_file:
+        # The core owns a queue to fall back on; a worker without a usable record has no signal.
         try:
             data = json.loads(Path(work_file).read_text())
         except (OSError, ValueError) as e:
-            return (False, f"work file unreadable ({type(e).__name__}) — no work signal")
+            return work_outstanding(workspace, now) if core else (False, f"work file unreadable ({type(e).__name__}) — no work signal")
         rec = data.get(target) if isinstance(data, dict) and target in data else data
         if isinstance(rec, dict) and "outstanding" in rec and (target in data or "outstanding" in data):
             val = rec.get("outstanding")
             if type(val) is not bool:  # "false", 0, 1, null: a malformed record is a missing signal, never a verdict input
-                return (False, f"work file: 'outstanding' for {target!r} is not a boolean ({val!r}) — no work signal")
+                return work_outstanding(workspace, now) if core else (False, f"work file: 'outstanding' for {target!r} is not a boolean ({val!r}) — no work signal")
             return (val, str(rec.get("detail") or ("work file: outstanding" if val else "work file: nothing outstanding")))
         if core:
             return work_outstanding(workspace, now)

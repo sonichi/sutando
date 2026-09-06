@@ -556,6 +556,22 @@ class Cli(unittest.TestCase):
                 by = json.loads(out)["targets"]
                 self.assertEqual((by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"]["work_detail"]), (False, "deliverer says drained"))
 
+    def test_an_invalid_work_file_never_silences_the_core_but_still_silences_a_worker(self):
+        # Missing file, bad JSON, non-boolean record: the core falls back to its queue; a worker
+        # keeps the fail-closed missing-signal result.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); (ws / "tasks").mkdir(); (ws / "tasks" / "task-1.txt").write_text("x")
+            truth = w.work_outstanding(ws, 0.0)
+            self.assertTrue(truth[0])
+            missing = str(ws / "absent.json")
+            bad = ws / "bad.json"; bad.write_text("{not json")
+            nonbool = ws / "nb.json"; nonbool.write_text(json.dumps({"=sutando-core:0": {"outstanding": "false"}}))
+            for wf in (missing, str(bad), str(nonbool)):
+                self.assertEqual(w.work_signal("=sutando-core:0", ws, 0.0, work_file=wf, core=True), truth, wf)
+                got = w.work_signal("=w1:1", ws, 0.0, work_file=wf)
+                self.assertFalse(got[0], (wf, got))
+                self.assertIn("no work signal", got[1])
+
     def test_probe_targets_gives_one_verdict_per_worker_with_its_own_signal(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d) / "ws"
