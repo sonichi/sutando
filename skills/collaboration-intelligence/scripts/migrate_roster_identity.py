@@ -208,13 +208,9 @@ def _namespaced_identity_leaf(key: str, namespace: str) -> bool:
 # declaration and the id lives in free text rather than in an `..._id` slot.
 _PROSE_EVIDENCE_KEYS = frozenset({"stand_status"})
 
-# Provider objects carrying their own snowflake: an object name between the
-# principal and a bare `id` means the id is the OBJECT's, not the person's.
-_PROVIDER_OBJECT_WORDS = frozenset({
-    "room", "channel", "guild", "server", "message", "thread", "event",
-    "scheduled", "emoji", "role", "webhook", "attachment", "category",
-    "invite", "sticker", "application", "interaction", "voice", "forum",
-})
+# The ONLY intervening containers that may stand between a principal and a bare
+# `id`. Positive and bounded: an unanticipated object name is refused by default.
+_TRANSPARENT_CONTAINERS = frozenset({"account", "identity", "identities", "wrapper", "profile"})
 
 
 def _principal_slot(field: str) -> bool:
@@ -255,9 +251,13 @@ def _principal_container(segment: str) -> bool:
     words = {w.lower() for w in _WORDS.findall(str(segment))}
     if not words:
         return False
-    # Containers are transparent by design (`account`, `identities`, `wrapper`),
-    # so only a segment naming a provider OBJECT may not be.
-    return not (words & _PROVIDER_OBJECT_WORDS)
+    if not (words - _ID_WORDS):
+        return True                                   # pure namespace, e.g. `discord`
+    if str(segment).strip().lower() in _TRANSPARENT_CONTAINERS:
+        return True
+    # A denylist of provider objects only ever refuses the nouns already thought of;
+    # `integration`, `poll` and five more walked straight through one.
+    return bool(_verdicts_from_field(segment))
 
 
 def _identity_leaf(key: str) -> bool:

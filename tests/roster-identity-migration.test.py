@@ -2428,6 +2428,24 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
+    def test_the_objects_a_denylist_MISSED(self):
+        """qingyun-wu 5124886040 at 609264f2: the first fix enumerated provider nouns,
+        which is the denylist this function's own docstring rules out. All seven of
+        these exited 0 and wrote the object's snowflake as the human."""
+        for obj in ("integration", "poll", "command", "stage_instance",
+                    "audit_log_entry", "entitlement", "soundboard_sound"):
+            with self.subTest(object=obj):
+                _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("human_discord_id"), obj)
+
+    def test_an_object_NOBODY_anticipated_is_refused_by_default(self):
+        """The control that separates a bounded allowlist from a longer denylist:
+        a name in neither list, which no future provider noun can be added to."""
+        for obj in ("zzz_unheard_of", "quux_widget", "brand_new_2027_object"):
+            with self.subTest(object=obj):
+                _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("human_discord_id"), obj)
+
     def test_the_positive_control_still_resolves(self):
         # Without this the class above proves only that everything is refused.
         _rc, err, rec = self._human({"discord": True, "user_id": self.R})
