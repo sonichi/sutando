@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import http.client
 import json
 import os
 import uuid
@@ -2297,8 +2298,10 @@ def _maybe_push_workers_snapshot() -> bool:
         return False  # mid-write or malformed: the next change retries
     if not isinstance(snap, dict):
         return False
-    # The pushing seat is authoritative about itself; the lead's file is not.
-    snap = {**snap, "worker_id": WORKER_ID, "location": WORKER_LOCATION}
+    # Third request body carrying seat identity; gated like heartbeat and poll
+    # so a broker that never advertises sees the exact parent envelope.
+    if _broker_worker_routing:
+        snap = {**snap, "worker_id": WORKER_ID, "location": WORKER_LOCATION}
     try:
         _req("POST", "/v1/workers", snap, timeout=15)
     except urllib.error.HTTPError as e:
@@ -2436,7 +2439,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         _revoke_broker_capabilities()
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
+        # IncompleteRead subclasses HTTPException and escapes during resp.read(),
+        # so a truncated 200 carries no advertisement and must revoke like a 404.
         _revoke_broker_capabilities()
         _log(f"heartbeat network error: {e} — continuing")
         return False

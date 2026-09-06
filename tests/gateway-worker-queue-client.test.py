@@ -127,7 +127,19 @@ class Handler(BaseHTTPRequestHandler):
             caps = {"capabilities": _adv} if _adv else {}
             self._json(200, caps); return
         if self.path == "/v1/workers":
-            STATE["workers"].append(self._body()); self._json(200, {}); return
+            _w = self._body()
+            STATE["workers"].append(_w)
+            # A legacy relay REJECTS unknown keys on this endpoint too; without
+            # this the "parent envelope accepted" check could not fail.
+            _wlegacy = {"writer", "live_cores", "bindings", "ts", "seats", "lead"}
+            # A broker that ADVERTISED worker-routing must also accept the routed
+            # keys; a stub that advertises then rejects is an incoherent broker.
+            if STATE["advertise_routing"]:
+                _wlegacy |= {"worker_id", "location"}
+            if STATE["strict_wire"] and set(_w) - _wlegacy:
+                STATE["wire_rejected"].append(("workers", sorted(set(_w) - _wlegacy)))
+                self._json(422, {"error": "unknown fields"}); return
+            self._json(200, {}); return
         STATE["other"].append((self.path, self._body()))
         self.send_response(404); self.end_headers()
 
@@ -230,9 +242,14 @@ def main() -> int:
     snap.parent.mkdir(parents=True, exist_ok=True)
     blob = {"ts": 1, "writer": "pool-lead", "live_cores": ["core-1"], "bindings": {}}
     snap.write_text(json.dumps(blob))
+    # CHANGED with the routing capability: identity rides /v1/workers only after
+    # the broker advertises `worker-routing`, exactly like the heartbeat and poll.
+    STATE["advertise_routing"] = True
+    named._post_heartbeat(set(), force=True)
+    named._workers_push_mtime = 0.0; named._workers_push_retry_at = 0.0
     check(named._maybe_push_workers_snapshot() is True
           and STATE["workers"][-1] == {**blob, "worker_id": "worker-9", "location": "cloud"},
-          "workers-snapshot push stamps worker_id/location beside the lead's fields")
+          "workers-snapshot push stamps worker_id/location ONCE routing is advertised")
     snap.unlink()
 
     # ── 3. legacy broker: 404 heartbeat, ignored worker= ─────────────────────
@@ -682,6 +699,61 @@ def main() -> int:
           "worker-routing alone does NOT enable result metadata")
     STATE["strict_wire"] = False
     STATE["advertise"] = True; STATE["advertise_routing"] = False
+
+
+    # ---- 14. blockers 3 + 4: /v1/workers is the THIRD body carrying seat
+    # identity; ungated, a strict relay 422s it and the push backs off 1h.
+    import http.client as _hc
+    ws14 = root / "ws14"; (ws14 / "state").mkdir(parents=True, exist_ok=True)
+    d14 = _load("d14", ws14, port, SUTANDO_WORKER_ID="core-4",
+                SUTANDO_WORKER_LOCATION="cloud")
+    snap_file = ws14 / "state" / "pool-status.json"
+    snap_file.write_text(json.dumps({"writer": "lead", "live_cores": 2,
+                                     "bindings": {}, "ts": 1}))
+    STATE["strict_wire"] = True
+    STATE["advertise"] = False; STATE["advertise_routing"] = False
+    d14._post_heartbeat(set(), force=True)
+    check(d14._broker_worker_routing is False, "routing OFF for the snapshot control")
+    d14._workers_push_mtime = 0.0; d14._workers_push_retry_at = 0.0
+    check(d14._maybe_push_workers_snapshot() is True,
+          "un-advertised: the snapshot posts the EXACT parent envelope and is accepted")
+    check(all(r[0] != "workers" for r in STATE["wire_rejected"]),
+          f"the strict relay rejected nothing on /v1/workers: {STATE['wire_rejected']}")
+    check("worker_id" not in sorted(STATE["workers"][-1])
+          and "location" not in sorted(STATE["workers"][-1]),
+          f"and carries no seat keys: {sorted(STATE['workers'][-1])}")
+
+    STATE["advertise_routing"] = True
+    d14._post_heartbeat(set(), force=True)
+    check(d14._broker_worker_routing is True, "routing advertised")
+    snap_file.write_text(json.dumps({"writer": "lead", "live_cores": 3,
+                                     "bindings": {}, "ts": 2}))
+    d14._workers_push_mtime = 0.0; d14._workers_push_retry_at = 0.0
+    check(d14._maybe_push_workers_snapshot() is True, "advertised: snapshot posts")
+    check("worker_id" in sorted(STATE["workers"][-1])
+          and "location" in sorted(STATE["workers"][-1]),
+          f"and identity rides it only now: {sorted(STATE['workers'][-1])}")
+
+    # (3) a TRUNCATED successful heartbeat escapes during resp.read(); it carries
+    # no advertisement, so it must revoke exactly like a 404 or a malformed 200.
+    check(d14._broker_worker_metadata is True or d14._broker_worker_metadata is False,
+          "metadata flag readable before the truncation control")
+    STATE["advertise"] = True; STATE["advertise_routing"] = True
+    d14._post_heartbeat(set(), force=True)
+    check(d14._broker_worker_routing is True, "capabilities ON before truncation")
+    _real_urlopen = d14.urllib.request.urlopen
+
+    def _truncating(*a, **k):
+        raise _hc.IncompleteRead(b"{\"ok\": tr", 42)
+    d14.urllib.request.urlopen = _truncating
+    try:
+        check(d14._post_heartbeat(set(), force=True) is False,
+              "a truncated 200 does not raise out of the heartbeat")
+    finally:
+        d14.urllib.request.urlopen = _real_urlopen
+    check(d14._broker_worker_routing is False and d14._broker_worker_metadata is False,
+          "and it REVOKES both capabilities — absence of a reply is absence of evidence")
+    STATE["strict_wire"] = False
 
     srv.shutdown()
     if FAILS:
