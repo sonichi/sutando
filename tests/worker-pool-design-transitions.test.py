@@ -82,8 +82,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         `spent`, and pauses before its own rename. `contender_rename` resumes it.
     `clear_spent_on_rollback=True` -- the pre-fix rollback, which removed the witness while a
         contender was already past the gate.
-    `gate_lags_the_request=True` -- kick writes only the request and the later sweep creates the
-        gate, so a worker in between reads stale as ordinary eligibility.
+    `gate_lags_the_request=True` -- the request does NOT gate, so a worker between the kick and
+        the sweep reads stale as ordinary eligibility.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
@@ -130,10 +130,13 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def gated():
         """The WORKER's question: does the directory exist? Not the same question as issued().
 
+        The REQUEST gates too: it is published before the allowance exists, so between the two a
+        worker still sees a reset in force instead of reading stale as ordinary eligibility.
+
         A file-shaped gate reads ABSENT on a crashed issuance and, past snapshot expiry, releases
         the worker to the ordinary path over a standing allowance directory.
         """
-        return d.admit_dir
+        return (d.request and not gate_lags_the_request) or d.admit_dir
 
     def verdict():
         # The directory gate is UNCONDITIONAL -- before every record read, not only past expiry.
@@ -287,10 +290,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.claimed_rec is not None: d.results.add(d.claimed_rec)
 
     def kick():
-        # The gate exists from the instant the request does, or a worker in the
-        # window between them reads stale as ordinary eligibility and is unbounded.
+        # ONE durable write. The request itself gates (see `gated`), so kick does
+        # not create the directory and there is no seam inside a kick to crash in.
         d.request = True; d.writers.add(("request", "kick-pool"))
-        if not gate_lags_the_request: d.admit_dir = True
     def wait(): now[0] += WINDOW + 1
     def drift(): now[0] += STALE + 2      # past snapshot expiry, INSIDE probation's own window
     def crash_worker():
@@ -930,14 +932,15 @@ class AReturnedAttemptDoesNotUnwitnessAContender(unittest.TestCase):
         self.assertTrue(d.token, "a collision still returns the one attempt")
 
 
-class TheGateExistsFromTheInstantTheRequestDoes(unittest.TestCase):
+class TheRequestGatesUntilTheAllowanceExists(unittest.TestCase):
     """A request with no gate is a reset asked for and not yet enforced.
 
-    `kick-pool` wrote only the request and the next sweep created the allowance, so
-    between them the only thing a worker could read was the snapshot -- and past
-    expiry that reads as ordinary eligibility, which is unbounded by design. The
-    whole backlog enters a pool that has just been judged hung, which is the exact
-    opposite of what the reset was asked for.
+    Between the kick and the sweep the only thing a worker could read was the
+    snapshot, and past expiry that reads as ordinary eligibility -- unbounded by
+    design -- so the whole backlog entered a pool just judged hung. The repair is
+    that the REQUEST gates: an existence-only read of an artifact already
+    published, rather than moving `mkdir` into the kick, which would give the kick
+    two durable writes and a crash seam whose halves are both unsafe.
     """
 
     WINDOW = ["sweep", "kick", "drift", "worker", "event", "sweep"]
@@ -947,7 +950,7 @@ class TheGateExistsFromTheInstantTheRequestDoes(unittest.TestCase):
         _v, claimed, pending, _d = run(self.WINDOW, gate_lags_the_request=True)
         self.assertEqual((claimed, pending), (5, 0), "every task entered during the window")
 
-    def test_raising_the_gate_with_the_request_holds_the_bound(self):
+    def test_the_request_gating_on_its_own_holds_the_bound(self):
         _v, claimed, _p, _d = run(self.WINDOW)
         self.assertEqual(claimed, 0, "nothing may enter before the allowance is minted")
         _v, claimed, _p, _d = run(self.WINDOW + ["worker"])
@@ -962,6 +965,27 @@ class TheGateExistsFromTheInstantTheRequestDoes(unittest.TestCase):
     def test_the_control_the_normal_path_still_admits_one(self):
         _v, claimed, _p, _d = run(["kick", "sweep", "worker"])
         self.assertEqual(claimed, 1)
+
+    def test_a_kick_publishes_exactly_one_durable_artifact(self):
+        # Two durable writes in a kick means a seam, and both half-published
+        # orders are unsafe -- so the repair is that the seam cannot exist.
+        _v, _c, _p, d = run(["kick"])
+        self.assertTrue(d.request, "the request is the one artifact a kick writes")
+        self.assertFalse(d.admit_dir, "kick must not create the allowance directory")
+
+    def test_a_crash_between_kick_and_sweep_still_holds_the_bound(self):
+        # The only half-state a kick can leave is 'request, no allowance'. It must
+        # gate, or this is the whole-backlog window again.
+        _v, claimed, _p, d = run(["sweep", "kick", "drift", "worker", "event"])
+        self.assertEqual(claimed, 0, "a standing request holds the pool with no allowance yet")
+        self.assertFalse(d.admit_dir, "and no directory exists to have gated it")
+
+    def test_the_sweep_remains_the_directorys_only_creator(self):
+        # The invariant the first fix spent. It is not needed and is restored.
+        _v, _c, _p, d = run(["kick"])
+        self.assertFalse(d.admit_dir)
+        _v, _c, _p, d = run(["kick", "sweep"])
+        self.assertTrue(d.admit_dir, "the sweep, and only the sweep, creates it")
 
 
 if __name__ == "__main__":
