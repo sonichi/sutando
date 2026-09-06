@@ -39,9 +39,30 @@ SENTINEL = "tool-suites-last-run.json"
 EXTRAS = "tool-suites-extra.json"       # {"suites": ["tests/x.test.py", ...]}
 
 
-def tools_and_suites(scripts: Path):
-    suites = sorted(p for p in scripts.glob("*.test.py"))
-    tools = sorted(p for p in scripts.glob("*.py") if not p.name.endswith(".test.py"))
+
+def watched_dirs(ws: Path):
+    """Every immediate subdir of the workspace holding a top-level *.py.
+
+    Named dirs were the bug: `(scripts, tools)` misses a host whose tools live in
+    `bin/`, and the trigger then reports fresh forever while that dir's tools go
+    unstat'd. Over-watching costs a stat; under-watching costs a gate that is
+    green by construction.
+    """
+    if not ws.is_dir():
+        return []
+    return sorted(
+        (d for d in ws.iterdir()
+         if d.is_dir() and not d.name.startswith(".") and any(d.glob("*.py"))),
+        key=lambda d: d.name,
+    )
+
+
+def tools_and_suites(dirs):
+    """Union over EVERY candidate dir, not the first that matches: a workspace
+    mid-migration holds .py in both, and picking one hides the other's suites."""
+    found = [p for d in dirs for p in d.glob("*.py")]
+    suites = sorted(p for p in found if p.name.endswith(".test.py"))
+    tools = sorted(p for p in found if not p.name.endswith(".test.py"))
     return tools, suites
 
 
@@ -202,11 +223,11 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
-    scripts, statedir = ws / "scripts", ws / "state"
-    if not scripts.is_dir():
-        print(f"CANNOT ANSWER: no {scripts}", file=sys.stderr)
-        return 2
-    tools, suites = tools_and_suites(scripts)
+    statedir = ws / "state"
+    # DISCOVER the dirs; never name them. A fixed list is the same defect one
+    # name later — a third dir is unwatched and its staleness is silent (3852-r3).
+    candidates = watched_dirs(ws)
+    tools, suites = tools_and_suites(candidates)
     try:
         host = a.host or resolve_host(Path(a.repo).resolve())
         extras = extra_suites(extras_path(ws, host), Path(a.repo).resolve())
