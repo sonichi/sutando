@@ -270,6 +270,30 @@ class Hook(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "air"}):
             self.assertTrue(hook.pickup_line({"sender": "qingyun", "text": "hi"}).startswith("air is working on a task from qingyun: hi"))
 
+    def test_answered_sees_every_archive_shape_the_delivery_paths_write(self):
+        # Live, gateway (epoch suffix) and bridge (month dir) shapes; 0 of 400 live ids sat flat.
+        ws = self.ws; r = ws / "results"; r.mkdir(exist_ok=True)
+        shapes = {
+            "task-11111111111111": r / "task-11111111111111.txt",
+            "task-22222222222222": r / "archive" / "task-22222222222222-1788657562.txt",
+            "task-33333333333333": r / "archive" / "2026-06" / "task-33333333333333.txt",
+        }
+        for path in shapes.values():
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text("reply")
+        for tid in shapes:
+            self.assertTrue(hook.answered(ws, tid), tid)
+        self.assertFalse(hook.answered(ws, "task-99999999999999"))
+        self.assertFalse(hook.answered(ws, "../etc/passwd"))
+
+    def test_agent_name_comes_from_env_then_the_manifest_then_the_fallback(self):
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": ""}), mock.patch.object(hook, "manifest_config", return_value=""):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("Your agent is working"))
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": ""}), mock.patch.object(hook, "manifest_config", return_value="air"):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("air is working"))
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "env-air"}), mock.patch.object(hook, "manifest_config", return_value="air"):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("env-air is working"))
+        self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")  # declared, unset by default
+
     def post(self, sid, tool, inp):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
 

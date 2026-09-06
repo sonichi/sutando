@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from local_task_protocol import find_result  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
@@ -158,17 +159,28 @@ def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:
     return None
 
 
+def manifest_config(key: str) -> str:
+    """This skill's declared setting (manifest.json `config`), the source below an env override."""
+    try:
+        data = json.loads((Path(__file__).resolve().parents[1] / "manifest.json").read_text())
+        val = (data.get("config") or {}).get(key)
+        return val if isinstance(val, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def pickup_line(task: dict) -> str:
     """The lifecycle's first row as the owner reads it: which agent, whose message, its start."""
-    agent = os.environ.get("AGENT_DISPLAY_NAME") or "Your agent"
+    agent = os.environ.get("AGENT_DISPLAY_NAME") or manifest_config("AGENT_DISPLAY_NAME") or "Your agent"
     who = task.get("sender") or task.get("from") or "unknown"
     text = task.get("text") or ""
     return f"{agent} is working on a task from {who}: {text[:20]}{'…' if len(text) > 20 else ''}"
 
 
 def answered(ws: Path, task_id: str) -> bool:
-    """A result already exists: the task is finished, whatever the log says."""
-    return any((ws / d / f"{task_id}.txt").exists() for d in ("results", os.path.join("results", "archive")))
+    """A result exists — live, or archived in any shape the delivery paths write (the shared lookup
+    knows the epoch-suffixed, month-partitioned and retention layouts): the task is finished."""
+    return find_result(ws / "results", task_id) is not None
 
 
 def working_line(tool_name: str, tool_input) -> str | None:
