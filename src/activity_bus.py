@@ -54,7 +54,7 @@ class TaskActivityState:
     phase: str = "RECEIVED"
     generation: int = 0  # bumps each time the task enters RUNNING: one per run
     seq: int = 0  # last runtime-event sequence applied, across sessions
-    emitted: int = 0  # rows projected so far: the stable projection id of the next row
+    emitted: int = 0
     message_event_id: str | None = None
     room: str | None = None
     sender: str | None = None
@@ -167,7 +167,8 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
             # QUEUED and RUNNING are emitted by independent processes and can land out of order: an
             # earlier-stamped QUEUED is history — row written, phase kept, a replay of it a no-op.
             state.applied += ["queued", key]
-            rows.append(_row(state, "notice", "queued", now))
+            rows.append(_row(state, "notice", "queued", now, audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
+                             projection="TASK_STATUS"))
             return state, rows
         if frm != state.phase or state.phase in TERMINAL or item.to_phase not in TRANSITIONS.get(state.phase, frozenset()):
             # Not a valid move from where the task is: a stale or replayed transition. Telemetry only.
