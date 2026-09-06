@@ -44,6 +44,24 @@ def _load_token(env):
     return resolve_channel_token("DISCORD_BOT_TOKEN", env_file=env)
 
 
+def format_timestamp(raw, owner_tz=None):
+    """Render a Discord UTC timestamp in the owner's timezone, never raw UTC.
+    Priority: owner_tz arg > host OS tz; any failure falls back to labeled UTC."""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if owner_tz:
+            from zoneinfo import ZoneInfo
+            local = dt.astimezone(ZoneInfo(owner_tz))
+        else:
+            local = dt.astimezone()  # host OS timezone = the user's configured tz
+        return local.strftime("%Y-%m-%dT%H:%M:%S %Z")
+    except Exception:
+        return raw[:19] + " UTC"
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("channel_id")
@@ -111,7 +129,7 @@ def main(argv=None):
         if args.until and _strictly_older_than_boundary(msg, args.until):
             continue
         author = msg.get("author", {}).get("username", "?")
-        ts = msg.get("timestamp", "")[:19]
+        ts = format_timestamp(msg.get("timestamp", ""), os.environ.get("OWNER_TZ"))
         clip = None if args.full else CLIP
         print(f"[{ts}] {author}: {_render(msg, clip)}")
         ctx = _reply_context(msg, None if args.full else REPLY_CLIP)
