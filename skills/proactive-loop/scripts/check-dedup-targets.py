@@ -15,7 +15,6 @@ Usage:
 Exit 0 clean, 1 contradictions found, 2 could not answer.
 """
 
-import re
 import sys
 from pathlib import Path
 
@@ -23,22 +22,31 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 
 
-def _canonical():
-    """`result_markers.dedup_holder_delivered`, the repo's policy owner.
+def _owner():
+    """`src/dedup_soundness.py`, the judgement's owner, or None if unavailable.
 
-    Re-implementing "did the holder deliver" drifts: a hand-rolled `[no-send]`
-    test called a `[REPLIED]` holder delivered, while the owner counts EVERY skip
-    action. Import it rather than copy it; if it cannot be imported the checker
-    must refuse (exit 2), never fall back to a weaker local rule.
+    Resolved through the CURRENT `REPO` rather than captured at import, so the
+    absent-owner path stays reachable (and testable) instead of turning into an
+    import-time crash. That distinction matters to the caller: a tool that dies
+    on import exits 1, and every checker in the proactive loop reserves 1 for a
+    REAL finding — so a missing owner would read as "dedups resolve to nothing"
+    rather than "the checker could not answer".
     """
     src = REPO / "src"
-    if not (src / "result_markers.py").is_file():
+    if not (src / "dedup_soundness.py").is_file() or not (src / "result_markers.py").is_file():
         return None
-    sys.path.insert(0, str(src))
-    import result_markers
-    return result_markers.dedup_holder_delivered
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    import dedup_soundness
+    return dedup_soundness
 
-DEDUP = re.compile(r"^\s*\[deduped:\s*([^\]]+?)\s*\]", re.M)
+
+def _require_owner():
+    ds = _owner()
+    if ds is None:
+        raise RuntimeError("src/dedup_soundness.py (or result_markers.py) not importable — "
+                           "cannot answer; refusing to fall back to a weaker local rule")
+    return ds
 
 
 def workspace() -> Path:
@@ -47,68 +55,73 @@ def workspace() -> Path:
     return resolve_workspace(migrate=False)
 
 
-def target_body(ws: Path, tid: str) -> "str | None":
-    """The referenced result's body, or None if no such result exists."""
-    tid = tid.strip()
-    direct = ws / "results" / f"{tid}.txt"
-    if direct.is_file():
-        return direct.read_text(errors="ignore")
-    hits = sorted((ws / "results" / "archive").glob(f"{tid}*.txt"))
-    if hits:
-        return hits[-1].read_text(errors="ignore")
-    return None
-
-
 def check(ws: Path, files) -> "list[tuple[str, str, str]]":
-    """(file, target, why) for every dedup that resolves to nothing."""
+    """(file, target, why) for every dedup that resolves to nothing.
+
+    The task id is the result FILENAME's stem, which is what lets the shared
+    judgement compare this task's sender and room against the holder's. Passing
+    the body alone (as this file used to) makes those two checks unreachable.
+    """
+    ds = _require_owner()
+    src = REPO / "src"
+    results, tasks = ws / "results", ws / "tasks"
     bad = []
     for f in files:
         try:
             body = f.read_text(errors="ignore")
         except OSError:
             continue
-        m = DEDUP.search(body)
-        if not m:
+        target = ds.dedup_target(body, src)
+        if not target:
             continue
-        why = resolve(ws, m.group(1))
+        why = ds.dedup_problem(
+            results, _task_id(f), tasks if tasks.is_dir() else None, text=body, src_dir=src)
         if why:
-            bad.append((f.name, m.group(1), why))
+            bad.append((f.name, target, why))
     return bad
 
 
+def _task_id(result_file: Path) -> str:
+    """`task-<id>` from a result filename, across the shapes it can carry:
+    `task-x.txt`, `<channel-key>.task-x.txt`, `task-x.txt.sending`."""
+    name = result_file.name
+    for suffix in (".txt.sending", ".txt"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.rsplit(".", 1)[-1]
+
+
 def resolve(ws: Path, tid: str) -> "str | None":
-    """None if the target delivered a real reply; else why it delivers nothing.
+    """None if the target delivered a real reply; else why it does not.
 
-    Delegates the whole judgement to the repo's owner, `result_markers.
-    dedup_holder_delivered`. That is deliberate and it is the second time this
-    file has been corrected toward it:
-
-      - a hand-rolled `[no-send]` test called a `[REPLIED]` holder delivered;
-      - hand-rolled CHAIN FOLLOWING (a -> b -> real reply => clean) was MORE
-        PERMISSIVE than production. `[deduped:]` is itself a skip action, so the
-        bridge's `dedup_decision` returns "requeue" for a chained holder and never
-        walks it. A guard that clears what the bridge rejects is worse than none.
-
-    So: no local rule, no recursion. Ask the owner.
+    Kept as the by-target-id entry point, now delegating to
+    `src/dedup_soundness.py`. This file previously owned its own copy of the
+    marker regex, the result-path resolution and the verdict, and each was the
+    weaker one: a bare `{tid}*` archive glob matched `{tid}.too-old.<epoch>`, so
+    a dedup pointing at a QUARANTINED reply — never delivered — read as clean.
     """
-    tb = target_body(ws, tid)
-    if tb is None:
+    ds = _require_owner()
+    src = REPO / "src"
+    target_path = ds.result_path(ws / "results", tid.strip())
+    if target_path is None:
         return "target result does not exist"
-    delivered = _canonical()
-    if delivered is None:
-        raise RuntimeError("result_markers.py not importable — cannot answer")
+    delivered, _ = ds.markers(src)
+    tb = ds.read(target_path)
     if not delivered(tb):
-        nxt = DEDUP.search(tb)
+        nxt = ds.dedup_target(tb, src)
         if nxt:
-            return (f"target is itself [deduped: {nxt.group(1)}] — the bridge treats a chained "
+            return (f"target is itself [deduped: {nxt}] — the bridge treats a chained "
                     f"holder as not delivered and requeues; it does not walk the chain")
-        # Quote the target's own first line for diagnostics. The VERDICT stays
-        # the owner's; this only says what the reader would see there.
-        first = (tb.strip().splitlines() or [""])[0][:40]
+        first = ((tb or "").strip().splitlines() or [""])[0][:40]
         return f"target delivered nothing (canonical dedup_holder_delivered); it begins {first!r}"
     return None
 
 def main(argv) -> int:
+    if _owner() is None:
+        print("cannot answer: src/dedup_soundness.py (or result_markers.py) is not importable — "
+              "refusing to fall back to a weaker local rule", file=sys.stderr)
+        return 2
     ws = workspace()
     if argv:
         files = [Path(a) for a in argv]
