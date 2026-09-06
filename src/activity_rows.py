@@ -120,13 +120,6 @@ def _pid_in_archive(workspace: Path | None, pid: str, ts: float) -> bool:
     return False
 
 
-def _oldest_live_ts(path: Path) -> float | None:
-    try:
-        first = path.read_text(encoding="utf-8").split("\n", 1)[0]
-        return float(json.loads(first).get("ts")) if first.strip() else None
-    except (OSError, ValueError, TypeError):
-        return None
-
 
 def _pid_in_log(path: Path, pid: str) -> bool:
     try:
@@ -160,9 +153,10 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         task_id = task.get("id") if isinstance(task, dict) and isinstance(task.get("id"), str) else None
         acked = bool(pid and task_id and (_pid_acked(workspace, task_id, pid)
                                           or (done and _pid_in_log(summaries_path(workspace), pid))))
-        oldest = _oldest_live_ts(path) if pid and not acked else None
-        rotated = oldest is not None and rec["ts"] < oldest and _pid_in_archive(workspace, pid, rec["ts"])
-        if not (pid and (acked or rotated or _pid_in_log(path, pid))):
+        # No ordering heuristic: an unacknowledged row absent from the live log is looked up in the
+        # archive file its own timestamp names — exact, and a fresh row only pays for a small read.
+        landed = bool(pid) and (acked or _pid_in_log(path, pid) or _pid_in_archive(workspace, pid, rec["ts"]))
+        if not landed:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if pid and task_id:

@@ -287,6 +287,24 @@ class IdempotentProjection(unittest.TestCase):
             sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
             self.assertEqual([x["rows"] for x in sums], [2], f"fault={fault}: the summary counts two rows, once")
 
+    def test_an_archived_unacked_row_is_found_whatever_the_live_windows_order(self):
+        # yixuan's residual: after a replayed old-ts row lands in the live log, any "older than the
+        # window" reading lies. The lookup must not depend on live order at all.
+        import activity_rows
+        t = {"id": "task-h1"}
+        with unittest.mock.patch.object(activity_rows, "_ack", lambda w, tid, pid: None):  # the ack never lands
+            card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-h1:1:1", ts=1_757_000_000.0)
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"noise {i}", kind="notice", room=None, workspace=self.ws)
+        self.assertNotIn("task-h1", card.log_path(self.ws).read_text(), "precondition: the victim is archived")
+        # a replayed row with an ancient event ts now sits in the live window, both older and newer rows around it
+        card.append("old replay", kind="notice", room=None, task={"id": "task-o"}, workspace=self.ws, pid="task-o:1:1", ts=1.0)
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-h1:1:1", ts=1_757_000_000.0)
+        history = "".join(p.read_text() for p in (self.ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name)
+        self.assertEqual(history.count('"pid": "task-h1:1:1"'), 1, "found in the archive; not appended again")
+        card.append("fresh", kind="notice", room=None, task=t, workspace=self.ws, pid="task-h1:1:9")
+        self.assertEqual(card.log_path(self.ws).read_text().count('"pid": "task-h1:1:9"'), 1, "control: a new pid appends once")
+
     def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
         # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid
         # projected again must not count the row twice.
