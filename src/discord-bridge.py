@@ -785,6 +785,7 @@ if TEAM_TIER_OWNER:
 
 # Dedup: skip duplicate messages (Discord gateway can replay events on reconnect)
 seen_message_ids = set()  # Discord message IDs already processed
+_inflight_discord_message_ids = set()  # claimed before the first handler await
 
 
 # Durable on-disk backup of the Discord access allowlist (parity with
@@ -2813,6 +2814,8 @@ async def on_ready():
         client.loop.create_task(_supervise_loop(poll_pending_notify, "poll_pending_notify"))
         client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
         client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
+        client.loop.create_task(
+            _supervise_loop(_dm_reconciliation_loop, "_dm_reconciliation_loop"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
         client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
 
@@ -2963,7 +2966,7 @@ async def _ack_not_allowlisted(
 
 @client.event
 async def on_message(message):
-    await _handle_discord_message(message)
+    await _dispatch_discord_message(message)
 
 
 @client.event
@@ -2979,7 +2982,7 @@ async def on_message_edit(before, after):
     # Case 1: edit introduced a bot mention
     if _message_mentions_bot(after) and not _message_mentions_bot(before):
         print(f"  [edit] mention added to msg {after.id} — reprocessing", flush=True)
-        await _handle_discord_message(after, force=True)
+        await _dispatch_discord_message(after, force=True)
         return
     # Case 2: owner edited their own DM within 5 minutes
     if not isinstance(after.channel, discord.DMChannel):
@@ -2993,7 +2996,7 @@ async def on_message_edit(before, after):
     if age_sec > 300:
         return
     print(f"  [edit] owner edited DM {after.id} within {age_sec:.0f}s — reprocessing as new task", flush=True)
-    await _handle_discord_message(after, force=True)
+    await _dispatch_discord_message(after, force=True)
 
 
 def _write_task_file(task_file: Path, content, username: str,
@@ -3129,6 +3132,47 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
     except Exception as send_exc:
         print(f"  [core-restart] ack send failed: {send_exc}", flush=True)
     return True
+
+
+def _claim_discord_message(message_id, force=False) -> bool:
+    """Claim a message before the handler's first await.
+
+    Gateway delivery and REST reconciliation can discover the same message at
+    the same time. The bridge runs on one asyncio event loop, so this
+    check-and-add is atomic as long as it happens before yielding. ``force``
+    preserves intentional edit reprocessing.
+    """
+    if force:
+        return True
+    if (
+        message_id in seen_message_ids
+        or message_id in _inflight_discord_message_ids
+    ):
+        return False
+    _inflight_discord_message_ids.add(message_id)
+    return True
+
+
+async def _dispatch_discord_message(message, force=False):
+    if not _claim_discord_message(message.id, force=force):
+        print(
+            f"  [dedup] skipping already-processed message {message.id} "
+            f"from @{message.author}",
+            flush=True,
+        )
+        return
+    if force:
+        await _handle_discord_message(message, force=True)
+        return
+    try:
+        await _handle_discord_message(message, force=False)
+    except Exception:
+        _inflight_discord_message_ids.discard(message.id)
+        raise
+    _inflight_discord_message_ids.discard(message.id)
+    if len(seen_message_ids) >= 10000:
+        seen_message_ids.clear()
+    seen_message_ids.add(message.id)
 
 
 async def _handle_discord_message(message, force=False):
@@ -3874,16 +3918,8 @@ async def _handle_discord_message(message, force=False):
         except Exception:
             pass
 
-    # Dedup: skip if we've already processed this Discord message ID.
-    # EXCEPTION: force=True means on_message_edit is reprocessing because the
-    # edit added a new mention — re-queue even though the ID is seen.
-    if message.id in seen_message_ids and not force:
-        print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
-        return
-    seen_message_ids.add(message.id)
-    # Cap set size to prevent unbounded growth
-    if len(seen_message_ids) > 10000:
-        seen_message_ids.clear()
+    # Dedup: the claim happens in `_dispatch_discord_message` before its first
+    # await, which is what keeps the check-and-add atomic across gateway/REST.
 
     # Plugin "magic word" join trigger. THIN hook (CLAUDE.md core/skill
     # split): the bridge only checks "is this the owner saying the join
@@ -4641,13 +4677,31 @@ def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
     _atomic_write_dm_checkpoint(current)
 
 
-async def _catchup_missed_dms():
-    """Restart-safety: on full reconnect (after gateway IDENTIFY),
-    replay any DM messages that arrived during the disconnect window.
+# Created lazily inside the running loop: py3.9 asyncio.Lock() binds its event
+# loop at construction, so a module-scope lock raises on contended acquire.
+_dm_catchup_lock = None
+
+
+def _get_dm_catchup_lock():
+    """The DM-catchup lock, constructed on first use inside the running loop (see
+    the note above). No extra guarding needed: the create is synchronous with no
+    await between the None-check and the assignment, so two coroutines on the
+    single-threaded event loop can never both construct it."""
+    global _dm_catchup_lock
+    if _dm_catchup_lock is None:
+        _dm_catchup_lock = asyncio.Lock()
+    return _dm_catchup_lock
+
+
+DM_RECONCILE_INTERVAL_SECONDS = 60
+
+
+async def _catchup_missed_dms_unlocked():
+    """Replay DM messages missed by gateway delivery.
 
     For each channel in the DM checkpoint, fetch messages with
     `after=<last_seen_id>` via Discord REST and dispatch each one
-    through `_handle_discord_message`. Bounded at 50 messages per
+    through `_dispatch_discord_message`. Bounded at 50 messages per
     channel per pass.
     """
     checkpoint = _load_dm_checkpoint()
@@ -4670,7 +4724,7 @@ async def _catchup_missed_dms():
                 # Checkpoint advancement happens inside
                 # `_handle_discord_message` for any DM.
                 try:
-                    await _handle_discord_message(msg)
+                    await _dispatch_discord_message(msg)
                     replayed += 1
                 except Exception as e:
                     print(f"  [dm-catchup] replay failed for msg {msg.id}: {e}", flush=True)
@@ -4679,6 +4733,30 @@ async def _catchup_missed_dms():
                 print(f"  [dm-catchup] replayed {replayed} missed DM(s) on channel {channel_id_str}", flush=True)
         except Exception as e:
             print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
+
+
+async def _catchup_missed_dms():
+    """Serialize reconnect and periodic REST reconciliation passes."""
+    async with _get_dm_catchup_lock():
+        await _catchup_missed_dms_unlocked()
+
+
+async def _reconcile_missed_dms_if_ready() -> bool:
+    """Run one reconciliation pass only while the gateway reports ready."""
+    if not client.is_ready():
+        return False
+    await _catchup_missed_dms()
+    return True
+
+
+async def _dm_reconciliation_loop():
+    """Periodically close silent gateway gaps without requiring reconnect."""
+    while True:
+        await asyncio.sleep(DM_RECONCILE_INTERVAL_SECONDS)
+        try:
+            await _reconcile_missed_dms_if_ready()
+        except Exception as e:
+            print(f"  [dm-reconcile] periodic pass failed: {e}", flush=True)
 
 
 # Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
