@@ -28,11 +28,16 @@ def parking_files():
     warn whose decision is settled is written there rather than to a file that
     waits on a human. Omitting it reported those as untriaged, which is the one
     verdict that invites re-deriving a decision already made.
+
+    The build log is the third kind and the largest: the other files record what
+    a pass DECIDED, it records what a pass FOUND. A re-derivation collides with
+    the finding, so a corpus of decisions is blind to exactly this class.
     """
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
-    from util_paths import memory_dir, personal_path
+    from util_paths import memory_dir, personal_path, shared_personal_path
     files = [p for p in (personal_path("pending-questions.md"),
-                         personal_path("current-track.md")) if p.exists()]
+                         personal_path("current-track.md"),
+                         shared_personal_path("build_log.md")) if p.exists()]
     mem = memory_dir()
     if mem.is_dir():
         files.extend(sorted(p for p in mem.glob("*.md") if p.is_file()))
@@ -43,7 +48,8 @@ def display(path):
     """`memory/<name>` for a memory file, bare name otherwise.
 
     A pending question waits on a human; a memory records a decision already
-    taken. The reader must be able to tell which one a hit is.
+    taken; `build_log.md` records a measurement nobody has to act on. The reader
+    must be able to tell which one a hit is.
     """
     return f"memory/{path.name}" if path.parent.name == "memory" else path.name
 

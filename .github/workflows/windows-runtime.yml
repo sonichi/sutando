@@ -196,6 +196,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
           python tests/agent-activity.test.py
           if ($LASTEXITCODE -ne 0) { throw 'agent-activity.test.py failed' }
+          python tests/activity-bus.test.py Acceptance StateMachine
+          if ($LASTEXITCODE -ne 0) { throw 'activity-bus.test.py failed' }
           python tests/core-input-watch-chat-escalation.test.py
           if ($LASTEXITCODE -ne 0) { throw 'core-input-watch-chat-escalation.test.py failed' }
           python tests/current-track-rotate.test.py
