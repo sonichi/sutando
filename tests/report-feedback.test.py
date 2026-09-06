@@ -3,6 +3,7 @@
 
 import builtins
 import importlib.util
+import contextlib
 import io
 import json
 import os
@@ -322,7 +323,7 @@ class TestAskFirst(unittest.TestCase):
             did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "medium", "title": "t", "body": "b", "auto": True}, "!dm:x")
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not file")):
-                self._run(["--title", "ignored", "--decide", did, "skip"])
+                self._run(["--decide", did, "skip"])  # the documented form: no --title
             self.assertEqual(report_feedback.list_drafts(ws), [])
 
     def test_decide_file_posts_the_parked_report_and_records_it(self):
@@ -335,13 +336,31 @@ class TestAskFirst(unittest.TestCase):
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
-                self._run(["--title", "ignored", "--decide", did, "file"])
+                self._run(["--decide", did, "file"])
             self.assertEqual(posted[0][0], "https://x/api/feedback")
             body = posted[0][1]
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
             self.assertTrue(body["context"]["logs_opted_out"])
             self.assertEqual(report_feedback.list_drafts(ws), [])
             self.assertFalse(report_feedback.check_auto_gate(ws, "relay down")[0], "filing must count toward the dedupe window")
+
+    def test_drafts_runs_without_a_title_and_lists_what_is_parked(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"}, "!dm:x")
+            buf = io.StringIO()
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    contextlib.redirect_stdout(buf):
+                self._run(["--drafts"])
+            self.assertEqual([d["id"] for d in json.loads(buf.getvalue())], [did])
+
+    def test_filing_still_requires_a_title(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    self.assertRaises(SystemExit) as cm:
+                self._run(["--body", "no title given"])
+            self.assertEqual(cm.exception.code, 1)
 
     def test_reply_labels_map_to_decisions(self):
         f = report_feedback.decision_for_reply

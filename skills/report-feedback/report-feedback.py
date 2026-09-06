@@ -512,7 +512,8 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--title", required=True)
+    # Optional at parse time: --drafts and --decide carry no title; filing and asking enforce it below.
+    ap.add_argument("--title", default="")
     ap.add_argument("--body", default="")
     ap.add_argument("--kind", choices=["bug", "feature", "other"], default="bug")
     ap.add_argument("--severity", choices=["low", "medium", "high", "critical"], default="medium")
