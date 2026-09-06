@@ -252,5 +252,47 @@ class StoreShapes(unittest.TestCase):
         self.assertIn("reviewer on the server-PR stack", out, out)
 
 
+class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
+    """The reader is activated on the v2 sidecar, so its reserved block matters."""
+
+    V2 = {"_schema": {"version": 2, "contract": "reserved"},
+          "x": {"github": "gh-x", "human": "X", "stand": "@sutando-x:ag2.space"}}
+
+    def test_the_reserved_schema_block_is_not_a_reviewer(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            ids = [r["entity_id"] for r in lk.load_roster(d)]
+            self.assertNotIn("_schema", ids, "metadata rendered as an addressable person")
+            self.assertEqual(ids, ["x"])
+
+    def test_the_metadata_rule_has_ONE_owner(self):
+        # roster_identity.is_person_key is the owner; a byte-equivalent private
+        # copy passes every behaviour test and drifts the moment the rule moves.
+        import pathlib as _p
+        # EVERY reader of the promoted roster, not just the one that prompted
+        # this test: a scan naming one file lets the next copy in unseen.
+        scripts = _p.Path(lk.__file__).parent
+        for name in ("lookup.py", "notify_reviewers.py"):
+            src = (scripts / name).read_text()
+            self.assertNotIn('startswith("_")', src,
+                             f"{name} carries its own copy of the metadata rule")
+            self.assertIn("is_person_key", src, f"{name} must call the owner")
+
+    def test_the_owner_itself_is_the_only_definition(self):
+        # The negative control: the scan above must not be satisfiable by
+        # deleting the rule everywhere, so pin that the owner still defines it.
+        import pathlib as _p
+        owner = (_p.Path(lk.__file__).parent / "roster_identity.py").read_text()
+        self.assertIn("def is_person_key", owner)
+        self.assertIn('startswith("_")', owner,
+                      "the owner is where the rule is allowed to live")
+
+    def test_a_real_person_in_the_same_document_still_loads(self):
+        # The negative control: filtering must not empty the roster.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            self.assertEqual(len(lk.match(lk.load_roster(d), "gh-x")), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

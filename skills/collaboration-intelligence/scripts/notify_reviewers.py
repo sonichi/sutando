@@ -45,6 +45,7 @@ _PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from roster_union import host_rosters, roster_login, roster_union
 
@@ -61,6 +62,14 @@ def _host_label() -> str:
     out = subprocess.run(["bash", "scripts/sutando-config.sh", "host-label"],
                          capture_output=True, text=True, cwd=str(_REPO))
     return out.stdout.strip()
+def _ri():
+    """The shared owner of the metadata rule; a copy here would drift silently."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "roster_identity", Path(__file__).with_name("roster_identity.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def roster_path() -> Path:
@@ -373,7 +382,7 @@ def _actor_map(roster) -> dict:
             parent[hi] = lo
 
     for k, v in (roster or {}).items():
-        if not isinstance(v, dict) or k.startswith("_"):
+        if not isinstance(v, dict) or not _ri().is_person_key(k):
             continue
         find(k)
         other = v.get("same_actor_as")
@@ -433,7 +442,7 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     actor_of = _actor_map(roster)
     seen_actors, unasked = set(), []
     for k, v in sorted((roster or {}).items()):
-        if not isinstance(v, dict) or k.startswith("_"):
+        if not isinstance(v, dict) or not _ri().is_person_key(k):
             continue
         actor = actor_of.get(k, k)
         if k in prior or k == "keweichen":

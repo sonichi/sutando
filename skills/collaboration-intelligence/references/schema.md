@@ -9,6 +9,7 @@ Use this conceptual schema with any available durable store. Preserve stable IDs
 - [Relationship](#relationship)
 - [Evidenced fact](#evidenced-fact)
 - [Candidate identity link](#candidate-identity-link)
+- [Reviewer identity map (`reviewer-identity/2`)](#reviewer-identity-map-reviewer-identity2)
 - [Alert](#alert)
 - [Merge rules](#merge-rules)
 - [Suggested freshness windows](#suggested-freshness-windows)
@@ -270,6 +271,107 @@ Treat these as defaults, not truth:
 | Explicit identity / ownership | 180 days |
 
 Explicit end dates and newer contradictory evidence override these windows.
+
+## Reviewer identity map (`reviewer-identity/2`)
+
+`<workspace>/data/collaboration-intelligence/reviewer-stands.json` — the single
+map of a reviewer's Discord identities. **Keyed by the roster's own local
+key**, with the GitHub login in the `github` FIELD — a key-equality lookup
+on a login queries the wrong axis and reads a mapped reviewer as absent
+(measured twice, 2026-08-27 and 08-28). GitHub logins are matched
+case-insensitively wherever they are joined.
+
+```json
+{
+  "_schema": {"name": "reviewer-identity", "version": 2, "generated_at": "...",
+              "migrated_from": "...", "contract": "..."},
+  "<roster-local-key>": {
+    "human_discord_id": "<the PERSON's id>  | null",
+    "stand_discord_id": "<the AGENT's id>   | null",
+    "other_stand_discord_ids": [{"id": "...", "basis": ["..."]}],
+    "unresolved_discord_ids": [{"id": "...", "reason": "...",
+                                "seeded_by": [{"path": "…", "verdict": "human|stand",
+                                               "reason": "…"}]}],
+    "home_channel": "<channel id> | null",
+    "id_basis": {"human_discord_id": ["..."], "stand_discord_id": ["..."]},
+    "id_shape_failures": [{"path": "…|null", "kind": "…", "reason": "…",
+                           "arbitrated_ids": ["…"], "arbitrated_states": ["human|stand"]}],
+    "...": "every v1 provenance field (verification, verified_at, source, observed_at, stand, evidence) is preserved verbatim"
+  }
+}
+```
+
+**Why the field names are long.** v1 carried one `discord_id` whose referent was
+unstated, and the pr-triage config carried `{discord, bots[]}` for the same
+people. Measured 2026-08-28: for `qingyun-wu` the roster's `discord_id` was the
+AGENT and pr-triage's `discord` was the HUMAN — both spelled "discord". Merging
+on the shared name makes a person and their agent the same value, and every
+downstream ping then reaches the wrong party while reporting success.
+
+**Rules for writers.**
+
+- Fill a slot only from a source that STATES the referent: a field whose own
+  name says which (`discord_human_id`, `stand_status`, `secondary_agent`),
+  pr-triage `people.<login>.discord` vs `.bots[]`, the Discord `peers.json`
+  (peer bot ids), or `discord-config.json` `owner` (the human owner).
+- A display name is not evidence. "Sutando-Mini" reads as a bot to a person and
+  states nothing to a program.
+- Sources that disagree, or two ids claiming one slot, go to
+  `unresolved_discord_ids` — never arbitrate.
+- Keys beginning with `_` are document metadata, not people.
+
+**Rules for readers.** Check `_schema` first and refuse anything below version 2
+rather than reading `discord_id`; use `scripts/roster_identity.py`'s accessors
+(`human_discord_id`, `stand_discord_id`, `stand_discord_ids`). An id in
+`unresolved_discord_ids` answers no lookup.
+
+`seeded_by` records which writer-owned slots stated a referent for a contested
+id. The migration overwrites those slots, so its own output no longer holds the
+claim that caused the disagreement; without the record a re-migration sees only
+the surviving source, agrees with itself, and publishes the referent the
+previous pass refused.
+
+A seed is discharged by **repair**, not by occupancy: the slot reads again AND
+nothing in the current pass still contradicts it. A *rival* id filling the slot
+leaves the original disagreement untouched, so clearing the seed there
+republishes the contested id — the seed is carried while any source this pass
+states a different referent for the same id, and dropped once none does.
+
+A seed is untrusted input, so it is consumed only when all three hold:
+
+- the document declares `reviewer-identity/2` — below that the source has no
+  stated referent to make the claim with, and the id stays unresolved;
+- the `path` names a **referent-bearing** slot (`human_discord_id`,
+  `stand_discord_id`, `other_stand_discord_ids`). `unresolved_discord_ids` is
+  writer-owned but says which ids have no agreed principal, so a verdict quoted
+  against it is unbacked;
+- the `verdict` **agrees with** that path, and the `id` is a whole snowflake.
+
+Neither of the last two implies the other, and a mismatch is not cosmetic: a
+`human_discord_id` path carrying a `stand` verdict resolved the id to the
+opposite principal and returned success.
+
+`id_shape_failures` is RESERVED and migration-owned: findings the migration
+could not re-derive from its own output, carried so a refusal survives a
+re-migration. `roster_identity.py` owns its record shape, its canonicalisation
+and its bound (`SHAPE_MAX`); a present-but-unusable value is a refusal, never
+an absence, and is never silently erased. A finding on a writer-owned field
+clears only by repairing the SOURCE roster and re-migrating — our own rewrite
+of that field is not a repair. Do not use this name for anything else: a v1
+roster carrying a same-named provenance field would be read as a refusal.
+
+Two record kinds are reserved and pathless by design, so both survive the bound
+and the pathless-evidence drop. `kind: "invalid"` is a carried refusal that
+could not be represented — a present-but-unusable container is a refusal, never
+an absence. `kind: "arbitration-overflow"` stands in for arbitration records
+that exceed `SHAPE_MAX`, carrying the union of their `arbitrated_ids` and
+referents so the contested ids stay refused; identity facts are aggregated
+rather than dropped, while diagnostic history is truncated.
+
+**Migrating.** `scripts/migrate_roster_identity.py --roster <v1> --triage-config
+<pr-triage/config.json> --peers <peers.json> --discord-config <discord-config.json>
+--out <v2> --table` — it never writes its input and prints the per-entry
+before/after.
 
 ## Roster refusal keys
 
