@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -244,7 +245,7 @@ class Hook(unittest.TestCase):
         (self.ws / "tasks" / "task-abc123.txt").write_text(
             "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
         out = hook.handle(self.pre("S1", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run)
-        self.assertEqual(out, [("processing", "working on a task from qingyun: Read the latest disc…")])
+        self.assertEqual(out, [("processing", "Your agent is working on a task from qingyun: Read the latest disc…")])
         cmd = self.runs[-1]
         self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--from") + 1]), ("append", "task-abc123", "!team:s", "@q:s"))
         self.assertEqual(cmd[cmd.index("--text") + 1], "Read the latest discussion in this room.")
@@ -265,7 +266,9 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.handle(self.pre("S2", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run), [])
         self.assertEqual(hook.load_json(self.p["bind"], {}), {})
         self.assertEqual(self.runs, [])
-        self.assertEqual(hook.pickup_line({"from": "@q:s", "text": "x" * 30}), "working on a task from @q:s: " + "x" * 20 + "…")
+        self.assertEqual(hook.pickup_line({"from": "@q:s", "text": "x" * 30}), "Your agent is working on a task from @q:s: " + "x" * 20 + "…")
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "air"}):
+            self.assertTrue(hook.pickup_line({"sender": "qingyun", "text": "hi"}).startswith("air is working on a task from qingyun: hi"))
 
     def post(self, sid, tool, inp):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}

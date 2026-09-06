@@ -159,10 +159,11 @@ def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:
 
 
 def pickup_line(task: dict) -> str:
-    """The Processing row as the owner reads it: who asked, and the start of what."""
+    """The lifecycle's first row as the owner reads it: which agent, whose message, its start."""
+    agent = os.environ.get("AGENT_DISPLAY_NAME") or "Your agent"
     who = task.get("sender") or task.get("from") or "unknown"
     text = task.get("text") or ""
-    return f"working on a task from {who}: {text[:20]}{'…' if len(text) > 20 else ''}"
+    return f"{agent} is working on a task from {who}: {text[:20]}{'…' if len(text) > 20 else ''}"
 
 
 def answered(ws: Path, task_id: str) -> bool:
