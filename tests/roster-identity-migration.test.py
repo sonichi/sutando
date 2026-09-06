@@ -2400,12 +2400,12 @@ class AnEntryIsValidatedAsOneRecord(unittest.TestCase):
 
 
 class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
-    """keweichen 5124729413 / qingyun-wu 5124753570 at b615bfcc.
+    """Eligibility is a property of the whole PATH, never of the leaf alone.
 
-    `_principal_slot` read only the FINAL segment, so `human.room.id` presented
-    `id`, passed as an identity leaf, and took HUMAN from the ancestor — the room
-    snowflake became the person with rc 0. The `room_id` / `room.id` pair is the
-    discriminating one: the same value, two spellings, opposite verdicts.
+    Reading only the final segment lets `human.room.id` present `id`, pass as an
+    identity leaf, and take HUMAN from the ancestor, so a room snowflake becomes
+    the person. The `room_id` / `room.id` pair is the discriminating one: same
+    value, two spellings, opposite verdicts.
     """
 
     R = "1400000000000000001"
@@ -2429,9 +2429,9 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
     def test_the_objects_a_denylist_MISSED(self):
-        """qingyun-wu 5124886040 at 609264f2: the first fix enumerated provider nouns,
-        which is the denylist this function's own docstring rules out. All seven of
-        these exited 0 and wrote the object's snowflake as the human."""
+        """A denylist of provider nouns only ever refuses the ones already thought
+        of. Each object here is one nobody enumerated, and each wrote its own
+        snowflake as the human at rc 0."""
         for obj in ("integration", "poll", "command", "stage_instance",
                     "audit_log_entry", "entitlement", "soundboard_sound"):
             with self.subTest(object=obj):
@@ -2439,10 +2439,10 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
     def test_a_referent_word_does_not_licence_the_words_beside_it(self):
-        """qingyun-wu 5124973175 at 7102c665: asking whether the segment STATES a
-        principal admitted any object that also carried a referent token, so
-        `human.integration.id` refused while `human.human_integration.id` passed.
-        Both sides of the join, because one referent word is not a container."""
+        """One referent word does not licence the words beside it. Asking only
+        whether a segment STATES a principal admits any object carrying a referent
+        token, so `human.integration.id` refuses while `human.human_integration.id`
+        passes. Both sides of the join, because a join is not a container."""
         for obj in ("human_integration", "integration_human", "foo_human_bar",
                     "stand_channel", "agent_room", "room_stand"):
             with self.subTest(container=obj):
@@ -2450,10 +2450,10 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
     def test_a_bare_compatibility_QUALIFIER_is_not_a_container(self):
-        """qingyun-wu 5124973175 -> 5124983993: granting each qualifier word
-        independently let a segment made ONLY of qualifiers pass, with the outer
-        `human` supplying the referent. The measured compatible containers are
-        COMPLETE spellings (`secondary_agent`), never their parts."""
+        """Granting each qualifier word independently lets a segment made ONLY of
+        qualifiers pass, with the outer `human` supplying the referent. The
+        compatible containers are COMPLETE spellings (`secondary_agent`), never
+        their parts."""
         for obj in ("status", "primary", "other", "secondary",
                     "primary_status", "other_profile"):
             with self.subTest(container=obj):
@@ -2529,6 +2529,87 @@ class AMalformedSecondaryContainerFailsClosed(unittest.TestCase):
         e = self._entry([12, "nope", {"id": "1600000000000000001"}])
         self.assertTrue(ri.entry_is_coherent(e))
         self.assertIn("1600000000000000001", ri.stand_discord_ids(e))
+
+
+class AnUnresolvedContainerSuppliesNoPrincipalEvidence(_InProcessCli, unittest.TestCase):
+    """`unresolved_discord_ids` is writer-owned and states by design that its ids
+    have NO agreed referent, so nesting one under `human` must not make it the
+    human. Writer-owned membership alone admitted it, and the SAME field then read
+    mined-and-unresolved at the root but canonical one level down.
+    """
+
+    R = "1400000000000000001"
+
+    def _rec(self, value):
+        return self._cli({"provider": "discord", "human": value})
+
+    def test_the_root_and_nested_spellings_agree(self):
+        unresolved = [{"id": self.R, "reason": "no agreed referent"}]
+        _rc, _e, root = self._cli({"provider": "discord",
+                                   ri.UNRESOLVED_FIELD: list(unresolved)})
+        _rc2, _e2, nested = self._rec({"discord": True, ri.UNRESOLVED_FIELD: list(unresolved)})
+        for label, rec in (("root", root), ("nested", nested)):
+            self.assertIsNone(rec.get("human_discord_id"), label)
+            self.assertIn(self.R, [o["id"] for o in rec.get(ri.UNRESOLVED_FIELD, [])],
+                          f"{label}: the id stays collected, never silently dropped")
+
+    def test_the_positive_control_still_resolves(self):
+        # A checker never observed passing is not a validated checker: these are
+        # the id spellings a `human` ancestor SHOULD resolve.
+        for leaf in ("discord_user_id", "discord_id", "id"):
+            with self.subTest(leaf=leaf):
+                _rc, err, rec = self._rec({"discord": True, leaf: self.R})
+                self.assertEqual(rec.get("human_discord_id"), self.R, err)
+
+    def test_a_non_referent_writer_owned_container_is_still_transparent(self):
+        # Only the UNRESOLVED field states no referent; the others still qualify.
+        for field in (ri.HUMAN_FIELD, ri.STAND_FIELD, ri.OTHER_STANDS_FIELD):
+            with self.subTest(field=field):
+                self.assertTrue(mig._principal_container(field))
+        self.assertFalse(mig._principal_container(ri.UNRESOLVED_FIELD))
+
+
+class AMalformedCanonicalScalarFailsTheWholeEntry(unittest.TestCase):
+    """A present canonical role is absent/None or a whole-string snowflake.
+
+    Filtering a malformed one out of the collision test hid the collision: a
+    string `human` beside a mapping `stand` carrying the SAME id compared one
+    role, passed, and then answered the human lookup as if the stand were empty.
+    """
+
+    H = "1400000000000000001"
+    S = "1500000000000000001"
+
+    def _entry(self, human, stand):
+        return {"_schema": "reviewer-identity/2",
+                ri.HUMAN_FIELD: human, ri.STAND_FIELD: stand}
+
+    def test_the_valid_distinct_pair_still_answers(self):
+        e = self._entry(self.H, self.S)
+        self.assertTrue(ri.entry_is_coherent(e))
+        self.assertEqual(ri.human_discord_id(e), self.H)
+        self.assertEqual(ri.stand_discord_id(e), self.S)
+
+    def test_a_malformed_role_hiding_a_collision_fails_closed(self):
+        for stand in ({"id": self.H}, [self.H], int(self.H)):
+            with self.subTest(stand=type(stand).__name__):
+                e = self._entry(self.H, stand)
+                self.assertFalse(ri.entry_is_coherent(e))
+                self.assertIsNone(ri.human_discord_id(e))
+                self.assertIsNone(ri.stand_discord_id(e))
+
+    def test_it_holds_on_the_other_side_of_the_pair_too(self):
+        e = self._entry({"id": self.S}, self.S)
+        self.assertFalse(ri.entry_is_coherent(e))
+        self.assertIsNone(ri.stand_discord_id(e))
+
+    def test_an_absent_role_is_not_malformed(self):
+        for human, stand in ((self.H, None), (None, self.S)):
+            with self.subTest(human=human, stand=stand):
+                self.assertTrue(ri.entry_is_coherent(self._entry(human, stand)))
+
+    def test_the_same_id_in_both_roles_still_fails(self):
+        self.assertFalse(ri.entry_is_coherent(self._entry(self.H, self.H)))
 
 
 if __name__ == "__main__":

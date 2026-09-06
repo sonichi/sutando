@@ -243,8 +243,12 @@ def entry_is_coherent(entry: dict) -> bool:
         return False
     human = entry.get(HUMAN_FIELD)
     stand = entry.get(STAND_FIELD)
-    roles = [v for v in (human, stand) if _is_snowflake_str(v)]
-    if len(roles) == 2 and roles[0] == roles[1]:
+    # A present canonical scalar is absent/None or a whole-string snowflake.
+    # Filtering a malformed one out of the collision test below HIDES a collision.
+    for role in (human, stand):
+        if role is not None and not _is_snowflake_str(role):
+            return False
+    if _is_snowflake_str(human) and human == stand:
         return False
     # The container fails CLOSED on shape: skipping the loop for a non-list let
     # a mapping or bare string read as "nothing contested".

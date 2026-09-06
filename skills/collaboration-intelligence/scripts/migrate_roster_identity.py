@@ -255,8 +255,12 @@ def _principal_container(segment: str) -> bool:
     if not words:
         return False
     seg = str(segment).strip().lower()
-    if seg in _TRANSPARENT_CONTAINERS or seg in ri.WRITER_OWNED:
+    if seg in _TRANSPARENT_CONTAINERS:
         return True
+    # Writer-owned is not enough: the UNRESOLVED field is writer-owned and states
+    # by design that its ids have no agreed referent. `path_referent` owns that.
+    if seg in ri.WRITER_OWNED:
+        return ri.path_referent(seg) is not None
 
     # EVERY word must be allowed: one referent word does not licence the rest,
     # which is how `human_integration` laundered while `integration` refused.
