@@ -326,5 +326,18 @@ class Reading(unittest.TestCase):
         self.assertEqual(av.availability(av.read_runtime_state(Path(tempfile.mkdtemp())), time.time()), "unknown")
 
 
+class WedgeFoldIsTotal(unittest.TestCase):
+    def test_every_kind_cli_wedge_can_emit_has_a_fold_entry(self):
+        # The kinds are string literals in one module; a new one without a fold entry fails here
+        # instead of reading as unknown and handing availability back to the heartbeat.
+        import inspect
+        import re
+        import cli_wedge
+        emitted = set(re.findall(r'"kind":\s*"([a-z-]+)"', inspect.getsource(cli_wedge)))
+        self.assertGreaterEqual(len(emitted), 9, "the detector's kinds were not found in its source")
+        self.assertEqual(emitted - set(av._WEDGE_KIND_TO_SIGNAL), set(), "unmapped kinds")
+        self.assertEqual(set(av._WEDGE_KIND_TO_SIGNAL.values()) - {"working", "idle", "wedged", "unknown"}, set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

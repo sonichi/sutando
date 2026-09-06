@@ -35,10 +35,10 @@ WORK_SIGNALS = ("working", "idle", "wedged", "unknown")
 # stops when the pane is gone, so an old window must never outrank a stale heartbeat.
 WORK_SIGNAL_MAX_AGE_S = 180.0
 # The CLI wedge detector reads the pane, not the process: its verdict kinds fold to the three the
-# room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown.
+# room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown. Total over every kind cli_wedge emits (a test derives the set).
 _WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": "idle",
                          "static-with-work": "wedged", "retry-loop": "wedged", "provider-limit": "wedged",
-                         "low-novelty": "wedged"}
+                         "low-novelty": "wedged", "cadence-too-sparse": "unknown", "unknown": "unknown"}
 
 
 def work_signal_from_verdict(verdict, max_age_s: float = WORK_SIGNAL_MAX_AGE_S) -> str:
