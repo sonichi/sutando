@@ -161,7 +161,10 @@ def purpose(path: Path) -> str:
 
 def collect() -> list[tuple[str, str]]:
     rows = []
-    for p in sorted(SRC.rglob("*")):
+    for p in sorted(
+        SRC.rglob("*"),
+        key=lambda p: p.relative_to(REPO).as_posix(),
+    ):
         if not p.is_file() or p.suffix not in SUFFIXES:
             continue
         if any(part in SKIP_DIRS for part in p.relative_to(REPO).parts):
@@ -235,7 +238,7 @@ def main() -> int:
         return 1
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(rendered, encoding="utf-8")
+    OUT.write_bytes(rendered.encode("utf-8"))
     undocumented = sum(1 for _, d in rows if not d)
     tally = f"{len(rows)} modules"
     if undocumented:

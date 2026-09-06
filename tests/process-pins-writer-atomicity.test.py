@@ -152,6 +152,8 @@ class WriterValidatesAndBounds(unittest.TestCase):
 
     def test_windows_replace_retries_a_transient_sharing_violation(self) -> None:
         real_replace = process_pins.os.replace
+        fake_os = mock.Mock(wraps=process_pins.os)
+        fake_os.name = "nt"
         calls = 0
 
         def transient(source, destination):
@@ -161,17 +163,19 @@ class WriterValidatesAndBounds(unittest.TestCase):
                 raise PermissionError("sharing violation")
             return real_replace(source, destination)
 
-        with mock.patch.object(process_pins.os, "name", "nt"), \
-                mock.patch.object(process_pins.os, "replace", side_effect=transient), \
+        with mock.patch.object(process_pins, "os", fake_os), \
+                mock.patch.object(fake_os, "replace", side_effect=transient), \
                 mock.patch.object(process_pins.time, "sleep") as sleep:
             process_pins.save_pins(self.path, [GOOD])
         self.assertEqual(process_pins.load_pins(self.path), [GOOD])
         sleep.assert_called_once_with(process_pins._WINDOWS_REPLACE_DELAY_S)
 
     def test_windows_replace_retry_is_bounded_and_raises(self) -> None:
-        with mock.patch.object(process_pins.os, "name", "nt"), \
+        fake_os = mock.Mock(wraps=process_pins.os)
+        fake_os.name = "nt"
+        with mock.patch.object(process_pins, "os", fake_os), \
                 mock.patch.object(
-                    process_pins.os, "replace",
+                    fake_os, "replace",
                     side_effect=PermissionError("sharing violation")) as replace, \
                 mock.patch.object(process_pins.time, "sleep") as sleep, \
                 self.assertRaises(PermissionError):
