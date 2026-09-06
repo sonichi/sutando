@@ -2612,5 +2612,47 @@ class AMalformedCanonicalScalarFailsTheWholeEntry(unittest.TestCase):
         self.assertFalse(ri.entry_is_coherent(self._entry(self.H, self.H)))
 
 
+class AStandAncestorIsCoveredOnTheProductionPath(_InProcessCli, unittest.TestCase):
+    """Every other container case here nests under a HUMAN ancestor, so the
+    Stand half of the same code was exercised by no end-to-end case at all."""
+
+    R = "1400000000000000001"
+    ANCESTORS = ("stand", "agent")
+    LEAVES = ("discord_user_id", "discord_id", "id")
+
+    def _stand(self, value):
+        # with_stand=False: the default would pre-fill the slot under test.
+        return self._cli({"provider": "discord", "stand": value}, with_stand=False)
+
+    def _under(self, ancestor, value):
+        return self._cli({"provider": "discord", ancestor: value}, with_stand=False)
+
+    def test_the_positive_control_a_stand_ancestor_resolves_its_leaves(self):
+        for ancestor in self.ANCESTORS:
+            for leaf in self.LEAVES:
+                with self.subTest(ancestor=ancestor, leaf=leaf):
+                    _rc, err, rec = self._under(ancestor, {"discord": True, leaf: self.R})
+                    self.assertEqual(rec.get("stand_discord_id"), self.R, err)
+                    self.assertIsNone(rec.get("human_discord_id"), err)
+
+    def test_a_nested_unresolved_container_states_no_stand(self):
+        unresolved = [{"id": self.R, "reason": "no agreed referent"}]
+        _rc, err, rec = self._stand({"discord": True,
+                                     ri.UNRESOLVED_FIELD: list(unresolved)})
+        self.assertIsNone(rec.get("stand_discord_id"), err)
+        self.assertIn(self.R, [o["id"] for o in rec.get(ri.UNRESOLVED_FIELD, [])],
+                      "the id stays collected, never silently dropped")
+
+    def test_an_unheard_of_object_under_a_stand_ancestor_is_refused(self):
+        for obj in ("zzz_unheard_of", "quux_widget", "brand_new_2027_object"):
+            with self.subTest(object=obj):
+                _rc, _e, rec = self._stand({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("stand_discord_id"), obj)
+
+    def test_a_transparent_container_stays_transparent_under_a_stand_ancestor(self):
+        _rc, err, rec = self._stand({"discord": True, "account": {"id": self.R}})
+        self.assertEqual(rec.get("stand_discord_id"), self.R, err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
