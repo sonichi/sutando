@@ -42,10 +42,15 @@ python3 skills/report-feedback/report-feedback.py --drafts        # pending draf
 python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_no_logs|skip   # by hand
 ```
 
-- `--apply` also registers any parked draft whose card was never created (a store write that failed
-  at ask time exits 3 and keeps the draft), then files or drops every draft the owner clicked and
-  resolves its card. A decision that cannot complete (signed out, API error) keeps the draft and the
-  card stays in progress for the next `--apply`. Run it on each proactive pass while `--drafts` is non-empty.
+- The click is applied **automatically**: `manifest.json` declares a `Stop` hook (`hooks/apply-clicks.py`,
+  registered by `bash src/install-claude-hooks.sh` like every skill hook) that runs `apply_clicks()` when
+  the agent's turn ends, so an answered card is filed or dropped within a turn with nobody typing `--apply`.
+  `--apply` is the same routine by hand. It also registers any parked draft whose card was never created
+  (a store write that failed at ask time exits 3 and keeps the draft).
+- Filing is exactly-once by receipt: after the post the draft is renamed to `<id>.filed`, then the card is
+  resolved, then the receipt is removed. A run that finds a receipt closes the card **without posting**;
+  a decision that cannot complete (signed out, API error) keeps the draft and the card stays in progress.
+  The payload carries `context.idempotency_key = <draft id>` for the server side.
 - `file` attaches logs only if `sendLogs` is on; `file_no_logs` never does; `skip` drops the draft.
   Logs are gathered only after the choice — the card carries the title only.
 - The ask is the throttled event: dedupe and the daily cap are checked and **recorded** when the card

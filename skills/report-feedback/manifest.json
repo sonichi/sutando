@@ -1,0 +1,18 @@
+{
+  "name": "report-feedback",
+  "version": "1.1.0",
+  "owner": "github:sonichi/sutando",
+  "stability": "stable",
+  "description": "Bug reports to Agent Universe under the owner's cloud identity, with the owner's Settings toggles as the consent surface. Ask-first parks a draft and registers its card in the HITL store; the Stop hook applies the owner's click at the end of the agent's turn.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "cloud-auth"
+  },
+  "hooks": [
+    {
+      "event": "Stop",
+      "command": "./hooks/apply-clicks.py"
+    }
+  ]
+}

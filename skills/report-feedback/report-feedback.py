@@ -55,6 +55,14 @@ PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
 DRAFTS_DIR = "feedback-drafts"
 DRAFT_ID_RE = re.compile(r"^fb_[0-9a-f]{10}$")  # the writer's grammar; anything else never becomes a path
 HITL_RUNTIME = "report-feedback"
+FILED_SUFFIX = ".filed"  # the receipt: the post landed, the card is not yet resolved
+ENGINE_SRC = Path(__file__).resolve().parents[2] / "src"
+
+
+def _engine_modules() -> None:
+    """hitl lives in the engine's src: one place adds the path, for every importer in this file."""
+    if str(ENGINE_SRC) not in sys.path:
+        sys.path.insert(0, str(ENGINE_SRC))
 ASK_ACTIONS = [
     {"id": "file", "kind": "confirmation", "label": "File this bug report"},
     {"id": "file_no_logs", "kind": "confirmation", "label": "File without logs"},
@@ -323,6 +331,19 @@ def drop_draft(ws: Path, draft_id: str) -> None:
         pass
 
 
+def filed_receipt(ws: Path, draft_id: str) -> Path:
+    return _draft_path(ws, draft_id).with_suffix(FILED_SUFFIX)
+
+
+def mark_filed(ws: Path, draft_id: str) -> None:
+    """One atomic rename after the post: a retry that finds the receipt must never post again."""
+    os.replace(_draft_path(ws, draft_id), filed_receipt(ws, draft_id))
+
+
+def clear_filed(ws: Path, draft_id: str) -> None:
+    filed_receipt(ws, draft_id).unlink(missing_ok=True)
+
+
 def decision_for_reply(text: str) -> str | None:
     """Map an action reply's body (the card label, optionally `label — note`) to a decision."""
     head = (text or "").split(" — ", 1)[0].strip().lower()
@@ -334,7 +355,7 @@ def decision_for_reply(text: str) -> str | None:
 
 def hitl_manager(ws: Path):
     """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    _engine_modules()
     from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
 
     return HitlManager(HitlStore(default_store(ws)))
@@ -342,6 +363,7 @@ def hitl_manager(ws: Path):
 
 def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
     """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
+    _engine_modules()
     from hitl.schema import Action, HumanRequirement  # type: ignore
 
     req = HumanRequirement(
@@ -363,7 +385,8 @@ def requirement_for_draft(manager, draft_id: str):
 
 def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
     """Register parked drafts that have no card yet, then run every choice the owner clicked.
-    A decision that cannot complete (signed out, API down) stays in progress for the next run."""
+    A decision that cannot complete (signed out, API down) stays in progress for the next run;
+    one whose post landed but whose card did not resolve finishes from its receipt, without posting."""
     out = {"registered": [], "applied": [], "kept": [], "cancelled": []}
     manager = hitl_manager(ws)
     for rec in list_drafts(ws):
@@ -373,16 +396,35 @@ def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
         if req.runtime != HITL_RUNTIME or req.status != "in_progress" or not req.chosen_action:
             continue
         draft_id = str((req.subject or {}).get("draft_id") or req.guard)
+        if not DRAFT_ID_RE.match(draft_id):
+            manager.cancel(req.id)
+            out["cancelled"].append(req.id)
+            continue
+        if filed_receipt(ws, draft_id).exists():
+            manager.resolve(req.id)
+            clear_filed(ws, draft_id)
+            out["applied"].append(req.id)
+            continue
         if load_draft(ws, draft_id) is None:
             manager.cancel(req.id)  # the draft is gone (decided by hand, or never valid): nothing to run
             out["cancelled"].append(req.id)
             continue
         if decide(ws, prefs, draft_id, req.chosen_action) == 0:
             manager.resolve(req.id)
+            clear_filed(ws, draft_id)
             out["applied"].append(req.id)
         else:
             out["kept"].append(req.id)
     return out
+
+
+def pending_clicks(ws: Path) -> int:
+    """How many cards the owner has answered that this skill has not finished — the hook's cheap gate."""
+    try:
+        return sum(1 for r in hitl_manager(ws).active()
+                   if r.runtime == HITL_RUNTIME and r.status == "in_progress" and r.chosen_action)
+    except Exception:  # noqa: BLE001 — no store, no engine: nothing to apply
+        return 0
 
 
 def _auto_state_path(ws: Path) -> Path:
@@ -498,6 +540,9 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     if choice not in ("file", "file_no_logs", "skip"):
         print(f"ERROR: choice must be file | file_no_logs | skip, got {choice!r}.")
         return 1
+    if DRAFT_ID_RE.match(draft_id or "") and filed_receipt(ws, draft_id).exists():
+        print(f"OK: draft {draft_id} was already filed; the receipt closes the card on the next --apply.")
+        return 0
     rec = load_draft(ws, draft_id)
     if not rec:
         print(f"ERROR: no parked draft {draft_id}.")
@@ -512,7 +557,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
         return 2
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
-                 "auto": bool(d.get("auto")), "owner_approved": True}
+                 "auto": bool(d.get("auto")), "owner_approved": True, "idempotency_key": draft_id}
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -532,7 +577,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}")
         return 1
-    drop_draft(ws, draft_id)  # the ledger was written when the card was asked
+    mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
     print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
     return 0
 
@@ -578,6 +623,7 @@ def main() -> None:
             req = requirement_for_draft(manager, a.decide[0])
             if req is not None:
                 manager.resolve(req.id)  # the card follows the hand-made decision
+            clear_filed(ws, a.decide[0]) if DRAFT_ID_RE.match(a.decide[0]) else None
         if rc:
             sys.exit(rc)
         return

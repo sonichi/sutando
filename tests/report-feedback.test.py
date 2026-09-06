@@ -533,6 +533,106 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual(self._hitl(ws).get(rid).status, "resolved")
             self.assertEqual(report_feedback.list_drafts(ws), [])
 
+    def test_a_clean_process_asks_and_registers_the_card(self):
+        """Codex's control: a fresh interpreter, nothing imported before the ask. At 68e48b61 the
+        schema import ran before the engine path was set and every first ask parked with exit 3."""
+        import subprocess
+        script = Path(__file__).resolve().parent.parent / "skills" / "report-feedback" / "report-feedback.py"
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"askFirst": True})
+            code = (
+                "import importlib.util, sys; from pathlib import Path\n"
+                f"spec = importlib.util.spec_from_file_location('rf', {str(script)!r}); rf = importlib.util.module_from_spec(spec); spec.loader.exec_module(rf)\n"
+                f"rf.resolve_workspace = lambda: Path({td!r})\n"
+                "sys.argv = ['report-feedback.py', '--title', 'clean run', '--auto']; rf.main()"
+            )
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("ASKED:", r.stdout)
+            self.assertEqual(len(self._hitl(ws).active()), 1, "the card exists after one clean ask")
+
+    def test_a_retry_after_the_post_landed_does_not_post_again(self):
+        """Receipt transition: post → rename the draft to its receipt → resolve. A failure after the
+        post leaves the receipt; the retry closes the card from it and posts nothing."""
+        posted = []
+        def _capture(req, timeout=None):
+            posted.append(json.loads(req.data.decode())); return _FakeResp()
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"sendLogs": False})
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "once", "body": "b", "auto": True})
+            m = self._hitl(ws)
+            rid = report_feedback.register_ask(ws, did, "once", "host")
+            from hitl.schema import ActionReply
+            from hitl.manager import HitlManager
+            m.apply_action(ActionReply(hitl_id=rid, expected_revision=1, action_id="file", guard=did))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
+                with mock.patch.object(HitlManager, "resolve", side_effect=OSError("store lock lost")):
+                    with self.assertRaises(OSError):
+                        self._run(["--apply"])
+                self.assertEqual(len(posted), 1)
+                self.assertTrue(report_feedback.filed_receipt(ws, did).exists(), "the receipt survives the failure")
+                self.assertEqual(m.get(rid).status, "in_progress")
+                self._run(["--apply"])
+            self.assertEqual(len(posted), 1, "the retry must not post a second report")
+            self.assertEqual(m.get(rid).status, "resolved")
+            self.assertFalse(report_feedback.filed_receipt(ws, did).exists())
+            self.assertEqual(report_feedback.list_drafts(ws), [])
+            self.assertEqual(posted[0]["context"]["idempotency_key"], did)
+
+    def test_the_stop_hook_applies_a_click_without_anyone_running_apply(self):
+        """The skill-owned executor: the manifest declares a Stop hook, discovery sees it, and the
+        hook's entry point finishes an answered card with nobody typing --apply. A hook must never
+        raise (it would block the agent), so a broken store is swallowed and retried next turn."""
+        import importlib.util
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "src"))
+        from skill_hooks import discover
+        hooks = [r for r in discover(repo) if r[1] == "apply-clicks.py"]
+        self.assertEqual([h[0] for h in hooks], ["Stop"])
+        spec = importlib.util.spec_from_file_location("apply_clicks_hook", repo / "skills" / "report-feedback" / "hooks" / "apply-clicks.py")
+        h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
+        self.assertTrue(hasattr(h.load_rf(), "apply_clicks"), "the hook loads the sibling script from disk")
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            self.assertEqual(h.main(workspace=ws, rf=report_feedback), 0, "nothing pending: a no-op")
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b", "auto": True})
+            m = self._hitl(ws)
+            rid = report_feedback.register_ask(ws, did, "t", "host")
+            from hitl.schema import ActionReply
+            m.apply_action(ActionReply(hitl_id=rid, expected_revision=1, action_id="skip", guard=did))
+            self.assertEqual(report_feedback.pending_clicks(ws), 1)
+            self.assertEqual(h.main(workspace=ws, rf=report_feedback), 0)
+            self.assertEqual(m.get(rid).status, "resolved", "the hook finished the click")
+            self.assertEqual(report_feedback.list_drafts(ws), [])
+            self.assertEqual(report_feedback.pending_clicks(ws), 0)
+            with mock.patch.object(report_feedback, "apply_clicks", side_effect=RuntimeError("store gone")):
+                m.create(report_feedback.hitl_manager(ws).get(rid).__class__(kind="choice", runtime="report-feedback", message="x", guard="fb_0000000000", chosen_action="skip", status="in_progress"))
+                self.assertEqual(h.main(workspace=ws, rf=report_feedback), 0, "a raising apply never escapes the hook")
+
+    def test_apply_cancels_a_card_with_a_foreign_guard_and_a_receipt_is_a_finished_filing(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            m = self._hitl(ws)
+            from hitl.schema import Action, ActionReply, HumanRequirement
+            # A requirement in this skill's runtime whose guard is not a draft id can only be foreign or forged.
+            odd = m.create(HumanRequirement(kind="choice", runtime="report-feedback", message="x", guard="../../etc",
+                                            device={"id": "report-feedback:odd"},
+                                            actions=[Action(id="skip", kind="confirmation", label="Skip")]))
+            m.apply_action(ActionReply(hitl_id=odd.id, expected_revision=1, action_id="skip", guard="../../etc"))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--apply"])
+            self.assertEqual(m.get(odd.id).status, "cancelled")
+            # A receipt means the post landed: deciding again is a no-op success, never a second post.
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            report_feedback.mark_filed(ws, did)
+            with mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not post")):
+                self.assertEqual(report_feedback.decide(ws, {}, did, "file"), 0)
+            self.assertTrue(report_feedback.filed_receipt(ws, did).exists())
+            with mock.patch.object(report_feedback, "hitl_manager", side_effect=OSError("no store")):
+                self.assertEqual(report_feedback.pending_clicks(ws), 0, "no store reads as nothing pending")
+
     def test_reply_labels_map_to_decisions(self):
         f = report_feedback.decision_for_reply
         self.assertEqual(f("File this bug report"), "file")
