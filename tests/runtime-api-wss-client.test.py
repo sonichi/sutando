@@ -139,8 +139,9 @@ def main() -> int:
             return None
         try:
             started = _await_line(lambda l: '"watching": true' in l.lower(), 5)
-            check(started is not None and '"transport": "wss"' in started,
-                  "sutando watch over WSS opens a streaming subscription")
+            # label reflects the ACTUAL scheme: this test connects ws://
+            check(started is not None and '"transport": "ws"' in started,
+                  "sutando watch labels its true (cleartext) scheme")
             time.sleep(0.4)  # let the watcher seed past the initial step
             Path(TMP, "state", "core-status.json").write_text(json.dumps(
                 {"status": "running", "step": "WATCH-OVER-WSS", "ts": 9}))
