@@ -16,12 +16,24 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Callable
 
 
 # A dot is legal inside an id: pool_lead allows [A-Za-z0-9._~-] and excludes the
 # state suffixes by lookahead rather than banning dots.
-_ID_STATE = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+?\.txt$")
-_ID_PLAIN = re.compile(r"^(task-.+?)\.txt(?:\.\d+|\.archive-failed.*)?$")
+_STATE_SUFFIX = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+$")
+
+# The collision/quarantine tail is appended to the WHOLE name, so the structural
+# .txt is the rightmost one: greedy, or a long id's quarantine re-aliases.
+_NOT_A_RECORD = re.compile(r"^(.+)\.txt(?:\.\d+|\.archive-failed.*)$")
+_DECLARED_ID = re.compile(r"^id:[ \t]*(\S+)[ \t]*$", re.M)
+
+
+def _stem_of(name: str) -> str | None:
+    if name.endswith(".txt"):
+        return name[:-4] or None
+    m = _NOT_A_RECORD.match(name)
+    return m.group(1) if m else None
 
 
 def task_id_from_filename(name: str) -> str | None:
@@ -31,34 +43,75 @@ def task_id_from_filename(name: str) -> str | None:
     for a CLAIMED file, so the caller then looks for a result under an id that
     nothing ever writes. Covers the lead's `.assigned-<inst>` rename too.
     """
-    # _ID_STATE first: the non-greedy id in _ID_PLAIN would otherwise swallow a
-    # state suffix and hand back the compound name this function exists to avoid.
-    match = _ID_STATE.match(name) or _ID_PLAIN.match(name)
-    return match.group(1) if match else None
+    stem = _stem_of(name)
+    # An LF is a legal filename byte but not an id byte: the grammar rejects it.
+    if stem is None or "\n" in stem or not stem.startswith("task-"):
+        return None
+    m = _STATE_SUFFIX.match(stem)
+    return m.group(1) if m else stem
+
+
+def archive_id_from_filename(name: str) -> str | None:
+    """The id an ARCHIVED file carries, whatever its producer prefix, or None.
+
+    `task_id_from_filename` is deliberately anchored to the live `task-*`
+    namespace; the archive is not, so a history reader that only knows the
+    live grammar drops every legacy row. Callers gate the result with
+    `local_task_protocol.valid_archive_lookup_id`.
+    """
+    task_id = task_id_from_filename(name)
+    if task_id is not None:
+        return task_id
+    return _stem_of(name)
+
+
+def declared_task_id(path: Path) -> str | None:
+    """The `id:` a task file persists in its header block, or None."""
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return None
+    head = text.split("\ntask:", 1)[0]
+    m = _DECLARED_ID.search(head)
+    return m.group(1) if m else None
+
+
+def task_id_for(path: Path, *, accept: Callable[[str], bool] | None = None) -> str | None:
+    """The canonical id of a task file, live or quarantined, or None.
+
+    The persisted `id:` is the positive authority: a gateway id may itself end
+    in `.claimed-<x>`, and only the header tells it from a pool rename. The
+    filename answers only for a file that declares nothing (or nothing
+    `accept` admits). `accept` is the caller's id grammar; this module has none.
+    """
+    declared = declared_task_id(path)
+    if declared is not None and (accept is None or accept(declared)):
+        return declared
+    parsed = archive_id_from_filename(Path(path).name)
+    if parsed is None or (accept is not None and not accept(parsed)):
+        return None
+    return parsed
+
 
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
-    Checks the bare name first (unclaimed), then any state variant. State
-    matching goes through `_ID_STATE` — the same grammar `task_id_from_filename`
-    uses — because a second, narrower pattern here is exactly how one state gets
-    handled and its sibling missed. If multiple variants exist (shouldn't happen
-    but defensive), returns the first lexicographic match; the caller only needs
-    one path to archive.
+    Checks the bare name first (unclaimed), then every variant — pool state or
+    quarantine — through the one predicate `task_id_for`, so the persisted id
+    is the same authority for a quarantined file as for a live one. A live
+    variant outranks a quarantine; ties fall to the first lexicographic name.
     """
     bare = tasks_dir / f"{task_id}.txt"
     if bare.exists():
         return bare
     matches = sorted(
-        p for p in tasks_dir.glob(f"{task_id}.*")
-        if (m := _ID_STATE.match(p.name)) and m.group(1) == task_id
+        (p for p in tasks_dir.glob(f"{task_id}.*")
+         if p.name != bare.name and task_id_for(p) == task_id),
+        # A quarantine has left the .txt glob; it answers only when no live
+        # variant does, since routing still needs its surviving header block.
+        key=lambda p: (not p.name.endswith(".txt"), p.name),
     )
-    if matches:
-        return matches[0]
-    # Quarantined last: it is the task's only surviving header block, and
-    # routing needs those headers or a failed archive also strands the reply.
-    quarantined = sorted(tasks_dir.glob(f"{task_id}.txt.archive-failed*"))
-    return quarantined[0] if quarantined else None
+    return matches[0] if matches else None
 
 
 # Collision NAMING lives here (_move_without_clobbering mints `.N`); collision

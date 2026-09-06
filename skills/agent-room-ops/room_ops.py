@@ -110,6 +110,9 @@ def _main(argv):
     p = sub.add_parser("read", help="pull recent room history")
     p.add_argument("room_id")
     p.add_argument("--limit", type=int, default=_read.DEFAULT_LIMIT)
+    p.add_argument("--oldest-first", action="store_true",
+                   help="render oldest->newest so `| tail` shows the LATEST messages "
+                        "(default newest-first makes tail show the oldest)")
     p.add_argument("--before", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
@@ -221,7 +224,8 @@ def _main(argv):
 
     a = ap.parse_args(argv)
     if a.cmd == "read":
-        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before)
+        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
+                              oldest_first=a.oldest_first)
     elif a.cmd == "fetch":
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":

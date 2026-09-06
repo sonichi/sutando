@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for scripts/review-preflight.py.
+"""Tests for skills/review-preflight/scripts/review-preflight.py.
 
 The failure this guards is silent: `CLAUDE.md` and `REVIEW.md` both instruct
 reviewers to run a preflight that prints the criteria, and for months no such
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import tempfile
 import types
 import unittest
@@ -18,7 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "review-preflight.py"
+SCRIPT = REPO / "skills" / "review-preflight" / "scripts" / "review-preflight.py"
 SPEC = importlib.util.spec_from_file_location("review_preflight", SCRIPT)
 assert SPEC and SPEC.loader
 pf = importlib.util.module_from_spec(SPEC)
@@ -130,8 +131,8 @@ class ReviewPreflightErrorPathTest(unittest.TestCase):
 
         with mock.patch.object(pf.subprocess, "run", side_effect=boom):
             root = pf.repo_root()
-        # The fallback is <script dir>/.. — i.e. the repo containing scripts/.
-        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+        # The fallback is three levels above the script — the repo containing skills/.
+        self.assertEqual(root, Path(pf.__file__).resolve().parents[3])
         self.assertTrue((root / "REVIEW.md").is_file(),
                         "fallback must still locate the shipped guide")
 
@@ -142,7 +143,7 @@ class ReviewPreflightErrorPathTest(unittest.TestCase):
         done = _sp.CompletedProcess(args=[], returncode=0, stdout="   \n", stderr="")
         with mock.patch.object(pf.subprocess, "run", return_value=done):
             root = pf.repo_root()
-        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+        self.assertEqual(root, Path(pf.__file__).resolve().parents[3])
 
     def test_unreadable_guide_exits_nonzero_without_traceback(self):
         """A guide that exists but cannot be read reports and exits 1."""
@@ -190,7 +191,7 @@ class PriorArtTest(unittest.TestCase):
     def test_a_comment_is_surfaced_even_though_it_is_not_a_review(self):
         run = self._runner(comments='[{"created_at":"2026-08-24T11:36:36Z",'
                                     '"user":{"login":"sonichi"},"body":"the finding"}]')
-        seen, _ = pf.prior_art("3327", runner=run)
+        seen = pf.prior_art("3327", runner=run).items
         self.assertEqual(len(seen), 1)
         self.assertIn("sonichi", seen[0])
         self.assertIn("(comment)", seen[0])
@@ -205,7 +206,7 @@ class PriorArtTest(unittest.TestCase):
         the only review shape an agent can leave."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"COMMENTED","body":"a real finding"}]')
-        seen, _ = pf.prior_art("1", runner=run)
+        seen = pf.prior_art("1", runner=run).items
         self.assertEqual(len(seen), 1)
         self.assertIn("COMMENTED", seen[0])
 
@@ -219,7 +220,8 @@ class PriorArtTest(unittest.TestCase):
         preflight answer "nothing here" over a live approval."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"APPROVED","body":"   "}]')
-        seen, verdicts = pf.prior_art("1", runner=run)
+        art = pf.prior_art("1", runner=run)
+        seen, verdicts = art.items, art.verdicts
         self.assertEqual(seen, [], "a bare approval carries no prose to read")
         self.assertEqual(verdicts, ["t  a: APPROVED"], "but the verdict stands")
 
@@ -229,7 +231,7 @@ class PriorArtTest(unittest.TestCase):
                                    '"user":{"login":"qingyun-wu"},'
                                    '"state":"APPROVED","body":""}]')
         got = pf.prior_art("1", runner=run)
-        rendered = "\n".join(pf.verdict_block(got[1]) + pf.prior_art_block("1", got[0]))
+        rendered = "\n".join(pf.verdict_block(got) + pf.prior_art_block("1", got))
         self.assertIn("qingyun-wu", rendered)
         self.assertIn("APPROVED", rendered)
         self.assertNotIn("DECISIVE STATE: none", rendered)
@@ -243,10 +245,11 @@ class PriorArtTest(unittest.TestCase):
         old_approval = ('{"submitted_at":"t00","user":{"login":"early"},'
                         '"state":"APPROVED","body":""}')
         run = self._runner(reviews=f"[{old_approval},{reviews}]")
-        seen, verdicts = pf.prior_art("1", runner=run)
-        shown = "\n".join(pf.prior_art_block("1", seen))
+        art = pf.prior_art("1", runner=run)
+        seen, verdicts = art.items, art.verdicts
+        shown = "\n".join(pf.prior_art_block("1", art))
         self.assertNotIn("early", shown, "precondition: prose list truncated it away")
-        self.assertIn("early", "\n".join(pf.verdict_block(verdicts)))
+        self.assertIn("early", "\n".join(pf.verdict_block(art)))
 
     def test_verdict_unknown_and_verdict_none_do_not_render_alike(self):
         """The same load-bearing distinction the prose block already makes.
@@ -255,8 +258,8 @@ class PriorArtTest(unittest.TestCase):
         decisive review. Rendering them alike would let a failed check read as
         a clean one — the exact substitution lesson 16 tells a reviewer to
         avoid, one layer down."""
-        unknown = "\n".join(pf.verdict_block(None))
-        none = "\n".join(pf.verdict_block([]))
+        unknown = "\n".join(pf.verdict_block(pf.PriorArt(False, [], [])))
+        none = "\n".join(pf.verdict_block(pf.PriorArt(True, [], [])))
         self.assertIn("COULD NOT CHECK", unknown)
         self.assertNotIn("COULD NOT CHECK", none)
         self.assertNotEqual(unknown, none)
@@ -267,7 +270,7 @@ class PriorArtTest(unittest.TestCase):
                                    '"state":"CHANGES_REQUESTED","body":""},'
                                    '{"submitted_at":"t1","user":{"login":"a"},'
                                    '"state":"APPROVED","body":""}]')
-        _, verdicts = pf.prior_art("1", runner=run)
+        verdicts = pf.prior_art("1", runner=run).verdicts
         self.assertEqual(verdicts, ["t9  a: CHANGES_REQUESTED"])
 
     def test_unknown_is_not_empty(self):
@@ -276,14 +279,48 @@ class PriorArtTest(unittest.TestCase):
                            ("gh failed", self._runner(rc=1)),
                            ("bad json", self._runner(reviews="not json"))):
             with self.subTest(label):
-                self.assertIsNone(pf.prior_art("1", runner=run), label)
+                self.assertFalse(pf.prior_art("1", runner=run).checked, label)
         # Pin the repo: unpinned, this falls through to resolve_repo() and reads the
         # real env, so the branch under test depends on the developer's shell.
-        unknown = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
-        empty = "\n".join(pf.prior_art_block("1", []))
+        unknown = "\n".join(pf.prior_art_block("1", pf.PriorArt(False, [], []), repo="a/b"))
+        empty = "\n".join(pf.prior_art_block("1", pf.PriorArt(True, [], [])))
         self.assertIn("COULD NOT CHECK", unknown)
         self.assertNotIn("COULD NOT CHECK", empty)
         self.assertNotEqual(unknown, empty)
+
+    def test_checked_dominates_content_so_arm_ORDER_cannot_matter(self):
+        """The whole point of the field, and the one case falsiness cannot express.
+
+        Before this, the two states were told apart only by the ORDER of
+        `if seen is None` and `if not seen`. Under that scheme "the check
+        failed but I have content" is unrepresentable, so nothing could pin
+        which arm wins. With `checked` as its own field it IS representable,
+        and `checked=False` must win over non-empty content in both renderers
+        — a property that survives someone swapping the arms round.
+        """
+        contentful_but_unchecked = pf.PriorArt(False, ["t  who (comment)"], ["t  who: APPROVED"])
+        prose = "\n".join(pf.prior_art_block("1", contentful_but_unchecked, repo="a/b"))
+        verdicts = "\n".join(pf.verdict_block(contentful_but_unchecked))
+        self.assertIn("COULD NOT CHECK", prose)
+        self.assertNotIn("who (comment)", prose)
+        self.assertIn("COULD NOT CHECK", verdicts)
+        self.assertNotIn("APPROVED", verdicts)
+
+    def test_verdict_block_separates_unchecked_from_none(self):
+        """verdict_block had the same falsy conflation, one function over.
+
+        `prior_art` no longer returns None, so passing `art.verdicts` straight
+        through would render a FAILED check as "none — no APPROVED ... on
+        record": the exact clean-looking output this PR exists to prevent.
+        """
+        unchecked = "\n".join(pf.verdict_block(pf.PriorArt(False, [], [])))
+        none = "\n".join(pf.verdict_block(pf.PriorArt(True, [], [])))
+        found = "\n".join(pf.verdict_block(pf.PriorArt(True, [], ["t  who: APPROVED"])))
+        self.assertIn("COULD NOT CHECK", unchecked)
+        self.assertNotIn("COULD NOT CHECK", none)
+        self.assertIn("none", none)
+        self.assertIn("APPROVED", found)
+        self.assertEqual(len({unchecked, none, found}), 3, "two states render alike")
 
     def test_an_unexpanded_repo_placeholder_names_its_own_fix(self):
         """The one COULD-NOT-CHECK the reader can act on must say so.
@@ -292,8 +329,8 @@ class PriorArtTest(unittest.TestCase):
         and this check is inert on every run — indistinguishable, before this,
         from ordinary gh flakiness.
         """
-        no_repo = "\n".join(pf.prior_art_block("1", None, repo="{owner}/{repo}"))
-        gh_down = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
+        no_repo = "\n".join(pf.prior_art_block("1", pf.PriorArt(False, [], []), repo="{owner}/{repo}"))
+        gh_down = "\n".join(pf.prior_art_block("1", pf.PriorArt(False, [], []), repo="a/b"))
         for body in (no_repo, gh_down):
             self.assertIn("COULD NOT CHECK", body)
         self.assertIn("--repo", no_repo)
@@ -303,14 +340,14 @@ class PriorArtTest(unittest.TestCase):
         self.assertNotEqual(no_repo, gh_down)
 
     def test_the_block_says_why_reviews_alone_are_not_enough(self):
-        body = "\n".join(pf.prior_art_block("1", ["t  sonichi (comment)"]))
+        body = "\n".join(pf.prior_art_block("1", pf.PriorArt(True, ["t  sonichi (comment)"], [])))
         self.assertIn("COMMENTED", body)
         self.assertIn("sonichi", body)
 
     def test_a_truncated_list_says_it_is_truncated(self):
         """A bare count above a shorter list reads as a wrong count, not a cut list."""
         many = [f"t{i}  sonichi (comment)" for i in range(63)]
-        body = pf.prior_art_block("1", many)
+        body = pf.prior_art_block("1", pf.PriorArt(True, many, []))
         rows = [ln for ln in body if ln.startswith("  t")]
         self.assertEqual(len(rows), pf.PRIOR_ART_SHOWN)
         self.assertIn(f"showing last {pf.PRIOR_ART_SHOWN} of 63", body[0])
@@ -318,7 +355,7 @@ class PriorArtTest(unittest.TestCase):
 
     def test_an_untruncated_list_does_not_claim_truncation(self):
         few = [f"t{i}  sonichi (comment)" for i in range(pf.PRIOR_ART_SHOWN)]
-        head = pf.prior_art_block("1", few)[0]
+        head = pf.prior_art_block("1", pf.PriorArt(True, few, []))[0]
         self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
         self.assertNotIn("showing last", head)
 
@@ -356,9 +393,166 @@ class RepoResolution(unittest.TestCase):
         def failing(argv):
             return types.SimpleNamespace(returncode=1, stdout="")
 
-        self.assertIsNone(pf.prior_art("1", runner=failing, repo="a/b"))
+        self.assertFalse(pf.prior_art("1", runner=failing, repo="a/b").checked)
         self.assertIn("COULD NOT CHECK",
-                      "\n".join(pf.prior_art_block("1", None, repo="a/b")))
+                      "\n".join(pf.prior_art_block("1", pf.PriorArt(False, [], []), repo="a/b")))
+
+
+class StaleApprovalTest(unittest.TestCase):
+    """The gate can read satisfied while an approval sits against a vanished diff."""
+
+    HEAD = "e56769db012f1f68348e927053d0ede1e12cb659"
+    OLD = "03dea831c2726f40ccd33eeebad70df6251df1a6"
+
+    def _runner(self, reviews=None, commits=None, pull=None, fail=None):
+        def run(argv):
+            url = argv[2]
+            if fail and fail in url:
+                return _R(1, "")
+            if url.endswith("/reviews"):
+                return _R(0, json.dumps(reviews or []))
+            if url.endswith("/commits"):
+                return _R(0, json.dumps(commits if commits is not None else []))
+            return _R(0, json.dumps(pull if pull is not None else {"head": {"sha": self.HEAD}}))
+        return run
+
+    def _review(self, who, state, at, when):
+        return {"user": {"login": who}, "state": state, "commit_id": at, "submitted_at": when}
+
+    def _commit(self, sha, when, parents=1):
+        return {"sha": sha, "parents": [{"sha": "p"}] * parents,
+                "commit": {"committer": {"date": when}}}
+
+    def test_a_raising_gh_reads_as_could_not_check_not_empty(self):
+        def boom(argv):
+            raise OSError("no gh")
+        self.assertIsNone(pf.stale_approvals("1", runner=boom))
+
+    def test_unparsable_gh_output_reads_as_could_not_check(self):
+        self.assertIsNone(pf.stale_approvals(
+            "1", runner=lambda argv: _R(0, "not json {")))
+
+    def test_a_pull_without_a_head_sha_reads_as_could_not_check(self):
+        self.assertIsNone(pf.stale_approvals("1", runner=self._runner(
+            reviews=[], commits=[], pull={"head": {}})))
+
+    def test_an_approval_without_a_timestamp_is_skipped_not_crashed(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[{"user": {"login": "a"}, "state": "APPROVED",
+                      "commit_id": self.OLD, "submitted_at": ""}],
+            commits=[self._commit(self.HEAD, "2026-08-30T10:00:00Z")]))
+        self.assertEqual(rows, [])
+
+    def test_an_approval_after_the_last_commit_is_not_stale(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.HEAD, "2026-08-30T11:00:00Z")],
+            commits=[self._commit(self.HEAD, "2026-08-30T10:00:00Z")]))
+        self.assertEqual(rows, [])
+
+    def test_a_content_commit_after_the_approval_is_reported(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("john-the-dev", "APPROVED", self.OLD, "2026-08-27T23:48:51Z")],
+            commits=[self._commit(self.OLD, "2026-08-27T23:40:00Z"),
+                     self._commit("ed530fbcb2", "2026-08-27T23:55:35Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:00:03Z", parents=2)]))
+        self.assertEqual([r["content"] for r in rows], [1])
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("RE-READ", body)
+        self.assertIn("ed530fbcb2", body)
+
+    def test_a_merge_only_row_renders_the_base_only_verdict(self):
+        """The body's table keeps base-only distinct from content-stale.
+
+        A conflict resolution can still live in a merge commit, so the softer
+        verdict carries the spot-check caveat rather than silence about it.
+        """
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertEqual((rows[0]["content"], rows[0]["merges"]), (0, 1))
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("base-only, approval still fits", body)
+        self.assertIn("spot-check conflicts", body)
+        self.assertNotIn("RE-READ", body)
+
+    def test_a_content_commit_since_still_demands_a_re_read(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit("cc1" * 13 + "c", "2026-08-30T11:20:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertEqual((rows[0]["content"], rows[0]["merges"]), (1, 1))
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("RE-READ", body)
+        self.assertNotIn("still fits", body)
+
+    def test_an_unlocatable_merge_only_row_stays_re_read(self):
+        """Force-push means the walk cannot be trusted: fail to the hard verdict."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", "f" * 40, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertFalse(rows[0]["locatable"])
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("RE-READ", body)
+        self.assertNotIn("still fits", body)
+
+    def test_a_repointed_commit_id_on_the_head_does_not_clear_a_stale_approval(self):
+        """GitHub moves commit_id forward, so an anchor on it erases the commit it should catch."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.HEAD, "2026-08-28T09:15:20Z")],
+            commits=[self._commit("c0", "2026-08-28T09:00:00Z"),
+                     self._commit("contentc1", "2026-08-28T10:00:00Z"),
+                     self._commit(self.HEAD, "2026-08-28T17:15:11Z", parents=2)]))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["content"], 1)
+        self.assertEqual(rows[0]["first_unseen"], "contentc1")
+
+    def test_main_commits_pulled_in_by_a_base_merge_are_not_counted(self):
+        """The branch's own history is the subject; a base compare conflates it with main's."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertEqual(rows[0]["since"], 1)
+
+    def test_an_approval_whose_commit_vanished_is_named_as_such(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", "deadbeefcafe", "2026-08-27T00:00:00Z")],
+            commits=[self._commit(self.HEAD, "2026-08-28T00:00:00Z")]))
+        self.assertFalse(rows[0]["locatable"])
+        self.assertIn("force-push", "\n".join(pf.stale_approval_block("1", rows)))
+
+    def test_commented_does_not_supersede_the_approval_it_follows(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-27T00:00:00Z"),
+                     self._review("a", "COMMENTED", self.HEAD, "2026-08-29T00:00:00Z")],
+            commits=[self._commit(self.HEAD, "2026-08-28T00:00:00Z")]))
+        self.assertEqual([r["user"] for r in rows], ["a"])
+
+    def test_a_later_changes_requested_is_not_reported_as_a_stale_approval(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-27T00:00:00Z"),
+                     self._review("a", "CHANGES_REQUESTED", self.OLD, "2026-08-28T00:00:00Z")],
+            commits=[self._commit(self.HEAD, "2026-08-29T00:00:00Z")]))
+        self.assertEqual(rows, [])
+
+    def test_a_failed_call_is_not_reported_as_nothing_stale(self):
+        """The whole point: unchecked must never render as clean."""
+        for endpoint in ("/reviews", "/commits"):
+            self.assertIsNone(pf.stale_approvals("1", runner=self._runner(fail=endpoint)))
+        body = "\n".join(pf.stale_approval_block("1", None))
+        self.assertIn("COULD NOT CHECK", body)
+        clean = "\n".join(pf.stale_approval_block("1", []))
+        self.assertIn("none", clean)
+        self.assertNotIn("COULD NOT CHECK", clean)
+
+
+class _R:
+    def __init__(self, returncode, stdout):
+        self.returncode, self.stdout = returncode, stdout
+
 
 
 if __name__ == "__main__":
