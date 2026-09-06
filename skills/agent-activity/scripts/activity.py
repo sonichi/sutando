@@ -107,7 +107,9 @@ def queued(task_file: Path, workspace: Path | None = None) -> int:
         task, room = task_from_file(task_file)
     except OSError:
         return 0
-    if not room or not task.get("text"):
+    # Only a task that names a room AND a message can mount under one: a room-addressed task with no
+    # source_message_id would leave a queued row the client can never place.
+    if not room or not task.get("text") or not task.get("event"):
         return 0
     rec = append("queued", kind="notice", room=room, task=task, workspace=workspace)
     print(json.dumps(rec, ensure_ascii=False))

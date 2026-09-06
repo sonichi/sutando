@@ -13,7 +13,9 @@ queued_activity_row() {
 	[ -n "${TASKS_DIR:-}" ] && [ -f "$TASKS_DIR/$filename" ] || return 0
 	local writer="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/skills/agent-activity/scripts/activity.py"
 	[ -f "$writer" ] || return 0
-	( python3 "$writer" queued --task-file "$TASKS_DIR/$filename" >/dev/null 2>&1 & ) 2>/dev/null || true
+	# The watcher's resolved interpreter, never PATH's: a configured python that works while PATH's
+	# does not would otherwise deliver the task and silently write no row.
+	( "${SUTANDO_PY_BIN:-python3}" "$writer" queued --task-file "$TASKS_DIR/$filename" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0
 }
 emit_task_file() {

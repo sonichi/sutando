@@ -188,6 +188,10 @@ class MessageEvent(unittest.TestCase):
         # a cron/bookkeeping task names no room: nothing is written, and never to a default room
         card.main(["queued", "--task-file", str(self._task("task-cron-1", room=None)), "--workspace", str(self.ws)])
         self.assertEqual(len(self._rows()), 1)
+        # a room-addressed compatibility task with no source_message_id cannot mount under a message:
+        # nothing is written for it either (a queued row nobody can place is misleading drawer activity)
+        card.main(["queued", "--task-file", str(self._task("task-noevent", event=None)), "--workspace", str(self.ws)])
+        self.assertEqual(len(self._rows()), 1)
 
     def test_done_into_marks_a_consolidated_reply(self):
         card.main(["done", "consolidated", "--task-id", "task-d1", "--into", "$holder", "--event", "$ev1",
