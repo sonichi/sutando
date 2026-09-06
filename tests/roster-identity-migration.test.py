@@ -2649,6 +2649,24 @@ class AStandAncestorIsCoveredOnTheProductionPath(_InProcessCli, unittest.TestCas
                 _rc, _e, rec = self._stand({"discord": True, obj: {"id": self.R}})
                 self.assertIsNone(rec.get("stand_discord_id"), obj)
 
+    def test_a_compound_segment_carrying_a_stand_word_is_still_refused(self):
+        # The refusal cases above put the object in a SEPARATE child, so the child
+        # blocks on its own and a Stand-token short-circuit never has to be reached.
+        for ancestor in self.ANCESTORS:
+            for seg in ("stand_channel", "agent_room", "room_stand"):
+                with self.subTest(ancestor=ancestor, segment=seg):
+                    _rc, _e, rec = self._under(ancestor, {"discord": True, seg: {"id": self.R}})
+                    self.assertIsNone(rec.get("stand_discord_id"),
+                                      f"{ancestor}/{seg}: an object segment was promoted")
+
+    def test_the_compound_control_a_bare_referent_segment_still_resolves(self):
+        # Or the case above passes by refusing every compound, including legal ones.
+        for ancestor in self.ANCESTORS:
+            with self.subTest(ancestor=ancestor):
+                _rc, err, rec = self._under(ancestor, {"discord": True,
+                                                       "stand_discord_id": self.R})
+                self.assertEqual(rec.get("stand_discord_id"), self.R, err)
+
     def test_a_transparent_container_stays_transparent_under_a_stand_ancestor(self):
         _rc, err, rec = self._stand({"discord": True, "account": {"id": self.R}})
         self.assertEqual(rec.get("stand_discord_id"), self.R, err)
