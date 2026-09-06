@@ -67,6 +67,28 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+#### Worker pins are control messages, and `source` is what says so
+
+A broker may send a **worker pin** — a control message that binds a room to a
+worker rather than work to be executed. The bridge consumes a pin as control
+**only** when the task carries the broker's authoritative stamp
+`"source": "worker-picker"`. That stamp is the sole discriminator.
+
+The pin's `id` shape (`worker-pin-<digits>-<hex>`) is **not** a discriminator
+and must never be used as one. A task object is only required to carry a
+unique `id`, and `source` is optional, so an ordinary task is free to arrive
+with an id of any shape and no `source` at all. A classifier keyed on the id
+would consume such a task as control: journal it, ACK it — which stops
+redelivery — and close its lease with `[no-send]`, destroying owner work
+silently.
+
+**Compatibility:** a pin-shaped id arriving *without* the stamp is written as
+an ordinary task. That is the fail-safe direction — a pin mistaken for work is
+visible and recoverable, whereas work mistaken for a pin is destroyed. A bridge
+must not fall back to id-only consumption for older brokers, and must not gate
+on process-local state such as "a stamped pin was seen earlier": that resets on
+restart, so the destructive path re-arms on every start.
+
 An AG2 Space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
