@@ -87,7 +87,9 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # of spawning an unbounded process fanout. Unhandled work still emits its
 # TASK_FILE event immediately, even while the provider queue is full.
 TASK_HANDLER_WORKERS=2
-SUTANDO_PY_BIN="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+# shellcheck source=../scripts/python-binary.sh
+. "$__REPO_ROOT/scripts/python-binary.sh"
+SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 DISPATCH_DIR=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -97,7 +99,7 @@ GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # Per instance: this receipt says "MY optional handler declined this task", and
 # a shared one makes another instance bypass its own handler. Owner: util_paths.
-FALLBACKS_DIR="$(python3 "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "watch-tasks-stream: could not resolve the fallback receipt dir" >&2
   exit 1
 }

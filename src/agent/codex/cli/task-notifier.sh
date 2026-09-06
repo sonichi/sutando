@@ -14,7 +14,10 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
-TASK_HANDLER_FALLBACKS_DIR="$(python3 "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+# shellcheck source=../../../../scripts/python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
@@ -92,7 +95,7 @@ prepare_workstream_context() {
   [ -f "$WORKSTREAM_CONTEXT_SCRIPT" ] || return 0
   candidate="$(mktemp "${TMPDIR:-/tmp}/sutando-workstream-context.XXXXXX")" || return 0
   chmod 600 "$candidate" 2>/dev/null || true
-  if python3 "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null; then
+  if "$NOTIFIER_PY" "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null; then
     if [ -s "$candidate" ]; then
       workstream_context_file="$candidate"
     else
@@ -200,7 +203,7 @@ next_pending_task() {
     printf '%s\n' "$candidate"
     return 0
   done < <(
-    python3 - "$REPO/src" "$TASKS_DIR" <<'PY'
+    "$NOTIFIER_PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
 import sys
 from pathlib import Path
 
@@ -373,7 +376,7 @@ fi
 
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
-python3 -c \
+"$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!

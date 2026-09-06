@@ -36,7 +36,11 @@ WATCHER_SENTINEL_STEM="watch-tasks-stream"
 sentinel_path_for() {
   local state_dir="$1" here out
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if ! out="$(python3 "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
+  local py
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "resolve the watcher sentinel")" || return 1
+  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
     echo "watcher_sentinel: could not resolve the sentinel path" >&2
     return 1
   fi
