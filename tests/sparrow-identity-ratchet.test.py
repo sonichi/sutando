@@ -55,7 +55,9 @@ TASK_MINT_PIN = {
     ("discord-bridge.py", "poll_results"): 1,
     ("github-webhook.py", "do_POST"): 1,
     ("health-check.py", "emit_task_for_failures"): 2,
-    ("remote-gateway-bridge.test.py", "main"): 4,
+    # +1 from main: a deterministic `task-PRIO<LEVEL>` fixture asserting priority is
+    # serialized above `task:`. A fixed test id, not a runtime mint.
+    ("remote-gateway-bridge.test.py", "main"): 5,
     ("slack-bridge.py", "_dedup_recover"): 1,
     ("slack-bridge.py", "_write_task"): 1,
     ("telegram-bridge.py", "_dedup_recover"): 1,
