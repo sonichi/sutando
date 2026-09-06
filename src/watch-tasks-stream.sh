@@ -372,8 +372,9 @@ queue_handler_task() {
 dispatch_task() {
   local task_path="$1" rc filename
   filename="$(basename "$task_path")"
+  queued_activity_row "$filename"
   if [ -z "$DISPATCH_DIR" ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
     return
   fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
@@ -386,10 +387,10 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      printf 'TASK_FILE: %s\n' "$filename" || exit 0
+      emit_dispatch_task_file "$filename"
       return
     fi
-    queue_handler_task "$task_path" "fallback" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$filename"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
@@ -398,10 +399,10 @@ dispatch_task() {
       publish_terminal_failure "$filename" "could not be queued" || true
     fi
   elif [ "$rc" -eq 3 ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
   fi
 }
 

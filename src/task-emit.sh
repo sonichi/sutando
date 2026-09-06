@@ -41,6 +41,14 @@ emit_task_file() {
 
 # The handler-failed fallback, NOT a shutdown emit: it runs in normal drain on
 # real stdout, so it must not borrow the shutdown emitter's fd 9.
+# The watcher's ordinary dispatch: QUEUED was marked once by dispatch_task; here the live core is told
+# (the printf failing means stdout is gone and the watcher exits, as before) and RUNNING follows.
+emit_dispatch_task_file() {
+	local filename="$1"
+	printf 'TASK_FILE: %s\n' "$filename" || exit 0
+	activity_transition RUNNING "$filename"
+}
+
 emit_fallback_task_file() {
 	local filename="$1"
 	queued_activity_row "$filename"
