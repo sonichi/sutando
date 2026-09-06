@@ -8,8 +8,8 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, appendRejection, requestModel, decodeRejectionBody, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
-import { gzipSync, brotliCompressSync, zstdCompressSync } from 'node:zlib';
+import { createProxyServer, appendRejection, requestModel, decodeRejectionBody, buildDecoders, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import * as zlib from 'node:zlib';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -76,7 +76,9 @@ test('a COMPRESSED rejection body is decoded before it is recorded', async () =>
 	// The upstream compresses whatever the client's accept-encoding asked for, so an
 	// uncompressed fixture cannot see this: every real snippet on a live host was mojibake.
 	const body = '{"error":{"type":"invalid_request_error","message":"credit balance is too low"}}';
-	for (const [enc, compress] of [['gzip', gzipSync], ['br', brotliCompressSync], ['zstd', zstdCompressSync]] as const) {
+	const codecs: [string, (b: Buffer) => Buffer][] = [['gzip', zlib.gzipSync], ['br', zlib.brotliCompressSync]];
+	if (typeof zlib.zstdCompressSync === 'function') codecs.push(['zstd', zlib.zstdCompressSync]);
+	for (const [enc, compress] of codecs) {
 		recorded = [];
 		upstreamHandler = (_req, res) => {
 			res.writeHead(400, { 'content-type': 'application/json', 'content-encoding': enc });
@@ -89,6 +91,18 @@ test('a COMPRESSED rejection body is decoded before it is recorded', async () =>
 		assert.match(recorded[0].snippet, /credit balance is too low/, `${enc} body must be readable`);
 		assert.equal(recorded[0].content_encoding, enc, `${enc} must be recorded`);
 	}
+});
+
+test('a Node without zstd still loads and still decodes everything else', () => {
+	// package.json allows Node 22.5.0; zstdDecompressSync landed in 22.15.0. A named import of a
+	// missing export is an ESM linkage failure — it kills the whole proxy before any try/catch.
+	const floor = { gunzipSync: zlib.gunzipSync, inflateSync: zlib.inflateSync, brotliDecompressSync: zlib.brotliDecompressSync };
+	const d = buildDecoders(floor);
+	assert.deepEqual(Object.keys(d).sort(), ['br', 'deflate', 'gzip', 'x-gzip'], 'zstd absent, the rest present');
+	assert.equal(typeof d.gzip, 'function', 'gzip must still work on the floor');
+	assert.ok(!('zstd' in d), 'an absent codec must not appear as undefined');
+	assert.ok('zstd' in buildDecoders(zlib as Record<string, unknown>) === (typeof zlib.zstdDecompressSync === 'function'),
+		'present exactly when this runtime supports it');
 });
 
 test('an undecodable body says so instead of emitting mojibake', () => {

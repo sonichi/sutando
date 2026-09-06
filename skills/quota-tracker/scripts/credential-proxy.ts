@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { gunzipSync, inflateSync, brotliDecompressSync, zstdDecompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
 import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
@@ -40,10 +40,21 @@ const QUOTA_FILE = statusPath('quota-state.json');
 export const MAX_RECENT_REJECTIONS = 20;
 const REJECTION_SNIPPET_BYTES = 2048;
 
-const DECODERS: Record<string, (b: Buffer) => Buffer> = {
-	gzip: gunzipSync, 'x-gzip': gunzipSync, deflate: inflateSync,
-	br: brotliDecompressSync, zstd: zstdDecompressSync,
-};
+type Zlib = Partial<Record<string, unknown>>;
+
+/** Built from the zlib namespace so an export missing on the supported Node floor is
+ *  simply absent from the map. zstd landed in 22.15.0; package.json allows 22.5.0. */
+export function buildDecoders(z: Zlib): Record<string, (b: Buffer) => Buffer> {
+	const out: Record<string, (b: Buffer) => Buffer> = {};
+	const add = (name: string, fn: unknown) => {
+		if (typeof fn === 'function') out[name] = fn as (b: Buffer) => Buffer;
+	};
+	add('gzip', z.gunzipSync); add('x-gzip', z.gunzipSync); add('deflate', z.inflateSync);
+	add('br', z.brotliDecompressSync); add('zstd', z.zstdDecompressSync);
+	return out;
+}
+
+const DECODERS = buildDecoders(zlib as Zlib);
 
 /** Decode a rejection body for reading. Upstream compresses whatever the client's
  *  accept-encoding asked for, so the raw bytes are not text; a failure must say so
