@@ -67,7 +67,7 @@ gives the sidecar), `SUTANDO_ACP_TURN_TIMEOUT_S` (default 300).
 ## Provisioning one user
 
 ```bash
-cp deploy/cloud-worker/.env.example /somewhere/private/alice.env   # fill URL + token
+cp deploy/cloud-worker/.env.example /somewhere/private/alice.env   # fill URL, token, RUNTIME
 bash deploy/cloud-worker/provision.sh cloud-alice /somewhere/private/alice.env --build
 docker logs -f sutando-worker-cloud-alice
 bash deploy/cloud-worker/deprovision.sh cloud-alice            # keep the volume

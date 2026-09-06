@@ -19,7 +19,17 @@ fi
 export GATEWAY_INSTANCE="${GATEWAY_INSTANCE:-cloud}"
 export SUTANDO_WORKER_LOCATION=cloud
 export SUTANDO_SUPERVISED=1
-RUNTIME="${SUTANDO_WORKER_RUNTIME:-stub}"
+# No default: a seat that answers must be chosen deliberately. Defaulting to the
+# test double let the documented quickstart post "answered by ..." as a real result.
+RUNTIME="${SUTANDO_WORKER_RUNTIME:-}"
+if [ -z "$RUNTIME" ]; then
+  echo "cloud-worker: SUTANDO_WORKER_RUNTIME is required (claude | ag2-assistant | adapter | stub)" >&2
+  exit 2
+fi
+if [ "$RUNTIME" = stub ] && [ "${SUTANDO_ALLOW_STUB_SEAT:-}" != "1" ]; then
+  echo "cloud-worker: runtime 'stub' is a TEST DOUBLE and would post 'answered by ...' as a real result; set SUTANDO_ALLOW_STUB_SEAT=1 to permit it" >&2
+  exit 2
+fi
 
 # The workspace lives on the volume; the resolver reads this file beside the engine.
 if ! mkdir -p "$WS/tasks" "$WS/results" "$WS/state" "$WS/logs"; then

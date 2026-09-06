@@ -90,7 +90,9 @@ run_entry() {  # run_entry <extra env assignments...> ; prints rc, stderr in $ER
       bash "$ENGINE/deploy/cloud-worker/entrypoint.sh" >"$OUT" 2>"$ERR"
   echo $?
 }
-FULL=(REMOTE_TASK_URL=http://broker.invalid REMOTE_TASK_TOKEN=secret SUTANDO_WORKER_ID=cloud-t)
+FULL=(REMOTE_TASK_URL=http://broker.invalid REMOTE_TASK_TOKEN=secret SUTANDO_WORKER_ID=cloud-t
+  # the harness is the legitimate test-double consumer, so it opts in explicitly
+  SUTANDO_WORKER_RUNTIME=stub SUTANDO_ALLOW_STUB_SEAT=1)
 
 rc="$(run_entry)"
 [ "$rc" = 2 ] && grep -q 'missing required env: REMOTE_TASK_URL REMOTE_TASK_TOKEN SUTANDO_WORKER_ID' "$ERR" \
@@ -123,6 +125,25 @@ rc="$(run_entry "${FULL[@]}" FAKE_WS=/elsewhere)"
 [ "$rc" = 3 ] && grep -q "expected '$WS'" "$ERR" && ok "workspace resolving elsewhere → exit 3" || bad "workspace mismatch → exit 3" "rc=$rc $(cat "$ERR")"
 rc="$(run_entry "${FULL[@]}" SUTANDO_WORKER_RUNTIME=bogus)"
 [ "$rc" = 2 ] && grep -q "unknown SUTANDO_WORKER_RUNTIME='bogus'" "$ERR" && ok "unknown runtime → exit 2" || bad "unknown runtime → exit 2" "rc=$rc"
+
+# keweichen blocker 2: the documented quickstart must not be able to answer with
+# the test double. Copy .env.example verbatim, fill only URL+token, and run it.
+ENVF="$(mktemp)"; grep -v '^#' "$REPO/deploy/cloud-worker/.env.example" > "$ENVF" || true
+set -a; . "$ENVF" 2>/dev/null || true; set +a
+grep -qE '^SUTANDO_WORKER_RUNTIME=stub' "$REPO/deploy/cloud-worker/.env.example" \
+  && bad "the shipped example does not select the stub" "it still sets stub" \
+  || ok "the shipped .env.example does not select the stub runtime"
+rc=0; env -i PATH="$PATH" REMOTE_TASK_URL=u REMOTE_TASK_TOKEN=t SUTANDO_WORKER_ID=w \
+  bash "$REPO/deploy/cloud-worker/entrypoint.sh" >/dev/null 2>"$ERR" || rc=$?
+[ "$rc" = 2 ] && grep -q 'SUTANDO_WORKER_RUNTIME is required' "$ERR" \
+  && ok "no runtime selected → exit 2 naming it (fail closed, not stub)" \
+  || bad "unset runtime must fail closed" "rc=$rc $(cat "$ERR")"
+rc=0; env -i PATH="$PATH" REMOTE_TASK_URL=u REMOTE_TASK_TOKEN=t SUTANDO_WORKER_ID=w \
+  SUTANDO_WORKER_RUNTIME=stub bash "$REPO/deploy/cloud-worker/entrypoint.sh" >/dev/null 2>"$ERR" || rc=$?
+[ "$rc" = 2 ] && grep -q 'SUTANDO_ALLOW_STUB_SEAT' "$ERR" \
+  && ok "stub without the explicit opt-in → exit 2 naming the opt-in" \
+  || bad "stub must require an explicit opt-in" "rc=$rc $(cat "$ERR")"
+rm -f "$ENVF"
 rc="$(run_entry "${FULL[@]}" SUTANDO_WORKER_RUNTIME=adapter)"
 [ "$rc" = 4 ] && grep -q 'runtime.sh' "$ERR" && ok "adapter without /workspace/runtime.sh → exit 4 naming the hook" || bad "adapter slot → exit 4" "rc=$rc $(cat "$ERR")"
 rc="$(run_entry "${FULL[@]}" SUTANDO_WORKER_RUNTIME=ag2-assistant)"
