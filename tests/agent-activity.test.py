@@ -88,6 +88,7 @@ class Writer(unittest.TestCase):
         import multiprocessing as mp
         with mp.get_context("fork").Pool(8) as pool:
             pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
+            pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         live = card.log_path(self.ws).read_text().splitlines()
         arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
         lines = [json.loads(l)["line"] for l in live + arch]
@@ -432,6 +433,7 @@ class Hook(unittest.TestCase):
         ws = str(self.ws)
         with mp.get_context("fork").Pool(8) as pool:
             pool.starmap(_bind_in_process, [(ws, f"task-c{i:06d}", f"S{i}") for i in range(8)])
+            pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         binds = hook.load_json(self.p["bind"], {})
         self.assertEqual(sorted(binds), [f"task-c{i:06d}" for i in range(8)], binds)
         self.assertFalse(list((self.ws / "state").glob(".agent-activity.sessions.json.*.tmp")), "no temp files left")
