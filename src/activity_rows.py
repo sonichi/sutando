@@ -130,7 +130,7 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
-           pid: str | None = None, ts: float | None = None) -> dict:
+           pid: str | None = None, ts: float | None = None, replay: bool = False) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
@@ -153,9 +153,9 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         task_id = task.get("id") if isinstance(task, dict) and isinstance(task.get("id"), str) else None
         acked = bool(pid and task_id and (_pid_acked(workspace, task_id, pid)
                                           or (done and _pid_in_log(summaries_path(workspace), pid))))
-        # No ordering heuristic: an unacknowledged row absent from the live log is looked up in the
-        # archive file its own timestamp names — exact, and a fresh row only pays for a small read.
-        landed = bool(pid) and (acked or _pid_in_log(path, pid) or _pid_in_archive(workspace, pid, rec["ts"]))
+        # Only a replay (the bus retrying an owed row) consults the archive: exact for recovery, and a
+        # fresh row never reads the day file under the lock.
+        landed = bool(pid) and (acked or _pid_in_log(path, pid) or (replay and _pid_in_archive(workspace, pid, rec["ts"])))
         if not landed:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

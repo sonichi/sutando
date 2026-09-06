@@ -299,11 +299,36 @@ class IdempotentProjection(unittest.TestCase):
         self.assertNotIn("task-h1", card.log_path(self.ws).read_text(), "precondition: the victim is archived")
         # a replayed row with an ancient event ts now sits in the live window, both older and newer rows around it
         card.append("old replay", kind="notice", room=None, task={"id": "task-o"}, workspace=self.ws, pid="task-o:1:1", ts=1.0)
-        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-h1:1:1", ts=1_757_000_000.0)
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-h1:1:1", ts=1_757_000_000.0, replay=True)
         history = "".join(p.read_text() for p in (self.ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name)
         self.assertEqual(history.count('"pid": "task-h1:1:1"'), 1, "found in the archive; not appended again")
         card.append("fresh", kind="notice", room=None, task=t, workspace=self.ws, pid="task-h1:1:9")
         self.assertEqual(card.log_path(self.ws).read_text().count('"pid": "task-h1:1:9"'), 1, "control: a new pid appends once")
+
+    def test_a_fresh_row_never_reads_the_archive(self):
+        # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
+        # the live-log read they always paid, and nothing more, however large the day file grows.
+        import activity_rows
+        calls = {"n": 0}; real = activity_rows._pid_in_archive
+        def counting(ws, pid, ts):
+            calls["n"] += 1
+            return real(ws, pid, ts)
+        with unittest.mock.patch.object(activity_rows, "_pid_in_archive", counting):
+            store = ActivityStore(self.ws)
+            for i in range(200):
+                store.apply(T(f"task-p{i}", "RUNNING", ts=1 + i, message_event_id="$m"))
+            for i in range(50):
+                card.append(f"noise {i}", kind="notice", room=None, task={"id": f"task-n{i}"}, workspace=self.ws, pid=f"n:{i}")
+            self.assertEqual(calls["n"], 0, "no fresh row reads the archive")
+            with unittest.mock.patch.object(activity_rows, "_ack", lambda w, tid, pid: (_ for _ in ()).throw(OSError("ack disk full"))):
+                store.apply(T("task-q1", "RUNNING", ts=400, message_event_id="$m"))  # landed, ack lost, row owed
+            for i in range(card.LIVE_ROWS + 1):
+                card.append(f"more {i}", kind="notice", room=None, task={"id": f"task-m{i}"}, workspace=self.ws, pid=f"m:{i}")
+            self.assertEqual(calls["n"], 0, "rotation traffic does not read the archive either")
+            ActivityStore(self.ws).apply(T("task-q1", "COMPLETED", ts=401))  # the replay of the owed row
+            self.assertEqual(calls["n"], 1, "exactly the replay consulted the archive")
+            rows = [json.loads(l) for p in (self.ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name for l in p.read_text().splitlines() if "task-q1" in l]
+            self.assertEqual(sorted(r["line"] for r in rows), ["picked up", "replied"], "found in the archive: applied once")
 
     def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
         # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid

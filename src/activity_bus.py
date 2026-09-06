@@ -205,7 +205,8 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws, pid=row.get("pid"), ts=row.get("ts"))
+                   workspace=self.ws, pid=row.get("pid"), ts=row.get("ts"),
+                   replay=int(row.get("attempts", 0)) > 1)
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"
@@ -244,6 +245,9 @@ class ActivityStore:
         """Project every owed row in order; stop at the first failure and persist what is still owed."""
         while state.pending:
             row = state.pending[0]
+            # The attempt is recorded and saved BEFORE projecting, so a retry knows it is a replay.
+            row["attempts"] = int(row.get("attempts", 0)) + 1
+            self.save(state)
             try:
                 self.project(row)
             except Exception:  # noqa: BLE001 - the rows stay owed; the caller must not fail
