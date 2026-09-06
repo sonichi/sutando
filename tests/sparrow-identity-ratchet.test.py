@@ -42,10 +42,10 @@ SRC = REPO / "src"
 
 # Shipped mint sites at the ratchet's introduction: (relpath, function) -> n.
 TASK_MINT_PIN = {
-    ("agent-api.py", "handle_twilio_voice"): 1,
-    ("agent-api.py", "handle_twilio_sms"): 1,
-    ("agent-api.py", "handle_twilio_transcription"): 1,
-    ("agent-api.py", "do_POST"): 1,
+    ("agent-api.py", "Handler.handle_twilio_voice"): 1,
+    ("agent-api.py", "Handler.handle_twilio_sms"): 1,
+    ("agent-api.py", "Handler.handle_twilio_transcription"): 1,
+    ("agent-api.py", "Handler.do_POST"): 1,
     ("cron_task_id.py", "task_id"): 1,
     # wall-clock mint behind a constant prefix, pre-existing; visible only
     # since the scanner resolves module constants (this PR's widening).
@@ -53,7 +53,7 @@ TASK_MINT_PIN = {
     ("discord-bridge.py", "_dedup_recover"): 1,
     ("discord-bridge.py", "_handle_discord_message"): 1,
     ("discord-bridge.py", "poll_results"): 1,
-    ("github-webhook.py", "do_POST"): 1,
+    ("github-webhook.py", "WebhookHandler.do_POST"): 1,
     ("health-check.py", "emit_task_for_failures"): 2,
     # +1 from main: a deterministic `task-PRIO<LEVEL>` fixture asserting priority is
     # serialized above `task:`. A fixed test id, not a runtime mint.
@@ -64,7 +64,7 @@ TASK_MINT_PIN = {
     ("telegram-bridge.py", "main"): 1,
     # Origination, not ingress: a client submits text over the local socket, so
     # there is no provider_event_id for ingress_task_id to be injective over.
-    ("runtime-api/tasks_view.py", "submit"): 1,
+    ("runtime-api/tasks_view.py", "TasksView.submit"): 1,
     # Same shape: the Signal Room originates a task from room speech; nothing
     # upstream carries a provider_event_id, so ingress_task_id has no domain.
     ("signal_room_tasks.py", "submit_signal_room_task"): 1,
@@ -81,6 +81,12 @@ DELIVERY_ID_LEGACY_SITES = {
 
 _DELIVERY_NAME = "delivery_id"
 _IDENTITY_MODULE = "ag2_sparrow.identity"
+
+
+def _scope_key(stack) -> str:
+    """Qualified scope identity. A bare `stack[-1]` lets a removal in `A.mint`
+    cancel a new site in `B.mint`, since both census as `mint`."""
+    return ".".join(stack[1:]) or "<module>"
 
 
 def _is_task_literal(node) -> bool:
@@ -157,7 +163,7 @@ def scan_task_mints(root: Path) -> dict:
             return False
 
         def record():
-            key = (rel, stack[-1])
+            key = (rel, _scope_key(stack))
             counts[key] = counts.get(key, 0) + 1
 
         class V(ast.NodeVisitor):
@@ -170,9 +176,13 @@ def scan_task_mints(root: Path) -> dict:
             visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_ClassDef(self, n):
+                # The class must enter the SCOPE KEY too, or `A.mint` and `B.mint` census
+                # identically and a removal in one cancels a new site in the other.
+                stack.append(n.name)
                 scopes.append(_bindings(n))
                 self.generic_visit(n)
                 scopes.pop()
+                stack.pop()
 
             def visit_JoinedStr(self, n):
                 # A glob metacharacter in the literal half makes this a MATCHER
@@ -505,7 +515,7 @@ def scan_delivery_id_sites(root: Path) -> dict:
             # is exempt — never a scope, never a file.
             if node is not None and id(node) in exempt:
                 return
-            key = (rel, stack[-1])
+            key = (rel, _scope_key(stack))
             counts[key] = counts.get(key, 0) + 1
 
         class V(ast.NodeVisitor):
@@ -611,6 +621,24 @@ class ScannerPositiveControls(unittest.TestCase):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(source)
             return scan_task_mints(Path(tmp))
+
+    def test_scope_key_distinguishes_same_named_methods(self):
+        """A bare scope name lets a removal in one class cancel a new site in
+        another: both census as `mint`, so the net count never moves."""
+        holder = ('class A:\n    def mint(self, x):\n%s\nclass B:\n'
+                  '    def mint(self, x):\n%s\n')
+        mints = '        T = "task-"\n        return f"{T}{x}"'
+        plain = '        return x'
+        in_a = self._scan_fixture("a.py", holder % (mints, plain))
+        in_b = self._scan_fixture("a.py", holder % (plain, mints))
+        self.assertNotEqual(in_a, in_b,
+                            "moving the sole mint between classes left the census unchanged")
+        self.assertEqual(in_a, {("a.py", "A.mint"): 1})
+        self.assertEqual(in_b, {("a.py", "B.mint"): 1})
+        # Control: a top-level function keeps its bare name, so qualifying the key does
+        # not silently rewrite every existing pin.
+        self.assertEqual(self._scan_fixture("a.py", 'def mint(x):\n    return f"task-{x}"\n'),
+                         {("a.py", "mint"): 1})
 
     def test_branch_order_does_not_decide_whether_a_mint_is_seen(self):
         """Mutually exclusive branches both reach the use, so a template bound in
