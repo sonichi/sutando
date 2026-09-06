@@ -25,6 +25,29 @@ python3 skills/report-feedback/report-feedback.py \
 - Ask the user for a short **title** and a **description** if they're not already clear from the conversation. Infer `kind` (default `bug`) and `severity` (default `medium`) from context.
 - **Announce the log attachment before sending, then honor an opt-out.** Recent diagnostic logs are attached by default. Since there's no visible checkbox on voice/chat (unlike the desktop form), *say so first* — e.g. "I'll attach recent diagnostic logs to help debug, unless you'd rather I didn't." If the user declines, pass `--no-logs`. This makes it an informed opt-out rather than a silent default (especially important on voice, where the user can't see what's being sent). Log excerpts are redaction-scrubbed (Bearer tokens, `token=`/`api_key=`/`secret=` values, common key formats, and the home-dir username are masked) as a backstop, but announcing is still required.
 
+## Ask first (`--ask`, or `askFirst` in the owner's prefs)
+
+The owner's approval step for automatic reports. Instead of filing, the report is parked as a draft under
+`<workspace>/state/feedback-drafts/<id>.json` and the owner gets a `space.ag2.hitl` card in the room you
+name — **File this bug report · File without logs · Skip** — with the same text as a plain fallback body.
+
+```bash
+# ask (also what --auto does when feedback-prefs.json has "askFirst": true):
+python3 skills/report-feedback/report-feedback.py --auto --title "..." --body "..." --room '<owner DM room id>'
+# the owner's click arrives as an ordinary message whose text is the card label; apply it:
+python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_no_logs|skip
+python3 skills/report-feedback/report-feedback.py --drafts        # pending drafts, oldest first
+```
+
+- `--room` wins; else `askRoom` from `feedback-prefs.json`; with neither the ask exits 3 and parks nothing —
+  the card must reach the owner, never a shared room. Pass the owner's DM room id (the `channel_id` of
+  their DM tasks).
+- The reply task's text is the label, optionally `label — note`. Map it with the labels above (or
+  `decision_for_reply()`); with one pending draft in that room it is the newest `--drafts` entry.
+  `file` attaches logs only if `sendLogs` is on; `file_no_logs` never does; `skip` drops the draft.
+- Dedupe and the daily cap apply when the card is asked; a filed decision is what records the report.
+- Needs the gateway env (`set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a`) to post the card.
+
 ## Automatic reports (`--auto`)
 
 When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — file it automatically with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).

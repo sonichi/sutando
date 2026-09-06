@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
@@ -48,7 +49,15 @@ SIGNED_OUT_SENTINEL = "__signed_out__"
 # Owner prefs written by the desktop Settings UI (host is the single writer).
 # autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
 # that carries incidental owner data, so it is opt-in rather than opt-out.
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False}
+PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
+# Ask-first: an automatic report is parked as a draft and the owner gets a card
+# (File / File without logs / Skip) instead of a filing; the reply files or drops it.
+DRAFTS_DIR = "feedback-drafts"
+ASK_ACTIONS = [
+    {"id": "file", "kind": "confirmation", "label": "File this bug report"},
+    {"id": "file_no_logs", "kind": "confirmation", "label": "File without logs"},
+    {"id": "skip", "kind": "confirmation", "label": "Skip"},
+]
 # Auto-report throttle state (this script is the single writer).
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
@@ -259,9 +268,94 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
+        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
+        if isinstance(d.get("askRoom"), str) and d["askRoom"].strip():
+            prefs["askRoom"] = d["askRoom"].strip()
     except Exception:
         pass
     return prefs
+
+
+def _drafts_dir(ws: Path) -> Path:
+    return ws / "state" / DRAFTS_DIR
+
+
+def write_draft(ws: Path, payload: dict, room: str, now: float | None = None) -> str:
+    """Park a report the owner has not approved yet; returns the draft id."""
+    d = _drafts_dir(ws)
+    d.mkdir(parents=True, exist_ok=True)
+    draft_id = f"fb_{uuid.uuid4().hex[:10]}"
+    rec = {"id": draft_id, "room": room, "created": now if now is not None else time.time(), "payload": payload}
+    tmp = d / f".{draft_id}.tmp"
+    tmp.write_text(json.dumps(rec, indent=2) + "\n")
+    os.replace(tmp, d / f"{draft_id}.json")
+    return draft_id
+
+
+def list_drafts(ws: Path) -> list:
+    """Pending drafts, oldest first."""
+    out = []
+    for f in sorted(_drafts_dir(ws).glob("fb_*.json")):
+        try:
+            out.append(json.loads(f.read_text()))
+        except Exception:
+            continue
+    return out
+
+
+def load_draft(ws: Path, draft_id: str) -> dict | None:
+    try:
+        return json.loads((_drafts_dir(ws) / f"{draft_id}.json").read_text())
+    except Exception:
+        return None
+
+
+def drop_draft(ws: Path, draft_id: str) -> None:
+    try:
+        (_drafts_dir(ws) / f"{draft_id}.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def decision_for_reply(text: str) -> str | None:
+    """Map an action reply's body (the card label, optionally `label — note`) to a decision."""
+    head = (text or "").split(" — ", 1)[0].strip().lower()
+    for a in ASK_ACTIONS:
+        if head == a["label"].lower():
+            return a["id"]
+    return None
+
+
+def card_payload(room: str, draft_id: str, title: str, device: str) -> dict:
+    """The space.ag2.hitl card the desktop renders; the plain body is the fallback text."""
+    hitl_id = f"hitl_{draft_id}"
+    requirement = {
+        "id": hitl_id, "kind": "confirmation", "runtime": "core", "status": "pending",
+        "revision": 1, "guard": "", "device": {"name": device},
+        "title": "File a bug report?",
+        "message": f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        "actions": ASK_ACTIONS,
+    }
+    return {
+        "op": "message", "room_id": room,
+        "body": f"I hit what looks like a Sutando/AG2 Space defect: {title}. Reply \"File this bug report\", \"File without logs\" or \"Skip\".",
+        "dedupe_key": f"hitl:{hitl_id}:1",
+        "extra_content": {"space.ag2.hitl": requirement},
+    }
+
+
+def post_card(payload: dict) -> int:
+    """Send the card through the gateway's room op; the env comes from the channel .env."""
+    url = os.environ.get("REMOTE_TASK_URL", "").rstrip("/")
+    tok = os.environ.get("REMOTE_TASK_TOKEN", "")
+    if not url or not tok:
+        raise RuntimeError("gateway env missing (REMOTE_TASK_URL/REMOTE_TASK_TOKEN)")
+    req = urllib.request.Request(
+        url + "/v1/room", data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json", "authorization": f"Bearer {tok}",
+                 "User-Agent": "sutando-gateway-client/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.status
 
 
 def _auto_state_path(ws: Path) -> Path:
@@ -371,6 +465,51 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
         return post_feedback(nxt, payload, token, _hops + 1)
 
 
+def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> None:
+    """The owner answered the card: file (with logs per prefs), file without logs, or skip."""
+    if choice not in ("file", "file_no_logs", "skip"):
+        print(f"ERROR: choice must be file | file_no_logs | skip, got {choice!r}.")
+        sys.exit(1)
+    rec = load_draft(ws, draft_id)
+    if not rec:
+        print(f"ERROR: no parked draft {draft_id}.")
+        sys.exit(1)
+    if choice == "skip":
+        drop_draft(ws, draft_id)
+        print(f"SKIPPED: draft {draft_id} dropped at the owner's request.")
+        return
+    base, token = read_cloud_auth(ws)
+    if not token:
+        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry --decide.")
+        sys.exit(2)
+    d = rec["payload"]
+    ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
+                 "auto": bool(d.get("auto")), "owner_approved": True}
+    with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
+    if with_logs:
+        excerpt, names = logs_excerpt(ws)
+        if excerpt:
+            ctx["last_logs_excerpt"] = excerpt
+            ctx["log_files"] = names
+        else:
+            ctx["logs_omitted"] = why_no_logs(ws)
+    else:
+        ctx["logs_opted_out"] = True
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    try:
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        if d.get("auto"):
+            record_auto_report(ws, d["title"])
+        drop_draft(ws, draft_id)
+        print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
+    except urllib.error.HTTPError as e:
+        print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", required=True)
@@ -384,14 +523,27 @@ def main() -> None:
         help="Agent-initiated automatic report: honors the owner's auto-report "
         "setting and is deduped/rate-limited. Exits 3 (SKIPPED) when gated.",
     )
+    ap.add_argument("--ask", action="store_true",
+                    help="Park the report as a draft and post a File / File without logs / Skip card instead of filing.")
+    ap.add_argument("--room", default="", help="Room for the ask-first card (default: prefs askRoom).")
+    ap.add_argument("--decide", nargs=2, metavar=("DRAFT_ID", "CHOICE"),
+                    help="Apply the owner's card reply to a parked draft: file | file_no_logs | skip.")
+    ap.add_argument("--drafts", action="store_true", help="List parked drafts as JSON and exit.")
     a = ap.parse_args()
+
+    ws = resolve_workspace()
+    prefs = read_prefs(ws)
+
+    if a.drafts:
+        print(json.dumps(list_drafts(ws), indent=2))
+        return
+    if a.decide:
+        decide(ws, prefs, a.decide[0], a.decide[1])
+        return
 
     if not a.title.strip():
         print("ERROR: --title is required (a short one-line summary).")
         sys.exit(1)
-
-    ws = resolve_workspace()
-    prefs = read_prefs(ws)
     if a.auto:
         if not prefs["autoReport"]:
             print("SKIPPED: automatic bug reports are disabled (Settings → Agent → Bug reports).")
@@ -400,6 +552,23 @@ def main() -> None:
         if not ok:
             print(f"SKIPPED: {reason}.")
             sys.exit(3)
+
+    if a.ask or (a.auto and prefs["askFirst"]):
+        room = a.room.strip() or prefs.get("askRoom", "")
+        if not room:
+            print("SKIPPED: ask-first needs a room — pass --room <owner DM room id> or set askRoom in feedback-prefs.json.")
+            sys.exit(3)
+        draft = {"kind": a.kind, "severity": a.severity, "title": a.title.strip(),
+                 "body": a.body.strip() or a.title.strip(), "auto": bool(a.auto), "no_logs": bool(a.no_logs)}
+        draft_id = write_draft(ws, draft, room)
+        try:
+            post_card(card_payload(room, draft_id, draft["title"], platform.node().split(".")[0]))
+        except Exception as e:  # noqa: BLE001
+            drop_draft(ws, draft_id)
+            print(f"ERROR: could not post the card ({e}); nothing filed, draft dropped.")
+            sys.exit(1)
+        print(f"ASKED: draft {draft_id} parked; card posted to {room}. On the reply run --decide {draft_id} file|file_no_logs|skip.")
+        return
 
     base, token = read_cloud_auth(ws)
     if not token:
