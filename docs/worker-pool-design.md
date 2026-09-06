@@ -1405,8 +1405,8 @@ itself to a room whose worker might still come back.
    is the harm the self-suppression gate above exists to prevent. It is bounded: one task,
    re-detected in one `stand_in_after_s` window, and visible as a claimed task whose worker
    holds no lease. That is strictly better than the alternative it replaces, where the harm is
-   unbounded and silent. **State the direction plainly: this design prefers a bounded,
-   re-detectable strand over a permanently dark room.**
+   unbounded and silent. **State the direction plainly: this design prefers a
+   bounded, re-detectable strand over a permanently dark room.**
 
    The kick is an owner action in v1, not something the core does on a timer. Automating it
    would put the core in a kick/re-wedge loop against a genuinely broken worker, and a loop
