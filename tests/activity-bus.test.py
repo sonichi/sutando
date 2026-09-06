@@ -128,6 +128,34 @@ class Acceptance(unittest.TestCase):
         summary = json.loads(card.summaries_path(self.ws).read_text().splitlines()[-1])
         self.assertEqual((summary["task"]["id"], summary["rows"], summary["line"]), ("t5", 3, "replied"))
 
+    def test_a_failed_projection_is_retried_later_and_projected_exactly_once(self):
+        # Reviewer's case: the snapshot advanced but the row was lost when projecting raised.
+        projected = []
+        calls = {"n": 0}
+        def flaky(row):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk full")
+            projected.append(row["line"])
+        store = ActivityStore(self.ws, project=flaky)
+        st = store.apply(T("t7", "RUNNING", ts=1, message_event_id="$m"))
+        self.assertEqual((st.phase, projected, len(st.pending)), ("RUNNING", [], 1), "committed, row still owed")
+        st = store.apply(T("t7", "COMPLETED", ts=2))
+        self.assertEqual((st.phase, projected, st.pending), ("COMPLETED", ["picked up", "replied"], []))
+        # a restart with a healthy projector drains what an earlier process left owed
+        store.project = flaky
+        calls["n"] = 0; projected.clear()
+        st = store.apply(T("t8", "RUNNING", ts=1)); self.assertEqual(len(st.pending), 1)
+        fresh = ActivityStore(self.ws, project=lambda r: projected.append(r["line"]))
+        st = fresh.apply(E("t8", "S1", 1, "Heartbeat", ts=2))
+        self.assertEqual((projected, st.pending), (["picked up"], []), "exactly once, on the next apply")
+
+    def test_rows_are_projected_inside_the_task_lock(self):
+        import inspect
+        src = inspect.getsource(bus.ActivityStore.apply)
+        self.assertLess(src.index("self._drain(state)", src.index("self.save(state)")), src.index("return state"))
+        self.assertNotIn("\n        for row in rows:", src, "no projection after the lock block")
+
     def test_a_consolidated_completion_names_the_holder(self):
         st = self.store.apply(T("t6", "RUNNING", ts=1, message_event_id="$m"))
         st = self.store.apply(T("t6", "COMPLETED", ts=2, into="$holder"))

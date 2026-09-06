@@ -55,6 +55,7 @@ class TaskActivityState:
     last_activity_at: float | None = None
     summary: str = ""
     into: str | None = None  # a consolidated reply: the holder message's event id
+    pending: list[dict] = field(default_factory=list)  # rows reduced but not yet projected
     applied: list[str] = field(default_factory=list)
     sessions: dict[str, int] = field(default_factory=dict)
     telemetry: int = 0
@@ -219,13 +220,29 @@ class ActivityStore:
         os.replace(tmp, p)
 
     def apply(self, item: LifecycleTransition | RuntimeEvent) -> TaskActivityState:
-        """Load → reduce → save → project, under one lock per task so two emitters serialize."""
+        """Load → drain → reduce → save (rows pending) → project → save (drained), all under one lock
+        per task, so two emitters serialize their rows as well as their transitions. A projection
+        that fails leaves its rows pending in the snapshot; the next apply on that task drains them
+        first, so a row is projected exactly once, later, never lost and never twice."""
         self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.dir / f".{item.task_id}.lock", "w") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
             state = self.load(item.task_id)
+            self._drain(state)
             state, rows = reduce(state, item)
-            self.save(state)
-        for row in rows:
-            self.project(row)
+            state.pending = list(state.pending) + rows
+            self.save(state)  # the transition is committed with its rows still owed
+            self._drain(state)
         return state
+
+    def _drain(self, state: TaskActivityState) -> None:
+        """Project every owed row in order; stop at the first failure and persist what is still owed."""
+        while state.pending:
+            row = state.pending[0]
+            try:
+                self.project(row)
+            except Exception:  # noqa: BLE001 - the rows stay owed; the caller must not fail
+                self.save(state)
+                return
+            state.pending = state.pending[1:]
+            self.save(state)
