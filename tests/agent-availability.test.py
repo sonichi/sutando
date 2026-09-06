@@ -229,6 +229,16 @@ class WorkSignal(unittest.TestCase):
         self.assertEqual(av.read_runtime_state(ws, host="h", work_probe=boom).work_signal, "unknown")
         self.assertEqual(av.read_runtime_state(ws, host="h").work_signal, "unknown", "no detector window here: unknown, never a crash")
 
+    def test_a_failing_window_read_is_no_reading(self):
+        try:
+            import cli_wedge
+        except ImportError:
+            self.skipTest("the detector is not on this tree")
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+        with unittest.mock.patch.object(cli_wedge, "load_window", side_effect=OSError("window unreadable")):
+            self.assertIsNone(av.wedge_window_verdict(ws, 1000.0))
+            self.assertEqual(av.read_runtime_state(ws, host="h", now=1000.0).work_signal, "unknown")
+
     def test_the_work_signal_never_reaches_a_room_payload(self):
         s = S(runtime_healthy=True, last_heartbeat_at=1000.0, work_signal="wedged")
         p = av.availability_projection(s, "air", "!eng:s", now=1000.0)

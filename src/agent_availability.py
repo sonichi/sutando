@@ -105,8 +105,6 @@ def availability(state: AgentRuntimeState, now: float | None = None) -> str:
         return "busy_accepting" if state.active_runs < max(state.max_concurrency, 1) else "busy_unavailable"
     if state.runtime_healthy is None or not is_fresh(state, now):
         return "unknown"
-    if not state.runtime_healthy:
-        return "unknown"
     if not state.accepting_work:
         return "busy_unavailable"
     if state.active_runs <= 0 and state.queue_depth <= 0:
