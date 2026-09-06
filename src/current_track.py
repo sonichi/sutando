@@ -169,7 +169,9 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     # Every entry kept BEFORE the walk is spent budget; charging only the pins let
     # the walk fill the whole cap on top of the protected ends.
     budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in keep)
-    used, started = 0, False
+    # The first-entry exception exists to keep the LIVE anchor whole; with both ends
+    # protected the anchor is already kept, so the walk pays the budget from entry one.
+    used, started = 0, facing is None
     for i in order:
         if i in keep:
             continue

@@ -482,6 +482,18 @@ class PinnedEntries(unittest.TestCase):
         self.assertFalse(r.oversized)
         self.assertTrue(r.archived, "nothing rotated, so the cap was never exercised")
 
+    def test_endpoints_over_the_cap_still_archive_the_middle(self):
+        """The first-entry exception must not fire when both ends are already protected."""
+        E = lambda n: f"## STATE 2026-09-06 — e{n}\n" + ("x" * 570) + "\n"
+        text = "# t\n\n" + E(0) + E(1) + E(2)
+        r = ct.plan(text, 1000)
+        self.assertIsNone(ct._orientation(ct.split(text)[1]))
+        self.assertIn("e0", r.head)
+        self.assertIn("e2", r.head)
+        self.assertIn("e1", r.archived)
+        self.assertNotIn("e1", r.head, "kept an avoidable third entry over an exhausted budget")
+        self.assertTrue(r.oversized)
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())
