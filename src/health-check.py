@@ -57,7 +57,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -68,6 +68,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
+    verdict_from_record as _gateway_verdict_from_record,
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
@@ -141,9 +142,7 @@ def _default_memory_dir() -> str:
     claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
     only when it is unset (preserving the old path for ad-hoc launches).
     """
-    repo = Path(__file__).parent.parent.resolve()
-    slug = claude_project_slug(repo)
-    return str(Path(claude_home_path()) / "projects" / slug / "memory")
+    return str(default_memory_dir())
 
 # SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
 # report on the same directory the runtime reads, so it opts out of #1724.
@@ -1603,6 +1602,39 @@ def check_workspace_wiring() -> "dict | None":
         "name": "workspace-wiring",
         "status": status,
         "detail": f"{state}: {report['detail']} — {fix}",
+    }
+
+
+CURRENT_TRACK_READ_BUDGET = 32 * 1024
+
+
+def check_context_read_budget() -> "dict | None":
+    """Warn when the per-pass mandatory read has outgrown a session's headroom.
+
+    Every proactive pass reads hosts/<host>/current-track.md FIRST (context-reconstruct),
+    and the file is append-only. Measured 2026-09-06: 222 KB on one host (~55k tokens),
+    170 KB on another — a session could spend most of its context before acting, and one
+    agent then declined granted work as "at the end of its context". The owner's rule is
+    that context state never grounds a decline; this probe makes the cause visible before
+    it does. Fix is scripts/current-track-rotate.py (head + archive, nothing deleted).
+    Returns None under the budget, so a healthy install gains no line.
+    """
+    path = WORKSPACE_DIR / "hosts" / _host_label() / "current-track.md"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None                      # no file, or unreadable: another probe's job
+    if size <= CURRENT_TRACK_READ_BUDGET:
+        return None
+    return {
+        "name": "context-read-budget",
+        "status": "warn",
+        "detail": (
+            f"hosts/{_host_label()}/current-track.md is {size} B (~{size // 4} tokens), over the "
+            f"{CURRENT_TRACK_READ_BUDGET} B per-pass read budget; every pass reads it first. "
+            f"Fix: python3 scripts/current-track-rotate.py {path} (keeps the preamble and the "
+            f"newest entries, archives the rest beside it; nothing deleted)"
+        ),
     }
 
 
@@ -6745,23 +6777,77 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
     return out
 
 
-def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | None":
+    """The lane sidecar's last parsed record, or None when absent/unreadable.
+
+    Raw only: `gateway_serving` owns what a record MEANS, so connectivity is
+    never interpreted here. Separate from `_gateway_stale_lanes`, whose
+    (lane, age) contract several callers and tests depend on.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    try:
+        rec = json.loads((root / f"gateway-status.{lane}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> dict:
     """The ok verdict for the bridge, demoted to warn when any lane's sidecar
     has gone silent — the primary being healthy says nothing about a lane."""
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
-    names = ", ".join(
-        f"{ln} (last write {age:.0f}s ago)" if age < 3600
-        else f"{ln} (last write {age / 3600:.1f}h ago)"
-        for ln, age in stalled)
+    def _aged(ln, age):
+        return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
+                else f"{ln} (last write {age / 3600:.1f}h ago)")
+
+    # Freshness is already decided, so ask the owner what the record MEANT.
+    # None is "no opinion" — never report that as the record saying connected.
+    import time as _time
+    _now = _time.time() if now is None else now
+    silent, failed, unknown, never = [], [], [], []
+    for ln, age in stalled:
+        rec = _gateway_lane_record(ln) or {}
+        err = rec.get("error")
+        verdict = _gateway_verdict_from_record(rec, now=_now, max_age=float("inf"))
+        if verdict is None:
+            unknown.append((ln, age, err))
+        elif verdict.connected is False or err:
+            failed.append((ln, age, err))
+        elif verdict.never_polled:
+            never.append((ln, age, err))
+        else:
+            silent.append((ln, age, err))
+    parts = []
+    if silent:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in silent)} stopped "
+            "writing its sidecar — its last record still says connected, so only "
+            "the silence shows it")
+    if never:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in never)} stopped "
+            "while claiming connection it never completed a poll on — its record "
+            "has no successful poll to point at")
+    for ln, age, err in unknown:
+        # Schema drift must not cost the operator the error string; `failed`
+        # prints it and this branch holds the same value.
+        why = f", but it recorded: {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped writing its sidecar and its "
+                     "last record carries no usable connectivity"
+                     f"{why} — read the file rather than trusting either state")
+    for ln, age, err in failed:
+        why = f": {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped after recording a "
+                     f"failure{why} — read that, not the silence")
     return {
         "name": "gateway-bridge",
         "status": "warn",
         "detail": (
-            f"{detail}, but lane {names} stopped writing its sidecar — its last "
-            "record still says connected, so only the silence shows it; messages "
-            "on that lane are not being delivered (retired lane? remove "
+            f"{detail}, but " + "; ".join(parts) + "; messages on that lane are "
+            "not being delivered (retired lane? remove "
             "state/gateway-status.<lane>.json)"
         ),
     }
@@ -6839,7 +6925,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing = [], []
+    unconsumed, trailing, unpublished = [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
@@ -6851,7 +6937,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         # missed-today verdict would blame it for the probe's own blind spot.
         if j.get("naming_stale"):
             drifted.append((j["name"], j.get("newest_artifact") or "?",
-                            j.get("artifact_age_days")))
+                            j.get("artifact_age_days"),
+                            bool(j.get("completion_today"))))
             continue
         # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
         # -1417 early. The filename date is logical, often a day off the mtime.
@@ -6875,8 +6962,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             if fired is None:
                 missed.append((j["name"], j["minutes_since_due"]))
             else:
-                unconsumed.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed:
+                # A completion record means the consumer DID run; blaming it would
+                # send the reader to the wrong layer. Separate bucket, separate cause.
+                bucket = unpublished if j.get("completion_today") else unconsumed
+                bucket.append((j["name"], fired, j["minutes_since_due"]))
+    if not late and not missed and not drifted and not unconsumed and not unpublished:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6908,16 +6998,28 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
+    for n, fired, m in unpublished:
+        bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} and COMPLETED "
+                    f"(a task-cron result exists) but published no artifact {m} min past "
+                    f"due — the producer, not the consumer, and not the cron")
     for n, fired, m in unconsumed:
         bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
                     f"no output {m} min past due — the schedule fired and the task was "
                     f"never consumed, so this is the consumer, not the cron")
-    for n, newest, age in sorted(drifted):
+    for n, newest, age, ran in sorted(drifted):
         age_txt = f", {age}d ago" if age is not None else ""
-        bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
-                    f"probe's filename match has drifted off this job's output; "
-                    f"punctuality cannot be scored and a missed-today verdict would "
-                    f"blame the job for the probe's own blind spot")
+        if ran:
+            # A completion record dates TODAY, so "the match drifted" cannot be
+            # asserted: this run holds evidence the job ran. Name both candidates.
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, but a "
+                        f"task-cron completion record exists TODAY, so the job did run; "
+                        f"either the probe's filename match drifted off its output or it "
+                        f"published nothing. Punctuality cannot be scored either way")
+        else:
+            bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
+                        f"probe's filename match has drifted off this job's output; "
+                        f"punctuality cannot be scored and a missed-today verdict would "
+                        f"blame the job for the probe's own blind spot")
     for n, m, dm, c in sorted(trailing):
         bits.append(f"{n}: dispatches on time (median {dm:+g} min); output trails by "
                     f"median {m:+g} min over {c} run(s) — latency, not the schedule")
@@ -7094,8 +7196,11 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = bool(arts) and launchd
         # Last resort, and the only lane needing no per-job config: a job that
         # publishes nothing dated still leaves a task-cron result when it finishes.
+        # Unconditional, not the no-artifact fallback below: a job that published
+        # artifacts then lost its producer keeps history, hiding its completion.
+        completions = _daily_task_record_minutes(ws / "results", jname)
         if not arts:
-            arts = _daily_task_record_minutes(ws / "results", jname)
+            arts = completions
             used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
@@ -7112,6 +7217,9 @@ def check_daily_cron_punctuality() -> dict:
             "newest_artifact": newest, "artifact_age_days": age_days,
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            # Consumption is a DIFFERENT fact from publication: a task can finish
+            # correctly and publish nothing (producer removed, [no-send] by design).
+            "completion_today": any(d == now.strftime("%Y-%m-%d") for d, _ in completions),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # Dispatch is the schedule's own evidence: it is what "on time"
             # means, and it is what an output mtime cannot report.
@@ -11417,6 +11525,10 @@ def run_all_checks() -> list[dict]:
     _root_tidy = check_workspace_root_tidy()
     if _root_tidy:
         checks.append(_root_tidy)
+
+    _read_budget = check_context_read_budget()
+    if _read_budget:
+        checks.append(_read_budget)
 
     _wiring = check_workspace_wiring()
     if _wiring:

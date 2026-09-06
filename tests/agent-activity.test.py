@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -242,9 +243,9 @@ class Hook(unittest.TestCase):
 
     def test_first_touch_of_a_task_file_binds_and_writes_processing_from_its_headers(self):
         (self.ws / "tasks" / "task-abc123.txt").write_text(
-            "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
+            "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
         out = hook.handle(self.pre("S1", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run)
-        self.assertEqual(out, [("processing", "picked up")])
+        self.assertEqual(out, [("processing", "Your agent is working on a task from qingyun: Read the latest disc…")])
         cmd = self.runs[-1]
         self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--from") + 1]), ("append", "task-abc123", "!team:s", "@q:s"))
         self.assertEqual(cmd[cmd.index("--text") + 1], "Read the latest discussion in this room.")
@@ -256,6 +257,50 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.task_file_refs("cat tasks/task-abc999.txt tasks/task-abc999.txt"), ["task-abc999"])
         # a task file that does not exist binds nothing
         self.assertEqual(hook.handle(self.pre("S1", "Read", {"file_path": "tasks/task-000000.txt"}), self.p, self.run), [])
+
+    def test_a_late_touch_of_an_answered_task_neither_binds_nor_reopens_it(self):
+        # The result exists (answered by a dedup or an earlier session): a re-read, a dedup check
+        # naming the file, or another session's touch must not write a Processing row after the Done.
+        (self.ws / "tasks" / "task-abc123.txt").write_text("id: task-abc123\nchannel_id: !dm:s\nuser_id: @q:s\ntask: hi\n")
+        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-abc123.txt").write_text("[deduped: task-zzz]")
+        self.assertEqual(hook.handle(self.pre("S2", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run), [])
+        self.assertEqual(hook.load_json(self.p["bind"], {}), {})
+        self.assertEqual(self.runs, [])
+        self.assertEqual(hook.pickup_line({"from": "@q:s", "text": "x" * 30}), "Your agent is working on a task from @q:s: " + "x" * 20 + "…")
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "air"}):
+            self.assertTrue(hook.pickup_line({"sender": "qingyun", "text": "hi"}).startswith("air is working on a task from qingyun: hi"))
+
+    def test_answered_sees_every_archive_shape_the_delivery_paths_write(self):
+        # Live, gateway (epoch suffix) and bridge (month dir) shapes; 0 of 400 live ids sat flat.
+        ws = self.ws; r = ws / "results"; r.mkdir(exist_ok=True)
+        shapes = {
+            "task-11111111111111": r / "task-11111111111111.txt",
+            "task-22222222222222": r / "archive" / "task-22222222222222-1788657562.txt",
+            "task-33333333333333": r / "archive" / "2026-06" / "task-33333333333333.txt",
+        }
+        for path in shapes.values():
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text("reply")
+        for tid in shapes:
+            self.assertTrue(hook.answered(ws, tid), tid)
+        self.assertFalse(hook.answered(ws, "task-99999999999999"))
+        self.assertFalse(hook.answered(ws, "../etc/passwd"))
+
+    def test_agent_name_comes_from_env_then_the_manifest_then_the_fallback(self):
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": ""}), mock.patch.object(hook, "manifest_config", return_value=""):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("Your agent is working"))
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": ""}), mock.patch.object(hook, "manifest_config", return_value="air"):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("air is working"))
+        with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "env-air"}), mock.patch.object(hook, "manifest_config", return_value="air"):
+            self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("env-air is working"))
+        self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")  # declared, unset by default
+
+    def test_an_unreadable_or_malformed_manifest_reads_as_unset_not_a_crash(self):
+        with mock.patch.object(hook.Path, "read_text", side_effect=OSError("gone")):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")
+        with mock.patch.object(hook.Path, "read_text", return_value="{not json"):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")
+        with mock.patch.object(hook.Path, "read_text", return_value='{"config": {"AGENT_DISPLAY_NAME": 7}}'):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")  # non-string value is not a name
 
     def post(self, sid, tool, inp):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
