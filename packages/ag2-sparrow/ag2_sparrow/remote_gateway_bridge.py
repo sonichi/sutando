@@ -1916,8 +1916,11 @@ def _one_line(value) -> str:
     practice and a stray newline only ever indicates an injection attempt.
 
     Load-bearing: this producer does no body defanging, so the flatten is the
-    only thing stopping a field from forging a registered header line."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    only thing stopping a field from forging a registered header line — so the
+    folded set is DERIVED from str.splitlines(), which is the reader's own set.
+    Enumerating it by hand left \v \f \x1c \x1d \x1e \x85 U+2028 U+2029 intact:
+    each is a line break to a splitlines() reader and was not to this flatten."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
