@@ -223,6 +223,42 @@ class IdempotentProjection(unittest.TestCase):
         self.assertEqual(len(fresh.load("task-i3").pending), 0)
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1)
 
+    def test_unrelated_pid_bearing_traffic_never_evicts_an_owed_rows_ack(self):
+        # yixuan's finding: the filler must carry pids of OTHER tasks, the memory a global ledger
+        # would evict. Per-task acknowledgement cannot be evicted by anyone else's rows.
+        import activity_rows
+        store = ActivityStore(self.ws)
+        store.apply(T("task-i4", "RUNNING", ts=1, message_event_id="$m"))
+        real = activity_rows._save_index; calls = {"n": 0}
+        def flaky(ip, idx):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("index disk full")
+            real(ip, idx)
+        with unittest.mock.patch.object(activity_rows, "_save_index", flaky):
+            store.apply(T("task-i4", "COMPLETED", ts=2))
+        for i in range(6100):
+            card.append(f"noise {i}", kind="notice", room=None, task={"id": f"task-n{i % 50}"}, workspace=self.ws, pid=f"pid-noise-{i}")
+        self.assertNotIn("task-i4", card.log_path(self.ws).read_text(), "precondition: rotated out")
+        fresh = ActivityStore(self.ws)
+        fresh.apply(T("task-i4", "COMPLETED", ts=2))
+        history = "".join(p.read_text() for p in (self.ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name)
+        self.assertEqual(history.count('"pid": "task-i4:1:2"'), 1, "still exactly once after 6100 pid-bearing rows")
+        self.assertEqual(len(fresh.load("task-i4").pending), 0)
+        # positive control: a brand-new pid still appends exactly one row
+        card.append("fresh", kind="notice", room=None, task={"id": "task-i4"}, workspace=self.ws, pid="task-i4:1:99")
+        self.assertEqual(card.log_path(self.ws).read_text().count('"pid": "task-i4:1:99"'), 1)
+
+    def test_a_closed_task_leaves_no_ack_file_behind(self):
+        import activity_rows
+        t = {"id": "task-i5"}
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-i5:1:1")
+        self.assertTrue((activity_rows.acks_dir(self.ws) / "task-i5").exists())
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i5:1:2")
+        self.assertFalse((activity_rows.acks_dir(self.ws) / "task-i5").exists(), "the summary carries the done pid; the file goes")
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i5:1:2")
+        self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "a replayed done row is still one summary")
+
     def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
         # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid
         # projected again must not count the row twice.

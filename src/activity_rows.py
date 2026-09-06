@@ -82,26 +82,30 @@ def default_room(workspace: Path | None = None) -> str | None:
     return d.get("channel_id") if d.get("channel") == "ag2space" else None
 
 
-def acks_path(workspace: Path | None = None) -> Path:
-    """Projection ids the writer has applied, one per line: the sink's acknowledgement, kept apart
-    from the rotating live log so a replay after rotation is still recognised."""
+def acks_dir(workspace: Path | None = None) -> Path:
+    """Per task, the projection ids the writer has applied — the sink's acknowledgement, kept apart
+    from the rotating live log and per task so unrelated traffic can never evict an owed row's ack."""
     return log_path(workspace).with_name("agent-activity.acks")
 
 
-def _pid_acked(path: Path, pid: str) -> bool:
+def _pid_acked(workspace: Path | None, task_id: str, pid: str) -> bool:
     try:
-        return pid in path.read_text(encoding="utf-8").split("\n")
+        return pid in (acks_dir(workspace) / task_id).read_text(encoding="utf-8").split("\n")
     except OSError:
         return False
 
 
-def _ack(path: Path, pid: str, keep: int = 5000) -> None:
-    with open(path, "a", encoding="utf-8") as f:
+def _ack(workspace: Path | None, task_id: str, pid: str) -> None:
+    d = acks_dir(workspace)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / task_id, "a", encoding="utf-8") as f:
         f.write(pid + "\n")
+
+
+def _ack_close(workspace: Path | None, task_id: str) -> None:
+    """The task is done: its summary carries the done pid, so the per-task file can go."""
     try:
-        lines = path.read_text(encoding="utf-8").split("\n")
-        if len(lines) > keep + 1000:
-            path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+        (acks_dir(workspace) / task_id).unlink()
     except OSError:
         pass
 
@@ -135,11 +139,14 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     # an inode that a concurrent rotation replaces.
     with open(path.with_suffix(".lock"), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        if not (pid and (_pid_acked(acks_path(workspace), pid) or _pid_in_log(path, pid))):
+        task_id = task.get("id") if isinstance(task, dict) and isinstance(task.get("id"), str) else None
+        acked = bool(pid and task_id and (_pid_acked(workspace, task_id, pid)
+                                          or (done and _pid_in_log(summaries_path(workspace), pid))))
+        if not (pid and (acked or _pid_in_log(path, pid))):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            if pid:
-                _ack(acks_path(workspace), pid)
+            if pid and task_id:
+                _ack(workspace, task_id, pid)
         if task and isinstance(task.get("id"), str):
             ip = index_path(workspace)
             idx = _load_index(ip)
@@ -154,6 +161,7 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
             if done:
                 idx.pop(task["id"], None)
                 summarize(rec, e, workspace)
+                _ack_close(workspace, task["id"])
             else:
                 idx[task["id"]] = e
             _save_index(ip, idx)
