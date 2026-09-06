@@ -218,6 +218,21 @@ class StalledLaneNamesItsCause(unittest.TestCase):
         self.assertNotIn("still says connected", d)
         self.assertIn("no usable connectivity", d)
 
+    def test_an_unknown_record_still_surfaces_its_recorded_error(self):
+        # Tested APART before: the error arm wrote connected=False, the unknown
+        # arms wrote no error. Together, the formatter discarded the captured err.
+        _write(self.d, "gateway-status.drift.json", error="relay 502 upstream refused",
+               ts=NOW - STALE)                       # no `connected` at all
+        d = self._detail()
+        self.assertIn("no usable connectivity", d)
+        self.assertIn("relay 502 upstream refused", d)
+
+    def test_an_unknown_record_without_an_error_says_nothing_extra(self):
+        _write(self.d, "gateway-status.q2.json", ts=NOW - STALE)
+        d = self._detail()
+        self.assertIn("no usable connectivity", d)
+        self.assertNotIn("but it recorded", d)
+
     def test_connected_without_a_completed_poll_is_named_separately(self):
         # gateway_serving.never_polled — connection claimed, no poll to point at.
         _write(self.d, "gateway-status.np.json", connected=True, error=None,

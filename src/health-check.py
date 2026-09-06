@@ -6800,11 +6800,13 @@ def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> 
             f"lane {', '.join(_aged(ln, age) for ln, age, _ in never)} stopped "
             "while claiming connection it never completed a poll on — its record "
             "has no successful poll to point at")
-    if unknown:
-        parts.append(
-            f"lane {', '.join(_aged(ln, age) for ln, age, _ in unknown)} stopped "
-            "writing its sidecar and its last record carries no usable "
-            "connectivity — read the file rather than trusting either state")
+    for ln, age, err in unknown:
+        # Schema drift must not cost the operator the error string; `failed`
+        # prints it and this branch holds the same value.
+        why = f", but it recorded: {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped writing its sidecar and its "
+                     "last record carries no usable connectivity"
+                     f"{why} — read the file rather than trusting either state")
     for ln, age, err in failed:
         why = f": {str(err)[:120]}" if err else ""
         parts.append(f"lane {_aged(ln, age)} stopped after recording a "
