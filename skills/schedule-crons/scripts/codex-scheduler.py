@@ -26,6 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from cron_execution_form import (  # noqa: E402
+    is_proactive_loop,
+    CODEX_FORMS, MALFORMED, SKILL, select_for_executor)
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -169,14 +172,18 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
     for raw_entry in raw:
         if not isinstance(raw_entry, dict):
             continue
+        # Selected form, not raw keys: claiming a shell-carrying record here
+        # strips only the skill leg, leaving a form load_jobs then refuses.
         canonical_main_loop = (
-            raw_entry.get("name") == "main-loop"
-            and raw_entry.get("prompt_skill") == "proactive-loop"
-            and not raw_entry.get("launchd")
+            is_proactive_loop(raw_entry) and not raw_entry.get("launchd")
         )
         implicit_main_loop = (
             include_main_loop and canonical_main_loop and raw_entry.get("execution") is None
         )
+        if raw_entry.get("launchd"):
+            # launchd owns it: claiming it too would double-dispatch, and
+            # raising over its shell form would abort every other schedule.
+            continue
         if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
             continue
         entry = dict(raw_entry)
@@ -210,7 +217,12 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
             ZoneInfo(entry.get("timezone", DEFAULT_TIMEZONE))
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"{name}: unknown timezone") from exc
-        if not isinstance(entry.get("prompt") or entry.get("prompt_skill"), str):
+        # Same selector every surface binds: a form this runner cannot execute
+        # must fail here, not fall through to whatever leg happens to be set.
+        kind, target = select_for_executor(entry, CODEX_FORMS)
+        if kind == MALFORMED:
+            raise ValueError(f"{name}: {target}")
+        if not target.strip():
             raise ValueError(f"{name}: prompt or prompt_skill is required")
         jobs.append(entry)
     return jobs
@@ -237,7 +249,9 @@ def _task_body(
     workspace: Path, job: dict[str, Any], slot: datetime, now: datetime, attempt: int = 1
 ) -> tuple[str, str]:
     task_id, _, result_path, proactive_path = _task_paths(workspace, job, slot, attempt)
-    prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
+    _kind, _target = select_for_executor(job, CODEX_FORMS)
+    prompt = confine_user_content(
+        f"/{_target}" if _kind == SKILL else _target)
     if job.get("delivery") == "proactive":
         prompt += (
             f" Write the concise owner-facing result to {proactive_path}, then write "

@@ -30,6 +30,12 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cron_execution_form import (  # noqa: E402
+    EXECUTOR_FORMS, LAUNCHD_FORMS, MALFORMED, PROMPT, SHELL, SKILL,
+    select_execution_form, select_for_executor)
+
 
 def cron_field_match(spec: str, value: int) -> bool:
     """Match one cron field value against a spec supporting *, */N, A-B, A,B, N."""
@@ -131,10 +137,12 @@ _RUN_PREFIX_RE = re.compile(r"^Run:?\s*")
 def schedule_owner(job: dict) -> str:
     """Which scheduler fires this entry: the OS-backed codex runner, the
     launchd cron-runner, a self-pacing /loop, or the live session's cron."""
-    if job.get("execution") == "codex-task":
-        return "codex"
+    # `launchd` first: cron-runner gates on it alone and never reads
+    # `execution`, so a record carrying both is fired by launchd.
     if job.get("launchd"):
         return "launchd"
+    if job.get("execution") == "codex-task":
+        return "codex"
     if job.get("loop") == "dynamic":
         return "dynamic-loop"
     return "session"
@@ -145,8 +153,10 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
     run. The read policy behind the dashboard Schedules card and SCP
     schedule.list; [] on missing/invalid file (never raises).
 
-    Per entry: name, cron ("" for a dynamic loop), kind (shell|skill|prompt),
-    prompt_or_skill (the skill name or prompt text), owner (session|launchd|
+    Per entry: name, cron ("" for a dynamic loop), kind (shell|skill|prompt|
+    malformed),
+    prompt_or_skill (shell command, skill name or prompt text; "" when
+    malformed), owner (session|launchd|
     codex|dynamic-loop — who fires it), description (UNescaped — HTML escaping
     is presentation), next_run (display string: "Mon 21:00 (in 2m)" | ">7d" |
     "invalid"), next_run_ts (epoch seconds, None when uncomputable)."""
@@ -167,18 +177,31 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
         else:
             next_str = ">7d" if expr else "invalid"
-        if job.get("description"):
+        # Owner-aware, and shared with every executor: describing a form this
+        # entry's own scheduler cannot run is the silent disagreement.
+        owner = schedule_owner(job)
+        kind, raw_target = select_for_executor(
+            job, EXECUTOR_FORMS.get(owner, LAUNCHD_FORMS))
+        # `raw_target` is what the executors run, byte for byte. Only the
+        # DESCRIPTION may tidy it; the API field must stay executable.
+        target = raw_target.strip()
+        if job.get("description") and kind != MALFORMED:
             desc = job["description"]
-        elif skill:
-            desc = f"Runs the /{skill} skill"
+        elif kind == SHELL:
+            desc = f"Runs shell command: {target}"
+        elif kind == SKILL:
+            desc = f"Runs the /{target} skill"
+        elif kind == MALFORMED:
+            # Never fall through to the skill leg: the runner skips this entry
+            # entirely, so any skill named here would describe work that stops.
+            desc = f"WILL NOT RUN — {target}"
         else:
-            _p = _RUN_PREFIX_RE.sub("", (job.get("prompt") or "").strip())
+            _p = _RUN_PREFIX_RE.sub("", target)
             desc = (_p[:100] + "…") if len(_p) > 100 else _p
-        _shell = bool((job.get("shell_command") or "").strip())
         out.append({"name": job.get("name", "?"), "cron": expr,
-                    "kind": "shell" if _shell else ("skill" if skill else "prompt"),
-                    "prompt_or_skill": skill or (job.get("prompt") or ""),
-                    "owner": schedule_owner(job),
+                    "kind": kind,
+                    "prompt_or_skill": "" if kind == MALFORMED else raw_target,
+                    "owner": owner,
                     "description": desc,
                     "next_run": next_str,
                     "next_run_ts": int(nxt.timestamp()) if nxt else None})
@@ -292,6 +315,9 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
             # Only the launchd runner executes shell jobs and the session
             # scheduler skips them, so an unflagged one would never run at all.
             merged["launchd"] = True
+            # `merged` starts from the on-disk entry, so a codex-owned job
+            # switched to a shell body would keep both owner markers.
+            merged.pop("execution", None)
         err = validate_job(merged)
         if err:
             return 400, {"error": err}
