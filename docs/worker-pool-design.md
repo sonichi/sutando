@@ -188,7 +188,7 @@ which by the default above means eligible-if-its-beat-is-fresh:
 | file missing, unreadable, or not valid JSON | absent |
 | `version` absent, not an integer, or not one this reader implements | absent |
 | `computed_at` absent, not an integer, or more than 60 s in the FUTURE | absent — a clock ahead must not confer permanent freshness |
-| `now > computed_at + stale_after_s` | absent (stale) — never its last value, or a dead publisher keeps a worker diverted forever |
+| `now > computed_at + stale_after_s` | absent (stale) — never its last value, or a dead publisher keeps a worker diverted forever. **PROBATION IS EXEMPT**: its gate is the on-disk `state/pool-probation/` directory, which does not expire — see "The probation gate is the DIRECTORY" |
 | `stale_after_s` absent, not an integer, or outside **60..600** | absent — see the bound below |
 | the instance is not a key of `instances` | absent — an unlisted instance is unjudged, not judged clean |
 | its value is not exactly `eligible` or `wedged` | absent |
@@ -1401,6 +1401,26 @@ itself to a room whose worker might still come back.
    the record AND the sole creator of tokens; a worker never writes either. A sweep that runs BEFORE
    the worker's reconciliation does not republish anything — the verdict is held while `probation`
    stands.
+
+   **The probation gate is the DIRECTORY, not the record — so it outlives the snapshot.** The
+   validation matrix above maps `now > computed_at + stale_after_s` to ABSENT, and ABSENT means
+   eligible-if-the-beat-is-fresh. v1 fixes `stale_after_s` at 180 while `stand_in_after_s` defaults
+   to 300, so a stopped or delayed sweep erases probation from the record 120 s BEFORE probation's
+   own window closes, and the worker would then take the ordinary path — `2 * runners` through
+   reconciliation, unbounded through events. That contradicts the guarantee two paragraphs up.
+
+   So a target reads `state/pool-probation/` for its own name BEFORE it reads the record, and any
+   artifact there — `<instance>.admit`, `<instance>.admit.<task_id>`, or `.claimed` — puts it under
+   probation whatever the record says, ABSENT included. Files do not expire, and the sweep is
+   already their sole creator and sole remover, so the same act that ends probation clears the gate.
+
+   **The cost, stated rather than buried: a dead publisher now bounds a probationed worker to its
+   one task indefinitely, which is exactly what the stale->ABSENT row was written to prevent for
+   ORDINARY eligibility.** That row stays for ordinary eligibility and is exempted only here,
+   because the two failures are not symmetric and this document already chose between them: the
+   worst probation misread must be one more suppressed worker, never one more admitted. A worker
+   held to one task by a dead sweep is suppression; a worker released to `2 * runners` by the same
+   dead sweep is admission.
 
    **Token consumption and task custody are ONE recoverable transaction, and the renamed token
    is a durable admission record that outlives the claim.** The target's self-gate reads

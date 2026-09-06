@@ -18,6 +18,9 @@ import unittest
 RUNNERS = 2
 WINDOW = 100          # stand_in_after_s, in model seconds
 
+# STALE < WINDOW mirrors v1's 180 < 300: the snapshot expires first, and that gap is the bug.
+STALE = 60
+
 
 class Disk:
     def __init__(self):
@@ -26,16 +29,24 @@ class Disk:
         self.record, self.probation, self.request = {}, {}, False
         self.token, self.journal, self.claimed_rec = False, None, None   # .admit / .admit.<t> / .admit.<t>.claimed
         self.token_at, self.journal_at, self.claimed_at = None, None, None
+        self.computed_at = None      # when the sweep last published; the snapshot's own clock
         self.claims, self.results, self.writers = {}, set(), set()   # claims: task -> owner id
         self.live_owners = set()
 
 
-def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False):
+def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
+        durable_gate=True):
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
     def verdict():
+        # Past stale_after_s every cell reads ABSENT, which means eligible. The gate is the
+        # on-disk directory, so it survives that; `durable_gate=False` is the pre-fix reader.
+        if d.computed_at is not None and now[0] - d.computed_at > STALE:
+            if durable_gate and (d.token or d.journal is not None or d.claimed_rec is not None):
+                return "probation"
+            return "eligible"
         # a v1 reader sees only the scalar; a probation-aware reader consults the sibling key
         return "probation" if d.record["w"] == "wedged" and "w" in d.probation else d.record["w"]
 
@@ -47,7 +58,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False)
         return None
 
     def sweep():
-        now[0] += 10; d.writers.add(("record", "sweep"))
+        now[0] += 10; d.writers.add(("record", "sweep")); d.computed_at = now[0]
         if d.request and "w" not in d.probation:
             if not d.token:                                   # (a) idempotent token
                 d.token, d.token_at = True, now[0]
@@ -126,6 +137,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False)
 
     def kick(): d.request = True; d.writers.add(("request", "kick-pool"))
     def wait(): now[0] += WINDOW + 1
+    def drift(): now[0] += STALE + 2      # past snapshot expiry, INSIDE probation's own window
     def crash_worker():
         if verdict() == "probation" and d.journal is None and d.claimed_rec is None: gate_step1(f"t{claimed+1}")
 
@@ -138,7 +150,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False)
             d.claims[d.journal] = "other"; d.live_owners.add("other")
 
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
-             "crash_worker": crash_worker, "finish": finish, "wait": wait,
+             "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
              "other_live_claim": other_live_claim}
     for s in order: steps[s]()
     return verdict(), claimed, pending - claimed, d
@@ -273,6 +285,51 @@ class TheClaimToPromotionSeamIsCrashComplete(unittest.TestCase):
                       ["kick", "sweep", "worker", "worker", "worker", "worker"]):
             v, c, p, d = run(order, "crash_after_claim")
             self.assertEqual(c, 1, f"{order}: exactly one task may be admitted per probation")
+
+
+class ProbationOutlivesTheEligibilitySnapshot(unittest.TestCase):
+    """keweichen 5124841589 / qingyun-wu 5124875551 at 3940c629, found independently.
+
+    v1 fixes `stale_after_s` at 180 while `stand_in_after_s` defaults to 300, so a stopped sweep
+    erases probation from the record 120 s BEFORE probation's own window closes. ABSENT means
+    eligible-if-the-beat-is-fresh, so the worker took the ordinary path and the one-token bound
+    was gone. The model could not express it: `verdict()` had no snapshot clock at all.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "drift", "worker", "event"]
+
+    def test_the_pre_fix_reader_releases_the_worker_past_snapshot_expiry(self):
+        # The defect itself, so the class is not just asserting the fix agrees with itself.
+        v, c, p, d = run(self.ORDER, durable_gate=False)
+        self.assertEqual(v, "eligible", "the record reads ABSENT once the snapshot expires")
+        self.assertGreater(c, 1, "the ordinary path admits beyond the one-token bound")
+
+    def test_the_durable_gate_holds_the_bound_across_expiry(self):
+        v, c, p, d = run(self.ORDER)
+        self.assertEqual(v, "probation")
+        self.assertEqual(c, 1, "one token, one task, whatever the snapshot says")
+
+    def test_it_holds_for_an_UNCONSUMED_token_too(self):
+        # The other half of the boundary: expiry before the worker ever reaches its gate.
+        v, c, p, d = run(["kick", "sweep", "drift", "worker", "event"])
+        self.assertEqual(v, "probation")
+        self.assertEqual(c, 1)
+        v, c, p, d = run(["kick", "sweep", "drift", "worker", "event"], durable_gate=False)
+        self.assertGreater(c, 1)
+
+    def test_a_returning_sweep_still_terminates_it(self):
+        # The cost of the fix is a dead publisher holding the worker; a LIVE one must still end it.
+        v, c, p, d = run(["kick", "sweep", "worker", "drift", "finish", "sweep"])
+        self.assertEqual(v, "eligible")
+        v, c, p, d = run(["kick", "sweep", "worker", "drift", "wait", "sweep"])
+        self.assertEqual(v, "wedged")
+
+    def test_no_schedule_crossing_expiry_leaves_probation_as_the_last_word(self):
+        for order in (["kick", "sweep", "worker", "drift", "wait", "sweep"],
+                      ["kick", "sweep", "drift", "worker", "wait", "sweep"],
+                      ["kick", "sweep", "worker", "drift", "restart", "worker", "wait", "sweep"]):
+            v, c, p, d = run(order)
+            self.assertIn(v, ("eligible", "wedged"), order)
 
 
 if __name__ == "__main__":
