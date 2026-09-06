@@ -107,8 +107,10 @@ def scan_task_mints(root: Path) -> dict:
         def _bindings(scope) -> dict:
             out = {}
             def _bind(target, value):
+                # MAY, not last-write-wins: mutually exclusive branches both reach a use,
+                # so one branch binding a template must not be erased by the other.
                 if isinstance(target, ast.Name):
-                    out[target.id] = _is_task_literal(value)
+                    out[target.id] = out.get(target.id, False) or _is_task_literal(value)
             def _own(node):
                 # This scope's statements, not a nested scope's: a nested
                 # function's local cannot bind a template for its parent.
@@ -609,6 +611,21 @@ class ScannerPositiveControls(unittest.TestCase):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(source)
             return scan_task_mints(Path(tmp))
+
+    def test_branch_order_does_not_decide_whether_a_mint_is_seen(self):
+        """Mutually exclusive branches both reach the use, so a template bound in
+        either one must count regardless of which the source lists first."""
+        tmpl = 'def mint(flag, x):\n    if flag:\n        T = "%s"\n    else:\n        T = "%s"\n    return f"{T}{x}"\n'
+        task_first = self._scan_fixture("a.py", tmpl % ("task-", "plain-"))
+        plain_first = self._scan_fixture("a.py", tmpl % ("plain-", "task-"))
+        self.assertEqual(task_first, plain_first,
+                         "source order changed the census of one program")
+        self.assertEqual(plain_first, {("a.py", "mint"): 1},
+                         "a task template on either branch must be counted")
+        # Control: with no task template on either branch there is nothing to find,
+        # so the equality above cannot be satisfied by two empty censuses.
+        neither = self._scan_fixture("a.py", tmpl % ("plain-", "other-"))
+        self.assertEqual(neither, {}, "control: neither branch binds a template")
 
     def test_catches_quote_styles_nesting_and_spellings(self):
         cases = {
