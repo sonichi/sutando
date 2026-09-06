@@ -5956,6 +5956,12 @@ async def poll_dm_fallback():
                 age = now - st.st_mtime
                 if age < GRACE_SECONDS:
                     continue
+                # Digest artifacts (question-/insight-) are web-UI/voice
+                # surfaces, never DM material — archive past the grace window.
+                if f.name.startswith(("question-", "insight-")):
+                    print(f"  [dm-fallback] digest artifact archived (no DM): {f.name}", flush=True)
+                    archive_file(f, "results", f.stem)
+                    continue
                 # Discord rejects empty content with HTTP 400. Retrying never
                 # succeeds — drop it.
                 if st.st_size == 0:
