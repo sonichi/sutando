@@ -344,7 +344,7 @@ def _scope_nodes(body_node):
         # A nested scope has its own walk; an assignment's subtree is
         # handled at the assignment, value before targets.
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                              ast.ClassDef, ast.Assign, ast.AnnAssign)):
+                              ast.ClassDef, ast.Assign, ast.AnnAssign, ast.If)):
             continue
         yield from _scope_nodes(child)
 
@@ -452,8 +452,31 @@ def _certified_nodes(tree, bindings: set) -> set:
                         and node.id in cert:
                     out.add(id(node))
 
-        for node in _scope_nodes(body_node):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
+        def run(nodes):
+            for node in nodes:
+                step(node)
+
+        def branch_merge(node):
+            # Alternatives cannot both execute: certification survives only where EVERY
+            # arm keeps it, while shadowing spreads from any arm so invalidation is never lost.
+            visit_expr(node.test)
+            base_c, base_s = set(cert), set(shadowed)
+            arms = [node.body, node.orelse or []]
+            results = []
+            for arm in arms:
+                cert.clear(); cert.update(base_c)
+                shadowed.clear(); shadowed.update(base_s)
+                run(_scope_nodes(ast.Module(body=arm, type_ignores=[])))
+                results.append((set(cert), set(shadowed)))
+            merged_c = set.intersection(*(c for c, _ in results)) if results else base_c
+            merged_s = set.union(*(sh for _, sh in results)) if results else base_s
+            cert.clear(); cert.update(merged_c)
+            shadowed.clear(); shadowed.update(merged_s)
+
+        def step(node):
+            if isinstance(node, ast.If):
+                branch_merge(node)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for name in _import_bindings(node):
                     shadow(name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -486,6 +509,8 @@ def _certified_nodes(tree, bindings: set) -> set:
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
                     and node.id in cert:
                 out.add(id(node))
+
+        run(_scope_nodes(body_node))
 
     # Each scope is walked once, lexically, with its own rebinding set.
     walk_scope(tree, set())
@@ -736,6 +761,44 @@ class ScannerPositiveControls(unittest.TestCase):
             f.write_text("delivery_id = compute()\n")
             self.assertEqual(scan_delivery_id_sites(Path(tmp)),
                              {("runtime-api/b.py", "<module>"): 1})
+
+
+class BranchCertificationIsPerPath(unittest.TestCase):
+    """Mutually exclusive arms cannot both execute, so certification must hold on
+    EVERY path to exempt a use, and an invalidation on any path must survive."""
+
+    def _d(self, source: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "probe.py").write_text(source)
+            return scan_delivery_id_sites(Path(tmp))
+
+    HDR = "from ag2_sparrow.identity import delivery_id\n\n"
+    CANON = '        k = delivery_id(item, ts)'
+    RAW = "        k = f'{item}#{ts}'"
+    TMPL = ("def mint(flag, item, ts, rec):\n    if flag:\n%s\n    else:\n%s\n"
+            "    rec['delivery_id'] = k\n    return rec\n")
+
+    def _arms(self, first, second):
+        return self._d(self.HDR + self.TMPL % (first, second))
+
+    def test_branch_order_does_not_decide_certification(self):
+        self.assertEqual(self._arms(self.RAW, self.CANON),
+                         self._arms(self.CANON, self.RAW),
+                         "source order of the two arms changed the census")
+        self.assertEqual(self._arms(self.RAW, self.CANON), {("probe.py", "mint"): 1},
+                         "a raw value on either arm must leave the use counted")
+
+    def test_certification_still_works_and_invalidation_survives(self):
+        # Without this pair, a change that simply stopped certifying anything would
+        # pass the order test above -- that is exactly how the first attempt failed.
+        self.assertEqual(self._arms(self.RAW, self.RAW), {("probe.py", "mint"): 1},
+                         "control: neither arm is canonical, so the use is counted")
+        self.assertEqual(self._arms(self.CANON, self.CANON), {},
+                         "control: every arm canonical, so the use stays exempt")
+        rebound = (self.HDR + 'def mint(flag, task):\n    d = delivery_id(task, "gw")\n'
+                   '    if flag:\n        d = "raw"\n    return {"delivery_id": d}\n')
+        self.assertEqual(self._d(rebound), {("probe.py", "mint"): 1},
+                         "a rebind inside one arm must revoke certification made before it")
 
 
 class DeliveryGateHostileControls(unittest.TestCase):
