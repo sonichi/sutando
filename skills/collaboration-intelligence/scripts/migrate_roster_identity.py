@@ -204,12 +204,49 @@ def _namespaced_identity_leaf(key: str, namespace: str) -> bool:
     return bool(_id_slot(key)) or bool(_verdicts_from_field("_".join(rest)))
 
 
-# An identity leaf, positively: it names the referent, or it is the schema's
-# own `user_id` / a bare `id`. `room_id` names a ROOM (`schema.md:67-70`).
+# Schema-named prose evidence (`schema.md`), where the referent word is the
+# declaration and the id lives in free text rather than in an `..._id` slot.
+_PROSE_EVIDENCE_KEYS = frozenset({"stand_status"})
+
+
+def _principal_slot(field: str) -> bool:
+    """May this field's referent word decide a CANONICAL SLOT?
+
+    Extraction and eligibility are different questions: `discord_human_display_name`
+    states `human` and holds a display name, so it may be mined and left
+    unresolved, but it must never answer `human_discord_id`. Our own writer-owned
+    slots qualify by construction; everything else must declare an id and name no
+    other object.
+    """
+    leaf = str(field).split(".")[-1].strip()
+    if leaf in ri.WRITER_OWNED or leaf.lower() in _PROSE_EVIDENCE_KEYS:
+        return True
+    if _identity_leaf(leaf):
+        return True
+    if _id_slot(leaf) is None:
+        return False
+    words = {w.lower() for w in _WORDS.findall(leaf)}
+    return not (words - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS)
+
+
 def _identity_leaf(key: str) -> bool:
+    """Does this leaf DECLARE that it holds a principal's id?
+
+    A referent word is not that declaration. `discord_human_display_name`
+    names a display and `discord_human_scheduled_event_id` names an event;
+    both state `human` and neither holds the person's id. So eligibility is a
+    positive test — the leaf declares an id slot AND names no other object —
+    rather than a denylist, which only ever refuses the objects already
+    thought of.
+    """
     words = [w.lower() for w in _WORDS.findall(str(key))]
-    return bool(_verdicts_from_field(key)) or words in (["user", "id"], ["id"],
-                                                        ["ids"])
+    if words in (["user", "id"], ["id"], ["ids"]):
+        return True
+    if str(key).strip().lower() in _PROSE_EVIDENCE_KEYS:
+        return True
+    if not _verdicts_from_field(key) or _id_slot(key) is None:
+        return False
+    return not (set(words) - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS)
 
 
 def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
@@ -565,6 +602,10 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     roots: dict = {}    # id -> writer-owned roots it was READ from
     for id_ in [c for c in collected if c not in arbitrated]:
         for field in _cited_in(entry, id_):
+            # Mined but not eligible: the id stays collected (and therefore
+            # unresolved) while its field is refused a say in any slot.
+            if not _principal_slot(field):
+                continue
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
                 if ri.writer_owned_path(field):

@@ -2289,10 +2289,13 @@ class AnAccessorValidatesWhatItReturns(unittest.TestCase):
                          (None, None, []))
 
     def test_an_unresolved_id_answers_no_lookup(self):
-        entry = {"human_discord_id": self.V, "stand_discord_id": self.V,
-                 "other_stand_discord_ids": [self.V, self.S],
+        """ONE condition per fixture. This one previously also made V both the
+        human and the Stand, so the unresolved filter hid the missing
+        role-disjointness check -- the reviewer's point, and why the entry-level
+        collision now has its own isolated control."""
+        entry = {"human_discord_id": self.V, "stand_discord_id": self.S,
                  "unresolved_discord_ids": [{"id": self.V}]}
-        self.assertEqual(self._all(entry), (None, None, [self.S]))
+        self.assertEqual(self._all(entry), (None, self.S, [self.S]))
 
     def test_direct_and_aggregate_stand_accessors_agree(self):
         for entry in ({"stand_discord_id": 1500000000000000002},
@@ -2301,6 +2304,99 @@ class AnAccessorValidatesWhatItReturns(unittest.TestCase):
             direct = ri.stand_discord_id(entry)
             agg = ri.stand_discord_ids(entry)
             self.assertEqual(direct, agg[0] if agg else None, entry)
+
+
+class AReferentWordDoesNotMakeAnObjectFieldEligible(_InProcessCli, unittest.TestCase):
+    """Extraction and ELIGIBILITY are different questions.
+
+    Splitting referent from ancestor was not enough: a `human` token inside a
+    leaf that names a display or an event still answered `human_discord_id`.
+    Eligibility is now a positive declaration -- the leaf declares an id slot
+    and names no other object -- so an unanticipated object word refuses by
+    construction rather than by being on a list.
+    """
+
+    R = "1400000000000000001"
+
+    def test_a_display_name_field_is_not_the_human(self):
+        rc, _e, rec = self._cli({"discord_human_display_name": self.R})
+        self.assertIsNone(rec.get("human_discord_id"))
+        self.assertEqual(self._unresolved(rec), [self.R])
+        self.assertEqual(rc, 5)
+
+    def test_an_event_field_is_not_the_human_flat_or_nested(self):
+        for entry in ({"discord_human_scheduled_event_id": self.R},
+                      {"human": {"discord_scheduled_event_id": self.R}}):
+            rc, _e, rec = self._cli(entry)
+            self.assertIsNone(rec.get("human_discord_id"), entry)
+            self.assertEqual(self._unresolved(rec), [self.R], entry)
+
+    def test_an_unanticipated_object_word_refuses_without_being_listed(self):
+        # THE discriminating arm: no denylist names 'ticket'.
+        rc, _e, rec = self._cli({"discord_human_ticket_id": self.R})
+        self.assertIsNone(rec.get("human_discord_id"))
+        self.assertEqual(self._unresolved(rec), [self.R])
+
+    def test_the_typed_positive_controls_still_resolve(self):
+        rc, _e, rec = self._cli({"human": {"discord_user_id": self.R}})
+        self.assertEqual((rc, rec.get("human_discord_id")), (0, self.R))
+        rc2, _e2, rec2 = self._cli({"stand_status": f"stand id {self.R}"},
+                                   with_stand=False)
+        self.assertEqual((rc2, rec2.get("stand_discord_id")), (0, self.R))
+
+
+class AnEntryIsValidatedAsOneRecord(unittest.TestCase):
+    """A set of fields that each look fine alone is not a valid identity record.
+
+    Validating them independently let one snowflake answer as both person and
+    agent, and let an unresolved container of the wrong shape read as "nothing
+    contested" while the public accessor returned its keys, its characters, or
+    a TypeError.
+    """
+
+    R = "1400000000000000001"
+    S = "1500000000000000001"
+
+    def _all(self, entry):
+        return (ri.human_discord_id(entry), ri.stand_discord_id(entry),
+                ri.stand_discord_ids(entry), ri.unresolved_discord_ids(entry))
+
+    def test_a_valid_distinct_entry_answers(self):
+        self.assertEqual(
+            self._all({"human_discord_id": self.R, "stand_discord_id": self.S,
+                       "unresolved_discord_ids": []}),
+            (self.R, self.S, [self.S], []))
+
+    def test_one_id_cannot_be_both_roles(self):
+        self.assertEqual(self._all({"human_discord_id": self.R,
+                                    "stand_discord_id": self.R}),
+                         (None, None, [], []))
+
+    def test_the_human_cannot_also_be_a_secondary_stand(self):
+        self.assertEqual(self._all({"human_discord_id": self.R,
+                                    "stand_discord_id": self.S,
+                                    "other_stand_discord_ids": [self.R]}),
+                         (None, None, [], []))
+
+    def test_an_unresolved_container_of_the_wrong_shape_fails_closed(self):
+        for bad in ({"id": self.R}, self.R, 12, "not-a-list"):
+            entry = {"human_discord_id": self.R, "unresolved_discord_ids": bad}
+            self.assertEqual(self._all(entry), (None, None, [], []), repr(bad))
+
+    def test_a_member_of_the_wrong_shape_fails_closed(self):
+        entry = {"human_discord_id": self.R,
+                 "stand_discord_id": self.S,
+                 "unresolved_discord_ids": [{"no_id": "x"}]}
+        self.assertEqual(self._all(entry), (None, None, [], []))
+
+    def test_a_well_formed_unresolved_record_still_suppresses_only_its_own_id(self):
+        # POSITIVE CONTROL: the container is valid, so the entry stays usable
+        # and only the contested id is withheld.
+        entry = {"human_discord_id": self.R, "stand_discord_id": self.S,
+                 "unresolved_discord_ids": [{"id": self.R}]}
+        h, st, stands, unres = self._all(entry)
+        self.assertEqual((h, st, stands), (None, self.S, [self.S]))
+        self.assertEqual([u["id"] for u in unres], [self.R])
 
 
 if __name__ == "__main__":

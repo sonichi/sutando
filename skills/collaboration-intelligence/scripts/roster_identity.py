@@ -196,24 +196,72 @@ def people(doc: dict) -> dict:
             if is_person_key(k) and isinstance(v, dict)}
 
 
-def _unresolved_id_set(entry: dict) -> set:
-    """Ids the entry itself declines to resolve. Any of them answers no lookup.
+def _unresolved_records(entry: dict):
+    """`(records, ok)` for the unresolved container.
 
-    Private and set-shaped: the public `unresolved_discord_ids` below returns
-    the RECORDS, and two functions under one name silently shadowed this one.
+    `ok` is False when the field is present in a shape the schema does not
+    define — a bare string, a mapping, a number. Those are not empty: iterating
+    them yields characters, keys, or a TypeError, so the whole entry is treated
+    as malformed rather than as having nothing contested.
     """
+    raw = (entry or {}).get(UNRESOLVED_FIELD)
+    if raw is None:
+        return [], True
+    if not isinstance(raw, (list, tuple)):
+        return [], False
+    for rec in raw:
+        rid = rec.get("id") if isinstance(rec, dict) else rec
+        if not _is_snowflake_str(rid):
+            return list(raw), False
+    return list(raw), True
+
+
+def _unresolved_id_set(entry: dict) -> set:
+    """Ids the entry itself declines to resolve. Any of them answers no lookup."""
+    recs, _ok = _unresolved_records(entry)
     out = set()
-    for rec in (entry or {}).get(UNRESOLVED_FIELD) or []:
+    for rec in recs:
         rid = rec.get("id") if isinstance(rec, dict) else rec
         if _is_snowflake_str(rid):
             out.add(rid)
     return out
 
 
+def entry_is_coherent(entry: dict) -> bool:
+    """Is this ENTRY one identity record, rather than a set of fields that each
+    look fine alone?
+
+    Validating fields independently let one snowflake answer both
+    `human_discord_id` and `stand_discord_id`, and let a malformed unresolved
+    container read as "nothing contested". A role collision is unresolvable
+    from inside the entry, so every accessor fails closed instead of picking.
+    """
+    if not isinstance(entry, dict):
+        return False
+    _recs, ok = _unresolved_records(entry)
+    if not ok:
+        return False
+    human = entry.get(HUMAN_FIELD)
+    stand = entry.get(STAND_FIELD)
+    roles = [v for v in (human, stand) if _is_snowflake_str(v)]
+    if len(roles) == 2 and roles[0] == roles[1]:
+        return False
+    extras = entry.get(OTHER_STANDS_FIELD)
+    if isinstance(extras, (list, tuple)):
+        for extra in extras:
+            eid = extra.get("id") if isinstance(extra, dict) else extra
+            if _is_snowflake_str(eid) and eid == human:
+                return False
+    return True
+
+
 def _canonical_id(entry: dict, field: str):
-    """The ONE validation every public accessor applies: a whole-string
-    snowflake, and not an id the entry lists as unresolved. The `_schema`
-    marker says the document was migrated; it does not validate a value."""
+    """The ONE validation every public accessor applies: the ENTRY is coherent,
+    the value is a whole-string snowflake, and the entry does not list it as
+    unresolved. The `_schema` marker says the document was migrated; it
+    validates neither the value nor the record it sits in."""
+    if not entry_is_coherent(entry):
+        return None
     v = (entry or {}).get(field)
     if not _is_snowflake_str(v) or v in _unresolved_id_set(entry):
         return None
@@ -237,6 +285,8 @@ def stand_discord_ids(entry: dict) -> list:
     ...}` records. Iterating anything else yielded one fake id per character
     for a bare string, and dict KEYS for a mapping.
     """
+    if not entry_is_coherent(entry):
+        return []
     out = []
     primary = stand_discord_id(entry)
     if primary:
@@ -253,4 +303,7 @@ def stand_discord_ids(entry: dict) -> list:
 
 
 def unresolved_discord_ids(entry: dict) -> list:
-    return list((entry or {}).get(UNRESOLVED_FIELD) or [])
+    """The contested records. A container the schema does not define answers
+    with nothing rather than with its characters, its keys, or a TypeError."""
+    recs, ok = _unresolved_records(entry)
+    return recs if ok else []
