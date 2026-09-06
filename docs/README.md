@@ -60,6 +60,8 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Architecture boundaries](architecture-boundaries.md)
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
+- [Task-envelope HMAC](task-envelope-hmac.md) — the tasks/ integrity seal:
+  mechanism, security claim, and the phased mailbox-authority plan
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Sparrow delivery identity — frozen definitions](sparrow-delivery-identity.md)
