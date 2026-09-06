@@ -296,7 +296,13 @@ def parse_markers(text: str) -> ParseResult:
     for m in _ATTACH_RE.finditer(body):
         if _in_code(m.start()):
             continue
-        actions.append(Action(kind="attach", value=m.group(1).strip()))
+        # The label above the marker: one message per file loses the body's
+        # interleaved order, so the caption must travel with the action.
+        head = body[:m.start()].rstrip("\n")
+        cap = head.rsplit("\n", 1)[-1].strip() if head else ""
+        if cap.startswith("[") or len(cap) > 120:
+            cap = ""
+        actions.append(Action(kind="attach", value=m.group(1).strip(), extra=cap or None))
 
     # Strip only the markers we acted on — one shown in a code block stays
     # visible, which is the whole point of showing it.

@@ -5197,6 +5197,10 @@ async def poll_results():
                     # File paths extracted by parse_markers() above; body already clean.
                     clean_text = reply_text
                     files = [a.value for a in _parsed.actions if a.kind == "attach"]
+                    # Caption per file, from the line above its marker: one
+                    # message per file loses the body's interleaved order.
+                    _caps = {os.path.expanduser(a.value.strip()): a.extra
+                             for a in _parsed.actions if a.kind == "attach"}
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -5248,7 +5252,11 @@ async def poll_results():
                     for fpath in files:
                         fpath = os.path.expanduser(fpath.strip())
                         if _is_path_sendable(fpath):
-                            await channel.send(file=discord.File(fpath))
+                            _cap = _caps.get(fpath)
+                            if _cap:
+                                await channel.send(_cap, file=discord.File(fpath))
+                            else:
+                                await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not fpath:
                             # EMPTY target = malformed, not a prose quotation.
