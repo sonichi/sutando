@@ -12,14 +12,18 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Full spec: docs/remote-gateway-protocol.md
 
   Protocol (versioned, Bearer-auth):
-  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&worker=<worker-id>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
+       `worker` names the pulling seat and rides ONLY after the broker
+       advertises `worker-routing`; absent that, the poll is byte-for-byte
+       legacy, so a broker that rejects unknown query keys still serves.
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/results
        → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
        → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+         (`worker_id`/`location` are added only under `worker-routing`)
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -27,6 +31,39 @@ any Discord/Telegram/Slack task. When `results/task-<id>.txt` appears, its body
 is POSTed back and the result file is archived. Ack/heartbeat are best-effort:
 if an older gateway returns 404/405, the client keeps working against the
 original pull/result protocol.
+
+Worker seats (issue: cloud workers sharing the agent identity). Every client is
+a queue client for ONE seat of the agent: the home seat (`home`), a pool seat
+(`worker-N`) or a cloud seat. The seat rides the wire ONLY once the broker advertises `worker-routing`
+(`worker=` on the pull, `worker_id`/`location` on heartbeat and the
+workers-snapshot push); until then every request is legacy-shaped. A
+worker-aware broker can then dispatch per seat and fail a lease over from a seat
+that stops beating. A cloud seat runs this same client with its own workspace:
+the pull → `tasks/` → `results/` → POST cycle needs nothing from another host —
+`state/pool-status.json` and `state/cores/` are read only when present.
+
+Lease safety (at-least-once). The broker's lease re-fronts a task on expiry, so
+a slow seat can see its own task delivered again, or a peer seat can receive it.
+Locally a re-delivered id is never queued twice while the first copy is live
+(`_write_task`: pending, assigned or claimed file → no rewrite; archived or
+delivered → `[no-send]` lease close), and the result sink dedupes on the task
+id. What this client cannot prevent: a lease shorter than the seat's honest
+task time hands the SAME id to another seat, which then answers it too — set
+RELAY_VISIBILITY_TIMEOUT (seconds, on the BROKER) above the longest honest
+task. The consequence is at-least-once: a task on a seat that dies mid-run is
+re-served to another seat, and the result sink dedupes by task id.
+
+Control messages: the broker's pin route also enqueues a `worker-pin-<ms>-<hex>`
+compat task. It is consumed in-client (ack, `[no-send]` lease close) and never
+written to `tasks/` — the watcher globs `*.txt` there, so a pin written under
+any name would be dispatched as an ordinary task.
+
+Result attribution: a result POST carries `metadata.worker_id` and
+`metadata.location` only while the broker advertises `worker-metadata`;
+control closes carry neither. The worker id is the pool done-flag owner
+(`state/cores/<worker>/done/<task>.flag`) when exactly one exists — a pool
+worker answering a task its lead routed — else this seat's own WORKER_ID: a
+cloud seat has no done-flag, and its result is still its own.
 
 Config (env / .env):
   REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
@@ -42,6 +79,10 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  SUTANDO_WORKER_ID     this seat's worker id on the wire (default "home";
+                        `worker-<SUTANDO_CORE_ID>` when only the pool seat
+                        number is set). Charset [A-Za-z0-9_-], max 32.
+  SUTANDO_WORKER_LOCATION  "cloud" marks a cloud seat; anything else is "local"
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -51,6 +92,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import http.client
 import json
 import os
 import uuid
@@ -318,8 +360,6 @@ GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled tas
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
-_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
-_WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
@@ -345,6 +385,14 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+# Injective: a named lane always carries the `named.` infix and _INSTANCE_RE
+# forbids dots, so no instance name can spell the unnamed lane's directory.
+_CONTROL_OWNER = f"named.{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else "primary"
+_WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results.{_CONTROL_OWNER}"
+# The review DM is OWNER-owned, not instance-owned, and is already keyed by
+# owner on read; namespacing it would create one duplicate room per instance.
+_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
+_WITHHELD_CONTROL_DIR_LEGACY = _STATE / "withheld-review-control-results"
 # Optional fence for instanced lanes: claim only rooms on this suffix
 GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
 # Rooms on these suffixes belong to a foreign lane; the default lane's gateway
@@ -1044,6 +1092,13 @@ def _retry_review_card_resolutions() -> None:
             _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
 
 
+def _declined_envelope(resp) -> bool:
+    """Delegate to delivery_core's owner of this policy; a local copy would
+    drift from the provider that already classifies these envelopes."""
+    from .delivery_core.contract import is_declined_envelope
+    return is_declined_envelope(resp)
+
+
 def _control_result_path(task_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)[:160]
     return _WITHHELD_CONTROL_DIR / f"{safe}.json"
@@ -1058,7 +1113,29 @@ def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
         _atomic_private_json(path, {"id": task_id, "body": body})
 
 
+_LEGACY_CONTROL_WARNED = False
+
+
+def _warn_legacy_control_records() -> int:
+    """Count unsuffixed leftovers once. Never adopt them: with two instances
+    live, whoever starts first would claim records owned by the other. The
+    default lane is a lane like any other -- if it read this path directly the
+    warning would be false and it would drain the very rows it disclaims."""
+    global _LEGACY_CONTROL_WARNED
+    try:
+        stale = sorted(_WITHHELD_CONTROL_DIR_LEGACY.glob("*.json"))
+    except OSError:
+        return 0
+    if stale and not _LEGACY_CONTROL_WARNED:
+        _LEGACY_CONTROL_WARNED = True
+        _log(f"{len(stale)} control record(s) under the pre-instance path "
+             f"{_WITHHELD_CONTROL_DIR_LEGACY}; not adopted (ownership unknown) — "
+             "move them into the owning instance's directory by hand")
+    return len(stale)
+
+
 def _retry_review_control_results() -> None:
+    _warn_legacy_control_records()
     try:
         paths = sorted(_WITHHELD_CONTROL_DIR.glob("*.json"))[:512]
     except OSError:
@@ -1068,11 +1145,66 @@ def _retry_review_control_results() -> None:
         if not record or not record.get("id"):
             continue
         try:
-            _req("POST", "/v1/results", {
+            resp = _req("POST", "/v1/results", {
                 "id": record["id"], "body": record.get("body") or "[no-send]"})
+            # A declining 2xx did NOT close the lease; dropping the journal here
+            # would strand it with nothing left on disk to retry.
+            if _declined_envelope(resp):
+                _log(f"review control result {record['id']} declined — journal kept:"
+                     f" {str(resp)[:120]}")
+                continue
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
             _log(f"review control result {record.get('id')} retry deferred: {exc}")
+
+
+_WORKER_PIN_PREFIX = "worker-pin-"
+# Full documented grammar. A prefix test alone classifies ordinary work
+# (e.g. worker-pin-user-message) as control and silently closes it.
+_WORKER_PIN_RE = re.compile(r"worker-pin-[0-9]+-[0-9a-fA-F]+\Z")
+# The broker, not the id shape, authorises closing a task unread: an id is
+# user-forgeable, this source stamp is written by the broker.
+_WORKER_PIN_SOURCE = "worker-picker"
+_pin_source_downgrade_logged = False
+# Log-once only. It never promotes id-only to control: the stamp stays the sole
+# discriminator, because a process latch resets on restart.
+
+
+def _consume_worker_pin(task: dict) -> bool:
+    """The broker's pin route enqueues a `worker-pin-<ms>-<hex>` compat task: a
+    control message for this seat, never user work. It writes no task file: the
+    watcher globs *.txt, so one would be dispatched to the core as ordinary work.
+    It is acked and its lease closed [no-send]. False = not a pin."""
+    global _pin_source_downgrade_logged
+    tid = str(task.get("id") or "").strip()
+    if not _WORKER_PIN_RE.fullmatch(tid) or not _valid_tid(tid):
+        return False
+    # On id alone an ordinary task matching the grammar is closed [no-send]
+    # before reaching the task writer, losing the user's work silently.
+    src = str(task.get("source") or "").strip()
+    if src and src != _WORKER_PIN_SOURCE:
+        return False
+    if not src:
+        # The stamp is the ONLY discriminator. A process-memory latch is not a bound:
+        # it resets on restart, and an unstamped ordinary task is then destroyed again.
+        if not _pin_source_downgrade_logged:
+            _pin_source_downgrade_logged = True
+            _log("broker sent a worker-pin with no source stamp; not consuming it as "
+                 "control — it will be written as an ordinary task")
+        return False
+    # ACK, journal path, payload and status check must see ONE id, or a
+    # deferred close reports itself archived under a path nothing wrote.
+    pinned = dict(task, id=tid)
+    # Durable close intent BEFORE the ack: an ack stops redelivery, so a crash
+    # between them strands a lease with nothing left on disk to close it.
+    _queue_review_control_result(pinned)
+    _post_task_ack(_local_tid(tid))
+    _retry_review_control_results()
+    if _control_result_path(tid).is_file():
+        _log(f"worker-pin {tid}: lease close deferred — next poll retries")
+    else:
+        _log(f"archived {tid} (marker no-send, lease closed, not sent)")
+    return True
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -1496,6 +1628,13 @@ def _auth_probe() -> bool:
         return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
+# Result `metadata` is an EXTENSION to the documented {id, body} envelope, so it
+# ships only once the broker advertises it; a strict relay 422s unknown keys.
+_broker_worker_metadata = False
+# A SEPARATE wire contract from result attribution: coupling them would let a
+# broker opt into routing merely by accepting result metadata.
+_broker_worker_routing = False
+_routing_downgrade_logged = False
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Routing keys the pool lead reads with a strict task-last
@@ -1535,6 +1674,39 @@ if LOCAL_TIER == "other":
     LOCAL_TIER = "guest"
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
+
+# Same id charset as GATEWAY_INSTANCE: it lands in a query string and in
+# broker-side queue keys, so a stray value fails at import, never on the wire.
+_WORKER_ID_RE = _INSTANCE_RE
+
+
+def _worker_identity() -> "tuple[str, str]":
+    """(worker_id, location) for this seat, from env only.
+
+    SUTANDO_WORKER_ID wins; a bare pool seat number (SUTANDO_WORKER_SEAT or
+    SUTANDO_CORE_ID) derives `worker-<n>` the way the room-ops scripts do; an
+    unconfigured process is the home seat. Location is "cloud" only when
+    SUTANDO_WORKER_LOCATION says so — a typo degrades to today's local path."""
+    wid = (os.environ.get("SUTANDO_WORKER_ID") or "").strip()
+    if not wid:
+        seat = (os.environ.get("SUTANDO_WORKER_SEAT")
+                or os.environ.get("SUTANDO_CORE_ID") or "").strip()
+        wid = f"worker-{seat}" if seat else "home"
+    if not _WORKER_ID_RE.fullmatch(wid):
+        sys.exit("FATAL: SUTANDO_WORKER_ID must match "
+                 f"{_WORKER_ID_RE.pattern} (ASCII only; got {wid!r})")
+    loc = (os.environ.get("SUTANDO_WORKER_LOCATION") or "").strip().lower()
+    return wid, ("cloud" if loc == "cloud" else "local")
+
+
+WORKER_ID, WORKER_LOCATION = _worker_identity()
+# The poll's query suffix, built once: `&worker=<seat>` after `wait=<sec>`.
+def _seat_qs() -> str:
+    """Computed per call: advertisement and revocation both happen at runtime, so
+    an import-time constant would send `worker=` to a broker that never allowed it."""
+    if not _broker_worker_routing:
+        return ""
+    return f"&worker={urllib.parse.quote(WORKER_ID, safe='')}"
 
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
@@ -2152,6 +2324,7 @@ def _read_core_status() -> tuple[str | None, str | None]:
 
 _WORKERS_SNAPSHOT_FILE = _STATE / "pool-status.json"
 _workers_push_mtime = 0.0
+_workers_push_routing = False
 _workers_push_retry_at = 0.0
 
 
@@ -2160,7 +2333,7 @@ def _maybe_push_workers_snapshot() -> bool:
     picker's read path). No file = no pool = no-op; a broker without the
     endpoint (404) backs the push off an hour; nothing here may ever
     break the task loop."""
-    global _workers_push_mtime, _workers_push_retry_at
+    global _workers_push_mtime, _workers_push_routing, _workers_push_retry_at
     now = time.time()
     if now < _workers_push_retry_at:
         return False
@@ -2168,7 +2341,10 @@ def _maybe_push_workers_snapshot() -> bool:
         mtime = _WORKERS_SNAPSHOT_FILE.stat().st_mtime
     except OSError:
         return False
-    if mtime <= _workers_push_mtime:
+    # Half this payload's shape is the capability, so the already-sent key has
+    # to carry it too: the same file under a new routing mode is a new snapshot.
+    routing = bool(_broker_worker_routing)
+    if mtime <= _workers_push_mtime and routing == _workers_push_routing:
         return False
     try:
         snap = json.loads(_WORKERS_SNAPSHOT_FILE.read_text())
@@ -2176,6 +2352,10 @@ def _maybe_push_workers_snapshot() -> bool:
         return False  # mid-write or malformed: the next change retries
     if not isinstance(snap, dict):
         return False
+    # Third request body carrying seat identity; gated like heartbeat and poll
+    # so a broker that never advertises sees the exact parent envelope.
+    if routing:
+        snap = {**snap, "worker_id": WORKER_ID, "location": WORKER_LOCATION}
     try:
         _req("POST", "/v1/workers", snap, timeout=15)
     except urllib.error.HTTPError as e:
@@ -2188,6 +2368,7 @@ def _maybe_push_workers_snapshot() -> bool:
         _log(f"workers-snapshot push failed, retrying in 5m: {e}")
         return False
     _workers_push_mtime = mtime
+    _workers_push_routing = routing
     _log("workers-snapshot pushed")
     return True
 
@@ -2241,6 +2422,41 @@ def _maybe_push_agent_profile() -> bool:
     return True
 
 
+def _apply_broker_capabilities(metadata: bool, routing: bool) -> None:
+    """The one owner of a capability transition, so every path that changes
+    routing invalidates the same evidence in the same way."""
+    global _broker_worker_metadata, _broker_worker_routing, _workers_push_retry_at
+    was_routing = _broker_worker_routing
+    _broker_worker_metadata = metadata
+    _broker_worker_routing = routing
+    if routing != was_routing:
+        # EITHER edge: a backoff is evidence about a payload shape we no longer
+        # send, and the shape we now send may well be accepted.
+        _workers_push_retry_at = 0.0
+
+
+def _note_broker_capabilities(reply) -> None:
+    """Re-read the broker's advertised capabilities from each heartbeat reply.
+    Recomputed (not latched) so a downgraded broker turns the extension back off."""
+    global _routing_downgrade_logged
+    caps = reply.get("capabilities") if isinstance(reply, dict) else None
+    known = caps if isinstance(caps, list) else []
+    _apply_broker_capabilities("worker-metadata" in known, "worker-routing" in known)
+    if not _broker_worker_routing and not _routing_downgrade_logged:
+        # One line per process: silence makes a safe downgrade undiagnosable,
+        # a per-heartbeat line would be noise.
+        _routing_downgrade_logged = True
+        _log("broker did not advertise worker-routing; using legacy shared-queue polling")
+
+
+def _revoke_broker_capabilities() -> None:
+    """A heartbeat that returns no advertisement leaves us no evidence the
+    extension is supported; the keys are additive and return on the next
+    advertising reply, so dropping them cannot lose a result while keeping
+    them can (a strict relay 422s an un-advertised key)."""
+    _apply_broker_capabilities(False, False)
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2262,25 +2478,43 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator"],
         }
+        # Legacy-safe first exchange: seat identity rides only after the broker
+        # advertises `worker-routing`, so a strict relay never sees a new key.
+        if _broker_worker_routing:
+            payload["worker_id"] = WORKER_ID
+            payload["location"] = WORKER_LOCATION
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
         if _status is not None:
             payload["status"] = _status
         if _step is not None:
             payload["step"] = _step
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _note_broker_capabilities(_req("POST", "/v1/heartbeat", payload, timeout=10))
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
             _heartbeat_disabled = True
+            # Heartbeat is the only capability channel, so disabling it means no
+            # later reply can revoke the extension. Revoke here or it is latched.
+            _revoke_broker_capabilities()
             _log("gateway does not support heartbeat — continuing without")
             return False
         if e.code in (401, 403):
             raise
+        _revoke_broker_capabilities()
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except (OSError, TimeoutError, http.client.HTTPException) as e:
+        # OSError covers URLError AND a bare ConnectionResetError from resp.read():
+        # any reply we could not read carries no advertisement, so it must revoke.
+        _revoke_broker_capabilities()
         _log(f"heartbeat network error: {e} — continuing")
+        return False
+    except ValueError as e:
+        # A malformed 200 raises inside _req's json.loads, so the reply never
+        # reaches _note_broker_capabilities and advertises nothing.
+        _revoke_broker_capabilities()
+        _log(f"heartbeat reply undecodable: {e} — continuing")
         return False
 
 
@@ -3319,9 +3553,10 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _worker_of(tid)
-    if worker:
-        doc["metadata"] = {"worker_id": worker}
+    # Pool done-flag owner first; else this seat answered it (cloud, home).
+    if _broker_worker_metadata:
+        doc["metadata"] = {"worker_id": _worker_of(tid) or WORKER_ID,
+                           "location": WORKER_LOCATION}
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
@@ -3904,7 +4139,7 @@ def main() -> None:
             _retry_review_card_resolutions()
             _retry_review_control_results()
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_seat_qs()}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
@@ -3915,6 +4150,8 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                if _consume_worker_pin(task):
+                    continue
                 hitl_out = _handle_hitl_action(task)
                 if hitl_out:
                     body = "[no-send]"

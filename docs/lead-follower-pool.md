@@ -202,6 +202,59 @@ handler must be before affinity yields — lower favors latency, higher favors
 conversational continuity; `continuity_breaks` in the pool metrics measures
 what that choice costs.
 
+### Cloud worker (#3794, slice 1 — client half)
+
+A cloud worker is the same gateway client (`packages/ag2-sparrow/ag2_sparrow/
+remote_gateway_bridge.py`) on another host, sharing the agent identity and
+speaking to the broker as one seat of it. Two env knobs, read at import like
+`REMOTE_TASK_URL`:
+
+- `SUTANDO_WORKER_ID` — the seat name on the wire (`home` by default;
+  `worker-<n>` is derived when only `SUTANDO_CORE_ID` is set, matching the
+  pool's own convention). Charset `[A-Za-z0-9_-]`, at most 32 characters.
+- `SUTANDO_WORKER_LOCATION` — `cloud` marks a cloud seat; anything else is
+  `local`.
+
+The seat rides those three calls — `worker=` on `GET /v1/tasks`, `worker_id` +
+`location` on `POST /v1/heartbeat` and on the `POST /v1/workers` snapshot push —
+**only after the broker advertises `worker-routing`**. Until then each request is
+byte-for-byte the legacy shape, so a broker that predates seats keeps serving
+whether it ignores unknown fields or rejects them; a worker-aware broker (the ag2space-backend half of #3794)
+keys its queues and leases per seat and fails a lease over from a seat that
+stops beating.
+
+A cloud seat depends on nothing from this host: it pulls straight into its own
+`tasks/`, its seat answers into its own `results/`, and the client POSTs the
+result. `state/pool-status.json` and `state/cores/` are read only when they
+exist — no lead, no pool files, no affinity table are required on that host.
+`tests/gateway-worker-queue-client.test.py` runs that cycle against a stub
+broker with none of them present.
+
+Redelivery is at-least-once. The broker re-fronts a task whose lease expired,
+so a seat can receive an id it already holds. The client never queues it twice
+while the first copy is live (pending, `.assigned-*` or `.claimed-*` file) and
+re-acks it so the broker learns the seat still has it; an id already archived
+or delivered closes the lease with a `[no-send]` marker. What the client cannot
+prevent is a lease shorter than an honest task: the broker then hands the same
+id to another seat, which answers it too. Set `RELAY_VISIBILITY_TIMEOUT`
+(seconds) on the broker above the longest honest task. The at-least-once
+consequence in one sentence: a task on a worker that dies mid-run is re-served
+to another seat, and results dedupe by task id.
+
+The broker's pin route also enqueues a `worker-pin-<ms>-<hex>` compat task.
+The client consumes it as a control message — ack, then a `[no-send]` lease
+close, no task file — because `src/watch-tasks-stream.sh` globs `*.txt` under
+`tasks/`, so a pin written there would be dispatched as an ordinary task.
+Log line: `archived worker-pin-… (marker no-send, lease closed, not sent)`.
+
+A result POST names the seat that produced it — `metadata.worker_id` +
+`metadata.location` — only while the broker advertises the `worker-metadata`
+capability; control closes carry neither. On a pool host the worker id is the
+done-flag owner (`state/cores/<worker>/done/<task>.flag`, the worker that
+answered a task
+the lead routed); a cloud seat has no done-flag, so its own `SUTANDO_WORKER_ID`
+is the attribution of last resort (`cloud-1` / `cloud`, never an empty payload).
+
 ### Turning on a Codex follower
 
 The runtime dimension (`--runtime` / `--core-runtime`) declares which CLI a core

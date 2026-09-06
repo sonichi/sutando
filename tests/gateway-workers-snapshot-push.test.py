@@ -32,6 +32,9 @@ def main() -> int:
     os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9"  # never contacted
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
     os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+    for k in ("SUTANDO_WORKER_ID", "SUTANDO_WORKER_SEAT", "SUTANDO_CORE_ID",
+              "SUTANDO_WORKER_LOCATION"):
+        os.environ.pop(k, None)  # hermetic: the host's seat must not leak in
 
     spec = importlib.util.spec_from_file_location(
         "rtc_push", Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py")
@@ -57,8 +60,24 @@ def main() -> int:
     snap_path.write_text(json.dumps(blob))
     check(rtc._maybe_push_workers_snapshot() is True,
           "new snapshot pushes")
+    # Seat identity is NEGOTIATED: un-advertised, the push is the exact parent
+    # envelope, so a strict relay cannot 422 it and back the push off an hour.
     check(calls == [("POST", "/v1/workers", blob)],
-          "pushed the exact blob to POST /v1/workers")
+          "un-advertised: pushes the lead's blob verbatim, no seat keys")
+    rtc._broker_worker_routing = True
+    snap_path.write_text(json.dumps({**blob, "ts": 99}))
+    os.utime(snap_path, (time.time() + 1, time.time() + 1))
+    check(rtc._maybe_push_workers_snapshot() is True
+          and calls[-1] == ("POST", "/v1/workers",
+                            {**blob, "ts": 99, "worker_id": "home", "location": "local"}),
+          "once worker-routing is advertised, the seat rides the snapshot")
+    rtc._broker_worker_routing = False
+    # Revocation changes the payload too, so it is a NEW snapshot: the seat
+    # keys must come off the wire or a strict legacy relay 422s them.
+    check(rtc._maybe_push_workers_snapshot() is True
+          and calls[-1] == ("POST", "/v1/workers", {**blob, "ts": 99}),
+          "revoking worker-routing re-pushes the legacy shape")
+    calls[:] = calls[:1]
     check(rtc._maybe_push_workers_snapshot() is False and len(calls) == 1,
           "unchanged snapshot never re-posts")
 

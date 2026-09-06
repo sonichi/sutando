@@ -6,7 +6,12 @@ event's content["space.ag2.worker"].id (ag2space-backend#882).
 The worker is read from the per-core done-flag the pool already writes
 (state/cores/<core>/done/task-<id>.flag), NOT from the "- core-N" signature
 in the body: that line is for humans, and reformatting it must not silently
-change routing or attribution.
+change routing or attribution. A seat with no done-flag (a cloud seat, or the
+home seat outside a pool) attributes to its OWN worker id — the seat that
+POSTs the result answered it — so no result ever leaves unattributed.
+
+`metadata` is an OPTIONAL extension: the client sends it only once the broker
+advertises `worker-metadata` (see gateway-worker-queue-client.test.py section 8).
 
 Run: python3 tests/gateway-result-worker-attribution.test.py
 """
@@ -14,15 +19,23 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
+_SEAT_ENV = ("SUTANDO_WORKER_ID", "SUTANDO_WORKER_SEAT", "SUTANDO_CORE_ID",
+             "SUTANDO_WORKER_LOCATION")
 
 
-def _load():
+def _load(**seat: str):
+    # The seat identity is read at import; a fresh env per load keeps the
+    # cases independent of each other and of the host's own seat.
+    for k in _SEAT_ENV:
+        os.environ.pop(k, None)
+    os.environ.update(seat)
     spec = importlib.util.spec_from_file_location("_rgb_worker", _SRC)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["_rgb_worker"] = mod
@@ -37,15 +50,21 @@ class _Captured(Exception):
 
 class WorkerAttribution(unittest.TestCase):
     def setUp(self):
-        self.mod = _load()
         self.tmp = tempfile.mkdtemp()
-        self.mod._STATE = Path(self.tmp)
-
         self.seen = {}
+        self._seat()
+
+    def _seat(self, **seat: str):
+        self.mod = _load(**seat)
+        self.mod._STATE = Path(self.tmp)
+        # Attribution is a negotiated extension; this suite is about WHICH
+        # worker is named, so grant the capability the broker would advertise.
+        self.mod._broker_worker_metadata = True
+        seen = self.seen
 
         class _Backend:
             def publish(_s, tid, payload):
-                self.seen["payload"] = json.loads(payload.decode())
+                seen["payload"] = json.loads(payload.decode())
                 raise _Captured()
 
         self.mod._delivery_core = lambda: type("C", (), {"backend": _Backend()})()
@@ -66,7 +85,7 @@ class WorkerAttribution(unittest.TestCase):
     def test_worker_rides_the_payload(self):
         self._flag("core-2", "task-0023dacce4b1f0a9c7")
         doc = self._doc("task-0023dacce4b1f0a9c7")
-        self.assertEqual(doc["metadata"], {"worker_id": "core-2"})
+        self.assertEqual(doc["metadata"], {"worker_id": "core-2", "location": "local"})
         # Attribution must not leak into the text the user reads.
         self.assertEqual(doc["body"], "done!")
 
@@ -78,15 +97,39 @@ class WorkerAttribution(unittest.TestCase):
         self.assertEqual(b["metadata"]["worker_id"], "core-3")
         self.assertNotEqual(a["metadata"], b["metadata"])
 
-    def test_control_no_flag_sends_no_metadata(self):
-        # Single-core installs write no per-core flag; absent must mean absent,
-        # never a fabricated default that would misattribute every result.
-        self.assertNotIn("metadata", self._doc("task-unflagged00000000"))
+    def test_no_flag_attributes_to_this_seat(self):
+        # Single-seat installs write no per-core flag; the seat that POSTs the
+        # result answered it, so its own id is the attribution of last resort.
+        self.assertEqual(self._doc("task-unflagged00000000")["metadata"],
+                         {"worker_id": "home", "location": "local"})
 
-    def test_control_ambiguous_flags_send_no_metadata(self):
+    def test_cloud_seat_attributes_to_itself(self):
+        # Measured defect: a cloud seat has no done-flag, and its results left
+        # with no metadata at all (worker_attribution_missing = 2 of 2).
+        self._seat(SUTANDO_WORKER_ID="cloud-1", SUTANDO_WORKER_LOCATION="cloud")
+        self.assertEqual((self.mod.WORKER_ID, self.mod.WORKER_LOCATION),
+                         ("cloud-1", "cloud"))
+        doc = self._doc("task-cloudseat0000000")
+        self.assertEqual(doc["metadata"], {"worker_id": "cloud-1", "location": "cloud"})
+        self.assertEqual(doc["body"], "done!")
+
+    def test_done_flag_outranks_the_seat(self):
+        # A pool worker's done-flag is the answering seat even when the lead
+        # (worker-1) is the one POSTing: pool attribution is unchanged.
+        self._seat(SUTANDO_WORKER_ID="worker-1")
+        self._flag("worker-2", "task-flagwins000000000")
+        self.assertEqual(self._doc("task-flagwins000000000")["metadata"]["worker_id"],
+                         "worker-2")
+        self.assertEqual(self._doc("task-noflag0000000000")["metadata"]["worker_id"],
+                         "worker-1")
+
+    def test_control_ambiguous_flags_fall_back_to_this_seat(self):
+        # Two flags name no single worker; the POSTing seat is the only fact.
+        self._seat(SUTANDO_WORKER_ID="worker-1")
         self._flag("core-1", "task-4ambiguous000000a")
         self._flag("core-2", "task-4ambiguous000000a")
-        self.assertNotIn("metadata", self._doc("task-4ambiguous000000a"))
+        self.assertEqual(self._doc("task-4ambiguous000000a")["metadata"]["worker_id"],
+                         "worker-1")
 
     def test_control_a_bare_id_does_not_attribute(self):
         # Production never passes a bare id; if one ever reaches here it must

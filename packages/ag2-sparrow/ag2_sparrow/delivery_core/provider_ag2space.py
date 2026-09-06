@@ -22,6 +22,7 @@ import urllib.error
 from typing import Callable, Optional
 
 from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
+                       is_declined_envelope,
                        ProviderCapabilities, ProviderIndeterminate,
                        ProviderRefused)
 
@@ -64,7 +65,7 @@ class AG2SpaceResultProvider:
                 f"transport failure for {item_id}: {e}") from e
         # 2xx IS confirmation here (recorded + lease-closed; see class doc);
         # only an explicit decline envelope on a 2xx maps to refusal.
-        if resp.get("ok") is False or resp.get("error") or resp.get("errcode"):
+        if is_declined_envelope(resp):
             raise ProviderRefused(f"gateway declined {item_id}: {str(resp)[:200]}")
         return DeliveryReceipt(
             outcome=DeliveryOutcome.CONFIRMED,

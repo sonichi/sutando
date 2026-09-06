@@ -260,3 +260,11 @@ class DeliveryProvider(Protocol):
         cannot answer (capability-gated). The attempt carries the payload so
         a keyed-dedup provider may reconcile by safe re-send."""
         ...
+
+
+def is_declined_envelope(resp) -> bool:
+    """A 2xx whose body explicitly declines. Transports must not treat such a
+    reply as acceptance: the request was received and refused, not applied."""
+    if not isinstance(resp, dict):
+        return False
+    return bool(resp.get("ok") is False or resp.get("error") or resp.get("errcode"))
