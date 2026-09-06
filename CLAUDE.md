@@ -178,8 +178,8 @@ _tmp="$(mktemp "$WORKSPACE/results/.task-chat-${_ts}.XXXXXX")"
 cat > "$_tmp" << EOF
 <result summary>
 EOF
-mv -f "$_tmp" "$_out"    # rename within one directory is atomic; the temp is
-                         # dot-prefixed and has no .txt, so no drain can claim it
+mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
+                         # matches a name without `.txt` (pathlib `*` sees dotfiles)
 ```
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
