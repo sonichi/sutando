@@ -360,8 +360,6 @@ GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled tas
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
-_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
-_WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
@@ -387,6 +385,11 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+# Per-instance, like every other mutable state path here: two gateways sharing
+# one workspace must not drain or delete each other's deferred control records.
+_WITHHELD_DM_CACHE = _STATE / f"withheld-review-dm{_INST_SUFFIX}.json"
+_WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results{_INST_SUFFIX}"
+_WITHHELD_CONTROL_DIR_LEGACY = _STATE / "withheld-review-control-results"
 # Optional fence for instanced lanes: claim only rooms on this suffix
 GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
 # Rooms on these suffixes belong to a foreign lane; the default lane's gateway
@@ -1107,7 +1110,27 @@ def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
         _atomic_private_json(path, {"id": task_id, "body": body})
 
 
+_LEGACY_CONTROL_WARNED = False
+
+
+def _warn_legacy_control_records() -> int:
+    """Count unsuffixed leftovers once. Never adopt them: with two instances
+    live, whoever starts first would claim records owned by the other."""
+    global _LEGACY_CONTROL_WARNED
+    try:
+        stale = sorted(_WITHHELD_CONTROL_DIR_LEGACY.glob("*.json"))
+    except OSError:
+        return 0
+    if stale and not _LEGACY_CONTROL_WARNED:
+        _LEGACY_CONTROL_WARNED = True
+        _log(f"{len(stale)} control record(s) under the pre-instance path "
+             f"{_WITHHELD_CONTROL_DIR_LEGACY}; not adopted (ownership unknown) — "
+             "move them into the owning instance's directory by hand")
+    return len(stale)
+
+
 def _retry_review_control_results() -> None:
+    _warn_legacy_control_records()
     try:
         paths = sorted(_WITHHELD_CONTROL_DIR.glob("*.json"))[:512]
     except OSError:

@@ -755,6 +755,68 @@ def main() -> int:
           "and it REVOKES both capabilities — absence of a reply is absence of evidence")
     STATE["strict_wire"] = False
 
+
+    # ---- 15. two-instance isolation of the durable control journal -----------
+    # keweichen + Codex both blocked here: one workspace, two GATEWAY_INSTANCEs.
+    def _load_inst(name: str, ws: Path, port: int, inst: str):
+        for k in SEAT_ENV:
+            os.environ.pop(k, None)
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        os.environ["SUTANDO_WORKSPACE"] = str(ws)
+        Path(ws, ".notes-migrated").touch(); Path(ws, ".build_log-migrated").touch()
+        os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{port}"
+        os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
+        os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+        os.environ["REMOTE_TASK_TIER"] = "owner"
+        os.environ["REMOTE_TASK_POLL_WAIT"] = "0"
+        os.environ["REMOTE_OUTBOUND_WATCHER"] = "off"
+        os.environ.pop("AG2_DEVICE_ENV", None)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(ws / "cfg")
+        os.environ["GATEWAY_INSTANCE"] = inst
+        spec = importlib.util.spec_from_file_location(name, LOADER)
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        os.environ.pop("GATEWAY_INSTANCE", None)
+        return mod
+
+    ws15 = root / "ws15"; ws15.mkdir()
+    prod = _load_inst("d15p", ws15, port, "prod")
+    dev = _load_inst("d15d", ws15, port, "dev")
+    check(prod._WITHHELD_CONTROL_DIR != dev._WITHHELD_CONTROL_DIR,
+          f"the two instances resolve DIFFERENT control dirs: "
+          f"{prod._WITHHELD_CONTROL_DIR.name} vs {dev._WITHHELD_CONTROL_DIR.name}")
+    check(prod._WITHHELD_DM_CACHE != dev._WITHHELD_DM_CACHE,
+          "the withheld-DM cache is per-instance too (same defect, unreported)")
+
+    tid15 = "worker-pin-909-d0d0"
+    prod._queue_review_control_result({"id": tid15})
+    check(prod._control_result_path(tid15).is_file(), "A journalled its close intent")
+    check(not dev._control_result_path(tid15).is_file(),
+          "B cannot SEE A's record — the whole point of the namespacing")
+
+    STATE["results"].clear()
+    dev._retry_review_control_results()
+    check(STATE["results"] == [],
+          f"B's drain posts nothing for A's record: {STATE['results']}")
+    check(prod._control_result_path(tid15).is_file(),
+          "and B did NOT delete it — this is the data-integrity half")
+
+    prod._retry_review_control_results()
+    check(len(STATE["results"]) == 1 and STATE["results"][0].get("id") == tid15,
+          f"A closes its own record exactly once: {STATE['results']}")
+    check(not prod._control_result_path(tid15).is_file(), "A's journal is cleared after its close")
+    STATE["results"].clear()
+    prod._retry_review_control_results()
+    check(STATE["results"] == [], "and a second drain by A posts nothing (exactly once, not at-least-once)")
+
+    legacy = ws15 / "state" / "withheld-review-control-results"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "orphan.json").write_text(json.dumps({"id": "task-orphan", "body": "[no-send]"}))
+    STATE["results"].clear()
+    prod._retry_review_control_results()
+    check(STATE["results"] == [] and (legacy / "orphan.json").is_file(),
+          "a pre-instance leftover is NEITHER adopted NOR deleted — ownership is unknown")
+    check(prod._warn_legacy_control_records() == 1, "but it IS counted, so it cannot rot silently")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
