@@ -494,6 +494,20 @@ class PinnedEntries(unittest.TestCase):
         self.assertNotIn("e1", r.head, "kept an avoidable third entry over an exhausted budget")
         self.assertTrue(r.oversized)
 
+    def test_a_pinned_anchor_does_not_grant_the_exception_to_the_next_entry(self):
+        """The anchor kept via the PIN set already satisfies the exception; the next entry pays."""
+        mk = lambda st, n, c: f"## STATE {st} — {n}\n" + (c * 800) + "\n"
+        newest = mk("2026-09-06T10:00:00Z", "newest HOLD: hands off", "x")
+        older = mk("2026-09-05T10:00:00Z", "older", "y")
+        for why, text, facing in (("newest-first", "# t\n\n" + newest + older, True),
+                                  ("newest-last", "# t\n\n" + older + newest, False)):
+            self.assertIs(ct._orientation(ct.split(text)[1]), facing, why)
+            r = ct.plan(text, 700)
+            self.assertIn("hands off", r.head, f"{why}: the pinned anchor left the head")
+            self.assertIn("older", r.archived, f"{why}: the safe entry was not archived")
+            self.assertNotIn("older", r.head, f"{why}: kept an entry the pin had already spent")
+            self.assertTrue(r.oversized)
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())
