@@ -222,7 +222,12 @@ from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_redaction import redact_chat_body  # noqa: E402
-from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
+from core_restart_intent import (  # noqa: E402
+    IntentPending,
+    await_consumption,
+    parse_restart_command,
+    write_intent,
+)
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -3101,7 +3106,8 @@ def select_rulebook_key(access_tier, is_collaborator):
     return "team-collaborator" if is_collaborator else access_tier
 
 
-async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+async def _handle_restart_command(message, text, access_tier, username, workspace,
+                                  wait_for_consumption=await_consumption) -> bool:
     """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
     is handled by the BRIDGE, not the core — the whole point is that it works
     while the core is dead. Writes the intent file for the GUI-session
@@ -3116,11 +3122,29 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
         return False
     try:
         write_intent(workspace, action, "discord")
-        ack = ("Restart requested — the app will relaunch the core in a few "
-               "seconds (authenticated, GUI session). I'll be back once it's up."
-               if action == "restart" else
-               "Stop requested — the app will stop the core in a few seconds. "
-               "It stays stopped until you say `restart core`.")
+        # Ack on CONSUMPTION, not on write (#3183): a write always succeeds, so
+        # acking there promised a restart on hosts whose executor was gone.
+        claimed = await asyncio.to_thread(wait_for_consumption, workspace)
+        if claimed:
+            ack = ("Restart requested and picked up by the executor — I'll be "
+                   "back once it's up."
+                   if action == "restart" else
+                   "Stop requested and picked up by the executor. It stays "
+                   "stopped until you say `restart core`.")
+        else:
+            # The intent stays on disk, so a late executor can still claim it
+            # before STALE_SEC — say "not yet", never "nothing will happen".
+            ack = (f"Wrote the {action} request, but **no executor picked it up "
+                   f"within 12s**. It may still run if one starts before the "
+                   f"request expires in 10 minutes. If nothing consumes "
+                   f"`state/core-restart-requested.json` on this host (the "
+                   f"desktop app, or a launchd executor), it will simply lapse.")
+    except IntentPending as pending:
+        # One intent at a time: acking a superseded request would report the
+        # wrong action as picked up when the survivor's deletion arrives.
+        ack = (f"A **{pending.action}** request is already pending and not yet "
+               f"picked up, so I did not queue the {action}. Wait for that one "
+               f"to be consumed (or to expire in 10 minutes), then ask again.")
     except Exception as exc:
         ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
     print(f"  [core-restart] owner {action} command from @{username}", flush=True)
