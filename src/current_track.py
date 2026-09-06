@@ -14,6 +14,10 @@ before the head is replaced, so a crash leaves a duplicate, never a gap.
     replace(path, text)               -> None   (create or rewrite the whole head)
     rotate(path, keep_bytes, pin) -> RotateResult(head, archived, oversized)
 
+A pinned entry (an owner hold, say) is kept in the head AND archived at its own
+position, so retiring the pin later cannot reorder history; the archive is
+append-only and never takes the same entry twice.
+
 An entry that alone exceeds keep_bytes is never truncated: rotate() keeps it,
 archives everything older, and reports oversized=True so a caller can refuse
 loudly instead of reporting "nothing to do" forever.
@@ -115,9 +119,28 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
         keep.add(i)
         used += _size(entries[i])
     head = preamble + "".join(entries[i] for i in sorted(keep))
-    archived = "".join(entries[i] for i in range(len(entries)) if i not in keep)
+    # A pinned entry is archived at its historical position AND kept in the head:
+    # the archive stays chronological, so retiring a pin cannot reorder history.
+    archived = "".join(entries[i] for i in range(len(entries))
+                       if i not in keep or i in pinned)
     pinned_bytes = sum(_size(entries[i]) for i in pinned)
     return RotateResult(head, archived, _size(head) > keep_bytes, pinned_bytes, len(pinned))
+
+
+def _not_yet_archived(archive: Path, outgoing: str) -> str:
+    """Entries of `outgoing` the archive does not already hold, in order.
+
+    A pinned entry is archived when it is first skipped, so the rotation that
+    follows its retirement must not append it a second time.
+    """
+    try:
+        have = archive.read_text(encoding="utf-8")
+    except OSError:
+        return outgoing
+    _, entries = split(outgoing)
+    if not entries:
+        return outgoing if outgoing not in have else ""
+    return "".join(e for e in entries if e not in have)
 
 
 def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
@@ -131,8 +154,10 @@ def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
         if dry_run or not r.archived:
             return r
         archive = path.with_name(path.stem + "-archive.md")
-        with open(archive, "a", encoding="utf-8") as f:   # archive first: a crash duplicates, never loses
-            f.write(r.archived)
+        fresh = _not_yet_archived(archive, r.archived)
+        if fresh:
+            with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
+                f.write(fresh)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_text(r.head, encoding="utf-8")
         os.replace(tmp, path)

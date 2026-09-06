@@ -64,7 +64,7 @@ class Plan(unittest.TestCase):
         self.assertEqual((r.head, r.archived, r.oversized), (text, "", False))
 
     def test_head_plus_archive_is_the_original_and_newest_kept(self):
-        pre, ents = fixture(); text = pre + "".join(ents)
+        pre, ents = fixture(); text = pre + "".join(ents)   # no pins in this fixture
         r = ct.plan(text, 8 * 1024)
         self.assertEqual(pre + r.archived + r.head[len(pre):], text)
         self.assertTrue(r.head.startswith(pre))
@@ -102,8 +102,9 @@ class PinnedEntries(unittest.TestCase):
         text = self.corpus()
         for keep in (8 * 1024, 16 * 1024, 32 * 1024):
             r = ct.plan(text, keep)
+            # The LIVE copy must be in the head. The archive also carries a
+            # historical copy at its own position; that is the ordering contract.
             self.assertIn("hands off #3166", r.head, f"hold archived at keep={keep}")
-            self.assertNotIn("hands off #3166", r.archived)
             self.assertIn("entry 59", r.head)          # newest ordinary entry still kept
             self.assertIn("entry 0", r.archived)       # ordinary old entries still rotate
 
@@ -154,6 +155,53 @@ class PinnedEntries(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
         self.assertIn("the newest entry alone", r.stderr)
         self.assertNotIn("pinned entries", r.stderr)
+
+    def test_a_pinned_entry_is_archived_in_place_and_kept_in_the_head(self):
+        """Its historical copy goes to the archive at its own position; the live copy stays."""
+        text = self.corpus()
+        r = ct.plan(text, 8 * 1024)
+        self.assertIn("hands off #3166", r.head)          # live copy
+        self.assertIn("hands off #3166", r.archived)      # historical copy
+        self.assertLess(r.archived.index("hands off #3166"), r.archived.index("entry 0"))
+
+    def test_two_passes_retiring_the_pin_keeps_reconstruction_order(self):
+        """P,A,B,C: rotate with the pin, retire it, rotate again — order holds, no duplicate."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        pre = "# t\n\n"
+        P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
+        A = "## 2026-05-01T00:00Z — A\n" + ("a" * 3000) + "\n\n"
+        B = "## 2026-06-01T00:00Z — B\n" + ("b" * 3000) + "\n\n"
+        C = "## 2026-09-06T00:00Z — C newest\n" + ("c" * 3000) + "\n\n"
+        p.write_text(pre + P + A + B + C)
+        archive = p.with_name("current-track-archive.md")
+
+        ct.rotate(p, 5 * 1024)                      # pass 1: P pinned, A and B leave
+        self.assertIn("hands off #3166", p.read_text())
+        first = archive.read_text()
+        self.assertLess(first.index("hands off"), first.index("— A"))
+        self.assertLess(first.index("— A"), first.index("— B"))
+
+        ct.rotate(p, 1024, pin=None)                # pass 2: the pin is retired
+        after = archive.read_text()
+        self.assertEqual(after.count("hands off #3166"), 1, "the retired pin was archived twice")
+        self.assertLess(after.index("hands off"), after.index("— A"))
+        self.assertLess(after.index("— A"), after.index("— B"))
+
+    def test_reconstruction_is_the_archive_then_whatever_the_head_still_holds(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        p.write_text(self.corpus())
+        original = p.read_text()
+        ct.rotate(p, 8 * 1024)
+        archive = p.with_name("current-track-archive.md").read_text()
+        _, orig_entries = ct.split(original)
+        _, arch_entries = ct.split(archive)
+        orig_order = [e.splitlines()[0] for e in orig_entries]
+        arch_order = [e.splitlines()[0] for e in arch_entries]
+        # Same relative order the file had; the fixture's stamps are not
+        # monotonic, so sorting them would test the fixture, not the contract.
+        self.assertEqual(arch_order, [h for h in orig_order if h in arch_order])
 
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
