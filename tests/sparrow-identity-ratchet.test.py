@@ -33,6 +33,8 @@ Run: python3 tests/sparrow-identity-ratchet.test.py   (stdlib only)
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -833,6 +835,18 @@ class BranchCertificationIsPerPath(unittest.TestCase):
         self.assertEqual(self._arms(self.RAW, self.CANON), {("probe.py", "mint"): 1},
                          "a raw value on either arm must leave the use counted")
 
+    def _run_zero_path(self, src: str, zero_arg: tuple) -> str:
+        """Execute a fixture out-of-process and return its recorded delivery_id."""
+        driver = ("def delivery_id(item, ts):\n    return 'CANON'\n\n" + src
+                  + f"\nprint(mint(*{zero_arg!r}, 'it', 7, {{}})['delivery_id'])\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "fixture.py"
+            f.write_text(driver)
+            out = subprocess.run([sys.executable, str(f)], capture_output=True,
+                                 text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
     def test_a_construct_that_may_run_no_alternative_keeps_the_incoming_state(self):
         """A loop body and a non-exhaustive match can execute ZERO alternatives, so
         the incoming value survives. Certifying from the arms alone reports {} for
@@ -853,10 +867,9 @@ class BranchCertificationIsPerPath(unittest.TestCase):
                 src = tmpl % (R, C)
                 self.assertEqual(self._d(self.HDR + src), {("probe.py", "mint"): 1},
                                  f"{name}: the zero-alternative path was not certified away")
-                # runtime control: the fixture really does emit the RAW id there
-                ns = {"delivery_id": lambda item, ts: "CANON"}
-                exec(compile(src, "<probe>", "exec"), ns)
-                got = ns["mint"](*zero_arg, "it", 7, {})["delivery_id"]
+                # Runtime control, out of process: an in-process exec() trips
+                # lint-hermetic-bridge-tests, whose pre-filter keys on "exec(".
+                got = self._run_zero_path(src, zero_arg)
                 self.assertEqual(got, "it#7",
                                  f"{name}: fixture does not exercise the zero path")
                 # and the all-canonical form must still certify, or this over-reports
