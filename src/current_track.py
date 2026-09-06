@@ -18,6 +18,11 @@ appended to it, in the order entries leave. The archive is written before the
 head is replaced, so an interruption between the two repeats that batch on the
 next run rather than losing it.
 
+Orientation is detected, not assumed, and it has THREE answers. When the stamps
+that both entries carry cannot order them -- a date-only heading against a
+second-precision one -- rotation keeps BOTH ends rather than guessing, since the
+live entry sits at one of them.
+
 What it does NOT promise, and cannot while replace() exists:
   * exactly once -- the interruption above is a real duplicate, chosen over a
     real loss;
@@ -107,32 +112,37 @@ _STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?
 
 
 def _stamp_key(line: str):
-    """A comparable key, not the matched text: 'T' and ' ' separate identically and
-    a minute-precision stamp must not tie with a second-precision one."""
+    """(components, precision). Precision is how many components the stamp ACTUALLY
+    carried: a zero-filled date-only stamp must not read as midnight."""
     m = _STAMP.search(line)
     if not m:
         return None
     y, mo, d, h, mi, sec = m.groups()
-    return (int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(sec or 0))
+    parts = (int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(sec or 0))
+    return parts, (6 if sec else 5 if h else 3)
 
 
-def _newest_first(entries) -> bool:
-    """True when entry 1 is NEWER than entry N, so the newest sits at the head.
+def _cmp_stamps(a, b) -> int:
+    """Order on the precision BOTH carry; equal there means undetermined, not equal."""
+    n = min(a[1], b[1])
+    ka, kb = a[0][:n], b[0][:n]
+    return (ka > kb) - (ka < kb)
 
-    context-reconstruct's maintain contract PREPENDS a rewritten state block, so a
-    real file can run either way; assuming append-only archives the live entry.
+
+def _orientation(entries):
+    """True newest-first, False newest-last, None undetermined.
+
+    None is a real answer: `2026-09-06` against `2026-09-06T08:00:00Z` says nothing
+    about their order, and guessing archives whichever live entry the guess misses.
     """
     keys = [k for k in (_stamp_key(e.splitlines()[0]) for e in entries) if k]
     if len(keys) < 2:
-        return False
-    if keys[0] != keys[-1]:
-        return keys[0] > keys[-1]
-    # The ends tie (one timestamp, or one minute). Ask the first pair that does not,
-    # rather than reading a tie as "not newest-first" and keeping the wrong end.
-    for a, b in zip(keys, keys[1:]):
-        if a != b:
-            return a > b
-    return False
+        return None
+    for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:])):
+        c = _cmp_stamps(a, b)
+        if c:
+            return c > 0
+    return None
 
 
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
@@ -151,11 +161,15 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in pinned)
     # Walk from the NEWEST end, whichever end that is; a pin never stops the walk,
     # or an old hold would freeze the archive and rotation would free nothing.
-    order = (list(range(len(entries))) if _newest_first(entries)
+    facing = _orientation(entries)
+    order = (list(range(len(entries))) if facing
              else list(range(len(entries) - 1, -1, -1)))
-    keep, used, started = set(pinned), 0, False
+    # Undetermined orientation protects BOTH ends: the live entry sits at one of
+    # them, and no walk direction can be shown to keep it.
+    keep = set(pinned) | ({0, len(entries) - 1} if facing is None else set())
+    used, started = 0, False
     for i in order:
-        if i in pinned:
+        if i in keep:
             continue
         if started and used + _size(entries[i]) > budget:
             break

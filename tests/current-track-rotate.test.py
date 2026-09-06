@@ -301,19 +301,19 @@ class PinnedEntries(unittest.TestCase):
         p = Path(d.name) / "current-track.md"
         archive = p.with_name("current-track-archive.md")
         E = lambda h: f"## {h}\n" + ("x" * 900) + "\n\n"
-        p.write_text("# t\n\n" + E("03:00Z A") + E("01:00Z P HOLD: hands off")
-                     + E("03:00Z B equal-stamp") + E("undated C") + E("09:00Z D newest"))
+        p.write_text("# t\n\n" + E("2026-09-01T03:00Z A") + E("2026-09-02T01:00Z P HOLD: hands off")
+                     + E("2026-09-03T03:00Z B equal-stamp") + E("undated C") + E("2026-09-05T09:00Z D newest"))
         original = [e.splitlines()[0] for e in ct.split(p.read_text())[1]]
         ct.rotate(p, 2400)
         first = [e.splitlines()[0] for e in ct.split(archive.read_text())[1]]
-        self.assertNotIn("## 01:00Z P HOLD: hands off", first)
+        self.assertNotIn("## 2026-09-02T01:00Z P HOLD: hands off", first)
         self.assertEqual(first, [h for h in original if h in first])   # file order, no reordering
         ct.rotate(p, 1200, pin=None)
         after = [e.splitlines()[0] for e in ct.split(archive.read_text())[1]]
         self.assertEqual(after[:len(first)], first)                    # earlier departures untouched
-        pin = "## 01:00Z P HOLD: hands off"
+        pin = "## 2026-09-02T01:00Z P HOLD: hands off"
         self.assertEqual(after.count(pin), 1)
-        self.assertGreater(after.index(pin), after.index("## 03:00Z A"))  # departure, not stamp
+        self.assertGreater(after.index(pin), after.index("## 2026-09-01T03:00Z A"))  # departure, not stamp
         self.assertEqual(sorted(after + [e.splitlines()[0] for e in ct.split(p.read_text())[1]]),
                          sorted(original))                             # every entry, exactly once
 
@@ -322,8 +322,8 @@ class PinnedEntries(unittest.TestCase):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"
         archive = p.with_name("current-track-archive.md")
-        body = lambda c: f"## 2026-09-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
-        p.write_text("# t\n\n" + body("A") + body("B") + body("C"))
+        body = lambda n, c: f"## 2026-09-0{n}T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
+        p.write_text("# t\n\n" + body(1, "A") + body(2, "B") + body(3, "C"))
 
         class Boom(Exception):
             pass
@@ -425,15 +425,50 @@ class PinnedEntries(unittest.TestCase):
                              f"{why}: archived the entry a consumer reads first")
 
     def test_identical_stamps_at_both_ends_ask_the_next_pair(self):
-        """Ends tying must not read as 'not newest-first'; look inward before defaulting."""
+        """Ends tying must not decide; look inward, and say None when nothing decides."""
         E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 500) + "\n"
         same = "2026-09-06T08:33:10Z"
         entries = ct.split(E(same, "a") + E("2026-09-06T09:00:00Z", "b") + E(same, "c"))[1]
-        self.assertFalse(ct._newest_first(entries))     # a < b, so oldest-first
+        self.assertIs(ct._orientation(entries), False)
         entries = ct.split(E(same, "a") + E("2026-09-06T07:00:00Z", "b") + E(same, "c"))[1]
-        self.assertTrue(ct._newest_first(entries))      # a > b, so newest-first
+        self.assertIs(ct._orientation(entries), True)
         flat = ct.split(E(same, "a") + E(same, "b"))[1]
-        self.assertFalse(ct._newest_first(flat))        # no evidence -> documented default
+        self.assertIsNone(ct._orientation(flat))
+
+    def test_a_coarse_current_stamp_is_not_read_as_older(self):
+        """Zero-filling made '2026-09-06' sort below '2026-09-06T08:00:00Z' and archive it."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 900) + "\n"
+        cases = [("date-only vs second", "2026-09-06", "2026-09-06T08:00:00Z"),
+                 ("minute vs second", "2026-09-06T10:27", "2026-09-06T10:27:02Z")]
+        for why, newest, oldest in cases:
+            d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+            p = Path(d.name) / "current-track.md"
+            p.write_text(E(newest, "newest") + E(oldest, "oldest"))
+            ct.rotate(p, 1200, pin=None)
+            archive = p.with_name("current-track-archive.md")
+            self.assertIn("newest", p.read_text(), f"{why}: the current entry left the head")
+            if archive.exists():
+                self.assertNotIn("newest", archive.read_text(), f"{why}: archived the current entry")
+
+    def test_shared_precision_decides_and_an_equal_prefix_is_undetermined(self):
+        """Compare only what both stamps carry; an equal prefix at differing precision decides nothing."""
+        k = ct._stamp_key
+        date_only, second = k("## 2026-09-06 — a"), k("## 2026-09-06T08:00:00Z — b")
+        self.assertEqual((date_only[1], second[1]), (3, 6))
+        self.assertEqual(ct._cmp_stamps(date_only, second), 0)
+        self.assertEqual(ct._cmp_stamps(k("## 2026-09-07 — a"), second), 1)
+        E = lambda st: f"## STATE {st} — e\n" + ("x" * 300) + "\n"
+        self.assertIsNone(ct._orientation(ct.split(E("2026-09-06") + E("2026-09-06T08:00:00Z"))[1]))
+
+    def test_an_undetermined_file_keeps_both_ends(self):
+        """No walk direction can be shown correct, so neither end may be archived."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 900) + "\n"
+        text = "# t\n\n" + E("2026-09-06", "first") + E("2026-09-06T08:00:00Z", "middle") + E("2026-09-06", "last")
+        r = ct.plan(text, 1200)
+        self.assertIn("first", r.head)
+        self.assertIn("last", r.head)
+        self.assertNotIn("first", r.archived)
+        self.assertNotIn("last", r.archived)
 
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
