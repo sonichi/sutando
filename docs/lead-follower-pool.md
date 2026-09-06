@@ -255,6 +255,22 @@ answered a task
 the lead routed); a cloud seat has no done-flag, so its own `SUTANDO_WORKER_ID`
 is the attribution of last resort (`cloud-1` / `cloud`, never an empty payload).
 
+#### Packaging a cloud worker (slice 2 — one container per user)
+
+`deploy/cloud-worker/` packages one cloud seat as a container: the gateway
+client above in cloud mode (`SUTANDO_WORKER_LOCATION=cloud`, `GATEWAY_INSTANCE`
+default `cloud`) plus a seat runtime chosen by `SUTANDO_WORKER_RUNTIME` —
+`stub` (answers every task, the test double), `claude` (the Claude Code CLI
+seat, one subscription login per container on the `/workspace` volume),
+`ag2-assistant` (the backup seat: an AG2 Assistant sidecar on a Gemini key,
+driven over ACP, its own brain and memory) or `adapter` (a
+`/workspace/runtime.sh` hook for the Agent SDK / codex app-server seats that
+do not exist yet). One container = one broker token + one worker
+id; `provision.sh <worker-id> <env-file>` creates it, `deprovision.sh` removes
+it, and the `HEALTHCHECK` reads the client's `state/gateway-status.<instance>.json`.
+Env contract, runtime auth, the at-least-once note and what is not done:
+[`deploy/cloud-worker/README.md`](../deploy/cloud-worker/README.md).
+
 ### Turning on a Codex follower
 
 The runtime dimension (`--runtime` / `--core-runtime`) declares which CLI a core
