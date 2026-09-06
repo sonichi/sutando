@@ -18,7 +18,6 @@ Namespace prefixes keep the kinds parseable and collision-free:
 from __future__ import annotations
 
 import hashlib
-import re
 
 from .types import (AttemptId, DeliveryId, IdempotencyKey, IncarnationId,
                     TaskId)
@@ -74,9 +73,12 @@ _LEGACY_DIGEST = 16
 _EMPTY_KEY_FILL = "empty-content-key-" * 5
 
 
-def _readable_prefix(esc: str) -> str:
+def _readable_prefix(value: str) -> str:
+    # One character can escape to SEVERAL %XX tokens, so the indivisible unit
+    # is the character, not the escape; a split one is not decodable UTF-8.
     out, n = [], 0
-    for tok in re.findall(r"%[0-9A-F]{2}|.", esc):   # never split an escape
+    for ch in value:
+        tok = escape_component(ch)
         if n + len(tok) > _LEGACY_READABLE:
             break
         out.append(tok)
@@ -88,12 +90,12 @@ def _bounded_legacy_component(content_key: str) -> str:
     if not isinstance(content_key, str):
         raise ValueError("legacy content key must be a string")
     if content_key == "":
-        prefix = _readable_prefix(escape_component(_EMPTY_KEY_FILL))
+        prefix = _readable_prefix(_EMPTY_KEY_FILL)
     else:
         esc = escape_component(content_key)
         if len(esc) <= _LEGACY_READABLE:
             return esc
-        prefix = _readable_prefix(esc)
+        prefix = _readable_prefix(content_key)
     digest = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:_LEGACY_DIGEST]
     return f"{prefix}.{digest}"
 

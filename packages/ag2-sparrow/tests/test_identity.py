@@ -349,7 +349,10 @@ class LegacyDeliveryIdStaysBounded(unittest.TestCase):
     escape-dense item takes a digest form rather than raising — and the
     ids derived from it (attempt, resend) must still fit."""
 
-    LONG = ("x" * 191, "/" * 65, "\u00e9" * 100, "a b" * 70)
+    # 2-, 3- and 4-byte characters: the readable bound is a CHARACTER
+    # boundary, and only the 2-byte case was covered when it regressed.
+    LONG = ("x" * 191, "/" * 65, "\u00e9" * 100, "a b" * 70,
+            "\u754c" * 100, "\U0001f4a5" * 100)
 
     def test_long_items_map_and_stay_derivable(self):
         for item in self.LONG:
@@ -361,6 +364,21 @@ class LegacyDeliveryIdStaysBounded(unittest.TestCase):
                 I.resend_delivery_id(m.delivery_id, 1)
                 self.assertEqual(m.idempotency_key.value, f"{item}#0",
                                  "the provider key must stay byte-for-byte")
+
+    def test_the_readable_prefix_never_splits_a_character(self):
+        """A multi-byte character escapes to several %XX tokens. Bounding on
+        tokens instead of characters leaves a dangling `%E7%95`, which is not
+        decodable and fails canonicalisation downstream."""
+        for ch in ("\u00e9", "\u754c", "\U0001f4a5"):
+            with self.subTest(char=ch, utf8_len=len(ch.encode())):
+                value = I.legacy_delivery_id(ch * 100, "gw").value
+                readable = value.split(":", 1)[1].rsplit("@", 1)[0]
+                if "." in readable:
+                    readable = readable.rsplit(".", 1)[0]
+                raw = bytes(int(readable[i + 1:i + 3], 16)
+                            for i in range(0, len(readable), 3))
+                # decodes without error <=> no character was cut in half
+                self.assertEqual(raw.decode("utf-8"), ch * (len(raw) // len(ch.encode())))
 
     def test_readable_and_digest_forms_are_disjoint(self):
         """A valid short key whose escaped form spells `<80 readable>.<16 hex>`
