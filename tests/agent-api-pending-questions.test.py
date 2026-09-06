@@ -228,6 +228,16 @@ class TestPython39AndTimezones(unittest.TestCase):
         self.assertEqual(0, r.returncode, f"3.9 rejected the helper: {r.stderr[-300:]}")
         self.assertEqual("2020-01-01T02:20Z", r.stdout.strip())
 
+    def test_a_shaped_but_impossible_date_is_not_an_age(self):
+        """`2026-13-45` matches the heading regex and no strptime format — the branch
+        must fall through to (None, None) rather than raise or invent an age."""
+        asked, dt = api._parse_asked_date("2026-13-45 — not a real date")
+        self.assertIsNone(asked)
+        self.assertIsNone(dt)
+        q = api.parse_pending_questions("# Q\n\n## 2026-13-45 — not a real date\nBody.\n")[0]
+        self.assertIsNone(q["asked"])
+        self.assertIsNone(q["age_days"])
+
     def test_a_Z_heading_is_utc_not_local(self):
         """Parsed naive and compared to a local now(), a just-asked question reports -1."""
         _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
