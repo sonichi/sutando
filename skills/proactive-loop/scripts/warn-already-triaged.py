@@ -22,11 +22,40 @@ import re
 import sys
 
 def parking_files():
-    """The per-host parking files, resolved by the repo's own `personal_path`."""
+    """Everywhere a triage is parked, resolved by the repo's own helpers.
+
+    Core memory is a parking location, not just a preference store: a chronic
+    warn whose decision is settled is written there rather than to a file that
+    waits on a human. Omitting it reported those as untriaged, which is the one
+    verdict that invites re-deriving a decision already made.
+    """
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
-    from util_paths import personal_path
-    return [p for p in (personal_path("pending-questions.md"),
-                        personal_path("current-track.md")) if p.exists()]
+    from util_paths import memory_dir, personal_path
+    files = [p for p in (personal_path("pending-questions.md"),
+                         personal_path("current-track.md")) if p.exists()]
+    mem = memory_dir()
+    if mem.is_dir():
+        files.extend(sorted(p for p in mem.glob("*.md") if p.is_file()))
+    return files
+
+
+def display(path):
+    """`memory/<name>` for a memory file, bare name otherwise.
+
+    A pending question waits on a human; a memory records a decision already
+    taken. The reader must be able to tell which one a hit is.
+    """
+    return f"memory/{path.name}" if path.parent.name == "memory" else path.name
+
+
+_LINES = {}
+
+def lines_of(path):
+    """Read once per run: the corpus is now dozens of files x tokens x warns."""
+    key = str(path)
+    if key not in _LINES:
+        _LINES[key] = path.read_text(errors="ignore").splitlines()
+    return _LINES[key]
 
 # entities worth searching for: paths, dotted filenames, backticked identifiers
 # Component count is unbounded; the 3..40 length check below is the only size
@@ -64,11 +93,11 @@ def report(name, text, files):
     hits, seen_at = [], set()
     for tok in toks:
         for f in files:
-            for i, line in enumerate(f.read_text(errors="ignore").splitlines(), 1):
+            for i, line in enumerate(lines_of(f), 1):
                 if tok.lower() in line.lower() and line.lstrip().startswith("#"):
-                    if (f.name, i) not in seen_at:
-                        seen_at.add((f.name, i))
-                        hits.append((tok, f.name, i, line.strip()[:92]))
+                    if (display(f), i) not in seen_at:
+                        seen_at.add((display(f), i))
+                        hits.append((tok, display(f), i, line.strip()[:92]))
                     break
     if hits:
         # ALL candidates, not just the first. A probe warns for SEVERAL distinct
@@ -80,9 +109,9 @@ def report(name, text, files):
     body = []
     for tok in toks:
         for f in files:
-            for i, line in enumerate(f.read_text(errors="ignore").splitlines(), 1):
+            for i, line in enumerate(lines_of(f), 1):
                 if tok.lower() in line.lower():
-                    body.append((tok, f.name, i)); break
+                    body.append((tok, display(f), i)); break
     if body:
         # "No heading" is NOT "nothing written" — material is often parked in a
         # BODY under a neighbouring heading.

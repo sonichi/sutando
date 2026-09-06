@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from local_task_protocol import find_result  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
@@ -145,15 +146,41 @@ def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:
         fields: dict = {}
         for l in p.read_text(encoding="utf-8", errors="replace").splitlines():
             k, _, v = l.partition(":")
-            if k in ("user_id", "task", "channel_id") and k not in fields:
+            if k in ("user_id", "task", "channel_id", "sender_name") and k not in fields:
                 fields[k] = v.strip()
         task = {"id": task_id}
         if fields.get("user_id"):
             task["from"] = fields["user_id"]
+        if fields.get("sender_name"):
+            task["sender"] = fields["sender_name"]
         if fields.get("task"):
             task["text"] = fields["task"][:160]
         return task, fields.get("channel_id") or None
     return None
+
+
+def manifest_config(key: str) -> str:
+    """This skill's declared setting (manifest.json `config`), the source below an env override."""
+    try:
+        data = json.loads((Path(__file__).resolve().parents[1] / "manifest.json").read_text())
+        val = (data.get("config") or {}).get(key)
+        return val if isinstance(val, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def pickup_line(task: dict) -> str:
+    """The lifecycle's first row as the owner reads it: which agent, whose message, its start."""
+    agent = os.environ.get("AGENT_DISPLAY_NAME") or manifest_config("AGENT_DISPLAY_NAME") or "Your agent"
+    who = task.get("sender") or task.get("from") or "unknown"
+    text = task.get("text") or ""
+    return f"{agent} is working on a task from {who}: {text[:20]}{'…' if len(text) > 20 else ''}"
+
+
+def answered(ws: Path, task_id: str) -> bool:
+    """A result exists — live, or archived in any shape the delivery paths write (the shared lookup
+    knows the epoch-suffixed, month-partitioned and retention layouts): the task is finished."""
+    return find_result(ws / "results", task_id) is not None
 
 
 def working_line(tool_name: str, tool_input) -> str | None:
@@ -245,15 +272,17 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         # First touch of a task file by this session: bind it and write its processing row from the
         # task's own headers — the agent never has to remember to.
         for tid in task_file_refs(blob):
-            if tid in binds:
+            # A late touch of an answered task (a dedup check, a re-read) must not reopen it.
+            if tid in binds or answered(p["ws"], tid):
                 continue
             found = task_header(p["ws"], tid)
             if not found:
                 continue
             task, room = found
+            line = pickup_line(task)
             bind(p, tid, sid)
-            emit("processing", "picked up", task, room, p["ws"], run)
-            out.append(("processing", "picked up"))
+            emit("processing", line, task, room, p["ws"], run)
+            out.append(("processing", line))
         if out:
             return out
         if result_file_refs(blob):

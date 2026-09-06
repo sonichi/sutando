@@ -359,6 +359,27 @@ def claude_project_slug(path: str | Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
+def default_memory_dir() -> Path:
+    """Claude Code's memory dir for THIS checkout, ignoring any override.
+
+    Composed here so `SUTANDO_MEMORY_DIR`'s divergence check and every reader
+    of the corpus agree on what the un-overridden location is.
+    """
+    repo = Path(__file__).parent.parent.resolve()
+    return claude_home_path("projects", claude_project_slug(repo), "memory")
+
+
+def memory_dir() -> Path:
+    """The core-memory dir a reader should actually read.
+
+    Resolves through `_memory_dir_env()`, exactly as `personal_path()` and
+    `shared_personal_path()` do, so a host on the legacy `SUTANDO_PRIVATE_DIR`
+    alias reads its real corpus instead of an empty default path.
+    """
+    root = _memory_dir_env()
+    return Path(os.path.expanduser(root)) if root else default_memory_dir()
+
+
 def channel_access_path(source: str) -> Path:
     """Resolve `channels/<source>/access.json` inside the configured Claude home.
 
