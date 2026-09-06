@@ -20,70 +20,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-from workspace_default import resolve_workspace  # noqa: E402
-
-KINDS = ("processing", "thinking", "working", "notice", "done")
-TEXT_MAX = 160
-
-
-def log_path(workspace: Path | None = None) -> Path:
-    return (workspace or resolve_workspace()) / "state" / "agent-activity.jsonl"
-
-
-def summaries_path(workspace: Path | None = None) -> Path:
-    """One line per finished task: what the folded card shows after the task's rows have left the
-    live log. Never rotated; ~200 bytes a task."""
-    return (workspace or resolve_workspace()) / "state" / "agent-activity.summaries.jsonl"
-
-
-def day_of(ts: float) -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime(ts))
-
-
-def index_path(workspace: Path | None = None) -> Path:
-    """Per open task: {task, room, started, rows, days}. Updated on every append under the writer
-    lock, so a summary is exact after any rotation; an entry leaves when its task is summarized."""
-    return (workspace or resolve_workspace()) / "state" / "agent-activity.index.json"
-
-
-def _load_index(path: Path) -> dict:
-    try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_index(path: Path, d: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def day_range(start_ts: float, end_ts: float) -> list[str]:
-    """Every UTC day from start to end inclusive: the complete list of archive files that can hold
-    a row of the span, never just its two ends."""
-    out, t = [], start_ts
-    while day_of(t) <= day_of(end_ts):
-        out.append(day_of(t))
-        t += 86400
-    return out
-
-
-def open_task_index(workspace: Path | None = None) -> dict:
-    """The tasks the index still holds open: what the hook falls back to when a task's rows have
-    rotated out of the live log but its result now exists."""
-    return _load_index(index_path(workspace))
-
-
-def default_room(workspace: Path | None = None) -> str | None:
-    """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
-    p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
-    try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-    return d.get("channel_id") if d.get("channel") == "ag2space" else None
+from workspace_default import resolve_workspace  # noqa: E402,F401
+from activity_rows import (  # noqa: E402,F401  (the writer lives in core; the CLI keeps these names)
+    KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, default_room, index_path, log_path, open_task_index,
+    rotate, summaries_path, summarize,
+)
 
 
 def task_from_file(path: Path) -> tuple[dict, str | None]:
@@ -101,90 +42,6 @@ def task_from_file(path: Path) -> tuple[dict, str | None]:
     if fields.get("source_message_id"):
         task["event"] = fields["source_message_id"]  # the client mounts the card under this message
     return task, fields.get("channel_id") or None
-
-
-def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
-           done: bool = False, workspace: Path | None = None, live_rows: int | None = None) -> dict:
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}")
-    rec: dict = {"ts": time.time(), "line": line.strip(), "kind": kind}
-    if room:
-        rec["room"] = room
-    if task:
-        rec["task"] = task
-    if done:
-        rec["done"] = True
-    path = log_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # One lock for the append AND the rotation; the log is opened only under it, so no writer holds
-    # an inode that a concurrent rotation replaces.
-    with open(path.with_suffix(".lock"), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        if task and isinstance(task.get("id"), str):
-            ip = index_path(workspace)
-            idx = _load_index(ip)
-            e = idx.get(task["id"]) or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
-            e["rows"] = int(e.get("rows", 0)) + 1
-            e["started"] = min(float(e.get("started", rec["ts"])), rec["ts"])
-            e["task"] = dict(e.get("task") or {}, **task)
-            if room:
-                e["room"] = room
-            if done:
-                idx.pop(task["id"], None)
-                summarize(rec, e, workspace)
-            else:
-                idx[task["id"]] = e
-            _save_index(ip, idx)
-        rotate(path, live_rows if live_rows is not None else LIVE_ROWS)
-    return rec
-
-
-def summarize(done_rec: dict, entry: dict, workspace: Path | None = None) -> dict:
-    """Append the task's durable summary from the index entry — exact whether or not its rows have
-    rotated out — with `days` as every UTC day of the span, the complete archive fetch list.
-    Called with the writer lock held."""
-    started = float(entry.get("started", done_rec["ts"]))
-    summary = {"ts": done_rec["ts"], "started": started, "rows": max(int(entry.get("rows", 1)), 1),
-               "days": day_range(started, done_rec["ts"]), "line": done_rec["line"], "task": done_rec["task"]}
-    if done_rec.get("room"):
-        summary["room"] = done_rec["room"]
-    sp = summaries_path(workspace)
-    with open(sp, "a", encoding="utf-8") as f:
-        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
-    return summary
-
-
-LIVE_ROWS = 400
-
-
-def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
-    """The live file keeps the newest `keep` rows; older rows move to <name>.archive.jsonl, so every
-    reader that re-parses the live file per event stays bounded. Called with the writer lock held."""
-    try:
-        rows = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    if len(rows) <= keep:
-        return
-    # One archive file per UTC day of the row's own timestamp, so a reader expanding an old card
-    # fetches one small immutable file, not the whole history; a torn row goes to the undated file.
-    by_day: dict[str, list[str]] = {}
-    for line in rows[:-keep]:
-        try:
-            ts = json.loads(line).get("ts")
-            day = day_of(ts) if isinstance(ts, (int, float)) else None
-        except (ValueError, AttributeError):
-            day = None
-        by_day.setdefault(day, []).append(line)
-    for day, lines in by_day.items():
-        name = f"{path.stem}.archive.{day}.jsonl" if day else f"{path.stem}.archive.jsonl"
-        with open(path.with_name(name), "a", encoding="utf-8") as arch:
-            arch.write("\n".join(lines) + "\n")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text("\n".join(rows[-keep:]) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
 
 
 def queued(task_file: Path, workspace: Path | None = None) -> int:
