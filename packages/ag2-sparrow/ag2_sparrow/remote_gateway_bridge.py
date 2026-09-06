@@ -385,9 +385,9 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
-# The JOURNAL is instance-owned, so EVERY lane gets an owned directory -- the
-# default one included, or its path collapses onto the legacy path below.
-_CONTROL_OWNER = GATEWAY_INSTANCE or "default"
+# Injective: a named lane always carries the `named.` infix and _INSTANCE_RE
+# forbids dots, so no instance name can spell the unnamed lane's directory.
+_CONTROL_OWNER = f"named.{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else "primary"
 _WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results.{_CONTROL_OWNER}"
 # The review DM is OWNER-owned, not instance-owned, and is already keyed by
 # owner on read; namespacing it would create one duplicate room per instance.
@@ -1166,6 +1166,8 @@ _WORKER_PIN_RE = re.compile(r"worker-pin-[0-9]+-[0-9a-fA-F]+\Z")
 # user-forgeable, this source stamp is written by the broker.
 _WORKER_PIN_SOURCE = "worker-picker"
 _pin_source_downgrade_logged = False
+# Latched once a broker-stamped pin arrives: after that, id-only is not control.
+_pin_stamp_seen = False
 
 
 def _consume_worker_pin(task: dict) -> bool:
@@ -1173,7 +1175,7 @@ def _consume_worker_pin(task: dict) -> bool:
     control message for this seat, never user work. It writes no task file
     (the watcher globs *.txt, so one would sit in flight until the lease
     expired); it is acked and its lease closed [no-send]. False = not a pin."""
-    global _pin_source_downgrade_logged
+    global _pin_source_downgrade_logged, _pin_stamp_seen
     tid = str(task.get("id") or "").strip()
     if not _WORKER_PIN_RE.fullmatch(tid) or not _valid_tid(tid):
         return False
@@ -1182,12 +1184,17 @@ def _consume_worker_pin(task: dict) -> bool:
     src = str(task.get("source") or "").strip()
     if src and src != _WORKER_PIN_SOURCE:
         return False
-    if not src and not _pin_source_downgrade_logged:
-        # Bounded compat: a broker predating the stamp leaves only the id.
-        # One line per process — the residual window must stay diagnosable.
-        _pin_source_downgrade_logged = True
-        _log("broker sent a worker-pin with no source stamp; "
-             "falling back to id grammar alone for control classification")
+    if not src:
+        # Bounded for real: one stamped pin proves the broker speaks source, so
+        # the id-only path retires for the process rather than only going quiet.
+        if _pin_stamp_seen:
+            return False
+        if not _pin_source_downgrade_logged:
+            _pin_source_downgrade_logged = True
+            _log("broker sent a worker-pin with no source stamp; using id grammar "
+                 "alone until the first stamped pin retires this fallback")
+    else:
+        _pin_stamp_seen = True
     # ACK, journal path, payload and status check must see ONE id, or a
     # deferred close reports itself archived under a path nothing wrote.
     pinned = dict(task, id=tid)
@@ -2485,9 +2492,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         _revoke_broker_capabilities()
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
-    except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
-        # IncompleteRead subclasses HTTPException and escapes during resp.read(),
-        # so a truncated 200 carries no advertisement and must revoke like a 404.
+    except (OSError, TimeoutError, http.client.HTTPException) as e:
+        # OSError covers URLError AND a bare ConnectionResetError from resp.read():
+        # any reply we could not read carries no advertisement, so it must revoke.
         _revoke_broker_capabilities()
         _log(f"heartbeat network error: {e} — continuing")
         return False

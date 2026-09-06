@@ -426,6 +426,27 @@ def main() -> int:
     for k in ("acks", "results"):
         STATE[k].clear()
 
+    # keweichen: the fallback must RETIRE, not merely stop logging. One stamped
+    # pin proves the broker speaks source, so id-only is no longer control.
+    seat6._pin_stamp_seen = False
+    check(seat6._consume_worker_pin(
+        {"id": "worker-pin-1756000000002-feedface", "task": "legacy pin"}) is True,
+          "before any stamp, a source-less pin still rides the legacy id-only path")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    check(seat6._consume_worker_pin(dict(exact, source="worker-picker")) is True,
+          "a stamped pin arrives — the broker demonstrably speaks source")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    check(seat6._consume_worker_pin(
+        {"id": "worker-pin-1756000000003-0badcafe", "task": "an ordinary ask"}) is False,
+          "AFTER the stamp, a source-less exact-grammar task is USER WORK, not control")
+    check(STATE["acks"] == [] and STATE["results"] == [],
+          f"and it was neither acked nor closed: {STATE['acks']} {STATE['results']}")
+    seat6._pin_stamp_seen = False
+    for k in ("acks", "results"):
+        STATE[k].clear()
+
     # Same id, broker's own stamp -> control. Pins the discriminator as the
     # SOURCE, not the id: flip one field and the verdict flips with it.
     stamped = dict(exact, source="worker-picker")
@@ -435,7 +456,8 @@ def main() -> int:
           f"the stamped control was closed no-send: {STATE['results']}")
     for k in ("acks", "results"):
         STATE[k].clear()
-    check(seat6._consume_worker_pin({"id": " worker-pin-123-abc ", "task": "pin"}) is True,
+    check(seat6._consume_worker_pin(
+        {"id": " worker-pin-123-abc ", "task": "pin", "source": "worker-picker"}) is True,
           "a padded pin id is still a pin")
     check(STATE["acks"] == [("/v1/tasks/worker-pin-123-abc/ack",
                              {"id": "worker-pin-123-abc"})],
@@ -780,6 +802,29 @@ def main() -> int:
         d14.urllib.request.urlopen = _real_urlopen
     check(d14._broker_worker_routing is False and d14._broker_worker_metadata is False,
           "and it REVOKES both capabilities — absence of a reply is absence of evidence")
+
+    # (4) keweichen: a bare ConnectionResetError from resp.read() is NOT an
+    # HTTPException and was escaping the heartbeat with both flags left ON.
+    STATE["advertise"] = True; STATE["advertise_routing"] = True
+    d14._post_heartbeat(set(), force=True)
+    check(d14._broker_worker_routing is True, "capabilities ON before the reset control")
+
+    def _resetting(*a, **k):
+        raise ConnectionResetError(104, "Connection reset by peer")
+    d14.urllib.request.urlopen = _resetting
+    escaped = None
+    try:
+        returned = d14._post_heartbeat(set(), force=True)
+    except BaseException as exc:  # noqa: BLE001 — the escape IS the defect
+        returned, escaped = None, type(exc).__name__
+    finally:
+        d14.urllib.request.urlopen = _real_urlopen
+    check(escaped is None, f"a response-body reset does not escape the heartbeat: {escaped}")
+    check(returned is False, f"it reports failure like any other blind beat: {returned}")
+    check(d14._broker_worker_routing is False and d14._broker_worker_metadata is False,
+          "and BOTH capabilities are revoked — a reply we could not read advertises nothing")
+    check("worker=" not in d14._seat_qs(),
+          f"so the next poll is legacy-shaped, not stale worker=: {d14._seat_qs()!r}")
     STATE["strict_wire"] = False
 
 
@@ -848,6 +893,10 @@ def main() -> int:
     # The check above uses a NAMED instance, which is exactly why it passed while
     # the DEFAULT lane drained the rows it disclaims. Migration control:
     default = _load_inst("d15n", ws15, port, "")
+    literal = _load_inst("d15L", ws15, port, "default")
+    check(default._WITHHELD_CONTROL_DIR != literal._WITHHELD_CONTROL_DIR,
+          f"an instance literally NAMED 'default' does not alias the unnamed lane: "
+          f"{default._WITHHELD_CONTROL_DIR.name} vs {literal._WITHHELD_CONTROL_DIR.name}")
     check(default._WITHHELD_CONTROL_DIR != legacy,
           f"the DEFAULT lane owns a distinct dir, not the legacy path: "
           f"{default._WITHHELD_CONTROL_DIR.name} vs {legacy.name}")
