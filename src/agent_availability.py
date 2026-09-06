@@ -19,12 +19,6 @@ from pathlib import Path
 from workspace_default import resolve_workspace
 
 AVAILABILITY = ("available", "busy_accepting", "busy_unavailable", "offline", "unknown")
-# What a room policy may turn each true value into: the same, something less available, or
-# unknown. Never more available, never a different known fact (offline is a fact, not a level).
-NARROWING = {"available": frozenset({"available", "busy_accepting", "busy_unavailable", "unknown"}),
-             "busy_accepting": frozenset({"busy_accepting", "busy_unavailable", "unknown"}),
-             "busy_unavailable": frozenset({"busy_unavailable", "unknown"}),
-             "offline": frozenset({"offline", "unknown"}), "unknown": frozenset({"unknown"})}
 ACTIVE_PHASES = frozenset({"RUNNING", "WAITING"})
 HEARTBEAT_MAX_AGE_S = 90.0  # matches the core liveness rule: younger than ~90 s is alive
 # A live run keeps writing its snapshot (events, transitions); one silent this long is a leftover.
@@ -40,15 +34,26 @@ class AgentRuntimeState:
     queue_depth: int = 0
     runtime_healthy: bool | None = None  # None = nothing readable
     accepting_work: bool = True
+    last_heartbeat_at: float | None = None
+    last_runtime_update_at: float | None = None
+    disconnected: bool = False  # an explicit, known disconnect: offline, never merely unknown
 
 
-def availability(state: AgentRuntimeState) -> str:
-    """The narrow room-visible value. Never derived from 'has a running task' alone: a concurrent
-    agent with 2 of 4 runs active is busy_accepting, not busy."""
-    if state.runtime_healthy is None:
+def is_fresh(state: AgentRuntimeState, now: float | None = None, max_age_s: float = HEARTBEAT_MAX_AGE_S) -> bool:
+    now = now if now is not None else time.time()
+    return state.last_heartbeat_at is not None and now - state.last_heartbeat_at < max_age_s
+
+
+def availability(state: AgentRuntimeState, now: float | None = None) -> str:
+    """The narrow room-visible value. offline is a known fact (an explicit disconnect); unknown is
+    missing or stale telemetry — other agents decide differently on the two, so they never merge.
+    Never derived from 'has a running task' alone: 2 of 4 runs active is busy_accepting."""
+    if state.disconnected:
+        return "offline"
+    if state.runtime_healthy is None or not is_fresh(state, now):
         return "unknown"
     if not state.runtime_healthy:
-        return "offline"
+        return "unknown"
     if not state.accepting_work:
         return "busy_unavailable"
     if state.active_runs <= 0 and state.queue_depth <= 0:
@@ -58,18 +63,28 @@ def availability(state: AgentRuntimeState) -> str:
     return "busy_unavailable"
 
 
+ROOM_AVAILABILITY_FIELDS = frozenset({"worker", "room", "availability", "audience", "projection", "ts"})
+ROOM_TASK_STATUS_FIELDS = frozenset({"task_id", "message_event_id", "worker", "phase", "since_s", "last_status_at",
+                                     "audience", "projection"})
+# Never in a room payload, by key: what a server log, a sync or another client could otherwise read.
+FORBIDDEN_IN_ROOM = frozenset({"summary", "thinking", "tool", "command", "private_room_id", "active_runs",
+                               "capacity", "max_concurrency", "queue_depth", "reason", "seq", "activity_session_id"})
+
+
 def availability_projection(state: AgentRuntimeState, worker: str | None = None, room_id: str | None = None,
-                            room_policy=None) -> dict:
+                            room_policy=None, now: float | None = None) -> dict:
     """What THIS room may see. No counts, no reasons, no queue contents. The canonical state is global;
     `room_policy(room_id, value) -> value` lets a room learn less (never more), so a member of one
     room cannot infer what the agent does in another."""
-    value = availability(state)
+    value = availability(state, now)
     if room_policy is not None:
         narrowed = room_policy(room_id, value)
-        if narrowed in NARROWING[value]:  # a policy may only say less; anything else is ignored
+        if narrowed in AVAILABILITY:
             value = narrowed
-    return {"worker": worker, "room": room_id, "availability": value, "audience": "room",
-            "projection": "AVAILABILITY", "ts": time.time()}
+    payload = {"worker": worker, "room": room_id, "availability": value, "audience": "room",
+               "projection": "AVAILABILITY", "ts": now if now is not None else time.time()}
+    assert set(payload) <= ROOM_AVAILABILITY_FIELDS  # privacy happens here, before any transport
+    return payload
 
 
 def task_projection(snapshot: dict, now: float | None = None) -> dict:
@@ -77,10 +92,12 @@ def task_projection(snapshot: dict, now: float | None = None) -> dict:
     the bus's shared projection; carries no summary and no steps."""
     started = snapshot.get("started_at")
     now = now if now is not None else time.time()
-    return {"task_id": snapshot.get("task_id"), "message_event_id": snapshot.get("message_event_id"),
-            "worker": snapshot.get("worker"), "phase": snapshot.get("phase"),
-            "since_s": (max(0.0, now - started) if isinstance(started, (int, float)) else None),
-            "audience": snapshot.get("audience") or "room", "projection": "TASK_STATUS"}
+    payload = {"task_id": snapshot.get("task_id"), "message_event_id": snapshot.get("message_event_id"),
+               "worker": snapshot.get("worker"), "phase": snapshot.get("phase"),
+               "since_s": (max(0.0, now - started) if isinstance(started, (int, float)) else None),
+               "last_status_at": snapshot.get("last_activity_at"), "audience": "room", "projection": "TASK_STATUS"}
+    assert set(payload) <= ROOM_TASK_STATUS_FIELDS  # privacy happens here, before any transport
+    return payload
 
 
 def this_host() -> str:
@@ -132,10 +149,22 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
             continue
     queue = sum(1 for p in (ws / "tasks").glob("task-*.txt") if not p.name.startswith("task-cron-")) if (ws / "tasks").exists() else 0
     healthy: bool | None = None
+    beat_at: float | None = None
+    disconnected = False
     cores = ws / "state" / "cores"
     beats = [cores / f"{host}.alive"] if (cores / f"{host}.alive").exists() else []
     if beats:
-        healthy = any(now - b.stat().st_mtime < HEARTBEAT_MAX_AGE_S for b in beats)
+        beat_at = max(b.stat().st_mtime for b in beats)
+        healthy = True  # the heartbeat writer only writes while the core runs; staleness is judged by age
+    else:
+        # The heartbeat unlinks its file on a graceful stop: no file plus a stop marker is a KNOWN
+        # disconnect; no file and no marker is merely unknown.
+        try:
+            status = json.loads((ws / "state" / "core-status.json").read_text(encoding="utf-8")).get("status")
+        except (OSError, ValueError):
+            status = None
+        disconnected = status in ("stopped", "shutdown", "offline")
     # accepting_work: the scheduler's pause control sets it later; this reader never does.
     return AgentRuntimeState(active_runs=active, max_concurrency=max_concurrency, queue_depth=queue,
-                             runtime_healthy=healthy, accepting_work=True)
+                             runtime_healthy=healthy, accepting_work=True, last_heartbeat_at=beat_at,
+                             disconnected=disconnected)

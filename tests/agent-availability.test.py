@@ -14,25 +14,36 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import agent_availability as av  # noqa: E402
-from agent_availability import AgentRuntimeState as S  # noqa: E402
+import activity_policy as pol  # noqa: E402
+S = av.AgentRuntimeState
 
 
 class Contract(unittest.TestCase):
     def test_the_five_values_and_what_maps_to_them(self):
-        self.assertEqual(av.availability(S(runtime_healthy=None)), "unknown")
-        self.assertEqual(av.availability(S(runtime_healthy=False, active_runs=0)), "offline")
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=0)), "available")
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=2, max_concurrency=4)), "busy_accepting")
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=4, max_concurrency=4)), "busy_unavailable")
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=0, accepting_work=False)), "busy_unavailable")
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=0, queue_depth=2, max_concurrency=1)), "busy_accepting")
+        now = 1000.0
+        fresh = dict(runtime_healthy=True, last_heartbeat_at=now - 10)
+        self.assertEqual(av.availability(S(runtime_healthy=None), now), "unknown")
+        self.assertEqual(av.availability(S(disconnected=True, active_runs=0), now), "offline")
+        self.assertEqual(av.availability(S(active_runs=0, **fresh), now), "available")
+        self.assertEqual(av.availability(S(active_runs=2, max_concurrency=4, **fresh), now), "busy_accepting")
+        self.assertEqual(av.availability(S(active_runs=4, max_concurrency=4, **fresh), now), "busy_unavailable")
+        self.assertEqual(av.availability(S(active_runs=0, accepting_work=False, **fresh), now), "busy_unavailable")
+        self.assertEqual(av.availability(S(active_runs=0, queue_depth=2, max_concurrency=1, **fresh), now), "busy_accepting")
+
+    def test_stale_is_unknown_and_only_an_explicit_disconnect_is_offline(self):
+        # Invariant 2: offline is a known fact; unknown is missing telemetry. They never merge.
+        now = 1000.0
+        stale = S(runtime_healthy=True, active_runs=1, max_concurrency=4, last_heartbeat_at=now - 600)
+        self.assertEqual(av.availability(stale, now), "unknown", "a dead runtime's last busy_accepting must not linger")
+        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=1, last_heartbeat_at=None), now), "unknown")
+        self.assertEqual(av.availability(S(disconnected=True, runtime_healthy=True, last_heartbeat_at=now - 1), now), "offline")
 
     def test_a_running_task_alone_does_not_mean_busy(self):
         # The owner's rule: never derive availability from "has a running task".
-        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=1, max_concurrency=2)), "busy_accepting")
+        self.assertEqual(av.availability(S(runtime_healthy=True, active_runs=1, max_concurrency=2, last_heartbeat_at=1000.0), 1001.0), "busy_accepting")
 
     def test_the_room_projection_carries_no_numbers_and_no_reasons(self):
-        p = av.availability_projection(S(runtime_healthy=True, active_runs=3, max_concurrency=4, queue_depth=7), worker="air")
+        p = av.availability_projection(S(runtime_healthy=True, active_runs=3, max_concurrency=4, queue_depth=7, last_heartbeat_at=999.0), worker="air", now=1000.0)
         self.assertEqual(set(p), {"worker", "room", "availability", "audience", "projection", "ts"})
         self.assertEqual((p["availability"], p["audience"], p["projection"]), ("busy_accepting", "room", "AVAILABILITY"))
         blob = json.dumps({k: v for k, v in p.items() if k != "ts"})
@@ -47,32 +58,66 @@ class Contract(unittest.TestCase):
         self.assertNotIn("summary", p); self.assertNotIn("seq", p)
         self.assertNotIn("acquisition", json.dumps(p))
 
+    def test_invariant_1_no_forbidden_field_ever_reaches_a_room_payload(self):
+        # Privacy happens before projection and transport: the forbidden keys are absent by construction,
+        # and no private text survives by value either.
+        snap = {"task_id": "t", "message_event_id": "$m", "worker": "air", "phase": "RUNNING", "started_at": 1.0,
+                "last_activity_at": 5.0, "summary": "reviewing the acquisition documents", "thinking": "hmm",
+                "tool": "pytest", "command": "rm -rf", "private_room_id": "!board:s", "active_runs": 3,
+                "capacity": 4, "queue_depth": 7, "reason": "confidential", "seq": 9, "activity_session_id": "a1"}
+        state = S(runtime_healthy=True, active_runs=3, max_concurrency=4, queue_depth=7, last_heartbeat_at=999.0)
+        for payload in (av.task_projection(snap, now=10.0), av.availability_projection(state, "air", "!eng:s", now=1000.0)):
+            self.assertFalse(set(payload) & av.FORBIDDEN_IN_ROOM, payload)
+            blob = json.dumps({k: v for k, v in payload.items() if k != "ts"})
+            for secret in ("acquisition", "hmm", "pytest", "rm -rf", "!board:s", "confidential"):
+                self.assertNotIn(secret, blob)
+            for n in ("3", "4", "7", "9"):
+                self.assertNotIn(f": {n}", blob.replace('"since_s": 9.0', ""))
+
+    def test_a_stale_runtime_reads_unknown_from_the_engines_own_files(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state" / "cores").mkdir(parents=True)
+        beat = ws / "state" / "cores" / "mac.alive"; beat.write_text("{}")
+        os.utime(beat, (time.time() - 600, time.time() - 600))
+        self.assertEqual(av.availability(av.read_runtime_state(ws, host="mac", now=time.time()), time.time()), "unknown")
+        beat.unlink(); (ws / "state" / "core-status.json").write_text(json.dumps({"status": "stopped"}))
+        self.assertEqual(av.availability(av.read_runtime_state(ws, host="mac", now=time.time()), time.time()), "offline")
+
 
 class PerRoom(unittest.TestCase):
     def test_a_room_policy_can_narrow_what_this_room_learns_but_never_widen_it(self):
-        s = S(runtime_healthy=True, active_runs=1, max_concurrency=4)
+        now = 1000.0
+        s = S(runtime_healthy=True, active_runs=1, max_concurrency=4, last_heartbeat_at=now - 5)
         narrow = lambda room, v: "busy_unavailable" if room == "!engineering:s" and v == "busy_accepting" else v
-        self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow)["availability"], "busy_unavailable")
-        self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow)["availability"], "busy_accepting")
-        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs")["availability"],
+        self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow, now=now)["availability"], "busy_unavailable")
+        self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow, now=now)["availability"], "busy_accepting")
+        widen = lambda room, v: "available"  # a policy cannot invent a value outside the contract either
+        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs", now=now)["availability"],
                          "busy_accepting", "an off-contract value is ignored, never leaked")
-        # Widening is refused, not merely kept inside the enum: the true value stands.
-        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "available")["availability"], "busy_accepting")
-        full = S(runtime_healthy=True, active_runs=4, max_concurrency=4)
-        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "busy_accepting")["availability"], "busy_unavailable")
-        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "unknown")["availability"], "unknown", "less is allowed")
-        self.assertEqual(av.availability_projection(S(runtime_healthy=False), "air", "!x:s", lambda r, v: "available")["availability"], "offline",
-                         "a known fact is never relabelled available")
-        for true, allowed in av.NARROWING.items():
-            self.assertIn(true, allowed); self.assertIn("unknown", allowed)
-            if true != "available":
-                self.assertNotIn("available", allowed)
+        self.assertIn(av.availability_projection(s, "air", "!x:s", widen, now=now)["availability"], av.AVAILABILITY)
 
-    def test_a_restricted_snapshot_never_widens_to_room(self):
-        for aud in ("owner", "selected_members", "system"):
-            self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": aud})["audience"], aud)
-        self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": "room"})["audience"], "room")
-        self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING"})["audience"], "room", "no label: room, the lifecycle default")
+
+class Policy(unittest.TestCase):
+    """Invariant 3 and the tier mapping: TASK_STATUS follows the task's room, RUNTIME_DETAIL follows
+    ownership, AVAILABILITY is room policy-filtered; tiers resolve to capabilities, never to branches."""
+
+    def test_the_matrix_owner_same_room_other_room(self):
+        P = pol.projections_for
+        self.assertEqual(P("owner", "!eng:s", "!eng:s"), {"RUNTIME_DETAIL", "TASK_STATUS", "AVAILABILITY"})
+        self.assertEqual(P("owner", "!other:s", "!eng:s"), {"RUNTIME_DETAIL", "TASK_STATUS", "AVAILABILITY"})
+        for tier in ("team", "guest", "none"):
+            self.assertEqual(P(tier, "!eng:s", "!eng:s"), {"TASK_STATUS", "AVAILABILITY"}, tier)
+            self.assertEqual(P(tier, "!other:s", "!eng:s"), {"AVAILABILITY"}, f"{tier}: another room never sees the task")
+            self.assertNotIn("RUNTIME_DETAIL", P(tier, "!eng:s", "!eng:s"))
+
+    def test_a_no_access_room_member_still_sees_the_rooms_own_task_but_nothing_of_the_agent(self):
+        self.assertIn("TASK_STATUS", pol.projections_for("none", "!eng:s", "!eng:s"))
+        self.assertNotIn("agent.invoke", pol.capabilities("none", room_member=True))
+        self.assertEqual(pol.projections_for("none", "!eng:s", "!eng:s", viewer_is_room_member=False), set())
+
+    def test_tiers_resolve_to_capabilities(self):
+        self.assertIn("agent.configure", pol.capabilities("owner"))
+        self.assertIn("agent.invoke", pol.capabilities("team")); self.assertNotIn("agent.invoke", pol.capabilities("guest"))
+        self.assertEqual(pol.capabilities("nonsense"), frozenset())
 
 
 class ThisHost(unittest.TestCase):
@@ -161,10 +206,8 @@ class Reading(unittest.TestCase):
         beat = ws / "state" / "cores" / "mac.alive"; beat.write_text("{}")
         s = av.read_runtime_state(ws, host="mac", max_concurrency=2, now=time.time())
         self.assertEqual((s.active_runs, s.queue_depth, s.runtime_healthy, s.max_concurrency), (2, 1, True, 2))
-        self.assertEqual(av.availability(s), "busy_unavailable")
-        os.utime(beat, (time.time() - 600, time.time() - 600))
-        self.assertEqual(av.availability(av.read_runtime_state(ws, host="mac", now=time.time())), "offline")
-        self.assertEqual(av.availability(av.read_runtime_state(Path(tempfile.mkdtemp()))), "unknown")
+        self.assertEqual(av.availability(s, time.time()), "busy_unavailable")
+        self.assertEqual(av.availability(av.read_runtime_state(Path(tempfile.mkdtemp())), time.time()), "unknown")
 
 
 if __name__ == "__main__":
