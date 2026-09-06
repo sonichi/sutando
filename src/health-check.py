@@ -12308,7 +12308,11 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
     $CLAUDE_CONFIG_DIR/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
     Both must be present — otherwise there's no one to DM.
     """
-    token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
+    # env -> .env -> VAULT, the tiering the relaunch path already uses (~:3499).
+    # Without the third tier a vault-only host loses its alerting channel silently.
+    token = (os.environ.get("SLACK_BOT_TOKEN", "").strip()
+             or _slack_token_from_env_file()
+             or token_from_vault("SLACK_BOT_TOKEN"))
     if not token:
         return None
     access = claude_home_path("channels", "slack", "access.json")
@@ -12316,10 +12320,10 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
         data = json.loads(access.read_text())
     except Exception:
         return None
-    owner = data.get("tofuOwner")
-    if not owner:
-        allow = data.get("allowFrom") or []
-        owner = allow[0] if allow else None
+    # Owner selection is slack_owner's policy, not this function's: a demoted
+    # tofuOwner or a team-tier allowFrom[0] must never receive a watchdog DM.
+    from slack_owner import resolve_proactive_owner_id
+    owner = resolve_proactive_owner_id(data)
     if not owner:
         return None
     return token, owner
