@@ -38,6 +38,19 @@ TERMINAL_TAG = "terminal"
 SEP = "~"
 TOKEN_PARTS = 5
 
+
+def is_producer_token(name: str) -> bool:
+    """A name C's claim writer could have produced, arity AND pid.
+
+    recover() and _live_and_dead() both ignore a non-numeric pid forever, so a
+    caller that checks only arity calls a permanently-unrecoverable name valid.
+    """
+    parts = name.split(SEP)
+    # isascii() too: isdigit alone admits '\u00b2' (int() raises in recover)
+    # and '\u0663' (int() accepts it; str(os.getpid()) cannot emit it).
+    return (len(parts) == TOKEN_PARTS
+            and parts[2].isascii() and parts[2].isdigit())
+
 _ACTIVATED: set[str] = set()
 _ACTIVATE_GUARD = threading.Lock()
 
@@ -50,6 +63,85 @@ class OutboxConfigError(RuntimeError):
 class InvariantError(RuntimeError):
     """Two simultaneous LIVE holders for one key — a state with no producer.
     Raw-token plurality is NOT this error (dead ghosts are anticipated)."""
+
+
+def _record_is_terminal_proof(rec) -> bool:
+    """The ONE total validator — shared by staged promotion, archive
+    retirement, and reads. Divergent copies are the failure it prevents."""
+    if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
+            or rec.get("schema") != 1:
+        return False
+    item_id = rec.get("item_id")
+    # "" is a legal id (publish("") is contract-valid); the _safe_key
+    # binding, not truthiness, is what discriminates.
+    if not isinstance(item_id, str):
+        return False
+    if rec.get("outcome") != DeliveryOutcome.CONFIRMED.value:
+        return False                     # C stages terminals ONLY for confirmed
+    receipt = rec.get("receipt")
+    # _write_terminal always emits both keys (values may be None); a
+    # receipt without them was not produced by the writer.
+    if not isinstance(receipt, dict) \
+            or "provider" not in receipt or "destination" not in receipt:
+        return False
+    if not _exact_int(rec.get("completed_ns")) \
+            or not _exact_int(rec.get("attempts")):
+        return False
+    worker = rec.get("worker")
+    # "" stays rejected here: _safe_component refuses it at claim time,
+    # so no real incarnation can carry an empty worker.
+    if not isinstance(worker, str) or not worker:
+        return False
+    inc = rec.get("incarnation")
+    if not isinstance(inc, str):
+        return False
+    iparts = inc.split(SEP)
+    if not iparts or iparts[0] != _safe_key(item_id):
+        return False                     # record's own incarnation/id split
+    if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
+        return False
+    # Arity is policy: native claims are EXACTLY five parts (producer
+    # grammar), imports EXACTLY two. No writer emits anything else.
+    if len(iparts) == 5:
+        if not is_producer_token(inc):
+            return False
+    elif len(iparts) == 2:
+        # The importer is the ONLY 2-part writer: require its full
+        # provenance, or arbitrary on-disk JSON becomes delivery proof.
+        if rec.get("imported") is not True or worker != "a-import":
+            return False
+        dig = rec.get("a_record_digest")
+        if not isinstance(dig, str) or len(dig) != 64 \
+                or any(ch not in "0123456789abcdef" for ch in dig):
+            return False
+    else:
+        return False
+    return True
+
+
+def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
+    """Pure read of a root's terminal records — no dir creation, no fence
+    check, usable on a root no backend has been constructed for (audit and
+    migration-window resolvers). The backend method delegates here."""
+    key = _safe_key(item_id)
+    out = []
+    arch = Path(root) / ARCHIVE
+    if not arch.is_dir():
+        return out
+    for f in arch.glob(f"{key}*.json"):
+        if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
+            continue                      # a longer key sharing the prefix
+        data = _regular_json(f)
+        if data is None:
+            continue
+        if _record_is_terminal_proof(data) \
+                and data.get("item_id") == item_id:
+            out.append(data)
+    # cycle FIRST: a clock correction must not let an older receipt win.
+    # completed_ns only breaks ties (legacy records carry no cycle -> 0).
+    out.sort(key=lambda r: (r.get("cycle") if _exact_int(r.get("cycle")) else 0,
+                            r["completed_ns"]))
+    return out
 
 
 def _safe_key(item_id: str) -> str:
@@ -171,7 +263,7 @@ class DesignCClaimBackend:
         live, dead = [], []
         for f in self._tokens(key):
             parts = f.name.split(SEP)
-            if len(parts) != TOKEN_PARTS:
+            if not is_producer_token(f.name):
                 continue
             try:
                 ident = outbox.process_identity(int(parts[2]))
@@ -389,60 +481,9 @@ class DesignCClaimBackend:
         """All terminal records for `item_id`, oldest first by completed_ns.
         Legacy filename-format entries carry no receipt and are not listed.
         Records failing the total validator are never returned as proof."""
-        key = _safe_key(item_id)
-        out = []
-        for f in self._d(ARCHIVE).glob(f"{key}*.json"):
-            if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
-                continue                      # a longer key sharing the prefix
-            data = _regular_json(f)
-            if data is None:
-                continue
-            if self._record_is_terminal_proof(data) \
-                    and data.get("item_id") == item_id:
-                out.append(data)
-        # cycle FIRST: a clock correction must not let an older receipt win.
-        # completed_ns only breaks ties (legacy records carry no cycle -> 0).
-        out.sort(key=lambda r: (r.get("cycle") if _exact_int(r.get("cycle")) else 0,
-                               r["completed_ns"]))
-        return out
+        return read_terminal_records(self.root, item_id)
 
-    @staticmethod
-    def _record_is_terminal_proof(rec) -> bool:
-        """The ONE total validator — shared by staged promotion, archive
-        retirement, and reads. Divergent copies are the failure it prevents."""
-        if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
-                or rec.get("schema") != 1:
-            return False
-        item_id = rec.get("item_id")
-        # "" is a legal id (publish("") is contract-valid); the _safe_key
-        # binding, not truthiness, is what discriminates.
-        if not isinstance(item_id, str):
-            return False
-        if rec.get("outcome") != DeliveryOutcome.CONFIRMED.value:
-            return False                     # C stages terminals ONLY for confirmed
-        receipt = rec.get("receipt")
-        # _write_terminal always emits both keys (values may be None); a
-        # receipt without them was not produced by the writer.
-        if not isinstance(receipt, dict) \
-                or "provider" not in receipt or "destination" not in receipt:
-            return False
-        if not _exact_int(rec.get("completed_ns")) \
-                or not _exact_int(rec.get("attempts")):
-            return False
-        worker = rec.get("worker")
-        # "" stays rejected here: _safe_component refuses it at claim time,
-        # so no real incarnation can carry an empty worker.
-        if not isinstance(worker, str) or not worker:
-            return False
-        inc = rec.get("incarnation")
-        if not isinstance(inc, str):
-            return False
-        iparts = inc.split(SEP)
-        if not iparts or iparts[0] != _safe_key(item_id):
-            return False                     # record's own incarnation/id split
-        if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
-            return False
-        return True
+    _record_is_terminal_proof = staticmethod(_record_is_terminal_proof)
 
     @classmethod
     def _staged_is_complete(cls, staged, incarnation: str) -> bool:
@@ -515,7 +556,7 @@ class DesignCClaimBackend:
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
-            if len(parts) != TOKEN_PARTS or not parts[2].isdigit():
+            if not is_producer_token(f.name):
                 continue
             key = parts[0]
             # M-D window: retire ONLY a claim whose OWN incarnation is
