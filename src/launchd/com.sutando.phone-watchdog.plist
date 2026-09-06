@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Template — the installer substitutes __REPO__/__WORKSPACE__/__HOMEBREW_BIN__.
+  KeepAlive omitted on purpose: persistence would defeat StartInterval.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.phone-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/src/phone-watchdog.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>120</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/phone-watchdog-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/phone-watchdog-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

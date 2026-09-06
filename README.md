@@ -252,6 +252,7 @@ Exiting `startup.sh` alone does NOT stop background services. Always use `restar
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
 5. Remove any tools you installed during setup (e.g. `imsg`, `wacli`) via the package manager you used to install them.
 6. If you installed the OS-supervised health checks: `bash src/install-health-check-launchd.sh --uninstall` (idempotent — no-op if not installed).
+7. If you installed the phone-stack watchdog: `bash src/install-phone-watchdog-launchd.sh --uninstall` (idempotent — no-op if not installed).
 
 ---
 
@@ -268,6 +269,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Optional global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Build and launch separately; core startup stays headless |
 | OS-supervised health checks | Detect stuck loops, dead watchers, and queue pileups even when core is unresponsive — macOS notifies you when Sutando is broken | `bash src/install-health-check-launchd.sh` (idempotent; uninstall with `--uninstall`) |
+| Phone-stack watchdog | **Only useful if you set up Twilio phone calls.** Curls the public webhook `/health` every 120s and re-runs the phone launcher when it is down, so a host sleep or process death doesn't leave your Twilio number answering with a generic application error. Opt-in because it restarts processes on its own. | `bash src/install-phone-watchdog-launchd.sh` (idempotent; `--status` to inspect, `--uninstall` to remove) |
 | Multi-machine workspace sync | Run the same agent identity across Mac mini + MacBook + Mac Studio etc.; memory + notes + state stay consistent via a private git repo you own | Create a private vault repo, set `vault.remote_url` in `sutando.config.local.json`, run `bash scripts/sync-workspace.sh --init` once + cron it. See [docs/workspace-sync.md](docs/workspace-sync.md). The legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0. |
 
 ---
