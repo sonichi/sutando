@@ -596,8 +596,9 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         bots = []
     bots = bots or []
     for bot in bots:
-        if _is_snowflake(str(bot)):
-            claim(str(bot), STAND, f"pr-triage config `{src}.bots[]`")
+        # No str(): a JSON number may already be rounded, so it is malformed.
+        if _is_snowflake(bot):
+            claim(bot, STAND, f"pr-triage config `{src}.bots[]`")
         else:
             _bad(bad, bot, STAND,
                  f"pr-triage `{src}.bots[]` entry is not a snowflake",
@@ -843,8 +844,21 @@ def main() -> int:
 
     triage_people = (_source("--triage-config", a.triage_config) or {}).get("people") or {}
     peer_raw = _source("--peers", a.peers) or {}
-    peer_ids = {str(v): k for k, v in peer_raw.items()}
-    owner_id = str((_source("--discord-config", a.discord_config) or {}).get("owner") or "")
+    owner_raw = (_source("--discord-config", a.discord_config) or {}).get("owner")
+    # An external id arrives as a JSON string or not at all: a number may be
+    # rounded before it is read, so it is refused before anything is written.
+    raw_bad = {f"peers.json `{k}`": v for k, v in peer_raw.items()
+               if not isinstance(v, str)}
+    if owner_raw is not None and not isinstance(owner_raw, str):
+        raw_bad["discord-config.json `owner`"] = owner_raw
+    if raw_bad:
+        for k, v in raw_bad.items():
+            print(f"refusing to migrate: {k} holds a {type(v).__name__} "
+                  f"({v!r}); an external id must be a JSON string",
+                  file=sys.stderr)
+        return 2
+    peer_ids = {v: k for k, v in peer_raw.items()}
+    owner_id = owner_raw or ""
 
     try:
         out, rows = migrate(doc, triage_people, peer_ids, owner_id, a.roster.name)

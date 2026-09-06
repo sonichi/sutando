@@ -258,6 +258,42 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertEqual(d["o"]["human_discord_id"], HUMAN, "discord-config states the owner")
 
 
+    RAW = 1400000000000000001   # a JSON number: 19 digits, past float precision, unlike every id above
+
+    def test_a_numeric_peer_id_is_refused_before_anything_is_written(self):
+        src = self._roster({"p": {"discord_id": BOT}})
+        peers = Path(self.tmp) / "peers.json"
+        peers.write_text(json.dumps({"pro": self.RAW}))
+        out = Path(self.tmp) / "v2.json"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = self._main("--roster", str(src), "--peers", str(peers),
+                               "--out", str(out))
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertFalse(out.exists(), "a refusal writes nothing")
+        self.assertIn("peers.json `pro` holds a int", err.getvalue())
+
+    def test_a_numeric_owner_id_is_refused_before_anything_is_written(self):
+        src = self._roster({"o": {"discord_id": HUMAN}})
+        dcfg = Path(self.tmp) / "discord-config.json"
+        dcfg.write_text(json.dumps({"owner": self.RAW}))
+        out = Path(self.tmp) / "v2.json"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = self._main("--roster", str(src), "--discord-config",
+                               str(dcfg), "--out", str(out))
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertFalse(out.exists(), "a refusal writes nothing")
+        self.assertIn("discord-config.json `owner` holds a int", err.getvalue())
+
+    def test_a_numeric_triage_bot_id_is_never_promoted_to_a_stand(self):
+        out, rows = migrate({"x": {"discord_id": HUMAN}},
+                            {"x": {"discord": HUMAN, "bots": [self.RAW]}})
+        self.assertNotEqual(out["x"].get("stand_discord_id"), str(self.RAW))
+        row = rows[0]
+        self.assertTrue(row["after_unresolved"] or row.get("after_shape_failure"),
+                        "a number in bots[] is malformed evidence, not a claim")
+
     def test_a_triage_only_login_is_not_dropped(self):
         # The roster is keyed by person, pr-triage by GitHub login. Iterating
         # only roster rows silently loses everyone pr-triage alone knows.
@@ -687,7 +723,7 @@ class MemberOrderIsNotIdentityEvidence(unittest.TestCase):
 
     `_collect_ids` walks in traversal order and the first Stand claim became
     primary, so writing the schema's own two fields in the other order swapped
-    the agents while still returning 0 (#3537).
+    the agents while still returning 0.
     """
 
     SECOND = "1529720369668292629"
@@ -699,7 +735,7 @@ class MemberOrderIsNotIdentityEvidence(unittest.TestCase):
                                         for o in e.get(ri.OTHER_STANDS_FIELD) or []]
 
     def test_secondary_first_still_yields_the_declared_primary(self):
-        # The reviewer's exact rerun: only the member order differs.
+        # Only the member order differs.
         primary, others = self._primary_and_others(
             {"x": {ri.OTHER_STANDS_FIELD: [self.SECOND], ri.STAND_FIELD: BOT}})
         self.assertEqual(primary, BOT)
@@ -804,7 +840,7 @@ class EveryBadCallSiteIsExercised(unittest.TestCase):
 
 class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
     """A singular typed slot discarded a value it could read no id from, so the
-    CLI returned 0 having dropped explicitly human-typed evidence (#3537).
+    CLI returned 0 having dropped explicitly human-typed evidence.
 
     Only a NON-STRING scalar reached the shape branch, so `12` exited 5 while
     the string and empty-container cases beside it exited 0. Run through the
@@ -854,7 +890,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIn("SHAPE x", err)
 
     def test_a_number_is_still_refused(self):
-        # The reviewer's control: it passed BEFORE the fix, so a regression
+        # Control: it passed BEFORE the fix, so a regression
         # widening only the string path would satisfy the three cases above.
         rc, err, _ = self._typed(12)
         self.assertEqual(rc, 5)
@@ -923,7 +959,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertNotIn("SHAPE", err)
 
     def test_a_foreign_id_beside_a_malformed_discord_slot_still_refuses(self):
-        # The pairing the reviewer asked for: scoping the discriminator must
+        # The pairing: scoping the discriminator must
         # not be achieved by disabling it. One row, both fields.
         entry = dict(self.FOREIGN)
         entry["stand_discord_id"] = self.STAND
@@ -1141,7 +1177,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rec["human_discord_id"], HUMAN)
 
     def test_validation_and_collection_agree_on_a_wrapped_id(self):
-        # The reviewer asked for ONE decision. A one-element list IS mined at
+        # ONE decision. A one-element list IS mined at
         # this path, so refusing it would accept and reject the same value.
         rc, err, rec = self._cli({"discord_human_id": [HUMAN],
                                   "stand_discord_id": self.STAND})
@@ -1649,7 +1685,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
     def test_a_RIVAL_id_filling_the_slot_does_not_discharge_a_carried_seed(self):
         """A seed is discharged by REPAIR, not by the slot being occupied.
 
-        Found independently by qingyun-wu and by Mark's agent. Pass 1 refuses BOT
+        Pass 1 refuses BOT
         (roster says human, triage says bot) and the writer puts the clean id in
         that slot. On pass 2 the slot reads again -- but it holds a DIFFERENT id,
         and triage still calls BOT a bot, so the disagreement is untouched. The
