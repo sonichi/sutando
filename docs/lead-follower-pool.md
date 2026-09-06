@@ -215,10 +215,11 @@ speaking to the broker as one seat of it. Two env knobs, read at import like
 - `SUTANDO_WORKER_LOCATION` — `cloud` marks a cloud seat; anything else is
   `local`.
 
-The seat rides every wire call: `worker=` on `GET /v1/tasks`, `worker_id` +
-`location` on `POST /v1/heartbeat` and on the `POST /v1/workers` snapshot push.
-A broker that predates seats ignores all three and serves the agent's queue
-exactly as before; a worker-aware broker (the ag2space-backend half of #3794)
+The seat rides those three calls — `worker=` on `GET /v1/tasks`, `worker_id` +
+`location` on `POST /v1/heartbeat` and on the `POST /v1/workers` snapshot push —
+**only after the broker advertises `worker-routing`**. Until then each request is
+byte-for-byte the legacy shape, so a broker that predates seats keeps serving
+whether it ignores unknown fields or rejects them; a worker-aware broker (the ag2space-backend half of #3794)
 keys its queues and leases per seat and fails a lease over from a seat that
 stops beating.
 

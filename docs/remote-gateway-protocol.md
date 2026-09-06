@@ -124,6 +124,31 @@ reply: { "capabilities": ["worker-metadata"] }
 `worker-metadata` tells the client the broker accepts the optional `metadata`
 key on `POST /v1/results`. Brokers that omit it receive the documented envelope.
 
+`worker-routing` is a **separate** capability and is not implied by
+`worker-metadata`: a broker may accept result attribution without wanting to be
+routed to. It tells the client the broker accepts seat identity on three request
+bodies — `worker=` on `GET /v1/tasks`, and `worker_id` + `location` on both
+`POST /v1/heartbeat` and `POST /v1/workers`.
+
+Enable/revoke is a state machine driven entirely by the heartbeat, because the
+heartbeat reply is the only capability channel:
+
+| event | state |
+|---|---|
+| reply advertises `worker-routing` | enabled from the NEXT request onward |
+| reply omits it | revoked |
+| heartbeat 404/405 (no endpoint) | revoked, and the heartbeat is disabled |
+| other non-auth HTTP error | revoked |
+| network error / timeout | revoked |
+| malformed 200 (undecodable JSON) | revoked |
+| truncated 200 (`IncompleteRead`) | revoked |
+| 401/403 | raises; not a capability signal |
+
+Absence of a reply is absence of evidence, so every non-advertising outcome
+revokes. The asymmetry is deliberate: dropping the keys cannot lose a result,
+whereas keeping them against a strict broker can. The advertising heartbeat is
+itself legacy-shaped — identity rides only the requests that follow it.
+
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.

@@ -14,15 +14,16 @@ Full spec: docs/remote-gateway-protocol.md
   Protocol (versioned, Bearer-auth):
   GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&worker=<worker-id>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
-       `worker` names the pulling seat; a broker that ignores it serves the
-       agent's queue exactly as before (one queue per agent identity).
+       `worker` names the pulling seat and rides ONLY after the broker
+       advertises `worker-routing`; absent that, the poll is byte-for-byte
+       legacy, so a broker that rejects unknown query keys still serves.
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/results
        → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
-       → body {"client": "...", "inflight": N, "worker_id": "...",
-               "location": "local|cloud", ...}  → 200 on accepted
+       → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+         (`worker_id`/`location` are added only under `worker-routing`)
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -33,9 +34,10 @@ original pull/result protocol.
 
 Worker seats (issue: cloud workers sharing the agent identity). Every client is
 a queue client for ONE seat of the agent: the home seat (`home`), a pool seat
-(`worker-N`) or a cloud seat. The seat rides every wire call (`worker=` on the
-pull, `worker_id`/`location` on heartbeat and the workers-snapshot push) so a
-worker-aware broker can dispatch per seat and fail a lease over from a seat
+(`worker-N`) or a cloud seat. The seat rides the wire ONLY once the broker advertises `worker-routing`
+(`worker=` on the pull, `worker_id`/`location` on heartbeat and the
+workers-snapshot push); until then every request is legacy-shaped. A
+worker-aware broker can then dispatch per seat and fail a lease over from a seat
 that stops beating. A cloud seat runs this same client with its own workspace:
 the pull → `tasks/` → `results/` → POST cycle needs nothing from another host —
 `state/pool-status.json` and `state/cores/` are read only when present.
