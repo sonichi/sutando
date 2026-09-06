@@ -136,6 +136,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'health-check-live-tree-drift.test.py failed' }
           python tests/health-check-held-no-consumer.test.py
           if ($LASTEXITCODE -ne 0) { throw 'health-check-held-no-consumer.test.py failed' }
+          python tests/core-heartbeat.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'core-heartbeat.test.py failed' }
           python tests/cli-wedge.test.py
           if ($LASTEXITCODE -ne 0) { throw 'cli-wedge.test.py failed' }
           python tests/cli-wedge-health-probe.test.py

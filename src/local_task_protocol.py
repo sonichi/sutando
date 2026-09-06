@@ -118,9 +118,23 @@ PRIORITIES = ("urgent", "normal", "low")
 # canonical completion marker); archived = under tasks/archive/.
 LIFECYCLE_STATES = ("pending", "result_written", "archived")
 
-# `owner` is full, `team` is workspace-write sandboxed, `guest`/`other` are
-# read-only, and `ambient` is sandboxed observation — never instructions.
+# `owner` is full, `team` is workspace-write sandboxed, `guest` is read-only,
+# and `ambient` is sandboxed observation — never instructions.
 ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
+
+# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits
+# the value; removal is gated on the writers, not on a release count.
+LEGACY_ACCESS_TIER_ALIASES = {"other": "guest"}
+
+
+def canonical_access_tier(value) -> str:
+    """Normalize a tier string: trimmed, lower-cased, legacy aliases resolved.
+
+    Unknown values pass through unchanged so each reader keeps its own
+    fail-closed default; only the spelling is unified here.
+    """
+    tier = str(value or "").strip().lower()
+    return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is

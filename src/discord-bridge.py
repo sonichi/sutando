@@ -916,7 +916,7 @@ def load_policy():
 
 
 def load_tier_map() -> dict:
-    """Per-user-id -> tier ("owner"|"team"|"other") from access.json `tierMap`.
+    """Per-user-id -> tier ("owner"|"team"|"guest") from access.json `tierMap`.
     Empty dict if absent. Mirrors slack-bridge.load_tier_map so the two
     bridges share one access-control model."""
     try:
@@ -3823,7 +3823,7 @@ async def _handle_discord_message(message, force=False):
     print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
-    access_tier = "other"
+    access_tier = "guest"
     # is_collaborator: a TEAM sender the owner has listed under the SERVING
     # channel's `collaborators` array in access.json. Collaborators get the
     # `team-collaborator` "engage" rulebook (reply in-channel, fold in their
@@ -3845,7 +3845,7 @@ async def _handle_discord_message(message, force=False):
         seeded_ok = ensure_tier_map_seeded()
         _tier_map = load_tier_map()
         if sender_id in _tier_map:
-            access_tier = _tier_map[sender_id]
+            access_tier = local_task_protocol.canonical_access_tier(_tier_map[sender_id])
         else:  # pragma: no cover — fail-closed branch inside the async handler mega-function; the seed-failure→team resolution logic is unit-tested in tests/bridges-allowlist-default-readonly.test.py
             access_tier = "team"
             if not seeded_ok and not _tier_map:
@@ -3988,7 +3988,7 @@ async def _handle_discord_message(message, force=False):
     # codex (per CLAUDE.md "Discord access control"), so preamble is N/A there.
     # Collaborators are also N/A: they're engaged directly by the core agent
     # (not sandboxed via codex), so they must NOT get the codex framing preamble.
-    if access_tier in ("team", "other") and not is_collaborator:
+    if access_tier in ("team", "guest") and not is_collaborator:
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
             "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
@@ -4043,7 +4043,7 @@ async def _handle_discord_message(message, force=False):
             user_task_text = confine_user_content(enriched)
             # The enriched body replaces the prompt; the launch argument is composed later.
             codex_prompt_text = user_task_text  # pragma: no cover
-        elif access_tier in ("team", "other") and not is_collaborator:
+        elif access_tier in ("team", "guest") and not is_collaborator:
             # Silent-escalate stays NON-OWNER-only, and collaborators are
             # excluded too. The prefetch above now runs for all tiers (so the
             # contextNotFrom gate applies to owner too), but an owner OR
@@ -4081,7 +4081,7 @@ async def _handle_discord_message(message, force=False):
     # both tier blocks are robust regardless of cwd.
     # Note: the silent-escalate path (above) `return`s before this point when
     # `already_escalated=True`, so the only valid keys consumed below are
-    # owner/team/other. (An earlier draft had an `already_escalated` tier
+    # owner/team/guest. (An earlier draft had an `already_escalated` tier
     # instruction that told the agent to NO-REPLY archive, but that left the
     # task in `pending_replies` until age-out — leak-prone per MacBook's #639
     # review. Removed in favor of skipping the task-file write entirely.)
@@ -4117,9 +4117,9 @@ async def _handle_discord_message(message, force=False):
             "- If codex is invoked and Stage 2 fallback triggers (codex exit non-zero or staging file empty), the fallback line is the result body — do not write anything else to results/task-{id}.txt for that task.\n"
             "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
         ),
-        "other": (
+        "guest": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from an OTHER tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
+            "This task is from a GUEST tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
             f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
             f"  Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move).\n"
             f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.'; exit 0 with empty/missing staging: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'.\n\n"
@@ -4290,7 +4290,7 @@ async def _handle_discord_message(message, force=False):
             f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
-            f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
+            f"{tier_instructions.get(rulebook_key, tier_instructions['guest'])}"
             f"{discord_skill_hints}"
             f"{secret_notice}"
         )
@@ -5136,12 +5136,12 @@ async def poll_results():
                     _redirect_action = next((a for a in _parsed.actions if a.kind == "redirect"), None)
                     if _redirect_action:
                         target_channel_id = int(_redirect_action.value)
-                        task_tier = "other"
+                        task_tier = "guest"
                         # The core agent may have already moved the processed
                         # task out of the live dir before we pick up the result
                         # (2026-06-10: an owner [channel:] forward was dropped
                         # because the gate read tier from a path that no longer
-                        # existed and failed safe to "other"). A processed task
+                        # existed and failed safe to "guest"). A processed task
                         # can be in four places — mirror _isVoiceTask's set
                         # (task-bridge.ts): live, processed/, legacy flat
                         # archive/, and the active month-partitioned
@@ -5162,9 +5162,10 @@ async def poll_results():
                                 task_body = _tier_path.read_text()
                             except Exception:
                                 continue
-                            task_tier = (local_task_protocol.parse_task_headers(task_body)
-                                         .headers.get("access_tier") or "other").strip() or "other"
-                            break  # first readable file wins; missing all → "other"
+                            task_tier = local_task_protocol.canonical_access_tier(
+                                local_task_protocol.parse_task_headers(task_body)
+                                .headers.get("access_tier")) or "guest"
+                            break  # first readable file wins; missing all → "guest"
                         if task_tier != "owner":
                             print(
                                 f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
@@ -6010,7 +6011,7 @@ async def poll_dm_fallback():
                     target_channel_id = int(_redirect_fb.value)
                     clean_body = _parsed_fb.body  # already stripped by parse_markers
                     _task_id = f.stem
-                    # Tier read from task file. Default "other" on missing /
+                    # Tier read from task file. Default "guest" on missing /
                     # unreadable: voice- and cron-originated tasks don't write
                     # an access_tier field (only the Discord bridge does at
                     # line ~2534), so they'll fall into this default. The
@@ -6019,13 +6020,14 @@ async def poll_dm_fallback():
                     # voice user who genuinely wants channel-redirect can
                     # have voice-agent write `access_tier: owner` into the
                     # task file (the same shape Discord uses).
-                    task_tier = "other"
+                    task_tier = "guest"
                     try:
                         task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
-                        task_tier = (local_task_protocol.parse_task_headers(task_body)
-                                     .headers.get("access_tier") or "other").strip() or "other"
+                        task_tier = local_task_protocol.canonical_access_tier(
+                            local_task_protocol.parse_task_headers(task_body)
+                            .headers.get("access_tier")) or "guest"
                     except Exception:
-                        task_tier = "other"
+                        task_tier = "guest"
 
                     if task_tier == "owner":
                         try:
