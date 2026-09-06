@@ -45,6 +45,8 @@ class Disk:
         self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
         self.spent = False            # created BEFORE the token leaves; never moves
 
+        self.phase_dirs = set()       # which of held/ claimed/ EXIST -- a rename needs its parent
+
         self.torn = False             # a promotion lands between two directory reads
         self.token, self.journal, self.claimed_rec = False, None, None   # token / held/<t> / claimed/<t>
         self.token_at, self.journal_at, self.claimed_at = None, None, None
@@ -55,7 +57,8 @@ class Disk:
 
 def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         durable_gate=True, flat_issuance=False, unconditional_gate=True,
-        dir_is_allowance=False, walk_recovery=False):
+        dir_is_allowance=False, walk_recovery=False, single_phase_parent=False,
+        nonatomic_teardown=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -63,10 +66,15 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         republished snapshot releases the worker over a standing artifact.
     `flat_issuance=True`  -- issuance step (a) tests the TOKEN NAME, which a worker's rename
         makes absent. Step (a) only: the recovery branch already tested the whole family.
+    `single_phase_parent=True` -- the worker creates only `held/`, so the promotion renames
+        into a directory that does not exist. ENOENT, reproduced on scratch files.
+    `nonatomic_teardown=True` -- retirement unlinks children and then removes the root, so a
+        crash between them leaves the root standing with no name inside it.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     crash_mkdir = [mode == "crash_mkdir"]
+    crash_teardown = [nonatomic_teardown]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
     def walked():
@@ -116,6 +124,19 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.token: return d.token_at
         return None
 
+    def retire(state):
+        """End probation. ONE rename of the root, so no reader sees a half-removed family.
+
+        Unlinking children first leaves the root standing with no name inside it, which
+        recovery reads as unfinished issuance and finishes -- after the task completed.
+        """
+        if crash_teardown[0]:
+            crash_teardown[0] = False
+            d.spent = False; d.journal = None; d.claimed_rec = None   # children gone
+            return                                                    # crash before the root
+        d.probation.pop("w", None); d.token = False; d.journal = None; d.claimed_rec = None
+        d.spent = False; d.admit_dir = False; d.phase_dirs.clear(); d.record["w"] = state
+
     def sweep():
         now[0] += 10; d.writers.add(("record", "sweep")); d.computed_at = now[0]
         if d.request and "w" not in d.probation:
@@ -145,15 +166,12 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
                 d.token, d.token_at = True, now[0]            # finish it exactly once
                 return
             if d.claimed_rec is not None and d.claimed_rec in d.results:
-                # rmtree(<instance>.admit): the whole directory, not just the phase that ended it
-                d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.spent = False; d.admit_dir = False; d.record["w"] = "eligible"; return
+                retire("eligible"); return
             start = clock_start()
             # A fallback start would silently supply a clock the design lacks, so a shape with
             # no clock must be expressible or the timeout test passes however the clocks read.
             if start is not None and now[0] - start > WINDOW:
-                d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.spent = False; d.admit_dir = False; d.record["w"] = "wedged"; return
+                retire("wedged"); return
             return                                            # held, with a clock running
         if claimed and pending - claimed == 0:
             d.record["w"] = "eligible"
@@ -163,6 +181,10 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         # recovery refuses to mint over, and it is the name that never moves between phases.
         if not d.token: return False
         d.spent = True
+        # `mkdir -p held/ claimed/`: (3) renames into claimed/, so its parent must exist
+        # before (1), not at promotion time -- a parent cannot be made after the crash.
+        d.phase_dirs.add("held")
+        if not single_phase_parent: d.phase_dirs.add("claimed")
         d.token = False; d.journal, d.journal_at = task, now[0]; return True
 
     def gate_step2a():
@@ -178,6 +200,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         nonlocal claimed
         task = d.journal
         if task is None or d.claims.get(task) is None: return
+        if "claimed" not in d.phase_dirs: return          # ENOENT: the rename has no parent
         d.claimed_rec, d.claimed_at = task, now[0]; d.journal = None; claimed += 1
 
     def worker():
@@ -639,6 +662,67 @@ class RecoveryAsksTwoNAMES_NotAWalk(unittest.TestCase):
             v, c, p, d = run(order)
             self.assertIn(v, ("eligible", "wedged"), order)
             self.assertFalse(d.spent or d.admit_dir, f"{order}: an artifact outlived its probation")
+
+
+class ThePromotionsParentExistsBeforeTheFirstRename(unittest.TestCase):
+    """`held/<task_id>` -> `claimed/<task_id>` is a rename, and a rename needs its parent.
+
+    Creating only `held/` left the promotion renaming into a directory nothing makes. On scratch
+    files that is ENOENT, and the claim then sits held with no promotion record for the sweep to
+    read -- so probation ends on the journal clock as `wedged` rather than on the task completing.
+    """
+
+    ORDER = ["kick", "sweep", "worker"]
+
+    def test_only_held_leaves_the_promotion_unlandable(self):
+        # The defect itself, so this class is not asserting the fix agrees with itself.
+        _v, claimed, _p, d = run(self.ORDER, single_phase_parent=True)
+        self.assertEqual(claimed, 0, "the promotion cannot have landed with no claimed/ parent")
+        self.assertIsNone(d.claimed_rec)
+        self.assertEqual(d.journal, "t1", "the claim is stuck in the held phase")
+
+    def test_both_parents_let_the_promotion_land(self):
+        _v, claimed, _p, d = run(self.ORDER)
+        self.assertEqual(claimed, 1)
+        self.assertEqual(d.claimed_rec, "t1")
+        self.assertEqual(sorted(d.phase_dirs), ["claimed", "held"])
+
+    def test_the_parents_exist_before_the_token_leaves(self):
+        # Making them at promotion time would be too late: the crash is what removes the chance.
+        _v, _c, _p, d = run(["kick", "sweep", "worker"], "crash_between")
+        self.assertIn("claimed", d.phase_dirs, "the parent must survive a crash after (1)")
+
+
+class RetirementIsOneRenameNotAChildwiseRemoval(unittest.TestCase):
+    """Ending probation removes a FAMILY of names, and `rmtree` is not one act.
+
+    Unlinking the children first leaves the root standing holding no name, which is exactly the
+    state recovery is required to read as unfinished issuance -- so it finishes it, minting a
+    fresh token after the admitted task already completed. One rename of the root flips the
+    gate and every recovery name together.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "finish", "sweep", "sweep"]
+
+    def test_childwise_removal_mints_a_token_after_the_task_completed(self):
+        # The defect itself. `token=True` here IS the second admission.
+        verdict, _c, _p, d = run(self.ORDER, nonatomic_teardown=True)
+        self.assertTrue(d.token, "a fresh allowance was minted after completion")
+        self.assertTrue(d.admit_dir, "the root outlived the names inside it")
+        self.assertFalse(d.spent, "the name recovery refuses to mint over is already gone")
+        self.assertEqual(verdict, "probation", "probation reopened on a finished task")
+
+    def test_one_rename_ends_it_with_nothing_left_to_recover(self):
+        verdict, _c, _p, d = run(self.ORDER)
+        self.assertEqual(verdict, "eligible")
+        self.assertFalse(d.token or d.spent or d.admit_dir)
+        self.assertEqual(d.phase_dirs, set())
+
+    def test_the_wedged_path_retires_the_same_way(self):
+        # Both exits share one retirement, or the seam returns on the timeout path alone.
+        verdict, _c, _p, d = run(["kick", "sweep", "worker", "wait", "sweep"])
+        self.assertEqual(verdict, "wedged")
+        self.assertFalse(d.token or d.spent or d.admit_dir)
 
 
 if __name__ == "__main__":

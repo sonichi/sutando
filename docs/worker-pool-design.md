@@ -1443,8 +1443,12 @@ itself to a room whose worker might still come back.
 
    **The worker's first act is therefore `spent`, not the rename.** Consumption is
    `create(<instance>.admit/spent, O_EXCL)` — which is also what makes "exactly one caller wins" hold
-   at the FIRST step rather than at the rename — then `mkdir -p held/`, then
-   `rename(token, held/<task_id>)`. A crash anywhere in that sequence leaves `spent` standing, which
+   at the FIRST step rather than at the rename — then `mkdir -p held/ claimed/`, then
+   `rename(token, held/<task_id>)`. **Both phase parents are made here, before the token leaves.**
+   The promotion in (3) is a rename into `claimed/`, and a rename needs its parent: creating that
+   directory at promotion time would put it after the crash seam it has to survive, and on scratch
+   files the missing parent is a plain `ENOENT` that strands the claim in `held/` with no promotion
+   record for the sweep to read. A crash anywhere in that sequence leaves `spent` standing, which
    is exactly the state recovery must not mint over. A crash before it leaves `token`, which recovery
    also refuses to mint over. An allowance directory holding NEITHER name has one cause: issuance
    stopped after `mkdir`, and `O_EXCL` on `token` finishes it exactly once however many sweeps race.
@@ -1524,12 +1528,22 @@ itself to a room whose worker might still come back.
 
    **Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
-   computed afresh; the whole `<instance>.admit/` directory removed); or the window `stand_in_after_s` has
+   computed afresh; the allowance retired by the single rename below); or the window `stand_in_after_s` has
    elapsed — measured from `probation.since` while the token is unconsumed (a worker that never
    reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
    the `claimed/<task_id>` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
-   the allowance directory is removed by the sweep, and the request is NOT re-armed; a second kick
+   the allowance is retired by the same single rename, and the request is NOT re-armed; a second kick
    needs a second command. `probation` is never the last word.
+
+   **Retirement is ONE rename, because the allowance is a FAMILY of names and `rmtree` is not
+   one act.** The sweep ends probation with `rename(<instance>.admit, <instance>.admit.retired)`
+   and removes the tombstone afterwards; a tombstone left by a crash is inert, and removing it is
+   idempotent. Removing children first is what must not happen: unlinking `spent` and the phase
+   records leaves the root standing holding no name, and that is precisely the state recovery is
+   required to read as unfinished issuance — so the next sweep finishes it, minting a fresh
+   allowance beside a task that has already completed. The single rename flips the worker's gate
+   (does the directory exist?) and both of recovery's names (`token`, `spent`) at the same instant,
+   which is the property the two-question split depends on.
 
    The journal clock deliberately does NOT require the journal to be unclaimed: between (2) and (3)
    the journal is the only durable timestamp that exists, so qualifying it on `unclaimed` would leave
@@ -1551,7 +1565,7 @@ itself to a room whose worker might still come back.
    kick -> multi-task backlog  one token consumed; 4 stay pending
    event arrives in probation  event path hits the same gate; admit already 0 -> pending
    crash after publish, before token   next sweep re-issues the token; worker admits 1
-   crash after mkdir, worker consumes  the restarted sweep finds the directory and mints NOTHING
+   crash after mkdir, worker gated     no token exists to consume; the sweep finishes issuance once
    worker never reaches its gate      window from `since` elapses -> wedged, allowance removed
    claimed, unfinished past window    window from claimed/<task_id> elapses -> wedged
    ```
