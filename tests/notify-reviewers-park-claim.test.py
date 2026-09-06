@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -813,6 +814,69 @@ class TypedIdentityMembership(unittest.TestCase):
         nr = _nr()
         self.assertEqual(nr.valid_tags(["endpoint:mx:@sutando-rui:ag2.space"]),
                          {nr._tag("endpoint", "mx", "@sutando-rui:ag2.space")})
+
+
+class ABoundedUnionRefusesInsteadOfRaising(unittest.TestCase):
+    """component_tags bounds ONE component; the UNION of two can exceed the same bound.
+
+    The overflow then surfaced as a ValueError from the ledger append, AFTER the send
+    decision and outside reserve_ask's handlers, so it aborted the remaining batch and
+    left later reviewers unnotified. It must refuse like any other bound failure.
+    """
+
+    MSG = "re-review https://github.com/o/r/pull/7"
+
+    def setUp(self):
+        # Same isolation as every other class here: the module resolves the ledger
+        # path at import, so the env var is set BEFORE _load().
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self.prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        self.nr = _load()
+        self.A = {self.nr._tag("actor", f"a{n}") for n in range(self.nr._MAX_TAGS)}
+        self.B = ({self.nr._tag("actor", f"b{n}") for n in range(self.nr._MAX_TAGS - 1)}
+                  | {sorted(self.A)[0]})
+
+    def tearDown(self):
+        if self.prev is None:
+            os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+        else:
+            os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.prev
+
+    def _park(self, m):
+        return self.nr.claim_park(self.MSG, "m", actor="act", canonical=lambda x: x,
+                             endpoint=None, membership=m)
+
+    def test_the_two_components_are_each_legal_and_their_union_is_not(self):
+        # Without this the case proves nothing: both inputs must be individually valid.
+        self.assertEqual(len(self.A), self.nr._MAX_TAGS)
+        self.assertEqual(len(self.B), self.nr._MAX_TAGS)
+        self.assertGreater(len(self.A | self.B), self.nr._MAX_TAGS)
+
+    def test_the_overflowing_union_raises_the_BOUND_error_not_ValueError(self):
+        self.assertEqual(self._park(self.A), 1)
+        with self.assertRaises(self.nr.MembershipTooLarge):
+            self._park(self.B)
+
+    def test_reserve_ask_turns_it_into_a_refusal_that_does_not_abort_the_batch(self):
+        self._park(self.A)
+        ask = types.SimpleNamespace(kind="ask", message=self.MSG)
+        orig = self.nr.component_tags
+        self.nr.component_tags = lambda r, n: self.B
+        try:
+            proceed, bucket, note = self.nr.reserve_ask(
+                ask, {"name": "m"}, "m", (lambda x: x), {"m": {"discord_id": "1"}})
+        finally:
+            self.nr.component_tags = orig
+        self.assertFalse(proceed)
+        self.assertEqual(bucket, "failure")
+        self.assertIn("Nothing was sent", note)
+
+    def test_a_same_membership_repeat_still_PARKS(self):
+        # The control: the bound must not swallow the ordinary handled park.
+        self.assertEqual(self._park(self.A), 1)
+        self.assertIsNone(self._park(self.A))
 
 
 if __name__ == "__main__":

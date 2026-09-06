@@ -966,10 +966,17 @@ def claim_park(message: str, reviewer: str, actor: str = None,
             prior, ident, matched = hit
             # Only the streams that overlapped may learn `unknown`: a PR in the
             # same message that was never sent has nothing possibly-landed.
+            merged = prior | set(membership)
+            # component_tags bounds ONE component; the UNION of two can exceed
+            # the same bound, and the reader rejects it after the send decision.
+            if len(merged) > _MAX_TAGS:
+                raise MembershipTooLarge(
+                    f"{reviewer}: the union of this component with the parked one is "
+                    f"{len(merged)} identity tags, over the {_MAX_TAGS} bound")
             record_asks(message, ident.get("reviewer") or reviewer,
                         outcome="unknown", actor=ident.get("actor"),
                         endpoint=ident.get("endpoint"),
-                        membership=prior | set(membership), only=matched)
+                        membership=merged, only=matched)
             return None
         if unknown_parked(message, reviewer, who, canonical=canonical,
                           endpoint=endpoint):
