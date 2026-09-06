@@ -114,16 +114,22 @@ class Contract(unittest.TestCase):
 
 class PerRoom(unittest.TestCase):
     def test_a_room_policy_can_narrow_what_this_room_learns_but_never_widen_it(self):
-        now = 1000.0
-        s = S(runtime_healthy=True, active_runs=1, max_concurrency=4, last_heartbeat_at=now - 5)
+        s = S(runtime_healthy=True, active_runs=1, max_concurrency=4, last_heartbeat_at=1000.0)
         narrow = lambda room, v: "busy_unavailable" if room == "!engineering:s" and v == "busy_accepting" else v
-        self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow, now=now)["availability"], "busy_unavailable")
-        self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow, now=now)["availability"], "busy_accepting")
-        widen = lambda room, v: "available"  # a policy cannot invent a value outside the contract either
-        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs", now=now)["availability"],
+        self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow, now=1001.0)["availability"], "busy_unavailable")
+        self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow, now=1001.0)["availability"], "busy_accepting")
+        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs", now=1001.0)["availability"],
                          "busy_accepting", "an off-contract value is ignored, never leaked")
-        self.assertIn(av.availability_projection(s, "air", "!x:s", widen, now=now)["availability"], av.AVAILABILITY)
-
+        # Widening is refused, not merely kept inside the enum: the true value stands.
+        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "available", now=1001.0)["availability"], "busy_accepting")
+        full = S(runtime_healthy=True, active_runs=4, max_concurrency=4, last_heartbeat_at=1000.0)
+        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "busy_accepting", now=1001.0)["availability"], "busy_unavailable")
+        self.assertEqual(av.availability_projection(full, "air", "!x:s", lambda r, v: "unknown", now=1001.0)["availability"], "unknown", "less is allowed")
+        self.assertEqual(av.availability_projection(S(disconnected=True), "air", "!x:s", lambda r, v: "available")["availability"], "offline")
+        for true, allowed in av.NARROWING.items():
+            self.assertIn(true, allowed); self.assertIn("unknown", allowed)
+            if true != "available":
+                self.assertNotIn("available", allowed)
 
 class Policy(unittest.TestCase):
     """Invariant 3 and the tier mapping: TASK_STATUS follows the task's room, RUNTIME_DETAIL follows
