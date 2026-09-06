@@ -2141,5 +2141,167 @@ class ThePluralStandAccessorValidatesItsContainer(unittest.TestCase):
         self.assertEqual(self._ids(["nope", 12, {"id": 12}, self.X]), [self.X])
 
 
+class _InProcessCli:
+    """Run the migration in process on one entry; a subprocess is invisible to
+    the coverage gate, and every control below must be measured."""
+    STAND = "1500000000000000001"
+
+    def _cli(self, entry, with_stand=True, schema=None):
+        d = Path(tempfile.mkdtemp(prefix="three-"))
+        e = dict(entry)
+        if with_stand:
+            e.setdefault("stand_discord_id", self.STAND)
+        doc = {"x": e}
+        if schema is not None:
+            doc["_schema"] = schema
+        (d / "r.json").write_text(json.dumps(doc))
+        (d / "t.json").write_text(json.dumps({"people": {}}))
+        out = d / "o.json"
+        argv = sys.argv
+        sys.argv = ["m", "--roster", str(d / "r.json"),
+                    "--triage-config", str(d / "t.json"), "--out", str(out)]
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = mig.main()
+        finally:
+            sys.argv = argv
+        rec = json.loads(out.read_text())["x"] if out.exists() else {}
+        return rc, err.getvalue(), rec
+
+    @staticmethod
+    def _unresolved(rec):
+        return [u.get("id") for u in rec.get("unresolved_discord_ids") or []]
+
+
+class ThreeDecisionsAreSeparate(_InProcessCli, unittest.TestCase):
+    """Namespace (is this a Discord id?), principal eligibility (may it fill a
+    slot?) and referent (person or agent?) are three decisions. Collapsed into
+    one boolean, a `human` ancestor promoted any Discord-shaped id beneath it
+    — including an object the leaf never called a principal — and a Matrix
+    handle's localpart was read as a Discord id because its key named a person.
+    """
+
+    R = "1400000000000000001"
+
+    def test_an_unstated_object_stays_unresolved_under_a_referent_ancestor(self):
+        # The discriminating pair: the same leaf, at the root and nested. The
+        # root case was already unresolved; nesting alone must not resolve it.
+        for entry in ({"understanding_discord_id": self.R},
+                      {"human": {"understanding_discord_id": self.R}}):
+            rc, _e, rec = self._cli(entry)
+            self.assertIsNone(rec.get("human_discord_id"), entry)
+            self.assertEqual(self._unresolved(rec), [self.R], entry)
+            self.assertEqual(rc, 5, entry)
+
+    def test_a_non_principal_object_absent_from_the_denylist_is_not_the_human(self):
+        rc, _e, rec = self._cli({"human": {"discord_scheduled_event_id": self.R}})
+        self.assertIsNone(rec.get("human_discord_id"))
+        self.assertEqual(self._unresolved(rec), [self.R])
+
+    def test_a_matrix_handle_is_not_discord_evidence(self):
+        # Legacy `human`/`stand` hold room handles; a localpart is no snowflake.
+        # The source field is carried through -- a DISCORD slot must not take it.
+        for entry in ({"human": f"@{self.R}:matrix.example"},
+                      {"stand": f"@{self.R}:matrix.example"},
+                      {"stand_status": f"stand @{self.R}:matrix.example"}):
+            rc, _e, rec = self._cli(entry)
+            self.assertIsNone(rec.get("human_discord_id"), entry)
+            self.assertEqual(rec.get("stand_discord_id"), self.STAND, entry)
+            self.assertEqual(self._unresolved(rec), [], entry)
+            self.assertNotIn(self.R, json.dumps(rec.get("other_stand_discord_ids")), entry)
+            self.assertNotIn(self.R, json.dumps(rec.get("id_basis")), entry)
+            self.assertEqual(rc, 0, entry)
+
+    def test_a_typed_leaf_under_human_still_resolves(self):
+        # POSITIVE CONTROL: the ancestor supplies the referent for a leaf that
+        # declares only the namespace and that it is an id.
+        rc, _e, rec = self._cli({"human": {"discord_user_id": self.R}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec.get("human_discord_id"), self.R)
+        self.assertEqual(self._unresolved(rec), [])
+
+    def test_stand_status_prose_still_resolves(self):
+        # POSITIVE CONTROL for the namespace rule: documented prose evidence.
+        rc, _e, rec = self._cli({"stand_status": f"stand id {self.R}"}, with_stand=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec.get("stand_discord_id"), self.R)
+
+
+class ReasonProseCannotRankAStand(_InProcessCli, unittest.TestCase):
+    """Rank comes from the validated structured path of a claim, never from the
+    `reason` prose a carried seed supplies: that prose is untrusted input, and
+    a backticked path forged into it promoted a secondary Stand to primary."""
+
+    X = "1400000000000000002"
+    Y = "1400000000000000003"
+    V2 = {"name": "reviewer-identity", "version": 2}
+
+    def _run(self, reason, seed_first):
+        seed = {"id": self.X, "seeded_by": [
+            {"path": "other_stand_discord_ids", "verdict": "stand",
+             "reason": reason}]}
+        # Key order decides claim order, and a tie falls to claim order.
+        entry = {"unresolved_discord_ids": [seed], "stand_discord_id": self.Y} \
+            if seed_first else \
+            {"stand_discord_id": self.Y, "unresolved_discord_ids": [seed]}
+        rc, _e, rec = self._cli(entry, with_stand=False, schema=self.V2)
+        return rc, rec
+
+    def test_the_declared_primary_survives_any_reason_text(self):
+        for seed_first in (True, False):
+            for reason in ("cited in `other_stand_discord_ids`",
+                           "cited in `stand_discord_id`",
+                           "cited in `stand_discord_id` `stand_discord_id`", ""):
+                rc, rec = self._run(reason, seed_first)
+                why = f"seed_first={seed_first} reason={reason!r}"
+                self.assertEqual(rc, 0, why)
+                self.assertEqual(rec.get("stand_discord_id"), self.Y, why)
+                self.assertEqual(ri.stand_discord_ids(rec), [self.Y, self.X], why)
+
+
+class AnAccessorValidatesWhatItReturns(unittest.TestCase):
+    """The v2 marker says the document was migrated; it does not validate an
+    entry. Every public accessor checks the value it is about to return: a
+    whole-string snowflake, and not an id the entry itself lists as unresolved.
+    """
+
+    V = "1400000000000000004"
+    S = "1500000000000000002"
+
+    def _all(self, entry):
+        return (ri.human_discord_id(entry), ri.stand_discord_id(entry),
+                ri.stand_discord_ids(entry))
+
+    def test_a_valid_entry_answers(self):
+        # POSITIVE CONTROL FIRST.
+        self.assertEqual(self._all({"human_discord_id": self.V, "stand_discord_id": self.S}),
+                         (self.V, self.S, [self.S]))
+
+    def test_a_json_number_answers_nothing(self):
+        self.assertEqual(self._all({"human_discord_id": 1400000000000000004,
+                                    "stand_discord_id": 1500000000000000002}),
+                         (None, None, []))
+
+    def test_a_partial_id_answers_nothing(self):
+        self.assertEqual(self._all({"human_discord_id": "150431", "stand_discord_id": "15"}),
+                         (None, None, []))
+
+    def test_an_unresolved_id_answers_no_lookup(self):
+        entry = {"human_discord_id": self.V, "stand_discord_id": self.V,
+                 "other_stand_discord_ids": [self.V, self.S],
+                 "unresolved_discord_ids": [{"id": self.V}]}
+        self.assertEqual(self._all(entry), (None, None, [self.S]))
+
+    def test_direct_and_aggregate_stand_accessors_agree(self):
+        for entry in ({"stand_discord_id": 1500000000000000002},
+                      {"stand_discord_id": "x"},
+                      {"stand_discord_id": self.S, "unresolved_discord_ids": [{"id": self.S}]}):
+            direct = ri.stand_discord_id(entry)
+            agg = ri.stand_discord_ids(entry)
+            self.assertEqual(direct, agg[0] if agg else None, entry)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

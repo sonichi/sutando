@@ -51,9 +51,13 @@ SHAPE_FIELD = ri.SHAPE_FIELD    # owned by the schema module
 _SNOWFLAKE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
 
 
+# A Matrix id is `@localpart:server`; a numeric localpart is not a snowflake.
+_MXID = re.compile(r"@[^\s:@]+:[^\s]+")
+
+
 def _snowflakes(text: str) -> list:
     """Every whole snowflake in a string, never a prefix of a longer one."""
-    return _SNOWFLAKE.findall(str(text))
+    return _SNOWFLAKE.findall(_MXID.sub(" ", str(text)))
 
 
 def _is_snowflake(v) -> bool:
@@ -86,6 +90,10 @@ def _cited_in(entry: dict, id_: str) -> list:
 _WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 
 _HUMAN_WORDS = frozenset({"human", "humans", "person"})
+# Words that declare namespace or id-ness without naming an object.
+_ID_WORDS = frozenset({"discord", "id", "ids", "user"})
+# Legacy keys notify_reviewers reads as ROOM HANDLES, not Discord evidence.
+_HANDLE_KEYS = frozenset({"human", "stand"})
 _STAND_WORDS = frozenset({"stand", "stands", "agent", "agents"})
 
 
@@ -104,9 +112,11 @@ def _verdicts_from_field(field: str) -> list:
     Returning both lets the existing disagreement path resolve it; picking one
     would be a precedence no source documents.
     """
-    # Any word, at any depth: nesting must not change what a typed field
-    # states, or `wrapper.stand_status.id` would classify as nothing.
-    words = _field_words(field)
+    # A bare id leaf inherits its ancestors (`wrapper.stand_status.id`); a
+    # leaf naming its own object does not, or `human.<object>_id` is the human.
+    segs = str(field).split(".")
+    leaf = _field_words(segs[-1])
+    words = leaf if leaf - _ID_WORDS else _field_words(field)
     out = []
     if words & _HUMAN_WORDS:
         out.append((HUMAN, f"cited in `{field}` (field names the human)"))
@@ -227,6 +237,8 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
     become Discord by moving the key one level down.
     """
     if not _namespaced_identity_leaf(key, "discord"):
+        return False
+    if str(key).strip().lower() in _HANDLE_KEYS:
         return False
     if provider is not None:
         return provider == "discord"
@@ -495,9 +507,6 @@ def _mineable_now(value) -> bool:
 
 #: The backticked path inside a generated basis reason ("cited in `a.b`").
 #: Reasons are produced by this module, so both sides share one spelling.
-_CITED_PATH = re.compile(r"`([A-Za-z0-9_.]+)`")
-
-
 def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str, src_version: int = 0):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{},
@@ -553,11 +562,13 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                     "reason": "two ids claim one singular slot; order would "
                               "decide, so neither is taken"})
     seeds: dict = {}    # id -> writer-owned slots that stated a referent
+    roots: dict = {}    # id -> writer-owned roots it was READ from
     for id_ in [c for c in collected if c not in arbitrated]:
         for field in _cited_in(entry, id_):
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
                 if ri.writer_owned_path(field):
+                    roots.setdefault(id_, set()).add(field.split(".")[0])
                     seeds.setdefault(id_, []).append(
                         {"path": field, "verdict": verdict, "reason": reason})
         claims.setdefault(id_, {})
@@ -618,6 +629,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             entry, arbitrated, observed, peer_ids, owner_id, src_version):
         claim(id_, verdict, reason)
         seeds.setdefault(id_, []).append(seed)
+        roots.setdefault(id_, set()).add(str(seed["path"]).split(".")[0])
 
     for id_ in list(claims):
         if id_ in peer_ids:
@@ -656,14 +668,13 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if human_id:
         basis[ri.HUMAN_FIELD] = humans[0][1]
 
-    # The schema NAMES primacy, and the RANKING must read the same evidence the
-    # collector did: scanning the raw slot text let a note's snowflake rank it.
+    # Primacy from the validated path an id was read from — never from
+    # `reason` prose, which a carried seed supplies and which ranked a forgery.
     def _rank(item):
-        roots = {p.split(".")[0] for r in (item[1] or [])
-                 for p in _CITED_PATH.findall(str(r))}
-        if ri.STAND_FIELD in roots:
+        _r = roots.get(item[0]) or set()
+        if ri.STAND_FIELD in _r:
             return 0
-        return 2 if ri.OTHER_STANDS_FIELD in roots else 1
+        return 2 if ri.OTHER_STANDS_FIELD in _r else 1
 
     stands.sort(key=_rank)
 

@@ -196,14 +196,38 @@ def people(doc: dict) -> dict:
             if is_person_key(k) and isinstance(v, dict)}
 
 
+def _unresolved_id_set(entry: dict) -> set:
+    """Ids the entry itself declines to resolve. Any of them answers no lookup.
+
+    Private and set-shaped: the public `unresolved_discord_ids` below returns
+    the RECORDS, and two functions under one name silently shadowed this one.
+    """
+    out = set()
+    for rec in (entry or {}).get(UNRESOLVED_FIELD) or []:
+        rid = rec.get("id") if isinstance(rec, dict) else rec
+        if _is_snowflake_str(rid):
+            out.add(rid)
+    return out
+
+
+def _canonical_id(entry: dict, field: str):
+    """The ONE validation every public accessor applies: a whole-string
+    snowflake, and not an id the entry lists as unresolved. The `_schema`
+    marker says the document was migrated; it does not validate a value."""
+    v = (entry or {}).get(field)
+    if not _is_snowflake_str(v) or v in _unresolved_id_set(entry):
+        return None
+    return v
+
+
 def human_discord_id(entry: dict):
     """The person. Never the agent, and never a v1 `discord_id`."""
-    return (entry or {}).get(HUMAN_FIELD) or None
+    return _canonical_id(entry, HUMAN_FIELD)
 
 
 def stand_discord_id(entry: dict):
     """The agent that acts for the person."""
-    return (entry or {}).get(STAND_FIELD) or None
+    return _canonical_id(entry, STAND_FIELD)
 
 
 def stand_discord_ids(entry: dict) -> list:
@@ -215,14 +239,15 @@ def stand_discord_ids(entry: dict) -> list:
     """
     out = []
     primary = stand_discord_id(entry)
-    if _is_snowflake_str(primary):
+    if primary:
         out.append(primary)
     extras = (entry or {}).get(OTHER_STANDS_FIELD)
     if not isinstance(extras, (list, tuple)):
         return out
+    unresolved = _unresolved_id_set(entry)
     for extra in extras:
         eid = extra.get("id") if isinstance(extra, dict) else extra
-        if _is_snowflake_str(eid) and eid not in out:
+        if _is_snowflake_str(eid) and eid not in out and eid not in unresolved:
             out.append(eid)
     return out
 
