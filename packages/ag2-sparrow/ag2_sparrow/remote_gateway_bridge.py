@@ -992,6 +992,8 @@ def _handle_hitl_action(task: dict):
     if out == "applied" and getattr(handler, "last_turn", False):
         # The click is recorded; the requirement asked for a turn, so the same relay
         # task goes on to the core (idempotent by task id) and its executor runs now.
+        # The header tells the core it is a recorded click, not an instruction.
+        task["hitl_click"] = "true"
         return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
         # A non-owner typed a label as a reply: that is a message, not a click
@@ -1607,6 +1609,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
                 "requested_worker", "priority",
+                # A card click already recorded in the HITL store, passed on for the turn it
+                # causes: the core answers [no-send] and lets its Stop hook do the work.
+                "hitl_click",
                 "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends

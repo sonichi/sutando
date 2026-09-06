@@ -667,13 +667,21 @@ class TestAskFirst(unittest.TestCase):
                 self.assertTrue(report_feedback.posting_marker(ws, did).exists())
                 self.assertEqual(report_feedback.list_drafts(ws), [])
                 self.assertEqual([d["id"] for d in report_feedback.list_drafts(ws, state="posting")], [did])
-                self._run(["--apply"])  # held: no second post, the card stays open for the owner
+                self._run(["--apply"])  # held: no second post; the answered card closes and a new card asks
                 self.assertEqual(len(posted), 1, "an indeterminate outcome is never re-posted on a guess")
-                self.assertEqual(m.get(rid).status, "in_progress")
-                # the owner decides: skip drops the in-flight draft and closes the card
-                self._run(["--decide", did, "skip"])
+                self.assertEqual(m.get(rid).status, "resolved", "the click was consumed; the question moved to a new card")
+                held = [r for r in m.active() if r.guard == f"{did}:held"]
+                self.assertEqual(len(held), 1, "a held draft is owner-visible as its own card")
+                self.assertTrue(held[0].turn_on_action)
+                self.assertEqual([a.id for a in held[0].actions], ["file", "skip"])
+                self._run(["--apply"])  # idempotent: the held card is not duplicated
+                self.assertEqual(len([r for r in m.active() if r.guard == f"{did}:held"]), 1)
+                # the owner clicks Skip on the held card: the in-flight draft is dropped, the card closes
+                m.apply_action(ActionReply(hitl_id=held[0].id, expected_revision=held[0].revision, action_id="skip", guard=held[0].guard))
+                self._run(["--apply"])
                 self.assertFalse(report_feedback.posting_marker(ws, did).exists())
-                self.assertEqual(m.get(rid).status, "resolved")
+                self.assertEqual(m.get(held[0].id).status, "resolved")
+                self.assertEqual(len(posted), 1)
             # a transport error with no answer is the same shape
             did2 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "two", "body": "b", "auto": True})
             with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
@@ -695,6 +703,34 @@ class TestAskFirst(unittest.TestCase):
                 self._run(["--decide", did2, "file"])
             self.assertEqual(len(posted), 2)
             self.assertFalse(report_feedback.posting_marker(ws, did2).exists())
+
+    def test_held_card_edge_cases_settled_by_hand_failing_repost_and_decide_closes_it(self):
+        from hitl.schema import ActionReply
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"sendLogs": False})
+            m = self._hitl(ws)
+            # 1. a held card whose draft was settled by hand meanwhile is cancelled, not run
+            d1 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "one", "body": "b"})
+            h1 = report_feedback.register_held(ws, m, d1, "one", "host")
+            report_feedback.drop_draft(ws, d1)
+            m.apply_action(ActionReply(hitl_id=h1, expected_revision=1, action_id="file", guard=f"{d1}:held"))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--apply"])
+            self.assertEqual(m.get(h1).status, "cancelled")
+            # 2. a held click whose re-post fails keeps the card and the in-flight draft
+            d2 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "two", "body": "b"})
+            report_feedback.mark_posting(ws, d2)
+            h2 = report_feedback.register_held(ws, m, d2, "two", "host")
+            m.apply_action(ActionReply(hitl_id=h2, expected_revision=1, action_id="file", guard=f"{d2}:held"))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=(None, None)):
+                self._run(["--apply"])
+            self.assertEqual(m.get(h2).status, "in_progress")
+            # 3. a by-hand --decide on a draft with a held card closes that card too
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws):
+                self._run(["--decide", d2, "skip"])
+            self.assertEqual(m.get(h2).status, "resolved")
+            self.assertFalse(report_feedback.posting_marker(ws, d2).exists())
 
     def test_reply_labels_map_to_decisions(self):
         f = report_feedback.decision_for_reply

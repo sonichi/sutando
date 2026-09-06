@@ -401,6 +401,29 @@ def requirement_for_draft(manager, draft_id: str):
     return None
 
 
+HELD_ACTIONS = [
+    {"id": "file", "kind": "confirmation", "label": "File it again"},
+    {"id": "skip", "kind": "confirmation", "label": "Skip"},
+]
+
+
+def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> str:
+    """The post got no answer: a new card says so and asks again. Same guard grammar with a suffix,
+    so the store dedupes a repeat and the click's task path is the same one."""
+    from hitl.schema import Action, HumanRequirement  # type: ignore
+
+    req = HumanRequirement(
+        kind="choice", runtime=HITL_RUNTIME, title="Bug report: filed or not?",
+        message=(f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
+                 f"File it again, or skip it?"),
+        guard=f"{draft_id}:held", device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device},
+        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in HELD_ACTIONS],
+        subject={"draft_id": draft_id, "title": title, "held": True},
+        turn_on_action=True,
+    )
+    return manager.create(req).id
+
+
 def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
     """Register parked drafts that have no card yet, then run every choice the owner clicked.
     A decision that cannot complete (signed out, API down) stays in progress for the next run;
@@ -418,6 +441,19 @@ def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
             manager.cancel(req.id)
             out["cancelled"].append(req.id)
             continue
+        if (req.subject or {}).get("held"):
+            # The owner answered the held card: file again on purpose, or drop the in-flight draft.
+            if not posting_marker(ws, draft_id).exists() and load_draft(ws, draft_id) is None:
+                manager.cancel(req.id)  # settled by hand meanwhile
+                out["cancelled"].append(req.id)
+                continue
+            if decide(ws, prefs, draft_id, req.chosen_action) == 0:
+                manager.resolve(req.id)
+                clear_filed(ws, draft_id)
+                out["applied"].append(req.id)
+            else:
+                out["kept"].append(req.id)
+            continue
         if filed_receipt(ws, draft_id).exists():
             manager.resolve(req.id)
             clear_filed(ws, draft_id)
@@ -425,10 +461,13 @@ def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
             continue
         if posting_marker(ws, draft_id).exists():
             # The post was sent and nothing came back: it may or may not have filed. Never
-            # re-post on a guess; the owner decides with --decide <id> file|skip.
+            # re-post on a guess: the answered card closes, and a new card asks the owner.
+            title = str((req.subject or {}).get("title") or draft_id)
+            held_id = register_held(ws, manager, draft_id, title, device)
+            manager.resolve(req.id)
             print(f"HELD: draft {draft_id} has an in-flight post with no recorded answer; "
-                  f"--decide {draft_id} file re-posts on purpose, skip drops it.")
-            out["held"].append(req.id)
+                  f"asked again as {held_id} (File it again / Skip); --decide {draft_id} file|skip also settles it.")
+            out["held"].append(held_id)
             continue
         if load_draft(ws, draft_id) is None:
             manager.cancel(req.id)  # the draft is gone (decided by hand, or never valid): nothing to run
@@ -657,6 +696,9 @@ def main() -> None:
             req = requirement_for_draft(manager, a.decide[0])
             if req is not None:
                 manager.resolve(req.id)  # the card follows the hand-made decision
+            held = next((r for r in manager.active() if r.runtime == HITL_RUNTIME and r.guard == f"{a.decide[0]}:held"), None)
+            if held is not None:
+                manager.resolve(held.id)
             clear_filed(ws, a.decide[0]) if DRAFT_ID_RE.match(a.decide[0]) else None
         if rc:
             sys.exit(rc)

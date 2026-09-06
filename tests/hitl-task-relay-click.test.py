@@ -124,6 +124,9 @@ class TaskRelayClickTests(unittest.TestCase):
         t = self._task(hitl_action={"hitl_id": req.id, "expected_revision": req.revision,
                                     "action_id": "file", "guard": req.guard}, task="File this bug report")
         self.assertIs(rgb._handle_hitl_action(t), False, "not consumed: the core takes a turn on it")
+        self.assertEqual(t.get("hitl_click"), "true", "the forwarded task says it is a recorded click")
+        self.assertIn("hitl_click", rgb._TASK_FIELDS)
+        self.assertLess(rgb._TASK_FIELDS.index("hitl_click"), rgb._TASK_FIELDS.index("task"), "a header below task: is body")
         after = self.mgr.get(req.id)
         self.assertEqual((after.status, after.chosen_action), ("in_progress", "file"))
         # the same task offered again (relay redelivery) is a stale click: consumed, owner told
