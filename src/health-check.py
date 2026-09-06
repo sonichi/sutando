@@ -55,7 +55,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -8232,8 +8232,13 @@ def _is_watcher_argv(argv: str) -> bool:
             and script.endswith("watch-tasks-stream.sh"))
 
 
-def _pid_instance_id(pid: str):
-    """`SUTANDO_INSTANCE_ID` from THAT process's environment, or None if unreadable.
+# The actor half, in `rundir.agent_id`'s precedence order. First NON-EMPTY wins
+# there, so an empty earlier name must fall through exactly as `or` does.
+_ACTOR_ENV_NAMES = ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID")
+
+
+def _pid_env_first(pid: str, names):
+    """First of `names` set in THAT process's environment, "" if it states none.
 
     Tri-state on purpose: None is "cannot read", never "default" -- naming a
     sentinel from THIS process's env is how a named watcher gets the canonical file.
@@ -8251,27 +8256,51 @@ def _pid_instance_id(pid: str):
         # `ps -E` prints ARGV then the environment, so take the LAST match: a
         # process whose own argv mentions the variable is otherwise misread.
         toks = out.stdout.split()
-        hits = [k for k in toks if k.startswith("SUTANDO_INSTANCE_ID=")]
-        if hits:
-            return hits[-1].split("=", 1)[1]
+        for name in names:
+            hits = [k for k in toks if k.startswith(f"{name}=")]
+            if hits and hits[-1].split("=", 1)[1]:
+                return hits[-1].split("=", 1)[1]
         # A miss means default ONLY if the environment was printed at all. Keying
         # that on a SUTANDO_ prefix would be a correlated field, not the answer.
         printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
         return "" if printed_env else None
+    seen = {}
     for raw in environ.split(b"\0"):
-        if raw.startswith(b"SUTANDO_INSTANCE_ID="):
-            return raw.split(b"=", 1)[1].decode("utf-8", "replace")
+        for name in names:
+            prefix = name.encode() + b"="
+            if raw.startswith(prefix):
+                seen.setdefault(name, raw.split(b"=", 1)[1].decode("utf-8", "replace"))
+    for name in names:
+        if seen.get(name):
+            return seen[name]
     return ""
+
+
+def _pid_instance_id(pid: str):
+    """The instance half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, ("SUTANDO_INSTANCE_ID",))
+
+
+def _pid_actor_id(pid: str):
+    """The actor half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, _ACTOR_ENV_NAMES)
 
 
 def _watcher_sentinel_target(state_dir, pid):
     """The sentinel path for the watcher at `pid`, or None when its identity is
     not authoritative. A guess here is published as a repair target."""
     inst = _pid_instance_id(pid)
-    if inst is None:
+    actor = _pid_actor_id(pid)
+    if inst is None or actor is None:
         return None
     try:
-        return watcher_sentinel_path(state_dir, instance=(inst or None))
+        # BOTH halves explicitly. None means "resolve from the caller", and the
+        # caller here is health-check -- a different actor than the watcher.
+        defaults = stated_default_identity(state_dir)
+        if defaults is None:
+            return None
+        return watcher_sentinel_path(state_dir, instance=(inst or defaults[0]),
+                                     agent=(actor or defaults[1]))
     except Exception:  # noqa: BLE001
         return None
 

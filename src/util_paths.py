@@ -526,6 +526,21 @@ def instance_scope_key(state_dir, instance=None, agent=None) -> str:
     return ikey.instance_key(who, inst)
 
 
+def stated_default_identity(state_dir):
+    """The (instance, agent) pair a process names when it sets NEITHER env var.
+
+    A caller naming ANOTHER process's path cannot pass None for an observed
+    default: None re-resolves from the CALLER's own environment, which is a
+    different identity. This returns the values to pass explicitly instead.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return None
+    rundir, ikey = ident
+    return ikey.DEFAULT_INSTANCE, (rundir.enrolled_agent_id(state_dir)
+                                   or rundir.DEFAULT_ACTOR)
+
+
 def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
     """The sentinel THIS instance writes."""
     key = instance_scope_key(state_dir, instance, agent)

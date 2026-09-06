@@ -13,6 +13,8 @@ never a recency choice, despite the comment that said so.
 """
 import importlib.util
 import sys
+import contextlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,7 +32,7 @@ WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
 
 def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
-        parent="1", pid_instance=None) -> dict:
+        parent="1", pid_instance=None, pid_actor="") -> dict:
     """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
 
     `pid_instance` is what the WATCHER's own environment yields: a string names
@@ -45,7 +47,7 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             (ws / "state" / fn).write_text(text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
-                 hc._pid_instance_id)
+                 hc._pid_instance_id, hc._pid_actor_id)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = (argv if callable(argv) else (lambda pid: argv))
@@ -54,11 +56,12 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             hc._pid_parent = lambda pid, ps=None: parent
             hc._fresh_local_core_record = lambda *a, **k: ({} if core_alive else None)
             hc._pid_instance_id = lambda pid: pid_instance
+            hc._pid_actor_id = lambda pid: pid_actor
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
-             hc._pid_instance_id) = saved
+             hc._pid_instance_id, hc._pid_actor_id) = saved
 
 
 class PoolHost(unittest.TestCase):
@@ -227,6 +230,43 @@ class TheRestampTargetComesFromTheWATCHERsIdentity(unittest.TestCase):
                          "a guessed target is published as a repair instruction")
         self.assertIn("_sentinel_restamp_pid", r, "the pid is still reported")
         self.assertIn("unreadable", r["detail"])
+
+    @contextlib.contextmanager
+    def _health_check_identity(self, actor, instance):
+        """Give HEALTH-CHECK a different identity than the watcher.
+
+        Without this the two resolve alike and `agent=None` returns the right
+        answer for the wrong reason, so the defect is invisible to every case above.
+        """
+        names = {"SUTANDO_AGENT_ID": actor, "SUTANDO_INSTANCE_ID": instance}
+        saved = {k: os.environ.get(k) for k in names}
+        os.environ.update(names)
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                os.environ[k] = v if v is not None else os.environ.pop(k, "")
+                if v is None:
+                    os.environ.pop(k, None)
+
+    def test_the_target_follows_the_WATCHERs_identity_not_health_checks(self):
+        with self._health_check_identity("health-b", "health-z"):
+            r = run({}, **self.SUPERVISED, pid_instance="worker-7", pid_actor="watcher-a")
+            self.assertEqual(Path(r["_sentinel_restamp_path"]).name,
+                             "watch-tasks-stream-watcher-a+worker-7.pid",
+                             "health-check's own actor leaked into the repair target")
+
+    def test_an_observed_default_is_the_canonical_default_not_the_callers(self):
+        # `inst or None` sent an OBSERVED default back to the caller's environment.
+        with self._health_check_identity("health-b", "health-z"):
+            r = run({}, **self.SUPERVISED, pid_instance="", pid_actor="watcher-a")
+            self.assertEqual(Path(r["_sentinel_restamp_path"]).name,
+                             "watch-tasks-stream-watcher-a.pid")
+
+    def test_an_unreadable_ACTOR_also_offers_no_target(self):
+        # The instance half already refused; the actor half must refuse alike.
+        r = run({}, **self.SUPERVISED, pid_instance="worker-7", pid_actor=None)
+        self.assertNotIn("_sentinel_restamp_path", r)
 
     def test_the_watcher_is_never_prescribed_for_stopping_in_any_of_them(self):
         for inst in ("worker-7", "", None):
