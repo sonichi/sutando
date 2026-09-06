@@ -444,6 +444,13 @@ class PoolLead:
     def _wake_evidence_path(self) -> Path:
         return self.state_dir / "pool" / "lead-tick.json"
 
+    def _wake_lock(self) -> _FlockCtx:
+        """Serializes the wake record's load/merge/replace across overlapping
+        leads; plain reads of the atomic file need no lock."""
+        path = self._wake_evidence_path().with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return _FlockCtx(path)
+
     def _load_wake_evidence(self) -> "tuple[float, float, float | None] | None":
         """Previous lead's last (wall, mono, defer_until) sample, or None.
 
@@ -480,22 +487,26 @@ class PoolLead:
         """Publish this lead's wake sample. False = not published, so a caller
         can observe the loss instead of trusting a silent best-effort write."""
         p = self._wake_evidence_path()
-        payload = {"wall": wall, "mono": mono}
-        if defer_until is None:
-            # A deadline-free sample must not ERASE an open one: the window
-            # belongs to the host's wake event, not to whoever ticked last.
-            prior = self._load_wake_evidence()
-            if prior is not None and prior[2] is not None and mono < prior[2]:
-                payload["defer_until"] = prior[2]
-        else:
-            payload["defer_until"] = defer_until
         # Per-writer temp name, as pool_status does: briefly overlapping leads
         # are supported, and a shared temp lets one consume the other's bytes.
         tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(payload))
-            os.replace(tmp, p)
+            # One lock across load..replace: unique temps stop a torn record,
+            # not a stale write erasing a deadline opened since its load.
+            with self._wake_lock():
+                payload = {"wall": wall, "mono": mono}
+                # The window belongs to the wake event, not to whoever ticked
+                # last, so the MAXIMUM still-open deadline survives.
+                prior = self._load_wake_evidence()
+                open_du = prior[2] if prior is not None else None
+                if open_du is not None and mono < open_du:
+                    defer_until = (open_du if defer_until is None
+                                   else max(defer_until, open_du))
+                if defer_until is not None:
+                    payload["defer_until"] = defer_until
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps(payload))
+                os.replace(tmp, p)
             return True
         except OSError:
             try:
@@ -503,6 +514,17 @@ class PoolLead:
             except OSError:
                 pass
             return False
+
+    def _publish_wake(self, wall: float, mono: float,
+                      defer_until: "float | None") -> bool:
+        """Publish the wake sample and REPORT a loss. A silent best-effort
+        write is what let a failed publish renew the same window forever."""
+        if self._save_wake_evidence(wall, mono, defer_until):
+            return True
+        print("pool-lead: wake evidence not published "
+              f"(defer_until={defer_until}); grace cannot be bounded",
+              file=sys.stderr, flush=True)
+        return False
 
     def _host_gap_defers_reclaim(self) -> bool:
         """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's
@@ -541,13 +563,17 @@ class PoolLead:
             try:
                 followers = list(self.followers_fn())
             except Exception:  # noqa: BLE001 — broken resolver must not defer
-                self._save_wake_evidence(
+                self._publish_wake(
                     now, mono, getattr(self, "_reclaim_defer_until", None))
                 return False
             if followers and not any(self.alive_fn(f) for f in followers):
                 self._reclaim_defer_until = mono + LEAD_STALE_S
         du = getattr(self, "_reclaim_defer_until", None)
-        self._save_wake_evidence(now, mono, du)
+        if not self._publish_wake(now, mono, du):
+            # The one-window bound lives IN the record a successor seeds from;
+            # unpublished, every restart re-opens grace. Refuse, don't renew.
+            self._reclaim_defer_until = None
+            return False
         return du is not None and mono < du
 
     def reclaim_dead(self) -> "list[str]":

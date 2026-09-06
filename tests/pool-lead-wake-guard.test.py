@@ -9,8 +9,11 @@ Run: python3 tests/pool-lead-wake-guard.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -96,6 +99,86 @@ class TheWakeRecordHasOneWriterContract(WakeGuardBase):
         got = self.lead._load_wake_evidence()
         self.assertIsNotNone(got, "concurrent writers published a torn record")
         self.assertEqual(len(got), 3)
+
+    def _second_lead(self):
+        """A second PoolLead over the SAME state dir — the overlapping-lead
+        case the pgrep/exec TOCTOU in pool-lead-wrapper.sh admits."""
+        return PoolLead(self.tasks, self.state,
+                        followers_fn=lambda: list(self.pool),
+                        alive_fn=lambda i: self.alive.get(i, False),
+                        now_fn=lambda: self.clock,
+                        mono_fn=lambda: self.mono,
+                        results_dir=self.results)
+
+    def test_a_stale_read_modify_write_cannot_erase_a_newer_open_deadline(self):
+        """The DISCRIMINATING interleaving: a deadline-free writer loads the
+        record, another lead opens grace, then the first one publishes. Unique
+        temp names do not order these — only a lock held across load..replace
+        does, so this fails on the per-writer-temp parent."""
+        other = self._second_lead()
+        want = self.mono + LEAD_STALE_S
+        loaded = threading.Event()
+        real_load = self.lead._load_wake_evidence
+
+        def load_then_yield():
+            got = real_load()             # the REAL load, under the real lock
+            loaded.set()
+            time.sleep(0.25)              # hold the transaction open
+            return got
+        self.lead._load_wake_evidence = load_then_yield
+
+        opened = []
+
+        def opener():
+            loaded.wait(5)
+            # production writer, the deadline-carrying half
+            opened.append(other._save_wake_evidence(self.clock, self.mono, want))
+        t = threading.Thread(target=opener)
+        t.start()
+        # production writer, the deadline-FREE half that must not clobber
+        self.lead._save_wake_evidence(self.clock, self.mono, None)
+        t.join(10)
+        self.lead._load_wake_evidence = real_load
+
+        self.assertEqual(opened, [True], "opener never published")
+        got = self.lead._load_wake_evidence()
+        self.assertIsNotNone(got, "record lost entirely")
+        self.assertEqual(
+            got[2], want,
+            "a stale deadline-free write erased a newer open deadline — "
+            "the successor loses its grace and repools a live claim")
+
+    def test_a_shorter_deadline_never_shortens_the_open_window(self):
+        """Same lost-update shape with BOTH writers carrying a deadline: the
+        maximum still-open window is the one that belongs to the wake event."""
+        longer = self.mono + LEAD_STALE_S
+        self.lead._save_wake_evidence(self.clock, self.mono, longer)
+        other = self._second_lead()
+        other._save_wake_evidence(self.clock, self.mono, self.mono + 1.0)
+        got = self.lead._load_wake_evidence()
+        self.assertEqual(got[2], longer, "a shorter sample truncated the window")
+
+    def test_an_unpublishable_window_is_refused_and_reported_not_renewed(self):
+        """keweichen: `_save_wake_evidence` returning False was discarded at
+        both call sites, so a failing publish let each restart re-open the same
+        window forever. The bound lives IN the record, so grace it cannot
+        record must be refused — and said out loud."""
+        (self.tasks / "task-live.claimed-core-2.txt").write_text("x")
+        self.lead._save_wake_evidence(self.clock, self.mono, None)
+        self._sleep_whole_host(968)      # skew: wall jumps, mono does not
+
+        self.lead._save_wake_evidence = lambda *a, **k: False   # disk refuses
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            deferred = self.lead._host_gap_defers_reclaim()
+
+        self.assertFalse(deferred,
+                         "granted a grace window it could not record, so every "
+                         "restart re-opens it and recovery never runs")
+        self.assertIn("not published", err.getvalue(),
+                      "publication failure was swallowed at the call site")
+        self.assertIsNone(getattr(self.lead, "_reclaim_defer_until", None),
+                          "an unrecordable window stayed armed in-process")
 
     def test_a_deadline_free_sample_does_not_erase_an_open_deadline(self):
         want = self._open_deadline()
