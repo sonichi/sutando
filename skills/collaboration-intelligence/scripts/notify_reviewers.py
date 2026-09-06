@@ -940,8 +940,12 @@ def reserve_ask(a, t, who, person_of, roster, require_ref=True):
     return True, None, None
 
 
-def settler(a, t, who):
-    """The matching settlement for reserve_ask, on either transport."""
+def settler(a, t, who, parked=True):
+    """The matching settlement for reserve_ask, on either transport.
+
+    `parked` is what reserve_ask actually reserved. An unkeyable ask holds no
+    park, so a failure there blocks nothing and must not claim it does.
+    """
     def _settle(outcome, detail):
         # A NOTICE never claimed, so it has nothing to supersede — and a row
         # here would be projected into ask history by `_first_ask`.
@@ -951,10 +955,15 @@ def settler(a, t, who):
             return record_asks(a.message, t["name"], outcome=outcome, actor=who,
                                detail=detail, endpoint=t.get("endpoint")) or 0
         except OSError as err:
-            # The reservation still stands, so the park holds and the next run
-            # refuses rather than repeating. Say which way it fails.
-            print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the park holds, "
-                  "so a repeat is blocked until it is cleared", file=sys.stderr)
+            # Which way this fails depends on whether anything was reserved.
+            if parked:
+                print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the park "
+                      "holds, so a repeat is blocked until it is cleared",
+                      file=sys.stderr)
+            else:
+                print(f"  WARNING: {t['name']} is UNRECORDED ({err}) — this ask "
+                      "carries no PR URL, so NO park was claimed and a repeat is "
+                      "NOT blocked; re-running may send it again", file=sys.stderr)
             return None
     return _settle
 
@@ -1649,6 +1658,7 @@ def main() -> int:
         who = actors.get(t["name"], t["name"])
         # Same reservation as the Discord path: an alias on this transport must
         # not walk past a park an ask on the other one is still holding.
+        keyable = bool(_PR_URL.search(a.message))
         proceed, bucket, note = reserve_ask(a, t, who, person_of, roster,
                                             require_ref=False)
         if not proceed:
@@ -1658,7 +1668,7 @@ def main() -> int:
             else:
                 failures += 1
             continue
-        _settle = settler(a, t, who)
+        _settle = settler(a, t, who, parked=keyable)
         # Per-target boundary: a raise here would drop every remaining target
         # AND skip the return, so the caller sees no asks and no failure code.
         try:
