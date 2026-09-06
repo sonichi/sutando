@@ -1040,7 +1040,7 @@ rooms must be kept off the same worker:
   deliberately does not — it accepts a bounded overlap instead.** The heading said "every
   transition fences" for three revisions while the first-pin subsection two hundred lines below
   said the opposite in as many words, so the summary and its own body disagreed; the body is
-  right. For two of the three the outgoing claimant is the CORE. The fence above stops a worker. It does not cover the other two ways a binding changes,
+  right. For ONE of the three — first-pin — the outgoing claimant is the CORE; in unpin the core is the INCOMING claimant, as the table below shows. The fence above stops a worker. It does not cover the other two ways a binding changes,
   and both have the same check-then-act shape this section spent three revisions removing:
 
   | transition | outgoing claimant | incoming claimant |
@@ -1364,20 +1364,49 @@ itself to a room whose worker might still come back.
    republishes `wedged` forever: the room is permanently dark, with every individual rule
    behaving exactly as written.
 
-   The reset therefore cannot be inferred; some actor must perform it. **`kick-pool` owns
-   it.** Un-wedging the idle prompt and clearing the verdict are one transition, not two —
-   a kick that leaves the verdict standing changes nothing observable, since the worker
-   resumes and still suppresses. The kick deletes the instance's entry from the published
-   eligibility record (making it absent, which rule 1's table already reads as eligible),
-   and the next sweep re-evaluates from scratch.
+   The reset therefore cannot be inferred; some actor must COMMAND it. **`kick-pool` commands
+   it; the core sweep performs it.** `kick-pool` writes nothing to the eligibility record — it
+   drops a one-line probation request (`state/pool-probation/<instance>`, `os.replace`-atomic,
+   holding the requesting sweep's `record_ts`). The record keeps exactly one writer. Un-wedging
+   the idle prompt and requesting the reset are one transition, not two — a kick that leaves the
+   verdict standing changes nothing observable, since the worker resumes and still suppresses.
+
+   **The reset is a DURABLE PROBATION STATE, not a deletion, so it survives an intervening
+   sweep.** On its next pass the core sweep consumes the request and publishes
+   `{"verdict": "probation", "admit": 1, "since": <sweep_ts>}` for that instance, in place of
+   `wedged`. A sweep that runs BEFORE the worker's reconciliation therefore does not republish
+   `wedged` — the inputs are unchanged but the verdict is no longer computed from them while a
+   probation stands; it is held. Probation ends by exactly one of: the worker completes an
+   admitted task (verdict → `eligible`, computed afresh), or `stand_in_after_s` elapses with the
+   admitted task claimed-and-unfinished (verdict → `wedged`, and the probation request is NOT
+   re-armed — a second kick needs a second command).
+
+   **`admit: 1` is consumed ATOMICALLY at the admission boundary — the target's self-gate, the
+   one place a claim is decided.** The self-gate reads `probation` as: claim ONLY IF `admit > 0`,
+   and decrement-and-claim under the same dispatch lock `acquire_task_claim` already takes, so two
+   candidates cannot both read `admit: 1`. Once `admit` reaches 0 the gate suppresses again until
+   the sweep re-evaluates. This is what bounds the risk to one task: reconciliation's
+   `2 * runners` throttle and the unbounded event path both route through this gate, and neither
+   can admit a second task on a spent probation.
+
+   The four orderings this must hold under, each pinned by
+   `tests/worker-pool-design-transitions.test.py` as a no-write transition model over these exact
+   rules (five pending tasks, two runners):
+
+   ```
+   kick -> sweep -> worker     probation held across the sweep; worker admits 1   (was: wedged, 0, 5)
+   kick -> worker -> sweep     worker admits 1, not 4; sweep sees probation, holds  (was: eligible, 4, 1)
+   kick -> multi-task backlog  admit decrements once; 4 stay pending
+   event arrives in probation  event path hits the same gate; admit already 0 -> pending
+   ```
 
    **This admits exactly one task's worth of risk, deliberately.** A worker still hung
-   after the kick claims the admitted task and strands it — claimed, undeliverable — which
+   after the kick claims the one admitted task and strands it — claimed, undeliverable — which
    is the harm the self-suppression gate above exists to prevent. It is bounded: one task,
-   re-detected by the next sweep in one `stand_in_after_s` window, and visible as a claimed
-   task whose worker holds no lease. That is strictly better than the alternative it
-   replaces, where the harm is unbounded and silent. **State the direction plainly: this
-   design prefers a bounded, re-detectable strand over a permanently dark room.**
+   re-detected in one `stand_in_after_s` window, and visible as a claimed task whose worker
+   holds no lease. That is strictly better than the alternative it replaces, where the harm is
+   unbounded and silent. **State the direction plainly: this design prefers a bounded,
+   re-detectable strand over a permanently dark room.**
 
    The kick is an owner action in v1, not something the core does on a timer. Automating it
    would put the core in a kick/re-wedge loop against a genuinely broken worker, and a loop
