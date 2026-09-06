@@ -1372,22 +1372,27 @@ itself to a room whose worker might still come back.
    verdict standing changes nothing observable, since the worker resumes and still suppresses.
 
    **The reset is a DURABLE PROBATION STATE, not a deletion, so it survives an intervening
-   sweep.** On its next pass the core sweep consumes the request and publishes
-   `{"verdict": "probation", "admit": 1, "since": <sweep_ts>}` for that instance, in place of
-   `wedged`. A sweep that runs BEFORE the worker's reconciliation therefore does not republish
-   `wedged` — the inputs are unchanged but the verdict is no longer computed from them while a
-   probation stands; it is held. Probation ends by exactly one of: the worker completes an
-   admitted task (verdict → `eligible`, computed afresh), or `stand_in_after_s` elapses with the
-   admitted task claimed-and-unfinished (verdict → `wedged`, and the probation request is NOT
-   re-armed — a second kick needs a second command).
+   sweep — and the consumable token lives in a SEPARATELY OWNED artifact, so the record stays
+   core-only.** On its next pass the core sweep consumes the request and does two things: it
+   publishes `{"verdict": "probation", "since": <sweep_ts>}` for that instance in `pool-status.json`
+   (a read-only fact — no counter, nothing a worker would ever need to change), and it creates
+   the token file `state/pool-probation/<instance>.admit` (`os.replace`-atomic, one byte). The
+   sweep is the sole writer of the record AND the sole creator of tokens; a worker never writes
+   either. A sweep that runs BEFORE the worker's reconciliation does not republish `wedged` — the
+   verdict is held while `probation` stands. Probation ends by exactly one of: the worker completes
+   an admitted task (verdict → `eligible`, computed afresh), or `stand_in_after_s` elapses with the
+   admitted task claimed-and-unfinished (verdict → `wedged`, the token — if still present — is
+   removed by the sweep, and the request is NOT re-armed; a second kick needs a second command).
 
-   **`admit: 1` is consumed ATOMICALLY at the admission boundary — the target's self-gate, the
-   one place a claim is decided.** The self-gate reads `probation` as: claim ONLY IF `admit > 0`,
-   and decrement-and-claim under the same dispatch lock `acquire_task_claim` already takes, so two
-   candidates cannot both read `admit: 1`. Once `admit` reaches 0 the gate suppresses again until
-   the sweep re-evaluates. This is what bounds the risk to one task: reconciliation's
-   `2 * runners` throttle and the unbounded event path both route through this gate, and neither
-   can admit a second task on a spent probation.
+   **The token is consumed ATOMICALLY at the admission boundary by `os.rename`, the one
+   single-consumer primitive that needs no shared counter.** The target's self-gate reads
+   `probation` as: claim ONLY IF `rename(<instance>.admit, <instance>.admit.<task_id>)` succeeds.
+   Exactly one caller wins that rename — two concurrent candidates, or reconciliation racing the
+   event path, cannot both succeed, and neither touches `pool-status.json`. A worker that restarts
+   and re-reads the record still sees `verdict: probation`, but the token is already renamed, so it
+   suppresses: the consumed state is on disk, not in a process's memory. This is what bounds the
+   risk to one task: reconciliation's `2 * runners` throttle and the unbounded event path both route
+   through this gate, and there is one token.
 
    The four orderings this must hold under, each pinned by
    `tests/worker-pool-design-transitions.test.py` as a no-write transition model over these exact
@@ -1396,7 +1401,7 @@ itself to a room whose worker might still come back.
    ```
    kick -> sweep -> worker     probation held across the sweep; worker admits 1   (was: wedged, 0, 5)
    kick -> worker -> sweep     worker admits 1, not 4; sweep sees probation, holds  (was: eligible, 4, 1)
-   kick -> multi-task backlog  admit decrements once; 4 stay pending
+   kick -> multi-task backlog  one token consumed; 4 stay pending
    event arrives in probation  event path hits the same gate; admit already 0 -> pending
    ```
 
@@ -1453,7 +1458,7 @@ worker that stopped, carried from #3604's operations section:
 |---|---|---|
 | auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
 | timeouts, 5xx | transport | back off and retry; do not touch the session |
-| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the room stops admitting new work. `kick-pool` un-wedges the idle prompt **and clears the `wedged` verdict in the same transition** — un-wedging alone does not resume the worker, because it suppresses on its own verdict. See "Clearing a wedged verdict" |
+| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the room stops admitting new work. `kick-pool` un-wedges the idle prompt **and requests a probation**; the next sweep publishes it and issues one admit token — see "Clearing a wedged verdict" |
 | beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets, and its rooms stay pending meanwhile. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and never becomes visible as stuck. Measured live: four seats beating normally at zero throughput |
 | beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
