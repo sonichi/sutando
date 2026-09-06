@@ -97,7 +97,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
-**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Codex's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 skills/review-preflight/scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Codex's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
 ## Workspace contract
 
@@ -169,11 +169,17 @@ EOF
 **Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
 **When done:**
-Write a result file using the same task ID (re-use the `WORKSPACE` from above):
+Write a result file using the same task ID (re-use the `WORKSPACE` from above).
+**Write it atomically** — a drain can claim `results/task-*.txt` the moment it appears, so a file
+built in place is published half-written:
 ```bash
-cat > "$WORKSPACE/results/task-chat-${_ts}.txt" << EOF
+_out="$WORKSPACE/results/task-chat-${_ts}.txt"
+_tmp="$(mktemp "$WORKSPACE/results/.task-chat-${_ts}.XXXXXX")"
+cat > "$_tmp" << EOF
 <result summary>
 EOF
+mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
+                         # matches a name without `.txt` (pathlib `*` sees dotfiles)
 ```
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
@@ -265,6 +271,16 @@ Send a second update at meaningful checkpoints (e.g. "Done with the research —
 
 The script is fail-open — always continue the task regardless of exit code. Only skip for
 immediate one-sentence answers that require no tool calls.
+
+## Agent activity (what the owner sees you doing)
+
+With the `agent-activity` skill installed, the desktop shows your live activity in the room whose
+message you are on (a drawer above the composer) and in the dock's Activity panel. Its hooks write the
+rows: `processing` when a session first touches a task file, `working` per tool call, `thinking` from
+your turn-end narration, `done` when the result file is written. Do not hand-write those four. Add
+rows only for what the owner asks to see beyond them — a decision worth naming, a PR heartbeat —
+with `python3 skills/agent-activity/scripts/activity.py append "<line>" --kind thinking|notice
+--task-file <workspace>/tasks/<task>.txt`. Row schema: `skills/agent-activity/SKILL.md`.
 
 ## Workspace layout
 

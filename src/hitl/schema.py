@@ -19,6 +19,24 @@ KINDS = frozenset(
      "core-blocked", "unknown"}
 )
 
+CATEGORY_BLOCKED = "blocked"
+CATEGORY_DECISION = "decision"
+# Mirrors ag2-space/cinny-webclient src/app/components/message/hitlCategory.ts
+# (#847). An unlisted kind is BLOCKED: under-stating a block strands the user.
+_KIND_CATEGORY = {
+    "auth": CATEGORY_BLOCKED,
+    "permission": CATEGORY_BLOCKED,
+    "billing": CATEGORY_BLOCKED,
+    "external_action": CATEGORY_BLOCKED,
+    "choice": CATEGORY_DECISION,
+    "confirmation": CATEGORY_DECISION,
+}
+
+
+def category_of(kind: "str | None") -> str:
+    """Which of the two presentations this kind gets."""
+    return _KIND_CATEGORY.get(kind or "", CATEGORY_BLOCKED)
+
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_RESOLVED = "resolved"

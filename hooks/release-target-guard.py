@@ -21,8 +21,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _shell_scan  # noqa: E402  (sibling module; path set above)
 
 FULL_SHA = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 # Both take the same case set: widening only HEX_RUN would deny a valid
@@ -41,41 +43,6 @@ def _deny(reason):
     sys.exit(0)
 
 
-def _newline_separators(command: str) -> str:
-    """Unquoted `#` comments out to end of line; an unquoted line break ends the
-    command. Comments go FIRST: once a newline is a `;`, nothing terminates one."""
-    out, quote, esc, comment = [], None, False, False
-    prev = " "
-    for i, ch in enumerate(command):
-        if comment:
-            if ch in "\r\n":
-                comment = False
-            else:
-                prev = ch
-                continue
-        if esc:
-            out.append(ch); esc = False; prev = ch; continue
-        if ch == "\\" and quote != "'":
-            out.append(ch); esc = True; prev = ch; continue
-        if quote is None and ch in ("'", '"'):
-            quote = ch
-        elif ch == quote:
-            quote = None
-        # bash opens a comment only at a word start, and `;&|()` end a word too.
-        # `a#b` and `x/y#frag` stay literal.
-        if ch == "#" and quote is None and (
-                prev.isspace() or prev == "" or prev in ";&|()"):
-            comment = True; prev = ch; continue
-        if ch in "\r\n" and quote is None:
-            # CRLF is ONE separator: two `;` lex as the single token `;;`,
-            # which is not in SEPARATORS, so `armed` would never reset.
-            if not (ch == "\r" and command[i + 1:i + 2] == "\n"):
-                out.append(";")
-            prev = ch
-            continue
-        out.append(ch); prev = ch
-    return "".join(out)
-
 def _is_release_cut(rest) -> bool:
     """`release create|edit` anywhere in this gh command, not at a fixed offset.
 
@@ -93,32 +60,21 @@ def _is_release_cut(rest) -> bool:
 def targets(command: str):
     """Every --target value belonging to a `gh release create|edit` in `command`.
 
-    `punctuation_chars` tokenizes `;` `&&` `|` as their own words while leaving
-    quoted text intact, so a separator ends the gh command instead of gluing to
-    the sha before it — and another tool's `--target` after one is not read.
+    Segments are simple commands, so a separator ends the gh command by
+    construction and another tool's `--target` after one is never read.
     """
-    command = _newline_separators(command)
-    try:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lex.commenters = ""  # _newline_separators owns comments; shlex's fire mid-word
-        lex.whitespace_split = True
-        words = list(lex)
-    except ValueError:
-        return []
-    out, i, armed = [], 0, False
-    while i < len(words):
-        w = words[i]
-        if w in SEPARATORS:
-            armed = False
-        if os.path.basename(w) == "gh":
-            armed = _is_release_cut(words[i + 1:])
-        if armed and w == "--target" and i + 1 < len(words):
-            out.append(words[i + 1])
-        elif armed and w.startswith("--target="):
-            out.append(w.split("=", 1)[1])
-        i += 1
+    out = []
+    for seg in _shell_scan.segments(command):
+        texts = [w.text for w in seg]
+        armed = False
+        for i, w in enumerate(texts):
+            if os.path.basename(w) == "gh":
+                armed = _is_release_cut(texts[i + 1:])
+            if armed and w == "--target" and i + 1 < len(texts):
+                out.append(texts[i + 1])
+            elif armed and w.startswith("--target="):
+                out.append(w.split("=", 1)[1])
     return out
-
 
 def offenders(command: str):
     """The --target values GitHub will reject. Full SHAs and names are fine."""

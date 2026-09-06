@@ -37,6 +37,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
+- **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
@@ -52,9 +53,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
+- **`current_track.py`** — The one writer for a host's current-track.md: append and rotate share a lock.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
+- **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
@@ -119,6 +122,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
+- **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
@@ -279,6 +283,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).
 - **`supervisor.py`** — Runtime supervisor pass: detector -> manager -> projector, one turn.
+- **`tui_gate.py`** — A TUI gate as a HumanRequirement with semantic actions, and the keys that answer it.
 
 ## `src/launchd/`
 

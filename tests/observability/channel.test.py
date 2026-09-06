@@ -72,12 +72,12 @@ class EmitChannelTest(unittest.TestCase):
         self.assertEqual(self.cap.events[0]["actor"]["access_tier"], "unknown")
 
     def test_tier_normalized_to_schema(self) -> None:
-        # Bridge vocabulary (owner/team/other) → obs AccessTier
-        # (owner/team/public/unknown). "other" must map to the schema's
-        # "public"; anything unrecognized → "unknown" (never "owner").
+        # Bridge vocabulary (owner/team/guest, legacy other) → obs AccessTier:
+        # guest and its legacy spelling are "public"; unrecognized is "unknown", never owner.
         cases = {
             "owner": "owner",
             "team": "team",
+            "guest": "public",
             "other": "public",
             "public": "public",
             "unknown": "unknown",
