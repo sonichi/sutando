@@ -6304,6 +6304,102 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
+def _state_in_use_age_h(state_dir: "Path") -> "float | None":
+    """Age of the OLDEST top-level file in state/, or None when unknowable.
+
+    Top level only: state/cores/ is synced across hosts, so a peer's file would
+    date a workspace this host created minutes ago.
+    """
+    try:
+        ages = [time.time() - p.stat().st_mtime
+                for p in state_dir.iterdir() if p.is_file()]
+    except OSError:
+        return None
+    return max(ages) / 3600 if ages else None
+
+
+def _stamper_age_h() -> "float | None":
+    """Hours since the marker-WRITING code was installed here, or None if it is
+    not installed at all.
+
+    A missing marker only indicts the loop once the code that writes it has been
+    present long enough for a pass to close. At merge that code is younger than
+    every existing workspace, so workspace age alone convicts every host.
+    """
+    p = REPO_DIR / "scripts" / "core-status.sh"
+    try:
+        if "last-loop-ok" not in p.read_text(encoding="utf-8", errors="replace"):
+            return None
+        return (time.time() - p.stat().st_mtime) / 3600
+    except OSError:
+        return None
+
+
+def check_cron_schedule() -> dict:
+    """Smoke detector for a session cron schedule that stopped firing.
+
+    CronCreate jobs expire 7 days after registration, and the mechanism that
+    would re-register them (/schedule-crons via /proactive-loop) is itself one of
+    the expiring crons, so nothing self-heals.
+
+    The signal is `state/last-loop-ok`, stamped by scripts/core-status.sh on
+    `idle`. Deliberately NOT core-status.json, which owner turns also refresh and
+    which would therefore stay fresh through any conversation — masking a dead
+    schedule exactly when someone is around to be misled.
+    """
+    name = "cron-schedule"
+    marker = Path(WORKSPACE_DIR) / "state" / "last-loop-ok"
+
+    def _h(env_name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(env_name, str(default)))
+        except ValueError:
+            return default
+
+    warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
+    fail_h = _h("SUTANDO_CRON_STALE_FAIL_H", 26.0)
+
+    try:
+        age_h = (time.time() - marker.stat().st_mtime) / 3600
+    except OSError:
+        # Absence has two opposite meanings: a genuinely fresh workspace, or a loop
+        # that NEVER STARTED — the deadlock above, which writes no marker at all.
+        in_use_h = _state_in_use_age_h(marker.parent)
+        stamper_h = _stamper_age_h()
+        if stamper_h is None:
+            # This build cannot stamp the marker, so its absence says nothing at all.
+            return {"name": name, "status": "ok",
+                    "detail": "no loop marker, and this build does not stamp one"}
+        if stamper_h <= warn_h:
+            # A writer younger than the warn band cannot have had a pass close since
+            # it arrived, so its absence is explained without indicting the loop.
+            return {"name": name, "status": "ok",
+                    "detail": (f"no loop marker yet, but the stamping code is only "
+                               f"{stamper_h:.1f}h old (<{warn_h:.0f}h) — no pass has had "
+                               f"time to close since it was installed")}
+        if in_use_h is not None and in_use_h > warn_h:
+            return {"name": name, "status": "warn",
+                    "detail": (f"no loop marker in the {stamper_h:.1f}h since the stamping code "
+                               f"was installed, and state/ has been written for {in_use_h:.1f}h "
+                               f"(>{warn_h:.0f}h) — a pass should have closed by now, so the loop "
+                               f"may never have STARTED. Check CronList against crons.json")}
+        # Nothing rules out "fresh", and a missing marker must never be louder
+        # than a stale one.
+        return {"name": name, "status": "ok",
+                "detail": "no loop marker yet (fresh install, or no pass closed since restore)"}
+
+    if age_h > fail_h:
+        return {"name": name, "status": "fail",
+                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{fail_h:.0f}h) — the model "
+                           f"cron schedule is almost certainly dead. CronCreate jobs expire after 7d; "
+                           f"re-register from hosts/<host>/crons.json via /schedule-crons")}
+    if age_h > warn_h:
+        return {"name": name, "status": "warn",
+                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{warn_h:.0f}h). "
+                           f"Check CronList against crons.json")}
+    return {"name": name, "status": "ok", "detail": f"last loop pass closed {age_h:.1f}h ago"}
+
+
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     """Detect a stuck core proactive loop via stale core-status.json.
 
@@ -11950,6 +12046,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
+    checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
