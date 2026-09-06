@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""current-track-rotate.py keeps the per-pass read bounded without losing a byte."""
+"""current_track.py is the one writer: append and rotate share a lock, nothing is lost, an
+oversized newest entry is refused loudly instead of reported as nothing to do."""
 import importlib.util
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "scripts" / "current-track-rotate.py"
-
-
-def load():
-    spec = importlib.util.spec_from_file_location("rot", SCRIPT); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+ROTATE = REPO / "scripts" / "current-track-rotate.py"
+APPEND = REPO / "scripts" / "current-track-append.py"
+sys.path.insert(0, str(REPO / "src"))
+import current_track as ct  # noqa: E402
 
 
 def fixture(n_entries=40, size=600):
@@ -22,45 +23,103 @@ def fixture(n_entries=40, size=600):
     return pre, entries
 
 
-class Rotate(unittest.TestCase):
+def run(*argv, stdin=None):
+    return subprocess.run([sys.executable, *map(str, argv)], input=stdin, capture_output=True, text=True)
+
+
+class Plan(unittest.TestCase):
     def test_under_cap_is_a_noop(self):
-        m = load(); pre, ents = fixture(3)
-        text = pre + "".join(ents)
-        head, archived = m.plan(text, 1 << 20)
-        self.assertEqual((head, archived), (text, ""))
+        pre, ents = fixture(3); text = pre + "".join(ents)
+        r = ct.plan(text, 1 << 20)
+        self.assertEqual((r.head, r.archived, r.oversized), (text, "", False))
 
-    def test_head_plus_archive_is_the_original(self):
-        m = load(); pre, ents = fixture()
-        text = pre + "".join(ents)
-        head, archived = m.plan(text, 8 * 1024)
-        self.assertEqual(pre + archived + head[len(pre):], text)
-        self.assertTrue(head.startswith(pre))
-        self.assertLessEqual(len(head.encode()), 8 * 1024 + 700)  # one entry of slack at most
+    def test_head_plus_archive_is_the_original_and_newest_kept(self):
+        pre, ents = fixture(); text = pre + "".join(ents)
+        r = ct.plan(text, 8 * 1024)
+        self.assertEqual(pre + r.archived + r.head[len(pre):], text)
+        self.assertTrue(r.head.startswith(pre))
+        self.assertIn("entry 39", r.head); self.assertNotIn("entry 0\n", r.head)
+        self.assertLessEqual(len(r.head.encode()), 8 * 1024)
+        self.assertFalse(r.oversized)
 
-    def test_newest_entries_are_the_ones_kept(self):
-        m = load(); pre, ents = fixture()
-        head, archived = m.plan(pre + "".join(ents), 8 * 1024)
-        self.assertIn("entry 39", head); self.assertIn("entry 0", archived); self.assertNotIn("entry 0\n", head)
+    def test_no_headings_means_nothing_to_archive_but_over_budget(self):
+        r = ct.plan("plain prose " * 1000, 100)
+        self.assertEqual(r.archived, ""); self.assertTrue(r.oversized)
 
-    def test_cli_rotates_atomically_and_twice_is_idempotent(self):
-        pre, ents = fixture()
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "current-track.md"; p.write_text(pre + "".join(ents))
-            r = subprocess.run([sys.executable, str(SCRIPT), str(p), "--keep-bytes", "8192"], capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            arch = Path(d) / "current-track-archive.md"
-            self.assertTrue(arch.exists())
-            self.assertEqual(pre + arch.read_text() + p.read_text()[len(pre):], pre + "".join(ents))
-            before = (p.read_text(), arch.read_text())
-            r2 = subprocess.run([sys.executable, str(SCRIPT), str(p), "--keep-bytes", "8192"], capture_output=True, text=True)
-            self.assertEqual(r2.returncode, 0); self.assertIn("nothing to do", r2.stdout)
-            self.assertEqual(before, (p.read_text(), arch.read_text()))
-            self.assertEqual([f for f in os.listdir(d) if f.endswith(".tmp")], [])
+    def test_oversized_newest_entry_is_kept_whole_and_flagged(self):
+        pre, ents = fixture(5, 600)
+        big = "## 2026-09-06T02:00Z — the giant\n" + ("y" * 40_000) + "\n"
+        text = pre + "".join(ents) + big
+        r = ct.plan(text, 32 * 1024)
+        self.assertTrue(r.oversized)
+        self.assertEqual(r.head, pre + big)              # kept whole, never cut
+        self.assertEqual(r.archived, "".join(ents))      # everything older still leaves
 
-    def test_unreadable_path_is_exit_1(self):
-        r = subprocess.run([sys.executable, str(SCRIPT), "/nonexistent/current-track.md"], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 1)
+
+class RotateAndAppend(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.p = Path(self.d.name) / "current-track.md"
+        pre, ents = fixture(); self.pre = pre; self.p.write_text(pre + "".join(ents))
+        self.archive = self.p.with_name("current-track-archive.md")
+
+    def tearDown(self):
+        self.d.cleanup()
+
+    def test_rotate_writes_archive_first_then_replaces_head(self):
+        before = self.p.read_text()
+        r = ct.rotate(self.p, 8 * 1024)
+        self.assertEqual(self.p.read_text(), r.head)
+        self.assertEqual(self.pre + self.archive.read_text() + r.head[len(self.pre):], before)
+
+    def test_dry_run_touches_nothing(self):
+        before = self.p.read_text()
+        r = ct.rotate(self.p, 8 * 1024, dry_run=True)
+        self.assertTrue(r.archived); self.assertEqual(self.p.read_text(), before); self.assertFalse(self.archive.exists())
+
+    def test_concurrent_append_during_rotation_survives(self):
+        """The reviewer's race: an append between rotate's read and its replace must land in the head."""
+        entry = "## 2026-09-06T02:10Z — landed mid-rotation\nkeep me\n"
+        done = threading.Event()
+
+        def appender():
+            ct.append(self.p, entry); done.set()
+
+        def seam():
+            threading.Thread(target=appender, daemon=True).start()
+            self.assertFalse(done.wait(0.5))   # blocked on the writer lock while rotate holds it
+
+        ct.rotate(self.p, 8 * 1024, _between_read_and_replace=seam)
+        self.assertTrue(done.wait(5))
+        self.assertIn(entry, self.p.read_text())
+        self.assertNotIn(entry, self.archive.read_text())
+
+    def test_append_cli_and_rotate_cli_share_the_lock_across_processes(self):
+        entry = "## 2026-09-06T02:20Z — from the CLI\nvia stdin\n"
+        procs = [subprocess.Popen([sys.executable, str(APPEND), str(self.p)], stdin=subprocess.PIPE, text=True) for _ in range(3)]
+        rot = subprocess.Popen([sys.executable, str(ROTATE), str(self.p), "--keep-bytes", "8192"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for i, pr in enumerate(procs):
+            pr.communicate(entry.replace("CLI", f"CLI {i}"))
+        rot.communicate()
+        self.assertEqual(rot.returncode, 0)
+        text = self.p.read_text() + self.archive.read_text()
+        for i in range(3):
+            self.assertEqual(text.count(f"from the CLI {i}"), 1)
+
+    def test_cli_exit_codes(self):
+        r = run(ROTATE, self.p, "--keep-bytes", "8192", "--dry-run"); self.assertEqual(r.returncode, 0); self.assertIn("would move", r.stdout)
+        r = run(ROTATE, self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("moved", r.stdout)
+        r = run(ROTATE, self.p, "--keep-bytes", "8192"); self.assertEqual(r.returncode, 0); self.assertIn("nothing to do", r.stdout)
+        r = run(ROTATE, self.p, "--keep-bytes", "0"); self.assertEqual(r.returncode, 2)
+        r = run(ROTATE, self.p.with_name("absent.md")); self.assertEqual(r.returncode, 1); self.assertIn("cannot read", r.stderr)
+        self.p.write_text(self.pre + "## 2026-09-06T02:00Z — the giant\n" + "y" * 40_000 + "\n")
+        r = run(ROTATE, self.p, "--keep-bytes", "32768"); self.assertEqual(r.returncode, 3)
+        self.assertIn("REFUSING", r.stderr); self.assertIn("the giant", r.stderr)
+        r = run(ROTATE, self.p, "--keep-bytes", "32768", "--dry-run"); self.assertEqual(r.returncode, 3); self.assertIn("would keep", r.stderr)
+        r = run(APPEND, self.p, stdin="   \n"); self.assertEqual(r.returncode, 1)
+        r = run(APPEND, stdin="x"); self.assertEqual(r.returncode, 2)
+        r = run(APPEND, self.p, stdin="## 2026-09-06T02:30Z — no trailing newline"); self.assertEqual(r.returncode, 0)
+        self.assertTrue(self.p.read_text().endswith("no trailing newline\n"))
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    unittest.main()

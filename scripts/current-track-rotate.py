@@ -1,79 +1,24 @@
 #!/usr/bin/env python3
 """Rotate a host's current-track.md so the per-pass read stays bounded.
 
-The file is chronological and append-only, and every proactive pass reads it
-first, so it grows without bound (222 KB on one host, ~55k tokens, 2026-09-06).
-Rotation keeps the pinned preamble (everything before the first dated `## `
-entry) plus the newest entries that fit under --keep-bytes, and appends the
-older entries, in order, to current-track-archive.md beside it. Nothing is
-deleted: head + archive is the original file, and a run under the cap is a no-op.
+Thin CLI over src/current_track.py, the one writer (append + rotate share a
+lock). Nothing is deleted: head + archive is the original.
 
     current-track-rotate.py <current-track.md> [--keep-bytes 32768] [--dry-run]
 
-Exit 0 rotated or nothing to do; 1 the file is unreadable; 2 bad arguments.
+Exit 0 rotated or nothing to do; 1 unreadable; 2 bad arguments; 3 the newest
+entry alone exceeds the budget — it was kept whole and everything older was
+archived, but the head is still over the budget, so say so instead of "nothing
+to do".
 """
 from __future__ import annotations
 
 import argparse
-import os
-import re
 import sys
 from pathlib import Path
 
-ENTRY = re.compile(r"^(##+ |### )", re.M)
-DEFAULT_KEEP = 32 * 1024
-
-
-def split(text: str) -> tuple[str, list[str]]:
-    """(preamble, entries) — entries start at each '## '/'### ' heading."""
-    starts = [m.start() for m in ENTRY.finditer(text)]
-    if not starts:
-        return text, []
-    preamble = text[: starts[0]]
-    entries = [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
-    return preamble, entries
-
-
-def plan(text: str, keep_bytes: int) -> tuple[str, str]:
-    """(head, archived) — head keeps the preamble and the newest entries under keep_bytes."""
-    if len(text.encode("utf-8")) <= keep_bytes:
-        return text, ""
-    preamble, entries = split(text)
-    if not entries:
-        return text, ""
-    budget = keep_bytes - len(preamble.encode("utf-8"))
-    kept: list[str] = []
-    for e in reversed(entries):
-        size = len(e.encode("utf-8"))
-        if kept and size + sum(len(k.encode("utf-8")) for k in kept) > budget:
-            break
-        kept.insert(0, e)
-    archived = entries[: len(entries) - len(kept)]
-    return preamble + "".join(kept), "".join(archived)
-
-
-def rotate(path: Path, keep_bytes: int, dry_run: bool = False) -> int:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        print(f"current-track-rotate: cannot read {path}: {e}", file=sys.stderr)
-        return 1
-    head, archived = plan(text, keep_bytes)
-    if not archived:
-        print(f"current-track-rotate: {path.name} is {len(text.encode())} B <= {keep_bytes} B — nothing to do")
-        return 0
-    archive = path.with_name(path.stem + "-archive.md")
-    if dry_run:
-        print(f"current-track-rotate: would move {len(archived.encode())} B to {archive.name}, keep {len(head.encode())} B")
-        return 0
-    # Archive first, then replace the head: a crash between the two leaves duplicates, never a gap.
-    with open(archive, "a", encoding="utf-8") as f:
-        f.write(archived)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(head, encoding="utf-8")
-    os.replace(tmp, path)
-    print(f"current-track-rotate: moved {len(archived.encode())} B to {archive.name}; {path.name} now {len(head.encode())} B")
-    return 0
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from current_track import DEFAULT_KEEP, rotate, split  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -85,7 +30,30 @@ def main(argv=None) -> int:
     if a.keep_bytes <= 0:
         print("current-track-rotate: --keep-bytes must be positive", file=sys.stderr)
         return 2
-    return rotate(Path(a.path), a.keep_bytes, a.dry_run)
+    path = Path(a.path)
+    try:
+        r = rotate(path, a.keep_bytes, a.dry_run)
+    except OSError as e:
+        print(f"current-track-rotate: cannot read {path}: {e}", file=sys.stderr)
+        return 1
+    name, arch = path.name, path.stem + "-archive.md"
+    if r.oversized:
+        _, entries = split(r.head)
+        newest = (entries[-1].splitlines() or ["?"])[0][:80] if entries else "the preamble"
+        verb = "would keep" if a.dry_run else "kept"
+        print(f"current-track-rotate: REFUSING TO CALL THIS BOUNDED — the newest entry alone is "
+              f"{len(r.head.encode()) - 0} B of head against a {a.keep_bytes} B budget "
+              f"({newest!r}); {verb} it whole, archived {len(r.archived.encode())} B; split or shorten that entry",
+              file=sys.stderr)
+        return 3
+    if not r.archived:
+        print(f"current-track-rotate: {name} is {len(r.head.encode())} B <= {a.keep_bytes} B — nothing to do")
+        return 0
+    if a.dry_run:
+        print(f"current-track-rotate: would move {len(r.archived.encode())} B to {arch}, keep {len(r.head.encode())} B")
+        return 0
+    print(f"current-track-rotate: moved {len(r.archived.encode())} B to {arch}; {name} now {len(r.head.encode())} B")
+    return 0
 
 
 if __name__ == "__main__":
