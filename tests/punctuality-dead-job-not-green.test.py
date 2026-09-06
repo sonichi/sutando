@@ -117,6 +117,30 @@ check("CONTROL: a genuinely missing invoked repo script still warns",
 check("CONTROL: a missing ABSOLUTE invoked script still warns",
       hc._cron_missing_script({"prompt": f"bash {_gone}"}) == _gone)
 
+# The verdict tells the operator to delete a schedule, so an ambiguous reference
+# must read ok; each control keeps the guard from answering None to everything.
+check("quoted: a double-quoted existing script is not missing",
+      hc._cron_missing_script({"prompt": 'Run python3 "src/health-check.py"'}) is None)
+check("quoted: a single-quoted existing script is not missing",
+      hc._cron_missing_script({"prompt": "Run python3 'src/health-check.py'"}) is None)
+check("CONTROL: a quoted script that is genuinely absent still warns",
+      hc._cron_missing_script({"prompt": 'python3 "scripts/does-not-exist.py"'})
+      == "scripts/does-not-exist.py")
+check("negated: an interpreter after a negation is a mention, not a run",
+      hc._cron_missing_script(
+          {"prompt": "Do not run python3 scripts/retired.py any more"}) is None)
+check("CONTROL: the same missing path without the negation still warns",
+      hc._cron_missing_script({"prompt": "Run python3 scripts/retired.py"})
+      == "scripts/retired.py")
+check("a trailing shell separator does not hide a missing script",
+      hc._cron_missing_script({"prompt": "python3 scripts/retired.py; echo done"})
+      == "scripts/retired.py")
+check("boundary: 'sh' inside another word does not introduce a script",
+      hc._cron_missing_script({"prompt": "wash scripts/does-not-exist.sh"}) is None)
+check("CONTROL: a real sh invocation of the same missing path warns",
+      hc._cron_missing_script({"prompt": "sh scripts/does-not-exist.sh"})
+      == "scripts/does-not-exist.sh")
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")

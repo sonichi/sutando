@@ -7032,6 +7032,10 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+_CRON_NOT_A_RUN = re.compile(
+    r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
+
+
 def _cron_missing_script(entry: dict) -> Optional[str]:
     """First script path a cron entry invokes that is not on disk, else None.
 
@@ -7044,10 +7048,15 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
     the two cases and the referenced path does.
     """
     cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
-    # Only an INVOKED path counts: an interpreter must introduce it. Prose that
-    # merely names a file (or negates it) is not evidence the job cannot run.
-    for ref in re.findall(
-            r"(?:python3?|bash|sh|node|npx|tsx)\s+(\S+\.(?:py|sh|ts|mjs))", cmd):
+    # Only an INVOKED path counts, and only when the reference is unambiguous:
+    # this verdict makes the operator delete a schedule, so doubt must read ok.
+    for m in re.finditer(r"\b(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
+        ref = m.group(1).strip("\"'").rstrip(";&|")
+        if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
+            continue
+        # A negation before the interpreter makes this a mention, not a run.
+        if _CRON_NOT_A_RUN.search(cmd[:m.start()]):
+            continue
         # An absolute path resolves on its own; only a repo-relative one is
         # judged against REPO_DIR, so a valid /tmp script is never "missing".
         target = Path(ref) if ref.startswith("/") else REPO_DIR / ref
