@@ -204,6 +204,21 @@ class MessageEvent(unittest.TestCase):
         cmd = runs[-1]
         self.assertEqual(cmd[cmd.index("--event") + 1], "$ev1")
 
+    def test_queued_with_a_missing_task_file_writes_nothing_and_never_raises(self):
+        self.assertEqual(card.main(["queued", "--task-file", str(self.ws / "tasks" / "task-gone.txt"), "--workspace", str(self.ws)]), 0)
+        self.assertFalse(card.log_path(self.ws).exists())
+
+    def test_consolidated_into_handles_a_missing_result_and_a_bare_numeric_target(self):
+        p = hook.paths(self.ws)
+        self.assertIsNone(hook.consolidated_into(self.ws, "task-none"), "no result file: not a dedup, not a crash")
+        (self.ws / "results").mkdir()
+        self._task("task-77", event="$ev77")
+        (self.ws / "results" / "task-x2.txt").write_text("[deduped: 77]\n")
+        self.assertEqual(hook.consolidated_into(self.ws, "task-x2"), "$ev77", "a bare id resolves to its task file")
+        (self.ws / "results" / "task-x3.txt").write_text("[deduped: task-unknown]\n")
+        self.assertEqual(hook.consolidated_into(self.ws, "task-x3"), "", "a dedup whose holder is gone still reads as consolidated")
+        del p
+
     def test_a_dedup_pointer_result_closes_as_consolidated_into_the_holder_message(self):
         p = hook.paths(self.ws); runs = []
         self._task("task-x1", event="$evx"); self._task("task-h1", event="$evh")
