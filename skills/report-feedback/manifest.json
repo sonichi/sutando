@@ -7,7 +7,7 @@
   "permissions": {
     "network": true,
     "filesystem": "read-write",
-    "secrets": "cloud-auth"
+    "secrets": ["AG2_CLOUD_TOKEN"]
   },
   "hooks": [
     {
