@@ -111,6 +111,34 @@ class TestArming(unittest.TestCase):
         self.assertIn("rc=1", r.stdout)
         self.assertIn("rc=0", r.stdout)
 
+    def test_whitespace_only_revisions_execute_their_own_bytes(self):
+        # @yixuan-ag2/@qingyun-wu on #3817: _git() stripped, so two blob ids wrote
+        # IDENTICAL bytes while the dupe guard keyed on the differing blob ids — the
+        # tool certified a comparison it never ran. Writing raw bytes closes that:
+        # these two arms genuinely differ, and the reported identity is what executed.
+        f = Path(self.tmp) / "src" / "m.py"
+        f.write_text(f.read_text().rstrip("\n") + "\n\n\n")
+        subprocess.run(["git", "-C", self.tmp, "commit", "-aqm", "ws"], check=True)
+        ws = subprocess.run(["git", "-C", self.tmp, "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+        raw_head = subprocess.run(["git", "-C", self.tmp, "cat-file", "-p", f"{self.head}:src/m.py"],
+                                  capture_output=True).stdout
+        raw_ws = subprocess.run(["git", "-C", self.tmp, "cat-file", "-p", f"{ws}:src/m.py"],
+                                capture_output=True).stdout
+        self.assertNotEqual(raw_head, raw_ws)
+        self.assertEqual(raw_head.strip(), raw_ws.strip(),
+                         "fixture must differ ONLY in whitespace, or it proves nothing")
+        r = self._run("--rev", self.head, "--rev", ws, "--no-worktree-arm")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("NOT A COMPARISON", r.stderr)
+
+    def test_an_unresolved_rev_leaves_too_few_arms_and_refuses(self):
+        r = self._run("--rev", self.head, "--rev", "refs/heads/does-not-exist",
+                      "--no-worktree-arm")
+        self.assertIn("does not resolve", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("arm(s) executed", r.stderr)
+
     def test_a_clean_tree_does_not_turn_a_real_comparison_into_a_refusal(self):
         # THE BLOCKER (@yixuan-ag2, #3817): on a clean tree the implicit arm's
         # blob equals HEAD's, so the dupe check fired on arms nobody compared.
@@ -142,7 +170,9 @@ class TestArming(unittest.TestCase):
     def test_the_refusal_names_the_shared_blob(self):
         r = self._run("--rev", self.head, "--rev", "HEAD", "--no-worktree-arm")
         blob = git(self.tmp, "rev-parse", "HEAD:src/m.py").stdout.strip()
-        self.assertIn(blob[:9], r.stderr)
+        # The refusal names the identity that was executed. A blob id is the wrong
+        # name for it: two blob ids can share one set of executed bytes.
+        self.assertIn("same content", r.stderr)
 
     def test_the_file_is_restored_afterwards(self):
         before = (Path(self.tmp) / "src" / "m.py").read_bytes()
@@ -190,12 +220,14 @@ class TestRefusalsInProcess(unittest.TestCase):
     def test_an_unreadable_blob_skips_that_arm_without_crashing(self):
         arm = _load_arm()
         real = arm._git
+        real_bytes = arm._git_bytes
 
         def cat_file_fails(*args):
             if args and args[0] == "cat-file":
                 return None
             return real(*args)
         arm._git = cat_file_fails
+        arm._git_bytes = lambda *a: None if a[:2] == ("cat-file", "-p") else real_bytes(*a)
         out, err = io.StringIO(), io.StringIO()
         cwd = os.getcwd()
         os.chdir(self.tmp)
@@ -206,9 +238,12 @@ class TestRefusalsInProcess(unittest.TestCase):
         finally:
             os.chdir(cwd)
             arm._git = real
+            arm._git_bytes = real_bytes
         self.assertIn("could not read blob", err.getvalue())
         self.assertIn("SKIPPED", err.getvalue())
-        self.assertEqual(rc, 0)
+        # A skipped arm leaves one arm, and one arm is not a comparison.
+        self.assertEqual(rc, 2)
+        self.assertIn("NOT A COMPARISON", err.getvalue())
 
 
 class TestTheRealCli(unittest.TestCase):

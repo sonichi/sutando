@@ -22,6 +22,7 @@ Exit 0 when every arm ran; 2 when two arms resolved to the same blob.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -32,6 +33,13 @@ from pathlib import Path
 def _git(*args: str) -> "str | None":
     r = subprocess.run(["git", *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _git_bytes(*args: str) -> "bytes | None":
+    """Unmodified bytes. _git() strips, which is fine for ids and fatal for content:
+    a stripped read executes different bytes than the blob the caller is told about."""
+    r = subprocess.run(["git", *args], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
 
 
 def blob_at(rev: str, path: str) -> "str | None":
@@ -77,22 +85,27 @@ def main(argv=None) -> int:
                 print(f"arm-test: {rev}:{a.file} does not resolve — arm SKIPPED",
                       file=sys.stderr)
                 continue
-            content = _git("cat-file", "-p", blob)
-            if content is None:
+            raw = _git_bytes("cat-file", "-p", blob)
+            if raw is None:
                 print(f"arm-test: could not read blob {blob[:9]} — arm SKIPPED",
                       file=sys.stderr)
                 continue
-            target.write_text(content + "\n" if not content.endswith("\n") else content)
+            # Identity is the bytes we WRITE, never the blob id: two blobs differing
+            # only in whitespace execute identically and would pass a blob-id dupe check.
+            target.write_bytes(raw)
+            written = hashlib.sha256(raw).hexdigest()
             rc, summary = run_arm(a.test, rev)
-            rows.append((rev, _git("rev-parse", rev) or "?", blob, rc, summary))
-            seen.setdefault(blob, []).append(rev)
-        # On a clean tree this arm's blob IS HEAD's, so adding it would trip
-        # the dupe refusal on a comparison nobody asked for.
-        if not a.no_worktree_arm and (worktree_blob or "?") not in seen:
+            rows.append((rev, _git("rev-parse", rev) or "?", written[:9], rc, summary))
+            seen.setdefault(written, []).append(rev)
+        # On a clean tree this arm's CONTENT is HEAD's, so adding it would trip the
+        # dupe refusal on a comparison nobody asked for. Compare the same identity
+        # `seen` is keyed on -- a blob id here would never match and never skip.
+        wt = hashlib.sha256(saved).hexdigest()
+        if not a.no_worktree_arm and wt not in seen:
             target.write_bytes(saved)
             rc, summary = run_arm(a.test, "worktree")
-            rows.append(("worktree", "-", worktree_blob or "?", rc, summary))
-            seen.setdefault(worktree_blob or "?", []).append("worktree")
+            rows.append(("worktree", "-", wt[:9], rc, summary))
+            seen.setdefault(wt, []).append("worktree")
         elif not a.no_worktree_arm:
             print(f"arm-test: tree arm skipped — its blob "
                   f"{(worktree_blob or '?')[:9]} is already an arm", file=sys.stderr)
@@ -104,11 +117,18 @@ def main(argv=None) -> int:
         print(f"ARM {rev:<{width}}  commit={commit[:9]:<9} blob={(blob or '?')[:9]}  "
               f"rc={rc}{('  ' + summary) if summary else ''}")
 
+    # Order matters: arms that RAN and collided get the specific diagnosis naming them;
+    # only a genuine shortfall of executed arms falls through to the count message.
     dupes = {b: revs for b, revs in seen.items() if len(revs) > 1}
+    ran = sum(len(v) for v in seen.values())
+    if not dupes and ran < 2:
+        print(f"arm-test: NOT A COMPARISON — {ran} arm(s) executed; a comparison needs "
+              f"two. Skipped arms do not count.", file=sys.stderr)
+        return 2
     if dupes:
         for b, revs in dupes.items():
-            print(f"arm-test: NOT A COMPARISON — {', '.join(revs)} resolved to the "
-                  f"same blob {b[:9]}; identical results prove nothing", file=sys.stderr)
+            print(f"arm-test: NOT A COMPARISON — {', '.join(revs)} wrote the "
+                  f"same content {b[:9]}; identical results prove nothing", file=sys.stderr)
         return 2
     return 0
 
