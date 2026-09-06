@@ -1,11 +1,10 @@
 """Transition model with ACTOR-OWNED durable state, a SEPARABLE crash seam, and a CLOCK.
 
-Earlier versions collapsed token consumption and task claim into one statement (qingyun-wu,
-33c16809), then collapsed record publication and token creation into one statement and had no
-clock, so neither the issuance crash nor a timeout could be modeled (qingyun-wu, keweichen,
-e8d270b1), then collapsed the CLAIM and its journal promotion into one statement, so the seam
-between a held claim and an unpromoted journal could not exist in the model at all (keweichen,
-a2e506e1). Here every durable write is its own step on a modeled disk, `crash_*` may land between
+Each durable write must be its own step, because collapsing any two of them makes the seam
+between them inexpressible: token consumption with the task claim, record publication with token
+creation (which also removes the clock, so neither the issuance crash nor a timeout can be
+modeled), and the claim with its journal promotion. Here every durable write is its own step on a
+modeled disk, `crash_*` may land between
 any two, restart re-reads disk under a NEW process identity, and the sweep carries a clock. Every
 schedule must end in `eligible` or `wedged`; `probation` is never terminal.
 
@@ -198,7 +197,7 @@ def record_writers(d): return {a for art, a in d.writers if art == "record"}
 
 
 class TheSeamWithoutReconciliationGoesDarkForever(unittest.TestCase):
-    """qingyun-wu's control (33c16809): the REJECTED design suppresses forever after the seam crash."""
+    """The REJECTED design, kept as a control: it suppresses forever after the seam crash."""
 
     def test_crash_between_rename_and_claim_suppresses_forever(self):
         v, c, p, d = run(["kick", "sweep", "crash_worker", "restart", "worker", "worker"], "seam")
@@ -226,14 +225,13 @@ class TheJournalReconcilesTheSeam(unittest.TestCase):
 
 
 class EveryProbationStateHasAClock(unittest.TestCase):
-    """keweichen's and qingyun-wu's controls (e8d270b1): the three states their reads left absorbing."""
+    """The three states an earlier reading left absorbing, each pinned with its clock."""
 
     def test_issuance_crash_is_reconciled_by_the_next_sweep(self):
         """Crash after the token, before the record: the request stands, the next sweep finishes it.
 
         The token IS the allowance, so the unconditional gate admits one off it even unpublished.
-        This expected `wedged, 0, 5` while the gate ran only past snapshot expiry (qingyun-wu,
-        5124977329).
+        This expected `wedged, 0, 5` while the gate ran only past snapshot expiry.
         """
         v, c, p, d = run(["kick", "sweep", "restart", "worker"], "crash_issuance")
         self.assertEqual((v, c, p), ("probation", 1, 4))
@@ -272,7 +270,7 @@ class EveryProbationStateHasAClock(unittest.TestCase):
 
 
 class TheClaimToPromotionSeamIsCrashComplete(unittest.TestCase):
-    """keweichen's control (a2e506e1): a held claim beside an UNPROMOTED journal.
+    """A held claim beside an UNPROMOTED journal.
 
     The claim commits and returns before the promotion runs, so this state is reachable in
     production. It is decidable only from the claim's owner and liveness -- the journal reads
@@ -331,7 +329,7 @@ class TheClaimToPromotionSeamIsCrashComplete(unittest.TestCase):
 
 
 class ProbationOutlivesTheEligibilitySnapshot(unittest.TestCase):
-    """keweichen 5124841589 / qingyun-wu 5124875551 at 3940c629, found independently.
+    """Probation must outlive the eligibility snapshot.
 
     v1 fixes `stale_after_s` at 180 while `stand_in_after_s` defaults to 300, so a stopped sweep
     erases probation from the record 120 s BEFORE probation's own window closes. ABSENT means
@@ -376,7 +374,7 @@ class ProbationOutlivesTheEligibilitySnapshot(unittest.TestCase):
 
 
 class IssuanceRecoveryMintsAtMostOneAllowance(unittest.TestCase):
-    """qingyun-wu 5124977329 / keweichen 5125025866 at a2546d89, found independently.
+    """Issuance recovery must mint at most one allowance.
 
     `O_EXCL` guards a NAME, never that name's renamed successor. Under the flat form the worker's
     first rename consumed the very name issuance tested, so a sweep restarting into a crashed
@@ -419,9 +417,9 @@ class IssuanceRecoveryMintsAtMostOneAllowance(unittest.TestCase):
     def test_ending_probation_leaves_no_artifact_behind(self):
         """Reopening the ordinary path once probation ENDS is correct; a leftover allowance is not.
 
-        At a2546d89 this schedule ended `verdict=eligible claimed=5 token=True`, which both
-        reviewers published. Each knob below reproduces one half of that row against the current
-        model. The flat mint itself is asserted by the first two tests in this class, where it
+        Before the fix this schedule ended `verdict=eligible claimed=5 token=True`. Each knob
+        below reproduces one half of that row against the current model. The flat mint itself is
+        asserted by the first two tests in this class, where it
         stands beside an already-claimed task; it is not re-asserted at the END of this schedule,
         because ending probation now removes the whole directory and would mask it.
         """
@@ -451,7 +449,7 @@ class IssuanceRecoveryMintsAtMostOneAllowance(unittest.TestCase):
 
 
 class TheArtifactPathIsInjective(unittest.TestCase):
-    """keweichen 5125025866: `<instance>.admit.<task_id>[.claimed]` is not a task identity.
+    """`<instance>.admit.<task_id>[.claimed]` is not a task identity.
 
     Gateway ids may contain dots and state-looking tails -- the design says so itself under
     "Order of claiming", and the gateway bridge accepts both ids below. The model's own
