@@ -135,19 +135,20 @@ class PinnedEntries(unittest.TestCase):
         self.assertTrue(r.oversized)
         self.assertIn("hands off", r.head)
 
-    def test_the_archive_is_a_contiguous_prefix_even_with_a_MIDDLE_pin(self):
-        """A, B, P(hold), C: the archive must read A, B, P — never A, P, B."""
-        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
-        archive = p.with_name("current-track-archive.md")
-        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
-        p.write_text("# t\n\n" + E("2026-01-01", "A") + E("2026-02-01", "B")
-                     + E("2026-03-01", "P HOLD: hands off") + E("2026-04-01", "C"))
-        ct.rotate(p, 350)
-        ct.rotate(p, 240)
-        names = [e.splitlines()[0].split("— ")[1] for e in ct.split(archive.read_text())[1]]
-        self.assertEqual(names, ["A", "B", "P HOLD: hands off"])
-        self.assertIn("hands off", p.read_text())          # still live in the head
+
+    def test_a_middle_pin_is_held_back_and_the_rest_archives_in_order(self):
+        """A pin is not archived while pinned; the ordinary entries around it still go."""
+        E = lambda n, body: f"## 2026-0{n}-01T00:00Z — {body}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E(1, "A") + E(2, "B")
+                + E(3, "P HOLD: hands off") + E(4, "C") + E(5, "D newest"))
+        r = ct.plan(text, 2400)
+        self.assertNotIn("hands off", r.archived)
+        self.assertIn("hands off", r.head)
+        name = lambda e: e.splitlines()[0].split("— ")[1]
+        head, arch = {name(e) for e in ct.split(r.head)[1]}, [name(e) for e in ct.split(r.archived)[1]]
+        ordinary = [name(e) for e in ct.split(text)[1] if "hands off" not in e]
+        self.assertEqual(arch, [n for n in ordinary if n not in head])
+        self.assertTrue(arch, "nothing rotated, so the case never exercised the pin")
 
     def test_retiring_a_middle_pin_adds_no_second_copy(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
@@ -163,7 +164,7 @@ class PinnedEntries(unittest.TestCase):
         self.assertEqual(names[:3], ["A", "B", "P HOLD: hands off"])
 
     def test_a_repeated_ordinary_entry_across_rotations_is_two_records(self):
-        """Only a RETAINED copy may cancel an outgoing entry; a real repeat may not."""
+        """Nothing cancels an outgoing entry by content: a real repeat is a second record."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"
         archive = p.with_name("current-track-archive.md")
@@ -197,37 +198,38 @@ class PinnedEntries(unittest.TestCase):
         self.assertIn("the newest entry alone", r.stderr)
         self.assertNotIn("pinned entries", r.stderr)
 
-    def test_a_pinned_entry_is_archived_in_place_and_kept_in_the_head(self):
-        """Its historical copy goes to the archive at its own position; the live copy stays."""
-        text = self.corpus()
-        r = ct.plan(text, 8 * 1024)
-        self.assertIn("hands off #3166", r.head)          # live copy
-        self.assertIn("hands off #3166", r.archived)      # historical copy
-        self.assertLess(r.archived.index("hands off #3166"), r.archived.index("entry 0"))
 
-    def test_two_passes_retiring_the_pin_keeps_reconstruction_order(self):
-        """P,A,B,C: rotate with the pin, retire it, rotate again — order holds, no duplicate."""
+    def test_a_pinned_entry_is_not_archived_while_it_is_pinned(self):
+        """The live copy is the only copy until the hold retires; nothing is duplicated."""
+        r = ct.plan(self.corpus(), 8 * 1024)
+        self.assertIn("hands off #3166", r.head)
+        self.assertNotIn("hands off #3166", r.archived)
+        self.assertIn("entry 0", r.archived)
+
+
+    def test_the_archive_is_ordered_by_departure_not_by_entry_stamp(self):
+        """P,A,B,C: the pin outlives A and B in the head, so it lands after them."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"
-        pre = "# t\n\n"
         P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
         A = "## 2026-05-01T00:00Z — A\n" + ("a" * 3000) + "\n\n"
         B = "## 2026-06-01T00:00Z — B\n" + ("b" * 3000) + "\n\n"
         C = "## 2026-09-06T00:00Z — C newest\n" + ("c" * 3000) + "\n\n"
-        p.write_text(pre + P + A + B + C)
+        p.write_text("# t\n\n" + P + A + B + C)
         archive = p.with_name("current-track-archive.md")
 
-        ct.rotate(p, 5 * 1024)                      # pass 1: P pinned, A and B leave
+        ct.rotate(p, 5 * 1024)                      # A and B leave; P is held back
         self.assertIn("hands off #3166", p.read_text())
-        first = archive.read_text()
-        self.assertLess(first.index("hands off"), first.index("— A"))
-        self.assertLess(first.index("— A"), first.index("— B"))
+        self.assertNotIn("hands off", archive.read_text())
 
-        ct.rotate(p, 1024, pin=None)                # pass 2: the pin is retired
+        ct.rotate(p, 1024, pin=None)                # the hold retires and leaves
         after = archive.read_text()
-        self.assertEqual(after.count("hands off #3166"), 1, "the retired pin was archived twice")
-        self.assertLess(after.index("hands off"), after.index("— A"))
+        self.assertEqual(after.count("hands off #3166"), 1)
         self.assertLess(after.index("— A"), after.index("— B"))
+        self.assertLess(after.index("— B"), after.index("hands off"))
+        every = after + p.read_text()
+        for name in ("hands off", "— A", "— B", "— C newest"):
+            self.assertIn(name, every)
 
     def test_reconstruction_is_the_archive_then_whatever_the_head_still_holds(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
@@ -244,18 +246,18 @@ class PinnedEntries(unittest.TestCase):
         # monotonic, so sorting them would test the fixture, not the contract.
         self.assertEqual(arch_order, [h for h in orig_order if h in arch_order])
 
+
     def test_a_repeated_identical_entry_is_two_records_not_one(self):
-        """Dedup by occurrence, not membership: the same text written twice is two records."""
+        """The same text written twice is two records; nothing cancels an entry by content."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"
         archive = p.with_name("current-track-archive.md")
-        pre = "# t\n\n"
         P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
         big = lambda n, c: f"## 2026-0{n}-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
-        p.write_text(pre + P + big(5, "A") + big(9, "C"))
+        p.write_text("# t\n\n" + P + big(5, "A") + big(9, "C"))
 
-        ct.rotate(p, 4 * 1024)                       # P pinned, archived once
-        self.assertEqual(archive.read_text().count("hands off #3166"), 1)
+        ct.rotate(p, 4 * 1024)
+        self.assertEqual(archive.read_text().count("hands off #3166"), 0)
         self.assertIn("hands off #3166", p.read_text())
 
         p.write_text(p.read_text() + P + big(9, "D"))   # the SAME text written again later
@@ -263,15 +265,104 @@ class PinnedEntries(unittest.TestCase):
         total = archive.read_text().count("hands off #3166") + p.read_text().count("hands off #3166")
         self.assertEqual(total, 2, "a legitimately repeated entry was dropped as a duplicate")
 
-    def test_a_previously_archived_pin_is_not_written_twice(self):
+    def test_a_pin_reaches_the_archive_exactly_once_when_it_retires(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"
         archive = p.with_name("current-track-archive.md")
         p.write_text(self.corpus())
         ct.rotate(p, 8 * 1024)
-        first = archive.read_text().count("hands off #3166")
+        self.assertEqual(archive.read_text().count("hands off #3166"), 0)
         ct.rotate(p, 1024, pin=None)
-        self.assertEqual(archive.read_text().count("hands off #3166"), first)
+        self.assertEqual(archive.read_text().count("hands off #3166"), 1)
+
+    def test_identical_pins_retired_in_separate_generations_are_two_records(self):
+        """The reviewer's generation case: same pin text, two lifetimes, two archived records."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
+        big = lambda c: f"## 2026-09-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
+        p.write_text("# t\n\n" + P + big("A") + big("B"))
+        ct.rotate(p, 4 * 1024)                      # generation 1: pinned, held back
+        ct.rotate(p, 1024, pin=None)                # generation 1 retires
+        self.assertEqual(archive.read_text().count("hands off #3166"), 1)
+        p.write_text(p.read_text() + P + big("C") + big("D"))
+        ct.rotate(p, 4 * 1024)                      # generation 2: the same text, pinned again
+        ct.rotate(p, 1024, pin=None)                # generation 2 retires
+        self.assertEqual(archive.read_text().count("hands off #3166"), 2)
+
+    def test_odd_stamps_do_not_reorder_the_archive(self):
+        """Reversed, equal and missing stamps: order comes from the file, never from headings."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        E = lambda h: f"## {h}\n" + ("x" * 900) + "\n\n"
+        p.write_text("# t\n\n" + E("03:00Z A") + E("01:00Z P HOLD: hands off")
+                     + E("03:00Z B equal-stamp") + E("undated C") + E("09:00Z D newest"))
+        original = [e.splitlines()[0] for e in ct.split(p.read_text())[1]]
+        ct.rotate(p, 2400)
+        first = [e.splitlines()[0] for e in ct.split(archive.read_text())[1]]
+        self.assertNotIn("## 01:00Z P HOLD: hands off", first)
+        self.assertEqual(first, [h for h in original if h in first])   # file order, no reordering
+        ct.rotate(p, 1200, pin=None)
+        after = [e.splitlines()[0] for e in ct.split(archive.read_text())[1]]
+        self.assertEqual(after[:len(first)], first)                    # earlier departures untouched
+        pin = "## 01:00Z P HOLD: hands off"
+        self.assertEqual(after.count(pin), 1)
+        self.assertGreater(after.index(pin), after.index("## 03:00Z A"))  # departure, not stamp
+        self.assertEqual(sorted(after + [e.splitlines()[0] for e in ct.split(p.read_text())[1]]),
+                         sorted(original))                             # every entry, exactly once
+
+    def test_interruption_on_either_side_duplicates_but_never_loses(self):
+        """Archive-first is a deliberate choice: retry repeats a batch, it never drops one."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        body = lambda c: f"## 2026-09-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
+        p.write_text("# t\n\n" + body("A") + body("B") + body("C"))
+
+        class Boom(Exception):
+            pass
+
+        # (i) before either write: nothing is committed, the retry is clean.
+        with self.assertRaises(Boom):
+            ct.rotate(p, 4 * 1024, _between_read_and_replace=self._raiser(Boom))
+        self.assertFalse(archive.exists())
+
+        # (ii) after the archive write, before the head commit.
+        real = ct.os.replace
+        def boom(a, b):
+            if str(b).endswith("current-track.md"):
+                raise Boom("interrupted before the head commit")
+            return real(a, b)
+        ct.os.replace = boom
+        self.addCleanup(setattr, ct.os, "replace", real)
+        with self.assertRaises(Boom):
+            ct.rotate(p, 4 * 1024)
+        ct.os.replace = real
+        self.assertEqual(archive.read_text().count("— A"), 1)
+        self.assertIn("— A", p.read_text())          # still in the head: no loss
+
+        ct.rotate(p, 4 * 1024)                       # retry
+        self.assertEqual(archive.read_text().count("— A"), 2)   # the documented duplicate
+        self.assertNotIn("— A", p.read_text())
+        ct.append(p, "## 2026-09-06T00:00Z — after the retry\n")
+        self.assertIn("after the retry", p.read_text())
+
+    def _raiser(self, exc):
+        def go():
+            raise exc("interrupted before any write")
+        return go
+
+    def test_an_edit_through_replace_leaves_no_archived_copy(self):
+        """The documented limit: replace() rewrites the head and archives nothing."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        ct.replace(p, "# t\n\n## 2026-01-01 — alpha\nbody\n\n## 2026-02-01 — beta\nbody\n")
+        ct.replace(p, "# t\n\n## 2026-02-01 — beta\nbody\n")
+        self.assertNotIn("alpha", p.read_text())
+        self.assertFalse(archive.exists(), "replace() must not be believed to archive")
 
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
