@@ -439,6 +439,19 @@ else
   fi
 fi
 
+# --effort is launch-time only: the CLI exports CLAUDE_EFFORT to describe the
+# running session but never reads it back, so this is the sole place to set it.
+EFFORT_ARGS=()
+if CORE_EFFORT="$(bash "$REPO/scripts/sutando-config.sh" core-effort)"; then
+  if [ -n "$CORE_EFFORT" ]; then
+    EFFORT_ARGS=(--effort "$CORE_EFFORT")
+    echo "core effort: $CORE_EFFORT"
+  fi
+else
+  # Degraded, not fatal: an unusable effort value must not cost a host its core.
+  echo "core effort: unusable core.effort (see error above) — launching at the CLI default" >&2
+fi
+
 # Optional feature-owned task handler.  The adapter injects the capability at
 # the edge; the generic watcher remains unaware of concrete skills and falls
 # back to its legacy TASK_FILE event whenever this script is absent/unhandled.
@@ -718,7 +731,7 @@ if tmux_session_exists; then
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
   CORE_CMD=(claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/startup")
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} -- "/startup")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
@@ -784,7 +797,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   # drop it just around the exec and re-raise the exec's own status.
   set +e
   exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} \
     -- "/startup"
   _exec_rc=$?
   set -e
@@ -820,7 +833,7 @@ if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} \
     -- "/startup" || true
   # Create-then-attach rather than `new-session -A`, so the sentinel clears only
   # once a session demonstrably exists; the poll below is the single verdict.
@@ -839,7 +852,7 @@ if [ -t 1 ]; then
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} \
     -- "/startup"
   # Verify the core actually came up before reporting success. Without this a
   # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still

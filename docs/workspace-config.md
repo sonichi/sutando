@@ -54,6 +54,15 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 // 1. Use Codex CLI as the persistent core
 { "core": { "runtime": "codex" } }
 
+// 1b. Raise (or lower) the reasoning effort the Claude core runs at.
+//     Scale: low → medium → high → xhigh → max; unset keeps the CLI default.
+//     `--effort` is launch-time only — the CLI exports CLAUDE_EFFORT to
+//     describe the running session but never reads it back, so setting that
+//     env var changes nothing. Takes effect on the next core start/restart.
+//     SUTANDO_CORE_EFFORT is a per-invocation override (wins over config).
+//     Claude core only; the Codex launcher ignores it.
+{ "core": { "effort": "xhigh" } }
+
 // 2. Move workspace outside the repo (e.g. shared between clones)
 { "workspace": { "path": "/Users/you/.sutando/workspace" } }
 

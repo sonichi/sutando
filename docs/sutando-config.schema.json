@@ -19,6 +19,17 @@
           ],
           "default": "claude"
         },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "description": "Reasoning-effort level the Claude core launches with (passed as --effort). Unset means the CLI's own default. The CLI exports CLAUDE_EFFORT to describe the running session but never reads it back, so this is the only way to set the level. SUTANDO_CORE_EFFORT overrides per-invocation. Claude core only; the Codex launcher ignores it."
+        },
         "expected_branch": {
           "type": "string",
           "minLength": 1,
