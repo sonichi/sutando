@@ -1606,6 +1606,39 @@ def check_workspace_wiring() -> "dict | None":
     }
 
 
+CURRENT_TRACK_READ_BUDGET = 32 * 1024
+
+
+def check_context_read_budget() -> "dict | None":
+    """Warn when the per-pass mandatory read has outgrown a session's headroom.
+
+    Every proactive pass reads hosts/<host>/current-track.md FIRST (context-reconstruct),
+    and the file is append-only. Measured 2026-09-06: 222 KB on one host (~55k tokens),
+    170 KB on another — a session could spend most of its context before acting, and one
+    agent then declined granted work as "at the end of its context". The owner's rule is
+    that context state never grounds a decline; this probe makes the cause visible before
+    it does. Fix is scripts/current-track-rotate.py (head + archive, nothing deleted).
+    Returns None under the budget, so a healthy install gains no line.
+    """
+    path = WORKSPACE_DIR / "hosts" / _host_label() / "current-track.md"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None                      # no file, or unreadable: another probe's job
+    if size <= CURRENT_TRACK_READ_BUDGET:
+        return None
+    return {
+        "name": "context-read-budget",
+        "status": "warn",
+        "detail": (
+            f"hosts/{_host_label()}/current-track.md is {size} B (~{size // 4} tokens), over the "
+            f"{CURRENT_TRACK_READ_BUDGET} B per-pass read budget; every pass reads it first. "
+            f"Fix: python3 scripts/current-track-rotate.py {path} (keeps the preamble and the "
+            f"newest entries, archives the rest beside it; nothing deleted)"
+        ),
+    }
+
+
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
 
@@ -11439,6 +11472,10 @@ def run_all_checks() -> list[dict]:
     _root_tidy = check_workspace_root_tidy()
     if _root_tidy:
         checks.append(_root_tidy)
+
+    _read_budget = check_context_read_budget()
+    if _read_budget:
+        checks.append(_read_budget)
 
     _wiring = check_workspace_wiring()
     if _wiring:
