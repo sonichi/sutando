@@ -47,7 +47,8 @@ import stat
 import subprocess
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -242,7 +243,7 @@ PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
 PQ_DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}(?::\d{2})?Z)?')
 
 
-def _parse_asked_date(title: str) -> tuple[str | None, datetime | None]:
+def _parse_asked_date(title: str) -> tuple[Optional[str], Optional[datetime]]:
     """Leading date on a section's `## ` heading, e.g. '2026-08-22 — ...' or
     '2026-08-20T02:20Z — ...'. (None, None) when the heading carries no date.
     """
@@ -253,7 +254,9 @@ def _parse_asked_date(title: str) -> tuple[str | None, datetime | None]:
     formats = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ") if m.group(2) else ("%Y-%m-%d",)
     for fmt in formats:
         try:
-            return asked, datetime.strptime(asked, fmt)
+            # Headings are UTC; a naive parse against a local now() reports a question
+            # asked minutes ago as -1 days, which the age sort then ranks first.
+            return asked, datetime.strptime(asked, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     return None, None
@@ -302,7 +305,7 @@ def parse_pending_questions(content: str) -> list[dict]:
             "text": title,
             "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
             "asked": asked,
-            "age_days": (datetime.now() - asked_dt).days if asked_dt else None,
+            "age_days": max(0, (datetime.now(timezone.utc) - asked_dt).days) if asked_dt else None,
             "start": start,
             "end": end,
         }

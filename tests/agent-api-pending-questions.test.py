@@ -25,7 +25,8 @@ import importlib.util
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -205,6 +206,41 @@ class TestParse(unittest.TestCase):
         self.assertIsNone(q["age_days"])
 
 
+class TestPython39AndTimezones(unittest.TestCase):
+    """agent-api.py has no `from __future__ import annotations`, so annotations are
+    evaluated at def time — a PEP 604 union breaks import on the supported 3.9."""
+
+    def test_the_module_defines_its_helpers_on_python_39(self):
+        py39 = Path("/usr/bin/python3")
+        if not py39.exists():
+            self.skipTest("no system python3 to check the floor against")
+        ver = subprocess.run([str(py39), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                             capture_output=True, text=True).stdout.strip()
+        if ver != "3.9":
+            self.skipTest(f"system python3 is {ver}, not the 3.9 floor")
+        src = Path(api.__file__).read_text()
+        start = src.index("def _parse_asked_date")
+        end = src.index("\n\n", src.index("return None, None", start))
+        prog = ("from datetime import datetime, timezone\nfrom typing import Optional\nimport re\n"
+                "PQ_DATE_RE = re.compile(r'^(\\d{4}-\\d{2}-\\d{2})(T\\d{2}:\\d{2}(?::\\d{2})?Z)?')\n"
+                + src[start:end] + "\nprint(_parse_asked_date('2020-01-01T02:20Z x')[0])\n")
+        r = subprocess.run([str(py39), "-c", prog], capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, f"3.9 rejected the helper: {r.stderr[-300:]}")
+        self.assertEqual("2020-01-01T02:20Z", r.stdout.strip())
+
+    def test_a_Z_heading_is_utc_not_local(self):
+        """Parsed naive and compared to a local now(), a just-asked question reports -1."""
+        _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
+        self.assertIsNotNone(dt.tzinfo, "a Z heading must parse as aware UTC")
+        self.assertEqual(0, dt.utcoffset().total_seconds())
+
+    def test_a_future_dated_heading_does_not_sort_first(self):
+        """Clock skew or a typo gives a negative age, which -(age) would rank ahead of all."""
+        ahead = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%MZ")
+        q = api.parse_pending_questions(f"# Q\n\n## {ahead} — from the future\nBody.\n")[0]
+        self.assertEqual(0, q["age_days"], "a future heading must clamp to 0, never go negative")
+
+
 class TestPendingQuestionRows(unittest.TestCase):
     """`_pending_question_rows()` orders by age — oldest first — with undated
     questions sorted last (never defaulted to age 0, which would put them
@@ -299,6 +335,7 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TestParse),
+        loader.loadTestsFromTestCase(TestPython39AndTimezones),
         loader.loadTestsFromTestCase(TestPendingQuestionRows),
         loader.loadTestsFromTestCase(TestAnswer),
     ])
