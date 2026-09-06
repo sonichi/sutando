@@ -266,6 +266,16 @@ Send a second update at meaningful checkpoints (e.g. "Done with the research —
 The script is fail-open — always continue the task regardless of exit code. Only skip for
 immediate one-sentence answers that require no tool calls.
 
+## Agent activity (what the owner sees you doing)
+
+With the `agent-activity` skill installed, the desktop shows your live activity in the room whose
+message you are on (a drawer above the composer) and in the dock's Activity panel. Its hooks write the
+rows: `processing` when a session first touches a task file, `working` per tool call, `thinking` from
+your turn-end narration, `done` when the result file is written. Do not hand-write those four. Add
+rows only for what the owner asks to see beyond them — a decision worth naming, a PR heartbeat —
+with `python3 skills/agent-activity/scripts/activity.py append "<line>" --kind thinking|notice
+--task-file <workspace>/tasks/<task>.txt`. Row schema: `skills/agent-activity/SKILL.md`.
+
 ## Workspace layout
 
 - Vision + docs: `README.md` (this directory)

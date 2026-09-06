@@ -21,7 +21,7 @@
    ],
    "status": "active",
    "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-   "last_verified": "2026-08-18"
+   "last_verified": "2026-09-04"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -236,7 +236,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-08-20"
+   "last_verified": "2026-09-04"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -371,7 +371,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace operational contract",
-   "last_verified": "2026-08-11"
+   "last_verified": "2026-09-04"
   },
   "docs/workspace-design.md": {
    "title": "Workspace design",
