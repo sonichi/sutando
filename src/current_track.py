@@ -14,9 +14,10 @@ before the head is replaced, so a crash leaves a duplicate, never a gap.
     replace(path, text)               -> None   (create or rewrite the whole head)
     rotate(path, keep_bytes, pin) -> RotateResult(head, archived, oversized)
 
-A pinned entry (an owner hold, say) is kept in the head AND archived at its own
-position, so retiring the pin later cannot reorder history; the archive is
-append-only and never takes the same entry twice.
+The archive only ever advances through a CONTIGUOUS PREFIX of the history, so it
+is the original order with nothing interleaved and no entry written twice. A
+pinned entry stops that frontier: it stays live in the head, and the entries
+after it wait until it is retired.
 
 An entry that alone exceeds keep_bytes is never truncated: rotate() keeps it,
 archives everything older, and reports oversized=True so a caller can refuse
@@ -35,8 +36,12 @@ from pathlib import Path
 ENTRY = re.compile(r"^##+ ", re.M)
 DEFAULT_KEEP = 32 * 1024
 
-#: Entries other tools read as LIVE STATE, kept at any age: an owner hold that
-#: ages out reads as "not held" to every consumer that greps this file.
+#: Marks the ARCHIVED copy of an entry still live in the head; only a copy
+#: carrying it may be skipped later, never an ordinary repeat.
+RETAINED = "<!-- current-track: copy retained live in the head -->"
+
+#: Entries other tools read as LIVE STATE, kept at any age: an aged-out hold
+#: reads as "not held" to every consumer that greps this file.
 PIN_DEFAULT = re.compile(
     r"\bHOLD\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
     r"|\bin force until\b|\bawait(?:ing)? (?:the )?owner\b|⛔",
@@ -98,10 +103,11 @@ class RotateResult:
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     """Keep the preamble, every PINNED entry, and the newest of the rest.
 
-    Pinned entries are kept at any age and in their original order. An owner
-    hold is an ordinary heading, so age-only rotation moved it to the archive
-    and every consumer that greps the head then read "not held" — a silent
-    lift, with nothing to notice. `pin=None` restores age-only behaviour.
+    The archive advances only through a CONTIGUOUS historical prefix, so it is
+    always the original order, nothing interleaved and nothing written twice. A
+    pinned entry inside that prefix is copied there, marked RETAINED, and also
+    kept live in the head, so a hold never freezes the archive.
+    `pin=None` restores age-only behaviour.
     """
     if _size(text) <= keep_bytes:
         return RotateResult(text, "", False)
@@ -110,31 +116,37 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
         return RotateResult(text, "", True)
     pinned = {i for i, e in enumerate(entries) if pin and pin.search(e)}
     budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in pinned)
-    keep = set(pinned)
-    used = 0
+    # The frontier is set by ORDINARY entries only: a pin must not stop it, or an
+    # old hold would freeze the archive and rotation would free nothing.
+    frontier, used = len(entries), 0
     for i in range(len(entries) - 1, -1, -1):
         if i in pinned:
             continue
-        if keep and used + _size(entries[i]) > budget:
+        if frontier < len(entries) and used + _size(entries[i]) > budget:
             break
-        keep.add(i)
         used += _size(entries[i])
+        frontier = i
+    keep = set(pinned) | set(range(frontier, len(entries)))
     head = preamble + "".join(entries[i] for i in sorted(keep))
-    # A pinned entry is archived at its historical position AND kept in the head:
-    # the archive stays chronological, so retiring a pin cannot reorder history.
-    archived = "".join(entries[i] for i in range(len(entries))
-                       if i not in keep or i in pinned)
+    archived = "".join(
+        (_mark_retained(entries[i]) if i in pinned else entries[i])
+        for i in range(frontier)
+    )
     pinned_bytes = sum(_size(entries[i]) for i in pinned)
     return RotateResult(head, archived, _size(head) > keep_bytes, pinned_bytes, len(pinned))
 
 
-def _not_yet_archived(archive: Path, outgoing: str) -> str:
-    """Entries of `outgoing` the archive does not already hold, by OCCURRENCE.
+def _mark_retained(entry: str) -> str:
+    """The archived copy of a still-live entry says so, in band."""
+    return entry.rstrip("\n") + "\n" + RETAINED + "\n\n"
 
-    A pinned entry is archived when first skipped, so the rotation after its
-    retirement must not append a second copy. Counting occurrences rather than
-    testing membership keeps a genuinely repeated entry: two identical entries
-    written on different days are two records, and dropping one loses history.
+
+def _not_yet_archived(archive: Path, outgoing: str) -> str:
+    """Entries of `outgoing` not already on record as a RETAINED copy.
+
+    Only an explicitly retained copy may cancel an outgoing entry: two identical
+    entries written on different days are two records, and global text equality
+    would drop the second silently.
     """
     try:
         have = archive.read_text(encoding="utf-8")
@@ -142,13 +154,14 @@ def _not_yet_archived(archive: Path, outgoing: str) -> str:
         return outgoing
     _, entries = split(outgoing)
     if not entries:
-        return "" if outgoing and outgoing in have else outgoing
+        return outgoing
     _, had = split(have)
-    remaining = Counter(had)
+    retained = Counter(e.replace(RETAINED + "\n", "") for e in had if RETAINED in e)
     keep = []
     for e in entries:
-        if remaining[e] > 0:
-            remaining[e] -= 1      # this copy is the one already on record
+        bare = e.replace(RETAINED + "\n", "")
+        if retained[bare] > 0:
+            retained[bare] -= 1
         else:
             keep.append(e)
     return "".join(keep)

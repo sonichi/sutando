@@ -135,6 +135,47 @@ class PinnedEntries(unittest.TestCase):
         self.assertTrue(r.oversized)
         self.assertIn("hands off", r.head)
 
+    def test_the_archive_is_a_contiguous_prefix_even_with_a_MIDDLE_pin(self):
+        """A, B, P(hold), C: the archive must read A, B, P — never A, P, B."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
+        p.write_text("# t\n\n" + E("2026-01-01", "A") + E("2026-02-01", "B")
+                     + E("2026-03-01", "P HOLD: hands off") + E("2026-04-01", "C"))
+        ct.rotate(p, 350)
+        ct.rotate(p, 240)
+        names = [e.splitlines()[0].split("— ")[1] for e in ct.split(archive.read_text())[1]]
+        self.assertEqual(names, ["A", "B", "P HOLD: hands off"])
+        self.assertIn("hands off", p.read_text())          # still live in the head
+
+    def test_retiring_a_middle_pin_adds_no_second_copy(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
+        p.write_text("# t\n\n" + E("2026-01-01", "A") + E("2026-02-01", "B")
+                     + E("2026-03-01", "P HOLD: hands off") + E("2026-04-01", "C"))
+        ct.rotate(p, 350); ct.rotate(p, 240)
+        ct.rotate(p, 120, pin=None)                        # the hold retires
+        self.assertEqual(archive.read_text().count("hands off"), 1)
+        names = [e.splitlines()[0].split("— ")[1] for e in ct.split(archive.read_text())[1]]
+        self.assertEqual(names[:3], ["A", "B", "P HOLD: hands off"])
+
+    def test_a_repeated_ordinary_entry_across_rotations_is_two_records(self):
+        """Only a RETAINED copy may cancel an outgoing entry; a real repeat may not."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
+        A, B, C = E("2026-01-01", "A"), E("2026-02-01", "B"), E("2026-03-01", "C")
+        p.write_text("# t\n\n" + A + B)
+        ct.rotate(p, 120, pin=None)
+        p.write_text(p.read_text() + A + C)
+        ct.rotate(p, 120, pin=None)
+        total = archive.read_text().count("— A") + p.read_text().count("— A")
+        self.assertEqual(total, 2, "a genuinely repeated entry was cancelled by an older copy")
+
     def test_the_refusal_names_the_cause_pins_or_one_giant_entry(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         pre, _ = fixture(0)
