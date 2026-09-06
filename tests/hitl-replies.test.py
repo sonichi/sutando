@@ -137,6 +137,31 @@ class ReplyHandlerTests(unittest.TestCase):
         self.h.offer(event(reply_for(self.mgr.get(tui.id), "open_terminal"), eid="$e3"))
         self.assertEqual(len(list(actions_dir(self.ws).glob("*.json"))), 1)
 
+    def test_turn_on_action_is_reported_after_an_applied_click_and_only_then(self):
+        """A producer that needs a turn sets turn_on_action; the handler reports it so the caller
+        keeps the click on the task path. A plain requirement, a rejection and a stale click all
+        report False, and the flag never survives from a previous offer."""
+        req = self.mgr.create(HumanRequirement(kind="choice", runtime="report-feedback", message="file?",
+                                               guard="fb_0123456789", device={"id": "rf:fb_0123456789"},
+                                               actions=[Action(id="file", kind="confirmation", label="File"),
+                                                        Action(id="skip", kind="confirmation", label="Skip")],
+                                               turn_on_action=True))
+        self.assertFalse(self.h.last_turn)
+        self.h.offer(event(reply_for(req, "file")))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "file")
+        # the SAME click redelivered (a death before its task was written) still owes the turn
+        self.h.offer(event(reply_for(req, "file", revision=1), eid="$e2"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
+        self.assertEqual(self.mgr.get(req.id).revision, 2, "the store did not move")
+        # a DIFFERENT action at the old revision is a stale click
+        self.h.offer(event(reply_for(req, "skip", revision=1), eid="$e2b"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("rejected", False))
+        self.h.offer(event(reply_for(self.req, "allow"), eid="$e3"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", False))
+        self.assertTrue(HumanRequirement(kind="choice", runtime="x", message="m", turn_on_action=True).to_wire()["turn_on_action"])
+        self.assertNotIn("turn_on_action", HumanRequirement(kind="choice", runtime="x", message="m").to_wire())
+
     def test_no_workspace_means_no_driver_file_but_still_applies(self):
         h = HitlReplyHandler(self.mgr, OWNER, workspace=None, log=self.logs.append)
         h.offer(event(reply_for(self.req, "deny")))

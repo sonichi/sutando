@@ -213,7 +213,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|hitl_click)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
