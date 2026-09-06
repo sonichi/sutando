@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
@@ -87,6 +88,19 @@ class ThisHost(unittest.TestCase):
         self.assertNotEqual(av.availability(s), "available", "my own heartbeat is stale; the peer's does not count")
         self.assertNotEqual(av.availability(av.read_runtime_state(ws, host="nobody", now=time.time())), "available")
         self.assertIsInstance(av.this_host(), str); self.assertTrue(av.this_host())
+
+
+class Fallbacks(unittest.TestCase):
+    def test_the_host_label_falls_back_to_the_node_name_when_the_resolver_is_missing(self):
+        import platform
+        with unittest.mock.patch.dict(sys.modules, {"util_paths": None}):  # the import raises
+            self.assertEqual(av.this_host(), platform.node().split(".")[0])
+
+    def test_an_unreadable_task_snapshot_is_skipped_not_counted(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state" / "activity").mkdir(parents=True)
+        (ws / "state" / "activity" / "task-ok.json").write_text(json.dumps({"task_id": "task-ok", "phase": "RUNNING"}))
+        (ws / "state" / "activity" / "task-bad.json").write_text("{not json")
+        self.assertEqual(av.read_runtime_state(ws, host="h", now=1.0).active_runs, 1)
 
 
 class Reading(unittest.TestCase):
