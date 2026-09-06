@@ -421,8 +421,10 @@ with tempfile.TemporaryDirectory() as d:
     before = ptr.read_text()
     rc, msg = mib.record_pointer(projects, REPO, pathlib.Path(d) / "nope" / "MEMORY.md")
     check("record: a target that is not a file REFUSES", rc == 2 and "not a file" in msg, msg)
+    (live / "notes.md").write_text("not an index\n", encoding="utf-8")
     rc2, msg2 = mib.record_pointer(projects, REPO, live / "notes.md")
-    check("record: a file that is not an index REFUSES", rc2 == 2, msg2)
+    check("record: a file that is not an index REFUSES *by name*, having passed the is-a-file check",
+          rc2 == 2 and "not named MEMORY.md" in msg2, msg2)
     check("record: a REFUSED write leaves the existing pointer untouched",
           ptr.read_text() == before, ptr.read_text())
 
@@ -485,6 +487,68 @@ with tempfile.TemporaryDirectory() as d:
               mib.record_pointer(projects, REPO, live / "MEMORY.md")[0] == 0)
     finally:
         mib._host_label = _real
+
+    # These run after a block that restores the real host label, so pin it again:
+    # `ptr` was computed under "test-host" and record_pointer must resolve the same path.
+    mib._host_label = lambda repo: "test-host"
+    # `ptr` above belongs to an earlier temporary tree; recompute it against THIS
+    # block's projects, or every path assertion below silently inspects a dead directory.
+    ptr = projects.parent.parent / "hosts" / "test-host" / "memory-corpus"
+    # The first-writer-wins guard: os.link losing the race is the ONLY thing standing
+    # between two concurrent publishes and a silently retargeted host.
+    import os as _os
+    third = _tree(projects, "slug-third", index_of(LIMIT // 5), age_s=20)
+    ptr.unlink(missing_ok=True)
+    _link = _os.link
+    try:
+        _os.link = lambda a, b: (_ for _ in ()).throw(FileExistsError())
+        rc_r, msg_r = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+    finally:
+        _os.link = _link
+    check("record: losing the link race REFUSES rather than clobbering",
+          rc_r == 2 and "concurrently" in msg_r, msg_r)
+    check("record: ...and the lost race leaves no staging file behind",
+          not list(ptr.parent.glob(".*tmp")), list(ptr.parent.glob(".*")))
+
+    ptr.unlink(missing_ok=True)
+    try:
+        _os.link = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt())
+        raised = False
+        try:
+            mib.record_pointer(projects, REPO, third / "MEMORY.md")
+        except KeyboardInterrupt:
+            raised = True
+    finally:
+        _os.link = _link
+    check("record: an interrupt mid-publish propagates rather than being swallowed", raised)
+    check("record: ...and still cleans up its staging file",
+          not list(ptr.parent.glob(".*tmp")), list(ptr.parent.glob(".*")))
+
+    # Both refusals must still name what is already recorded, even when that value
+    # cannot be read back -- an unreadable pointer is not a licence to overwrite it.
+    ptr.parent.mkdir(parents=True, exist_ok=True)
+    ptr.write_text(str(live / "MEMORY.md"), encoding="utf-8")
+    _rt = pathlib.Path.read_text
+    try:
+        pathlib.Path.read_text = lambda self, *a, **k: (_ for _ in ()).throw(OSError("nope"))
+        rc_u, msg_u = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+    finally:
+        pathlib.Path.read_text = _rt
+    check("record: an UNREADABLE existing pointer still REFUSES, and says so",
+          rc_u == 2 and "unreadable" in msg_u, msg_u)
+
+    ptr.unlink(missing_ok=True)
+    import tempfile as _tf
+    _mk = _tf.mkstemp
+    try:
+        _tf.mkstemp = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
+        rc_s, msg_s = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+    finally:
+        _tf.mkstemp = _mk
+    check("record: a staging failure REFUSES instead of writing in place",
+          rc_s == 2 and "cannot stage" in msg_s, msg_s)
+    check("record: ...and a failed stage records no pointer at all", not ptr.exists())
+
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
