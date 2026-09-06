@@ -58,16 +58,18 @@ def main(argv=None) -> int:
         head_b, keep_b = len(r.head.encode()), a.keep_bytes
         # Pins are the cause when the head would fit without them.
         if r.pinned_count and head_b - r.pinned_bytes <= keep_b:
-            print(f"current-track-rotate: REFUSING TO CALL THIS BOUNDED — {r.pinned_count} pinned "
+            did = ("would archive" if a.dry_run else "ARCHIVED")
+            print(f"current-track-rotate: ROTATED BUT STILL OVER BUDGET — {did} "
+                  f"{len(r.archived.encode())} B; the head is {head_b} B against a {keep_b} B "
+                  f"budget because {r.pinned_count} pinned "
                   f"entr{'y' if r.pinned_count == 1 else 'ies'} (owner holds and the like) hold "
-                  f"{r.pinned_bytes} B, so the head is {head_b} B against a {keep_b} B budget; "
-                  f"nothing was archived that a consumer reads as live. Raise --keep-bytes, or "
+                  f"{r.pinned_bytes} B, which rotation may not move. Raise --keep-bytes, or "
                   f"retire the holds that have expired", file=sys.stderr)
         else:
             _, entries = split(r.head)
             newest = (entries[-1].splitlines() or ["?"])[0][:80] if entries else "the preamble"
             verb = "would keep" if a.dry_run else "kept"
-            print(f"current-track-rotate: REFUSING TO CALL THIS BOUNDED — the newest entry alone is "
+            print(f"current-track-rotate: ROTATED BUT STILL OVER BUDGET — the newest entry alone is "
                   f"{head_b} B of head against a {keep_b} B budget ({newest!r}); {verb} it whole, "
                   f"archived {len(r.archived.encode())} B; split or shorten that entry",
                   file=sys.stderr)

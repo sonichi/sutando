@@ -57,6 +57,10 @@ def run(*argv, stdin=None):
     return subprocess.run([sys.executable, *map(str, argv)], input=stdin, capture_output=True, text=True)
 
 
+def _size_of(t):
+    return len(t.encode('utf-8'))
+
+
 class Plan(unittest.TestCase):
     def test_under_cap_is_a_noop(self):
         pre, ents = fixture(3); text = pre + "".join(ents)
@@ -364,6 +368,46 @@ class PinnedEntries(unittest.TestCase):
         self.assertNotIn("alpha", p.read_text())
         self.assertFalse(archive.exists(), "replace() must not be believed to archive")
 
+    def test_a_newest_first_file_keeps_the_newest_entries(self):
+        """context-reconstruct PREPENDS a rewritten state block, so newest-last is not universal."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E("2026-09-06T08:33Z", "newest")
+                + E("2026-09-04T21:27Z", "middle") + E("2026-09-01T10:00Z", "oldest"))
+        r = ct.plan(text, 1200)
+        self.assertIn("newest", r.head)
+        self.assertNotIn("newest", r.archived)
+        self.assertIn("oldest", r.archived)
+        self.assertEqual(_size_of(r.head) + _size_of(r.archived), _size_of(text))
+
+    def test_an_append_only_file_still_keeps_its_tail(self):
+        """The orientation fix must not invert the ordinary case."""
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E("2026-09-01T10:00Z", "oldest")
+                + E("2026-09-04T21:27Z", "middle") + E("2026-09-06T08:33Z", "newest"))
+        r = ct.plan(text, 1200)
+        self.assertIn("newest", r.head)
+        self.assertNotIn("newest", r.archived)
+        self.assertIn("oldest", r.archived)
+
+    def test_the_over_budget_exit_says_it_wrote_and_how_much(self):
+        """rc=3 next to 'nothing was archived' read as a no-op while 213 KB moved."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        pre, _ = fixture(0)
+        p = Path(d.name) / "current-track.md"
+        holds = "".join(f"## 2026-0{i%9+1}-01T00:00Z — HOLD: hands off #{3000+i}\n" + ("h" * 900) + "\n\n"
+                        for i in range(12))
+        p.write_text(pre + holds + "".join(f"## 2026-09-0{i%9+1}T00:00Z — entry {i}\n" + ("x" * 500) + "\n\n"
+                                            for i in range(20)))
+        before = p.read_text()
+        r = Cli(load(ROTATE))(p, "--keep-bytes", "4096")
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn("nothing was archived", r.stderr)
+        self.assertIn("ARCHIVED", r.stderr)
+        after = p.read_text()
+        self.assertNotEqual(before, after, "the exit-3 path claims a write it did not make")
+        archive = p.with_name("current-track-archive.md").read_text()
+        self.assertEqual(len(after.encode()) + len(archive.encode()), len(before.encode()))
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())
@@ -467,7 +511,7 @@ class RotateAndAppend(unittest.TestCase):
         r = rot(self.p.with_name("absent.md")); self.assertEqual(r.returncode, 1); self.assertIn("cannot read", r.stderr)
         self.p.write_text(self.pre + "## 2026-09-06T02:00Z — the giant\n" + "y" * 40_000 + "\n")
         r = rot(self.p, "--keep-bytes", "32768"); self.assertEqual(r.returncode, 3)
-        self.assertIn("REFUSING", r.stderr); self.assertIn("the giant", r.stderr)
+        self.assertIn("STILL OVER BUDGET", r.stderr); self.assertIn("the giant", r.stderr)
         r = rot(self.p, "--keep-bytes", "32768", "--dry-run"); self.assertEqual(r.returncode, 3); self.assertIn("would keep", r.stderr)
         self.p.write_text("plain prose with no heading " * 2000)
         r = rot(self.p, "--keep-bytes", "1024"); self.assertEqual(r.returncode, 3); self.assertIn("the preamble", r.stderr)
