@@ -19,10 +19,11 @@ never report work as delegated when nothing was spawned.
 Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
 
 **Context state never grounds a decline or a deferral** (Chi 2026-09-06). Compaction is automatic
-and the session continues from its summary; what carries work across it is the durable record
-(current-track, a detached mechanism), never an agent's estimate of its remaining window. Do not
-decline, park, or tell the owner to compact or restart a core because context is "near its end":
-write the record and proceed.
+and the session continues from its summary; what carries work across it is a durable record, never
+an agent's estimate of its remaining window. Do not decline, park, or tell the owner to compact or
+restart a core because context is "near its end": write the record and proceed. The record is the
+one your role owns — the live core writes its per-host `current-track.md`; a guest or one-shot
+session (see "Chat-path task tracking") writes its own task checkpoint and never the core's anchor.
 
 ## Architecture rules
 
