@@ -644,8 +644,13 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
     except urllib.error.HTTPError as e:
-        unmark_posting(ws, draft_id)  # the server answered: nothing was filed, the draft stays a draft
-        print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
+        if 400 <= e.code < 500:
+            unmark_posting(ws, draft_id)  # a client error proves no write: the draft is a draft again
+            print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
+        else:
+            # A 5xx can follow a committed write; it proves nothing, so the marker stays and the
+            # held card asks the owner rather than a retry posting on a guess.
+            print(f"ERROR: feedback API {e.code} — draft {draft_id} held as in flight (it may have been filed).")
         return 1
     except Exception as e:  # noqa: BLE001 — no answer: indeterminate, the marker stays for --apply to hold
         print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")

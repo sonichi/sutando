@@ -129,9 +129,20 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertLess(rgb._TASK_FIELDS.index("hitl_click"), rgb._TASK_FIELDS.index("task"), "a header below task: is body")
         after = self.mgr.get(req.id)
         self.assertEqual((after.status, after.chosen_action), ("in_progress", "file"))
-        # the same task offered again (relay redelivery) is a stale click: consumed, owner told
-        out = rgb._handle_hitl_action(t)
-        self.assertTrue(str(out).startswith("rejected:"), out)
+        # Crash seam: applied, then died before _write_task; the redelivered task must pass
+        # through again (idempotent write), not be rejected as stale — or the turn is lost.
+        again = rgb._handle_hitl_action(t)
+        self.assertIs(again, False, "the same click re-offered still owes its turn")
+        self.assertEqual(t.get("hitl_click"), "true")
+        same = self.mgr.get(req.id)
+        self.assertEqual((same.status, same.chosen_action, same.revision), (after.status, after.chosen_action, after.revision), "store unchanged")
+        # a DIFFERENT click on the now-answered card is stale as before
+        other = self._task(hitl_action={"hitl_id": req.id, "expected_revision": req.revision,
+                                        "action_id": "file", "guard": req.guard}, task="File this bug report", id="task-other")
+        other["hitl_action"]["expected_revision"] = req.revision  # the pre-click revision, as a stale client would send
+        other["hitl_action"]["action_id"] = "file"
+        stale = dict(other); stale["hitl_action"] = dict(other["hitl_action"], action_id="skip")
+        self.assertTrue(str(rgb._handle_hitl_action(stale)).startswith("rejected:"))
 
     def test_applied_click_closes_silently(self):
         t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,

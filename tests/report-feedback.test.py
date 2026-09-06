@@ -384,8 +384,8 @@ class TestAskFirst(unittest.TestCase):
                     with self.assertRaises(SystemExit) as cm:
                         self._run(["--decide", did, "file"])
                     self.assertEqual(cm.exception.code, 1)
-            # a 5xx is an answer (the draft came back), then the transport error left it in flight:
-            # held for the owner, not a plain draft a retry would post again
+            # a 5xx and a transport error both leave the draft in flight: held for the owner, not a
+            # plain draft a retry would post again
             self.assertEqual(report_feedback.list_drafts(ws), [])
             self.assertEqual([d["id"] for d in report_feedback.list_drafts(ws, state="posting")], [did])
 
@@ -688,14 +688,22 @@ class TestAskFirst(unittest.TestCase):
                     mock.patch.object(report_feedback, "post_feedback", side_effect=OSError("connection reset")):
                 self.assertEqual(report_feedback.decide(ws, {"sendLogs": False}, did2, "file"), 1)
             self.assertTrue(report_feedback.posting_marker(ws, did2).exists(), "no answer: held, not a draft")
-            # a definite server answer that did not file restores the draft for a retry
+            # a client error proves no write: the draft is a draft again, a retry may post
             did3 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "three", "body": "b", "auto": True})
-            http_err = urllib.error.HTTPError("https://x/api/feedback", 500, "boom", {}, io.BytesIO(b"no"))
+            bad_req = urllib.error.HTTPError("https://x/api/feedback", 400, "bad", {}, io.BytesIO(b"invalid_payload"))
             with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
-                    mock.patch.object(report_feedback, "post_feedback", side_effect=http_err):
+                    mock.patch.object(report_feedback, "post_feedback", side_effect=bad_req):
                 self.assertEqual(report_feedback.decide(ws, {"sendLogs": False}, did3, "file"), 1)
-            self.assertIsNotNone(report_feedback.load_draft(ws, did3), "a 5xx is an answer: the draft is a draft again")
+            self.assertIsNotNone(report_feedback.load_draft(ws, did3), "a 4xx is an answer that proves no write")
             self.assertFalse(report_feedback.posting_marker(ws, did3).exists())
+            # a 5xx can follow a committed write: it proves nothing, so it is held like no answer at all
+            did4 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "four", "body": "b", "auto": True})
+            srv_err = urllib.error.HTTPError("https://x/api/feedback", 500, "boom", {}, io.BytesIO(b"no"))
+            with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback, "post_feedback", side_effect=srv_err):
+                self.assertEqual(report_feedback.decide(ws, {"sendLogs": False}, did4, "file"), 1)
+            self.assertTrue(report_feedback.posting_marker(ws, did4).exists(), "a 5xx is held, never a free retry")
+            self.assertIsNone(report_feedback.load_draft(ws, did4))
             # and an explicit --decide file on an in-flight draft is the owner re-posting on purpose
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \

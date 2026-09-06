@@ -143,13 +143,19 @@ class ReplyHandlerTests(unittest.TestCase):
         report False, and the flag never survives from a previous offer."""
         req = self.mgr.create(HumanRequirement(kind="choice", runtime="report-feedback", message="file?",
                                                guard="fb_0123456789", device={"id": "rf:fb_0123456789"},
-                                               actions=[Action(id="file", kind="confirmation", label="File")],
+                                               actions=[Action(id="file", kind="confirmation", label="File"),
+                                                        Action(id="skip", kind="confirmation", label="Skip")],
                                                turn_on_action=True))
         self.assertFalse(self.h.last_turn)
         self.h.offer(event(reply_for(req, "file")))
         self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
         self.assertEqual(self.mgr.get(req.id).chosen_action, "file")
+        # the SAME click redelivered (a death before its task was written) still owes the turn
         self.h.offer(event(reply_for(req, "file", revision=1), eid="$e2"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
+        self.assertEqual(self.mgr.get(req.id).revision, 2, "the store did not move")
+        # a DIFFERENT action at the old revision is a stale click
+        self.h.offer(event(reply_for(req, "skip", revision=1), eid="$e2b"))
         self.assertEqual((self.h.last_outcome, self.h.last_turn), ("rejected", False))
         self.h.offer(event(reply_for(self.req, "allow"), eid="$e3"))
         self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", False))

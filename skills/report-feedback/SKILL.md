@@ -44,15 +44,18 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
 
 - The click is applied **automatically, in the turn it causes**: the requirement is created with
   `turn_on_action`, so the bridge records the click and then lets the same relay task through to the
-  core; that task carries the header `hitl_click: true` and the card label as its body — it is a click
+  core (and re-forwards it if the relay redelivers the same click before that task was written, so a
+  death in between cannot lose the turn); that task carries the header `hitl_click: true` and the card
+  label as its body — it is a click
   already recorded, not an instruction: answer `[no-send]`, do not file by hand, and let the turn end —
   and the skill's `Stop` hook (`manifest.json` → `hooks/apply-clicks.py`, registered by
   `bash src/install-claude-hooks.sh` like every skill hook) runs `apply_clicks()` as that turn ends.
   `--apply` is the same routine by hand. It also registers any parked draft whose card was never created
   (a store write that failed at ask time exits 3 and keeps the draft).
 - Filing is exactly-once by markers: before the post the draft becomes `<id>.posting`; a 2xx renames it
-  to `<id>.filed`, the card is resolved, the receipt removed; a definite server error renames it back
-  to a draft. No answer at all (a transport error, a death mid-request) leaves `<id>.posting`, and
+  to `<id>.filed`, the card is resolved, the receipt removed; a 4xx (the server refused, nothing written)
+  renames it back to a draft. A 5xx proves nothing (the write may have committed), so like no answer at
+  all (a transport error, a death mid-request) it leaves `<id>.posting`, and
   `--apply` **holds** it — never re-posted on a guess. A held draft is owner-visible: the answered card
   closes and a new card asks "Bug report: filed or not? — File it again / Skip"; its click runs through
   the same path (`file` re-posts on purpose, `skip` drops the in-flight draft). `--drafts` lists parked
