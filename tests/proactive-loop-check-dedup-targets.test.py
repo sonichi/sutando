@@ -33,11 +33,13 @@ def _ws(results: dict, archive: dict = None):
 
 class Contradictions(unittest.TestCase):
     def test_a_dedup_onto_a_no_send_target_is_flagged(self):
+        # Taxonomy is the shared owner's, so this condition is named
+        # identically here and in scripts/unanswered-tasks.py.
         ws = _ws({"a.txt": "[deduped: task-b]\n", "task-b.txt": "[no-send]\nnothing\n"})
         bad = cdt.check(ws, [ws / "results" / "a.txt"])
         self.assertEqual(len(bad), 1)
-        self.assertIn("delivered nothing", bad[0][2])
-        self.assertIn("[no-send]", bad[0][2])   # quoted from the target, for the reader
+        self.assertIn("HOLDER-SKIPPED", bad[0][2])
+        self.assertIn("task-b", bad[0][2])
 
     def test_a_dedup_onto_a_real_reply_is_clean(self):
         # Control: without this the checker could flag every dedup and the test
@@ -49,7 +51,30 @@ class Contradictions(unittest.TestCase):
         ws = _ws({"a.txt": "[deduped: task-nope]\n"})
         bad = cdt.check(ws, [ws / "results" / "a.txt"])
         self.assertEqual(len(bad), 1)
-        self.assertIn("does not exist", bad[0][2])
+        self.assertIn("ORPHANED", bad[0][2])
+        self.assertIn("task-nope", bad[0][2])
+
+    def test_a_QUARANTINED_target_is_not_mistaken_for_a_delivered_one(self):
+        """The regression this extraction exists for.
+
+        `{id}.too-old.<epoch>` is a result that was quarantined — never
+        delivered. This file resolved the target with a bare `{id}*` archive
+        glob, which matches it, so a dedup pointing at an undelivered reply read
+        as CLEAN. `unanswered-tasks.py` already required the `-` separator and
+        documented why; only the guard had the loose glob.
+        """
+        ws = _ws({"a.txt": "[deduped: task-b]\n"},
+                 archive={"task-b.too-old.1788000000.txt": "quarantined, never sent\n"})
+        bad = cdt.check(ws, [ws / "results" / "a.txt"])
+        self.assertEqual(len(bad), 1, "a quarantined target must not read as delivered")
+        self.assertIn("task-b", bad[0][2])
+
+    def test_a_delivered_archived_target_is_still_clean(self):
+        """Control for the arm above: the `-` separator must not reject the real
+        archive shape, or the fix would be 'flag everything' wearing a fix's name."""
+        ws = _ws({"a.txt": "[deduped: task-b]\n"},
+                 archive={"task-b-1788000001.txt": "the actual reply\n"})
+        self.assertEqual(cdt.check(ws, [ws / "results" / "a.txt"]), [])
 
     def test_the_target_is_resolved_from_the_archive_too(self):
         # Results are archived on delivery, so a same-pass check would otherwise
@@ -156,11 +181,22 @@ class Refusals(unittest.TestCase):
         self.assertEqual(cdt.check(ws, [ws / "results"]), [])   # a directory: OSError
 
     def test_without_the_policy_owner_the_checker_refuses(self):
-        # No local fallback rule: result_markers.py absent -> RuntimeError, never "clean".
+        # No local fallback rule: the owner absent -> raise, never "clean".
         ws = _ws({"a.txt": "[deduped: task-b]\n", "task-b.txt": "reply\n"})
         with mock.patch.object(cdt, "REPO", Path(tempfile.mkdtemp())):
             with self.assertRaises(RuntimeError):
-                cdt.resolve(ws, "task-b")
+                cdt.check(ws, [ws / "results" / "a.txt"])
+
+    def test_the_CLI_reports_a_missing_owner_as_2_not_1(self):
+        """Exit 1 is reserved for a real finding by every checker in the loop, so
+        a missing owner exiting 1 would read as 'dedups resolve to nothing'."""
+        ws = _ws({"a.txt": "[deduped: task-b]\n"})
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cdt, "REPO", Path(tempfile.mkdtemp())), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = cdt.main([str(ws / "results" / "a.txt")])
+        self.assertEqual(rc, 2)
+        self.assertIn("not importable", buf.getvalue() + err.getvalue())
 
 
 if __name__ == "__main__":

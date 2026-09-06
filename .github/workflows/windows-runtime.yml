@@ -130,6 +130,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'task-id-delegation.test.py failed' }
           python tests/task-archive.test.py
           if ($LASTEXITCODE -ne 0) { throw 'task-archive.test.py failed' }
+          python tests/local-task-protocol-atomic-write.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'local-task-protocol-atomic-write.test.py failed' }
           python tests/git-binary-resolution.test.py
           if ($LASTEXITCODE -ne 0) { throw 'git-binary-resolution.test.py failed' }
           python tests/health-check-live-tree-drift.test.py
