@@ -1459,7 +1459,13 @@ itself to a room whose worker might still come back.
    the instant-wise invariant reads as sufficient until you schedule against it.
 
    **The worker's first act is therefore `spent`, not the rename — but `spent` is a WITNESS, not
-   the mutex.** Consumption is `create(<instance>.admit/spent, O_EXCL)`, then `mkdir -p held/ claimed/`, then
+   the mutex, and it is written only when there is something to consume.** A worker legitimately
+   arrives at an allowance directory holding no token: the crash-after-`mkdir` state above is
+   permitted, and the directory alone is the gate. Writing the witness there poisons recovery, which
+   then refuses to finish issuance, and the residue it leaves — no token, no journal, no claimed
+   record — matches none of the three clocks, so probation can never end. **So the worker tests for
+   the token BEFORE its first durable write**; the retry path is unaffected because it arrives with
+   the token still standing. Consumption is `create(<instance>.admit/spent, O_EXCL)`, then `mkdir -p held/ claimed/`, then
    `rename(token, held/<task_id>)`. **Both phase parents are made here, before the token leaves.**
    The promotion in (3) is a rename into `claimed/`, and a rename needs its parent: creating that
    directory at promotion time would put it after the crash seam it has to survive, and on scratch

@@ -215,6 +215,10 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         d.token = False; d.journal, d.journal_at = task, now[0]; return True
 
     def gate_step1(task):
+        # `spent` over an empty directory makes recovery refuse to finish issuance,
+        # and the residue it leaves matches none of the three clocks.
+        if not d.token:
+            return False
         if gate_step1a() == "EEXIST" and spent_is_mutex:
             return False                              # pre-fix: the retry can never finish
         if crash_after_spent[0]:                      # crash between the two durable writes
@@ -817,6 +821,42 @@ class ConsumptionIsTwoWritesAndSpentIsAWitnessNotAMutex(unittest.TestCase):
         # Two workers past the spent step: the second finds no token and loses.
         _v, claimed, _p, _d = run(["kick", "sweep", "worker", "restart", "worker"])
         self.assertEqual(claimed, 1, "a second consumer must not admit a second task")
+
+
+class AWorkerThatFoundNoTokenLeavesNoWitness(unittest.TestCase):
+    """Splitting consumption into two writes let a worker create `spent` and only
+    then discover there was nothing to consume.
+
+    The design permits a crash after `mkdir` and before the token, and the
+    directory alone is the worker's gate — so a worker legitimately arrives at an
+    empty allowance. Writing the witness there makes recovery refuse to finish
+    issuance, and the residue (no token, no journal, no claimed record) has no
+    clock, so probation can never end. Splitting the writes did not cause this on
+    its own; not crossing the split with an already-valid state did.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "restart", "sweep", "wait", "sweep"]
+
+    def test_no_witness_is_written_over_an_empty_allowance(self):
+        _v, _c, _p, d = run(self.ORDER, "crash_mkdir")
+        self.assertFalse(d.spent, "`spent` with no token makes recovery refuse to mint")
+
+    def test_the_schedule_still_terminates(self):
+        # The failure is absorbing, so the verdict is the half that matters.
+        verdict, _c, _p, d = run(self.ORDER, "crash_mkdir")
+        self.assertEqual(verdict, "wedged", "probation with no clock never ends")
+        self.assertFalse(d.admit_dir, "the allowance outlived its own probation")
+
+    def test_the_control_a_present_token_is_still_consumed(self):
+        # Or the guard could pass by refusing every consumption.
+        _v, claimed, _p, d = run(["kick", "sweep", "worker"])
+        self.assertEqual(claimed, 1)
+        self.assertTrue(d.spent, "a real consumption still leaves its witness")
+
+    def test_the_control_the_eexist_retry_survives_the_guard(self):
+        # The guard runs before `spent`; the retry path arrives WITH a token.
+        _v, claimed, _p, _d = run(["kick", "sweep", "worker", "worker"], "crash_after_spent")
+        self.assertEqual(claimed, 1, "the new guard must not strand the retry it was built for")
 
 
 if __name__ == "__main__":
