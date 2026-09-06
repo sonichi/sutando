@@ -31,6 +31,7 @@ grep -q 'profiles.json \] || ag2-assistant profiles create backup' "$D/assistant
 ALLOW="sutando.config.json
 packages/ag2-sparrow/ag2_sparrow/
 src/remote-gateway-bridge.py
+src/task_archive.py
 src/workspace_default.py
 src/sutando_config.py
 src/util_paths.py

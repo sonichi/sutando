@@ -21,7 +21,7 @@ WORKDIR /app/engine
 # this list): package, loader shim + its src/ modules, the workspace resolver.
 COPY --chown=sutando:sutando sutando.config.json ./
 COPY --chown=sutando:sutando packages/ag2-sparrow/ag2_sparrow/ packages/ag2-sparrow/ag2_sparrow/
-COPY --chown=sutando:sutando src/remote-gateway-bridge.py src/workspace_default.py src/sutando_config.py src/util_paths.py src/proactive_routing.py src/task_envelope.py src/git_binary.py src/result_markers.py src/
+COPY --chown=sutando:sutando src/remote-gateway-bridge.py src/task_archive.py src/workspace_default.py src/sutando_config.py src/util_paths.py src/proactive_routing.py src/task_envelope.py src/git_binary.py src/result_markers.py src/
 COPY --chown=sutando:sutando scripts/sutando-config.sh scripts/python-binary.sh scripts/
 COPY --chown=sutando:sutando deploy/cloud-worker/entrypoint.sh deploy/cloud-worker/seat-stub.py deploy/cloud-worker/seat-ag2-assistant.py deploy/cloud-worker/healthcheck.sh deploy/cloud-worker/
 

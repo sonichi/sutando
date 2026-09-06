@@ -23,6 +23,11 @@ import sys
 import time
 from pathlib import Path
 
+# The task-protocol owner decides what a pending filename is; a private copy of
+# that rule here is what dropped legal dotted broker ids.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from task_archive import is_pending_task_file  # noqa: E402
+
 WS = Path(os.environ.get("SUTANDO_CLOUD_WORKSPACE") or "/workspace")
 WORKER = os.environ.get("SUTANDO_WORKER_ID") or "cloud"
 ACP_URL = os.environ.get("AG2ASSISTANT_ACP_URL") or "ws://assistant:8802"
@@ -30,7 +35,6 @@ ACP_TOKEN = os.environ.get("AG2ASSISTANT_ACP_TOKEN") or ""
 TURN_TIMEOUT_S = float(os.environ.get("SUTANDO_ACP_TURN_TIMEOUT_S") or "300")
 SCAN_S = float(os.environ.get("SUTANDO_STUB_SCAN_S") or "1.0")
 SIGNATURE = f"— {WORKER} (ag2-assistant)"
-PENDING = re.compile(r"^task-[^.]+\.txt$")
 PROTOCOL_VERSION = 1
 _STOP = False
 
@@ -170,7 +174,7 @@ def main() -> int:
           f"watching {tasks}", flush=True)
     while not _STOP:
         for task in sorted(tasks.glob("task-*.txt")) if tasks.is_dir() else []:
-            if not PENDING.match(task.name) or task.name in done:
+            if not is_pending_task_file(task.name) or task.name in done:
                 continue
             done.add(task.name)
             t0 = time.time()
