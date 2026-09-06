@@ -155,6 +155,78 @@ class WriterCli(unittest.TestCase):
         self.assertEqual((rec["task"]["id"], rec["task"]["from"], rec["room"]), ("task-cli", "@q:s", "!team:s"))
 
 
+class MessageEvent(unittest.TestCase):
+    """Every row carries the user message's event id, and the writer knows queued and consolidated."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "state").mkdir()
+        (self.ws / "tasks").mkdir()
+
+    def _task(self, name, room="!r:s", event="$ev1"):
+        body = f"id: {name}\nuser_id: @q:s\nsender_name: qingyun\ntask: Fix the thing\nsource: ag2space\n"
+        if room:
+            body += f"channel_id: {room}\n"
+        if event:
+            body += f"source_message_id: {event}\n"
+        (self.ws / "tasks" / f"{name}.txt").write_text(body)
+        return self.ws / "tasks" / f"{name}.txt"
+
+    def _rows(self):
+        return [json.loads(l) for l in (self.ws / "state" / "agent-activity.jsonl").read_text().splitlines()]
+
+    def test_task_file_carries_the_message_event_id(self):
+        task, room = card.task_from_file(self._task("task-e1"))
+        self.assertEqual((task["event"], room), ("$ev1", "!r:s"))
+
+    def test_queued_writes_a_notice_with_the_event_and_skips_a_roomless_file(self):
+        rc = card.main(["queued", "--task-file", str(self._task("task-q1")), "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        rows = self._rows()
+        self.assertEqual((rows[-1]["kind"], rows[-1]["line"], rows[-1]["room"], rows[-1]["task"]["event"]),
+                         ("notice", "queued", "!r:s", "$ev1"))
+        # a cron/bookkeeping task names no room: nothing is written, and never to a default room
+        card.main(["queued", "--task-file", str(self._task("task-cron-1", room=None)), "--workspace", str(self.ws)])
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_done_into_marks_a_consolidated_reply(self):
+        card.main(["done", "consolidated", "--task-id", "task-d1", "--into", "$holder", "--event", "$ev1",
+                       "--room", "!r:s", "--workspace", str(self.ws)])
+        row = self._rows()[-1]
+        self.assertTrue(row["done"])
+        self.assertEqual((row["task"]["into"], row["task"]["event"]), ("$holder", "$ev1"))
+
+    def test_pickup_row_carries_the_message_event_id(self):
+        p = hook.paths(self.ws); runs = []
+        self._task("task-p1")
+        hook.handle({"hook_event_name": "PreToolUse", "session_id": "S1", "tool_name": "Read",
+                     "tool_input": {"file_path": str(self.ws / "tasks" / "task-p1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        cmd = runs[-1]
+        self.assertEqual(cmd[cmd.index("--event") + 1], "$ev1")
+
+    def test_a_dedup_pointer_result_closes_as_consolidated_into_the_holder_message(self):
+        p = hook.paths(self.ws); runs = []
+        self._task("task-x1", event="$evx"); self._task("task-h1", event="$evh")
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-x1.txt").write_text("[deduped: task-h1]\n")
+        with open(p["log"], "a") as f:
+            f.write(json.dumps({"ts": 1, "kind": "processing", "line": "picked up", "room": "!r:s",
+                                "task": {"id": "task-x1", "event": "$evx"}}) + "\n")
+        hook.bind(p, "task-x1", "S1")
+        out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.ws / "results" / "task-x1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        self.assertEqual(out, [("done", "consolidated")])
+        cmd = runs[-1]
+        self.assertEqual((cmd[2], cmd[cmd.index("--into") + 1], cmd[cmd.index("--event") + 1]), ("done", "$evh", "$evx"))
+        # a real reply stays "replied" with no --into
+        runs.clear()
+        (self.ws / "results" / "task-x1.txt").write_text("Here is the answer.\n")
+        out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.ws / "results" / "task-x1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        self.assertEqual(out, [("done", "replied")])
+        self.assertNotIn("--into", runs[-1])
+
+
 class Hook(unittest.TestCase):
     """The PreToolUse/Stop hook: rows bind to the session that claimed the task, or nothing is written."""
 

@@ -18,6 +18,11 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | `line` | the text, plain |
 | `task` | `{id, from, text}` — the user message this row belongs to (`from` an mxid, `text` ≤160 chars) |
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
+| `task.event` | event id of the user message (`source_message_id`); the client mounts the per-message card under it |
+| `task.into` | on a consolidated `done`: event id of the message whose reply answered this one too |
+
+A `notice` row reading `queued` is written by the task watcher when the file lands, before any turn
+has it (`activity.py queued --task-file …`; only for files that name a room and a message).
 
 A task's rows are **live** until its `done` row; a task-less row is live 15 minutes. The drawer
 shows only live rows and hides itself when none is live. Rows are flat: the client marks the first
