@@ -477,6 +477,48 @@ def main() -> int:
     STATE["heartbeat_404"] = False
     STATE["strict"] = False
 
+    # The ordering only pays off if a LATER process finishes the close, so the
+    # control has to cross a real process boundary, not drain in the same one.
+    print("\n10. crash after a confirmed ack -> a fresh process closes it exactly once")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    STATE["advertise"] = True
+    ws10 = root / "ws10"; ws10.mkdir()
+    seat10 = _load("wqc_pin_restart", ws10, port, SUTANDO_WORKER_ID="cloud-2",
+                   SUTANDO_WORKER_LOCATION="cloud")
+    PIN = "worker-pin-909-d0d0"
+
+    def _die(*_a, **_k):
+        raise RuntimeError("process loss immediately after the confirmed ack")
+
+    seat10._retry_review_control_results = _die
+    try:
+        seat10._consume_worker_pin({"id": PIN, "task": "pin"})
+    except RuntimeError:
+        pass
+    check(STATE["acks"] == [(f"/v1/tasks/{PIN}/ack", {"id": PIN})],
+          f"the ack was CONFIRMED before the loss: {STATE['acks']}")
+    check(STATE["results"] == [],
+          f"the dying process did NOT close the lease: {STATE['results']}")
+    check(seat10._control_result_path(PIN).is_file(),
+          "the close intent survives on disk for whoever runs next")
+
+    # restart: a brand-new module over the same workspace, no in-process carry-over
+    seat10b = _load("wqc_pin_restart_b", ws10, port, SUTANDO_WORKER_ID="cloud-2",
+                    SUTANDO_WORKER_LOCATION="cloud")
+    check(seat10b is not seat10,
+          "control: a genuinely fresh module, not the crashed one")
+    check(seat10b._control_result_path(PIN).is_file(),
+          "the fresh process finds the pending close on DISK, not in memory")
+    seat10b._retry_review_control_results()
+    check(STATE["results"] == [{"id": PIN, "body": "[no-send]"}],
+          f"restart closes the lease exactly once: {STATE['results']}")
+    check(not seat10b._control_result_path(PIN).is_file(),
+          "and consumes the journal, so nothing can repeat it")
+    seat10b._retry_review_control_results()
+    check(STATE["results"] == [{"id": PIN, "body": "[no-send]"}],
+          f"a second drain after restart posts nothing more: {STATE['results']}")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
