@@ -152,7 +152,7 @@ class StalledLaneNamesItsCause(unittest.TestCase):
                                lambda: stale(state_dir=self.d, now=NOW)), \
              mock.patch.object(hc, "_gateway_lane_record",
                                lambda ln, state_dir=None: record(ln, state_dir=self.d)):
-            return hc._gateway_ok_unless_lane_stalled("running + connected")["detail"]
+            return hc._gateway_ok_unless_lane_stalled("running + connected", now=NOW)["detail"]
 
     def test_a_failed_lane_does_not_claim_the_record_says_connected(self):
         _write(self.d, "gateway-status.dlocal.json", connected=False,
@@ -167,15 +167,18 @@ class StalledLaneNamesItsCause(unittest.TestCase):
         self.assertIn("SSL CERTIFICATE_VERIFY_FAILED", self._detail())
 
     def test_a_silent_lane_keeps_the_original_wording(self):
-        # Green-on-purpose: the common case must not change.
+        # Green-on-purpose: the common case must not change. `last_ok_ts` is what
+        # makes it "was serving, went quiet" rather than never_polled.
         _write(self.d, "gateway-status.local.json", connected=True, error=None,
-               ts=NOW - STALE)
+               ts=NOW - STALE, last_ok_ts=NOW - STALE)
         d = self._detail()
         self.assertIn("still says connected", d)
         self.assertNotIn("recording a failure", d)
+        self.assertNotIn("no usable", d)
 
     def test_both_kinds_in_one_verdict_are_reported_separately(self):
-        _write(self.d, "gateway-status.local.json", connected=True, error=None, ts=NOW - STALE)
+        _write(self.d, "gateway-status.local.json", connected=True, error=None,
+               ts=NOW - STALE, last_ok_ts=NOW - STALE)
         _write(self.d, "gateway-status.dlocal.json", connected=False,
                error="boom", ts=NOW - STALE)
         d = self._detail()
@@ -190,15 +193,44 @@ class StalledLaneNamesItsCause(unittest.TestCase):
                error="relay 502", ts=NOW - STALE)
         self.assertIn("relay 502", self._detail())
 
-    def test_unreadable_lane_record_falls_back_to_the_silent_wording(self):
+    def test_unreadable_lane_record_is_reported_as_unknown_not_connected(self):
         (self.d / "gateway-status.broken.json").write_text("{not json")
         record = hc._gateway_lane_record
         with mock.patch.object(hc, "_gateway_stale_lanes", lambda: [("broken", STALE)]), \
              mock.patch.object(hc, "_gateway_lane_record",
                                lambda ln, state_dir=None: record(ln, state_dir=self.d)):
-            d = hc._gateway_ok_unless_lane_stalled("running + connected")["detail"]
-        self.assertIn("still says connected", d)
+            d = hc._gateway_ok_unless_lane_stalled("running + connected", now=NOW)["detail"]
+        self.assertNotIn("still says connected", d)
+        self.assertIn("no usable connectivity", d)
 
+
+    def test_a_record_with_no_connected_field_is_unknown_not_connected(self):
+        # The reviewers' P2: routing "no opinion" into the silent bucket asserted
+        # the record says something it does not say.
+        _write(self.d, "gateway-status.q.json", ts=NOW - STALE)
+        d = self._detail()
+        self.assertNotIn("still says connected", d)
+        self.assertIn("no usable connectivity", d)
+
+    def test_a_non_bool_connected_is_unknown_schema_drift(self):
+        _write(self.d, "gateway-status.q.json", connected="yes", ts=NOW - STALE)
+        d = self._detail()
+        self.assertNotIn("still says connected", d)
+        self.assertIn("no usable connectivity", d)
+
+    def test_connected_without_a_completed_poll_is_named_separately(self):
+        # gateway_serving.never_polled — connection claimed, no poll to point at.
+        _write(self.d, "gateway-status.np.json", connected=True, error=None,
+               ts=NOW - STALE)
+        d = self._detail()
+        self.assertIn("never completed a poll", d)
+        self.assertNotIn("still says connected", d)
+
+    def test_connectivity_is_interpreted_by_the_owner_not_here(self):
+        # Delegation pin: health-check must not re-derive the verdict inline.
+        src = (Path(__file__).resolve().parent.parent / "src" / "health-check.py").read_text()
+        fn = src.split("def _gateway_ok_unless_lane_stalled")[1].split("\ndef ")[0]
+        self.assertIn("_gateway_verdict_from_record(", fn)
 
 class LaneRecordAccessor(unittest.TestCase):
     def setUp(self):

@@ -68,6 +68,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
+    verdict_from_record as _gateway_verdict_from_record,
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
@@ -6748,8 +6749,9 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
 def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | None":
     """The lane sidecar's last parsed record, or None when absent/unreadable.
 
-    Separate from `_gateway_stale_lanes`, whose (lane, age) contract several
-    callers and tests depend on; this answers what the record SAID, not when.
+    Raw only: `gateway_serving` owns what a record MEANS, so connectivity is
+    never interpreted here. Separate from `_gateway_stale_lanes`, whose
+    (lane, age) contract several callers and tests depend on.
     """
     root = (Path(state_dir) if state_dir is not None
             else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
@@ -6760,7 +6762,7 @@ def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | 
     return rec if isinstance(rec, dict) else None
 
 
-def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> dict:
     """The ok verdict for the bridge, demoted to warn when any lane's sidecar
     has gone silent — the primary being healthy says nothing about a lane."""
     stalled = _gateway_stale_lanes()
@@ -6770,20 +6772,39 @@ def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
         return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
                 else f"{ln} (last write {age / 3600:.1f}h ago)")
 
-    # A lane that RECORDED a failure before stopping has a readable cause; saying
-    # "only the silence shows it" there sends the reader past the error message.
-    silent, failed = [], []
+    # Freshness is already decided, so ask the owner what the record MEANT.
+    # None is "no opinion" — never report that as the record saying connected.
+    import time as _time
+    _now = _time.time() if now is None else now
+    silent, failed, unknown, never = [], [], [], []
     for ln, age in stalled:
         rec = _gateway_lane_record(ln) or {}
         err = rec.get("error")
-        (failed if rec.get("connected") is False or err else silent).append(
-            (ln, age, err))
+        verdict = _gateway_verdict_from_record(rec, now=_now, max_age=float("inf"))
+        if verdict is None:
+            unknown.append((ln, age, err))
+        elif verdict.connected is False or err:
+            failed.append((ln, age, err))
+        elif verdict.never_polled:
+            never.append((ln, age, err))
+        else:
+            silent.append((ln, age, err))
     parts = []
     if silent:
         parts.append(
             f"lane {', '.join(_aged(ln, age) for ln, age, _ in silent)} stopped "
             "writing its sidecar — its last record still says connected, so only "
             "the silence shows it")
+    if never:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in never)} stopped "
+            "while claiming connection it never completed a poll on — its record "
+            "has no successful poll to point at")
+    if unknown:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in unknown)} stopped "
+            "writing its sidecar and its last record carries no usable "
+            "connectivity — read the file rather than trusting either state")
     for ln, age, err in failed:
         why = f": {str(err)[:120]}" if err else ""
         parts.append(f"lane {_aged(ln, age)} stopped after recording a "
