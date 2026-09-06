@@ -8368,8 +8368,12 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
     if not stale and not abandoned:
         status = "warn" if unreadable else "ok"
+        # Name the window, not an absolute absence: a body younger than the
+        # threshold is skipped above and is still undelivered.
         return {"name": name, "status": status,
-                "detail": f"no undelivered proactive bodies{partial}"}
+                "detail": f"no proactive body older than {threshold_age_sec // 60}m "
+                          f"and no claim older than {claim_threshold_age_sec // 60}m"
+                          f"{partial}"}
     parts = []
     if stale:
         stale.sort(key=lambda item: -item[1])
