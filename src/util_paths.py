@@ -526,6 +526,19 @@ def instance_scope_key(state_dir, instance=None, agent=None) -> str:
     return ikey.instance_key(who, inst)
 
 
+def actor_env_names():
+    """The actor half's env precedence, from the module that defines it.
+
+    A consumer reading ANOTHER process's identity must use the same order the
+    owner uses, and a second copy of the list is how the two answer differently.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return ()
+    rundir, _ikey = ident
+    return tuple(rundir.ACTOR_ENV_NAMES)
+
+
 def stated_default_identity(state_dir):
     """The (instance, agent) pair a process names when it sets NEITHER env var.
 

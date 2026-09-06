@@ -275,5 +275,63 @@ class TheRestampTargetComesFromTheWATCHERsIdentity(unittest.TestCase):
                 self.assertIn("Do NOT stop it", r["detail"])
 
 
+class ThePsFallbackProvesAbsenceNeverAValue(unittest.TestCase):
+    """`ps` concatenates argv and env with spaces, so a value containing one is
+    unrecoverable: `worker 7` reads back as `worker`.
+
+    That is not a fails-safe error — it names a DIFFERENT sentinel, and the pair
+    are genuinely distinct keys (`watcher-a+worker%207` vs `watcher-a+worker`),
+    so the repair would re-stamp another instance's file. The fallback can prove
+    the environment was printed and the name absent; it cannot prove a value.
+    """
+
+    class _R:
+        def __init__(self, out):
+            self.stdout, self.returncode, self.stderr = out, 0, ""
+
+    def _read(self, out):
+        saved = hc.subprocess.run
+        try:
+            hc.subprocess.run = lambda *a, **k: self._R(out)
+            return hc._pid_env_first("999", ("SUTANDO_INSTANCE_ID",))
+        finally:
+            hc.subprocess.run = saved
+
+    def test_a_whitespace_value_is_refused_not_truncated(self):
+        self.assertIsNone(self._read("sleep 8 FOO=1 SUTANDO_INSTANCE_ID=worker 7 BAR=2"))
+
+    def test_even_a_plain_value_is_refused_because_wholeness_is_unprovable(self):
+        self.assertIsNone(self._read("sleep 8 FOO=1 SUTANDO_INSTANCE_ID=worker-7 BAR=2"))
+
+    def test_the_control_a_printed_environment_can_still_prove_absence(self):
+        # Or the refusal could pass by answering None to everything.
+        self.assertEqual(self._read("sleep 8 FOO=1 BAR=2"), "")
+
+    def test_the_control_no_environment_at_all_is_still_unreadable(self):
+        self.assertIsNone(self._read("sleep 8"))
+
+    def test_the_two_identities_it_would_have_confused_are_distinct(self):
+        # The premise: if these collapsed, truncation would be harmless.
+        sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
+        ik = importlib.import_module("instance_key")
+        self.assertNotEqual(ik.instance_key("watcher-a", "worker 7"),
+                            ik.instance_key("watcher-a", "worker"))
+
+
+class TheActorPrecedenceComesFromItsOwner(unittest.TestCase):
+    """A consumer reading another process's identity must use the same order the
+    owner uses; a second copy of the list is how the two answer differently."""
+
+    def test_health_check_reads_the_owners_list(self):
+        sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
+        rundir = importlib.import_module("rundir")
+        self.assertEqual(tuple(hc.actor_env_names()), tuple(rundir.ACTOR_ENV_NAMES))
+
+    def test_no_local_copy_of_the_list_remains(self):
+        src = (ROOT / "src" / "health-check.py").read_text()
+        self.assertNotIn('"AGENT_MXID"', src,
+                         "the precedence is spelled here again, so it can drift")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

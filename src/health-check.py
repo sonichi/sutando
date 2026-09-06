@@ -55,7 +55,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
+from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -8232,9 +8232,8 @@ def _is_watcher_argv(argv: str) -> bool:
             and script.endswith("watch-tasks-stream.sh"))
 
 
-# The actor half, in `rundir.agent_id`'s precedence order. First NON-EMPTY wins
-# there, so an empty earlier name must fall through exactly as `or` does.
-_ACTOR_ENV_NAMES = ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID")
+# Read from the module that defines the precedence; a copy here is how this
+# reader and `rundir.agent_id` come to disagree about the same process.
 
 
 def _pid_env_first(pid: str, names):
@@ -8253,17 +8252,15 @@ def _pid_env_first(pid: str, names):
             return None
         if out.returncode != 0 or not out.stdout.strip():
             return None
-        # `ps -E` prints ARGV then the environment, so take the LAST match: a
-        # process whose own argv mentions the variable is otherwise misread.
+        # `ps` concatenates argv and env with spaces, so a value containing one is
+        # UNRECOVERABLE: `worker 7` reads back as `worker`, a different sentinel.
         toks = out.stdout.split()
-        for name in names:
-            hits = [k for k in toks if k.startswith(f"{name}=")]
-            if hits and hits[-1].split("=", 1)[1]:
-                return hits[-1].split("=", 1)[1]
-        # A miss means default ONLY if the environment was printed at all. Keying
-        # that on a SUTANDO_ prefix would be a correlated field, not the answer.
         printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
-        return "" if printed_env else None
+        if not printed_env:
+            return None
+        if any(k.startswith(f"{name}=") for name in names for k in toks):
+            return None                               # present but not recoverable
+        return ""                                     # printed, and states none
     seen = {}
     for raw in environ.split(b"\0"):
         for name in names:
@@ -8283,7 +8280,7 @@ def _pid_instance_id(pid: str):
 
 def _pid_actor_id(pid: str):
     """The actor half from THAT process's environment. See `_pid_env_first`."""
-    return _pid_env_first(pid, _ACTOR_ENV_NAMES)
+    return _pid_env_first(pid, actor_env_names())
 
 
 def _watcher_sentinel_target(state_dir, pid):
