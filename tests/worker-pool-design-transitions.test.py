@@ -58,7 +58,8 @@ class Disk:
 def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         durable_gate=True, flat_issuance=False, unconditional_gate=True,
         dir_is_allowance=False, walk_recovery=False, single_phase_parent=False,
-        nonatomic_teardown=False):
+        nonatomic_teardown=False, spent_first_recovery=False, spent_is_mutex=False,
+        consume_between_reads=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -70,11 +71,19 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         into a directory that does not exist. ENOENT, reproduced on scratch files.
     `nonatomic_teardown=True` -- retirement unlinks children and then removes the root, so a
         crash between them leaves the root standing with no name inside it.
+    `spent_first_recovery=True` -- recovery stats `spent` before `token`, the order the design
+        used to call interchangeable. Only meaningful with `consume_between_reads`.
+    `consume_between_reads=True` -- a worker consumes BETWEEN recovery's two stats, which is the
+        only schedule that distinguishes the two orders.
+    `spent_is_mutex=True` -- EEXIST on `spent` refuses, so a worker that crashed after creating it
+        can never finish. The pre-fix reading of exactly-once.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     crash_mkdir = [mode == "crash_mkdir"]
     crash_teardown = [nonatomic_teardown]
+    interleave = [consume_between_reads]
+    crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
     def walked():
@@ -89,13 +98,25 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         return d.token or d.journal is not None or d.claimed_rec is not None
 
     def issued():
-        """RECOVERY's question: has an allowance been minted? Two SINGLE-NAME tests.
+        """RECOVERY's question: has an allowance been minted? Two stats, `token` FIRST.
 
-        A recursive walk cannot answer it: the worker can promote held/<t> into claimed/<t> between
-        the sweep reading those two directories, so the scan sees no file while the allowance stands.
-        `spent` is created before the token leaves and removed only with the directory.
+        "Never both absent at one instant" is true and does NOT save two SEQUENTIAL reads: under
+        `spent`-then-`token` a worker running between them makes each read correct and the pair
+        wrong. Token-first cannot: an absent token means the rename already happened, which means
+        `spent` was created before it and stands until retirement.
         """
-        return d.token or d.spent
+        def stat(name):
+            return d.token if name == "token" else d.spent
+        order = ("spent", "token") if spent_first_recovery else ("token", "spent")
+        seen = {order[0]: stat(order[0])}
+        if interleave[0] and d.token:                     # a worker consumes between the stats
+            interleave[0] = False
+            d.spent = True
+            d.phase_dirs.add("held")
+            if not single_phase_parent: d.phase_dirs.add("claimed")
+            d.token = False; d.journal, d.journal_at = "t-race", now[0]
+        seen[order[1]] = stat(order[1])
+        return seen["token"] or seen["spent"]
 
     def gated():
         """The WORKER's question: does the directory exist? Not the same question as issued().
@@ -176,16 +197,29 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if claimed and pending - claimed == 0:
             d.record["w"] = "eligible"
 
-    def gate_step1(task):
-        # `spent` first (O_EXCL), THEN the rename: a crash anywhere after it leaves a name
-        # recovery refuses to mint over, and it is the name that never moves between phases.
-        if not d.token: return False
-        d.spent = True
-        # `mkdir -p held/ claimed/`: (3) renames into claimed/, so its parent must exist
-        # before (1), not at promotion time -- a parent cannot be made after the crash.
+    def gate_step1a():
+        """create(spent, O_EXCL). EEXIST says consumption BEGAN -- possibly by this very
+        worker before a crash -- so it is a state to reconcile, never a refusal."""
+        if d.spent: return "EEXIST"
+        d.spent = True; return "created"
+
+    def gate_step1b(task):
+        """mkdir -p held/ claimed/, then rename(token, held/<task>).
+
+        The RENAME is the exactly-once point: one caller renames a given source and the rest
+        get ENOENT. `spent` is the durable witness that consumption began, not the mutex.
+        """
+        if not d.token: return False                  # ENOENT: another consumer already won
         d.phase_dirs.add("held")
         if not single_phase_parent: d.phase_dirs.add("claimed")
         d.token = False; d.journal, d.journal_at = task, now[0]; return True
+
+    def gate_step1(task):
+        if gate_step1a() == "EEXIST" and spent_is_mutex:
+            return False                              # pre-fix: the retry can never finish
+        if crash_after_spent[0]:                      # crash between the two durable writes
+            crash_after_spent[0] = False; return False
+        return gate_step1b(task)
 
     def gate_step2a():
         """(2) acquire_task_claim -- commits and RETURNS. Its own durable write."""
@@ -723,6 +757,66 @@ class RetirementIsOneRenameNotAChildwiseRemoval(unittest.TestCase):
         verdict, _c, _p, d = run(["kick", "sweep", "worker", "wait", "sweep"])
         self.assertEqual(verdict, "wedged")
         self.assertFalse(d.token or d.spent or d.admit_dir)
+
+
+class RecoverysTwoStatsAreOrderedNotInterchangeable(unittest.TestCase):
+    """"Never both absent at one instant" is true, and does not save two SEQUENTIAL reads.
+
+    Each stat is atomic on its own; the CONJUNCTION is what recovery acts on, and it was never
+    observed at any single instant. Under `spent`-then-`token` a worker consuming between the two
+    reads makes both come back absent while an admission stands, so recovery mints beside it.
+    """
+
+    ORDER = ["kick", "sweep", "sweep"]
+
+    def test_spent_first_mints_beside_a_live_admission(self):
+        # The defect itself, so this class is not asserting the fix agrees with itself.
+        _v, _c, _p, d = run(self.ORDER, consume_between_reads=True, spent_first_recovery=True)
+        self.assertTrue(d.token, "a second allowance was minted")
+        self.assertEqual(d.journal, "t-race", "...beside a consumption that had already happened")
+        self.assertTrue(d.spent, "and neither name was actually absent")
+
+    def test_token_first_sees_the_admission(self):
+        _v, _c, _p, d = run(self.ORDER, consume_between_reads=True)
+        self.assertFalse(d.token, "no second allowance")
+        self.assertEqual(d.journal, "t-race")
+
+    def test_the_order_only_matters_across_the_seam(self):
+        # Without an interleaved consumer both orders agree, which is why an
+        # instant-wise argument reads as sufficient until you schedule against it.
+        for spent_first in (False, True):
+            with self.subTest(spent_first=spent_first):
+                _v, _c, _p, d = run(self.ORDER, spent_first_recovery=spent_first)
+                self.assertTrue(d.token, "the unconsumed token is seen either way")
+
+
+class ConsumptionIsTwoWritesAndSpentIsAWitnessNotAMutex(unittest.TestCase):
+    """`create(spent, O_EXCL)` and the rename are separate durable writes.
+
+    A crash between them leaves `spent + token` and no journal. If EEXIST on `spent` refuses, every
+    retry dies at the first step and the allowance is stranded until the window expires. Exactly-once
+    belongs to the RENAME -- one caller renames a given source -- so EEXIST is a state to reconcile.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "worker"]
+
+    def test_spent_as_mutex_strands_the_allowance(self):
+        # The defect itself: the retry gets EEXIST at step one and can never finish.
+        _v, claimed, _p, d = run(self.ORDER, "crash_after_spent", spent_is_mutex=True)
+        self.assertEqual(claimed, 0, "nothing was ever admitted")
+        self.assertTrue(d.spent and d.token, "the exact intermediate state, still on disk")
+        self.assertIsNone(d.journal, "and no journal to reconcile from")
+
+    def test_the_witness_reading_lets_the_retry_finish(self):
+        _v, claimed, _p, d = run(self.ORDER, "crash_after_spent")
+        self.assertEqual(claimed, 1)
+        self.assertFalse(d.token, "the token was consumed by the retry")
+        self.assertTrue(d.spent, "the witness stands until retirement")
+
+    def test_the_rename_is_what_makes_it_exactly_once(self):
+        # Two workers past the spent step: the second finds no token and loses.
+        _v, claimed, _p, _d = run(["kick", "sweep", "worker", "restart", "worker"])
+        self.assertEqual(claimed, 1, "a second consumer must not admit a second task")
 
 
 if __name__ == "__main__":

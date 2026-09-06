@@ -1437,18 +1437,44 @@ itself to a room whose worker might still come back.
    | `spent` exists | minted and consumed, in whichever phase | mint nothing; continue at (b) |
    | neither | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
 
-   Each row is one `stat`, so each is atomic on its own, and the two together are order-independent:
-   `spent` is created BEFORE the token leaves and is not removed until probation ends, so there is no
-   instant at which both are absent while an allowance exists.
+   Each row is one `stat`, so each is atomic on its own — and **the two together are NOT
+   order-independent, which an earlier draft of this section claimed.** `spent` is created BEFORE the
+   token leaves and is not removed until probation ends, so there is no instant at which both are
+   absent while an allowance exists. That invariant is true and it is not sufficient: recovery acts on
+   the CONJUNCTION of two sequential reads, and a conjunction that holds at no single instant is
+   exactly what an interleaved worker produces.
 
-   **The worker's first act is therefore `spent`, not the rename.** Consumption is
-   `create(<instance>.admit/spent, O_EXCL)` — which is also what makes "exactly one caller wins" hold
-   at the FIRST step rather than at the rename — then `mkdir -p held/ claimed/`, then
+   **So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.** The schedule that separates
+   the orders is a worker consuming between the two reads:
+
+   ```
+   read order          worker before   between   after
+   spent then token    ok              MINTS!    ok
+   token then spent    ok              ok        ok
+   ```
+
+   Token-first cannot produce the miss. An absent `token` means the rename has already happened,
+   which means `create(spent, O_EXCL)` preceded it, and `spent` stands until retirement — so the
+   second read sees it. The unsafe order fails only across the seam, which is why an argument from
+   the instant-wise invariant reads as sufficient until you schedule against it.
+
+   **The worker's first act is therefore `spent`, not the rename — but `spent` is a WITNESS, not
+   the mutex.** Consumption is `create(<instance>.admit/spent, O_EXCL)`, then `mkdir -p held/ claimed/`, then
    `rename(token, held/<task_id>)`. **Both phase parents are made here, before the token leaves.**
    The promotion in (3) is a rename into `claimed/`, and a rename needs its parent: creating that
    directory at promotion time would put it after the crash seam it has to survive, and on scratch
    files the missing parent is a plain `ENOENT` that strands the claim in `held/` with no promotion
-   record for the sweep to read. A crash anywhere in that sequence leaves `spent` standing, which
+   record for the sweep to read.
+
+   **`create(spent)` and the rename are separate durable writes, so a crash between them leaves
+   `spent` and `token` both standing with no journal, and every retry meets `EEXIST` at the first
+   step.** Treating that `EEXIST` as a refusal strands the allowance until the window expires, so it
+   is not one: it says consumption BEGAN — possibly by this same worker before the crash — and the
+   retry proceeds to the rename. **Exactly-once is the RENAME**, which one caller wins while the rest
+   get `ENOENT`; `spent` records that consumption started, for recovery's benefit, and decides nothing
+   about who wins.
+
+   A crash anywhere in that sequence leaves `spent` standing, which
    is exactly the state recovery must not mint over. A crash before it leaves `token`, which recovery
    also refuses to mint over. An allowance directory holding NEITHER name has one cause: issuance
    stopped after `mkdir`, and `O_EXCL` on `token` finishes it exactly once however many sweeps race.
