@@ -28,16 +28,17 @@ def parking_files():
     return [p for p in (personal_path("pending-questions.md"),
                         personal_path("current-track.md")) if p.exists()]
 
-# entities worth searching for: paths, dotted filenames, backticked identifiers
+# entities worth searching for: paths, dotted filenames, backticked identifiers,
+# and PR/issue numbers -- the commonest subject in the parking files by far
 # Component count is unbounded; the 3..40 length check below is the only size
 # bound. A cap truncates a hyphenated name and drops a snake_case one entirely.
-ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+)+)\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b')
+ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+)+)\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b|(?<!\w)(#\d{3,5})\b')
 STOP = {"health-check", "not-running", "restart-needed", "session-read", "read-limit"}
 
 def tokens(name, text):
     out = [name] if name else []
     for m in ENT.finditer(text):
-        t = (m.group(1) or m.group(2) or m.group(3) or m.group(4) or "").strip()
+        t = (m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(5) or "").strip()
         if 3 <= len(t) <= 40 and t.lower() not in STOP and t != name:
             out.append(t)
     seen, uniq = set(), []

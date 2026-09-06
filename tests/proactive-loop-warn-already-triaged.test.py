@@ -101,6 +101,35 @@ class SnakeCaseIdentifiers(unittest.TestCase):
             wat.tokens("", "The owner asked me to review the pull request and merge it"), [])
 
 
+class PullRequestNumbers(unittest.TestCase):
+    """A claim whose subject is a PR or issue number used to yield ZERO tokens,
+    so the gate refused (exit 2) on the commonest subject in the parking files.
+    """
+
+    def test_a_pr_number_is_extracted(self):
+        self.assertIn("#1893", wat.tokens("", "PR #1893 is open, conflicted and stale"))
+
+    def test_it_finds_material_parked_under_the_number(self):
+        f = _files("# notes\n## #1893 the Agent-SDK core — owner's call\nbody\n")
+        verdict, out = _report("", "PR #1893 is open, conflicted and stale", f)
+        self.assertEqual(verdict, "parked")
+
+    def test_a_number_written_nowhere_still_reports_none_found(self):
+        # Negative control: without it the arm above passes on a checker that
+        # never says untriaged.
+        f = _files("# notes\n## #4242 something else\n")
+        verdict, out = _report("", "PR #1893 is open, conflicted and stale", f)
+        self.assertEqual(verdict, "untriaged")
+
+    def test_short_and_long_runs_are_not_numbers(self):
+        # Bounded like the sibling recall-check.py (#\d{3,5}) so a price or a
+        # long digit run is not searched as a PR.
+        self.assertEqual(wat.tokens("", "it costs #12 and ref #123456"), [])
+
+    def test_a_bare_number_without_the_hash_is_not_a_token(self):
+        self.assertEqual(wat.tokens("", "a bare number 1893 with no hash"), [])
+
+
 class ClaimFindsParkedMaterial(unittest.TestCase):
     def test_a_heading_hit_reports_candidates_and_is_not_untriaged(self):
         f = _files("# notes\n## the `widget-cache.py` decision\nbody\n")
