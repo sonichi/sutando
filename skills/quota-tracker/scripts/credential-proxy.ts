@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
+import * as zlib from 'node:zlib';
 import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
@@ -38,6 +39,38 @@ const QUOTA_FILE = statusPath('quota-state.json');
 // persisted in quota-state.json so health-check can page on a transient one.
 export const MAX_RECENT_REJECTIONS = 20;
 const REJECTION_SNIPPET_BYTES = 2048;
+
+type Zlib = Partial<Record<string, unknown>>;
+
+/** Built from the zlib namespace so an export missing on the supported Node floor is
+ *  simply absent from the map. zstd landed in 22.15.0; package.json allows 22.5.0. */
+export function buildDecoders(z: Zlib): Record<string, (b: Buffer) => Buffer> {
+	const out: Record<string, (b: Buffer) => Buffer> = {};
+	const add = (name: string, fn: unknown) => {
+		if (typeof fn === 'function') out[name] = fn as (b: Buffer) => Buffer;
+	};
+	add('gzip', z.gunzipSync); add('x-gzip', z.gunzipSync); add('deflate', z.inflateSync);
+	add('br', z.brotliDecompressSync); add('zstd', z.zstdDecompressSync);
+	return out;
+}
+
+const DECODERS = buildDecoders(zlib as Zlib);
+
+/** Decode a rejection body for reading. Upstream compresses whatever the client's
+ *  accept-encoding asked for, so the raw bytes are not text; a failure must say so
+ *  rather than emit mojibake that looks like a corrupt message from the API. */
+export function decodeRejectionBody(buf: Buffer, encoding?: string): string {
+	const enc = (encoding ?? '').trim().toLowerCase();
+	if (!enc || enc === 'identity') return buf.toString('utf8');
+	const decode = DECODERS[enc];
+	if (!decode) return `<undecodable body: ${buf.length} bytes, content-encoding: ${enc}>`;
+	try {
+		return decode(buf).toString('utf8');
+	} catch {
+		// Truncated at the snippet cap, or simply not what the header claimed.
+		return `<undecodable ${enc} body: ${buf.length} bytes>`;
+	}
+}
 
 // OAuth self-refresh. A namespaced CLAUDE_CONFIG_DIR uses a namespaced keychain
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
@@ -316,6 +349,8 @@ export interface RejectionRecord {
 	model?: string;
 	user_agent?: string;
 	peer_port?: number;
+	// What the body arrived compressed as, so an undecodable snippet says why.
+	content_encoding?: string;
 }
 
 /** The `model` field of a JSON request body, or "" when absent or unparsable. */
@@ -578,12 +613,15 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 								if (seen < REJECTION_SNIPPET_BYTES) { rejChunks.push(c); seen += c.length; }
 							});
 							upRes.on('end', () => {
-								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
+								const contentEncoding = String(upRes.headers['content-encoding'] ?? '');
+								// Redaction runs on the DECODED text: it cannot scrub a secret it cannot read.
+								const snippet = redactForLog(decodeRejectionBody(Buffer.concat(rejChunks), contentEncoding)).slice(0, REJECTION_SNIPPET_BYTES);
 								const model = requestModel(body);
 								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
+						content_encoding: contentEncoding || undefined,
 										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
 									});
 								} catch { /* best effort */ }
