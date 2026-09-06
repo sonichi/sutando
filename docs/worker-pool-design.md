@@ -160,7 +160,25 @@ reason was wrong and contradicted this document in three other places
 reader arrives with the step-3 publisher. The conclusion survives its retracted
 premise — self-describing staleness is right because a consumer should not need
 the producer's config, not because of a staging gap that does not exist. `instances` maps an instance name to the enum
-`eligible` | `wedged`, and nothing else.
+`eligible` | `wedged`, and nothing else. **Probation is not a third value of that enum.** A
+probationed instance is published as `wedged` in `instances` — so a reader that implements only
+this matrix fails closed — and its probation state rides a sibling key, `probation`, which the
+last row of the matrix already makes every v1 reader ignore:
+
+```json
+{"eligibility": {
+   "version": 1, "computed_at": 1788546000, "stale_after_s": 180,
+   "instances": {"worker-2": "wedged"},
+   "probation": {"worker-2": {"since": 1788546000,
+                               "admitted": {"task_id": "task-1788546100", "at": 1788546100}}}}}
+```
+
+A reader that implements probation (revision 1.1 of this reader; `version` stays 1 because the
+record is backward compatible by construction) reads `probation[name]` only when
+`instances[name]` is `wedged`; `since` must be an integer not in the future and `admitted`, when
+present, must carry a task id and an integer `at`, else the sub-record is ignored and the instance
+is plain `wedged`. Under no shape does any reader admit a probationed instance through the
+ordinary eligible path: the worst misread is one more suppressed worker, never one more admitted.
 
 Validation is a matrix, and **every failing cell means ABSENT for that instance**,
 which by the default above means eligible-if-its-beat-is-fresh:
@@ -1373,36 +1391,44 @@ itself to a room whose worker might still come back.
 
    **The reset is a DURABLE PROBATION STATE, not a deletion, so it survives an intervening
    sweep — and the consumable token lives in a SEPARATELY OWNED artifact, so the record stays
-   core-only.** On its next pass the core sweep consumes the request and does two things: it
-   publishes `{"verdict": "probation", "since": <sweep_ts>}` for that instance in `pool-status.json`
-   (a read-only fact — no counter, nothing a worker would ever need to change), and it creates
-   the token file `state/pool-probation/<instance>.admit` (`os.replace`-atomic, one byte). The
-   sweep is the sole writer of the record AND the sole creator of tokens; a worker never writes
-   either. A sweep that runs BEFORE the worker's reconciliation does not republish `wedged` — the
-   verdict is held while `probation` stands. Probation ends by exactly one of: the worker completes
-   an admitted task (verdict → `eligible`, computed afresh), or `stand_in_after_s` elapses with the
-   admitted task claimed-and-unfinished (verdict → `wedged`, the token — if still present — is
-   removed by the sweep, and the request is NOT re-armed; a second kick needs a second command).
+   core-only.** On its next pass the core sweep consumes the request in an order that leaves no
+   absorbing state behind a crash: (a) it creates the token file `state/pool-probation/<instance>.admit`
+   if absent (`O_EXCL`, one byte — idempotent, so a re-run after a crash is a no-op); (b) it publishes
+   `instances[<instance>] = "wedged"` plus `probation[<instance>] = {"since": <sweep_ts>}` in
+   `pool-status.json` (one `os.replace`); (c) only then it removes the request. A crash after (a)
+   leaves the request standing, so the next sweep re-runs (a)–(c) and (a) finds its token already
+   there; a crash after (b) leaves a request that (c) simply removes. The sweep is the sole writer of
+   the record AND the sole creator of tokens; a worker never writes either. A sweep that runs BEFORE
+   the worker's reconciliation does not republish anything — the verdict is held while `probation`
+   stands.
 
    **Token consumption and task custody are ONE recoverable transaction, and the renamed token
-   is its journal.** The target's self-gate reads `probation` as a two-step sequence whose second
-   step is retried from the first's durable residue: (1) `rename(<instance>.admit,
-   <instance>.admit.<task_id>)` — exactly one caller wins, two concurrent candidates or
-   reconciliation racing the event path cannot both succeed, and neither touches
-   `pool-status.json`; (2) `acquire_task_claim(task_id)` — the hard-link claim the pool already
-   uses. The renamed token is not a spent counter; it is a durable record that *task_id was
-   admitted under probation*, and it stays on disk until the claim it names is held.
+   is a durable admission record that outlives the claim.** The target's self-gate reads
+   `probation` as a two-step sequence whose second step is retried from the first's durable
+   residue: (1) `rename(<instance>.admit, <instance>.admit.<task_id>)` — exactly one caller wins,
+   and neither touches `pool-status.json`; (2) `acquire_task_claim(task_id)` — the hard-link claim
+   the pool already uses. When (2) succeeds the journal is renamed once more, to
+   `<instance>.admit.<task_id>.claimed`, and it stays on disk until the sweep ends probation: the
+   sweep needs exactly that file to know *which* claim was the probation admission and *when* it
+   was made (its mtime), which an ordinary claim link does not say.
 
    **The crash seam between (1) and (2) is closed by reconciliation, in both directions.** A
    worker that restarts under `probation` and finds `<instance>.admit.<task_id>` with no claim held
-   does NOT suppress: it retries step (2) for that task_id. If the claim succeeds, the admission
-   completes. If `acquire_task_claim` fails because another instance now holds the task (claim
-   collision, or the task was cancelled), the worker renames the journal back to
-   `<instance>.admit` — the one attempt is returned, not lost — and re-enters the gate. A
-   restarted worker under `probation` with NO token and NO journal suppresses, because that state
-   means the sweep has not issued a token, not that one was consumed. The sweep's termination
-   rules read the journal the same way: `stand_in_after_s` is measured from the journal's mtime,
-   so a crash cannot leave a probation that no rule can end.
+   does NOT suppress: it retries step (2) for that task_id. If `acquire_task_claim` fails because
+   another instance now holds the task (claim collision, or the task was cancelled), the worker
+   renames the journal back to `<instance>.admit` — the one attempt is returned, not lost — and
+   re-enters the gate. A restarted worker under `probation` with NO token and NO journal
+   suppresses, because that state means the sweep has not issued a token, not that one was
+   consumed — and the sweep's own reconciliation ((a) above) re-creates a token the crash lost.
+
+   **Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep
+   ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
+   computed afresh; journal and `.claimed` record removed); or the window `stand_in_after_s` has
+   elapsed — measured from `probation.since` while the token is unconsumed (a worker that never
+   reaches its gate), from the journal's mtime while it is unclaimed, and from the `.claimed`
+   record's mtime while the claim is held and unfinished — in which case the verdict → `wedged`,
+   the token or journal is removed by the sweep, and the request is NOT re-armed; a second kick
+   needs a second command. `probation` is never the last word.
 
    This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the
    unbounded event path both route through this gate, there is one token, and every path out of
@@ -1417,6 +1443,9 @@ itself to a room whose worker might still come back.
    kick -> worker -> sweep     worker admits 1, not 4; sweep sees probation, holds  (was: eligible, 4, 1)
    kick -> multi-task backlog  one token consumed; 4 stay pending
    event arrives in probation  event path hits the same gate; admit already 0 -> pending
+   crash after publish, before token   next sweep re-issues the token; worker admits 1
+   worker never reaches its gate      window from `since` elapses -> wedged, token removed
+   claimed, unfinished past window    window from the .claimed record elapses -> wedged
    ```
 
    **This admits exactly one task's worth of risk, deliberately.** A worker still hung
@@ -1450,10 +1479,9 @@ process whose absence stops work, which is already true of every install today.
 Each claimant orders its own candidates: `urgent > normal > low`
 (`src/task_priority.py`'s contract), and within a priority oldest first by
 mtime, then claims the top. That contract holds only for task-last writers:
-the gateway's `_TASK_FIELDS` places `task` before `priority`
-(`remote_gateway_bridge.py:1592-1604`), so the safe parser reads gateway
-priorities as absent and a gateway `urgent` sorts as `normal`. Converging the
-gateway writer on task-last is a prerequisite of step 2, its own PR. Because candidate sets are fixed by the pin table,
+the gateway writer already orders `_TASK_FIELDS` as `requested_worker, priority,
+task` (landed on main at `93fc7e15`), so the safe parser reads gateway priorities
+and nothing about priority remains as a prerequisite of step 2. Because candidate sets are fixed by the pin table,
 priority needs no global view: the "first rename wins regardless of priority"
 defect of the 2026-05 leaderless design came from every core competing for
 every task, and pins remove the competition.
@@ -1565,10 +1593,10 @@ production-path tests; the staged list below marks which those are.
    readers would leave a last-wins parser reading `access_tier` off a task-last
    file, resting the trust boundary on an unstated invariant (the body flatten
    still stands behind it, so this is a sequencing rule, not a live hole). The
-   sort defect alone can be fixed first and separately by moving `priority`
-   ahead of `task` in `_TASK_FIELDS`, exactly as #3872 did for
-   `requested_worker`; that decouples the user-visible half from convergence.
-   Its own PR against an existing file, and one of TWO left. The other is the
+   sort defect is already fixed on main: `93fc7e15` moved `priority` ahead of
+   `task` in `_TASK_FIELDS`, exactly as #3872 did for `requested_worker`, which
+   decoupled the user-visible half from convergence. That leaves ONE
+   prerequisite, the
    **membership prerequisite**, which must land BEFORE the reconciliation ticker:
    `instance_registry.py` gains `role: "worker"` and `pool: <name>` on the manifest
    writer and a deregistration path (today it has neither — zero occurrences of
