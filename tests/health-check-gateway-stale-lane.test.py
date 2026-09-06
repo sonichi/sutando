@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -132,6 +133,91 @@ class ShippedPathReadsTheRealSidecar(unittest.TestCase):
             r = hc.check_gateway_bridge()
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("lane local", r["detail"])
+
+
+
+class StalledLaneNamesItsCause(unittest.TestCase):
+    """A stalled lane whose record says `connected: false` has a READABLE cause.
+    The old message hardcoded "its last record still says connected", which is the
+    docstring's own "almost always" promoted to always — it told the reader to look
+    for silence while an error sat in the file."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def _detail(self):
+        # Bind the ORIGINALS first: inside the patch, hc.<name> IS the lambda.
+        stale, record = hc._gateway_stale_lanes, hc._gateway_lane_record
+        with mock.patch.object(hc, "_gateway_stale_lanes",
+                               lambda: stale(state_dir=self.d, now=NOW)), \
+             mock.patch.object(hc, "_gateway_lane_record",
+                               lambda ln, state_dir=None: record(ln, state_dir=self.d)):
+            return hc._gateway_ok_unless_lane_stalled("running + connected")["detail"]
+
+    def test_a_failed_lane_does_not_claim_the_record_says_connected(self):
+        _write(self.d, "gateway-status.dlocal.json", connected=False,
+               error="network: SSL CERTIFICATE_VERIFY_FAILED", ts=NOW - STALE)
+        d = self._detail()
+        self.assertNotIn("still says connected", d)
+        self.assertIn("stopped after recording a failure", d)
+
+    def test_the_recorded_error_is_surfaced_verbatim(self):
+        _write(self.d, "gateway-status.dlocal.json", connected=False,
+               error="network: SSL CERTIFICATE_VERIFY_FAILED", ts=NOW - STALE)
+        self.assertIn("SSL CERTIFICATE_VERIFY_FAILED", self._detail())
+
+    def test_a_silent_lane_keeps_the_original_wording(self):
+        # Green-on-purpose: the common case must not change.
+        _write(self.d, "gateway-status.local.json", connected=True, error=None,
+               ts=NOW - STALE)
+        d = self._detail()
+        self.assertIn("still says connected", d)
+        self.assertNotIn("recording a failure", d)
+
+    def test_both_kinds_in_one_verdict_are_reported_separately(self):
+        _write(self.d, "gateway-status.local.json", connected=True, error=None, ts=NOW - STALE)
+        _write(self.d, "gateway-status.dlocal.json", connected=False,
+               error="boom", ts=NOW - STALE)
+        d = self._detail()
+        self.assertIn("still says connected", d)
+        self.assertIn("stopped after recording a failure", d)
+        self.assertIn("local", d)
+        self.assertIn("dlocal", d)
+
+    def test_an_error_with_connected_true_still_counts_as_a_failure(self):
+        # connected can lag; a recorded error is the discriminator that matters.
+        _write(self.d, "gateway-status.dlocal.json", connected=True,
+               error="relay 502", ts=NOW - STALE)
+        self.assertIn("relay 502", self._detail())
+
+    def test_unreadable_lane_record_falls_back_to_the_silent_wording(self):
+        (self.d / "gateway-status.broken.json").write_text("{not json")
+        record = hc._gateway_lane_record
+        with mock.patch.object(hc, "_gateway_stale_lanes", lambda: [("broken", STALE)]), \
+             mock.patch.object(hc, "_gateway_lane_record",
+                               lambda ln, state_dir=None: record(ln, state_dir=self.d)):
+            d = hc._gateway_ok_unless_lane_stalled("running + connected")["detail"]
+        self.assertIn("still says connected", d)
+
+
+class LaneRecordAccessor(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def test_reads_the_named_lane(self):
+        _write(self.d, "gateway-status.dlocal.json", connected=False, error="e", ts=NOW)
+        self.assertEqual(hc._gateway_lane_record("dlocal", state_dir=self.d).get("error"), "e")
+
+    def test_absent_is_none_not_an_exception(self):
+        self.assertIsNone(hc._gateway_lane_record("nope", state_dir=self.d))
+
+    def test_malformed_is_none(self):
+        (self.d / "gateway-status.bad.json").write_text("{{{")
+        self.assertIsNone(hc._gateway_lane_record("bad", state_dir=self.d))
+
+    def test_a_non_dict_payload_is_none(self):
+        (self.d / "gateway-status.arr.json").write_text("[1,2]")
+        self.assertIsNone(hc._gateway_lane_record("arr", state_dir=self.d))
 
 
 if __name__ == "__main__":

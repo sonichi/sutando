@@ -6745,23 +6745,55 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
     return out
 
 
+def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | None":
+    """The lane sidecar's last parsed record, or None when absent/unreadable.
+
+    Separate from `_gateway_stale_lanes`, whose (lane, age) contract several
+    callers and tests depend on; this answers what the record SAID, not when.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    try:
+        rec = json.loads((root / f"gateway-status.{lane}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
     """The ok verdict for the bridge, demoted to warn when any lane's sidecar
     has gone silent — the primary being healthy says nothing about a lane."""
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
-    names = ", ".join(
-        f"{ln} (last write {age:.0f}s ago)" if age < 3600
-        else f"{ln} (last write {age / 3600:.1f}h ago)"
-        for ln, age in stalled)
+    def _aged(ln, age):
+        return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
+                else f"{ln} (last write {age / 3600:.1f}h ago)")
+
+    # A lane that RECORDED a failure before stopping has a readable cause; saying
+    # "only the silence shows it" there sends the reader past the error message.
+    silent, failed = [], []
+    for ln, age in stalled:
+        rec = _gateway_lane_record(ln) or {}
+        err = rec.get("error")
+        (failed if rec.get("connected") is False or err else silent).append(
+            (ln, age, err))
+    parts = []
+    if silent:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in silent)} stopped "
+            "writing its sidecar — its last record still says connected, so only "
+            "the silence shows it")
+    for ln, age, err in failed:
+        why = f": {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped after recording a "
+                     f"failure{why} — read that, not the silence")
     return {
         "name": "gateway-bridge",
         "status": "warn",
         "detail": (
-            f"{detail}, but lane {names} stopped writing its sidecar — its last "
-            "record still says connected, so only the silence shows it; messages "
-            "on that lane are not being delivered (retired lane? remove "
+            f"{detail}, but " + "; ".join(parts) + "; messages on that lane are "
+            "not being delivered (retired lane? remove "
             "state/gateway-status.<lane>.json)"
         ),
     }
