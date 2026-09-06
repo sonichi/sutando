@@ -1425,22 +1425,29 @@ itself to a room whose worker might still come back.
    clocks, so the verdict can never end. That is the same defect the flat form had, one layer down:
    an existence test standing in for a state test.
 
-   **So recovery asks whether the directory holds a FILE, not whether it exists.** On `EEXIST` the
-   sweep walks `<instance>.admit/` for any regular file:
+   **So recovery asks TWO single-name questions, never a walk.** A recursive scan of
+   `<instance>.admit/` is not an atomic observation of the phase family: the worker can promote
+   `held/<task_id>` into `claimed/<task_id>` between the sweep reading those two directories, and the
+   scan then finds no file although the allowance was present the whole time. An atomic `rename` does
+   not make a multi-directory read atomic. So the allowance carries a marker whose NAME never moves:
 
-   | what recovery finds | meaning | act |
+   | name tested | meaning | act |
    |---|---|---|
-   | no regular file anywhere under it | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
-   | `token` | minted, unconsumed | mint nothing; continue at (b) |
-   | `held/<task_id>` or `claimed/<task_id>` | minted and spent | mint nothing; continue at (b) |
+   | `token` exists | minted, unconsumed | mint nothing; continue at (b) |
+   | `spent` exists | minted and consumed, in whichever phase | mint nothing; continue at (b) |
+   | neither | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
 
-   **Empty SUBDIRECTORIES are not a phase, and that is what makes this decidable.** A rename needs
-   its target's parent, so the worker does `mkdir -p <instance>.admit/held/` before
-   `rename(token, held/<task_id>)`. A crash between those leaves `token` still present beside an
-   empty `held/` — recovery sees the file, mints nothing, and the worker simply retries. The rename
-   itself is atomic, so at no instant are both names absent. An allowance directory containing no
-   file therefore has exactly one cause: issuance stopped after `mkdir`. Creating `token` there with
-   `O_EXCL` finishes it exactly once, and two sweeps racing that recovery cannot both win.
+   Each row is one `stat`, so each is atomic on its own, and the two together are order-independent:
+   `spent` is created BEFORE the token leaves and is not removed until probation ends, so there is no
+   instant at which both are absent while an allowance exists.
+
+   **The worker's first act is therefore `spent`, not the rename.** Consumption is
+   `create(<instance>.admit/spent, O_EXCL)` — which is also what makes "exactly one caller wins" hold
+   at the FIRST step rather than at the rename — then `mkdir -p held/`, then
+   `rename(token, held/<task_id>)`. A crash anywhere in that sequence leaves `spent` standing, which
+   is exactly the state recovery must not mint over. A crash before it leaves `token`, which recovery
+   also refuses to mint over. An allowance directory holding NEITHER name has one cause: issuance
+   stopped after `mkdir`, and `O_EXCL` on `token` finishes it exactly once however many sweeps race.
 
    Under the flat form the worker's first rename consumed the very name `O_EXCL` was guarding, so a
    sweep restarting into a crashed issuance found it absent and minted a SECOND allowance beside a
@@ -1459,9 +1466,13 @@ itself to a room whose worker might still come back.
    reconciliation, unbounded through events. That contradicts the guarantee two paragraphs up.
 
    So a target tests `state/pool-probation/<instance>.admit/` for its own name BEFORE EVERY read of
-   the record — unconditionally, not only once the snapshot has expired. The directory existing
-   puts it under probation whatever the record says, ABSENT and `eligible` included; which phase it
-   holds inside is reconciliation's question, never the gate's. Making that test conditional on
+   the record — unconditionally, not only once the snapshot has expired. **The gate asks whether the
+   DIRECTORY exists; recovery asks which NAME is inside it. Those are different questions and a model
+   that answers both with one predicate fails the gate:** an allowance whose issuance crashed holds no
+   file, so a file-shaped gate reads ABSENT and, once the snapshot expires, releases the worker to the
+   ordinary path over a standing directory. The directory existing puts it under probation whatever
+   the record says, ABSENT and `eligible` included; which phase it holds inside is reconciliation's
+   question, never the gate's. Making that test conditional on
    staleness reintroduces the same hole one layer down: a FRESH snapshot that has not yet been
    published, or one republished as `eligible` while an artifact still stands, released the worker
    to the ordinary path with the allowance on disk. Directories do not expire, and the sweep is

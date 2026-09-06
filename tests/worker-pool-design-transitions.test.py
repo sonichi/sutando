@@ -43,6 +43,9 @@ class Disk:
         # request: kick-pool. results: the worker finishing an admitted task.
         self.record, self.probation, self.request = {}, {}, False
         self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
+        self.spent = False            # created BEFORE the token leaves; never moves
+
+        self.torn = False             # a promotion lands between two directory reads
         self.token, self.journal, self.claimed_rec = False, None, None   # token / held/<t> / claimed/<t>
         self.token_at, self.journal_at, self.claimed_at = None, None, None
         self.computed_at = None      # when the sweep last published; the snapshot's own clock
@@ -52,7 +55,7 @@ class Disk:
 
 def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         durable_gate=True, flat_issuance=False, unconditional_gate=True,
-        dir_is_allowance=False):
+        dir_is_allowance=False, walk_recovery=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -66,19 +69,39 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     crash_mkdir = [mode == "crash_mkdir"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
-    def allowance():
-        """A FILE under <instance>.admit/ -- token, held/<t> or claimed/<t>.
+    def walked():
+        """The REJECTED recovery: a recursive scan of the phase directories.
 
-        Directory existence is NOT this question: mkdir and the token write are two writes, so an
-        empty directory means issuance stopped between them, never that an allowance was minted.
+        `torn` models a promotion landing between the two directory reads -- visit an empty
+        `claimed/`, the worker renames `held/<t>` into it, then visit a now-empty `held/`. Both
+        names are real the whole time; neither is seen. Reproduced on scratch files by review.
         """
+        if d.torn:
+            return False
         return d.token or d.journal is not None or d.claimed_rec is not None
+
+    def issued():
+        """RECOVERY's question: has an allowance been minted? Two SINGLE-NAME tests.
+
+        A recursive walk cannot answer it: the worker can promote held/<t> into claimed/<t> between
+        the sweep reading those two directories, so the scan sees no file while the allowance stands.
+        `spent` is created before the token leaves and removed only with the directory.
+        """
+        return d.token or d.spent
+
+    def gated():
+        """The WORKER's question: does the directory exist? Not the same question as issued().
+
+        A file-shaped gate reads ABSENT on a crashed issuance and, past snapshot expiry, releases
+        the worker to the ordinary path over a standing allowance directory.
+        """
+        return d.admit_dir
 
     def verdict():
         # The directory gate is UNCONDITIONAL -- before every record read, not only past expiry.
         # Gating it on staleness left a fresh-but-unpublished snapshot releasing the worker.
         stale = d.computed_at is not None and now[0] - d.computed_at > STALE
-        if durable_gate and allowance() and (unconditional_gate or stale):
+        if durable_gate and gated() and (unconditional_gate or stale):
             return "probation"
         # Past stale_after_s every cell reads ABSENT, which means eligible.
         if stale:
@@ -101,9 +124,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             d.admit_dir = True
             if crash_mkdir[0]:                                # crash after mkdir, before token
                 crash_mkdir[0] = False; return
-            if dir_is_allowance and d.admit_dir and not allowance():
+            if dir_is_allowance and d.admit_dir and not issued():
                 pass                                          # pre-fix: EEXIST read as a mint
-            elif not (d.token if flat_issuance else allowance()):
+            elif not (d.token if flat_issuance else (walked() if walk_recovery else issued())):
                 d.token, d.token_at = True, now[0]
             if crash_once[0]:                                 # crash after (a), before (b): once
                 crash_once[0] = False; return
@@ -117,26 +140,29 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if "w" in d.probation:
             # `dir_is_allowance=True` is the pre-fix reading: EEXIST proves a mint, so an
             # empty directory is never finished and the verdict has no clock to end on.
-            if not allowance() and not (dir_is_allowance and d.admit_dir):
+            if not (walked() if walk_recovery else issued()) and not (dir_is_allowance and d.admit_dir):
                 d.admit_dir = True                            # an empty directory is unfinished issuance
                 d.token, d.token_at = True, now[0]            # finish it exactly once
                 return
             if d.claimed_rec is not None and d.claimed_rec in d.results:
                 # rmtree(<instance>.admit): the whole directory, not just the phase that ended it
                 d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.admit_dir = False; d.record["w"] = "eligible"; return
+                d.spent = False; d.admit_dir = False; d.record["w"] = "eligible"; return
             start = clock_start()
             # A fallback start would silently supply a clock the design lacks, so a shape with
             # no clock must be expressible or the timeout test passes however the clocks read.
             if start is not None and now[0] - start > WINDOW:
                 d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.admit_dir = False; d.record["w"] = "wedged"; return
+                d.spent = False; d.admit_dir = False; d.record["w"] = "wedged"; return
             return                                            # held, with a clock running
         if claimed and pending - claimed == 0:
             d.record["w"] = "eligible"
 
     def gate_step1(task):
+        # `spent` first (O_EXCL), THEN the rename: a crash anywhere after it leaves a name
+        # recovery refuses to mint over, and it is the name that never moves between phases.
         if not d.token: return False
+        d.spent = True
         d.token = False; d.journal, d.journal_at = task, now[0]; return True
 
     def gate_step2a():
@@ -144,7 +170,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         task = d.journal
         if task is None: return False
         if fail[0]:
-            fail[0] = False; d.journal = None; d.token = True; return False    # claim failed -> return token
+            fail[0] = False; d.journal = None; d.token = True; d.spent = False; return False   # return the attempt
         d.claims[task] = me[0]; return True
 
     def gate_step2b():
@@ -169,7 +195,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             if owner == me[0]:                                # claim_is_ours: retry (3) ALONE
                 gate_step2b(); return
             if owner in d.live_owners:                        # live, not ours: collision, return the attempt
-                d.journal = None; d.token = True; return
+                d.journal = None; d.token = True; d.spent = False; return
             del d.claims[task]                                # stale: retire, re-link, then (3)
             if gate_step2a(): gate_step2b()
             return
@@ -192,6 +218,10 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def restart():
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
+    def tear():
+        """Arm the torn observation for the next recovery read."""
+        d.torn = True
+
     def other_live_claim():
         """A DIFFERENT, living instance takes the admitted task out from under us."""
         if d.journal is not None:
@@ -199,7 +229,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
 
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
              "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
-             "other_live_claim": other_live_claim}
+             "other_live_claim": other_live_claim, "tear": tear}
     for s in order: steps[s]()
     return verdict(), claimed, pending - claimed, d
 
@@ -552,7 +582,63 @@ class AnEmptyAllowanceDirectoryIsUnfinishedIssuance(unittest.TestCase):
         v, c, p, d = run(["kick", "sweep", "worker"], "crash_mkdir")
         self.assertTrue(d.admit_dir)
         self.assertEqual(c, 0, "nothing to consume yet")
-        self.assertEqual(v, "wedged", "the record still reads wedged; probation was never published")
+        self.assertEqual(v, "probation", "the DIRECTORY gates, so an empty one still holds the worker")
+
+    def test_the_gate_holds_the_empty_directory_across_snapshot_EXPIRY(self):
+        # The file-shaped gate read ABSENT here and released the worker to the ordinary path
+        # over a standing allowance directory: eligible, 4 admitted, admit_dir=True.
+        for order in (["kick", "sweep", "drift", "worker"],
+                      ["kick", "sweep", "drift", "worker", "event"]):
+            v, c, p, d = run(order, "crash_mkdir")
+            self.assertTrue(d.admit_dir, order)
+            self.assertEqual((v, c), ("probation", 0), order)
+
+
+class RecoveryAsksTwoNAMES_NotAWalk(unittest.TestCase):
+    """A recursive scan of the phase directories is not an atomic observation.
+
+    The worker can promote `held/<t>` into `claimed/<t>` between the sweep reading those two
+    directories, so the scan finds no file while the allowance stands the whole time. An atomic
+    rename does not make a multi-directory read atomic. `spent` is created BEFORE the token leaves
+    and moves for nothing, so recovery asks two single-name questions instead.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "tear", "sweep"]
+
+    def test_the_walk_mints_a_second_allowance_under_a_torn_read(self):
+        # The defect itself, so this class is not asserting the fix agrees with itself.
+        v, c, p, d = run(self.ORDER, walk_recovery=True)
+        self.assertEqual(d.claimed_rec, "t1", "the allowance was spent before the scan ran")
+        self.assertTrue(d.token, "and the torn scan minted another one beside it")
+
+    def test_the_marker_survives_the_same_tear(self):
+        v, c, p, d = run(self.ORDER)
+        self.assertEqual(d.claimed_rec, "t1")
+        self.assertTrue(d.spent, "the marker is what the scan could not see")
+        self.assertFalse(d.token, "so nothing is minted")
+        self.assertEqual(c, 1)
+
+    def test_the_marker_is_created_BEFORE_the_token_leaves(self):
+        # A crash between consumption and the rename must still leave a name recovery honours.
+        v, c, p, d = run(["kick", "sweep", "crash_worker"])
+        self.assertTrue(d.spent); self.assertFalse(d.token)
+        self.assertIsNotNone(d.journal)
+        v, c, p, d = run(["kick", "sweep", "crash_worker", "tear", "sweep"])
+        self.assertFalse(d.token, "a torn scan at that seam must not mint either")
+
+    def test_returning_the_attempt_clears_the_marker(self):
+        # A collision hands the allowance back UNCONSUMED, so `spent` must not outlive it.
+        v, c, p, d = run(["kick", "sweep", "worker"], claim_fails_once=True)
+        self.assertTrue(d.token); self.assertFalse(d.spent)
+        v, c, p, d = run(["kick", "sweep", "crash_worker", "other_live_claim", "worker"])
+        self.assertTrue(d.token); self.assertFalse(d.spent)
+
+    def test_no_torn_schedule_leaves_probation_as_the_last_word(self):
+        for order in (["kick", "sweep", "worker", "tear", "sweep", "wait", "sweep"],
+                      ["kick", "sweep", "worker", "tear", "sweep", "finish", "sweep"]):
+            v, c, p, d = run(order)
+            self.assertIn(v, ("eligible", "wedged"), order)
+            self.assertFalse(d.spent or d.admit_dir, f"{order}: an artifact outlived its probation")
 
 
 if __name__ == "__main__":
