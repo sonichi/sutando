@@ -43,7 +43,9 @@ STATE = {"gets": [], "acks": [], "results": [], "heartbeats": [], "workers": [],
          "other": [], "serve_n": 0, "heartbeat_404": False, "task": None,
          # A modern broker advertises the extension; `strict` models a legacy
          # relay that REJECTS unknown result keys instead of ignoring them.
-         "advertise": True, "strict": False, "rejected": []}
+         "advertise": True, "strict": False, "rejected": [],
+         # a 200 whose body is not JSON, and a 200 that explicitly declines
+         "heartbeat_garbage": False, "results_decline": False}
 TASK = {"id": "task-CLOUD1", "timestamp": "2026-09-03T00:00:00Z",
         "task": "hello cloud seat", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -82,7 +84,10 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["strict"] and set(body) - allowed:
                 STATE["rejected"].append(sorted(body))
                 self._json(422, {"error": "unknown field"}); return
-            STATE["results"].append(body); self._json(200, {"ok": True}); return
+            STATE["results"].append(body)
+            if STATE["results_decline"]:
+                self._json(200, {"ok": False, "error": "declined"}); return
+            self._json(200, {"ok": True}); return
         if self.path.startswith("/v1/tasks/") and self.path.endswith("/ack"):
             STATE["acks"].append((self.path, self._body())); self._json(200, {}); return
         if self.path == "/v1/heartbeat":
@@ -92,6 +97,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(404 if _hb is True else int(_hb))
                 self.end_headers(); return
             STATE["heartbeats"].append(self._body())
+            if STATE["heartbeat_garbage"]:
+                raw = b"<html>not json</html>"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers(); self.wfile.write(raw); return
             caps = {"capabilities": ["worker-metadata"]} if STATE["advertise"] else {}
             self._json(200, caps); return
         if self.path == "/v1/workers":
@@ -518,6 +528,62 @@ def main() -> int:
     seat10b._retry_review_control_results()
     check(STATE["results"] == [{"id": PIN, "body": "[no-send]"}],
           f"a second drain after restart posts nothing more: {STATE['results']}")
+
+    # A 200 that cannot be decoded never reaches _note_broker_capabilities, so
+    # there is no fresh advertisement and the extension must not stay latched.
+    print("\n11. undecodable 200 heartbeat -> extension revoked, not latched")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    STATE["rejected"].clear(); STATE["advertise"] = True
+    STATE["heartbeat_404"] = False; STATE["heartbeat_garbage"] = False
+    STATE["strict"] = True
+    ws11 = root / "ws11"; ws11.mkdir()
+    d11 = _load("garbage11", ws11, port,
+                SUTANDO_WORKER_ID="home-1", SUTANDO_WORKER_LOCATION="home")
+    check(d11._post_heartbeat(set(), force=True) is True
+          and d11._broker_worker_metadata is True,
+          "advertising broker -> extension ON")
+    STATE["heartbeat_garbage"] = True
+    STATE["advertise"] = False
+    check(d11._post_heartbeat(set(), force=True) is False,
+          "an undecodable 200 does not raise out of the heartbeat")
+    check(d11._broker_worker_metadata is False,
+          "extension REVOKED after an undecodable reply (not latched on)")
+    d11.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (d11.RESULTS_DIR / "task-GARBAGE.txt").write_text("answer after a bad reply\n")
+    d11._save_inflight({"task-GARBAGE"})
+    d11._post_ready_results(d11._load_inflight())
+    check(STATE["rejected"] == [],
+          f"the strict relay refused nothing: {STATE['rejected']}")
+    check(len(STATE["results"]) == 1 and sorted(STATE["results"][0]) == ["body", "id"],
+          f"wire-keys stay the documented envelope: "
+          f"{sorted(STATE['results'][0]) if STATE['results'] else None}")
+    STATE["heartbeat_garbage"] = False; STATE["strict"] = False
+
+    # A declining 2xx means the lease did NOT close; deleting the journal there
+    # strands it with nothing on disk to retry from.
+    print("\n12. a declining 2xx keeps the pin-close journal for the next drain")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    STATE["advertise"] = True
+    ws12 = root / "ws12"; ws12.mkdir()
+    d12 = _load("decline12", ws12, port,
+                SUTANDO_WORKER_ID="cloud-3", SUTANDO_WORKER_LOCATION="cloud")
+    PIN12 = "worker-pin-424-b0b0"
+    STATE["results_decline"] = True
+    check(d12._consume_worker_pin({"id": PIN12, "task": "pin"}) is True,
+          "the pin is consumed")
+    check(len(STATE["results"]) == 1,
+          f"one close attempt was made: {STATE['results']}")
+    check(d12._control_result_path(PIN12).is_file(),
+          "the broker DECLINED, so the journal is KEPT for a later drain")
+    STATE["results_decline"] = False
+    STATE["results"].clear()
+    d12._retry_review_control_results()
+    check(STATE["results"] == [{"id": PIN12, "body": "[no-send]"}],
+          f"the next drain closes it exactly once: {STATE['results']}")
+    check(not d12._control_result_path(PIN12).is_file(),
+          "and an ACCEPTED close does consume the journal")
 
     srv.shutdown()
     if FAILS:

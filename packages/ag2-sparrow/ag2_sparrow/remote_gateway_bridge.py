@@ -1082,6 +1082,13 @@ def _retry_review_card_resolutions() -> None:
             _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
 
 
+def _declined_envelope(resp) -> bool:
+    """Delegate to delivery_core's owner of this policy; a local copy would
+    drift from the provider that already classifies these envelopes."""
+    from .delivery_core.contract import is_declined_envelope
+    return is_declined_envelope(resp)
+
+
 def _control_result_path(task_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)[:160]
     return _WITHHELD_CONTROL_DIR / f"{safe}.json"
@@ -1106,8 +1113,14 @@ def _retry_review_control_results() -> None:
         if not record or not record.get("id"):
             continue
         try:
-            _req("POST", "/v1/results", {
+            resp = _req("POST", "/v1/results", {
                 "id": record["id"], "body": record.get("body") or "[no-send]"})
+            # A declining 2xx did NOT close the lease; dropping the journal here
+            # would strand it with nothing left on disk to retry.
+            if _declined_envelope(resp):
+                _log(f"review control result {record['id']} declined — journal kept:"
+                     f" {str(resp)[:120]}")
+                continue
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
             _log(f"review control result {record.get('id')} retry deferred: {exc}")
@@ -2405,6 +2418,12 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except (urllib.error.URLError, TimeoutError) as e:
         _revoke_broker_capabilities()
         _log(f"heartbeat network error: {e} — continuing")
+        return False
+    except ValueError as e:
+        # A malformed 200 raises inside _req's json.loads, so the reply never
+        # reaches _note_broker_capabilities and advertises nothing.
+        _revoke_broker_capabilities()
+        _log(f"heartbeat reply undecodable: {e} — continuing")
         return False
 
 
