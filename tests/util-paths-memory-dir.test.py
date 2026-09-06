@@ -28,6 +28,7 @@ from util_paths import (  # noqa: E402
     _private_machine_dir,
     shared_personal_path,
 )
+import util_paths  # noqa: E402
 
 
 def clear_env():
@@ -161,6 +162,63 @@ class SharedPersonalPathTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             p = shared_personal_path("MEMORY.md", workspace=Path("/tmp/ws"))
         self.assertEqual(p, Path("/tmp/legacy-mem/MEMORY.md"))
+
+
+
+class MemoryDirResolver(unittest.TestCase):
+    """`memory_dir()` / `default_memory_dir()` — the one composition every
+    reader of the core-memory corpus shares."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_is_claude_home_projects_slug_memory(self):
+        d = util_paths.default_memory_dir()
+        self.assertEqual(d.name, "memory")
+        self.assertEqual(d.parent.parent.name, "projects")
+        # the slug is derived, never a re-implemented regex
+        repo = Path(util_paths.__file__).parent.parent.resolve()
+        self.assertEqual(d.parent.name, util_paths.claude_project_slug(repo))
+
+    def test_override_wins_over_the_default(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/some-corpus"
+        self.assertEqual(util_paths.memory_dir(), Path("/tmp/some-corpus"))
+
+    def test_unset_falls_back_to_default(self):
+        self.assertEqual(util_paths.memory_dir(), util_paths.default_memory_dir())
+
+    def test_legacy_alias_is_deliberately_not_honored(self):
+        # Preserves the pre-existing reader behavior; `_memory_dir_env()` is the
+        # one that honors the alias. If this ever flips, it must flip on purpose.
+        os.environ["SUTANDO_PRIVATE_DIR"] = "/tmp/legacy-corpus"
+        self.assertEqual(util_paths.memory_dir(), util_paths.default_memory_dir())
+
+
+class HealthCheckDelegates(unittest.TestCase):
+    """health-check must not re-compose the path; a second copy is what drifts."""
+
+    def test_default_memory_dir_delegates(self):
+        src = (ROOT / "src" / "health-check.py").read_text()
+        body = src.split("def _default_memory_dir")[1].split("\ndef ")[0]
+        self.assertIn("default_memory_dir()", body)
+        for recomposed in ('"projects"', "claude_project_slug(repo)"):
+            self.assertNotIn(recomposed, body,
+                             f"health-check re-composes the memory path ({recomposed})")
+
+    def test_memory_dir_constant_delegates(self):
+        src = (ROOT / "src" / "health-check.py").read_text()
+        self.assertIn("MEMORY_DIR = memory_dir()", src)
+        self.assertNotIn('os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir())', src)
 
 
 if __name__ == "__main__":
