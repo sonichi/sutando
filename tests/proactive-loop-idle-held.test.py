@@ -298,5 +298,38 @@ with _tf.TemporaryDirectory() as td:
           f"rc={r.returncode} {r.stdout}{r.stderr}")
 
 
+# --init is the ONLY way to create the record, and it must never be able to destroy one.
+# Without it the tool -- the sole writer of held_item_ids -- could not bootstrap a host
+# that never had the key, so the mechanism was unreachable exactly where it was needed.
+with _tf.TemporaryDirectory() as td:
+    f = _os.path.join(td, "s.json")
+    open(f, "w").write(json.dumps({"streak": 3, "noop_total": 7}))
+    r = _sp.run([*_PY, _TOOL, "--state", f, "--init", "--write"], capture_output=True, text=True)
+    check("init: creates the key on a doc that has none", r.returncode == 0,
+          f"rc={r.returncode} {r.stderr}")
+    doc = json.load(open(f))
+    check("init: the created list is EMPTY, never invented content",
+          doc.get("held_item_ids") == [], repr(doc.get("held_item_ids")))
+    check("init: leaves the other keys untouched",
+          doc.get("streak") == 3 and doc.get("noop_total") == 7, repr(doc))
+
+    r = _sp.run([*_PY, _TOOL, "--state", f, "--init", "--write"], capture_output=True, text=True)
+    check("init: REFUSES when the key already exists (cannot clobber a record)",
+          r.returncode == 2, f"rc={r.returncode} {r.stdout}{r.stderr}")
+
+    r = _sp.run([*_PY, _TOOL, "--state", f, "--add", "demo-1:owner", "--write"],
+                capture_output=True, text=True)
+    check("init: --add works afterwards", r.returncode == 0, f"rc={r.returncode} {r.stderr}")
+    check("init: the add landed", json.load(open(f))["held_item_ids"] == [["demo-1", "owner"]],
+          repr(json.load(open(f)).get("held_item_ids")))
+
+# --init must not write anything without --write, like every other mutating path here.
+with _tf.TemporaryDirectory() as td:
+    f = _os.path.join(td, "s.json")
+    open(f, "w").write(json.dumps({"streak": 1}))
+    _sp.run([*_PY, _TOOL, "--state", f, "--init"], capture_output=True, text=True)
+    check("init: dry run persists nothing", "held_item_ids" not in json.load(open(f)),
+          repr(json.load(open(f))))
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

@@ -221,6 +221,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--state", required=True)
+    ap.add_argument("--init", action="store_true",
+                    help="create an EMPTY held_item_ids on a state file that has none. "
+                         "Refuses if the key already exists, so it can never clobber a "
+                         "record; still needs --write to persist.")
     ap.add_argument("--add", action="append", default=[], metavar="ID:GATE")
     ap.add_argument("--remove", action="append", default=[], metavar="ID")
     ap.add_argument("--reason", action="append", default=[],
@@ -240,6 +244,27 @@ def main(argv=None) -> int:
 
     state = Path(a.state)
     doc, err = load(state)
+    # BOOTSTRAP. load() refuses when the key is absent, which is right for every other
+    # path — but it also made the tool unable to create the record it is the sole writer
+    # of, so a host that never had one could not adopt it except by the hand-edit this
+    # tool exists to replace. --init adds an EMPTY list and never content.
+    if a.init:
+        if not err:
+            print(f"CANNOT ANSWER: {KEY} already exists — --init refuses to clobber a record",
+                  file=sys.stderr)
+            return 2
+        if not err.endswith("refusing to invent one"):
+            print(f"CANNOT ANSWER: {err}", file=sys.stderr)
+            return 2
+        try:
+            doc = json.loads(state.read_text())
+        except (OSError, ValueError) as exc:
+            print(f"CANNOT ANSWER: {exc}", file=sys.stderr)
+            return 2
+        doc[KEY] = []
+        err = None
+        print(f"init: created an empty {KEY}"
+              + ("" if a.write else "  (not written; pass --write)"))
     if err:
         print(f"CANNOT ANSWER: {err}", file=sys.stderr)
         return 2
