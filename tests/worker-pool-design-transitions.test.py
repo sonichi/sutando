@@ -1,10 +1,9 @@
-"""A transition model over the design's wedge/reset rules, with ACTOR-OWNED durable state.
+"""Transition model with ACTOR-OWNED durable state and a SEPARABLE crash seam.
 
-The first version kept `rec` and `admit` as shared in-process variables: it proved the
-count arithmetic and could not see which production actor persists the decrement — so
-it passed while the design had the worker mutating the core-only record. This version
-models the three durable artifacts separately, each writable by exactly one actor, and
-asserts the writer set on every run. Restart is modeled as re-reading disk.
+Earlier versions collapsed token consumption and task claim into one Python statement, so they
+could not see the crash between them (qingyun-wu, 33c16809). Here the two are distinct durable
+steps on a modeled disk; `crash` may land between them; restart re-reads disk. The writer set of
+the record is asserted on every run.
 """
 import unittest
 
@@ -13,119 +12,103 @@ RUNNERS = 2
 
 class Disk:
     def __init__(self):
-        # record: sweep-only. tokens: sweep creates, worker renames. request: kick-pool.
-        self.record, self.tokens, self.request = {}, set(), False
-        self.writers = set()
+        # record: sweep-only. token/journal: sweep creates, worker renames. request: kick-pool.
+        self.record, self.token, self.journal, self.request = {}, False, None, False
+        self.claims, self.writers = set(), set()
 
 
-def run(order, reset, pending=5, runners=RUNNERS, restart_after=None):
-    d = Disk()
-    d.record["w"] = "wedged"
-    claimed = 0
-    mem = {"admit_seen": None}    # a worker's in-process view; must NOT be load-bearing
+def run(order, mode, pending=5, runners=RUNNERS, claim_fails_once=False):
+    d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]
 
     def sweep():
         d.writers.add(("record", "sweep"))
-        if reset == "delete":
-            d.record["w"] = "wedged" if claimed == 0 else "eligible"
-        else:
-            if d.request and d.record["w"] != "probation":
-                d.record["w"] = "probation"; d.request = False
-                d.tokens.add("w"); d.writers.add(("token-create", "sweep"))
-            elif d.record["w"] == "probation":
-                pass                                   # held
-            elif claimed and pending - claimed == 0:
-                d.record["w"] = "eligible"
+        if d.request and d.record["w"] != "probation":
+            d.record["w"] = "probation"; d.request = False; d.token = True
+        elif d.record["w"] == "probation":
+            pass                                            # held
+        elif claimed and pending - claimed == 0:
+            d.record["w"] = "eligible"
+
+    def gate_step1(task):
+        if not d.token: return False
+        d.token = False; d.journal = task; return True     # rename .admit -> .admit.<task>
+
+    def gate_step2():
+        nonlocal claimed
+        task = d.journal
+        if task is None: return
+        if fail[0]:
+            fail[0] = False; d.journal = None; d.token = True   # claim failed -> return token
+            return
+        d.claims.add(task); d.journal = None; claimed += 1  # hard-link claim held
 
     def worker():
-        nonlocal claimed
-        v = d.record["w"]                              # re-read from disk every time
-        if v == "wedged":
+        v = d.record["w"]
+        if v == "wedged": return
+        if v == "eligible":
+            nonlocal claimed; claimed += min(2 * runners, pending - claimed); return
+        # the REJECTED design has no reconciliation: a journal with no claim means "token gone" -> suppress
+        if mode == "seam" and d.journal is not None:
             return
-        if reset == "delete":
-            claimed += min(2 * runners, pending - claimed)
-        elif reset == "counter":
-            # the REJECTED design: worker decrements admit inside the record
-            a = d.record.get("admit", 0)
-            if v == "probation" and a > 0:
-                d.record["admit"] = a - 1; d.writers.add(("record", "worker")); claimed += 1
-        else:
-            if v == "probation" and "w" in d.tokens:
-                d.tokens.discard("w"); d.writers.add(("token-consume", "worker")); claimed += 1
-            elif v == "eligible":
-                claimed += min(2 * runners, pending - claimed)
+        # probation: reconcile FIRST — a journal with no held claim is a retry, not a suppress
+        if d.journal is not None and d.journal not in d.claims:
+            gate_step2(); return
+        if gate_step1(f"t{claimed+1}"):
+            if mode == "crash_between": return              # crash lands here; step 2 never runs
+            gate_step2()
 
     def kick():
-        if reset == "delete":
-            d.record["w"] = "absent"; d.writers.add(("record", "kick-pool"))
-        else:
-            d.request = True; d.writers.add(("request", "kick-pool"))
-            if reset == "counter":
-                d.record["admit"] = 1; d.writers.add(("record", "sweep"))  # sweep would publish it
+        d.request = True; d.writers.add(("request", "kick-pool"))
 
     def restart():
-        mem["admit_seen"] = None                       # process memory gone; disk persists
+        pass                                                # process memory gone; disk persists
 
-    steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart}
+    steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
+             "crash": lambda: None}
     for s in order:
+        if s == "crash_worker":
+            # perform step 1 then crash before step 2
+            v = d.record["w"]
+            if v == "probation" and d.journal is None: gate_step1(f"t{claimed+1}")
+            continue
         steps[s]()
     return d.record["w"], claimed, pending - claimed, d
 
 
-RECORD_WRITERS_ALLOWED = {"sweep"}
+def record_writers(d): return {a for art, a in d.writers if art == "record"}
 
 
-def record_writers(d):
-    return {actor for art, actor in d.writers if art == "record"}
+class TheSeamWithoutReconciliationGoesDarkForever(unittest.TestCase):
+    """qingyun-wu's control: crash after token rename, before claim -> probation, no token,
+    task pending, restarted gate suppresses. This is the REJECTED design."""
+
+    def test_crash_between_rename_and_claim_suppresses_forever(self):
+        v, c, p, d = run(["kick", "sweep", "crash_worker", "restart", "worker", "worker"], "seam")
+        self.assertEqual((v, c, p), ("probation", 0, 5))
+        self.assertFalse(d.token); self.assertIsNotNone(d.journal)   # exactly their durable state
 
 
-class TheOldDeleteResetFailsTheReviewersControl(unittest.TestCase):
-    def test_kick_sweep_worker_leaves_the_room_dark(self):
-        self.assertEqual(run(["kick", "sweep", "worker"], "delete")[:3], ("wedged", 0, 5))
+class TheJournalReconcilesTheSeam(unittest.TestCase):
+    def test_crash_between_rename_and_claim_is_recovered_on_restart(self):
+        v, c, p, d = run(["kick", "sweep", "crash_worker", "restart", "worker"], "token")
+        self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertIsNone(d.journal)
 
-    def test_kick_worker_sweep_admits_four_not_one(self):
-        self.assertEqual(run(["kick", "worker", "sweep"], "delete")[:3], ("eligible", 4, 1))
+    def test_claim_collision_returns_the_token(self):
+        v, c, p, d = run(["kick", "sweep", "worker"], "token", claim_fails_once=True)
+        self.assertEqual((v, c, p), ("probation", 0, 5)); self.assertTrue(d.token)
+        v, c, p, d2 = run(["kick", "sweep", "worker", "worker"], "token", claim_fails_once=True)
+        self.assertEqual((v, c, p), ("probation", 1, 4))                # second attempt succeeds
 
-    def test_delete_makes_kickpool_a_record_writer(self):
-        self.assertIn("kick-pool", record_writers(run(["kick"], "delete")[3]))
-
-
-class TheCounterInTheRecordIsAlsoAWorkerWriter(unittest.TestCase):
-    """qingyun-wu's P1 on 2d7b01ad: consuming admit inside pool-status.json makes the worker
-    a writer of the core-only record. This is the CONTROL for the writer assertion."""
-
-    def test_counter_design_has_a_worker_record_writer(self):
-        d = run(["kick", "sweep", "worker"], "counter")[3]
-        self.assertIn("worker", record_writers(d))
-
-
-class TheTokenResetKeepsTheRecordCoreOnly(unittest.TestCase):
-    def assertCoreOnly(self, d):
-        self.assertEqual(record_writers(d), RECORD_WRITERS_ALLOWED, f"record writers: {record_writers(d)}")
-
-    def test_kick_sweep_worker_admits_exactly_one(self):
-        v, c, p, d = run(["kick", "sweep", "worker"], "token"); self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
-
-    def test_kick_worker_sweep_worker_admits_exactly_one(self):
-        v, c, p, d = run(["kick", "worker", "sweep", "worker"], "token"); self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
-
-    def test_multi_task_backlog_admits_once(self):
-        v, c, p, d = run(["kick", "sweep", "worker", "worker", "worker"], "token"); self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
-
-    def test_event_during_probation_cannot_admit_a_second(self):
-        v, c, p, d = run(["kick", "sweep", "worker", "event"], "token"); self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
-
-    def test_intervening_sweeps_hold_probation(self):
-        v, c, p, d = run(["kick", "sweep", "sweep", "sweep", "worker"], "token"); self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
-
-    def test_restart_and_reread_cannot_admit_again(self):
-        # consumed state is on disk (token renamed), not in process memory
+    def test_no_token_no_journal_still_suppresses(self):
         v, c, p, d = run(["kick", "sweep", "worker", "restart", "worker", "event"], "token")
-        self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertCoreOnly(d)
+        self.assertEqual((v, c, p), ("probation", 1, 4))
 
-    def test_two_concurrent_workers_share_one_token(self):
-        v, c, p, d = run(["kick", "sweep", "worker", "worker"], "token")
-        self.assertEqual(c, 1); self.assertCoreOnly(d)
+    def test_all_four_orderings_admit_exactly_one(self):
+        for order in (["kick", "sweep", "worker"], ["kick", "worker", "sweep", "worker"],
+                      ["kick", "sweep", "worker", "worker", "worker"], ["kick", "sweep", "worker", "event"]):
+            v, c, p, d = run(order, "token")
+            self.assertEqual((v, c, p), ("probation", 1, 4), order)
+            self.assertEqual(record_writers(d), {"sweep"}, order)
 
 
 if __name__ == "__main__":

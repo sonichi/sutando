@@ -1384,15 +1384,29 @@ itself to a room whose worker might still come back.
    admitted task claimed-and-unfinished (verdict → `wedged`, the token — if still present — is
    removed by the sweep, and the request is NOT re-armed; a second kick needs a second command).
 
-   **The token is consumed ATOMICALLY at the admission boundary by `os.rename`, the one
-   single-consumer primitive that needs no shared counter.** The target's self-gate reads
-   `probation` as: claim ONLY IF `rename(<instance>.admit, <instance>.admit.<task_id>)` succeeds.
-   Exactly one caller wins that rename — two concurrent candidates, or reconciliation racing the
-   event path, cannot both succeed, and neither touches `pool-status.json`. A worker that restarts
-   and re-reads the record still sees `verdict: probation`, but the token is already renamed, so it
-   suppresses: the consumed state is on disk, not in a process's memory. This is what bounds the
-   risk to one task: reconciliation's `2 * runners` throttle and the unbounded event path both route
-   through this gate, and there is one token.
+   **Token consumption and task custody are ONE recoverable transaction, and the renamed token
+   is its journal.** The target's self-gate reads `probation` as a two-step sequence whose second
+   step is retried from the first's durable residue: (1) `rename(<instance>.admit,
+   <instance>.admit.<task_id>)` — exactly one caller wins, two concurrent candidates or
+   reconciliation racing the event path cannot both succeed, and neither touches
+   `pool-status.json`; (2) `acquire_task_claim(task_id)` — the hard-link claim the pool already
+   uses. The renamed token is not a spent counter; it is a durable record that *task_id was
+   admitted under probation*, and it stays on disk until the claim it names is held.
+
+   **The crash seam between (1) and (2) is closed by reconciliation, in both directions.** A
+   worker that restarts under `probation` and finds `<instance>.admit.<task_id>` with no claim held
+   does NOT suppress: it retries step (2) for that task_id. If the claim succeeds, the admission
+   completes. If `acquire_task_claim` fails because another instance now holds the task (claim
+   collision, or the task was cancelled), the worker renames the journal back to
+   `<instance>.admit` — the one attempt is returned, not lost — and re-enters the gate. A
+   restarted worker under `probation` with NO token and NO journal suppresses, because that state
+   means the sweep has not issued a token, not that one was consumed. The sweep's termination
+   rules read the journal the same way: `stand_in_after_s` is measured from the journal's mtime,
+   so a crash cannot leave a probation that no rule can end.
+
+   This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the
+   unbounded event path both route through this gate, there is one token, and every path out of
+   the seam either completes the admission or returns the token.
 
    The four orderings this must hold under, each pinned by
    `tests/worker-pool-design-transitions.test.py` as a no-write transition model over these exact
