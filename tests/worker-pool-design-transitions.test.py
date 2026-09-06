@@ -22,6 +22,22 @@ WINDOW = 100          # stand_in_after_s, in model seconds
 STALE = 60
 
 
+def artifact_path(instance, phase, task=None):
+    """`<instance>.admit/{token | held/<task_id> | claimed/<task_id>}`.
+
+    A task id is one path component already (`tasks/task-<id>.txt`), so it cannot contain `/`:
+    the id is the WHOLE final segment and the phase is a segment of its own. Injective.
+    """
+    if phase == "token":
+        return f"{instance}.admit/token"
+    return f"{instance}.admit/{phase}/{task}"
+
+
+def legacy_artifact_path(instance, phase, task):
+    """The REJECTED flat form: phase appended to the name. Kept only as the control's other half."""
+    return f"{instance}.admit.{task}" + (".claimed" if phase == "claimed" else "")
+
+
 class Disk:
     def __init__(self):
         # record: sweep-only. token/journal/claimed: sweep creates, worker renames, sweep removes.
@@ -35,17 +51,35 @@ class Disk:
 
 
 def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
-        durable_gate=True):
+        durable_gate=True, flat_issuance=False, unconditional_gate=True):
+    """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
+
+    `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
+    `unconditional_gate=False` -- the gate runs only PAST snapshot expiry, so a fresh or
+        republished snapshot releases the worker over a standing artifact.
+    `flat_issuance=True`  -- issuance step (a) tests the TOKEN NAME, which a worker's rename
+        makes absent. Step (a) only: the recovery branch already tested the whole family.
+    """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
+    def allowance():
+        """The <instance>.admit/ directory: issued in SOME phase, or absent. One test, whole family.
+
+        Under the flat naming the worker's rename consumed the very name issuance guarded, so
+        this could not be asked as one question -- which is the second defect below.
+        """
+        return d.token or d.journal is not None or d.claimed_rec is not None
+
     def verdict():
-        # Past stale_after_s every cell reads ABSENT, which means eligible. The gate is the
-        # on-disk directory, so it survives that; `durable_gate=False` is the pre-fix reader.
-        if d.computed_at is not None and now[0] - d.computed_at > STALE:
-            if durable_gate and (d.token or d.journal is not None or d.claimed_rec is not None):
-                return "probation"
+        # The directory gate is UNCONDITIONAL -- before every record read, not only past expiry.
+        # Gating it on staleness left a fresh-but-unpublished snapshot releasing the worker.
+        stale = d.computed_at is not None and now[0] - d.computed_at > STALE
+        if durable_gate and allowance() and (unconditional_gate or stale):
+            return "probation"
+        # Past stale_after_s every cell reads ABSENT, which means eligible.
+        if stale:
             return "eligible"
         # a v1 reader sees only the scalar; a probation-aware reader consults the sibling key
         return "probation" if d.record["w"] == "wedged" and "w" in d.probation else d.record["w"]
@@ -60,7 +94,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def sweep():
         now[0] += 10; d.writers.add(("record", "sweep")); d.computed_at = now[0]
         if d.request and "w" not in d.probation:
-            if not d.token:                                   # (a) idempotent token
+            # (a) mkdir(<instance>.admit). EEXIST -- in ANY phase -- means the allowance is
+            # already issued, so recovery publishes over it and mints nothing.
+            if not (d.token if flat_issuance else allowance()):
                 d.token, d.token_at = True, now[0]
             if crash_once[0]:                                 # crash after (a), before (b): once
                 crash_once[0] = False; return
@@ -72,11 +108,13 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.request and "w" in d.probation:                  # crash after (b), before (c)
             d.request = False; return
         if "w" in d.probation:
-            if not d.token and d.journal is None and d.claimed_rec is None:
+            if not allowance():
                 d.token, d.token_at = True, now[0]            # issuance crash: re-create the lost token
                 return
             if d.claimed_rec is not None and d.claimed_rec in d.results:
-                d.probation.pop("w"); d.claimed_rec = None; d.record["w"] = "eligible"; return
+                # rmtree(<instance>.admit): the whole directory, not just the phase that ended it
+                d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
+                d.record["w"] = "eligible"; return
             start = clock_start()
             # A fallback start would silently supply a clock the design lacks, so a shape with
             # no clock must be expressible or the timeout test passes however the clocks read.
@@ -191,9 +229,14 @@ class EveryProbationStateHasAClock(unittest.TestCase):
     """keweichen's and qingyun-wu's controls (e8d270b1): the three states their reads left absorbing."""
 
     def test_issuance_crash_is_reconciled_by_the_next_sweep(self):
-        # crash after the token, before the record: the request still stands, the next sweep finishes issuance.
+        """Crash after the token, before the record: the request stands, the next sweep finishes it.
+
+        The token IS the allowance, so the unconditional gate admits one off it even unpublished.
+        This expected `wedged, 0, 5` while the gate ran only past snapshot expiry (qingyun-wu,
+        5124977329).
+        """
         v, c, p, d = run(["kick", "sweep", "restart", "worker"], "crash_issuance")
-        self.assertEqual((v, c, p), ("wedged", 0, 5))                   # nothing admitted through a half-issued state
+        self.assertEqual((v, c, p), ("probation", 1, 4))
         v, c, p, d = run(["kick", "sweep", "restart", "sweep", "worker"], "crash_issuance")
         self.assertEqual((v, c, p), ("probation", 1, 4)); self.assertFalse(d.request)
 
@@ -330,6 +373,125 @@ class ProbationOutlivesTheEligibilitySnapshot(unittest.TestCase):
                       ["kick", "sweep", "worker", "drift", "restart", "worker", "wait", "sweep"]):
             v, c, p, d = run(order)
             self.assertIn(v, ("eligible", "wedged"), order)
+
+
+class IssuanceRecoveryMintsAtMostOneAllowance(unittest.TestCase):
+    """qingyun-wu 5124977329 / keweichen 5125025866 at a2546d89, found independently.
+
+    `O_EXCL` guards a NAME, never that name's renamed successor. Under the flat form the worker's
+    first rename consumed the very name issuance tested, so a sweep restarting into a crashed
+    issuance found it absent and minted a second allowance beside an already-claimed task. Both
+    reviewers reproduced it in the then-committed model without modifying it.
+    """
+
+    ORDER = ["kick", "sweep", "drift", "worker", "sweep"]
+
+    def test_the_flat_form_mints_a_second_allowance(self):
+        # The defect itself, so this class is not just asserting the fix agrees with itself.
+        # `flat_issuance` restores the pre-fix test: mint whenever the TOKEN NAME is absent.
+        v, c, p, d = run(self.ORDER, "crash_issuance", flat_issuance=True)
+        self.assertEqual(d.claimed_rec, "t1", "the worker has already spent the allowance")
+        self.assertTrue(d.token, "and a second one was minted beside it")
+
+    def test_the_directory_test_covers_every_phase(self):
+        v, c, p, d = run(self.ORDER, "crash_issuance")
+        self.assertEqual(d.claimed_rec, "t1")
+        self.assertFalse(d.token, "EEXIST in the claimed phase: recovery publishes and mints nothing")
+        self.assertEqual(c, 1, "one task, whatever the crash schedule")
+
+    def test_it_holds_at_the_journal_seam_too(self):
+        # crash after the token, worker consumes as far as the JOURNAL only, then the sweep restarts
+        for order in (["kick", "sweep", "crash_worker", "sweep"],
+                      ["kick", "sweep", "drift", "crash_worker", "sweep"],
+                      ["kick", "sweep", "worker", "restart", "sweep"]):
+            v, c, p, d = run(order, "crash_issuance")
+            self.assertFalse(d.token and (d.journal is not None or d.claimed_rec is not None),
+                             f"{order}: a token beside a spent allowance")
+
+    def test_fresh_and_expired_snapshots_both_hold_the_bound(self):
+        # while the allowance stands, one task -- whichever side of snapshot expiry the worker runs on
+        for order in (["kick", "sweep", "worker", "sweep", "worker", "event"],
+                      ["kick", "sweep", "drift", "worker", "sweep", "worker", "event"]):
+            v, c, p, d = run(order, "crash_issuance")
+            self.assertEqual(c, 1, f"{order}: more than one task admitted under one allowance")
+            self.assertEqual(v, "probation", order)
+
+    def test_ending_probation_leaves_no_artifact_behind(self):
+        """Reopening the ordinary path once probation ENDS is correct; a leftover allowance is not.
+
+        At a2546d89 this schedule ended `verdict=eligible claimed=5 token=True`, which both
+        reviewers published. Each knob below reproduces one half of that row against the current
+        model. The flat mint itself is asserted by the first two tests in this class, where it
+        stands beside an already-claimed task; it is not re-asserted at the END of this schedule,
+        because ending probation now removes the whole directory and would mask it.
+        """
+        ORDER = ["kick", "sweep", "drift", "worker", "sweep", "finish", "sweep", "worker"]
+
+        # (i) the conditional gate: a republished snapshot releases the worker over an artifact
+        v, c, p, d = run(ORDER, "crash_issuance", unconditional_gate=False)
+        self.assertEqual((v, c), ("eligible", 5), "the gate must be conditional to release here")
+
+        # (ii) both pre-fix halves together: the leftover is minted and then spent
+        v, c, p, d = run(ORDER, "crash_issuance", flat_issuance=True, unconditional_gate=False)
+        self.assertEqual((v, c), ("eligible", 5))
+
+        # both fixed: exactly one admission WHILE probation stood, and the directory goes with it.
+        # The ordinary path reopening afterwards is correct -- probation ended on its own terms.
+        v, c, p, d = run(ORDER[:-1], "crash_issuance")
+        self.assertEqual((v, c), ("eligible", 1), "one task under the allowance, then released")
+        self.assertFalse(d.token or d.journal is not None or d.claimed_rec is not None,
+                         "no artifact may outlive the probation it gates")
+
+    def test_no_issuance_crash_schedule_leaves_probation_as_the_last_word(self):
+        for order in (["kick", "sweep", "restart", "sweep", "wait", "sweep"],
+                      ["kick", "sweep", "drift", "worker", "sweep", "wait", "sweep"],
+                      ["kick", "sweep", "worker", "sweep", "finish", "sweep"]):
+            v, c, p, d = run(order, "crash_issuance")
+            self.assertIn(v, ("eligible", "wedged"), order)
+
+
+class TheArtifactPathIsInjective(unittest.TestCase):
+    """keweichen 5125025866: `<instance>.admit.<task_id>[.claimed]` is not a task identity.
+
+    Gateway ids may contain dots and state-looking tails -- the design says so itself under
+    "Order of claiming", and the gateway bridge accepts both ids below. The model's own
+    `journal` and `claimed_rec` are separate fields, so the collision is invisible to it; it is
+    only visible in the PATH, which is why this control compares paths and not model state.
+    """
+
+    # both legal, and adjacent: one is the other plus the phase suffix the flat form appended
+    IDS = ("task-a", "task-a.claimed")
+
+    def test_the_flat_form_collides_on_two_legal_adjacent_ids(self):
+        promoted = legacy_artifact_path("worker-2", "claimed", self.IDS[0])
+        unpromoted = legacy_artifact_path("worker-2", "held", self.IDS[1])
+        self.assertEqual(promoted, unpromoted,
+                         "the control must exhibit the collision, or it proves nothing")
+
+    def test_the_segmented_form_separates_them(self):
+        promoted = artifact_path("worker-2", "claimed", self.IDS[0])
+        unpromoted = artifact_path("worker-2", "held", self.IDS[1])
+        self.assertNotEqual(promoted, unpromoted)
+        self.assertEqual(promoted, "worker-2.admit/claimed/task-a")
+        self.assertEqual(unpromoted, "worker-2.admit/held/task-a.claimed")
+
+    def test_the_id_is_the_whole_final_segment_for_every_shape(self):
+        for task in ("t1", "task-a", "task-a.claimed", "task.held.claimed", "a.b.c.claimed"):
+            for phase in ("held", "claimed"):
+                path = artifact_path("worker-2", phase, task)
+                self.assertEqual(path.rsplit("/", 1)[1], task, (phase, task))
+                self.assertEqual(path.split("/")[1], phase, (phase, task))
+
+    def test_no_task_id_can_forge_another_phase(self):
+        # a slash is the only thing that could, and a task id is already one path component
+        seen = {}
+        for task in ("t", "t.claimed", "claimed", "token", "held/x"):
+            for phase in ("held", "claimed"):
+                seen.setdefault(artifact_path("worker-2", phase, task), []).append((phase, task))
+        forged = {k: v for k, v in seen.items() if len(v) > 1}
+        self.assertEqual(forged, {}, f"two (phase, task) pairs share a path: {forged}")
+        self.assertNotIn(artifact_path("worker-2", "token"), seen,
+                         "an unconsumed token must not be reachable by any task id")
 
 
 if __name__ == "__main__":

@@ -1389,18 +1389,46 @@ itself to a room whose worker might still come back.
    the idle prompt and requesting the reset are one transition, not two — a kick that leaves the
    verdict standing changes nothing observable, since the worker resumes and still suppresses.
 
+   **The allowance is a DIRECTORY, and its phase is a PATH SEGMENT — so one `mkdir` tests the
+   whole artifact family and no task id can forge a phase.** The admission lives at
+   `state/pool-probation/<instance>.admit/`, and exactly one of these paths exists inside it:
+
+   | path | meaning | written by |
+   |---|---|---|
+   | `<instance>.admit/token` | issued, unconsumed | sweep creates |
+   | `<instance>.admit/held/<task_id>` | journal: token spent on this task, claim not yet promoted | worker renames |
+   | `<instance>.admit/claimed/<task_id>` | promotion landed; this claim was the probation admission | worker renames |
+
+   A task id is already one path component — the pool writes `tasks/task-<id>.txt` — so it cannot
+   contain `/`, and the id is therefore the WHOLE final segment while the phase is a segment of its
+   own. That is what makes the encoding injective. The earlier flat form appended state to the
+   name (`<instance>.admit.<task_id>`, `.claimed`), and this document has already explained under
+   "Order of claiming" why a state suffix cannot identify a task: gateway ids may contain dots and
+   state-looking tails, so `worker-2.admit.task-a.claimed` was the promoted record for `task-a`
+   AND the unpromoted journal for the equally legal id `task-a.claimed` — same bytes, opposite
+   reconciliation. (Found by keweichen, 5125025866.)
+
    **The reset is a DURABLE PROBATION STATE, not a deletion, so it survives an intervening
-   sweep — and the consumable token lives in a SEPARATELY OWNED artifact, so the record stays
+   sweep — and the consumable allowance lives in a SEPARATELY OWNED artifact, so the record stays
    core-only.** On its next pass the core sweep consumes the request in an order that leaves no
-   absorbing state behind a crash: (a) it creates the token file `state/pool-probation/<instance>.admit`
-   if absent (`O_EXCL`, one byte — idempotent, so a re-run after a crash is a no-op); (b) it publishes
-   `instances[<instance>] = "wedged"` plus `probation[<instance>] = {"since": <sweep_ts>}` in
-   `pool-status.json` (one `os.replace`); (c) only then it removes the request. A crash after (a)
-   leaves the request standing, so the next sweep re-runs (a)–(c) and (a) finds its token already
-   there; a crash after (b) leaves a request that (c) simply removes. The sweep is the sole writer of
-   the record AND the sole creator of tokens; a worker never writes either. A sweep that runs BEFORE
-   the worker's reconciliation does not republish anything — the verdict is held while `probation`
-   stands.
+   absorbing state behind a crash: (a) `mkdir(<instance>.admit)` and, if that succeeded, create
+   `token` inside it; (b) it publishes `instances[<instance>] = "wedged"` plus
+   `probation[<instance>] = {"since": <sweep_ts>}` in `pool-status.json` (one `os.replace`);
+   (c) only then it removes the request. A crash after (a) leaves the request standing, so the next
+   sweep re-runs (a)–(c); a crash after (b) leaves a request that (c) simply removes.
+
+   **`EEXIST` on that `mkdir` is the whole reconciliation, and that is the point of putting the
+   phase inside the directory rather than in its name.** The allowance is minted once; every
+   later transition is a rename WITHIN it, so the name the sweep tests never disappears. Under the
+   flat form the worker's first rename consumed the very name `O_EXCL` was guarding, so a sweep
+   restarting into a crashed issuance found it absent and minted a SECOND allowance beside a task
+   the worker had already claimed — `O_EXCL` protects a name, never that name's renamed successor.
+   (Found independently by qingyun-wu 5124977329 and keweichen 5125025866; both reproduced it in
+   the committed model without modifying it.) A directory that exists is an allowance that has
+   been issued, in whichever phase; the sweep publishes (b) and clears (c) over it and mints
+   nothing. The sweep is the sole creator and sole remover of the allowance; a worker only renames
+   within it, and never writes the record. A sweep that runs BEFORE the worker's reconciliation
+   does not republish anything — the verdict is held while `probation` stands.
 
    **The probation gate is the DIRECTORY, not the record — so it outlives the snapshot.** The
    validation matrix above maps `now > computed_at + stale_after_s` to ABSENT, and ABSENT means
@@ -1409,9 +1437,13 @@ itself to a room whose worker might still come back.
    own window closes, and the worker would then take the ordinary path — `2 * runners` through
    reconciliation, unbounded through events. That contradicts the guarantee two paragraphs up.
 
-   So a target reads `state/pool-probation/` for its own name BEFORE it reads the record, and any
-   artifact there — `<instance>.admit`, `<instance>.admit.<task_id>`, or `.claimed` — puts it under
-   probation whatever the record says, ABSENT included. Files do not expire, and the sweep is
+   So a target tests `state/pool-probation/<instance>.admit/` for its own name BEFORE EVERY read of
+   the record — unconditionally, not only once the snapshot has expired. The directory existing
+   puts it under probation whatever the record says, ABSENT and `eligible` included; which phase it
+   holds inside is reconciliation's question, never the gate's. Making that test conditional on
+   staleness reintroduces the same hole one layer down: a FRESH snapshot that has not yet been
+   published, or one republished as `eligible` while an artifact still stands, released the worker
+   to the ordinary path with the allowance on disk. Directories do not expire, and the sweep is
    already their sole creator and sole remover, so the same act that ends probation clears the gate.
 
    **The cost, stated rather than buried: a dead publisher now bounds a probationed worker to its
@@ -1425,17 +1457,17 @@ itself to a room whose worker might still come back.
    **Token consumption and task custody are ONE recoverable transaction, and the renamed token
    is a durable admission record that outlives the claim.** The target's self-gate reads
    `probation` as a two-step sequence whose second step is retried from the first's durable
-   residue: (1) `rename(<instance>.admit, <instance>.admit.<task_id>)` — exactly one caller wins,
+   residue: (1) `rename(<instance>.admit/token, <instance>.admit/held/<task_id>)` — exactly one caller wins,
    and neither touches `pool-status.json`; (2) `acquire_task_claim(task_id)` — the hard-link claim
    the pool already uses. When (2) succeeds the journal is renamed once more, to
-   `<instance>.admit.<task_id>.claimed`, and it stays on disk until the sweep ends probation: the
+   `<instance>.admit/claimed/<task_id>`, and it stays on disk until the sweep ends probation: the
    sweep needs exactly that file to know *which* claim was the probation admission and *when* it
    was made (its mtime), which an ordinary claim link does not say.
 
    **There are THREE durable writes, so there are TWO crash seams, and reconciliation is decided by
    the CLAIM, not by the journal alone.** The promotion in (3) is its own write: `acquire_task_claim`
    commits its hard link and returns before anything else runs (`src/watch-tasks-stream.sh:127-147`),
-   so a crash can land between a held claim and a journal that still reads `<instance>.admit.<task_id>`.
+   so a crash can land between a held claim and a journal that still reads `<instance>.admit/held/<task_id>`.
    A worker restarting under `probation` with that journal therefore asks about the CLAIM on that
    task_id, using the two predicates the pool already ships — `claim_is_ours` (line 2 of the claim
    file, the `WATCHER_ID`) and `claim_is_live` (line 1, the pid) — which partition the state:
@@ -1444,7 +1476,7 @@ itself to a room whose worker might still come back.
    |---|---|---|
    | none | absent | retry step (2), then (3) |
    | held by THIS process | `claim_is_ours` | the crash (or a failed rename) landed between (2) and (3): retry (3) alone. Promotion is idempotent and issues no second attempt — the token is already spent and the journal names the same task. |
-   | held by a LIVE other process | `claim_is_live`, not ours | genuine collision: rename the journal back to `<instance>.admit`, returning the one attempt, and re-enter the gate |
+   | held by a LIVE other process | `claim_is_live`, not ours | genuine collision: rename the journal back to `<instance>.admit/token`, returning the one attempt, and re-enter the gate |
    | present, owner DEAD | neither | `acquire_task_claim` retires the stale claim and re-links (`retire_stale_claim`), then (3); if the re-link loses, this is a collision and takes the row above |
 
    `WATCHER_ID` is `$$-$RANDOM`, so it is per-process: a worker's OWN claim from before a restart is
@@ -1460,17 +1492,17 @@ itself to a room whose worker might still come back.
 
    **Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
-   computed afresh; journal and `.claimed` record removed); or the window `stand_in_after_s` has
+   computed afresh; the whole `<instance>.admit/` directory removed); or the window `stand_in_after_s` has
    elapsed — measured from `probation.since` while the token is unconsumed (a worker that never
    reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
-   the `.claimed` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
-   the token or journal is removed by the sweep, and the request is NOT re-armed; a second kick
+   the `claimed/<task_id>` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
+   the allowance directory is removed by the sweep, and the request is NOT re-armed; a second kick
    needs a second command. `probation` is never the last word.
 
    The journal clock deliberately does NOT require the journal to be unclaimed: between (2) and (3)
    the journal is the only durable timestamp that exists, so qualifying it on `unclaimed` would leave
    exactly the seam above with no clock. The three clocks are therefore total over the three durable
-   shapes — token, journal, `.claimed` record — and each ends in `eligible` or `wedged` without
+   shapes — `token`, `held/<task_id>`, `claimed/<task_id>` — and each ends in `eligible` or `wedged` without
    re-arming the request.
 
    This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the
@@ -1487,8 +1519,9 @@ itself to a room whose worker might still come back.
    kick -> multi-task backlog  one token consumed; 4 stay pending
    event arrives in probation  event path hits the same gate; admit already 0 -> pending
    crash after publish, before token   next sweep re-issues the token; worker admits 1
-   worker never reaches its gate      window from `since` elapses -> wedged, token removed
-   claimed, unfinished past window    window from the .claimed record elapses -> wedged
+   crash after mkdir, worker consumes  the restarted sweep finds the directory and mints NOTHING
+   worker never reaches its gate      window from `since` elapses -> wedged, allowance removed
+   claimed, unfinished past window    window from claimed/<task_id> elapses -> wedged
    ```
 
    **This admits exactly one task's worth of risk, deliberately.** A worker still hung
