@@ -75,11 +75,23 @@ def task_projection(snapshot: dict, now: float | None = None) -> dict:
             "audience": "room", "projection": "TASK_STATUS"}
 
 
+def this_host() -> str:
+    """The label the heartbeat writes under, via the one resolver core_heartbeat uses; never a glob.
+    state/cores/ is synced across hosts, so any other choice lets a peer answer for this agent."""
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:  # noqa: BLE001
+        import platform
+        return platform.node().split(".")[0]
+
+
 def read_runtime_state(workspace: Path | None = None, host: str | None = None,
                        max_concurrency: int = 1, now: float | None = None) -> AgentRuntimeState:
     """The private numbers from what the engine already writes: task snapshots under state/activity
-    (active runs), the tasks/ directory (queue depth), and the core heartbeat (health)."""
+    (active runs), the tasks/ directory (queue depth), and THIS host's core heartbeat (health)."""
     ws = workspace or resolve_workspace()
+    host = host or this_host()
     now = now if now is not None else time.time()
     active = 0
     for p in (ws / "state" / "activity").glob("task-*.json"):
@@ -91,7 +103,7 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
     queue = sum(1 for p in (ws / "tasks").glob("task-*.txt") if not p.name.startswith("task-cron-")) if (ws / "tasks").exists() else 0
     healthy: bool | None = None
     cores = ws / "state" / "cores"
-    beats = list(cores.glob(f"{host}.alive")) if host else list(cores.glob("*.alive")) if cores.exists() else []
+    beats = [cores / f"{host}.alive"] if (cores / f"{host}.alive").exists() else []
     if beats:
         healthy = any(now - b.stat().st_mtime < HEARTBEAT_MAX_AGE_S for b in beats)
     return AgentRuntimeState(active_runs=active, max_concurrency=max_concurrency, queue_depth=queue,

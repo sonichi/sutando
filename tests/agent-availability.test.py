@@ -34,7 +34,8 @@ class Contract(unittest.TestCase):
         p = av.availability_projection(S(runtime_healthy=True, active_runs=3, max_concurrency=4, queue_depth=7), worker="air")
         self.assertEqual(set(p), {"worker", "room", "availability", "audience", "projection", "ts"})
         self.assertEqual((p["availability"], p["audience"], p["projection"]), ("busy_accepting", "room", "AVAILABILITY"))
-        self.assertNotIn("3", json.dumps(p)); self.assertNotIn("7", json.dumps({k: v for k, v in p.items() if k != "ts"}))
+        blob = json.dumps({k: v for k, v in p.items() if k != "ts"})
+        self.assertNotIn("3", blob); self.assertNotIn("7", blob)
 
     def test_the_task_projection_says_who_and_since_when_but_not_what(self):
         snap = {"task_id": "t", "message_event_id": "$m", "worker": "air", "phase": "RUNNING", "started_at": 1000.0,
@@ -56,6 +57,21 @@ class PerRoom(unittest.TestCase):
         self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs")["availability"],
                          "busy_accepting", "an off-contract value is ignored, never leaked")
         self.assertIn(av.availability_projection(s, "air", "!x:s", widen)["availability"], av.AVAILABILITY)
+
+
+class ThisHost(unittest.TestCase):
+    """state/cores/ is synced across hosts, so a glob lets a PEER's heartbeat answer for this agent.
+    Only this host's file counts."""
+
+    def test_a_peers_fresh_heartbeat_never_makes_a_dead_host_look_alive(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state" / "cores").mkdir(parents=True)
+        (ws / "state" / "cores" / "peer.alive").write_text("{}")
+        mine = ws / "state" / "cores" / "mac.alive"; mine.write_text("{}")
+        os.utime(mine, (time.time() - 4000, time.time() - 4000))
+        s = av.read_runtime_state(ws, host="mac", now=time.time())
+        self.assertNotEqual(av.availability(s), "available", "my own heartbeat is stale; the peer's does not count")
+        self.assertNotEqual(av.availability(av.read_runtime_state(ws, host="nobody", now=time.time())), "available")
+        self.assertIsInstance(av.this_host(), str); self.assertTrue(av.this_host())
 
 
 class Reading(unittest.TestCase):
