@@ -571,9 +571,9 @@ with tempfile.TemporaryDirectory() as d:
         mib._health_check = _hc
     check("record: ...and a SECOND CLI record refuses, exactly as the function does", rc_cli2 == 2, rc_cli2)
 
-    # The override is supported, so an external memory tree must NOT drag this
-    # host's pointer out of the workspace with it.
-    ptr.unlink(missing_ok=True)   # bootstrap-only: the prior case left one
+    # An external memory tree must not drag this host's pointer out of the
+    # workspace; the prior case recorded one, and recording is bootstrap-only.
+    ptr.unlink(missing_ok=True)
     ext = pathlib.Path(tempfile.mkdtemp()) / "external" / "projects" / "slug" / "memory"
     ext.mkdir(parents=True)
     (ext / "MEMORY.md").write_text("- external row\n", encoding="utf-8")
