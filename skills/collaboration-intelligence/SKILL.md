@@ -118,9 +118,171 @@ So do not rely on description matching alone. **Hook invocation to observable st
 | An identity appears that no stable ID in the map resolves | Resolve before addressing, never after. |
 | A request is about to go out addressed to nobody | Publishing is fine unaddressed; asking is not. |
 
-The rule to carry: **when a routine you are already running computes one of these, invoke this skill from that routine** — as a step, not as a hope that the description matches. A step executes regardless of framing; a description does not. Bound it to once per (subject, state-change) so a standing gap does not re-fire on every pass.
+The rule to carry: **when a routine you are already running computes one of these, invoke this
+skill from that routine** — as a step, not as a hope that the description matches. A step executes
+regardless of framing; a description does not. Bound it to once per `(subject, action, that
+action's own trigger)` — **the same key shape the section below uses**, so a standing gap does not
+re-fire on every pass while a newly-available action still gets in. A caller keyed on `(subject,
+state-change)` alone is wrong in both directions: it never re-invokes when a horizon crosses
+(crossing one is not a work-item state change, so escalation is unreachable no matter what the
+section's internal keys say), and it invokes on the first sweep of a subject even when no action
+is available at all.
 
 The same measurement makes the weaker path explicit, and it is worth stating plainly rather than implying the trigger is solved: on the night this was written, the gate had *already printed* the queued-on-nobody verdict before the agent acted, and the agent still did not invoke the skill. A signal nothing is obliged to read changes nothing.
+
+## Blocker removal
+
+Detecting a stalled item is not clearing one. The section above finds the observable; this one turns
+it into an action. A blocked item sits in two states that look identical from outside:
+
+- **Waiting on someone** — a capable party already holds a standing request. Do not ask again on every
+  sweep.
+- **Waiting on nobody** — the work needs action and no capable party is assigned. This is the common
+  case, and the only one that is yours.
+
+⇒ **A platform request creates durable queue state; an addressed message creates awareness. Both are
+required and neither substitutes for the other.** The request survives the reader's next inbox pass
+but is invisible until they look; the mention reaches them once and then decays into scrollback. An
+item carrying only the first is queued to someone who does not know; an item carrying only the second
+was known about once and is now in nobody's list. **Check that both exist — not that either does.**
+
+Measured 2026-08-22: a change-request latch was set at 09:22, the author answered it at 09:37 asking
+the reviewer to choose between two unblock options, and `reviewRequests` stayed **empty for eight
+hours**. The reviewer had been mentioned, so a notification existed; nothing stood in their queue
+afterwards. A merge gate reported `MAYBE-ANSWERED → READ IT` on four consecutive sweeps and the state
+never moved, because *reading it* was never the missing step. **Nobody had been asked.**
+
+### When to act
+
+Fire once per `(blocker, action, that action's own trigger)` — never once per sweep — when
+**all four** hold. **The key is per ACTION, not per routine**: steps 1-2 trigger on their channel
+being missing, step 3 triggers on the horizon crossing. A single routine-wide key would let the
+initial repair consume the one permitted firing and leave escalation unreachable for ever after,
+since crossing a horizon is not a state change of the work item. These are
+computable, so this is a step in a routine, not a judgement call:
+
+1. Another party must act.
+2. You have completed your part.
+3. No newer blocker puts the work back in your court.
+4. There is something to do — **either** a required channel is missing (no capable party holds a
+   standing request, or no state-change notification has been delivered since the last state
+   change), **or** every required channel is satisfied and the recorded horizon has passed with the
+   state still unchanged.
+
+If (2) is false the ball is in your court and nudging is a way of not doing your own work.
+
+**Condition 4 has two arms because the routine has two jobs.** The first arm is a *gap*: a channel is
+missing, and steps 1-2 repair it. The second is a *wait that has expired*: every channel is satisfied,
+so there is nothing left to repair, and step 3 escalates. Written as the gap alone, condition 4 makes
+step 3 unreachable — the ordinary overdue state has no gap by construction, and that is exactly when
+escalation is the only remaining action. A recorded-unavailable durable channel counts as satisfied
+here too, so an item with one unusable channel reaches escalation through the second arm rather than
+waiting forever on a request that can never be created.
+
+**Condition 4 is evaluated per channel, and each is repaired on its own.** A present request must
+never suppress a missing notification, or the trigger would classify a request-only item as "waiting
+on someone" and leave it in exactly the state this section opens by calling broken. Fire for the
+missing half only.
+
+Read state and timestamps from the artifact, and compare **timestamps, never dates** — a block and a
+head on the same day can be hours apart in either order. ⚠ On a shared account, comments after a
+block may be a **peer's**, not yours: verify who actually responded before recording a reply or
+claiming the block is addressed. Recording someone else's work as your own launders it and silences a
+re-report that was correct.
+
+### What to do
+
+Three channels. **Gate each independently — do the ones that are missing, skip the ones that already
+exist**, once per trigger per **action, step 3 included**. Steps 1 and 2 are both required, so neither one's presence
+excuses the other's absence. Step 3 escalates and is time-gated rather than gap-gated.
+
+1. **Create the platform request — only if none stands.** Request review, assign the issue, or
+   establish the equivalent durable state. Free, reversible, and the only step that survives an inbox
+   sweep. Do it first when it is missing: the party genuinely never had the item in their queue, so
+   **escalation (step 3) may then be unnecessary — step 2 is not.** Creating the request never
+   discharges the notification; if both were missing, both are still owed.
+2. **Notify the responsible party where their resolved identity is actually live — only if no
+   state-change notification has been delivered since the last state change.** Resolve the person
+   *and* their agent from the map **before** addressing anyone — a nudge sent to a stale handle reads
+   as answered to you and arrives nowhere. An agent stands in for its person and is reachable when the
+   human is not. **Prefer the shared work room when the party is reachable there** (the work already
+   has context); otherwise use whatever addressed surface the map says is live, honouring
+   `exclusive: true` — the reachability contract below is explicit that some people are reachable on
+   exactly one surface and a message anywhere else reaches nobody. **Hard-wiring this step to the
+   shared room contradicts that contract and produces the defect this section exists to remove:** a
+   durable request created while a reachable person stays unaware, with no immediate-awareness action
+   available until the horizon. If no addressed route is constructible at all, **the awareness
+   requirement is NOT satisfied** — hand the item to an owner or a reachable replacement and record
+   that handoff as the terminal outcome. This is deliberately **not** symmetric with the
+   durable-request branch: losing durable queue state can still leave the party aware, whereas
+   losing the awareness channel leaves nobody contacted. Re-evaluate host-local unreachability when
+   a route becomes available, and keep this case pinned through the horizon rather than letting it
+   lapse into satisfied. Step 3 remains the later escalation; it must never be used to delay
+   first awareness.
+3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
+   **when the ask is first made**, derived from the item's urgency and the team's conventions, and
+   record it with the ask. Escalate only when the horizon has passed, **every constructible channel
+   is confirmed *delivered*** — a **durable** channel recorded unavailable counts as **satisfied, not
+   pending**, while an unavailable **awareness** channel does not and instead triggers the handoff
+   above, since escalating to a personal channel is itself an addressed route and cannot be the
+   terminal step when no addressed route exists —
+   and the state has still not changed. A fixed number of hours invented here would
+   impose a uniform SLA on teams that do not share one; no horizon at all is "wait forever" wearing
+   patience's clothes.
+
+Include the artifact, what changed, and the exact action needed.
+
+**When the durable channel cannot represent the party, say so instead of creating a false one.**
+Step 1 assumes the platform can name the capable party; sometimes it cannot — a shared account, a bot
+identity several humans push under, an external reviewer with no account. Measured in this repo: three
+distinct display names resolve to one platform identity, so a request "assigned" there names no one.
+
+In that case the condition is **satisfied, not pending**: record that the durable channel is
+unavailable for this party and why, then treat step 2 as the only channel it has — and make the ask
+name the person explicitly, since the shared identity will otherwise absorb it. Do not create a
+request against an identity that cannot act, and do not leave condition 4 true forever waiting for
+one; a rule with no terminal branch re-fires on every sweep.
+
+**Four cases the conditions must not collapse into "waiting on someone":**
+
+- **Request-only** — a standing request exists, no notification since the last state change. The item
+  sits in a queue nobody has looked at. **Fire step 2 alone**; do not create a second request.
+- **Notification-only** — the party was addressed, no standing request exists. The item was known
+  about once and is now in nobody's list. **Fire step 1 alone**; do not re-send the message.
+- **Both missing** — the common case on a newly stalled item. **Fire steps 1 AND 2**, in that order.
+  This is the case a "later steps may be unnecessary" reading would truncate into request-only, which
+  is the state this section opens by calling broken.
+
+- **Unavailable-and-overdue** — the durable channel was recorded unavailable, step 2 was delivered,
+  and the horizon has passed. **Escalate.** Requiring an undeliverable step 1 first would strand this
+  item permanently, which is the one outcome every rule above exists to prevent.
+
+Each action keeps its own once-per-trigger record, so repairing one does not re-arm another — and
+step 3 has one too, keyed on `(blocker, state, horizon)`. A horizon can be crossed only once, so that
+key bounds escalation to a single message without borrowing the repair steps' key.
+
+### Guardrails
+
+- **If the blocker is still in your court, fix it instead of nudging.**
+- **If a capable request already exists, do not create another** — but check the notification half
+  separately; a present request is not evidence the party knows.
+- **Act once per trigger, not once per sweep.** A standing gap that has not changed does not deserve
+  a second message; re-sending teaches the recipient to filter you. Read this per action: a repair
+  already made is not re-made, and a horizon already crossed and escalated is not escalated again.
+- **Do not nudge someone who just acted.** Give a response time to be seen before treating silence as
+  a gap.
+- **Never chase work you do not own or shepherd.** On someone else's item, prepare and surface it to
+  your owner; do not push, comment, or chase on their behalf.
+- **Send state-changing messages** — *"I addressed X; please re-review"* — never contentless
+  *"any update?"* pings.
+- **A nudge is not a wait-state.** Verify that someone now holds the request — or that the durable
+  channel is recorded unavailable, which discharges this check rather than failing it — then keep working and
+  track the item to completion, reassignment, or release. Blocked-on-someone is a cue to switch
+  lanes, never to stop.
+- **Record what you did and when**, with the timestamp read from the artifact rather than the moment
+  of recording. A log that misstates when you asked misleads the next reader about whether the party
+  has had time to answer.
+
 
 ## Operating contract
 
@@ -135,7 +297,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 6. Update the record idempotently. Preserve contradictory evidence; do not silently overwrite it.
 7. Use the map to choose the smallest useful collaboration set. Prefer the responsible agent; cc its owner or relevant human when accountability, approval, ambiguity, or risk requires it.
 8. Report material changes: unfamiliar participants, ownership changes, conflicting identity claims, stale room purpose, or newly inferred sensitive relationships.
-9. **PR notification contract (owner rule 2026-08-23): every PR create or update ends with reviewers NOTIFIED, addressed to each reviewer's Sutando Stand.** A GitHub review request alone is not notification — the review-request queue is where PRs stall. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Roster field `identity_caveat` (optional, per entry): free text printed to stderr by `resolve()` before any target is built.** Populate it when one GitHub login covers more than one agent — the login is then not a discriminator in EITHER direction (a PR authored under it reads as the wrong agent; comments by one read as not-theirs). Say which discriminator IS reliable, e.g. the commit author email or a shepherd doc. It never refuses a target: a shared login is a reason to check WHICH person you mean, not a reason to skip them. **Population is per-host** — the roster is host-local and uncarved from the vault, so a caveat set on one machine is absent on every other, and the print is inert until someone fills the field in. Pinned by `tests/notify-reviewers-human-shapes.test.py`. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/data/collaboration-intelligence/reviewer-stands.json`) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
+9. **PR notification contract (owner rule 2026-08-23): whenever the messaging tests below fire for a PR, the message must be both SOLICITED and NOTIFIED — addressed to each reviewer's Sutando Stand on the channels where they actually are.** This item defines what ADDRESSING means; it does not define when to send. **The trigger is owned solely by "The trigger to message is a state change the other party would want to know about" below** — opening a PR, a new head needing re-review, an addressed finding, a changed direction, or the ownership horizon. A cosmetic title, body, or label edit fires nothing, and each trigger fires once: an unchanged gap is not re-announced. Stating the trigger here as well as there is what let this item drift into commanding a duplicate solicitation on every edit. Soliciting and notifying are two acts, not one: soliciting is the GitHub review request; notifying is the addressed message that reaches the Stand. A review request alone is not notification — the review-request queue is where PRs stall. Send the notification where that Stand is present rather than wherever you happen to be: check the map for its live channels and honour `exclusive: true`, since a message on a surface it does not read reaches nobody. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Roster field `identity_caveat` (optional, per entry): free text printed to stderr by `resolve()` before any target is built.** Populate it when one GitHub login covers more than one agent — the login is then not a discriminator in EITHER direction (a PR authored under it reads as the wrong agent; comments by one read as not-theirs). Say which discriminator IS reliable, e.g. the commit author email or a shepherd doc. It never refuses a target: a shared login is a reason to check WHICH person you mean, not a reason to skip them. **Population is per-host** — the roster is host-local and uncarved from the vault, so a caveat set on one machine is absent on every other, and the print is inert until someone fills the field in. Pinned by `tests/notify-reviewers-human-shapes.test.py`. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/data/collaboration-intelligence/reviewer-stands.json`) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
 
 ## Quick lookup index
 
