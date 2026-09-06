@@ -31,10 +31,21 @@ class HygieneBase(unittest.TestCase):
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: list(self.alive),
                              alive_fn=lambda i: self.alive.get(i, False),
-                             now_fn=lambda: self.clock[0])
+                             now_fn=lambda: self.clock[0],
+            mono_fn=lambda: self.clock[0])
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _pass_awake(self, seconds, fn):
+        """Advance in daemon-cadence steps: one clock leap reads as a host
+        sleep to the wake guard, which is not what these tests mean."""
+        outs = []
+        end = self.clock[0] + seconds
+        while self.clock[0] < end:
+            self.clock[0] = min(self.clock[0] + 20, end)
+            outs += fn()
+        return outs
 
 
 class StuckAssignmentTests(HygieneBase):
@@ -42,29 +53,28 @@ class StuckAssignmentTests(HygieneBase):
         f = self.tasks / "task-s1.assigned-core-1.txt"
         f.write_text("task: t\n")
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])  # adopted
-        self.clock[0] += 301
-        self.assertEqual(self.lead.reclaim_stuck_assignments(),
-                         ["task-s1.assigned-core-1.txt"])
+        outs = self._pass_awake(301, self.lead.reclaim_stuck_assignments)
+        self.assertEqual(outs, ["task-s1.assigned-core-1.txt"])
         self.assertTrue((self.tasks / "task-s1.txt").exists())
 
     def test_young_assignment_untouched(self):
         (self.tasks / "task-s2.assigned-core-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
-        self.clock[0] += 299
-        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.assertEqual(
+            self._pass_awake(299, self.lead.reclaim_stuck_assignments), [])
 
     def test_dead_follower_left_to_reclaim_dead(self):
         (self.tasks / "task-s3.assigned-core-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
         self.alive["core-1"] = False
-        self.clock[0] += 301
-        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.assertEqual(
+            self._pass_awake(301, self.lead.reclaim_stuck_assignments), [])
 
     def test_claimed_files_never_touched(self):
         (self.tasks / "task-s4.claimed-core-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
-        self.clock[0] += 10_000
-        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.assertEqual(
+            self._pass_awake(10_000, self.lead.reclaim_stuck_assignments), [])
         self.assertTrue((self.tasks / "task-s4.claimed-core-1.txt").exists())
 
     def test_ledger_forgets_departed_files(self):
@@ -72,8 +82,8 @@ class StuckAssignmentTests(HygieneBase):
         f.write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
         f.rename(self.tasks / "task-s5.claimed-core-1.txt")  # follower claimed
-        self.clock[0] += 400
-        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.assertEqual(
+            self._pass_awake(400, self.lead.reclaim_stuck_assignments), [])
         import json
         ledger = json.loads(
             (self.state / "pool" / "assignments.json").read_text())

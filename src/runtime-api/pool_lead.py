@@ -20,10 +20,15 @@ import re
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
+from pool_follower import LEAD_STALE_S  # noqa: E402
+
+# tick gap past one beat period = host sleep; shorter can't stale a beat
+SLEEP_SKEW_S = 5.0  # wall clock advances through host sleep; monotonic pauses
 
 # Depth at which channelless work overflows to the idle lane core; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
@@ -120,7 +125,7 @@ def _read_lane(path: Path) -> str:
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
                  now_fn=time.time, metrics=None, results_dir=None,
-                 runtime_fn=None):
+                 mono_fn=time.monotonic, runtime_fn=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files.
@@ -137,6 +142,7 @@ class PoolLead:
         self.followers_fn = followers_fn
         self.alive_fn = alive_fn
         self.now = now_fn
+        self.mono = mono_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
@@ -435,10 +441,159 @@ class PoolLead:
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
+    def _wake_evidence_path(self) -> Path:
+        return self.state_dir / "pool" / "lead-tick.json"
+
+    def _wake_lock(self) -> _FlockCtx:
+        """Serializes the wake record's load/merge/replace across overlapping
+        leads; plain reads of the atomic file need no lock."""
+        path = self._wake_evidence_path().with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return _FlockCtx(path)
+
+    def _load_wake_evidence(self) -> "tuple[float, float, float | None] | None":
+        """Previous lead's last (wall, mono, defer_until) sample, or None.
+
+        monotonic is BOOT-relative, so a predecessor's sample is
+        differenceable here; a reboot resets it, which shows up as a stored
+        value ahead of ours and is discarded.
+
+        The stored deadline carries an OPEN grace window across a respawn.
+        Without it the successor loads a post-wake pair showing no skew and
+        is ALSO excluded from the cold-lead fallback, because its seeded
+        sample is not None -- both escapes close together and the window is
+        silently lost.
+        """
+        try:
+            d = json.loads(self._wake_evidence_path().read_text())
+            w, m = float(d["wall"]), float(d["mono"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if m > self.mono():
+            return None
+        try:
+            du = d.get("defer_until")
+            du = None if du is None else float(du)
+        except (TypeError, ValueError):
+            du = None
+        # A deadline outside the window it was opened for is corrupt or
+        # foreign, never evidence; an expired one must not resurrect grace.
+        if du is not None and not (m <= du <= m + LEAD_STALE_S):
+            du = None
+        return w, m, du
+
+    def _save_wake_evidence(self, wall: float, mono: float,
+                            defer_until: "float | None" = None
+                            ) -> "tuple[bool, float | None]":
+        """Publish this lead's wake sample; return (published, effective).
+        `effective` is the deadline the record now CARRIES, which may be
+        another lead's — decide from it, never from the pre-merge value."""
+        p = self._wake_evidence_path()
+        # Per-writer temp name, as pool_status does: briefly overlapping leads
+        # are supported, and a shared temp lets one consume the other's bytes.
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+        try:
+            # One lock across load..replace: unique temps stop a torn record,
+            # not a stale write erasing a deadline opened since its load.
+            with self._wake_lock():
+                prior = self._load_wake_evidence()
+                # The loader bounds a deadline by the STORED mono, so an
+                # older sample beside a newer deadline voids grace on read.
+                if prior is not None and prior[1] > mono:
+                    wall, mono = prior[0], prior[1]
+                # The window belongs to the wake event, not to whoever ticked
+                # last, so the MAXIMUM still-open deadline survives.
+                open_du = prior[2] if prior is not None else None
+                if open_du is not None and mono < open_du:
+                    defer_until = (open_du if defer_until is None
+                                   else max(defer_until, open_du))
+                payload = {"wall": wall, "mono": mono}
+                if defer_until is not None:
+                    payload["defer_until"] = defer_until
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps(payload))
+                os.replace(tmp, p)
+            return True, defer_until
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False, None
+
+    def _publish_wake(self, wall: float, mono: float,
+                      defer_until: "float | None") -> "tuple[bool, float | None]":
+        """Publish the wake sample and REPORT a loss. A silent best-effort
+        write is what let a failed publish renew the same window forever."""
+        published, effective = self._save_wake_evidence(wall, mono, defer_until)
+        if published:
+            return True, effective
+        print("pool-lead: wake evidence not published "
+              f"(defer_until={defer_until}); grace cannot be bounded",
+              file=sys.stderr, flush=True)
+        return False, None
+
+    def _host_gap_defers_reclaim(self) -> bool:
+        """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's
+        own tick, not mere tick-gap size: the monotonic clock pauses through
+        host sleep while wall time advances, so skew is definitive — and an
+        awake-but-slow daemon (long --interval, GC stall) shows wall ~= mono,
+        gets no grace, and cannot renew the deferral.
+
+        The grace window, once opened, expires by TIME ONLY — a sibling
+        heartbeat must not end it while the claim owner's beat is still due.
+        """
+        now = self.now()
+        mono = self.mono()
+        last = getattr(self, "_last_reclaim_tick", None)
+        last_mono = getattr(self, "_last_reclaim_mono", None)
+        if last is None:
+            # A restarted lead has no in-process sample, but its predecessor
+            # left one: seed from it so the skew test below covers tick 1.
+            seeded = self._load_wake_evidence()
+            if seeded is not None:
+                last, last_mono, carried = seeded
+                # The window belongs to the host's wake event, not to the
+                # process that opened it; expiry stays time-only.
+                if carried is not None and mono < carried:
+                    self._reclaim_defer_until = carried
+        self._last_reclaim_tick = now
+        self._last_reclaim_mono = mono
+        if last is not None and last_mono is not None:
+            if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
+                # Deadline in MONOTONIC time: a backward wall correction must
+                # not stretch one stale window into hours of withheld recovery.
+                self._reclaim_defer_until = mono + LEAD_STALE_S
+        elif last is None:
+            # fresh lead + all-stale pool: indistinguishable from a
+            # post-wake lead restart — grace one window
+            try:
+                followers = list(self.followers_fn())
+            except Exception:  # noqa: BLE001 — broken resolver must not defer
+                self._publish_wake(
+                    now, mono, getattr(self, "_reclaim_defer_until", None))
+                return False
+            if followers and not any(self.alive_fn(f) for f in followers):
+                self._reclaim_defer_until = mono + LEAD_STALE_S
+        du = getattr(self, "_reclaim_defer_until", None)
+        published, effective = self._publish_wake(now, mono, du)
+        # Decide from the COMMITTED deadline: a peer's open grace binds this
+        # lead too, and it is only visible in what the record actually holds.
+        if effective is not None and (du is None or effective > du):
+            self._reclaim_defer_until = du = effective
+        if not published:
+            # The one-window bound lives IN the record a successor seeds from;
+            # unpublished, every restart re-opens grace. Refuse, don't renew.
+            self._reclaim_defer_until = None
+            return False
+        return du is not None and mono < du
+
     def reclaim_dead(self) -> "list[str]":
         """Return dead followers' assignments to the unassigned pool.
         Claimed files are NOT touched here — a claim means work may have
         side-effected; that recovery keeps the done-flag path (L2)."""
+        if self._host_gap_defers_reclaim():
+            return []
         reclaimed = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
         try:
@@ -449,6 +604,10 @@ class PoolLead:
             m = pat.match(f.name)
             if not m or self.alive_fn(m.group(2)):
                 continue
+            # Same post-liveness re-check as the claimed variant: the entry
+            # guard cannot see a suspension that begins after it sampled.
+            if self._host_gap_defers_reclaim():
+                return reclaimed
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
@@ -516,6 +675,8 @@ class PoolLead:
         session's wrapper keeps its heartbeat fresh, so reclaim_dead never
         fires — unclaimed age is the only signal. No claim = no work started,
         so repooling cannot double-fire a side effect."""
+        if self._host_gap_defers_reclaim():
+            return []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
         ledger = self._load_assign_ledger()
         out = []
@@ -545,6 +706,10 @@ class PoolLead:
                 # the cap anchors to file age, so a wedged core still yields
                 ledger[f.name] = self.now() - max_age_s + BUSY_EXIT_GRACE_S
                 continue
+            # Same post-observation re-check as the dead/claimed variants: the
+            # entry guard cannot see a suspension that began after the age read.
+            if self._host_gap_defers_reclaim():
+                return out
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
@@ -606,6 +771,8 @@ class PoolLead:
         deliver (sweep skips it). The reachable crash residue is a result
         with no done-flag — finish_task writes the result first — and that
         work is COMPLETE, so it must not be repooled for re-execution."""
+        if self._host_gap_defers_reclaim():
+            return []
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
@@ -616,6 +783,10 @@ class PoolLead:
             m = pat.match(f.name)
             if not m or self.alive_fn(m.group(2)):
                 continue
+            # Suspension can begin BETWEEN the entry guard and this liveness
+            # read, which would make a live owner read dead. Re-check first.
+            if self._host_gap_defers_reclaim():
+                return out
             canonical = m.group(1) + ".txt"
             try:
                 os.rename(f, f.with_name(canonical))
