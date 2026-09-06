@@ -31,6 +31,7 @@ import argparse
 import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -163,14 +164,68 @@ def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
         return cands[0], ""
     names = ", ".join(c.parent.parent.name for c in cands)
     ptr = _host_pointer_path(projects, repo) or "<hosts/<label>/memory-corpus>"
-    return None, (
-        f"CANNOT ANSWER: {len(cands)} candidate indexes under {projects} and nothing "
+    ambiguity = (
+        f"AMBIGUOUS CORPUS: {len(cands)} candidate indexes under {projects} and nothing "
         f"authoritative names one ({names}). An mtime says which was edited last, not "
-        f"which one this session loads, and most of these are ordinary Claude Code "
-        f"projects rather than this agent's corpus.\n"
+        f"which one this session loads.\n"
         f"RECORD IT ONCE -- this host then answers unattended forever:\n"
-        f"    echo '<abs path to the MEMORY.md this session loads>' > {ptr}\n"
+        f"    memory-index-budget.py --record <abs path to the MEMORY.md this session loads>\n"
+        f"    (writes {ptr}, validated and atomic)\n"
         f"(or set SUTANDO_MEMORY_DIR, or pass --index for a one-off.)")
+    # Refusing here makes the guard inert on every multi-corpus host, which costs
+    # more than an answer carrying its own caveat. Only a MISSING default refuses.
+    if default.is_file():
+        return default, (ambiguity + f"\nANSWERING FROM THE DEFAULT {default} — it may not be "
+                         f"the corpus this session loads; the number below is unverified.")
+    return None, "CANNOT ANSWER: " + ambiguity
+
+
+
+def record_pointer(projects: Path, repo: Path, target: Path,
+                   force: bool = False) -> "tuple[int, str]":
+    """THE writer for this host's corpus pointer. Validates, then writes atomically.
+
+    A pointer naming nothing turns every later call into a refusal that reads as a
+    missing corpus, so the validation is the contract, not a courtesy.
+    """
+    ptr = _host_pointer_path(projects, repo)
+    if ptr is None:
+        return 2, ("CANNOT ANSWER: this host's label is unresolvable, so there is no "
+                   "pointer path to write. Set SUTANDO_HOST_LABEL or pass --index.")
+    target = target.expanduser()
+    if not target.is_file():
+        return 2, f"REFUSED: {target} is not a file — a pointer must name an existing index."
+    if target.name != "MEMORY.md":
+        return 2, f"REFUSED: {target} is not named MEMORY.md — that is not an index."
+    # Bootstrap only. A writer that overwrites silently can retarget a host that was
+    # already correct, and this record is the one input the reader cannot sanity-check.
+    if ptr.exists() and not force:
+        try:
+            cur = ptr.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            cur = f"<unreadable: {e}>"
+        return 2, (f"REFUSED: {ptr} already records {cur!r}. This operation bootstraps a "
+                   "missing pointer; pass --force to retarget an existing one deliberately.")
+    resolved = target.resolve()
+    try:
+        ptr.parent.mkdir(parents=True, exist_ok=True)
+        fd, staged = tempfile.mkstemp(prefix=f".{ptr.name}.", suffix=".tmp", dir=str(ptr.parent))
+    except OSError as e:
+        return 2, f"REFUSED: cannot stage a write next to {ptr} ({e})."
+    tmp = Path(staged)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(resolved) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ptr)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return 0, f"recorded: {ptr} -> {resolved}"
 
 
 def main(argv=None) -> int:
@@ -179,6 +234,10 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]),
                     help="repo holding src/health-check.py (default: this checkout)")
     ap.add_argument("--index", help="path to MEMORY.md (default: from the repo's MEMORY_DIR)")
+    ap.add_argument("--record", metavar="MEMORY_MD",
+                    help="record THIS host's corpus pointer (validated, atomic) and exit")
+    ap.add_argument("--force", action="store_true",
+                    help="with --record: retarget a pointer that already exists")
     ap.add_argument("--adding")
     ap.add_argument("--adding-file")
     ap.add_argument("--at-top", action="store_true")
@@ -191,13 +250,21 @@ def main(argv=None) -> int:
               "than measuring with a private copy of the limit", file=sys.stderr)
         return 2
 
+    if a.record:
+        rc, msg = record_pointer(Path(getattr(mod, "MEMORY_DIR", "")).parent.parent,
+                                 repo, Path(a.record), force=a.force)
+        print(msg, file=sys.stderr if rc else sys.stdout)
+        return rc
+
     if a.index:
         index, note = Path(a.index), ""
     else:
         index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")), repo)
-        if index is None:
-            # note is non-empty IFF index is None -- every resolved path returns "".
+        # A note now travels with a RESOLVED index too, carrying the caveat that
+        # made it ambiguous; only a None index is a refusal.
+        if note:
             print(note, file=sys.stderr)
+        if index is None:
             return 2
     if not index.is_file():
         print(f"CANNOT ANSWER: no index at {index}", file=sys.stderr)

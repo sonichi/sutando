@@ -141,14 +141,15 @@ def _tree(projects, slug, text, age_s):
     return d
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
     got, note = mib._live_index(stale, REPO)
     # A 12-day gap is exactly the case where "freshest" looks authoritative and
     # is not: an unrelated project edited later is still not what loads here.
-    check("resolution: two corpora and no authoritative signal REFUSES, however wide the gap",
-          got is None and "CANNOT ANSWER" in note, f"got={got}")
+    check("resolution: two corpora ANSWER from the default, carrying the ambiguity as a caveat",
+          got == stale / "MEMORY.md" and "AMBIGUOUS CORPUS" in note
+          and "unverified" in note, f"got={got} note={note!r}")
     check("resolution: the refusal NAMES the candidates rather than picking one",
           "slug-live" in note and "slug-stale" in note, f"note={note!r}")
     check("resolution: the refusal says what to do instead of leaving the caller stuck",
@@ -204,10 +205,10 @@ with tempfile.TemporaryDirectory() as d:
           ptr.parent.name == "test-host" and ptr.parent.parent.name == "hosts", f"ptr={ptr}")
     # The pointer adds a way in; it does not soften the ambiguous refusal.
     got, note = mib._live_index(stale, REPO)
-    check("pointer: absent pointer leaves the ambiguous refusal intact",
-          got is None and "CANNOT ANSWER" in note, f"got={got}")
-    check("pointer: the refusal now names the file to record, so a host is not stuck",
-          str(ptr) in note and "RECORD IT ONCE" in note, f"note={note!r}")
+    check("pointer: an absent pointer still answers, still caveated",
+          got == stale / "MEMORY.md" and "AMBIGUOUS CORPUS" in note, f"got={got}")
+    check("pointer: the caveat names the file to record AND the writer that writes it",
+          str(ptr) in note and "RECORD IT ONCE" in note and "--record" in note, f"note={note!r}")
     # Point at the corpus that is neither freshest nor the derived one, so only
     # the pointer can produce this answer.
     ptr.parent.mkdir(parents=True, exist_ok=True)
@@ -223,28 +224,29 @@ with tempfile.TemporaryDirectory() as d:
     ptr.write_text("   \n")
     got, note = mib._live_index(stale, REPO)
     check("pointer: an empty pointer is 'unrecorded', not 'recorded as nothing'",
-          got is None and "CANNOT ANSWER" in note and "RECORD IT ONCE" in note, f"note={note!r}")
+          got == stale / "MEMORY.md" and "AMBIGUOUS CORPUS" in note
+          and "RECORD IT ONCE" in note, f"note={note!r}")
     os.environ.pop("SUTANDO_HOST_LABEL", None)
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     only = _tree(projects, "slug-only", index_of(LIMIT // 3), age_s=60)
     got, note = mib._live_index(only, REPO)
     check("resolution: a single corpus is unchanged behaviour and says nothing",
           got == only / "MEMORY.md" and note == "", f"got={got} note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     a = _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
     got, note = mib._live_index(a, REPO)
-    check("resolution: near-simultaneous indexes REFUSE too -- the gap never decides",
-          got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
+    check("resolution: near-simultaneous indexes are ambiguous too -- the gap never decides",
+          got == a / "MEMORY.md" and "AMBIGUOUS CORPUS" in note, f"got={got} note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
     # A fresher tree OUTSIDE the projects/ parent must not be reachable: the scope
     # bound is what keeps this from wandering the filesystem.
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     mine = _tree(projects, "slug-mine", index_of(LIMIT // 3), age_s=3600)
     outside = pathlib.Path(d) / "elsewhere" / "memory"
     outside.mkdir(parents=True)
@@ -254,7 +256,7 @@ with tempfile.TemporaryDirectory() as d:
           got == mine / "MEMORY.md", f"got {got}")
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale2", index_of(LIMIT // 3), age_s=86400)
     _tree(projects, "slug-live2", index_of(LIMIT // 2), age_s=60)
     named = stale / "MEMORY.md"
@@ -267,7 +269,7 @@ with tempfile.TemporaryDirectory() as d:
 with tempfile.TemporaryDirectory() as d:
     # The override outranks every heuristic, including when it names the OLDER
     # tree: the owner states identity, the tool does not infer it.
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     older = _tree(projects, "slug-older", index_of(LIMIT // 3), age_s=86400)
     newer = _tree(projects, "slug-newer", index_of(LIMIT // 2), age_s=60)
     _prev = os.environ.get("SUTANDO_MEMORY_DIR")
@@ -310,7 +312,7 @@ with tempfile.TemporaryDirectory() as d:
 with tempfile.TemporaryDirectory() as d:
     # Injected, not filesystem-induced: a FILE where projects/ should be does not
     # raise on macOS, it yields nothing — the wrong branch, same visible outcome.
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     live = _tree(projects, "slug-os", index_of(LIMIT // 3), age_s=60)
     real_glob = pathlib.Path.glob
     def boom(self, pattern, *a, **k):
@@ -344,7 +346,7 @@ def _main_with_memory_dir(memory_dir, args):
     return rc, buf.getvalue(), err.getvalue()
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale3", index_of(LIMIT // 3), age_s=86400)
     _tree(projects, "slug-live3", index_of(LIMIT // 2), age_s=60)
     rc, out, _ = _main_with_memory_dir(stale, ["--repo", str(REPO)])
@@ -355,7 +357,7 @@ with tempfile.TemporaryDirectory() as d:
           f"rc={rc} out={out[:120]!r}")
 
 with tempfile.TemporaryDirectory() as d:
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     a2 = _tree(projects, "slug-tie-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-tie-b", index_of(LIMIT // 3), age_s=11)
     rc, out, err = _main_with_memory_dir(a2, ["--repo", str(REPO)])
@@ -367,7 +369,7 @@ with tempfile.TemporaryDirectory() as d:
 with tempfile.TemporaryDirectory() as d:
     # main()'s refusal path: reachable only when _live_index cannot resolve, which
     # the override CAN produce -- it names a directory holding no index.
-    projects = pathlib.Path(d) / "projects"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     _tree(projects, "slug-present", index_of(LIMIT // 3), age_s=60)
     empty = projects / "slug-empty" / "memory"
     empty.mkdir(parents=True)
@@ -384,6 +386,86 @@ with tempfile.TemporaryDirectory() as d:
           mib._health_check(pathlib.Path(d)) is None)
     hc.write_text("raise RuntimeError('broken')\n")
     check("a health-check.py that raises on import -> None", mib._health_check(pathlib.Path(d)) is None)
+
+# ---- the refusal that must SURVIVE the caveat change -----------------------
+# A guard that can no longer refuse is not a guard. The caveat softens the
+# AMBIGUOUS case only; with nothing to fall back to, refusing is still correct.
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
+    _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
+    empty = pathlib.Path(d) / "no-default" / "memory"
+    empty.mkdir(parents=True)
+    got, note = mib._live_index(empty, REPO)
+    check("refusal SURVIVES: ambiguous AND no default to answer from still refuses",
+          got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
+
+# ---- the writer qingyun-wu asked for: validate, atomic, defined failures ----
+with tempfile.TemporaryDirectory() as d:
+    os.environ["SUTANDO_HOST_LABEL"] = "test-host"
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
+    ptr = projects.parent.parent / "hosts" / "test-host" / "memory-corpus"
+
+    rc, msg = mib.record_pointer(projects, REPO, live / "MEMORY.md")
+    check("record: a valid target writes and reports where", rc == 0 and str(ptr) in msg, msg)
+    check("record: the pointer holds the RESOLVED absolute path",
+          ptr.read_text().strip() == str((live / "MEMORY.md").resolve()), ptr.read_text())
+    check("record: it leaves no staging file behind",
+          not list(ptr.parent.glob(".*tmp")), list(ptr.parent.glob(".*")))
+    # Round trip: the thing just written is the thing the resolver honours.
+    stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
+    got, note = mib._live_index(stale, REPO)
+    check("record: ROUND TRIP -- what --record wrote is what the resolver returns",
+          got is not None and got.resolve() == (live / "MEMORY.md").resolve()
+          and note == "", f"got={got} note={note!r}")
+
+    before = ptr.read_text()
+    rc, msg = mib.record_pointer(projects, REPO, pathlib.Path(d) / "nope" / "MEMORY.md")
+    check("record: a target that is not a file REFUSES", rc == 2 and "not a file" in msg, msg)
+    rc2, msg2 = mib.record_pointer(projects, REPO, live / "notes.md")
+    check("record: a file that is not an index REFUSES", rc2 == 2, msg2)
+    check("record: a REFUSED write leaves the existing pointer untouched",
+          ptr.read_text() == before, ptr.read_text())
+
+    # Bootstrap-only: the writer must never silently retarget a live pointer.
+    # A stray call would repoint a host that was already correct, and the reader
+    # has no way to tell a wrong pointer from a right one.
+    second = _tree(projects, "slug-second", index_of(LIMIT // 4), age_s=30)
+    kept = ptr.read_text()
+    rc_c, msg_c = mib.record_pointer(projects, REPO, second / "MEMORY.md")
+    check("record: a SECOND record onto an existing pointer REFUSES",
+          rc_c == 2 and "already records" in msg_c, msg_c)
+    check("record: ...and the refusal names the value it declined to overwrite",
+          kept.strip() in msg_c, msg_c)
+    check("record: ...and the pointer is byte-identical afterwards",
+          ptr.read_text() == kept, ptr.read_text())
+    rc_f, msg_f = mib.record_pointer(projects, REPO, second / "MEMORY.md", force=True)
+    check("record: --force retargets deliberately", rc_f == 0, msg_f)
+    check("record: ...and the pointer then holds the NEW target",
+          ptr.read_text().strip() == str((second / "MEMORY.md").resolve()), ptr.read_text())
+    os.environ.pop("SUTANDO_HOST_LABEL", None)
+
+with tempfile.TemporaryDirectory() as d:
+    # No resolvable label means no pointer path; refusing beats writing somewhere.
+    # An EMPTY env var does not create this -- _host_label falls through to the
+    # hostname -- so the condition is made at the resolver, not via the environment.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "slug-live", index_of(LIMIT // 3), age_s=60)
+    _real = mib._host_label
+    mib._host_label = lambda repo: ""
+    try:
+        rc, msg = mib.record_pointer(projects, REPO, live / "MEMORY.md")
+    finally:
+        mib._host_label = _real
+    check("record: an unresolvable host label REFUSES rather than guessing a path",
+          rc == 2 and "label" in msg.lower(), msg)
+    mib._host_label = lambda repo: "test-host-control"
+    try:
+        check("record: ...and the control -- the SAME call succeeds once a label resolves",
+              mib.record_pointer(projects, REPO, live / "MEMORY.md")[0] == 0)
+    finally:
+        mib._host_label = _real
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
