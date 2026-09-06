@@ -32,17 +32,30 @@ class Contract(unittest.TestCase):
 
     def test_the_room_projection_carries_no_numbers_and_no_reasons(self):
         p = av.availability_projection(S(runtime_healthy=True, active_runs=3, max_concurrency=4, queue_depth=7), worker="air")
-        self.assertEqual(set(p), {"worker", "availability", "scope", "ts"})
-        self.assertEqual((p["availability"], p["scope"]), ("busy_accepting", "room"))
+        self.assertEqual(set(p), {"worker", "room", "availability", "audience", "projection", "ts"})
+        self.assertEqual((p["availability"], p["audience"], p["projection"]), ("busy_accepting", "room", "AVAILABILITY"))
         self.assertNotIn("3", json.dumps(p)); self.assertNotIn("7", json.dumps({k: v for k, v in p.items() if k != "ts"}))
 
     def test_the_task_projection_says_who_and_since_when_but_not_what(self):
         snap = {"task_id": "t", "message_event_id": "$m", "worker": "air", "phase": "RUNNING", "started_at": 1000.0,
                 "summary": "reviewing the acquisition documents", "seq": 9}
         p = av.task_projection(snap, now=1360.0)
-        self.assertEqual((p["worker"], p["phase"], p["since_s"], p["scope"]), ("air", "RUNNING", 360.0, "room"))
+        self.assertEqual((p["worker"], p["phase"], p["since_s"], p["audience"], p["projection"]),
+                         ("air", "RUNNING", 360.0, "room", "TASK_STATUS"))
         self.assertNotIn("summary", p); self.assertNotIn("seq", p)
         self.assertNotIn("acquisition", json.dumps(p))
+
+
+class PerRoom(unittest.TestCase):
+    def test_a_room_policy_can_narrow_what_this_room_learns_but_never_widen_it(self):
+        s = S(runtime_healthy=True, active_runs=1, max_concurrency=4)
+        narrow = lambda room, v: "busy_unavailable" if room == "!engineering:s" and v == "busy_accepting" else v
+        self.assertEqual(av.availability_projection(s, "air", "!engineering:s", narrow)["availability"], "busy_unavailable")
+        self.assertEqual(av.availability_projection(s, "air", "!board:s", narrow)["availability"], "busy_accepting")
+        widen = lambda room, v: "available"  # a policy cannot invent a value outside the contract either
+        self.assertEqual(av.availability_projection(s, "air", "!x:s", lambda r, v: "reviewing acquisition docs")["availability"],
+                         "busy_accepting", "an off-contract value is ignored, never leaked")
+        self.assertIn(av.availability_projection(s, "air", "!x:s", widen)["availability"], av.AVAILABILITY)
 
 
 class Reading(unittest.TestCase):

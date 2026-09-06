@@ -50,9 +50,18 @@ def availability(state: AgentRuntimeState) -> str:
     return "busy_unavailable"
 
 
-def availability_projection(state: AgentRuntimeState, worker: str | None = None) -> dict:
-    """What the room may see. No counts, no reasons, no queue contents."""
-    return {"worker": worker, "availability": availability(state), "scope": "room", "ts": time.time()}
+def availability_projection(state: AgentRuntimeState, worker: str | None = None, room_id: str | None = None,
+                            room_policy=None) -> dict:
+    """What THIS room may see. No counts, no reasons, no queue contents. The canonical state is global;
+    `room_policy(room_id, value) -> value` lets a room learn less (never more), so a member of one
+    room cannot infer what the agent does in another."""
+    value = availability(state)
+    if room_policy is not None:
+        narrowed = room_policy(room_id, value)
+        if narrowed in AVAILABILITY:
+            value = narrowed
+    return {"worker": worker, "room": room_id, "availability": value, "audience": "room",
+            "projection": "AVAILABILITY", "ts": time.time()}
 
 
 def task_projection(snapshot: dict, now: float | None = None) -> dict:
@@ -63,7 +72,7 @@ def task_projection(snapshot: dict, now: float | None = None) -> dict:
     return {"task_id": snapshot.get("task_id"), "message_event_id": snapshot.get("message_event_id"),
             "worker": snapshot.get("worker"), "phase": snapshot.get("phase"),
             "since_s": (max(0.0, now - started) if isinstance(started, (int, float)) else None),
-            "scope": "room"}
+            "audience": "room", "projection": "TASK_STATUS"}
 
 
 def read_runtime_state(workspace: Path | None = None, host: str | None = None,
