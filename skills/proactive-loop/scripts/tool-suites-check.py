@@ -145,10 +145,12 @@ def main(argv=None) -> int:
 
     ws = Path(a.workspace)
     scripts, statedir = ws / "scripts", ws / "state"
-    if not scripts.is_dir():
-        print(f"CANNOT ANSWER: no {scripts}", file=sys.stderr)
-        return 2
-    tools, suites = tools_and_suites(scripts)
+    # A missing workspace/scripts is not a refusal: the extras file exists precisely so a
+    # host whose suites live in the REPO can still run them. Returning 2 here made that
+    # mechanism unreachable, and this check then answered "cannot answer" on every pass —
+    # the exact silence step 3.6 was added to end. The genuinely-empty case is still
+    # refused below, by the zero-suites check.
+    tools, suites = tools_and_suites(scripts) if scripts.is_dir() else ([], [])
     try:
         extras = extra_suites(statedir, Path(a.repo).resolve())
     except ExtrasError as e:
