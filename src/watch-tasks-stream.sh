@@ -342,6 +342,7 @@ drain_dispatch_queue() {
       "$WATCH_RUNTIME_DIR/events" \
       "$(basename "$marker")" &
     printf '%s\n' "$!" > "$worker_receipt"
+    activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
     running_count=$((running_count + 1))
   done
   shopt -u nullglob

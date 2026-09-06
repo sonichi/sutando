@@ -13,6 +13,9 @@ via="$(printf '%s\n' "$body" | grep -c 'emit_dispatch_task_file')"
 [ "$via" -ge 4 ] && echo "PASS dispatch_task emits through emit_dispatch_task_file ($via sites)" || { echo "FAIL expected >=4 owner emits, got $via"; fail=1; }
 q="$(printf '%s\n' "$body" | grep -c 'queued_activity_row "\$filename"')"
 [ "$q" -eq 1 ] && echo "PASS dispatch_task marks QUEUED exactly once" || { echo "FAIL QUEUED marked $q times"; fail=1; }
+# The handler path: launching a worker is the pickup, so drain_dispatch_queue marks RUNNING there.
+drain="$(awk '/^drain_dispatch_queue\(\) \{/,/^\}/' "$SRC/watch-tasks-stream.sh")"
+printf '%s\n' "$drain" | grep -q 'activity_transition RUNNING "$(basename "$marker")"' && echo "PASS a launched handler marks RUNNING" || { echo "FAIL drain_dispatch_queue does not mark RUNNING on handler launch"; fail=1; }
 # Behaviour: emit_dispatch_task_file prints the line and marks RUNNING through the bus (stubbed).
 tmp="$(mktemp -d)"; log="$tmp/bus.log"
 cat > "$tmp/py" << PY
