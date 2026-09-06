@@ -87,6 +87,9 @@ class HitlReplyHandler:
         # Form task_to_event() last recognised: "click" (hitl_action) or
         # "fallback" (typed label) — a non-owner's fallback is a MESSAGE.
         self.last_branch = None
+        # True after an applied click whose requirement asks for an agent turn
+        # (turn_on_action): the caller keeps the click on the task path.
+        self.last_turn = False
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
@@ -100,6 +103,7 @@ class HitlReplyHandler:
         actor = str(event.get("actor_id") or "")
         self.last_outcome = "ignored"
         self.last_reason = ""
+        self.last_turn = False
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -119,10 +123,12 @@ class HitlReplyHandler:
             return claimed
         self.last_outcome = "applied"
         note = ""
-        if action.kind == TUI_ACTION_KIND and self._workspace is not None:
-            req = self._manager.get(reply.hitl_id)
-            if req is not None:
-                note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
+        req = self._manager.get(reply.hitl_id)
+        if req is not None and getattr(req, "turn_on_action", False):
+            self.last_turn = True
+            note = "; a turn follows"
+        if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
+            note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
 

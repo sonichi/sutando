@@ -113,6 +113,23 @@ class TaskRelayClickTests(unittest.TestCase):
         rec = json.loads(rgb._control_result_path(t["id"]).read_text())
         self.assertIn("did not apply", rec["body"])
 
+    def test_a_click_on_a_turn_requesting_card_is_applied_and_stays_a_task(self):
+        """turn_on_action: the store records the click, and the same relay task goes on to the core
+        (False = ordinary message) so the executor runs in the turn that follows, not later."""
+        req = self.mgr.create(HumanRequirement(
+            kind="choice", runtime="report-feedback", message="file the report?",
+            guard=f"fb_{os.urandom(5).hex()}", device={"id": f"rf-{os.urandom(2).hex()}"},
+            actions=[Action(id="file", kind="confirmation", label="File this bug report")],
+            turn_on_action=True))
+        t = self._task(hitl_action={"hitl_id": req.id, "expected_revision": req.revision,
+                                    "action_id": "file", "guard": req.guard}, task="File this bug report")
+        self.assertIs(rgb._handle_hitl_action(t), False, "not consumed: the core takes a turn on it")
+        after = self.mgr.get(req.id)
+        self.assertEqual((after.status, after.chosen_action), ("in_progress", "file"))
+        # the same task offered again (relay redelivery) is a stale click: consumed, owner told
+        out = rgb._handle_hitl_action(t)
+        self.assertTrue(str(out).startswith("rejected:"), out)
+
     def test_applied_click_closes_silently(self):
         t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
                                     "action_id": "allow", "guard": self.req.guard})

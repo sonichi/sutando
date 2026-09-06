@@ -384,7 +384,10 @@ class TestAskFirst(unittest.TestCase):
                     with self.assertRaises(SystemExit) as cm:
                         self._run(["--decide", did, "file"])
                     self.assertEqual(cm.exception.code, 1)
-            self.assertEqual(len(report_feedback.list_drafts(ws)), 1, "a failed filing keeps the draft for a retry")
+            # a 5xx is an answer (the draft came back), then the transport error left it in flight:
+            # held for the owner, not a plain draft a retry would post again
+            self.assertEqual(report_feedback.list_drafts(ws), [])
+            self.assertEqual([d["id"] for d in report_feedback.list_drafts(ws, state="posting")], [did])
 
     def _hitl(self, ws):
         return report_feedback.hitl_manager(ws)
@@ -488,16 +491,21 @@ class TestAskFirst(unittest.TestCase):
                          "hitl_action": {"hitl_id": req.id, "expected_revision": req.revision, "action_id": "file", "guard": req.guard}}
                 with mock.patch.object(rgb, "_STATE", ws / "state"):
                     out = rgb._handle_hitl_action(click)
-                self.assertEqual(out, "applied")
+                # False = the bridge keeps the click on the task path: the core takes a turn on it,
+                # and the turn's Stop hook is what files the draft. Nobody types --apply.
+                self.assertIs(out, False)
                 after = self._hitl(ws).get(req.id)
                 self.assertEqual((after.status, after.chosen_action), ("in_progress", "file"))
                 # a stranger's click on the same card is ignored and changes nothing
                 stranger = dict(click, user_id="@someone:ag2.space", id="task-click2")
                 with mock.patch.object(rgb, "_STATE", ws / "state"):
                     self.assertEqual(rgb._handle_hitl_action(stranger), "ignored")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("apply_clicks_hook_rt", Path(__file__).resolve().parent.parent / "skills" / "report-feedback" / "hooks" / "apply-clicks.py")
+                hook = importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)
                 with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                         mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
-                    self._run(["--apply"])
+                    self.assertEqual(hook.main(workspace=ws, rf=report_feedback), 0)
             self.assertEqual(posted[0][0], "https://x/api/feedback")
             body = posted[0][1]
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
@@ -626,12 +634,67 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual(m.get(odd.id).status, "cancelled")
             # A receipt means the post landed: deciding again is a no-op success, never a second post.
             did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            report_feedback.mark_posting(ws, did)
             report_feedback.mark_filed(ws, did)
             with mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not post")):
                 self.assertEqual(report_feedback.decide(ws, {}, did, "file"), 0)
             self.assertTrue(report_feedback.filed_receipt(ws, did).exists())
             with mock.patch.object(report_feedback, "hitl_manager", side_effect=OSError("no store")):
                 self.assertEqual(report_feedback.pending_clicks(ws), 0, "no store reads as nothing pending")
+
+    def test_an_indeterminate_post_is_held_and_never_re_posted_on_a_guess(self):
+        """The in-flight marker covers the window Codex named: a death between the 2xx and the receipt
+        (here: mark_filed raising) and a transport error with no answer both leave <id>.posting, and the
+        next --apply holds it instead of posting again. A definite server error restores the draft."""
+        posted = []
+        def _capture(req, timeout=None):
+            posted.append(json.loads(req.data.decode())); return _FakeResp()
+        from hitl.schema import ActionReply
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td, {"sendLogs": False})
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "once", "body": "b", "auto": True})
+            m = self._hitl(ws)
+            rid = report_feedback.register_ask(ws, did, "once", "host")
+            m.apply_action(ActionReply(hitl_id=rid, expected_revision=1, action_id="file", guard=did))
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
+                # crash after the 2xx, before the receipt
+                with mock.patch.object(report_feedback, "mark_filed", side_effect=OSError("died")):
+                    with self.assertRaises(OSError):
+                        self._run(["--apply"])
+                self.assertEqual(len(posted), 1)
+                self.assertTrue(report_feedback.posting_marker(ws, did).exists())
+                self.assertEqual(report_feedback.list_drafts(ws), [])
+                self.assertEqual([d["id"] for d in report_feedback.list_drafts(ws, state="posting")], [did])
+                self._run(["--apply"])  # held: no second post, the card stays open for the owner
+                self.assertEqual(len(posted), 1, "an indeterminate outcome is never re-posted on a guess")
+                self.assertEqual(m.get(rid).status, "in_progress")
+                # the owner decides: skip drops the in-flight draft and closes the card
+                self._run(["--decide", did, "skip"])
+                self.assertFalse(report_feedback.posting_marker(ws, did).exists())
+                self.assertEqual(m.get(rid).status, "resolved")
+            # a transport error with no answer is the same shape
+            did2 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "two", "body": "b", "auto": True})
+            with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback, "post_feedback", side_effect=OSError("connection reset")):
+                self.assertEqual(report_feedback.decide(ws, {"sendLogs": False}, did2, "file"), 1)
+            self.assertTrue(report_feedback.posting_marker(ws, did2).exists(), "no answer: held, not a draft")
+            # a definite server answer that did not file restores the draft for a retry
+            did3 = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "three", "body": "b", "auto": True})
+            http_err = urllib.error.HTTPError("https://x/api/feedback", 500, "boom", {}, io.BytesIO(b"no"))
+            with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback, "post_feedback", side_effect=http_err):
+                self.assertEqual(report_feedback.decide(ws, {"sendLogs": False}, did3, "file"), 1)
+            self.assertIsNotNone(report_feedback.load_draft(ws, did3), "a 5xx is an answer: the draft is a draft again")
+            self.assertFalse(report_feedback.posting_marker(ws, did3).exists())
+            # and an explicit --decide file on an in-flight draft is the owner re-posting on purpose
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
+                self._run(["--decide", did2, "file"])
+            self.assertEqual(len(posted), 2)
+            self.assertFalse(report_feedback.posting_marker(ws, did2).exists())
 
     def test_reply_labels_map_to_decisions(self):
         f = report_feedback.decision_for_reply

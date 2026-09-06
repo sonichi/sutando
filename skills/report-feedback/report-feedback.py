@@ -56,6 +56,7 @@ DRAFTS_DIR = "feedback-drafts"
 DRAFT_ID_RE = re.compile(r"^fb_[0-9a-f]{10}$")  # the writer's grammar; anything else never becomes a path
 HITL_RUNTIME = "report-feedback"
 FILED_SUFFIX = ".filed"  # the receipt: the post landed, the card is not yet resolved
+POSTING_SUFFIX = ".posting"  # in flight: the post was sent and no answer was recorded
 ENGINE_SRC = Path(__file__).resolve().parents[2] / "src"
 
 
@@ -300,10 +301,11 @@ def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
     return draft_id
 
 
-def list_drafts(ws: Path) -> list:
-    """Pending drafts, oldest first."""
+def list_drafts(ws: Path, state: str = "draft") -> list:
+    """Parked drafts (default), or the in-flight ones (`state="posting"`), oldest first."""
+    suffix = POSTING_SUFFIX if state == "posting" else ".json"
     out = []
-    for f in sorted(_drafts_dir(ws).glob("fb_*.json")):
+    for f in sorted(_drafts_dir(ws).glob(f"fb_*{suffix}")):
         try:
             out.append(json.loads(f.read_text()))
         except Exception:
@@ -335,9 +337,24 @@ def filed_receipt(ws: Path, draft_id: str) -> Path:
     return _draft_path(ws, draft_id).with_suffix(FILED_SUFFIX)
 
 
+def posting_marker(ws: Path, draft_id: str) -> Path:
+    return _draft_path(ws, draft_id).with_suffix(POSTING_SUFFIX)
+
+
+def mark_posting(ws: Path, draft_id: str) -> None:
+    """Before the post: the draft becomes the in-flight marker, so a death mid-request leaves
+    an indeterminate outcome on disk instead of a draft that a retry would post again."""
+    os.replace(_draft_path(ws, draft_id), posting_marker(ws, draft_id))
+
+
+def unmark_posting(ws: Path, draft_id: str) -> None:
+    """The server answered and did not file: the draft is a draft again."""
+    os.replace(posting_marker(ws, draft_id), _draft_path(ws, draft_id))
+
+
 def mark_filed(ws: Path, draft_id: str) -> None:
-    """One atomic rename after the post: a retry that finds the receipt must never post again."""
-    os.replace(_draft_path(ws, draft_id), filed_receipt(ws, draft_id))
+    """The server answered 2xx: one atomic rename, and a retry that finds the receipt never posts."""
+    os.replace(posting_marker(ws, draft_id), filed_receipt(ws, draft_id))
 
 
 def clear_filed(ws: Path, draft_id: str) -> None:
@@ -372,6 +389,7 @@ def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
         guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
         actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
         subject={"draft_id": draft_id, "title": title},
+        turn_on_action=True,  # the click reaches the core as a task, so the Stop hook runs at once
     )
     return hitl_manager(ws).create(req).id
 
@@ -387,7 +405,7 @@ def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
     """Register parked drafts that have no card yet, then run every choice the owner clicked.
     A decision that cannot complete (signed out, API down) stays in progress for the next run;
     one whose post landed but whose card did not resolve finishes from its receipt, without posting."""
-    out = {"registered": [], "applied": [], "kept": [], "cancelled": []}
+    out = {"registered": [], "applied": [], "kept": [], "cancelled": [], "held": []}
     manager = hitl_manager(ws)
     for rec in list_drafts(ws):
         if requirement_for_draft(manager, rec["id"]) is None:
@@ -404,6 +422,13 @@ def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
             manager.resolve(req.id)
             clear_filed(ws, draft_id)
             out["applied"].append(req.id)
+            continue
+        if posting_marker(ws, draft_id).exists():
+            # The post was sent and nothing came back: it may or may not have filed. Never
+            # re-post on a guess; the owner decides with --decide <id> file|skip.
+            print(f"HELD: draft {draft_id} has an in-flight post with no recorded answer; "
+                  f"--decide {draft_id} file re-posts on purpose, skip drops it.")
+            out["held"].append(req.id)
             continue
         if load_draft(ws, draft_id) is None:
             manager.cancel(req.id)  # the draft is gone (decided by hand, or never valid): nothing to run
@@ -543,6 +568,13 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     if DRAFT_ID_RE.match(draft_id or "") and filed_receipt(ws, draft_id).exists():
         print(f"OK: draft {draft_id} was already filed; the receipt closes the card on the next --apply.")
         return 0
+    if DRAFT_ID_RE.match(draft_id or "") and posting_marker(ws, draft_id).exists():
+        # An explicit --decide on an in-flight draft is the owner's call: skip drops it, file re-posts.
+        if choice == "skip":
+            posting_marker(ws, draft_id).unlink()
+            print(f"SKIPPED: in-flight draft {draft_id} dropped at the owner's request.")
+            return 0
+        unmark_posting(ws, draft_id)
     rec = load_draft(ws, draft_id)
     if not rec:
         print(f"ERROR: no parked draft {draft_id}.")
@@ -569,13 +601,15 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     else:
         ctx["logs_opted_out"] = True
     payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    mark_posting(ws, draft_id)
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
     except urllib.error.HTTPError as e:
+        unmark_posting(ws, draft_id)  # the server answered: nothing was filed, the draft stays a draft
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         return 1
-    except Exception as e:  # noqa: BLE001
-        print(f"ERROR: {e}")
+    except Exception as e:  # noqa: BLE001 — no answer: indeterminate, the marker stays for --apply to hold
+        print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")
         return 1
     mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
     print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")

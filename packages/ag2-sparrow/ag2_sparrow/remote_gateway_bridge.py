@@ -989,6 +989,10 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "applied" and getattr(handler, "last_turn", False):
+        # The click is recorded; the requirement asked for a turn, so the same relay
+        # task goes on to the core (idempotent by task id) and its executor runs now.
+        return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
         # A non-owner typed a label as a reply: that is a message, not a click
         # to decline; it must reach _write_task like any other text.

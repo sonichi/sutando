@@ -42,15 +42,20 @@ python3 skills/report-feedback/report-feedback.py --drafts        # pending draf
 python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_no_logs|skip   # by hand
 ```
 
-- The click is applied **automatically**: `manifest.json` declares a `Stop` hook (`hooks/apply-clicks.py`,
-  registered by `bash src/install-claude-hooks.sh` like every skill hook) that runs `apply_clicks()` when
-  the agent's turn ends, so an answered card is filed or dropped within a turn with nobody typing `--apply`.
+- The click is applied **automatically, in the turn it causes**: the requirement is created with
+  `turn_on_action`, so the bridge records the click and then lets the same relay task through to the
+  core; the core takes a turn on it (its text is the card label — answer in one line, or just let the
+  turn end), and the skill's `Stop` hook (`manifest.json` → `hooks/apply-clicks.py`, registered by
+  `bash src/install-claude-hooks.sh` like every skill hook) runs `apply_clicks()` as that turn ends.
   `--apply` is the same routine by hand. It also registers any parked draft whose card was never created
   (a store write that failed at ask time exits 3 and keeps the draft).
-- Filing is exactly-once by receipt: after the post the draft is renamed to `<id>.filed`, then the card is
-  resolved, then the receipt is removed. A run that finds a receipt closes the card **without posting**;
-  a decision that cannot complete (signed out, API error) keeps the draft and the card stays in progress.
-  The payload carries `context.idempotency_key = <draft id>` for the server side.
+- Filing is exactly-once by markers: before the post the draft becomes `<id>.posting`; a 2xx renames it
+  to `<id>.filed`, the card is resolved, the receipt removed; a definite server error renames it back
+  to a draft. No answer at all (a transport error, a death mid-request) leaves `<id>.posting`, and
+  `--apply` **holds** it — it is never re-posted on a guess. `--drafts` lists parked drafts; in-flight
+  ones are visible to `list_drafts(ws, state="posting")`, and the owner settles one with
+  `--decide <id> file` (re-post on purpose) or `--decide <id> skip` (drop). The payload carries
+  `context.idempotency_key = <draft id>` for a server-side check.
 - `file` attaches logs only if `sendLogs` is on; `file_no_logs` never does; `skip` drops the draft.
   Logs are gathered only after the choice — the card carries the title only.
 - The ask is the throttled event: dedupe and the daily cap are checked and **recorded** when the card
