@@ -845,6 +845,22 @@ def main() -> int:
           "a pre-instance leftover is NEITHER adopted NOR deleted — ownership is unknown")
     check(prod._warn_legacy_control_records() == 1, "but it IS counted, so it cannot rot silently")
 
+    # The check above uses a NAMED instance, which is exactly why it passed while
+    # the DEFAULT lane drained the rows it disclaims. Migration control:
+    default = _load_inst("d15n", ws15, port, "")
+    check(default._WITHHELD_CONTROL_DIR != legacy,
+          f"the DEFAULT lane owns a distinct dir, not the legacy path: "
+          f"{default._WITHHELD_CONTROL_DIR.name} vs {legacy.name}")
+    check(default._WITHHELD_CONTROL_DIR != prod._WITHHELD_CONTROL_DIR,
+          "default and named lanes stay isolated from each other too")
+    STATE["results"].clear()
+    default._retry_review_control_results()
+    check(STATE["results"] == [] and (legacy / "orphan.json").is_file(),
+          f"the DEFAULT lane neither adopts nor deletes the leftover it disclaims: "
+          f"{STATE['results']} exists={(legacy / 'orphan.json').is_file()}")
+    check(default._warn_legacy_control_records() == 1,
+          "and the default lane's warning is TRUE — it counts a row it really does not touch")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1

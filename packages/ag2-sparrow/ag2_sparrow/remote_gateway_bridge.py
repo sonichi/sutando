@@ -385,9 +385,10 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
-# The JOURNAL is instance-owned, so it is namespaced: two gateways sharing one
-# workspace must not drain or delete each other's deferred control records.
-_WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results{_INST_SUFFIX}"
+# The JOURNAL is instance-owned, so EVERY lane gets an owned directory -- the
+# default one included, or its path collapses onto the legacy path below.
+_CONTROL_OWNER = GATEWAY_INSTANCE or "default"
+_WITHHELD_CONTROL_DIR = _STATE / f"withheld-review-control-results.{_CONTROL_OWNER}"
 # The review DM is OWNER-owned, not instance-owned, and is already keyed by
 # owner on read; namespacing it would create one duplicate room per instance.
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
@@ -1117,7 +1118,9 @@ _LEGACY_CONTROL_WARNED = False
 
 def _warn_legacy_control_records() -> int:
     """Count unsuffixed leftovers once. Never adopt them: with two instances
-    live, whoever starts first would claim records owned by the other."""
+    live, whoever starts first would claim records owned by the other. The
+    default lane is a lane like any other -- if it read this path directly the
+    warning would be false and it would drain the very rows it disclaims."""
     global _LEGACY_CONTROL_WARNED
     try:
         stale = sorted(_WITHHELD_CONTROL_DIR_LEGACY.glob("*.json"))
