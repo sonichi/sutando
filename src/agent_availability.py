@@ -25,6 +25,9 @@ HEARTBEAT_MAX_AGE_S = 90.0  # matches the core liveness rule: younger than ~90 s
 # A live run keeps writing its snapshot (events, transitions); one silent this long is a leftover.
 ACTIVE_SNAPSHOT_MAX_AGE_S = 1800.0
 WORK_SIGNALS = ("working", "idle", "wedged", "unknown")
+# A pane reading older than this is no reading: the health probe samples about once a minute and
+# stops when the pane is gone, so an old window must never outrank a stale heartbeat.
+WORK_SIGNAL_MAX_AGE_S = 180.0
 # The CLI wedge detector reads the pane, not the process: its verdict kinds fold to the three the
 # room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown.
 _WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": "idle",
@@ -32,9 +35,13 @@ _WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": 
                          "low-novelty": "wedged"}
 
 
-def work_signal_from_verdict(verdict) -> str:
-    kind = verdict.get("kind") if isinstance(verdict, dict) else None
-    return _WEDGE_KIND_TO_SIGNAL.get(kind, "unknown")
+def work_signal_from_verdict(verdict, max_age_s: float = WORK_SIGNAL_MAX_AGE_S) -> str:
+    if not isinstance(verdict, dict):
+        return "unknown"
+    age = verdict.get("last_sample_age_s")
+    if isinstance(age, (int, float)) and age > max_age_s:
+        return "unknown"
+    return _WEDGE_KIND_TO_SIGNAL.get(verdict.get("kind"), "unknown")
 
 
 def wedge_window_verdict(ws: Path, now: float | None = None):
@@ -46,7 +53,9 @@ def wedge_window_verdict(ws: Path, now: float | None = None):
         entries = cli_wedge.load_window(cli_wedge.window_path(ws))
         if not entries:
             return None
-        return cli_wedge.classify_window(entries, cli_wedge.work_outstanding(ws, now), now)
+        verdict = dict(cli_wedge.classify_window(entries, cli_wedge.work_outstanding(ws, now), now))
+        verdict.setdefault("last_sample_age_s", max(0.0, now - max(float(e.get("ts", 0)) for e in entries)))
+        return verdict
     except Exception:  # noqa: BLE001
         return None
 

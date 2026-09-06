@@ -180,6 +180,28 @@ class WorkSignal(unittest.TestCase):
                          "busy_unavailable")
         self.assertEqual(av.availability(S(accepting_work=False, work_signal="idle")), "busy_unavailable")
 
+    def test_a_stale_pane_reading_is_no_reading(self):
+        self.assertEqual(av.work_signal_from_verdict({"kind": "idle", "last_sample_age_s": 30.0}), "idle")
+        self.assertEqual(av.work_signal_from_verdict({"kind": "idle", "last_sample_age_s": 600.0}), "unknown")
+        self.assertEqual(av.work_signal_from_verdict({"kind": "working", "last_sample_age_s": av.WORK_SIGNAL_MAX_AGE_S + 1}), "unknown")
+
+    def test_the_persisted_window_never_keeps_a_dead_core_available(self):
+        # The reviewer's control, through the production window writer and the default probe: two
+        # idle samples at 1000/1060, a heartbeat last touched at 1060, then the clock moves on.
+        try:
+            import cli_wedge
+        except ImportError:
+            self.skipTest("the detector is not on this tree")
+        ws = Path(tempfile.mkdtemp()); (ws / "state" / "cores").mkdir(parents=True); (ws / "tasks").mkdir()
+        cli_wedge.append_window(ws, "> idle prompt\n", 1000.0); cli_wedge.append_window(ws, "> idle prompt\n", 1060.0)
+        beat = ws / "state" / "cores" / "h.alive"; beat.write_text("{}"); os.utime(beat, (1060.0, 1060.0))
+        reading = lambda now: av.availability(av.read_runtime_state(ws, host="h", now=now), now)
+        self.assertEqual(reading(1061.0), "available", "a fresh pane reading counts")
+        self.assertEqual(reading(1660.0), "unknown", "600 s old: the window is no reading, the heartbeat is stale")
+        self.assertEqual(reading(2260.0), "unknown")
+        beat.unlink()
+        self.assertEqual(reading(1060.0 + 1200.0), "unknown", "no heartbeat and a 20-minute-old window")
+
     def test_no_reading_falls_back_to_the_heartbeat_rule(self):
         self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1000.0), 1001.0), "available")
         self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0), 1000.0), "unknown", "stale is unknown")
