@@ -505,6 +505,36 @@ class IdempotentProjection(unittest.TestCase):
         card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i2:1:2")
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "one summary")
         self.assertEqual(self.rows(), ["picked up", "replied"])
+class Visibility(unittest.TestCase):
+    """Audience is decided in the bus: lifecycle rows are the room's, observations are the owner's,
+    and the two projections of one TaskRun carry only what their audience may see."""
+
+    def test_lifecycle_rows_are_room_scoped_and_observations_owner_scoped(self):
+        s = TaskActivityState("t")
+        s, r1 = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m"))
+        s, r2 = reduce(s, E("t", "S1", 1, "Thinking", text="checking", ts=2))
+        s, r3 = reduce(s, E("t", "S1", 2, "InteractionRequired", text="pick one", ts=3))
+        self.assertEqual([r["scope"] for r in r1 + r2], ["room", "owner"])
+        self.assertEqual([r["scope"] for r in r3], ["room"], "the WAITING transition an observation caused is still lifecycle")
+
+    def test_the_shared_projection_carries_no_summary_and_the_private_one_does(self):
+        s = TaskActivityState("t")
+        s, _ = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m", worker="air"))
+        s, _ = reduce(s, E("t", "S1", 1, "Working", text="Running tests", ts=2))
+        shared, private = bus.shared_projection(s), bus.private_projection(s)
+        self.assertEqual((shared["phase"], shared["worker"], shared["scope"]), ("RUNNING", "air", "room"))
+        self.assertNotIn("summary", shared)
+        self.assertEqual((private["summary"], private["seq"], private["scope"]), ("Running tests", 1, "owner"))
+
+    def test_the_writer_persists_the_scope_on_the_row(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+        ActivityStore(ws).apply(T("t", "QUEUED", ts=1, room="!r:s", message_event_id="$m"))
+        row = json.loads(card.log_path(ws).read_text().splitlines()[-1])
+        self.assertEqual(row["scope"], "room")
+        rec = card.append("x", kind="working", room=None, workspace=ws)
+        self.assertNotIn("scope", rec, "a row with no stated audience carries none: the client's rule applies")
+
+
 class Wiring(unittest.TestCase):
     """The scheduler's emit points reach the bus: the CLI from shell, the manager and the outbox in-process."""
 
