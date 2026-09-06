@@ -408,6 +408,33 @@ class PinnedEntries(unittest.TestCase):
         archive = p.with_name("current-track-archive.md").read_text()
         self.assertEqual(len(after.encode()) + len(archive.encode()), len(before.encode()))
 
+    def test_orientation_survives_same_minute_and_mixed_separators(self):
+        """Minute-truncated string compare tied 08:33:50 with 08:33:10 and sorted ' ' before 'T'."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 900) + "\n"
+        cases = [("already ordered", "2026-09-06T08:34:10Z", "2026-09-06T08:33:10Z"),
+                 ("same minute", "2026-09-06T08:33:50Z", "2026-09-06T08:33:10Z"),
+                 ("space sorts below T", "2026-09-06 23:00", "2026-09-06T01:00Z")]
+        for why, newest, oldest in cases:
+            d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+            p = Path(d.name) / "current-track.md"
+            p.write_text(E(newest, "newest") + E(oldest, "oldest"))
+            ct.rotate(p, 1200, pin=None)
+            archive = p.with_name("current-track-archive.md")
+            self.assertIn("newest", p.read_text(), f"{why}: kept the wrong end")
+            self.assertNotIn("newest", archive.read_text(),
+                             f"{why}: archived the entry a consumer reads first")
+
+    def test_identical_stamps_at_both_ends_ask_the_next_pair(self):
+        """Ends tying must not read as 'not newest-first'; look inward before defaulting."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 500) + "\n"
+        same = "2026-09-06T08:33:10Z"
+        entries = ct.split(E(same, "a") + E("2026-09-06T09:00:00Z", "b") + E(same, "c"))[1]
+        self.assertFalse(ct._newest_first(entries))     # a < b, so oldest-first
+        entries = ct.split(E(same, "a") + E("2026-09-06T07:00:00Z", "b") + E(same, "c"))[1]
+        self.assertTrue(ct._newest_first(entries))      # a > b, so newest-first
+        flat = ct.split(E(same, "a") + E(same, "b"))[1]
+        self.assertFalse(ct._newest_first(flat))        # no evidence -> documented default
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())

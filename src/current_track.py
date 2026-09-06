@@ -103,7 +103,17 @@ class RotateResult:
     pinned_count: int = 0
 
 
-_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2})?")
+_STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?")
+
+
+def _stamp_key(line: str):
+    """A comparable key, not the matched text: 'T' and ' ' separate identically and
+    a minute-precision stamp must not tie with a second-precision one."""
+    m = _STAMP.search(line)
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = m.groups()
+    return (int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(sec or 0))
 
 
 def _newest_first(entries) -> bool:
@@ -112,8 +122,17 @@ def _newest_first(entries) -> bool:
     context-reconstruct's maintain contract PREPENDS a rewritten state block, so a
     real file can run either way; assuming append-only archives the live entry.
     """
-    stamps = [m.group(0) for m in (_STAMP.search(e.splitlines()[0]) for e in entries) if m]
-    return len(stamps) >= 2 and stamps[0] > stamps[-1]
+    keys = [k for k in (_stamp_key(e.splitlines()[0]) for e in entries) if k]
+    if len(keys) < 2:
+        return False
+    if keys[0] != keys[-1]:
+        return keys[0] > keys[-1]
+    # The ends tie (one timestamp, or one minute). Ask the first pair that does not,
+    # rather than reading a tie as "not newest-first" and keeping the wrong end.
+    for a, b in zip(keys, keys[1:]):
+        if a != b:
+            return a > b
+    return False
 
 
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
