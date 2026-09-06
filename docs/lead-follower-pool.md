@@ -242,14 +242,15 @@ to another seat, and results dedupe by task id.
 
 The broker's pin route also enqueues a `worker-pin-<ms>-<hex>` compat task.
 The client consumes it as a control message — ack, then a `[no-send]` lease
-close, no task file — because `src/watch-tasks-stream.sh` only globs
-`task-*.txt` and a file under any other name would sit in flight until the
-lease expired. Log line: `archived worker-pin-… (marker no-send, lease closed,
-not sent)`.
+close, no task file — because `src/watch-tasks-stream.sh` globs `*.txt` under
+`tasks/`, so a pin written there would be dispatched as an ordinary task.
+Log line: `archived worker-pin-… (marker no-send, lease closed, not sent)`.
 
-Every result POST names the seat that produced it — `metadata.worker_id` +
-`metadata.location`. On a pool host the worker id is the done-flag owner
-(`state/cores/<worker>/done/<task>.flag`, the pool worker that answered a task
+A result POST names the seat that produced it — `metadata.worker_id` +
+`metadata.location` — only while the broker advertises the `worker-metadata`
+capability; control closes carry neither. On a pool host the worker id is the
+done-flag owner (`state/cores/<worker>/done/<task>.flag`, the worker that
+answered a task
 the lead routed); a cloud seat has no done-flag, so its own `SUTANDO_WORKER_ID`
 is the attribution of last resort (`cloud-1` / `cloud`, never an empty payload).
 

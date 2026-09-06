@@ -53,11 +53,12 @@ re-served to another seat, and the result sink dedupes by task id.
 
 Control messages: the broker's pin route also enqueues a `worker-pin-<ms>-<hex>`
 compat task. It is consumed in-client (ack, `[no-send]` lease close) and never
-written to `tasks/` — the watcher globs `task-*.txt`, so a file under any other
-name would sit in flight until the lease expired.
+written to `tasks/` — the watcher globs `*.txt` there, so a pin written under
+any name would be dispatched as an ordinary task.
 
-Result attribution: every result POST carries `metadata.worker_id` and
-`metadata.location`. The worker id is the pool done-flag owner
+Result attribution: a result POST carries `metadata.worker_id` and
+`metadata.location` only while the broker advertises `worker-metadata`;
+control closes carry neither. The worker id is the pool done-flag owner
 (`state/cores/<worker>/done/<task>.flag`) when exactly one exists — a pool
 worker answering a task its lead routed — else this seat's own WORKER_ID: a
 cloud seat has no done-flag, and its result is still its own.
