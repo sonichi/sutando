@@ -990,9 +990,8 @@ def _handle_hitl_action(task: dict):
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
     if out == "applied" and getattr(handler, "last_turn", False):
-        # The click is recorded; the requirement asked for a turn, so the same relay
-        # task goes on to the core (idempotent by task id) and its executor runs now.
-        # The header tells the core it is a recorded click, not an instruction.
+        # Recorded, and the requirement asked for a turn: the same relay task goes on to
+        # the core (idempotent by id) with a header saying it is a click, not an order.
         task["hitl_click"] = "true"
         return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
