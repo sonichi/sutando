@@ -1403,6 +1403,8 @@ def main() -> int:
     a = ap.parse_args()
     a.message = resolve_body(a.message, a.body_file)
     names = list(dict.fromkeys(n.strip() for n in a.reviewers.split(",") if n.strip()))
+    # ONE snapshot for the whole invocation. Re-reading later let the row change
+    # between resolution and use: the login GATED and the endpoint SENT diverged.
     roster = load_roster()
     # resolve() dedups per person, so the two-reviewer gate counts PEOPLE, not
     # roster rows; gates then run on RESOLVED targets, never a partial batch.
@@ -1420,7 +1422,7 @@ def main() -> int:
                   file=sys.stderr)
         if refs:
             repo = refs[0][0]
-            roster_now = load_roster()
+            roster_now = roster
             kept = []
             for t in targets:
                 login, why_login = _github_login(t["name"], roster_now)
@@ -1463,7 +1465,7 @@ def main() -> int:
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
             return 7
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
+    stale, why = _stale_repeat_ask(a.message, targets, roster) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
@@ -1471,10 +1473,10 @@ def main() -> int:
     failures = unlogged = unknowns = 0
     # One person may hold several roster spellings; the park keys the endpoint,
     # so resolve the canonical actor once rather than per send.
-    actors = _actor_map(load_roster())
+    actors = _actor_map(roster)
     # Retry admission keys the PERSON, not a spelling: an outcome-unknown park
     # must block every alias and endpoint in that person's component.
-    person_of = component_resolver(load_roster())
+    person_of = component_resolver(roster)
     for t in targets:
         if t["transport"] == "discord":
             # No room-relocation branch: a Discord mention is channel-scoped and
@@ -1496,7 +1498,7 @@ def main() -> int:
             who = actors.get(t["name"], t["name"])
             # Claim BEFORE the POST: a later reservation cannot cover a crash
             # between the two. Shared with the Matrix path — see reserve_ask.
-            proceed, bucket, note = reserve_ask(a, t, who, person_of, load_roster())
+            proceed, bucket, note = reserve_ask(a, t, who, person_of, roster)
             if not proceed:
                 print(note, file=sys.stderr)
                 if bucket == "unknown":
@@ -1630,7 +1632,7 @@ def main() -> int:
         who = actors.get(t["name"], t["name"])
         # Same reservation as the Discord path: an alias on this transport must
         # not walk past a park an ask on the other one is still holding.
-        proceed, bucket, note = reserve_ask(a, t, who, person_of, load_roster(),
+        proceed, bucket, note = reserve_ask(a, t, who, person_of, roster,
                                             require_ref=False)
         if not proceed:
             print(note, file=sys.stderr)
