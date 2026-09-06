@@ -294,6 +294,14 @@ class Hook(unittest.TestCase):
             self.assertTrue(hook.pickup_line({"sender": "q", "text": "x"}).startswith("env-air is working"))
         self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")  # declared, unset by default
 
+    def test_an_unreadable_or_malformed_manifest_reads_as_unset_not_a_crash(self):
+        with mock.patch.object(hook.Path, "read_text", side_effect=OSError("gone")):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")
+        with mock.patch.object(hook.Path, "read_text", return_value="{not json"):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")
+        with mock.patch.object(hook.Path, "read_text", return_value='{"config": {"AGENT_DISPLAY_NAME": 7}}'):
+            self.assertEqual(hook.manifest_config("AGENT_DISPLAY_NAME"), "")  # non-string value is not a name
+
     def post(self, sid, tool, inp):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
 
