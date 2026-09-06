@@ -8222,14 +8222,28 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
 _WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
 
 
+# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
+# and a mention inside a longer word cannot match.
+_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
+
+
 def _is_watcher_argv(argv: str) -> bool:
-    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+    """True for `<shell> <path>/watch-tasks-stream.sh [tasks-dir]`.
+
+    A field COUNT cannot decide this: the notifier execs the script WITH a tasks
+    directory, and an install path containing a space splits into more tokens
+    again -- both real shapes, both previously read as "not a watcher".
+    """
     parts = argv.split()
-    if len(parts) != 2:
+    if len(parts) < 2:
         return False
-    exe, script = parts
-    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
-            and script.endswith("watch-tasks-stream.sh"))
+    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
+        return False
+    # `<shell> -c ...` is a wrapper running something that merely mentions the
+    # script -- the self-match this predicate exists to exclude.
+    if parts[1].startswith("-"):
+        return False
+    return _WATCHER_SCRIPT.search(argv) is not None
 
 
 # Read from the module that defines the precedence; a copy here is how this

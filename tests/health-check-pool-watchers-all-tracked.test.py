@@ -333,5 +333,49 @@ class TheActorPrecedenceComesFromItsOwner(unittest.TestCase):
                          "the precedence is spelled here again, so it can drift")
 
 
+class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
+    """`len(parts) != 2` rejected two shapes that actually run.
+
+    The Codex notifier execs the script WITH a tasks directory, and an install
+    path containing a space splits into more tokens again -- so a production
+    watcher read as "not a watcher", which makes a duplicate invisible to the
+    tree count and hides the running process from the re-stamp branch. Every
+    existing case used the synthetic two-token form, so none of them could see it.
+    """
+
+    REAL = [
+        ("the synthetic form the older cases use", "bash src/watch-tasks-stream.sh"),
+        ("the notifier's production exec", "bash /repo/src/watch-tasks-stream.sh /w/tasks"),
+        ("an app checkout whose path has a space",
+         "bash /Users/x/Library/Application Support/Sutando/src/watch-tasks-stream.sh"),
+        ("both at once", "bash /Users/x/Application Support/src/watch-tasks-stream.sh /w/my tasks"),
+    ]
+    IMPOSTORS = [
+        ("a grep FOR the script", "grep watch-tasks-stream"),
+        ("a shell -c that merely mentions it", "bash -c ps | grep watch-tasks-stream"),
+        ("a similarly named script", "bash /repo/src/x-watch-tasks-stream.sh"),
+        ("the name inside a longer filename", "bash /repo/src/watch-tasks-stream.sh.bak"),
+        ("an unrelated shell script", "bash /repo/src/startup.sh"),
+    ]
+
+    def test_every_real_launch_shape_is_recognised(self):
+        for label, argv in self.REAL:
+            with self.subTest(shape=label):
+                self.assertTrue(hc._is_watcher_argv(argv), argv)
+
+    def test_the_controls_impostors_are_still_refused(self):
+        # Without these the predicate could pass by accepting anything.
+        for label, argv in self.IMPOSTORS:
+            with self.subTest(shape=label):
+                self.assertFalse(hc._is_watcher_argv(argv), argv)
+
+    def test_a_production_shaped_duplicate_is_counted_as_a_second_tree(self):
+        # The consequence: two real watchers read as one, so the duplicate the
+        # probe exists to find is invisible.
+        ps = ("  100 1 bash /repo/src/watch-tasks-stream.sh /w/tasks\n"
+              "  200 1 bash /repo/src/watch-tasks-stream.sh /w/tasks\n")
+        self.assertEqual(len(hc._watcher_trees(ps)), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
