@@ -470,6 +470,18 @@ class PinnedEntries(unittest.TestCase):
         self.assertNotIn("first", r.archived)
         self.assertNotIn("last", r.archived)
 
+    def test_protected_endpoints_are_charged_to_the_budget(self):
+        """Pre-kept entries are spent budget; charging only pins let the walk fill the cap on top."""
+        E = lambda n: f"## STATE 2026-09-06 — e{n}\n" + ("x" * 250) + "\n"
+        text = "# t\n\n" + "".join(E(i) for i in range(8))
+        r = ct.plan(text, 1000)
+        self.assertIsNone(ct._orientation(ct.split(text)[1]))    # the branch under test
+        self.assertIn("e0", r.head)
+        self.assertIn("e7", r.head)
+        self.assertLessEqual(len(r.head.encode()), 1000)
+        self.assertFalse(r.oversized)
+        self.assertTrue(r.archived, "nothing rotated, so the cap was never exercised")
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())

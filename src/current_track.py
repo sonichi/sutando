@@ -158,15 +158,17 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     if not entries:
         return RotateResult(text, "", True)
     pinned = {i for i, e in enumerate(entries) if pin and pin.search(e)}
-    budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in pinned)
-    # Walk from the NEWEST end, whichever end that is; a pin never stops the walk,
-    # or an old hold would freeze the archive and rotation would free nothing.
     facing = _orientation(entries)
+    # Walk from the NEWEST end, whichever that is; a pin never stops the walk, or an
+    # old hold would freeze the archive and rotation would free nothing.
     order = (list(range(len(entries))) if facing
              else list(range(len(entries) - 1, -1, -1)))
     # Undetermined orientation protects BOTH ends: the live entry sits at one of
     # them, and no walk direction can be shown to keep it.
     keep = set(pinned) | ({0, len(entries) - 1} if facing is None else set())
+    # Every entry kept BEFORE the walk is spent budget; charging only the pins let
+    # the walk fill the whole cap on top of the protected ends.
+    budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in keep)
     used, started = 0, False
     for i in order:
         if i in keep:
