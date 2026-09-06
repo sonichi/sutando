@@ -13,6 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 ROTATE = REPO / "scripts" / "current-track-rotate.py"
 APPEND = REPO / "scripts" / "current-track-append.py"
+WRITE = REPO / "scripts" / "current-track-write.py"
 sys.path.insert(0, str(REPO / "src"))
 import current_track as ct  # noqa: E402
 
@@ -132,6 +133,37 @@ class RotateAndAppend(unittest.TestCase):
         text = self.p.read_text() + self.archive.read_text()
         for i in range(3):
             self.assertEqual(text.count(f"from the CLI {i}"), 1)
+
+
+    def test_concurrent_rewrite_during_rotation_survives(self):
+        """The reviewer's second race: the skill's rewrite (create/replace) must land after rotation, never under it."""
+        new_head = self.pre.replace("keep the loop honest", "OWNER REDIRECTED") + "## 2026-09-06T02:40Z — the new track\nowner redirected\n"
+        done = threading.Event()
+
+        def rewriter():
+            ct.replace(self.p, new_head); done.set()
+
+        def seam():
+            threading.Thread(target=rewriter, daemon=True).start()
+            self.assertFalse(done.wait(0.5))   # blocked on the writer lock while rotate holds it
+
+        ct.rotate(self.p, 8 * 1024, _between_read_and_replace=seam)
+        self.assertTrue(done.wait(5))
+        self.assertEqual(self.p.read_text(), new_head)   # rewrite_survived_head
+        self.assertIn("OWNER REDIRECTED", self.p.read_text())
+
+    def test_write_cli_append_and_replace_in_process(self):
+        w = load(WRITE)
+        r = Cli(w, stdin="## 2026-09-06T02:50Z — appended\n")("append", self.p); self.assertEqual(r.returncode, 0)
+        self.assertTrue(self.p.read_text().endswith("appended\n"))
+        r = Cli(w, stdin="# fresh head\n\nMain goal: replaced.\n")("replace", self.p); self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.p.read_text(), "# fresh head\n\nMain goal: replaced.\n")
+        r = Cli(w, stdin="   ")("replace", self.p); self.assertEqual(r.returncode, 1)
+        r = Cli(w, stdin="x")("rewrite", self.p); self.assertEqual(r.returncode, 2)
+        r = Cli(w, stdin="x")("append"); self.assertEqual(r.returncode, 2)
+        a = load(APPEND)
+        r = Cli(a, stdin="## alias\n")(self.p); self.assertEqual(r.returncode, 0); self.assertTrue(self.p.read_text().endswith("## alias\n"))
+        r = Cli(a, stdin="x")(); self.assertEqual(r.returncode, 2)
 
     def test_cli_exit_codes_in_process(self):
         rot = Cli(load(ROTATE))

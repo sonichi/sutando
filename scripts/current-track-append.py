@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
-"""Append an entry to a host's current-track.md under the writer lock.
-
-    printf '## 2026-09-06T02:00Z — …\n' | current-track-append.py <current-track.md>
-
-Shares src/current_track.py's lock with rotation, so an entry can never land
-between rotation's read and its replace. Exit 0 appended; 1 empty stdin.
-"""
+"""Alias: `current-track-write.py append <file>`. Kept so the shorter name keeps working."""
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import append  # noqa: E402
+_spec = importlib.util.spec_from_file_location("current_track_write", Path(__file__).with_name("current-track-write.py"))
+_mod = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_mod)
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1:
-        print("usage: current-track-append.py <current-track.md>  (entry on stdin)", file=sys.stderr)
-        return 2
-    text = sys.stdin.read()
-    if not text.strip():
-        print("current-track-append: empty entry, nothing written", file=sys.stderr)
-        return 1
-    append(Path(argv[0]), text)
-    return 0
+    return _mod.main(["append", *argv]) if len(argv) == 1 else _mod.main(argv)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ both operations take the same flock on <file>.lock, and the archive is written
 before the head is replaced, so a crash leaves a duplicate, never a gap.
 
     append(path, text)                -> None
+    replace(path, text)               -> None   (create or rewrite the whole head)
     rotate(path, keep_bytes) -> RotateResult(head, archived, oversized)
 
 An entry that alone exceeds keep_bytes is never truncated: rotate() keeps it,
@@ -50,6 +51,14 @@ def append(path: Path, text: str) -> None:
     with locked(path):
         with open(path, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
+
+
+def replace(path: Path, text: str) -> None:
+    """Create or rewrite the whole head under the writer lock, atomically (temp + os.replace)."""
+    with locked(path):
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
 
 def split(text: str) -> tuple[str, list[str]]:
