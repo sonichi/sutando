@@ -5,8 +5,10 @@
 #
 # To add a user, copy the `worker-example` block (and, for the ag2-assistant
 # backup seat, its `assistant-example` sidecar) and change: service names,
-# container_name, env_file (that user's env file), volume names, and
-# SUTANDO_WORKER_ID (a seat name, [A-Za-z0-9_-]{1,32}, e.g. cloud-alice).
+# container_name, env_file (that user's env file), volume names,
+# SUTANDO_WORKER_ID (a seat name, [A-Za-z0-9_-]{1,32}, e.g. cloud-alice),
+# the `networks:` name (its OWN — a shared network lets one user's worker reach
+# another's sidecar), and AG2ASSISTANT_ACP_TOKEN_<USER> (its own token var).
 # `provision.sh <worker-id> <env-file>` does the same without editing this file.
 services:
   worker-example:
@@ -21,6 +23,7 @@ services:
       AG2ASSISTANT_ACP_URL: ws://assistant-example:8802
     volumes:
       - worker-example:/workspace
+    networks: [example]
     depends_on:
       - assistant-example
     restart: unless-stopped
@@ -35,7 +38,9 @@ services:
       # Values come from the shell / compose .env at `up` time, not from the
       # worker's env file: the sidecar must not see the broker token.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      AG2ASSISTANT_ACP_TOKEN: ${AG2ASSISTANT_ACP_TOKEN:-}
+      # PER USER, not project-wide: one shared value would let any user's worker
+      # authenticate to every other user's sidecar.
+      AG2ASSISTANT_ACP_TOKEN: ${AG2ASSISTANT_ACP_TOKEN_EXAMPLE:-}
       TZ: ${TZ:-UTC}
     # assistant-bootstrap.sh: first-boot profile, key seed into the secret
     # store (acp-serve does not read the process env for it), then acp-serve.
@@ -44,6 +49,7 @@ services:
       - ./assistant-bootstrap.sh:/bootstrap.sh:ro
       - assistant-example-data:/data
       - assistant-example-workspace:/workspace
+    networks: [example]
     restart: unless-stopped
 
   # worker-alice:
@@ -53,6 +59,12 @@ services:
   #   environment: { SUTANDO_WORKER_ID: cloud-alice, SUTANDO_WORKER_LOCATION: cloud, AG2ASSISTANT_ACP_URL: ws://assistant-alice:8802 }
   #   volumes: [worker-alice:/workspace]
   #   restart: unless-stopped
+
+# One network PER USER PAIR. Without this every service joins the project
+# default network and any worker can reach any other user's sidecar.
+networks:
+  example:
+  # alice:
 
 volumes:
   worker-example:
