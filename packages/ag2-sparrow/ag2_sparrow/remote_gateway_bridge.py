@@ -1916,8 +1916,12 @@ def _one_line(value) -> str:
     practice and a stray newline only ever indicates an injection attempt.
 
     Load-bearing: this producer does no body defanging, so the flatten is the
-    only thing stopping a field from forging a registered header line."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    only thing stopping a field from forging a registered header line.
+
+    Folds on str.splitlines()' own set, not on CR/LF: readers split with
+    splitlines(), so any narrower set leaves a separator that is one line to
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
