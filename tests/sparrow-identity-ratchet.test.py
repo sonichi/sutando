@@ -140,7 +140,9 @@ def scan_task_mints(root: Path) -> dict:
                                           ast.withitem, ast.NamedExpr)):
                         tg = getattr(sub, "target", None) or getattr(sub, "optional_vars", None)
                         if isinstance(tg, ast.Name):
-                            out[tg.id] = False
+                            # setdefault, not assignment: these forms bind a non-template, but
+                            # under MAY they must not erase a template bound on another branch.
+                            out.setdefault(tg.id, False)
             return out
 
         scopes = [_bindings(tree)]
@@ -621,6 +623,24 @@ class ScannerPositiveControls(unittest.TestCase):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(source)
             return scan_task_mints(Path(tmp))
+
+    def test_a_non_assign_binding_does_not_erase_a_branch_template(self):
+        """`for T in ...` binds a non-template, but on a mutually exclusive branch it
+        must not clobber a template bound by the other. Assign was made MAY-safe
+        first; this is the same defect in the binding form that fix did not cover."""
+        tmpl = ('def mint(flag, x):\n    if flag:\n%s\n    else:\n%s\n'
+                '    return f"{T}{x}"\n')
+        assign = '        T = "task-"'
+        loop = '        for T in ["plain-"]:\n            pass'
+        assign_first = self._scan_fixture("a.py", tmpl % (assign, loop))
+        loop_first = self._scan_fixture("a.py", tmpl % (loop, assign))
+        self.assertEqual(assign_first, loop_first,
+                         "a For target erased a template bound on the other branch")
+        self.assertEqual(loop_first, {("a.py", "mint"): 1})
+        # Control: with no template on either branch there is nothing to count, so the
+        # equality above cannot be satisfied by two empty censuses.
+        self.assertEqual(
+            self._scan_fixture("a.py", tmpl % ('        T = "plain-"', loop)), {})
 
     def test_scope_key_distinguishes_same_named_methods(self):
         """A bare scope name lets a removal in one class cancel a new site in
