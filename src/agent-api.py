@@ -129,6 +129,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
                                submit_signal_room_task, submission_status)  # noqa: E402
 
@@ -340,30 +341,56 @@ def get_status() -> dict:
     }
 
 
+def _read_or_none(path) -> "str | None":
+    """Stripped file text, or None when it is absent — one call, no exists()
+    race between the check and the read."""
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _newest_first(paths) -> list:
+    """Paths sorted newest-first, skipping any that vanish during the scan.
+
+    A claim renames a task file, so any glob entry can be gone before its stat.
+    """
+    pairs = []
+    for p in paths:
+        try:
+            pairs.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    pairs.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in pairs]
+
+
 def _active_task_rows() -> list[dict]:
     """Reconcile task/result files into the ten most recent history rows."""
     # Classifier tasks are machinery, not user work, so they stay out of the
     # history the UI shows.
-    for task_file in sorted(
-        (
-            path
-            for path in TASK_DIR.glob("*.txt")
-            if not path.stem.startswith(
-                (
-                    task_workstreams.CLASSIFIER_TASK_PREFIX,
-                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
-                )
+    for task_file in _newest_first(
+        path
+        for path in TASK_DIR.glob("*.txt")
+        if not path.stem.startswith(
+            (
+                task_workstreams.CLASSIFIER_TASK_PREFIX,
+                task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
             )
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+        )
     )[:10]:
         # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
         if task_id is None:
             continue
-        content = task_file.read_text()
+        try:
+            content = task_file.read_text()
+            task_mtime = task_file.stat().st_mtime
+        except FileNotFoundError:
+            # Claimed and renamed between the glob and here; the row reappears
+            # under the claimed name on the next poll.
+            continue
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
@@ -377,32 +404,28 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
-        if result_file.exists():
+        result_text = _read_or_none(result_file)
+        if result_text is not None:
             status = "done"
-            result_text = result_file.read_text().strip()
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None:
+        elif archived_file is not None and (_archived := _read_or_none(archived_file)) is not None:
             status = "done"
-            result_text = archived_file.read_text().strip()
+            result_text = _archived
         else:
             status = "working"
             result_text = ""
         task_history[task_id] = {
             "status": status,
             "text": task_line or existing.get("text", task_id),
-            "time": task_file.stat().st_mtime,
+            "time": task_mtime,
             "result": result_text,
             "source": source_line or existing.get("source", ""),
         }
 
     # Results may outlive their task files after bridge cleanup.
-    for result_file in sorted(
-        RESULT_DIR.glob("task-*.txt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:10]:
+    for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
         _remember_done_result_file(result_file)
 
     # Reconcile stale rows after the disk scans above.
@@ -1322,6 +1345,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /scan-text — decoded-value guard re-run for the Signal Room daemon, which
+        # publishes the text itself: markers exempt nothing, scanner outage is a 500.
+        if path == "/scan-text":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > 262144:
+                self.send_json(413, {"error": "scan request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            # json.loads accepts any JSON value, so `[1]` reaches .get() outside
+            # the except above and raises instead of returning this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
+                return
+            texts = data.get("texts")
+            if (not isinstance(texts, list) or not texts or len(texts) > 64
+                    or not all(isinstance(t, str) for t in texts)
+                    or any(len(t) > 16384 for t in texts)):
+                self.send_json(400, {"error": "texts must be 1..64 strings of <=16384 chars"})
+                return
+            try:
+                from policy.egress.result import (SCANNER_UNAVAILABLE,
+                                                  guard_result_for_tier)
+                verdict = "pass"
+                for t in texts:
+                    _safe, reason = guard_result_for_tier(
+                        t, SIGNAL_ROOM_TIER, REPO_DIR, honor_suppressions=False)
+                    if reason is not None:
+                        if reason.startswith(SCANNER_UNAVAILABLE):
+                            self.send_json(500, {"error": "scanner unavailable"})
+                            return
+                        verdict = "withhold"
+                        break
+                self.send_json(200, {"verdict": verdict})
+            except Exception:
+                self.send_json(500, {"error": "scanner unavailable"})
+            return
+
         # /guest-task — the Signal Room lane.
         if path == "/guest-task":
             if not self.check_auth():
@@ -1340,6 +1410,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(self.rfile.read(length).decode() or "{}")
             except Exception:
                 self.send_json(400, {"error": "invalid JSON"})
+                return
+            # json.loads accepts any JSON value; a non-object would reach .get()
+            # and raise outside the except above — a 500 instead of this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
                 return
             task = data.get("task", "")
             if not isinstance(task, str) or not task.strip():
@@ -1384,8 +1459,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # ValueError covers JSONDecodeError, invalid UTF-8 and the int-digit
+            # limit; RecursionError (nesting) is outside it. All are the 400.
             self.send_json(400, {"error": "invalid JSON"})
+            return
+        if not isinstance(data, dict):
+            self.send_json(400, {"error": "body must be a JSON object"})
             return
 
         from_agent = data.get("from", "unknown")
@@ -1405,10 +1485,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # through the voice-only fallback path with incorrect downstream
         # behavior. Strip line terminators; cap to a sane single-line
         # length.
-        from_agent = (
-            from_agent.replace("\r", " ").replace("\n", " ").strip()[:120]
-            or "unknown"
-        )
+        from_agent = header_safe_value(from_agent).strip()[:120] or "unknown"
 
         if not task:
             self.send_json(400, {"error": "task is required"})

@@ -57,6 +57,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -118,9 +119,23 @@ PRIORITIES = ("urgent", "normal", "low")
 # canonical completion marker); archived = under tasks/archive/.
 LIFECYCLE_STATES = ("pending", "result_written", "archived")
 
-# `owner` is full, `team` is workspace-write sandboxed, `guest`/`other` are
-# read-only, and `ambient` is sandboxed observation — never instructions.
+# `owner` is full, `team` is workspace-write sandboxed, `guest` is read-only,
+# and `ambient` is sandboxed observation — never instructions.
 ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
+
+# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits
+# the value; removal is gated on the writers, not on a release count.
+LEGACY_ACCESS_TIER_ALIASES = {"other": "guest"}
+
+
+def canonical_access_tier(value) -> str:
+    """Normalize a tier string: trimmed, lower-cased, legacy aliases resolved.
+
+    Unknown values pass through unchanged so each reader keeps its own
+    fail-closed default; only the spelling is unified here.
+    """
+    tier = str(value or "").strip().lower()
+    return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -167,6 +182,12 @@ KNOWN_HEADER_KEYS = (
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
+    # Broker attestation that a Team sender is a collaborator. The bridge
+    # appends this line directly, bypassing serialize_task_last's key check.
+    "collaborator",
+    # Which worker the sender asked for. INTENT, not placement: the pool's
+    # own binding table decides, and no claim path consults this header.
+    "requested_worker",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
@@ -770,5 +791,21 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(apply_task_stamper(serialize_task_last(hdrs, task_body)))
+    text = apply_task_stamper(serialize_task_last(hdrs, task_body))
+    # `task:` is last, so a partial file still PARSES with the ask short or empty.
+    # mkstemp is per-writer unique; the dot and `.tmp` keep it out of task sweeps.
+    fd, staged = tempfile.mkstemp(prefix=f".{task_id}.", suffix=".tmp", dir=str(d))
+    tmp = Path(staged)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return path

@@ -189,8 +189,8 @@ def behavioral(bridge) -> list:
         fails.append("select_rulebook_key(team, is_collaborator=True) must be 'team-collaborator'")
     if srk("team", False) != "team":
         fails.append("select_rulebook_key(team, False) must stay 'team'")
-    if srk("other", False) != "other":
-        fails.append("select_rulebook_key(other, False) must stay 'other'")
+    if srk("guest", False) != "guest":
+        fails.append("select_rulebook_key(guest, False) must stay 'guest'")
     if srk("owner", False) != "owner":
         fails.append("select_rulebook_key(owner, False) must stay 'owner'")
 
@@ -215,9 +215,9 @@ def structural() -> list:
         fails.append("tier resolution must call resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id) — the hoisted, tier-gated wiring")
 
     # Codex-preamble + silent-escalate branches exclude collaborators.
-    if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
+    if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"guest"\)\s+and\s+not\s+is_collaborator\s*:', src):
         fails.append("codex-preamble branch must exclude collaborators (`and not is_collaborator`)")
-    if not re.search(r'elif\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
+    if not re.search(r'elif\s+access_tier\s+in\s+\("team",\s*"guest"\)\s+and\s+not\s+is_collaborator\s*:', src):
         fails.append("silent-escalate branch must exclude collaborators (`and not is_collaborator`)")
 
     # Task-file assembly: rulebook via helper, collaborator marker, wire tier unchanged.

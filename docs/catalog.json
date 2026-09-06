@@ -21,7 +21,7 @@
    ],
    "status": "active",
    "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-   "last_verified": "2026-08-18"
+   "last_verified": "2026-09-04"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -236,7 +236,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-08-20"
+   "last_verified": "2026-09-04"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -269,6 +269,16 @@
    "status": "active",
    "canonical_for": "Slack bridge setup and behavior",
    "last_verified": null
+  },
+  "docs/sparrow-delivery-identity.md": {
+   "title": "Sparrow delivery identity — frozen definitions (B, slice 1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the five delivery/agent-boundary identities (delivery_id, task_id, attempt_id, idempotency_key, incarnation_id) and the three identity ratchets that gate B's format changes",
+   "last_verified": "2026-08-22"
   },
   "docs/sparrow-v1-contract.md": {
    "title": "ag2-sparrow v1 — the frozen delivery contract",
@@ -361,7 +371,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace operational contract",
-   "last_verified": "2026-08-11"
+   "last_verified": "2026-09-04"
   },
   "docs/workspace-design.md": {
    "title": "Workspace design",
@@ -413,6 +423,36 @@
    "status": "active",
    "canonical_for": "the 76/100 blind-scored GAIA validation result and how to rebuild the suite without republishing the answer key",
    "last_verified": "2026-08-27"
+  },
+  "docs/graceful-shutdown.md": {
+   "title": "Graceful shutdown — sentinel paths",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "which restart path leaves the shutdown sentinel set, and why plain restart clears it",
+   "last_verified": "2026-08-19"
+  },
+  "docs/core-pool-standing-sessions.md": {
+   "title": "Core pool + standing sessions: how they compose",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
+   "last_verified": "2026-08-25"
+  },
+  "docs/proactive-loop-rationale.md": {
+   "title": "Proactive loop — rationale and measurements",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
+   "last_verified": "2026-09-04"
   }
  }
 }

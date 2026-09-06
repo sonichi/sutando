@@ -18,7 +18,7 @@ It does NOT exercise the actual Discord flow — that would need a live
 bridge + mocked discord.py objects.
 
 Guards:
-  1. access_tier starts as "other" (fail-closed default).
+  1. access_tier starts as "guest" (fail-closed default).
   2. The global `allowed` set maps to access_tier="owner".
   3. An else branch checks the union of channel-level allowFroms for
      access_tier="team".
@@ -54,11 +54,16 @@ def main() -> int:
         return 1
     block = match.group(1)
 
-    # 1. access_tier starts as "other" (fail-closed).
-    if not re.search(r'access_tier\s*=\s*[\'"]other[\'"]', block):
-        print('FAIL: access_tier should default to "other" before the owner/team checks', file=sys.stderr)
+    # 1. access_tier starts as "guest" (fail-closed). "other" is the retired
+    #    spelling — a revert to it must fail here, not just read oddly.
+    if not re.search(r'access_tier\s*=\s*[\'"]guest[\'"]', block):
+        print('FAIL: access_tier should default to "guest" before the owner/team checks', file=sys.stderr)
         print("---block---", file=sys.stderr)
         print(block, file=sys.stderr)
+        return 1
+
+    if re.search(r'access_tier\s*=\s*[\'"]other[\'"]', block):
+        print('FAIL: the retired "other" spelling must not be assigned anywhere in the tier block', file=sys.stderr)
         return 1
 
     # 2. if sender_id in allowed → owner ONLY via tierMap (post-2026-07-17:
@@ -95,7 +100,7 @@ def main() -> int:
         return 1
 
     print("PASS: discord-bridge.py access_tier classification looks correct.")
-    print("  - defaults to 'other'")
+    print("  - defaults to 'guest'")
     print("  - global allowFrom → owner")
     print("  - channel-level allowFrom union → team (fallback)")
     print("  - ordering enforced (owner check before team check)")
