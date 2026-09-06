@@ -205,7 +205,7 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws, pid=row.get("pid"))
+                   workspace=self.ws, pid=row.get("pid"), ts=row.get("ts"))
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"

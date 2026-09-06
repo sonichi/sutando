@@ -110,6 +110,24 @@ def _ack_close(workspace: Path | None, task_id: str) -> None:
         pass
 
 
+def _pid_in_archive(workspace: Path | None, pid: str, ts: float) -> bool:
+    """A landed row whose acknowledgement never landed: once rotated, its only memory is the archive
+    day file its own timestamp names (rotate() files by the row's ts)."""
+    live = log_path(workspace)
+    for name in (f"{live.stem}.archive.{day_of(ts)}.jsonl", f"{live.stem}.archive.jsonl"):
+        if _pid_in_log(live.with_name(name), pid):
+            return True
+    return False
+
+
+def _oldest_live_ts(path: Path) -> float | None:
+    try:
+        first = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        return float(json.loads(first).get("ts")) if first.strip() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def _pid_in_log(path: Path, pid: str) -> bool:
     try:
         return any(json.loads(l).get("pid") == pid for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
@@ -119,12 +137,12 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
-           pid: str | None = None) -> dict:
+           pid: str | None = None, ts: float | None = None) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
-    rec: dict = {"ts": time.time(), "line": line.strip(), "kind": kind}
+    rec: dict = {"ts": ts if ts is not None else time.time(), "line": line.strip(), "kind": kind}
     if pid:
         rec["pid"] = pid
     if room:
@@ -142,7 +160,9 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         task_id = task.get("id") if isinstance(task, dict) and isinstance(task.get("id"), str) else None
         acked = bool(pid and task_id and (_pid_acked(workspace, task_id, pid)
                                           or (done and _pid_in_log(summaries_path(workspace), pid))))
-        if not (pid and (acked or _pid_in_log(path, pid))):
+        oldest = _oldest_live_ts(path) if pid and not acked else None
+        rotated = oldest is not None and rec["ts"] < oldest and _pid_in_archive(workspace, pid, rec["ts"])
+        if not (pid and (acked or rotated or _pid_in_log(path, pid))):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if pid and task_id:

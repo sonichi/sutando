@@ -259,6 +259,34 @@ class IdempotentProjection(unittest.TestCase):
         card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i5:1:2")
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "a replayed done row is still one summary")
 
+    def test_a_row_whose_ack_never_landed_is_still_found_after_rotation(self):
+        # The log append completes, then _ack raises: once the row rotates no memory of it remains, so
+        # the replay must find it in the archive day file its own (event, not replay) timestamp names.
+        import activity_rows
+        for fault in (False, True):
+            ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+            real = activity_rows._ack; calls = {"n": 0}
+            def flaky(w, tid, pid):
+                calls["n"] += 1
+                if fault and calls["n"] == 1:
+                    raise OSError("ack disk full")  # AFTER the log append
+                real(w, tid, pid)
+            store = ActivityStore(ws)
+            with unittest.mock.patch.object(activity_rows, "_ack", flaky):
+                st = store.apply(T("task-g1", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+            self.assertEqual(len(st.pending), 1 if fault else 0, "a faulted ack leaves the row owed")
+            for i in range(card.LIVE_ROWS + 1):
+                card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+            self.assertNotIn("task-g1", card.log_path(ws).read_text(), "precondition: rotated out")
+            fresh = ActivityStore(ws); fresh.apply(T("task-g1", "COMPLETED", ts=1_757_000_002.0))
+            history = [json.loads(l) for p in (ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name for l in p.read_text().splitlines()]
+            mine = [r for r in history if r.get("task", {}).get("id") == "task-g1"]
+            self.assertEqual([r["line"] for r in sorted(mine, key=lambda r: r["ts"])], ["picked up", "replied"], f"fault={fault}")
+            self.assertEqual([r["ts"] for r in sorted(mine, key=lambda r: r["ts"])], [1_757_000_000.0, 1_757_000_002.0], "event timestamps, not a replay clock")
+            self.assertEqual(len(fresh.load("task-g1").pending), 0)
+            sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+            self.assertEqual([x["rows"] for x in sums], [2], f"fault={fault}: the summary counts two rows, once")
+
     def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
         # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid
         # projected again must not count the row twice.
