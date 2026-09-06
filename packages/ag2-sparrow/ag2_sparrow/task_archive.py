@@ -24,6 +24,20 @@ _ID_STATE = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+?\.txt$")
 _ID_PLAIN = re.compile(r"^(task-.+?)\.txt(?:\.\d+|\.archive-failed.*)?$")
 
 
+# A pending file is plain: no state suffix, no archive-retry tail. Kept beside
+# the id patterns so a second copy cannot drift from what an id may contain.
+_ID_PENDING = re.compile(r"^task-.+?\.txt$")
+
+
+def is_pending_task_file(name: str) -> bool:
+    """True only for an UNCLAIMED, unarchived `task-<id>.txt`.
+
+    A `[^.]+` id class silently drops legal dotted broker ids (`task-a.b`),
+    leaving that task pending forever while health stays green.
+    """
+    return _ID_STATE.match(name) is None and _ID_PENDING.match(name) is not None
+
+
 def task_id_from_filename(name: str) -> str | None:
     r"""The canonical task id for any name a task file carries, or None.
 
