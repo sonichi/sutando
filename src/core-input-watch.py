@@ -415,6 +415,33 @@ _TUI_SOURCE = "tui"
 DRIVE_SETTLE_S = 15.0
 
 
+# Footer tokens are anchored to their glyphs so a real prompt that merely contains the words
+# ("Bypass permissions for this tool? (y/n)") is not mistaken for the idle footer.
+_NOISE_LINE = re.compile(
+    r"https?://|%3A|code_challenge|[?&]state=|^\[[^\]\n]{0,40}\s\d+:\w+|⏵⏵ bypass permissions|← for agents",
+    re.I)
+_RULE_CHARS = set("─│┌┐└┘├┤┬┴┼╭╮╯╰═║ ")
+_HRULE = "─═"
+
+
+def prompt_excerpt(prompt, limit=6):
+    """The prompt lines the owner must read: the pane's tail minus the chrome around them —
+    box-drawing rules, URL fragments (an OAuth link wraps across lines), the tmux status bar and
+    the idle footer. When the filter leaves nothing, the raw tail is returned instead: this card is
+    the only thing that reaches the owner, so it must fail noisy, never silent."""
+    lines = [ln.strip() for ln in (prompt or "").splitlines() if ln.strip()]
+    out = []
+    for core in lines:
+        if set(core) <= _RULE_CHARS or core[0] in _HRULE:
+            continue  # a rule, with or without a label in it ("──── sutando-core ─")
+        if _NOISE_LINE.search(core):
+            continue
+        if len(core) > 80 and " " not in core:
+            continue
+        out.append(core.strip("─│ "))
+    return (out or lines)[-limit:]
+
+
 def escalation_message(state, detail, kind, prompt):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
@@ -424,9 +451,11 @@ def escalation_message(state, detail, kind, prompt):
     lines = [head, "", f"State: {state} — {detail}"]
     if kind and kind != "unknown":
         lines.append(f"Gate: {kind}")
-    if prompt:
-        excerpt = "\n".join(prompt.strip().splitlines()[-6:])
-        lines += ["", "What the terminal is showing:", "```", excerpt, "```"]
+    excerpt = prompt_excerpt(prompt) if prompt else []
+    if excerpt:
+        # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
+        # needs to read, not the pane's chrome around it.
+        lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
     lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
                   "Nothing else I do can clear this one."]
     return "\n".join(lines)

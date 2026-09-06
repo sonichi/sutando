@@ -57,7 +57,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
@@ -74,6 +74,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
+    verdict_from_record as _gateway_verdict_from_record,
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
@@ -147,9 +148,7 @@ def _default_memory_dir() -> str:
     claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
     only when it is unset (preserving the old path for ad-hoc launches).
     """
-    repo = Path(__file__).parent.parent.resolve()
-    slug = claude_project_slug(repo)
-    return str(Path(claude_home_path()) / "projects" / slug / "memory")
+    return str(default_memory_dir())
 
 # SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
 # report on the same directory the runtime reads, so it opts out of #1724.
@@ -6779,23 +6778,77 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
     return out
 
 
-def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | None":
+    """The lane sidecar's last parsed record, or None when absent/unreadable.
+
+    Raw only: `gateway_serving` owns what a record MEANS, so connectivity is
+    never interpreted here. Separate from `_gateway_stale_lanes`, whose
+    (lane, age) contract several callers and tests depend on.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    try:
+        rec = json.loads((root / f"gateway-status.{lane}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> dict:
     """The ok verdict for the bridge, demoted to warn when any lane's sidecar
     has gone silent — the primary being healthy says nothing about a lane."""
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
-    names = ", ".join(
-        f"{ln} (last write {age:.0f}s ago)" if age < 3600
-        else f"{ln} (last write {age / 3600:.1f}h ago)"
-        for ln, age in stalled)
+    def _aged(ln, age):
+        return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
+                else f"{ln} (last write {age / 3600:.1f}h ago)")
+
+    # Freshness is already decided, so ask the owner what the record MEANT.
+    # None is "no opinion" — never report that as the record saying connected.
+    import time as _time
+    _now = _time.time() if now is None else now
+    silent, failed, unknown, never = [], [], [], []
+    for ln, age in stalled:
+        rec = _gateway_lane_record(ln) or {}
+        err = rec.get("error")
+        verdict = _gateway_verdict_from_record(rec, now=_now, max_age=float("inf"))
+        if verdict is None:
+            unknown.append((ln, age, err))
+        elif verdict.connected is False or err:
+            failed.append((ln, age, err))
+        elif verdict.never_polled:
+            never.append((ln, age, err))
+        else:
+            silent.append((ln, age, err))
+    parts = []
+    if silent:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in silent)} stopped "
+            "writing its sidecar — its last record still says connected, so only "
+            "the silence shows it")
+    if never:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in never)} stopped "
+            "while claiming connection it never completed a poll on — its record "
+            "has no successful poll to point at")
+    for ln, age, err in unknown:
+        # Schema drift must not cost the operator the error string; `failed`
+        # prints it and this branch holds the same value.
+        why = f", but it recorded: {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped writing its sidecar and its "
+                     "last record carries no usable connectivity"
+                     f"{why} — read the file rather than trusting either state")
+    for ln, age, err in failed:
+        why = f": {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped after recording a "
+                     f"failure{why} — read that, not the silence")
     return {
         "name": "gateway-bridge",
         "status": "warn",
         "detail": (
-            f"{detail}, but lane {names} stopped writing its sidecar — its last "
-            "record still says connected, so only the silence shows it; messages "
-            "on that lane are not being delivered (retired lane? remove "
+            f"{detail}, but " + "; ".join(parts) + "; messages on that lane are "
+            "not being delivered (retired lane? remove "
             "state/gateway-status.<lane>.json)"
         ),
     }
@@ -8365,8 +8418,12 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
     if not stale and not abandoned:
         status = "warn" if unreadable else "ok"
+        # Name the window, not an absolute absence: a body younger than the
+        # threshold is skipped above and is still undelivered.
         return {"name": name, "status": status,
-                "detail": f"no undelivered proactive bodies{partial}"}
+                "detail": f"no proactive body older than {threshold_age_sec // 60}m "
+                          f"and no claim older than {claim_threshold_age_sec // 60}m"
+                          f"{partial}"}
     parts = []
     if stale:
         stale.sort(key=lambda item: -item[1])
