@@ -12,6 +12,7 @@ import io
 import os
 import contextlib
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -321,6 +322,75 @@ class MemoryIsPartOfTheCorpus(unittest.TestCase):
         self.assertEqual(reads.count(str(f)), 1, f"read {reads.count(str(f))}x")
 
 
+
+class BuildLogIsPartOfTheCorpus(unittest.TestCase):
+    """The per-host files record what a pass DECIDED; the build log records what
+    a pass FOUND. A re-derivation collides with the finding, so a corpus of
+    decisions is blind to exactly the class this gate exists to catch.
+
+    These patch the resolver rather than the environment on purpose: pointing
+    SUTANDO_MEMORY_DIR at a directory holding build_log.md lets the memory glob
+    pick the file up, so the suite still passes with the build log removed from
+    parking_files() -- a control that certifies nothing.
+    """
+
+    def _corpus(self, build_log_text):
+        d = Path(tempfile.mkdtemp())
+        bl = d / "build_log.md"
+        bl.write_text(build_log_text)
+        mem = d / "memory"
+        mem.mkdir()
+        (mem / "unrelated.md").write_text("## nothing to do with it\n")
+        return bl, mem
+
+    @contextlib.contextmanager
+    def _resolved(self, bl, mem):
+        # parking_files() puts src/ on sys.path when it runs; do it here too so
+        # the patch targets the same module object the function will import.
+        sys.path.insert(0, str(SCRIPTS.parents[2] / "src"))
+        import util_paths
+        fake = lambda name, workspace=None: bl if name == "build_log.md" else Path("/nonexistent-xyz") / name
+        with mock.patch.object(util_paths, "shared_personal_path", side_effect=fake), \
+             mock.patch.dict(os.environ, {"SUTANDO_MEMORY_DIR": str(mem)}):
+            yield
+
+    def test_the_build_log_joins_the_parking_corpus(self):
+        bl, mem = self._corpus("### zzz-subject measured and closed\n")
+        with self._resolved(bl, mem):
+            names = [f.name for f in wat.parking_files()]
+        self.assertIn("build_log.md", names)
+
+    def test_a_finding_recorded_only_in_the_build_log_is_not_called_untriaged(self):
+        # Without the build log this material is in no searched file, so the
+        # verdict is NONE FOUND -> exit 0, which the loop reads as a green light.
+        bl, mem = self._corpus("### zzz-subject measured and closed\n")
+        with self._resolved(bl, mem):
+            verdict, out = _report("", "the `zzz-subject` needs investigating", wat.parking_files())
+        self.assertEqual(verdict, "parked")
+        self.assertNotIn("NONE FOUND", out)
+
+    def test_the_hit_names_the_build_log_and_is_not_labelled_as_memory(self):
+        bl, mem = self._corpus("### zzz-subject measured and closed\n")
+        with self._resolved(bl, mem):
+            _, out = _report("", "the `zzz-subject` needs investigating", wat.parking_files())
+        self.assertIn("build_log.md", out)
+        self.assertNotIn("memory/build_log.md", out)
+
+    def test_absent_material_still_reports_untriaged_with_the_build_log_present(self):
+        # Green-on-purpose: the real corpus is 2 MB, so it must not match everything.
+        bl, mem = self._corpus("### something entirely else\n")
+        with self._resolved(bl, mem):
+            verdict, out = _report("", "the `zzz-subject` needs investigating", wat.parking_files())
+        self.assertEqual(verdict, "untriaged")
+        self.assertIn("NONE FOUND", out)
+
+    def test_a_missing_build_log_degrades_rather_than_raising(self):
+        d = Path(tempfile.mkdtemp())
+        mem = d / "memory"
+        mem.mkdir()
+        with self._resolved(d / "build_log.md", mem):
+            files = wat.parking_files()
+        self.assertTrue(all(f.exists() for f in files))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
