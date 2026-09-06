@@ -4,6 +4,7 @@ says who is on it and since when, never what they are doing inside."""
 from __future__ import annotations
 
 import json
+import subprocess
 import os
 import sys
 import tempfile
@@ -58,6 +59,34 @@ class Contract(unittest.TestCase):
         self.assertNotIn("summary", p); self.assertNotIn("seq", p)
         self.assertNotIn("acquisition", json.dumps(p))
 
+    def test_the_room_guard_refuses_rather_than_trims_and_survives_python_O(self):
+        with self.assertRaises(ValueError):
+            av.room_payload({"worker": "air", "summary": "the acquisition"}, av.ROOM_AVAILABILITY_FIELDS)
+        with self.assertRaises(ValueError):
+            av.room_payload({"worker": "air", "queue_depth": 7}, av.ROOM_TASK_STATUS_FIELDS)
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); import agent_availability as av\n"
+                 "try:\n    av.room_payload({'worker': 'a', 'thinking': 'x'}, av.ROOM_AVAILABILITY_FIELDS)\n"
+                 "except ValueError:\n    print('refused')\nelse:\n    print('LEAKED')")
+        out = subprocess.run([sys.executable, "-O", "-c", probe, src], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), "refused", "an assert would be compiled out under -O; this guard is not")
+
+    def test_the_task_projection_keeps_a_restricted_audience(self):
+        for aud in ("owner", "selected_members", "system"):
+            p = av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": aud}, now=1.0)
+            self.assertEqual(p["audience"], aud, "a restricted snapshot never becomes room-visible by projection")
+        self.assertEqual(av.task_projection({"task_id": "t", "phase": "RUNNING", "audience": "room"}, now=1.0)["audience"], "room")
+
+    def test_one_contract_the_wire_shape_derives_from_the_bus_snapshot(self):
+        import activity_bus as bus
+        st = bus.TaskActivityState(task_id="t9", phase="RUNNING", worker="air", message_event_id="$m", started_at=1.0,
+                                   last_activity_at=5.0, summary="the acquisition", seq=3, activity_session_id="a1")
+        snap = bus.shared_projection(st)
+        self.assertFalse(set(snap) & av.FORBIDDEN_IN_ROOM, "the snapshot carries no private key")
+        wire = av.task_projection(snap, now=10.0)
+        self.assertEqual(set(wire), set(av.ROOM_TASK_STATUS_FIELDS))
+        self.assertEqual((wire["phase"], wire["since_s"], wire["last_status_at"], wire["audience"]), ("RUNNING", 9.0, 5.0, snap["audience"]))
+
     def test_invariant_1_no_forbidden_field_ever_reaches_a_room_payload(self):
         # Privacy happens before projection and transport: the forbidden keys are absent by construction,
         # and no private text survives by value either.
@@ -101,7 +130,8 @@ class Policy(unittest.TestCase):
     ownership, AVAILABILITY is room policy-filtered; tiers resolve to capabilities, never to branches."""
 
     def test_the_matrix_owner_same_room_other_room(self):
-        P = pol.projections_for
+        def P(tier, viewer_room, task_room):
+            return pol.projections_for(tier, viewer_room, task_room, viewer_is_room_member=True)
         self.assertEqual(P("owner", "!eng:s", "!eng:s"), {"RUNTIME_DETAIL", "TASK_STATUS", "AVAILABILITY"})
         self.assertEqual(P("owner", "!other:s", "!eng:s"), {"RUNTIME_DETAIL", "TASK_STATUS", "AVAILABILITY"})
         for tier in ("team", "guest", "none"):
@@ -110,7 +140,8 @@ class Policy(unittest.TestCase):
             self.assertNotIn("RUNTIME_DETAIL", P(tier, "!eng:s", "!eng:s"))
 
     def test_a_no_access_room_member_still_sees_the_rooms_own_task_but_nothing_of_the_agent(self):
-        self.assertIn("TASK_STATUS", pol.projections_for("none", "!eng:s", "!eng:s"))
+        self.assertIn("TASK_STATUS", pol.projections_for("none", "!eng:s", "!eng:s", viewer_is_room_member=True))
+        self.assertEqual(pol.projections_for("none", "!eng:s", "!eng:s"), set(), "membership is claimed, never assumed")
         self.assertNotIn("agent.invoke", pol.capabilities("none", room_member=True))
         self.assertEqual(pol.projections_for("none", "!eng:s", "!eng:s", viewer_is_room_member=False), set())
 

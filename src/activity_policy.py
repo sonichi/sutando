@@ -29,7 +29,7 @@ def capabilities(tier: str, room_member: bool = False) -> frozenset[str]:
 
 
 def projections_for(viewer_tier: str, viewer_room: str | None, task_room: str | None,
-                    viewer_is_room_member: bool = True) -> frozenset[str]:
+                    viewer_is_room_member: bool = False) -> frozenset[str]:
     """Which projections this viewer may receive for a task that belongs to `task_room`."""
     caps = capabilities(viewer_tier, viewer_is_room_member)
     out: set[str] = set()

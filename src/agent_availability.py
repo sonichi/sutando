@@ -71,6 +71,16 @@ FORBIDDEN_IN_ROOM = frozenset({"summary", "thinking", "tool", "command", "privat
                                "capacity", "max_concurrency", "queue_depth", "reason", "seq", "activity_session_id"})
 
 
+def room_payload(payload: dict, allowed: frozenset[str]) -> dict:
+    """Privacy happens here, before any transport: a key outside the room allowlist or inside the
+    denylist is refused, not trimmed. A raise, not an assert — this must survive `python -O`."""
+    extra = set(payload) - allowed
+    leaked = set(payload) & FORBIDDEN_IN_ROOM
+    if extra or leaked:
+        raise ValueError(f"room payload refused: outside allowlist {sorted(extra)}, forbidden {sorted(leaked)}")
+    return payload
+
+
 def availability_projection(state: AgentRuntimeState, worker: str | None = None, room_id: str | None = None,
                             room_policy=None, now: float | None = None) -> dict:
     """What THIS room may see. No counts, no reasons, no queue contents. The canonical state is global;
@@ -83,21 +93,21 @@ def availability_projection(state: AgentRuntimeState, worker: str | None = None,
             value = narrowed
     payload = {"worker": worker, "room": room_id, "availability": value, "audience": "room",
                "projection": "AVAILABILITY", "ts": now if now is not None else time.time()}
-    assert set(payload) <= ROOM_AVAILABILITY_FIELDS  # privacy happens here, before any transport
-    return payload
+    return room_payload(payload, ROOM_AVAILABILITY_FIELDS)
 
 
 def task_projection(snapshot: dict, now: float | None = None) -> dict:
-    """What the room may see about one task: who is on it, where it stands, since when. Built from
-    the bus's shared projection; carries no summary and no steps."""
+    """The wire shape of one task's TASK_STATUS: who is on it, where it stands, since when. Its input
+    is the bus's shared_projection (the snapshot); the audience that snapshot carries is kept, never
+    widened to the room here."""
     started = snapshot.get("started_at")
     now = now if now is not None else time.time()
     payload = {"task_id": snapshot.get("task_id"), "message_event_id": snapshot.get("message_event_id"),
                "worker": snapshot.get("worker"), "phase": snapshot.get("phase"),
                "since_s": (max(0.0, now - started) if isinstance(started, (int, float)) else None),
-               "last_status_at": snapshot.get("last_activity_at"), "audience": "room", "projection": "TASK_STATUS"}
-    assert set(payload) <= ROOM_TASK_STATUS_FIELDS  # privacy happens here, before any transport
-    return payload
+               "last_status_at": snapshot.get("last_activity_at"), "audience": snapshot.get("audience") or "room",
+               "projection": "TASK_STATUS"}
+    return room_payload(payload, ROOM_TASK_STATUS_FIELDS)
 
 
 def this_host() -> str:
