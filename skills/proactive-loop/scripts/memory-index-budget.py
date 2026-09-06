@@ -137,8 +137,12 @@ def main(argv=None) -> int:
         print(f"\n✗ REFUSE — this addition drops {len(r['dropped'])} row(s) that load today:")
         for e in r["dropped"][:10]:
             print(f"    {e[:100]}")
-        print("\n  Free room FIRST. Run scripts/memory-hub-containment.py before trimming,")
-        print("  so a row you remove is still carried by its hub.")
+        # Names no containment script: the one this line used to cite has never
+        # existed in the repo or the workspace, so the advice was unrunnable at
+        # the exact moment it mattered — on a refusal.
+        print("\n  Free room FIRST, and check the row is still reachable from its hub")
+        print("  before removing it. health-check.py's memory-index probe reports the")
+        print("  loaded prefix; which rows go is the owner's call.")
     if r["addition_loads"] is False:
         bad = True
         print("\n✗ REFUSE — the addition itself lands past the cut and would never load.")
