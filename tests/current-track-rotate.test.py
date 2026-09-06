@@ -203,6 +203,35 @@ class PinnedEntries(unittest.TestCase):
         # monotonic, so sorting them would test the fixture, not the contract.
         self.assertEqual(arch_order, [h for h in orig_order if h in arch_order])
 
+    def test_a_repeated_identical_entry_is_two_records_not_one(self):
+        """Dedup by occurrence, not membership: the same text written twice is two records."""
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        pre = "# t\n\n"
+        P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
+        big = lambda n, c: f"## 2026-0{n}-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
+        p.write_text(pre + P + big(5, "A") + big(9, "C"))
+
+        ct.rotate(p, 4 * 1024)                       # P pinned, archived once
+        self.assertEqual(archive.read_text().count("hands off #3166"), 1)
+        self.assertIn("hands off #3166", p.read_text())
+
+        p.write_text(p.read_text() + P + big(9, "D"))   # the SAME text written again later
+        ct.rotate(p, 4 * 1024, pin=None)                # both retired
+        total = archive.read_text().count("hands off #3166") + p.read_text().count("hands off #3166")
+        self.assertEqual(total, 2, "a legitimately repeated entry was dropped as a duplicate")
+
+    def test_a_previously_archived_pin_is_not_written_twice(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        p = Path(d.name) / "current-track.md"
+        archive = p.with_name("current-track-archive.md")
+        p.write_text(self.corpus())
+        ct.rotate(p, 8 * 1024)
+        first = archive.read_text().count("hands off #3166")
+        ct.rotate(p, 1024, pin=None)
+        self.assertEqual(archive.read_text().count("hands off #3166"), first)
+
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())

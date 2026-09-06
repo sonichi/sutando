@@ -27,6 +27,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,10 +129,12 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
 
 
 def _not_yet_archived(archive: Path, outgoing: str) -> str:
-    """Entries of `outgoing` the archive does not already hold, in order.
+    """Entries of `outgoing` the archive does not already hold, by OCCURRENCE.
 
-    A pinned entry is archived when it is first skipped, so the rotation that
-    follows its retirement must not append it a second time.
+    A pinned entry is archived when first skipped, so the rotation after its
+    retirement must not append a second copy. Counting occurrences rather than
+    testing membership keeps a genuinely repeated entry: two identical entries
+    written on different days are two records, and dropping one loses history.
     """
     try:
         have = archive.read_text(encoding="utf-8")
@@ -139,8 +142,16 @@ def _not_yet_archived(archive: Path, outgoing: str) -> str:
         return outgoing
     _, entries = split(outgoing)
     if not entries:
-        return outgoing if outgoing not in have else ""
-    return "".join(e for e in entries if e not in have)
+        return "" if outgoing and outgoing in have else outgoing
+    _, had = split(have)
+    remaining = Counter(had)
+    keep = []
+    for e in entries:
+        if remaining[e] > 0:
+            remaining[e] -= 1      # this copy is the one already on record
+        else:
+            keep.append(e)
+    return "".join(keep)
 
 
 def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
