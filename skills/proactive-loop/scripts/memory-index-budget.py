@@ -108,19 +108,22 @@ def _host_label(repo: Path) -> "str | None":
         return None
 
 
-def _host_pointer_path(projects: Path, repo: Path) -> "Path | None":
+def _host_pointer_path(workspace: Path, repo: Path) -> "Path | None":
     """Where THIS host records which corpus it loads, or None if the label owner
-    cannot answer -- guessing the label is what the delegation exists to stop."""
+    cannot answer -- guessing the label is what the delegation exists to stop.
+
+    Anchored on the resolved workspace, never on the index's own ancestors: an
+    external SUTANDO_MEMORY_DIR would otherwise write state outside the workspace."""
     label = _host_label(repo)
     if not label:
         return None
-    return projects.parent.parent / "hosts" / label / "memory-corpus"
+    return workspace / "hosts" / label / "memory-corpus"
 
 
-def _host_stated_index(projects: Path, repo: Path) -> "tuple[Path | None, str]":
+def _host_stated_index(workspace: Path, repo: Path) -> "tuple[Path | None, str]":
     """(index, why) from the pointer; (None, "") when unrecorded -- absent is
     absent, so the caller still refuses rather than inferring."""
-    ptr = _host_pointer_path(projects, repo)
+    ptr = _host_pointer_path(workspace, repo)
     if ptr is None:
         return None, ""
     try:
@@ -132,7 +135,7 @@ def _host_stated_index(projects: Path, repo: Path) -> "tuple[Path | None, str]":
     return Path(raw).expanduser(), f"{ptr}"
 
 
-def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
+def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
     """(index, note); index None means refuse and the note says why. Freshness is
     not identity -- an mtime cannot say which corpus this session loads."""
     default = memory_dir / "MEMORY.md"
@@ -143,7 +146,7 @@ def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
             return default, ""
         return None, f"CANNOT ANSWER: SUTANDO_MEMORY_DIR resolves to {default}, which is not a file"
     projects = memory_dir.parent.parent
-    stated, why = _host_stated_index(projects, repo)
+    stated, why = _host_stated_index(workspace, repo)
     if stated is not None:
         if stated.is_file():
             return stated, ""
@@ -163,7 +166,7 @@ def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
     if len(cands) == 1:
         return cands[0], ""
     names = ", ".join(c.parent.parent.name for c in cands)
-    ptr = _host_pointer_path(projects, repo) or "<hosts/<label>/memory-corpus>"
+    ptr = _host_pointer_path(workspace, repo) or "<hosts/<label>/memory-corpus>"
     ambiguity = (
         f"AMBIGUOUS CORPUS: {len(cands)} candidate indexes under {projects} and nothing "
         f"authoritative names one ({names}). An mtime says which was edited last, not "
@@ -178,14 +181,14 @@ def _live_index(memory_dir: Path, repo: Path) -> "tuple[Path | None, str]":
 
 
 
-def record_pointer(projects: Path, repo: Path, target: Path,
+def record_pointer(workspace: Path, repo: Path, target: Path,
                    force: bool = False) -> "tuple[int, str]":
     """THE writer for this host's corpus pointer. Validates, then writes atomically.
 
     A pointer naming nothing turns every later call into a refusal that reads as a
     missing corpus, so the validation is the contract, not a courtesy.
     """
-    ptr = _host_pointer_path(projects, repo)
+    ptr = _host_pointer_path(workspace, repo)
     if ptr is None:
         return 2, ("CANNOT ANSWER: this host's label is unresolvable, so there is no "
                    "pointer path to write. Set SUTANDO_HOST_LABEL or pass --index.")
@@ -261,15 +264,20 @@ def main(argv=None) -> int:
         return 2
 
     if a.record:
-        rc, msg = record_pointer(Path(getattr(mod, "MEMORY_DIR", "")).parent.parent,
-                                 repo, Path(a.record), force=a.force)
+        ws = getattr(mod, "WORKSPACE_DIR", None)
+        if ws is None:
+            print("CANNOT ANSWER: health-check exposes no resolved workspace, so the "
+                  "pointer has no canonical destination", file=sys.stderr)
+            return 2
+        rc, msg = record_pointer(Path(ws), repo, Path(a.record), force=a.force)
         print(msg, file=sys.stderr if rc else sys.stdout)
         return rc
 
     if a.index:
         index, note = Path(a.index), ""
     else:
-        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")), repo)
+        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")), repo,
+                                  Path(getattr(mod, "WORKSPACE_DIR", repo / "workspace")))
         # A note now travels with a RESOLVED index too, carrying the caveat that
         # made it ambiguous; only a None index is a refusal.
         if note:

@@ -144,7 +144,7 @@ with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     # A 12-day gap is exactly the case where "freshest" looks authoritative and
     # is not: an unrelated project edited later is still not what loads here.
     check("resolution: two corpora REFUSE -- callers gate on the exit code, so an "
@@ -157,8 +157,10 @@ with tempfile.TemporaryDirectory() as d:
 # The pointer lives at <workspace>/hosts/<label>/memory-corpus; pin the label so
 # the test does not depend on the machine it runs on.
 def _ptr_for(projects):
+    # The pointer is anchored on the WORKSPACE, not on the projects dir; callers
+    # pass projects, so the workspace is two levels up from it.
     os.environ["SUTANDO_HOST_LABEL"] = "test-host"
-    return mib._host_pointer_path(projects, REPO)
+    return mib._host_pointer_path(projects.parent.parent, REPO)
 
 
 def _canonical_label():
@@ -203,7 +205,7 @@ with tempfile.TemporaryDirectory() as d:
     check("pointer: it is per-host by construction, not a shared filename",
           ptr.parent.name == "test-host" and ptr.parent.parent.name == "hosts", f"ptr={ptr}")
     # The pointer adds a way in; it does not soften the ambiguous refusal.
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     check("pointer: an absent pointer REFUSES -- ambiguity is unresolved, not defaulted",
           got is None and "AMBIGUOUS CORPUS" in note, f"got={got}")
     check("pointer: the caveat names the file to record AND the writer that writes it",
@@ -212,16 +214,16 @@ with tempfile.TemporaryDirectory() as d:
     # the pointer can produce this answer.
     ptr.parent.mkdir(parents=True, exist_ok=True)
     ptr.write_text(str(live / "MEMORY.md") + "\n")
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     check("pointer: a recorded corpus resolves, outranking both cwd and freshness",
           got == live / "MEMORY.md" and note == "", f"got={got} note={note!r}")
     # Falling through here would let a typo silently measure a different corpus.
     ptr.write_text(str(projects / "no-such" / "memory" / "MEMORY.md"))
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     check("pointer: a pointer to a missing file REFUSES, never falls back to inference",
           got is None and "is not a file" in note, f"got={got} note={note!r}")
     ptr.write_text("   \n")
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     check("pointer: an empty pointer is 'unrecorded', not 'recorded as nothing'",
           got is None and "AMBIGUOUS CORPUS" in note
           and "RECORD IT ONCE" in note, f"note={note!r}")
@@ -230,7 +232,7 @@ with tempfile.TemporaryDirectory() as d:
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     only = _tree(projects, "slug-only", index_of(LIMIT // 3), age_s=60)
-    got, note = mib._live_index(only, REPO)
+    got, note = mib._live_index(only, REPO, projects.parent.parent)
     check("resolution: a single corpus is unchanged behaviour and says nothing",
           got == only / "MEMORY.md" and note == "", f"got={got} note={note!r}")
 
@@ -238,7 +240,7 @@ with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     a = _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
-    got, note = mib._live_index(a, REPO)
+    got, note = mib._live_index(a, REPO, projects.parent.parent)
     check("resolution: near-simultaneous indexes are ambiguous too -- the gap never decides",
           got is None and "AMBIGUOUS CORPUS" in note, f"got={got} note={note!r}")
 
@@ -250,7 +252,7 @@ with tempfile.TemporaryDirectory() as d:
     outside = pathlib.Path(d) / "elsewhere" / "memory"
     outside.mkdir(parents=True)
     (outside / "MEMORY.md").write_text(index_of(LIMIT // 2))
-    got, _ = mib._live_index(mine, REPO)
+    got, _ = mib._live_index(mine, REPO, projects.parent.parent)
     check("resolution: a fresher index OUTSIDE projects/ is not eligible",
           got == mine / "MEMORY.md", f"got {got}")
 
@@ -274,13 +276,13 @@ with tempfile.TemporaryDirectory() as d:
     _prev = os.environ.get("SUTANDO_MEMORY_DIR")
     os.environ["SUTANDO_MEMORY_DIR"] = str(older)
     try:
-        got, note = mib._live_index(older, REPO)
+        got, note = mib._live_index(older, REPO, projects.parent.parent)
         check("resolution: with the override set, the caller's memory_dir is trusted outright",
               got == older / "MEMORY.md" and note == "", f"got={got} note={note!r}")
-        got, note = mib._live_index(newer, REPO)
+        got, note = mib._live_index(newer, REPO, projects.parent.parent)
         check("resolution: an override set means NO sibling scan -- a fresher tree is ignored",
               got == newer / "MEMORY.md" and note == "", f"got={got} note={note!r}")
-        got, note = mib._live_index(projects / "slug-absent" / "memory", REPO)
+        got, note = mib._live_index(projects / "slug-absent" / "memory", REPO, projects.parent.parent)
         check("resolution: override set but the index missing REFUSES, never falls back to a scan",
               got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
     finally:
@@ -298,13 +300,13 @@ with tempfile.TemporaryDirectory() as d:
     empty = pathlib.Path(d) / "elsewhere" / "memory"
     empty.mkdir(parents=True)
     (empty / "MEMORY.md").write_text(index_of(LIMIT // 3))
-    got, note = mib._live_index(empty, REPO)          # its projects/ parent holds no */memory/MEMORY.md
+    got, note = mib._live_index(empty, REPO, projects.parent.parent)          # its projects/ parent holds no */memory/MEMORY.md
     check("fallback: no candidates under projects/ but MEMORY_DIR has one -> use it",
           got == empty / "MEMORY.md" and note == "", f"got={got} note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
     missing = pathlib.Path(d) / "nowhere" / "memory"
-    got, note = mib._live_index(missing, REPO)
+    got, note = mib._live_index(missing, REPO, projects.parent.parent)
     check("refusal: no candidates and no index at MEMORY_DIR -> None + CANNOT ANSWER",
           got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
 
@@ -320,7 +322,7 @@ with tempfile.TemporaryDirectory() as d:
         return real_glob(self, pattern, *a, **k)
     pathlib.Path.glob = boom
     try:
-        got, note = mib._live_index(live, REPO)
+        got, note = mib._live_index(live, REPO, projects.parent.parent)
     finally:
         pathlib.Path.glob = real_glob
     # A raised scan proves nothing about uniqueness, so falling back to MEMORY_DIR's
@@ -394,7 +396,7 @@ with tempfile.TemporaryDirectory() as d:
     _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
     empty = pathlib.Path(d) / "no-default" / "memory"
     empty.mkdir(parents=True)
-    got, note = mib._live_index(empty, REPO)
+    got, note = mib._live_index(empty, REPO, projects.parent.parent)
     check("refusal SURVIVES: ambiguous AND no default to answer from still refuses",
           got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
 
@@ -405,7 +407,7 @@ with tempfile.TemporaryDirectory() as d:
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
     ptr = projects.parent.parent / "hosts" / "test-host" / "memory-corpus"
 
-    rc, msg = mib.record_pointer(projects, REPO, live / "MEMORY.md")
+    rc, msg = mib.record_pointer(projects.parent.parent, REPO, live / "MEMORY.md")
     check("record: a valid target writes and reports where", rc == 0 and str(ptr) in msg, msg)
     check("record: the pointer holds the RESOLVED absolute path",
           ptr.read_text().strip() == str((live / "MEMORY.md").resolve()), ptr.read_text())
@@ -413,16 +415,16 @@ with tempfile.TemporaryDirectory() as d:
           not list(ptr.parent.glob(".*tmp")), list(ptr.parent.glob(".*")))
     # Round trip: the thing just written is the thing the resolver honours.
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
-    got, note = mib._live_index(stale, REPO)
+    got, note = mib._live_index(stale, REPO, projects.parent.parent)
     check("record: ROUND TRIP -- what --record wrote is what the resolver returns",
           got is not None and got.resolve() == (live / "MEMORY.md").resolve()
           and note == "", f"got={got} note={note!r}")
 
     before = ptr.read_text()
-    rc, msg = mib.record_pointer(projects, REPO, pathlib.Path(d) / "nope" / "MEMORY.md")
+    rc, msg = mib.record_pointer(projects.parent.parent, REPO, pathlib.Path(d) / "nope" / "MEMORY.md")
     check("record: a target that is not a file REFUSES", rc == 2 and "not a file" in msg, msg)
     (live / "notes.md").write_text("not an index\n", encoding="utf-8")
-    rc2, msg2 = mib.record_pointer(projects, REPO, live / "notes.md")
+    rc2, msg2 = mib.record_pointer(projects.parent.parent, REPO, live / "notes.md")
     check("record: a file that is not an index REFUSES *by name*, having passed the is-a-file check",
           rc2 == 2 and "not named MEMORY.md" in msg2, msg2)
     check("record: a REFUSED write leaves the existing pointer untouched",
@@ -432,7 +434,7 @@ with tempfile.TemporaryDirectory() as d:
     # correct, and the reader cannot tell a wrong pointer from a right one.
     second = _tree(projects, "slug-second", index_of(LIMIT // 4), age_s=30)
     kept = ptr.read_text()
-    rc_c, msg_c = mib.record_pointer(projects, REPO, second / "MEMORY.md")
+    rc_c, msg_c = mib.record_pointer(projects.parent.parent, REPO, second / "MEMORY.md")
     check("record: a SECOND record onto an existing pointer REFUSES",
           rc_c == 2 and "already records" in msg_c, msg_c)
     check("record: ...and the refusal names the value it declined to overwrite",
@@ -460,9 +462,9 @@ with tempfile.TemporaryDirectory() as d:
           sorted(r[0] for r in out.values()) == [0, 2], out)
     check("record: ...and the racing loser leaves no staging file",
           not list(ptr.parent.glob(".*tmp")), list(ptr.parent.glob(".*")))
-    mib.record_pointer(projects, REPO, live / "MEMORY.md", force=True)
+    mib.record_pointer(projects.parent.parent, REPO, live / "MEMORY.md", force=True)
 
-    rc_f, msg_f = mib.record_pointer(projects, REPO, second / "MEMORY.md", force=True)
+    rc_f, msg_f = mib.record_pointer(projects.parent.parent, REPO, second / "MEMORY.md", force=True)
     check("record: --force retargets deliberately", rc_f == 0, msg_f)
     check("record: ...and the pointer then holds the NEW target",
           ptr.read_text().strip() == str((second / "MEMORY.md").resolve()), ptr.read_text())
@@ -476,7 +478,7 @@ with tempfile.TemporaryDirectory() as d:
     _real = mib._host_label
     mib._host_label = lambda repo: ""
     try:
-        rc, msg = mib.record_pointer(projects, REPO, live / "MEMORY.md")
+        rc, msg = mib.record_pointer(projects.parent.parent, REPO, live / "MEMORY.md")
     finally:
         mib._host_label = _real
     check("record: an unresolvable host label REFUSES rather than guessing a path",
@@ -484,7 +486,7 @@ with tempfile.TemporaryDirectory() as d:
     mib._host_label = lambda repo: "test-host-control"
     try:
         check("record: ...and the control -- the SAME call succeeds once a label resolves",
-              mib.record_pointer(projects, REPO, live / "MEMORY.md")[0] == 0)
+              mib.record_pointer(projects.parent.parent, REPO, live / "MEMORY.md")[0] == 0)
     finally:
         mib._host_label = _real
 
@@ -502,7 +504,7 @@ with tempfile.TemporaryDirectory() as d:
     _link = _os.link
     try:
         _os.link = lambda a, b: (_ for _ in ()).throw(FileExistsError())
-        rc_r, msg_r = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+        rc_r, msg_r = mib.record_pointer(projects.parent.parent, REPO, third / "MEMORY.md")
     finally:
         _os.link = _link
     check("record: losing the link race REFUSES rather than clobbering",
@@ -515,7 +517,7 @@ with tempfile.TemporaryDirectory() as d:
         _os.link = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt())
         raised = False
         try:
-            mib.record_pointer(projects, REPO, third / "MEMORY.md")
+            mib.record_pointer(projects.parent.parent, REPO, third / "MEMORY.md")
         except KeyboardInterrupt:
             raised = True
     finally:
@@ -531,7 +533,7 @@ with tempfile.TemporaryDirectory() as d:
     _rt = pathlib.Path.read_text
     try:
         pathlib.Path.read_text = lambda self, *a, **k: (_ for _ in ()).throw(OSError("nope"))
-        rc_u, msg_u = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+        rc_u, msg_u = mib.record_pointer(projects.parent.parent, REPO, third / "MEMORY.md")
     finally:
         pathlib.Path.read_text = _rt
     check("record: an UNREADABLE existing pointer still REFUSES, and says so",
@@ -542,7 +544,7 @@ with tempfile.TemporaryDirectory() as d:
     _mk = _tf.mkstemp
     try:
         _tf.mkstemp = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
-        rc_s, msg_s = mib.record_pointer(projects, REPO, third / "MEMORY.md")
+        rc_s, msg_s = mib.record_pointer(projects.parent.parent, REPO, third / "MEMORY.md")
     finally:
         _tf.mkstemp = _mk
     check("record: a staging failure REFUSES instead of writing in place",
@@ -554,6 +556,7 @@ with tempfile.TemporaryDirectory() as d:
     ptr.unlink(missing_ok=True)
     class _Mod:
         MEMORY_DIR = str(third)
+        WORKSPACE_DIR = str(projects.parent.parent)
     _hc = mib._health_check
     try:
         mib._health_check = lambda repo: _Mod()
@@ -567,6 +570,25 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         mib._health_check = _hc
     check("record: ...and a SECOND CLI record refuses, exactly as the function does", rc_cli2 == 2, rc_cli2)
+
+    # The override is supported, so an external memory tree must NOT drag this
+    # host's pointer out of the workspace with it.
+    ptr.unlink(missing_ok=True)   # bootstrap-only: the prior case left one
+    ext = pathlib.Path(tempfile.mkdtemp()) / "external" / "projects" / "slug" / "memory"
+    ext.mkdir(parents=True)
+    (ext / "MEMORY.md").write_text("- external row\n", encoding="utf-8")
+    class _ExtMod:
+        MEMORY_DIR = str(ext)
+        WORKSPACE_DIR = str(projects.parent.parent)
+    try:
+        mib._health_check = lambda repo: _ExtMod()
+        rc_ext = mib.main(["--record", str(ext / "MEMORY.md"), "--repo", str(REPO)])
+    finally:
+        mib._health_check = _hc
+    stray = ext.parent.parent.parent / "hosts" / "test-host" / "memory-corpus"
+    check("record: an EXTERNAL memory dir still records inside the workspace",
+          rc_ext == 0 and ptr.exists(), f"rc={rc_ext}")
+    check("record: ...and writes nothing beside the external tree", not stray.exists(), stray)
 
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
