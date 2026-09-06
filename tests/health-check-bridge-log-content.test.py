@@ -131,7 +131,7 @@ def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
 
         with patch.object(hc, "WORKSPACE_DIR", tmpws), \
              patch.object(hc, "claude_home_path", side_effect=_fake_chp), \
-             patch.object(hc, "find_pids", return_value=["999999"]):
+             patch.object(hc, "probe_pids", return_value=(["999999"], True)):
             checks = hc.run_all_checks()
         return next((c for c in checks if c["name"] == "slack-bridge"), None)
 

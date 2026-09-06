@@ -128,7 +128,7 @@ class DropLauncherParentsTest(unittest.TestCase):
 
             with mock.patch.object(health, "claude_home_path", side_effect=fake_home_path), \
                  mock.patch.object(health, "_should_skip_bridge", side_effect=lambda channel, _env: channel != "telegram"), \
-                 mock.patch.object(health, "find_pids", return_value=pgrep_pids), \
+                 mock.patch.object(health, "probe_pids", return_value=(pgrep_pids, True)), \
                  mock.patch.object(subprocess, "run", side_effect=fake_run):
                 checks = health.run_all_checks()
         return next(check for check in checks if check["name"] == "telegram-bridge")
