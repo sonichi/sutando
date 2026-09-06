@@ -187,6 +187,9 @@ KNOWN_HEADER_KEYS = (
     # Which worker the sender asked for. INTENT, not placement: the pool's
     # own binding table decides, and no claim path consults this header.
     "requested_worker",
+    # A card click the HITL store already recorded, passed on for the turn it causes;
+    # the core trusts it, so the guard must defang a forged copy in body text.
+    "hitl_click",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
