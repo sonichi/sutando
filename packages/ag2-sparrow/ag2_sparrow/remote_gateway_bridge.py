@@ -2349,6 +2349,15 @@ def _note_broker_capabilities(reply) -> None:
     _broker_worker_metadata = isinstance(caps, list) and "worker-metadata" in caps
 
 
+def _revoke_broker_capabilities() -> None:
+    """A heartbeat that returns no advertisement leaves us no evidence the
+    extension is supported; the keys are additive and return on the next
+    advertising reply, so dropping them cannot lose a result while keeping
+    them can (a strict relay 422s an un-advertised key)."""
+    global _broker_worker_metadata
+    _broker_worker_metadata = False
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2383,13 +2392,18 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
             _heartbeat_disabled = True
+            # Heartbeat is the only capability channel, so disabling it means no
+            # later reply can revoke the extension. Revoke here or it is latched.
+            _revoke_broker_capabilities()
             _log("gateway does not support heartbeat — continuing without")
             return False
         if e.code in (401, 403):
             raise
+        _revoke_broker_capabilities()
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
     except (urllib.error.URLError, TimeoutError) as e:
+        _revoke_broker_capabilities()
         _log(f"heartbeat network error: {e} — continuing")
         return False
 

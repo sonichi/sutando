@@ -87,7 +87,10 @@ class Handler(BaseHTTPRequestHandler):
             STATE["acks"].append((self.path, self._body())); self._json(200, {}); return
         if self.path == "/v1/heartbeat":
             if STATE["heartbeat_404"]:
-                self.send_response(404); self.end_headers(); return
+                # True keeps the historical 404; an int lets a case pick 405.
+                _hb = STATE["heartbeat_404"]
+                self.send_response(404 if _hb is True else int(_hb))
+                self.end_headers(); return
             STATE["heartbeats"].append(self._body())
             caps = {"capabilities": ["worker-metadata"]} if STATE["advertise"] else {}
             self._json(200, caps); return
@@ -436,6 +439,42 @@ def main() -> int:
           and STATE["results"][0].get("metadata")
           == {"worker_id": legacy8.WORKER_ID, "location": legacy8.WORKER_LOCATION},
           f"control: attribution rides again once advertised: {STATE['results']}")
+    STATE["strict"] = False
+
+    # A broker that advertised and is then rolled back must not leave the
+    # extension latched: 404/405 disables heartbeat, so no reply can revoke it.
+    print("\n9. advertised -> heartbeat 404/405 -> extension REVOKED, not latched")
+    for _code in (404, 405):
+        for k in ("gets", "acks", "results", "heartbeats", "other"):
+            STATE[k].clear()
+        STATE["rejected"].clear()
+        STATE["heartbeat_404"] = False
+        STATE["advertise"] = True
+        STATE["strict"] = True
+        ws9 = root / f"ws9_{_code}"; ws9.mkdir()
+        d9 = _load(f"down{_code}", ws9, port,
+                   SUTANDO_WORKER_ID="home-1", SUTANDO_WORKER_LOCATION="home")
+        check(d9._post_heartbeat(set(), force=True) is True
+              and d9._broker_worker_metadata is True,
+              f"[{_code}] a modern broker advertises -> extension ON")
+        # the broker is rolled back / re-routed: heartbeat now answers 404/405
+        STATE["heartbeat_404"] = _code
+        STATE["advertise"] = False
+        check(d9._post_heartbeat(set(), force=True) is False and d9._heartbeat_disabled,
+              f"[{_code}] heartbeat {_code} disables heartbeating for the process")
+        check(d9._broker_worker_metadata is False,
+              f"[{_code}] extension REVOKED on definitive absence (not latched on)")
+        d9.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (d9.RESULTS_DIR / f"task-DOWN{_code}.txt").write_text("answer after downgrade\n")
+        d9._save_inflight({f"task-DOWN{_code}"})
+        d9._post_ready_results(d9._load_inflight())
+        check(STATE["rejected"] == [],
+              f"[{_code}] the strict relay refused nothing: {STATE['rejected']}")
+        check(len(STATE["results"]) == 1
+              and sorted(STATE["results"][0]) == ["body", "id"],
+              f"[{_code}] wire-keys after downgrade are exactly the envelope: "
+              f"{sorted(STATE['results'][0]) if STATE['results'] else None}")
+    STATE["heartbeat_404"] = False
     STATE["strict"] = False
 
     srv.shutdown()
