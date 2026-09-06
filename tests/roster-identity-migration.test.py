@@ -2399,5 +2399,92 @@ class AnEntryIsValidatedAsOneRecord(unittest.TestCase):
         self.assertEqual([u["id"] for u in unres], [self.R])
 
 
+class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
+    """keweichen 5124729413 / qingyun-wu 5124753570 at b615bfcc.
+
+    `_principal_slot` read only the FINAL segment, so `human.room.id` presented
+    `id`, passed as an identity leaf, and took HUMAN from the ancestor — the room
+    snowflake became the person with rc 0. The `room_id` / `room.id` pair is the
+    discriminating one: the same value, two spellings, opposite verdicts.
+    """
+
+    R = "1400000000000000001"
+
+    def _human(self, value):
+        return self._cli({"provider": "discord", "human": value})
+
+    def test_the_two_spellings_of_a_room_id_now_agree(self):
+        _rc, _e, flat = self._human({"discord": True, "room_id": self.R})
+        self.assertIsNone(flat.get("human_discord_id"))
+        rc, err, nested = self._human({"discord": True, "room": {"id": self.R}})
+        self.assertIsNone(nested.get("human_discord_id"), err)
+        self.assertIn(self.R, [o["id"] for o in nested.get(ri.UNRESOLVED_FIELD, [])],
+                      "mined but ineligible: the id stays collected, not silently dropped")
+        self.assertEqual(rc, 5, "an id slot that yields nothing readable is a SHAPE failure")
+
+    def test_every_provider_object_between_the_principal_and_the_id_is_refused(self):
+        for obj in ("room", "channel", "guild", "message", "scheduled_event", "thread"):
+            with self.subTest(object=obj):
+                _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("human_discord_id"), obj)
+
+    def test_the_positive_control_still_resolves(self):
+        # Without this the class above proves only that everything is refused.
+        _rc, err, rec = self._human({"discord": True, "user_id": self.R})
+        self.assertEqual(rec.get("human_discord_id"), self.R, err)
+
+    def test_a_transparent_container_stays_transparent(self):
+        # The rule cannot be "every segment states a principal": `account`,
+        # `identities` and `wrapper` name no object and are documented shapes.
+        for value, label in (({"discord": True, "account": {"id": self.R}}, "account"),
+                             ({"identities": [{"provider": "discord", "user_id": self.R}]},
+                              "identities")):
+            with self.subTest(container=label):
+                _rc, err, rec = self._human(value)
+                self.assertEqual(rec.get("human_discord_id"), self.R, f"{label}: {err}")
+
+
+class AMalformedSecondaryContainerFailsClosed(unittest.TestCase):
+    """The same two reviews: `entry_is_coherent` inspected
+    `other_stand_discord_ids` only when it was ALREADY a list, so removing the
+    brackets turned a refused human/Stand collision into an accepted entry —
+    the malformed shape was safer than the correct one."""
+
+    H = "1400000000000000001"
+    S = "1500000000000000001"
+
+    def _entry(self, extras=...):
+        e = {"_schema": "reviewer-identity/2",
+             "human_discord_id": self.H, "stand_discord_id": self.S}
+        if extras is not ...:
+            e[ri.OTHER_STANDS_FIELD] = extras
+        return e
+
+    def test_a_collision_is_refused_in_every_container_spelling(self):
+        for extras, label in (([{"id": H}] if (H := self.H) else None, "documented list"),
+                              ({"id": self.H}, "mapping"),
+                              (self.H, "bare string")):
+            with self.subTest(shape=label):
+                e = self._entry(extras)
+                self.assertFalse(ri.entry_is_coherent(e), label)
+                self.assertIsNone(ri.human_discord_id(e), label)
+                self.assertEqual(ri.stand_discord_ids(e), [], label)
+
+    def test_the_valid_shapes_still_resolve(self):
+        # Controls, or the class above proves only that everything is refused.
+        for extras, label in ((..., "absent"), ([], "empty list"),
+                              ([{"id": "1600000000000000001"}], "distinct secondary")):
+            with self.subTest(shape=label):
+                e = self._entry(extras)
+                self.assertTrue(ri.entry_is_coherent(e), label)
+                self.assertEqual(ri.human_discord_id(e), self.H, label)
+
+    def test_a_non_snowflake_MEMBER_is_still_only_dropped(self):
+        # Member tolerance is documented; only the CONTAINER shape is fatal.
+        e = self._entry([12, "nope", {"id": "1600000000000000001"}])
+        self.assertTrue(ri.entry_is_coherent(e))
+        self.assertIn("1600000000000000001", ri.stand_discord_ids(e))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

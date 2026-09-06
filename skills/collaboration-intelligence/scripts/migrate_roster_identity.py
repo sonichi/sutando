@@ -208,6 +208,14 @@ def _namespaced_identity_leaf(key: str, namespace: str) -> bool:
 # declaration and the id lives in free text rather than in an `..._id` slot.
 _PROSE_EVIDENCE_KEYS = frozenset({"stand_status"})
 
+# Provider objects carrying their own snowflake: an object name between the
+# principal and a bare `id` means the id is the OBJECT's, not the person's.
+_PROVIDER_OBJECT_WORDS = frozenset({
+    "room", "channel", "guild", "server", "message", "thread", "event",
+    "scheduled", "emoji", "role", "webhook", "attachment", "category",
+    "invite", "sticker", "application", "interaction", "voice", "forum",
+})
+
 
 def _principal_slot(field: str) -> bool:
     """May this field's referent word decide a CANONICAL SLOT?
@@ -218,7 +226,14 @@ def _principal_slot(field: str) -> bool:
     slots qualify by construction; everything else must declare an id and name no
     other object.
     """
-    leaf = str(field).split(".")[-1].strip()
+    segments = [p.strip() for p in str(field).split(".") if p.strip()]
+    if not segments:
+        return False
+    # Eligibility is a property of the PATH: reading only the leaf discarded
+    # the container, so `human.room.id` presented `id`.
+    if not all(_principal_container(p) for p in segments[:-1]):
+        return False
+    leaf = segments[-1]
     if leaf in ri.WRITER_OWNED or leaf.lower() in _PROSE_EVIDENCE_KEYS:
         return True
     if _identity_leaf(leaf):
@@ -227,6 +242,22 @@ def _principal_slot(field: str) -> bool:
         return False
     words = {w.lower() for w in _WORDS.findall(leaf)}
     return not (words - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS)
+
+
+def _principal_container(segment: str) -> bool:
+    """May this segment stand BETWEEN a principal and its id?
+
+    The same positive test `_identity_leaf` applies to a leaf: the segment may
+    name the namespace or a principal and nothing else. A denylist would only
+    ever refuse the object names already thought of, and `scheduled_event` was
+    not one of them.
+    """
+    words = {w.lower() for w in _WORDS.findall(str(segment))}
+    if not words:
+        return False
+    # Containers are transparent by design (`account`, `identities`, `wrapper`),
+    # so only a segment naming a provider OBJECT may not be.
+    return not (words & _PROVIDER_OBJECT_WORDS)
 
 
 def _identity_leaf(key: str) -> bool:

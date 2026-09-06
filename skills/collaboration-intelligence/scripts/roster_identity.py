@@ -246,9 +246,15 @@ def entry_is_coherent(entry: dict) -> bool:
     roles = [v for v in (human, stand) if _is_snowflake_str(v)]
     if len(roles) == 2 and roles[0] == roles[1]:
         return False
+    # The container fails CLOSED on shape: skipping the loop for a non-list let
+    # a mapping or bare string read as "nothing contested".
     extras = entry.get(OTHER_STANDS_FIELD)
-    if isinstance(extras, (list, tuple)):
+    if extras is not None:
+        if not isinstance(extras, (list, tuple)):
+            return False
         for extra in extras:
+            # MEMBER tolerance is documented and stays: a non-snowflake member
+            # is dropped, not fatal. Only the CONTAINER shape fails closed.
             eid = extra.get("id") if isinstance(extra, dict) else extra
             if _is_snowflake_str(eid) and eid == human:
                 return False
