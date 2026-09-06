@@ -45,13 +45,15 @@ def task_from_file(path: Path) -> tuple[dict, str | None]:
     fields: dict = {}
     for l in path.read_text(encoding="utf-8", errors="replace").splitlines():
         k, _, v = l.partition(":")
-        if k in ("id", "user_id", "task", "channel_id") and k not in fields:
+        if k in ("id", "user_id", "task", "channel_id", "source_message_id") and k not in fields:
             fields[k] = v.strip()
     task = {"id": fields.get("id") or path.stem}
     if fields.get("user_id"):
         task["from"] = fields["user_id"]
     if fields.get("task"):
         task["text"] = fields["task"][:TEXT_MAX]
+    if fields.get("source_message_id"):
+        task["event"] = fields["source_message_id"]  # the client mounts the card under this message
     return task, fields.get("channel_id") or None
 
 
@@ -97,12 +99,36 @@ def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
     os.replace(tmp, path)
 
 
+def queued(task_file: Path, workspace: Path | None = None) -> int:
+    """A `queued` notice for a task file that just landed: the message reached the device before any
+    turn picked it up. Written only when the file names a room and a message; a cron or bookkeeping
+    task has neither and must not appear in the owner's room. Never falls back to the default room."""
+    try:
+        task, room = task_from_file(task_file)
+    except OSError:
+        return 0
+    # Only a task that names a room AND a message can mount under one: a room-addressed task with no
+    # source_message_id would leave a queued row the client can never place.
+    if not room or not task.get("text") or not task.get("event"):
+        return 0
+    rec = append("queued", kind="notice", room=room, task=task, workspace=workspace)
+    print(json.dumps(rec, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    q = sub.add_parser("queued", help="the message reached this device and no turn has it yet; from the task file only")
+    q.add_argument("--task-file", required=True)
+    q.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     for name, help_ in (("append", "one event"), ("done", "the task is finished: its rows leave the drawer")):
         s = sub.add_parser(name, help=help_)
         s.add_argument("line")
+        s.add_argument("--event", dest="task_event", default=None, help="event id of the user message this row belongs to")
+        if name == "done":
+            s.add_argument("--into", dest="task_into", default=None,
+                           help="consolidated reply: event id of the message whose reply answered this one too")
         s.add_argument("--room", default=None, help="room id; default: the owner's latest AG2 Space room")
         s.add_argument("--workspace", default=None, help=argparse.SUPPRESS)  # tests only
         s.add_argument("--task-id", default=None)
@@ -112,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "append":
             s.add_argument("--kind", choices=KINDS[:-1], default="notice")
     a = ap.parse_args(argv)
+    if a.cmd == "queued":
+        return queued(Path(a.task_file), Path(a.workspace) if a.workspace else None)
     task = None
     room = a.room
     if a.task_file:
@@ -125,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             task["from"] = a.task_from
         if a.task_text:
             task["text"] = a.task_text[:TEXT_MAX]
+    if a.task_event:
+        task = dict(task or {}, event=a.task_event)
+    if getattr(a, "task_into", None):
+        task = dict(task or {}, into=a.task_into)
     done = a.cmd == "done"
     ws = Path(a.workspace) if a.workspace else None
     rec = append(a.line, kind="done" if done else a.kind, room=room or default_room(ws), task=task, done=done,

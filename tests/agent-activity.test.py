@@ -88,6 +88,7 @@ class Writer(unittest.TestCase):
         import multiprocessing as mp
         with mp.get_context("fork").Pool(8) as pool:
             pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
+            pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         live = card.log_path(self.ws).read_text().splitlines()
         arch = (self.ws / "state" / "agent-activity.archive.jsonl").read_text().splitlines()
         lines = [json.loads(l)["line"] for l in live + arch]
@@ -153,6 +154,97 @@ class WriterCli(unittest.TestCase):
         p.write_text("id: task-file\nchannel_id: !team:s\nuser_id: @q:s\ntask: hello\n")
         rc, rec = self.run_main("append", "x", "--task-file", str(p), "--task-id", "task-cli")
         self.assertEqual((rec["task"]["id"], rec["task"]["from"], rec["room"]), ("task-cli", "@q:s", "!team:s"))
+
+
+class MessageEvent(unittest.TestCase):
+    """Every row carries the user message's event id, and the writer knows queued and consolidated."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "state").mkdir()
+        (self.ws / "tasks").mkdir()
+
+    def _task(self, name, room="!r:s", event="$ev1"):
+        body = f"id: {name}\nuser_id: @q:s\nsender_name: qingyun\ntask: Fix the thing\nsource: ag2space\n"
+        if room:
+            body += f"channel_id: {room}\n"
+        if event:
+            body += f"source_message_id: {event}\n"
+        (self.ws / "tasks" / f"{name}.txt").write_text(body)
+        return self.ws / "tasks" / f"{name}.txt"
+
+    def _rows(self):
+        return [json.loads(l) for l in (self.ws / "state" / "agent-activity.jsonl").read_text().splitlines()]
+
+    def test_task_file_carries_the_message_event_id(self):
+        task, room = card.task_from_file(self._task("task-e1"))
+        self.assertEqual((task["event"], room), ("$ev1", "!r:s"))
+
+    def test_queued_writes_a_notice_with_the_event_and_skips_a_roomless_file(self):
+        rc = card.main(["queued", "--task-file", str(self._task("task-q1")), "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        rows = self._rows()
+        self.assertEqual((rows[-1]["kind"], rows[-1]["line"], rows[-1]["room"], rows[-1]["task"]["event"]),
+                         ("notice", "queued", "!r:s", "$ev1"))
+        # a cron/bookkeeping task names no room: nothing is written, and never to a default room
+        card.main(["queued", "--task-file", str(self._task("task-cron-1", room=None)), "--workspace", str(self.ws)])
+        self.assertEqual(len(self._rows()), 1)
+        # a room-addressed compatibility task with no source_message_id cannot mount under a message:
+        # nothing is written for it either (a queued row nobody can place is misleading drawer activity)
+        card.main(["queued", "--task-file", str(self._task("task-noevent", event=None)), "--workspace", str(self.ws)])
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_done_into_marks_a_consolidated_reply(self):
+        card.main(["done", "consolidated", "--task-id", "task-d1", "--into", "$holder", "--event", "$ev1",
+                       "--room", "!r:s", "--workspace", str(self.ws)])
+        row = self._rows()[-1]
+        self.assertTrue(row["done"])
+        self.assertEqual((row["task"]["into"], row["task"]["event"]), ("$holder", "$ev1"))
+
+    def test_pickup_row_carries_the_message_event_id(self):
+        p = hook.paths(self.ws); runs = []
+        self._task("task-p1")
+        hook.handle({"hook_event_name": "PreToolUse", "session_id": "S1", "tool_name": "Read",
+                     "tool_input": {"file_path": str(self.ws / "tasks" / "task-p1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        cmd = runs[-1]
+        self.assertEqual(cmd[cmd.index("--event") + 1], "$ev1")
+
+    def test_queued_with_a_missing_task_file_writes_nothing_and_never_raises(self):
+        self.assertEqual(card.main(["queued", "--task-file", str(self.ws / "tasks" / "task-gone.txt"), "--workspace", str(self.ws)]), 0)
+        self.assertFalse(card.log_path(self.ws).exists())
+
+    def test_consolidated_into_handles_a_missing_result_and_a_bare_numeric_target(self):
+        p = hook.paths(self.ws)
+        self.assertIsNone(hook.consolidated_into(self.ws, "task-none"), "no result file: not a dedup, not a crash")
+        (self.ws / "results").mkdir()
+        self._task("task-77", event="$ev77")
+        (self.ws / "results" / "task-x2.txt").write_text("[deduped: 77]\n")
+        self.assertEqual(hook.consolidated_into(self.ws, "task-x2"), "$ev77", "a bare id resolves to its task file")
+        (self.ws / "results" / "task-x3.txt").write_text("[deduped: task-unknown]\n")
+        self.assertEqual(hook.consolidated_into(self.ws, "task-x3"), "", "a dedup whose holder is gone still reads as consolidated")
+        del p
+
+    def test_a_dedup_pointer_result_closes_as_consolidated_into_the_holder_message(self):
+        p = hook.paths(self.ws); runs = []
+        self._task("task-x1", event="$evx"); self._task("task-h1", event="$evh")
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-x1.txt").write_text("[deduped: task-h1]\n")
+        with open(p["log"], "a") as f:
+            f.write(json.dumps({"ts": 1, "kind": "processing", "line": "picked up", "room": "!r:s",
+                                "task": {"id": "task-x1", "event": "$evx"}}) + "\n")
+        hook.bind(p, "task-x1", "S1")
+        out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.ws / "results" / "task-x1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        self.assertEqual(out, [("done", "consolidated")])
+        cmd = runs[-1]
+        self.assertEqual((cmd[2], cmd[cmd.index("--into") + 1], cmd[cmd.index("--event") + 1]), ("done", "$evh", "$evx"))
+        # a real reply stays "replied" with no --into
+        runs.clear()
+        (self.ws / "results" / "task-x1.txt").write_text("Here is the answer.\n")
+        out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.ws / "results" / "task-x1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
+        self.assertEqual(out, [("done", "replied")])
+        self.assertNotIn("--into", runs[-1])
 
 
 class Hook(unittest.TestCase):
@@ -341,6 +433,7 @@ class Hook(unittest.TestCase):
         ws = str(self.ws)
         with mp.get_context("fork").Pool(8) as pool:
             pool.starmap(_bind_in_process, [(ws, f"task-c{i:06d}", f"S{i}") for i in range(8)])
+            pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         binds = hook.load_json(self.p["bind"], {})
         self.assertEqual(sorted(binds), [f"task-c{i:06d}" for i in range(8)], binds)
         self.assertFalse(list((self.ws / "state").glob(".agent-activity.sessions.json.*.tmp")), "no temp files left")
