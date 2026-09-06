@@ -1544,8 +1544,15 @@ itself to a room whose worker might still come back.
    |---|---|---|
    | none | absent | retry step (2), then (3) |
    | held by THIS process | `claim_is_ours` | the crash (or a failed rename) landed between (2) and (3): retry (3) alone. Promotion is idempotent and issues no second attempt — the token is already spent and the journal names the same task. |
-   | held by a LIVE other process | `claim_is_live`, not ours | genuine collision: rename the journal back to `<instance>.admit/token`, returning the one attempt, and re-enter the gate |
+   | held by a LIVE other process | `claim_is_live`, not ours | genuine collision: rename the journal back to `<instance>.admit/token`, returning the one attempt, and re-enter the gate. **`spent` is NOT removed** — see below |
    | present, owner DEAD | neither | `acquire_task_claim` retires the stale claim and re-links (`retire_stale_claim`), then (3); if the re-link loses, this is a collision and takes the row above |
+
+   **A returned attempt hands back the TOKEN and nothing else.** Removing `spent` alongside it looks
+   symmetric — the allowance really was handed back unconsumed — and it is unsafe once `EEXIST` means
+   proceed: a second consumer can already be past that gate and about to rename. Clearing the witness
+   then leaves neither name for the instant between its rename and the next sweep, and recovery mints
+   a fresh allowance beside a consumption that is still happening. The witness is removed only by root
+   retirement, which is also the only act that removes the gate.
 
    `WATCHER_ID` is `$$-$RANDOM`, so it is per-process: a worker's OWN claim from before a restart is
    correctly not `ours` and its pid is dead, which is what routes a restart into the bottom row and a

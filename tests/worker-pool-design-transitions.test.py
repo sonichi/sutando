@@ -59,7 +59,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         durable_gate=True, flat_issuance=False, unconditional_gate=True,
         dir_is_allowance=False, walk_recovery=False, single_phase_parent=False,
         nonatomic_teardown=False, spent_first_recovery=False, spent_is_mutex=False,
-        consume_between_reads=False):
+        consume_between_reads=False, contender_after_spent=False,
+        clear_spent_on_rollback=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -77,12 +78,18 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         only schedule that distinguishes the two orders.
     `spent_is_mutex=True` -- EEXIST on `spent` refuses, so a worker that crashed after creating it
         can never finish. The pre-fix reading of exactly-once.
+    `contender_after_spent=True` -- a SECOND worker passes the EEXIST gate while the first holds
+        `spent`, and pauses before its own rename. `contender_rename` resumes it.
+    `clear_spent_on_rollback=True` -- the pre-fix rollback, which removed the witness while a
+        contender was already past the gate.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     crash_mkdir = [mode == "crash_mkdir"]
     crash_teardown = [nonatomic_teardown]
     interleave = [consume_between_reads]
+    arm_contender = [contender_after_spent]
+    paused_contender = [False]
     crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
@@ -221,6 +228,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             return False
         if gate_step1a() == "EEXIST" and spent_is_mutex:
             return False                              # pre-fix: the retry can never finish
+        if arm_contender[0]:
+            arm_contender[0] = False                  # a 2nd consumer is past the gate
+            paused_contender[0] = True
         if crash_after_spent[0]:                      # crash between the two durable writes
             crash_after_spent[0] = False; return False
         return gate_step1b(task)
@@ -230,7 +240,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         task = d.journal
         if task is None: return False
         if fail[0]:
-            fail[0] = False; d.journal = None; d.token = True; d.spent = False; return False   # return the attempt
+            fail[0] = False; d.journal = None; d.token = True
+            if clear_spent_on_rollback: d.spent = False
+            return False                                      # return the attempt
         d.claims[task] = me[0]; return True
 
     def gate_step2b():
@@ -256,7 +268,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             if owner == me[0]:                                # claim_is_ours: retry (3) ALONE
                 gate_step2b(); return
             if owner in d.live_owners:                        # live, not ours: collision, return the attempt
-                d.journal = None; d.token = True; d.spent = False; return
+                d.journal = None; d.token = True
+                if clear_spent_on_rollback: d.spent = False
+                return
             del d.claims[task]                                # stale: retire, re-link, then (3)
             if gate_step2a(): gate_step2b()
             return
@@ -279,6 +293,14 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def restart():
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
+    def contender_rename():
+        """The paused second consumer completes its rename. Only one wins a source."""
+        if paused_contender[0] and d.token:
+            paused_contender[0] = False
+            d.phase_dirs.add("held")
+            if not single_phase_parent: d.phase_dirs.add("claimed")
+            d.token = False; d.journal, d.journal_at = "t-B", now[0]
+
     def tear():
         """Arm the torn observation for the next recovery read."""
         d.torn = True
@@ -290,7 +312,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
 
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
              "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
-             "other_live_claim": other_live_claim, "tear": tear}
+             "other_live_claim": other_live_claim, "tear": tear,
+             "contender_rename": contender_rename}
     for s in order: steps[s]()
     return verdict(), claimed, pending - claimed, d
 
@@ -687,12 +710,14 @@ class RecoveryAsksTwoNAMES_NotAWalk(unittest.TestCase):
         v, c, p, d = run(["kick", "sweep", "crash_worker", "tear", "sweep"])
         self.assertFalse(d.token, "a torn scan at that seam must not mint either")
 
-    def test_returning_the_attempt_clears_the_marker(self):
-        # A collision hands the allowance back UNCONSUMED, so `spent` must not outlive it.
+    def test_returning_the_attempt_returns_the_token_and_keeps_the_witness(self):
+        # The doc's collision row renames the journal back to `token` and says
+        # nothing about `spent`; clearing it was a write the design never had.
         v, c, p, d = run(["kick", "sweep", "worker"], claim_fails_once=True)
-        self.assertTrue(d.token); self.assertFalse(d.spent)
+        self.assertTrue(d.token, "the one attempt is handed back")
+        self.assertTrue(d.spent, "a contender may already be past the EEXIST gate")
         v, c, p, d = run(["kick", "sweep", "crash_worker", "other_live_claim", "worker"])
-        self.assertTrue(d.token); self.assertFalse(d.spent)
+        self.assertTrue(d.token); self.assertTrue(d.spent)
 
     def test_no_torn_schedule_leaves_probation_as_the_last_word(self):
         for order in (["kick", "sweep", "worker", "tear", "sweep", "wait", "sweep"],
@@ -857,6 +882,46 @@ class AWorkerThatFoundNoTokenLeavesNoWitness(unittest.TestCase):
         # The guard runs before `spent`; the retry path arrives WITH a token.
         _v, claimed, _p, _d = run(["kick", "sweep", "worker", "worker"], "crash_after_spent")
         self.assertEqual(claimed, 1, "the new guard must not strand the retry it was built for")
+
+
+class AReturnedAttemptDoesNotUnwitnessAContender(unittest.TestCase):
+    """Rollback removed `spent` while a second consumer was already past the gate.
+
+    Before EEXIST-means-proceed, clearing it was sound: the allowance really was
+    handed back unconsumed and nobody else could be mid-consumption. That rule made
+    the state reachable, so the same rollback became a way to un-witness a
+    consumption that was still happening. The design never asked for the write --
+    the collision row renames the journal back to `token` and stops there.
+    """
+
+    ORDER = ["kick", "sweep", "worker", "contender_rename", "sweep"]
+    KW = {"claim_fails_once": True, "contender_after_spent": True}
+
+    def test_clearing_the_witness_mints_beside_a_live_admission(self):
+        # The defect itself, as the reviewer scheduled it: A rolls back and removes
+        # `spent` while B holds the gate; B renames; recovery sees neither name.
+        _v, _c, _p, d = run(self.ORDER, clear_spent_on_rollback=True, **self.KW)
+        self.assertEqual(d.journal, "t-B", "the contender's consumption stands")
+        self.assertTrue(d.token, "and a fresh allowance was minted beside it")
+        self.assertFalse(d.spent)
+
+    def test_keeping_the_witness_leaves_nothing_to_mint_over(self):
+        _v, _c, _p, d = run(self.ORDER, **self.KW)
+        self.assertEqual(d.journal, "t-B")
+        self.assertFalse(d.token, "recovery reads the witness and refuses to mint")
+        self.assertTrue(d.spent)
+
+    def test_the_control_one_source_one_winner(self):
+        # Two consumers reach the rename; exactly one may consume the token.
+        _v, _c, _p, d = run(["kick", "sweep", "worker", "contender_rename"],
+                            contender_after_spent=True)
+        self.assertFalse(d.token, "the token was consumed exactly once")
+        self.assertEqual(d.claimed_rec, "t1", "the first consumer won its rename")
+
+    def test_the_control_no_contender_still_hands_the_token_back(self):
+        # Or the fix could pass by never returning the attempt at all.
+        _v, _c, _p, d = run(["kick", "sweep", "worker"], claim_fails_once=True)
+        self.assertTrue(d.token, "a collision still returns the one attempt")
 
 
 if __name__ == "__main__":
