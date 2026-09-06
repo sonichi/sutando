@@ -242,9 +242,9 @@ class Hook(unittest.TestCase):
 
     def test_first_touch_of_a_task_file_binds_and_writes_processing_from_its_headers(self):
         (self.ws / "tasks" / "task-abc123.txt").write_text(
-            "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
+            "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Read the latest discussion in this room.\nsource: ag2space\n")
         out = hook.handle(self.pre("S1", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run)
-        self.assertEqual(out, [("processing", "picked up")])
+        self.assertEqual(out, [("processing", "working on a task from qingyun: Read the latest disc…")])
         cmd = self.runs[-1]
         self.assertEqual((cmd[2], cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--from") + 1]), ("append", "task-abc123", "!team:s", "@q:s"))
         self.assertEqual(cmd[cmd.index("--text") + 1], "Read the latest discussion in this room.")
@@ -256,6 +256,16 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.task_file_refs("cat tasks/task-abc999.txt tasks/task-abc999.txt"), ["task-abc999"])
         # a task file that does not exist binds nothing
         self.assertEqual(hook.handle(self.pre("S1", "Read", {"file_path": "tasks/task-000000.txt"}), self.p, self.run), [])
+
+    def test_a_late_touch_of_an_answered_task_neither_binds_nor_reopens_it(self):
+        # The result exists (answered by a dedup or an earlier session): a re-read, a dedup check
+        # naming the file, or another session's touch must not write a Processing row after the Done.
+        (self.ws / "tasks" / "task-abc123.txt").write_text("id: task-abc123\nchannel_id: !dm:s\nuser_id: @q:s\ntask: hi\n")
+        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-abc123.txt").write_text("[deduped: task-zzz]")
+        self.assertEqual(hook.handle(self.pre("S2", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run), [])
+        self.assertEqual(hook.load_json(self.p["bind"], {}), {})
+        self.assertEqual(self.runs, [])
+        self.assertEqual(hook.pickup_line({"from": "@q:s", "text": "x" * 30}), "working on a task from @q:s: " + "x" * 20 + "…")
 
     def post(self, sid, tool, inp):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
