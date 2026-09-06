@@ -91,6 +91,10 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # the contract this lint exists to enforce, so the guard already complies where it
 # counts. Listed here rather than reworded to `parents[1]`, per the note above.
 #
+# scripts/pool-session-digest.py is the same category: it walks to the REPO
+# ROOT solely to import src/util_paths.claude_home_path, the sanctioned resolver
+# for the Claude home. It reads no workspace path at all.
+#
 # scripts/gen-src-map.py uses PATTERN_REPO_WALK to resolve the REPO ROOT
 # (to read tracked files under src/ and write docs/), NOT a workspace — same
 # category as scripts/check-utc-z-strftime.py and scripts/dedup-conversation-store.py,
