@@ -95,6 +95,16 @@ def _pid_acked(workspace: Path | None, task_id: str, pid: str) -> bool:
         return False
 
 
+def _pid_counter(pid: str | None) -> tuple[str | None, int]:
+    """(generation, emitted) from a `task:generation:emitted` pid; (None, 0) for a row without one."""
+    if not isinstance(pid, str):
+        return None, 0
+    parts = pid.rsplit(":", 2)
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None, 0
+    return parts[1], int(parts[2])
+
+
 def _ack(workspace: Path | None, task_id: str, pid: str) -> None:
     d = acks_dir(workspace)
     d.mkdir(parents=True, exist_ok=True)
@@ -165,9 +175,16 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
             ip = index_path(workspace)
             idx = _load_index(ip)
             e = idx.get(task["id"]) or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
-            if not (pid and e.get("last_pid") == pid):
+            # Applied evidence is the highest emitted counter per generation, saved with the count in
+            # the same record: a replay never counts twice, whatever landed in between.
+            gen, emitted = _pid_counter(pid)
+            applied = dict(e.get("applied") or {})
+            if gen is None or emitted > int(applied.get(gen, 0)):
                 e["rows"] = int(e.get("rows", 0)) + 1
-                e["last_pid"] = pid
+                if gen is not None:
+                    applied[gen] = emitted
+            e["applied"] = applied
+            e.pop("last_pid", None)
             e["started"] = min(float(e.get("started", rec["ts"])), rec["ts"])
             e["task"] = dict(e.get("task") or {}, **task)
             if room:

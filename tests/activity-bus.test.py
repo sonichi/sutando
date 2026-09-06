@@ -305,6 +305,36 @@ class IdempotentProjection(unittest.TestCase):
         card.append("fresh", kind="notice", room=None, task=t, workspace=self.ws, pid="task-h1:1:9")
         self.assertEqual(card.log_path(self.ws).read_text().count('"pid": "task-h1:1:9"'), 1, "control: a new pid appends once")
 
+    def test_the_index_never_counts_a_replayed_pid_twice_whatever_landed_between(self):
+        # The drained-snapshot save fails once AFTER row, ack and index landed; a same-task hook row
+        # lands through the shared writer; the replay must not count the pickup again (4 arms).
+        import activity_rows
+        for fault, hook in ((False, False), (True, False), (False, True), (True, True)):
+            ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+            store = ActivityStore(ws); real_save = store.save; hit = {"n": 0}
+            def faulty_save(state):
+                if fault and not state.pending and hit["n"] == 0:
+                    hit["n"] += 1
+                    raise OSError("snapshot disk full")  # the drained snapshot never publishes
+                real_save(state)
+            store.save = faulty_save
+            if fault:
+                with self.assertRaises(OSError):
+                    store.apply(T("task-x1", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+                self.assertEqual(len(store.load("task-x1").pending), 1, "the pickup row is still owed")
+            else:
+                store.apply(T("task-x1", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+            if hook:
+                card.append("hook detail", kind="working", room="!r:s", task={"id": "task-x1"}, workspace=ws)
+            fresh = ActivityStore(ws); fresh.apply(T("task-x1", "COMPLETED", ts=1_757_000_002.0))
+            self.assertEqual(len(fresh.load("task-x1").pending), 0)
+            rows = [json.loads(l) for p in (ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name for l in p.read_text().splitlines()]
+            mine = sorted((r for r in rows if r.get("task", {}).get("id") == "task-x1"), key=lambda r: r["ts"])
+            sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+            expect = 3 if hook else 2
+            self.assertEqual(len(mine), expect, f"fault={fault} hook={hook}: actual rows")
+            self.assertEqual([x["rows"] for x in sums], [expect], f"fault={fault} hook={hook}: the summary counts each row once")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.
