@@ -415,6 +415,32 @@ _TUI_SOURCE = "tui"
 DRIVE_SETTLE_S = 15.0
 
 
+_NOISE_LINE = re.compile(
+    r"https?://|%3A|code_challenge|[?&]state=|^\[[^\]\n]{0,40}\s\d+:\w+|bypass permissions|for agents",
+    re.I)
+_RULE_CHARS = set("─│┌┐└┘├┤┬┴┼╭╮╯╰═║ ")
+
+
+def prompt_excerpt(prompt, limit=6):
+    """The prompt lines the owner must read: the pane's tail minus the chrome around them —
+    box-drawing rules, URL fragments (an OAuth link wraps across lines), the tmux status bar and
+    the idle footer. Empty when nothing readable is left."""
+    out = []
+    for raw in (prompt or "").splitlines():
+        ln = raw.rstrip()
+        core = ln.strip()
+        if not core or set(core) <= _RULE_CHARS:
+            continue
+        if core[0] in _RULE_CHARS and sum(c in _RULE_CHARS for c in core) * 2 > len(core):
+            continue  # a rule with a label in it ("──── sutando-core ─") is chrome, not a prompt
+        if _NOISE_LINE.search(core):
+            continue
+        if len(core) > 80 and " " not in core:
+            continue
+        out.append(core.strip("─│ "))
+    return out[-limit:]
+
+
 def escalation_message(state, detail, kind, prompt):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
@@ -424,9 +450,11 @@ def escalation_message(state, detail, kind, prompt):
     lines = [head, "", f"State: {state} — {detail}"]
     if kind and kind != "unknown":
         lines.append(f"Gate: {kind}")
-    if prompt:
-        excerpt = "\n".join(prompt.strip().splitlines()[-6:])
-        lines += ["", "What the terminal is showing:", "```", excerpt, "```"]
+    excerpt = prompt_excerpt(prompt) if prompt else []
+    if excerpt:
+        # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
+        # needs to read, not the pane's chrome around it.
+        lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
     lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
                   "Nothing else I do can clear this one."]
     return "\n".join(lines)
