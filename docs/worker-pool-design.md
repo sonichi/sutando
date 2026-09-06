@@ -1408,10 +1408,18 @@ itself to a room whose worker might still come back.
    AND the unpromoted journal for the equally legal id `task-a.claimed` — same bytes, opposite
    reconciliation. (Found by keweichen, 5125025866.)
 
+   **`kick-pool` raises the GATE together with the request; the sweep mints the allowance inside
+   it.** Writing only the request leaves a window in which the reset has been asked for and nothing
+   enforces it — and past snapshot expiry a worker reads ABSENT as ordinary eligibility, which is
+   deliberately unbounded. The whole backlog then enters a pool that was just judged hung, which is
+   the opposite of what the kick asked for. So `mkdir(<instance>.admit)` moves to the request writer,
+   and the empty directory it leaves is the state recovery already knows how to finish.
+
    **The reset is a DURABLE PROBATION STATE, not a deletion, so it survives an intervening
    sweep — and the consumable allowance lives in a SEPARATELY OWNED artifact, so the record stays
    core-only.** On its next pass the core sweep consumes the request in an order that leaves no
-   absorbing state behind a crash: (a) `mkdir(<instance>.admit)` and, if that succeeded, create
+   absorbing state behind a crash: (a) `mkdir(<instance>.admit)` if the kick did not already make it,
+   and, if the directory stands, create
    `token` inside it; (b) it publishes `instances[<instance>] = "wedged"` plus
    `probation[<instance>] = {"since": <sweep_ts>}` in `pool-status.json` (one `os.replace`);
    (c) only then it removes the request. A crash after (a) leaves the request standing, so the next
@@ -1489,7 +1497,7 @@ itself to a room whose worker might still come back.
    sweep restarting into a crashed issuance found it absent and minted a SECOND allowance beside a
    task the worker had already claimed — `O_EXCL` protects a name, never that name's renamed
    successor. Putting the phase inside the directory fixes that: the name the sweep tests never
-   disappears, because every later transition is a rename WITHIN it. The sweep is the sole creator
+   disappears, because every later transition is a rename WITHIN it. The sweep is a creator
    and sole remover of the allowance; a worker only renames within it, and never writes the record.
    A sweep that runs BEFORE the worker's reconciliation does not republish anything — the verdict is
    held while `probation` stands.
@@ -1512,7 +1520,8 @@ itself to a room whose worker might still come back.
    staleness reintroduces the same hole one layer down: a FRESH snapshot that has not yet been
    published, or one republished as `eligible` while an artifact still stands, released the worker
    to the ordinary path with the allowance on disk. Directories do not expire, and the sweep is
-   already their sole creator and sole remover, so the same act that ends probation clears the gate.
+   already their sole REMOVER — a kick may raise the gate, only a retirement drops it — so the same
+   act that ends probation clears the gate.
 
    **The cost, stated rather than buried: a dead publisher now bounds a probationed worker to its
    one task indefinitely, which is exactly what the stale->ABSENT row was written to prevent for

@@ -60,7 +60,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         dir_is_allowance=False, walk_recovery=False, single_phase_parent=False,
         nonatomic_teardown=False, spent_first_recovery=False, spent_is_mutex=False,
         consume_between_reads=False, contender_after_spent=False,
-        clear_spent_on_rollback=False):
+        clear_spent_on_rollback=False, gate_lags_the_request=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -82,6 +82,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         `spent`, and pauses before its own rename. `contender_rename` resumes it.
     `clear_spent_on_rollback=True` -- the pre-fix rollback, which removed the witness while a
         contender was already past the gate.
+    `gate_lags_the_request=True` -- kick writes only the request and the later sweep creates the
+        gate, so a worker in between reads stale as ordinary eligibility.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
@@ -284,7 +286,11 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def finish():                                             # the admitted task completes
         if d.claimed_rec is not None: d.results.add(d.claimed_rec)
 
-    def kick(): d.request = True; d.writers.add(("request", "kick-pool"))
+    def kick():
+        # The gate exists from the instant the request does, or a worker in the
+        # window between them reads stale as ordinary eligibility and is unbounded.
+        d.request = True; d.writers.add(("request", "kick-pool"))
+        if not gate_lags_the_request: d.admit_dir = True
     def wait(): now[0] += WINDOW + 1
     def drift(): now[0] += STALE + 2      # past snapshot expiry, INSIDE probation's own window
     def crash_worker():
@@ -922,6 +928,40 @@ class AReturnedAttemptDoesNotUnwitnessAContender(unittest.TestCase):
         # Or the fix could pass by never returning the attempt at all.
         _v, _c, _p, d = run(["kick", "sweep", "worker"], claim_fails_once=True)
         self.assertTrue(d.token, "a collision still returns the one attempt")
+
+
+class TheGateExistsFromTheInstantTheRequestDoes(unittest.TestCase):
+    """A request with no gate is a reset asked for and not yet enforced.
+
+    `kick-pool` wrote only the request and the next sweep created the allowance, so
+    between them the only thing a worker could read was the snapshot -- and past
+    expiry that reads as ordinary eligibility, which is unbounded by design. The
+    whole backlog enters a pool that has just been judged hung, which is the exact
+    opposite of what the reset was asked for.
+    """
+
+    WINDOW = ["sweep", "kick", "drift", "worker", "event", "sweep"]
+
+    def test_the_window_admits_the_whole_backlog(self):
+        # The defect itself, at the reviewer's schedule.
+        _v, claimed, pending, _d = run(self.WINDOW, gate_lags_the_request=True)
+        self.assertEqual((claimed, pending), (5, 0), "every task entered during the window")
+
+    def test_raising_the_gate_with_the_request_holds_the_bound(self):
+        _v, claimed, _p, _d = run(self.WINDOW)
+        self.assertEqual(claimed, 0, "nothing may enter before the allowance is minted")
+        _v, claimed, _p, _d = run(self.WINDOW + ["worker"])
+        self.assertEqual(claimed, 1, "and then exactly one task's worth, as designed")
+
+    def test_the_control_ordinary_eligibility_is_untouched(self):
+        # The fence must bite only while a reset is pending. With no kick, a stale
+        # snapshot still means eligible and a worker still takes its normal share.
+        _v, claimed, _p, _d = run(["sweep", "drift", "worker"])
+        self.assertEqual(claimed, 4, "the fence must not gate a pool nobody kicked")
+
+    def test_the_control_the_normal_path_still_admits_one(self):
+        _v, claimed, _p, _d = run(["kick", "sweep", "worker"])
+        self.assertEqual(claimed, 1)
 
 
 if __name__ == "__main__":
