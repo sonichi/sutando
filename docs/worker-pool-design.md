@@ -1412,23 +1412,46 @@ itself to a room whose worker might still come back.
    sweep needs exactly that file to know *which* claim was the probation admission and *when* it
    was made (its mtime), which an ordinary claim link does not say.
 
-   **The crash seam between (1) and (2) is closed by reconciliation, in both directions.** A
-   worker that restarts under `probation` and finds `<instance>.admit.<task_id>` with no claim held
-   does NOT suppress: it retries step (2) for that task_id. If `acquire_task_claim` fails because
-   another instance now holds the task (claim collision, or the task was cancelled), the worker
-   renames the journal back to `<instance>.admit` — the one attempt is returned, not lost — and
-   re-enters the gate. A restarted worker under `probation` with NO token and NO journal
-   suppresses, because that state means the sweep has not issued a token, not that one was
-   consumed — and the sweep's own reconciliation ((a) above) re-creates a token the crash lost.
+   **There are THREE durable writes, so there are TWO crash seams, and reconciliation is decided by
+   the CLAIM, not by the journal alone.** The promotion in (3) is its own write: `acquire_task_claim`
+   commits its hard link and returns before anything else runs (`src/watch-tasks-stream.sh:127-147`),
+   so a crash can land between a held claim and a journal that still reads `<instance>.admit.<task_id>`.
+   A worker restarting under `probation` with that journal therefore asks about the CLAIM on that
+   task_id, using the two predicates the pool already ships — `claim_is_ours` (line 2 of the claim
+   file, the `WATCHER_ID`) and `claim_is_live` (line 1, the pid) — which partition the state:
+
+   | claim on `<task_id>` | predicate | reconciliation |
+   |---|---|---|
+   | none | absent | retry step (2), then (3) |
+   | held by THIS process | `claim_is_ours` | the crash (or a failed rename) landed between (2) and (3): retry (3) alone. Promotion is idempotent and issues no second attempt — the token is already spent and the journal names the same task. |
+   | held by a LIVE other process | `claim_is_live`, not ours | genuine collision: rename the journal back to `<instance>.admit`, returning the one attempt, and re-enter the gate |
+   | present, owner DEAD | neither | `acquire_task_claim` retires the stale claim and re-links (`retire_stale_claim`), then (3); if the re-link loses, this is a collision and takes the row above |
+
+   `WATCHER_ID` is `$$-$RANDOM`, so it is per-process: a worker's OWN claim from before a restart is
+   correctly not `ours` and its pid is dead, which is what routes a restart into the bottom row and a
+   failed promotion inside a living process into the second. Reading the journal alone cannot
+   separate them, and a blind retry of (2) is wrong in the second row — the live claim is the
+   worker's own, `acquire_task_claim` would report a collision, and returning the token there would
+   strand a held task with no admission record.
+
+   A restarted worker under `probation` with NO token and NO journal suppresses, because that state
+   means the sweep has not issued a token, not that one was consumed — and the sweep's own
+   reconciliation ((a) above) re-creates a token the crash lost.
 
    **Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
    computed afresh; journal and `.claimed` record removed); or the window `stand_in_after_s` has
    elapsed — measured from `probation.since` while the token is unconsumed (a worker that never
-   reaches its gate), from the journal's mtime while it is unclaimed, and from the `.claimed`
-   record's mtime while the claim is held and unfinished — in which case the verdict → `wedged`,
+   reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
+   the `.claimed` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
    the token or journal is removed by the sweep, and the request is NOT re-armed; a second kick
    needs a second command. `probation` is never the last word.
+
+   The journal clock deliberately does NOT require the journal to be unclaimed: between (2) and (3)
+   the journal is the only durable timestamp that exists, so qualifying it on `unclaimed` would leave
+   exactly the seam above with no clock. The three clocks are therefore total over the three durable
+   shapes — token, journal, `.claimed` record — and each ends in `eligible` or `wedged` without
+   re-arming the request.
 
    This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the
    unbounded event path both route through this gate, there is one token, and every path out of
