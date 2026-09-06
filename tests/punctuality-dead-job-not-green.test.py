@@ -99,9 +99,8 @@ check("CONTROL: identical fixture with the script PRESENT stays green",
       r_live["status"] == "ok",
       f"got {r_live['status']} — the check fires regardless of the script: {r_live['detail'][:120]}")
 
-# ---- an INVOKED path only: prose is not a dependency (qingyun-wu, #3672) ----
-# The detector matched `scripts/x.sh` inside a longer ABSOLUTE path and judged the
-# repo-relative remainder, so a working /tmp script read as missing.
+# A repo-relative pattern also matches INSIDE an absolute path; judging that
+# remainder against REPO_DIR calls a working schedule dead.
 _t = tempfile.mkdtemp()
 os.makedirs(os.path.join(_t, "scripts"), exist_ok=True)
 _live = os.path.join(_t, "scripts", "live.sh")
