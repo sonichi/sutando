@@ -9,10 +9,12 @@ on 2026-09-01, with the answer already filed since 2026-08-28.
 
 import importlib.util
 import io
+import os
 import contextlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
 _s = importlib.util.spec_from_file_location("wat", str(SCRIPTS / "warn-already-triaged.py"))
@@ -99,6 +101,35 @@ class SnakeCaseIdentifiers(unittest.TestCase):
         # still unanswerable, and saying so is the whole point of exit 2.
         self.assertEqual(
             wat.tokens("", "The owner asked me to review the pull request and merge it"), [])
+
+
+class PullRequestNumbers(unittest.TestCase):
+    """A claim whose subject is a PR or issue number used to yield ZERO tokens,
+    so the gate refused (exit 2) on the commonest subject in the parking files.
+    """
+
+    def test_a_pr_number_is_extracted(self):
+        self.assertIn("#1893", wat.tokens("", "PR #1893 is open, conflicted and stale"))
+
+    def test_it_finds_material_parked_under_the_number(self):
+        f = _files("# notes\n## #1893 the Agent-SDK core — owner's call\nbody\n")
+        verdict, out = _report("", "PR #1893 is open, conflicted and stale", f)
+        self.assertEqual(verdict, "parked")
+
+    def test_a_number_written_nowhere_still_reports_none_found(self):
+        # Negative control: without it the arm above passes on a checker that
+        # never says untriaged.
+        f = _files("# notes\n## #4242 something else\n")
+        verdict, out = _report("", "PR #1893 is open, conflicted and stale", f)
+        self.assertEqual(verdict, "untriaged")
+
+    def test_short_and_long_runs_are_not_numbers(self):
+        # Bounded like the sibling recall-check.py (#\d{3,5}) so a price or a
+        # long digit run is not searched as a PR.
+        self.assertEqual(wat.tokens("", "it costs #12 and ref #123456"), [])
+
+    def test_a_bare_number_without_the_hash_is_not_a_token(self):
+        self.assertEqual(wat.tokens("", "a bare number 1893 with no hash"), [])
 
 
 class ClaimFindsParkedMaterial(unittest.TestCase):
@@ -224,6 +255,71 @@ class ParkingFiles(unittest.TestCase):
         files = wat.parking_files()
         self.assertIsInstance(files, list)
         self.assertTrue(all(p.exists() for p in files))
+
+
+class MemoryIsPartOfTheCorpus(unittest.TestCase):
+    """A settled decision is written to core memory, not to a file that waits on
+    a human. Omitting memory reported those warns as untriaged — the one verdict
+    that invites re-deriving a decision already taken."""
+
+    def _corpus(self, **files):
+        d = Path(tempfile.mkdtemp())
+        mem = d / "memory"
+        mem.mkdir()
+        for n, t in files.items():
+            (mem / n).write_text(t)
+        return d, mem
+
+    def test_memory_files_join_the_parking_corpus(self):
+        d, mem = self._corpus(**{"a-decision.md": "## zzz-probe is expected\n"})
+        with mock.patch.dict(os.environ, {"SUTANDO_MEMORY_DIR": str(mem)}):
+            names = [p.name for p in wat.parking_files()]
+        self.assertIn("a-decision.md", names)
+
+    def test_a_warn_parked_only_in_memory_is_not_reported_untriaged(self):
+        d, mem = self._corpus(**{"a-decision.md": "## zzz-probe is expected here\n"})
+        files = sorted(mem.glob("*.md"))
+        verdict, out = _report("zzz-probe", "condition persists", files)
+        self.assertEqual(verdict, "parked")
+        self.assertNotIn("NONE FOUND", out)
+
+    def test_a_memory_hit_is_labelled_so_it_is_not_read_as_a_pending_question(self):
+        # A pending question waits on a human; a memory records a decision
+        # already taken. Same word, opposite next action.
+        d, mem = self._corpus(**{"a-decision.md": "## zzz-probe is expected here\n"})
+        _, out = _report("zzz-probe", "condition persists", sorted(mem.glob("*.md")))
+        self.assertIn("memory/a-decision.md", out)
+
+    def test_a_non_memory_file_is_not_labelled_as_memory(self):
+        (f,) = _files("## zzz-probe is expected here\n")
+        _, out = _report("zzz-probe", "condition persists", [f])
+        self.assertNotIn("memory/", out)
+
+    def test_absent_memory_dir_degrades_to_the_per_host_files(self):
+        # Must not raise on a checkout that has no memory dir.
+        with mock.patch.dict(os.environ, {"SUTANDO_MEMORY_DIR": "/nonexistent-corpus-xyz"}):
+            files = wat.parking_files()
+        self.assertTrue(all(p.exists() for p in files))
+
+    def test_genuinely_absent_material_still_reports_untriaged_with_memory_present(self):
+        # Green-on-purpose: widening the corpus must not make everything parked.
+        d, mem = self._corpus(**{"a-decision.md": "## something entirely else\n"})
+        verdict, out = _report("zzz-probe", "condition persists", sorted(mem.glob("*.md")))
+        self.assertEqual(verdict, "untriaged")
+        self.assertIn("NONE FOUND", out)
+
+    def test_each_file_is_read_once_however_many_tokens_are_searched(self):
+        (f,) = _files("## nothing matching here\n")
+        wat._LINES.clear()
+        reads = []
+        real = Path.read_text
+        def counting(self_, *a, **k):
+            reads.append(str(self_))
+            return real(self_, *a, **k)
+        with mock.patch.object(Path, "read_text", counting):
+            _report("zzz-probe", "a `token.py` and another-token and a third_token", [f])
+        self.assertEqual(reads.count(str(f)), 1, f"read {reads.count(str(f))}x")
+
 
 
 if __name__ == "__main__":

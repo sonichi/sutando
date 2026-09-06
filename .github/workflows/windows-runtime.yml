@@ -142,6 +142,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'health-check-punctuality-completed-unpublished.test.py failed' }
           python tests/health-check-context-read-budget.test.py
           if ($LASTEXITCODE -ne 0) { throw 'health-check-context-read-budget.test.py failed' }
+          python tests/health-check-gateway-stale-lane.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-gateway-stale-lane.test.py failed' }
+          python tests/health-check-stale-proactive-backlog.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-stale-proactive-backlog.test.py failed' }
+          python tests/health-check-memory-dir-override.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-memory-dir-override.test.py failed' }
           python tests/core-heartbeat.test.py
           if ($LASTEXITCODE -ne 0) { throw 'core-heartbeat.test.py failed' }
           python tests/cli-wedge.test.py
@@ -190,6 +196,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
           python tests/agent-activity.test.py
           if ($LASTEXITCODE -ne 0) { throw 'agent-activity.test.py failed' }
+          python tests/core-input-watch-chat-escalation.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'core-input-watch-chat-escalation.test.py failed' }
           python tests/current-track-rotate.test.py
           if ($LASTEXITCODE -ne 0) { throw 'current-track-rotate.test.py failed' }
           python tests/workspace-lock.test.py
