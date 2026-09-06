@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Slice 3 ingress: injective provider-derived task ids + durable replay skip.
+
+Run: python3 tests/discord-ingress-identity.test.py   (stdlib only)
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+
+# discord-bridge resolves channel config at import, so this must precede any
+# load of it: without isolation the test reads the developer's real allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="d1-ingress-cfg-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text("{}")
+_ccd_slack = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_ccd_slack.mkdir(parents=True, exist_ok=True)
+(_ccd_slack / "access.json").write_text("{}")
+
+from ingress_identity import already_admitted, provider_task_id  # noqa: E402
+
+
+class ProviderTaskId(unittest.TestCase):
+    def test_same_event_same_id_across_calls(self):
+        a = provider_task_id("dc1504316176686120980", "1541010944446963782")
+        b = provider_task_id("dc1504316176686120980", "1541010944446963782")
+        self.assertEqual(a, b)
+        self.assertEqual(a, "task-dc1504316176686120980~1541010944446963782")
+
+    def test_id_stays_in_the_pool_claim_charset(self):
+        tid = provider_task_id("dc123", "456")
+        self.assertRegex(tid, r"^task-[A-Za-z0-9._~-]+$")
+
+    def test_distinct_events_distinct_ids(self):
+        self.assertNotEqual(provider_task_id("dc1", "2"),
+                            provider_task_id("dc1", "3"))
+        self.assertNotEqual(provider_task_id("dc1~2", "3"),
+                            provider_task_id("dc1", "2~3"))
+
+
+class AlreadyAdmitted(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"
+        self.results = root / "results"
+        self.tasks.mkdir()
+        self.results.mkdir()
+        self.tid = provider_task_id("dc1", "42")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_event_is_not_admitted(self):
+        self.assertFalse(already_admitted(self.tid, self.tasks, self.results))
+
+    def test_pending_claimed_resulted_and_archived_all_count(self):
+        (self.tasks / f"{self.tid}.txt").write_text("x")
+        self.assertTrue(already_admitted(self.tid, self.tasks, self.results))
+        (self.tasks / f"{self.tid}.txt").rename(
+            self.tasks / f"{self.tid}.claimed-core-2.txt")
+        self.assertTrue(already_admitted(self.tid, self.tasks, self.results))
+        (self.tasks / f"{self.tid}.claimed-core-2.txt").unlink()
+        (self.results / f"{self.tid}.txt").write_text("done")
+        self.assertTrue(already_admitted(self.tid, self.tasks, self.results))
+        (self.results / f"{self.tid}.txt").unlink()
+        self.assertTrue(already_admitted(
+            self.tid, self.tasks, self.results, lambda tid: True))
+
+    def test_a_different_event_is_not_shadowed(self):
+        (self.tasks / f"{self.tid}.txt").write_text("x")
+        other = provider_task_id("dc1", "43")
+        self.assertFalse(already_admitted(other, self.tasks, self.results))
+
+    def test_a_longer_id_sharing_the_prefix_is_not_a_replay(self):
+        # A pending file for a LONGER id must not admit the shorter one: the
+        # glob is anchored to the id's "." delimiter, not a bare prefix (john #3316).
+        longer = self.tid + "extra"
+        (self.tasks / f"{longer}.txt").write_text("x")
+        self.assertFalse(already_admitted(self.tid, self.tasks, self.results))
+        # positive control: the exact-id file still admits
+        (self.tasks / f"{self.tid}.txt").write_text("x")
+        self.assertTrue(already_admitted(self.tid, self.tasks, self.results))
+
+
+class BridgeWiring(unittest.TestCase):
+    """One wiring pin per bridge: the mint site delegates to the policy."""
+
+    def test_discord_mint_site_uses_provider_task_id_with_replay_skip(self):
+        src = (REPO / "src" / "discord-bridge.py").read_text()
+        self.assertIn("from ingress_identity import provider_task_id", src)
+        site = re.search(
+            r"task_id = provider_task_id\(f\"dc\{_inst\}\", str\(message\.id\)\)"
+            r"[\s\S]{0,400}?already_admitted\(task_id, TASKS_DIR, RESULTS_DIR",
+            src)
+        self.assertIsNotNone(
+            site, "discord-bridge DM ingress must derive the id from the "
+                  "provider event and consult already_admitted before writing")
+
+    def test_slack_mint_site_uses_provider_task_id_with_replay_skip(self):
+        src = (REPO / "src" / "slack-bridge.py").read_text()
+        self.assertIn("from ingress_identity import provider_task_id", src)
+        site = re.search(
+            r"task_id = provider_task_id\(f\"sl\{event\.get\('team'\) or '0'\}\","
+            r"[\s\S]{0,400}?already_admitted\(task_id, TASKS_DIR, RESULTS_DIR",
+            src)
+        self.assertIsNotNone(
+            site, "slack-bridge ingress must derive the id from channel+ts "
+                  "and consult already_admitted before writing")
+
+    def test_slack_event_id_shape_needs_no_escaping(self):
+        tid = provider_task_id("slT08ABC", "D0B4N6DSY90-1787477641.984")
+        self.assertNotIn("%", tid)
+        self.assertRegex(tid, r"^task-[A-Za-z0-9._~-]+$")
+
+
+class HandlerReplaySkip(unittest.TestCase):
+    """Drive the real _handle_discord_message: a replayed event (same provider
+    message id) maps to the same file and returns at the dedup skip."""
+
+    def test_replayed_dm_writes_no_second_task(self):
+        import asyncio
+        import contextlib
+        import io
+        import json
+        import os
+        import types
+
+        cfg = tempfile.mkdtemp(prefix="ccd-ingress-replay-")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        os.environ["HOME"] = cfg
+        os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+        cdir = Path(cfg) / "channels" / "discord"
+        cdir.mkdir(parents=True)
+        (cdir / "access.json").write_text(json.dumps(
+            {"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"]}))
+        (cdir / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
+        if "discord" not in sys.modules:
+            _d = types.ModuleType("discord")
+            _d.Intents = type("I", (), {"default": staticmethod(
+                lambda: type("X", (), {"message_content": False})())})
+            _d.Client = type("C", (), {"__init__": lambda self, **k: None,
+                                       "event": staticmethod(lambda fn: fn)})
+            _d.File = type("F", (), {})
+            _d.Message = type("M", (), {})
+            _d.DMChannel = type("DM", (), {})
+            _d.MessageType = types.SimpleNamespace(default="default")
+            sys.modules["discord"] = _d
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_ingress_replay_db", REPO / "src" / "discord-bridge.py")
+        db = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = db
+        spec.loader.exec_module(db)
+        dsm = sys.modules["discord"]
+
+        with tempfile.TemporaryDirectory() as td:
+            tasks, results = Path(td) / "tasks", Path(td) / "results"
+            tasks.mkdir(); results.mkdir()
+            (tasks / "archive").mkdir()
+            db.TASKS_DIR, db.RESULTS_DIR = tasks, results
+            db.ARCHIVE_TASKS_DIR = tasks / "archive"
+
+            class _User:
+                def __init__(self, uid, bot=False):
+                    self.id = uid; self.bot = bot
+                def __str__(self): return f"user{self.id}"
+                def __eq__(self, o): return getattr(o, "id", None) == self.id
+                def __hash__(self): return hash(self.id)
+
+            class _Typing:
+                async def __aenter__(self): return self
+                async def __aexit__(self, *a): return False
+
+            class _DM(dsm.DMChannel):
+                def __init__(self):
+                    self.id = 555; self.sent = []
+                async def send(self, text, **kw):
+                    self.sent.append(text)
+                def typing(self):
+                    return _Typing()
+
+            class _Msg:
+                def __init__(self):
+                    self.author = _User("U_OWNER")
+                    self.channel = _DM()
+                    self.content = "hello there"
+                    self.id = 424242
+                    self.mentions = []; self.role_mentions = []
+                    self.attachments = []; self.embeds = []
+                    self.reference = None; self.guild = None
+                    self.message_snapshots = []
+                    self.type = dsm.MessageType.default
+
+            async def _noop(*a, **k):
+                return None
+            db._observe_for_mod = _noop
+            db._update_dm_checkpoint = lambda *a, **k: None
+            db.client.user = _User(777888, bot=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg()))
+            n_first = len(list(tasks.glob("task-*.txt")))
+            self.assertEqual(n_first, 1, f"first delivery mints one task; log={buf.getvalue()[-400:]}")
+
+            # a restart empties the in-memory seen set — the DURABLE skip is
+            # exactly what the ingress-dedup branch exists for
+            db.seen_message_ids.clear()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg()))
+            self.assertEqual(len(list(tasks.glob("task-*.txt"))), 1,
+                             "replay minted a second task")
+            self.assertIn("[ingress-dedup] replay of", buf.getvalue(),
+                          "skip did not go through the ingress-dedup branch")
+
+
+if __name__ == "__main__":
+    unittest.main()

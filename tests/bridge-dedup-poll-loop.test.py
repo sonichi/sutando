@@ -109,7 +109,7 @@ class DiscordPollLoopTest(unittest.TestCase):
         except (Exception, SystemExit) as e:  # noqa: BLE001
             self.skipTest(f"discord-bridge not importable: {str(e)[:60]}")
 
-    def _one_pass(self, td: str, holder_body: str, orig: str = ORIG):
+    def _one_pass(self, td: str, holder_body: str, orig: str = ORIG, extra=None):
         import asyncio
         db = self.db
         results, tasks = _seed(db, td, holder_body, orig)
@@ -133,8 +133,11 @@ class DiscordPollLoopTest(unittest.TestCase):
         db.client = _Client()
         db._recovered_replies = {}
         db.pending_replies.clear()
+        db.pending_admitted_ms.clear()
         db.pending_replies[TID] = chan
         db.save_pending_replies = lambda *a, **k: None
+        if extra:
+            extra(tasks)
 
         async def _sleep(_s):
             raise _Stop()
@@ -168,6 +171,24 @@ class DiscordPollLoopTest(unittest.TestCase):
             self.assertTrue(any("delivered nothing" in s for s in r["sent"]),
                             f"owner never told the ask could not be recovered; sent={r['sent']}")
             self.assertEqual(r["requeued"], [], "looped instead of reporting")
+
+    def test_cross_channel_reject_stamps_admission(self):
+        # holder lives in ANOTHER channel: first sighting re-queues here, and
+        # the re-ask must carry an admitted_at stamp or the ager orphans it.
+        with tempfile.TemporaryDirectory() as td:
+            def extra(tasks):
+                (tasks / f"{HOLDER}.txt").write_text(
+                    f"id: {HOLDER}\nsource: discord\nchannel_id: 9999\ntask: other ask\n")
+            r = self._one_pass(td, "", extra=extra)
+            requeued = [p for p in r["requeued"] if p.stem != HOLDER]
+            self.assertEqual(len(requeued), 1,
+                             f"cross-channel reject did not re-queue; log={r['log'][:300]}")
+            new_id = requeued[0].stem
+            self.assertIn(new_id, r["pending"], "re-ask unroutable")
+            self.assertIsInstance(self.db.pending_admitted_ms.get(new_id), int,
+                                  "re-ask has no admitted_at stamp — ager will orphan it")
+            self.assertIn("cross-channel reject", r["log"],
+                          "took the same-channel path — branch under test not driven")
 
     def test_holder_that_answered_is_left_alone(self):
         with tempfile.TemporaryDirectory() as td:
