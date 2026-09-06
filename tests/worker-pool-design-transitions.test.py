@@ -42,7 +42,8 @@ class Disk:
         # record: sweep-only. token/journal/claimed: sweep creates, worker renames, sweep removes.
         # request: kick-pool. results: the worker finishing an admitted task.
         self.record, self.probation, self.request = {}, {}, False
-        self.token, self.journal, self.claimed_rec = False, None, None   # .admit / .admit.<t> / .admit.<t>.claimed
+        self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
+        self.token, self.journal, self.claimed_rec = False, None, None   # token / held/<t> / claimed/<t>
         self.token_at, self.journal_at, self.claimed_at = None, None, None
         self.computed_at = None      # when the sweep last published; the snapshot's own clock
         self.claims, self.results, self.writers = {}, set(), set()   # claims: task -> owner id
@@ -50,7 +51,8 @@ class Disk:
 
 
 def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
-        durable_gate=True, flat_issuance=False, unconditional_gate=True):
+        durable_gate=True, flat_issuance=False, unconditional_gate=True,
+        dir_is_allowance=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -61,13 +63,14 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
+    crash_mkdir = [mode == "crash_mkdir"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
     def allowance():
-        """The <instance>.admit/ directory: issued in SOME phase, or absent. One test, whole family.
+        """A FILE under <instance>.admit/ -- token, held/<t> or claimed/<t>.
 
-        Under the flat naming the worker's rename consumed the very name issuance guarded, so
-        this could not be asked as one question -- which is the second defect below.
+        Directory existence is NOT this question: mkdir and the token write are two writes, so an
+        empty directory means issuance stopped between them, never that an allowance was minted.
         """
         return d.token or d.journal is not None or d.claimed_rec is not None
 
@@ -93,9 +96,14 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     def sweep():
         now[0] += 10; d.writers.add(("record", "sweep")); d.computed_at = now[0]
         if d.request and "w" not in d.probation:
-            # (a) mkdir(<instance>.admit). EEXIST -- in ANY phase -- means the allowance is
-            # already issued, so recovery publishes over it and mints nothing.
-            if not (d.token if flat_issuance else allowance()):
+            # (a) mkdir, then the token write: TWO writes, so a crash lands between them.
+            # EEXIST alone proves only the directory; recovery asks for a FILE.
+            d.admit_dir = True
+            if crash_mkdir[0]:                                # crash after mkdir, before token
+                crash_mkdir[0] = False; return
+            if dir_is_allowance and d.admit_dir and not allowance():
+                pass                                          # pre-fix: EEXIST read as a mint
+            elif not (d.token if flat_issuance else allowance()):
                 d.token, d.token_at = True, now[0]
             if crash_once[0]:                                 # crash after (a), before (b): once
                 crash_once[0] = False; return
@@ -107,19 +115,22 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.request and "w" in d.probation:                  # crash after (b), before (c)
             d.request = False; return
         if "w" in d.probation:
-            if not allowance():
-                d.token, d.token_at = True, now[0]            # issuance crash: re-create the lost token
+            # `dir_is_allowance=True` is the pre-fix reading: EEXIST proves a mint, so an
+            # empty directory is never finished and the verdict has no clock to end on.
+            if not allowance() and not (dir_is_allowance and d.admit_dir):
+                d.admit_dir = True                            # an empty directory is unfinished issuance
+                d.token, d.token_at = True, now[0]            # finish it exactly once
                 return
             if d.claimed_rec is not None and d.claimed_rec in d.results:
                 # rmtree(<instance>.admit): the whole directory, not just the phase that ended it
                 d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.record["w"] = "eligible"; return
+                d.admit_dir = False; d.record["w"] = "eligible"; return
             start = clock_start()
             # A fallback start would silently supply a clock the design lacks, so a shape with
             # no clock must be expressible or the timeout test passes however the clocks read.
             if start is not None and now[0] - start > WINDOW:
                 d.probation.pop("w"); d.token = False; d.journal = None; d.claimed_rec = None
-                d.record["w"] = "wedged"; return
+                d.admit_dir = False; d.record["w"] = "wedged"; return
             return                                            # held, with a clock running
         if claimed and pending - claimed == 0:
             d.record["w"] = "eligible"
@@ -490,6 +501,58 @@ class TheArtifactPathIsInjective(unittest.TestCase):
         self.assertEqual(forged, {}, f"two (phase, task) pairs share a path: {forged}")
         self.assertNotIn(artifact_path("worker-2", "token"), seen,
                          "an unconsumed token must not be reachable by any task id")
+
+
+class AnEmptyAllowanceDirectoryIsUnfinishedIssuance(unittest.TestCase):
+    """`mkdir` and the token write are TWO writes, so a crash leaves an empty directory.
+
+    Reading `EEXIST` as proof of a minted allowance publishes probation over a directory holding
+    no token, no journal and no claimed record: nothing to consume, and no timestamp for any of
+    the three clocks, so the verdict can never end. An existence test standing in for a state
+    test, which is the same shape as the flat form's defect one layer down.
+    """
+
+    ORDER = ["kick", "sweep", "restart", "sweep", "worker"]
+
+    def test_the_existence_reading_wedges_the_room_forever(self):
+        # The defect itself, so this class is not asserting the fix agrees with itself.
+        v, c, p, d = run(self.ORDER, "crash_mkdir", dir_is_allowance=True)
+        self.assertTrue(d.admit_dir, "the directory is there")
+        self.assertFalse(d.token or d.journal is not None or d.claimed_rec is not None,
+                         "and it holds nothing")
+        self.assertEqual((v, c), ("probation", 0), "published over an empty directory")
+        # And it is ABSORBING, which is the harm: no clock can start, so no sweep ends it.
+        for tail in (["wait", "sweep"], ["sweep", "sweep", "wait", "sweep"]):
+            v2, c2, _p, _d = run(self.ORDER + tail, "crash_mkdir", dir_is_allowance=True)
+            self.assertEqual((v2, c2), ("probation", 0), tail)
+
+    def test_recovery_finishes_issuance_and_the_worker_admits_one(self):
+        v, c, p, d = run(self.ORDER, "crash_mkdir")
+        self.assertEqual((v, c, p), ("probation", 1, 4))
+        self.assertEqual(d.claimed_rec, "t1")
+
+    def test_it_finishes_exactly_once_however_many_sweeps_run(self):
+        for extra in range(1, 4):
+            order = ["kick", "sweep", "restart"] + ["sweep"] * extra + ["worker", "worker", "event"]
+            v, c, p, d = run(order, "crash_mkdir")
+            self.assertEqual(c, 1, f"{extra} recovery sweeps admitted {c}")
+
+    def test_every_crash_mkdir_schedule_still_terminates(self):
+        for order in (["kick", "sweep", "restart", "sweep", "wait", "sweep"],
+                      ["kick", "sweep", "restart", "sweep", "worker", "wait", "sweep"],
+                      ["kick", "sweep", "restart", "sweep", "worker", "finish", "sweep"],
+                      ["kick", "sweep", "drift", "sweep", "worker", "wait", "sweep"]):
+            v, c, p, d = run(order, "crash_mkdir")
+            self.assertIn(v, ("eligible", "wedged"), order)
+            self.assertFalse(d.admit_dir, f"{order}: the directory outlived its probation")
+
+    def test_an_empty_directory_is_not_an_allowance_for_the_GATE_either(self):
+        # After the crash the directory stands with no file: the worker must NOT be held by it,
+        # because holding on a phase-less directory is the wedge this class exists to remove.
+        v, c, p, d = run(["kick", "sweep", "worker"], "crash_mkdir")
+        self.assertTrue(d.admit_dir)
+        self.assertEqual(c, 0, "nothing to consume yet")
+        self.assertEqual(v, "wedged", "the record still reads wedged; probation was never published")
 
 
 if __name__ == "__main__":

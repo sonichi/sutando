@@ -1417,18 +1417,39 @@ itself to a room whose worker might still come back.
    (c) only then it removes the request. A crash after (a) leaves the request standing, so the next
    sweep re-runs (a)–(c); a crash after (b) leaves a request that (c) simply removes.
 
-   **`EEXIST` on that `mkdir` is the whole reconciliation, and that is the point of putting the
-   phase inside the directory rather than in its name.** The allowance is minted once; every
-   later transition is a rename WITHIN it, so the name the sweep tests never disappears. Under the
-   flat form the worker's first rename consumed the very name `O_EXCL` was guarding, so a sweep
-   restarting into a crashed issuance found it absent and minted a SECOND allowance beside a task
-   the worker had already claimed — `O_EXCL` protects a name, never that name's renamed successor.
-   (Found independently by qingyun-wu 5124977329 and keweichen 5125025866; both reproduced it in
-   the committed model without modifying it.) A directory that exists is an allowance that has
-   been issued, in whichever phase; the sweep publishes (b) and clears (c) over it and mints
-   nothing. The sweep is the sole creator and sole remover of the allowance; a worker only renames
-   within it, and never writes the record. A sweep that runs BEFORE the worker's reconciliation
-   does not republish anything — the verdict is held while `probation` stands.
+   **`EEXIST` on that `mkdir` says the directory exists; it does NOT say an allowance was minted,
+   and conflating the two wedges the room.** Directory creation and the `token` write are two
+   filesystem writes, so a crash between them leaves an EMPTY directory. Reading `EEXIST` as proof
+   of a minted allowance then publishes probation over a directory holding no token, no journal and
+   no claimed record — nothing for a worker to consume, and no timestamp for any of the three
+   clocks, so the verdict can never end. That is the same defect the flat form had, one layer down:
+   an existence test standing in for a state test.
+
+   **So recovery asks whether the directory holds a FILE, not whether it exists.** On `EEXIST` the
+   sweep walks `<instance>.admit/` for any regular file:
+
+   | what recovery finds | meaning | act |
+   |---|---|---|
+   | no regular file anywhere under it | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
+   | `token` | minted, unconsumed | mint nothing; continue at (b) |
+   | `held/<task_id>` or `claimed/<task_id>` | minted and spent | mint nothing; continue at (b) |
+
+   **Empty SUBDIRECTORIES are not a phase, and that is what makes this decidable.** A rename needs
+   its target's parent, so the worker does `mkdir -p <instance>.admit/held/` before
+   `rename(token, held/<task_id>)`. A crash between those leaves `token` still present beside an
+   empty `held/` — recovery sees the file, mints nothing, and the worker simply retries. The rename
+   itself is atomic, so at no instant are both names absent. An allowance directory containing no
+   file therefore has exactly one cause: issuance stopped after `mkdir`. Creating `token` there with
+   `O_EXCL` finishes it exactly once, and two sweeps racing that recovery cannot both win.
+
+   Under the flat form the worker's first rename consumed the very name `O_EXCL` was guarding, so a
+   sweep restarting into a crashed issuance found it absent and minted a SECOND allowance beside a
+   task the worker had already claimed — `O_EXCL` protects a name, never that name's renamed
+   successor. Putting the phase inside the directory fixes that: the name the sweep tests never
+   disappears, because every later transition is a rename WITHIN it. The sweep is the sole creator
+   and sole remover of the allowance; a worker only renames within it, and never writes the record.
+   A sweep that runs BEFORE the worker's reconciliation does not republish anything — the verdict is
+   held while `probation` stands.
 
    **The probation gate is the DIRECTORY, not the record — so it outlives the snapshot.** The
    validation matrix above maps `now > computed_at + stale_after_s` to ABSENT, and ABSENT means
