@@ -244,10 +244,8 @@ def main(argv=None) -> int:
 
     state = Path(a.state)
     doc, err = load(state)
-    # BOOTSTRAP. load() refuses when the key is absent, which is right for every other
-    # path — but it also made the tool unable to create the record it is the sole writer
-    # of, so a host that never had one could not adopt it except by the hand-edit this
-    # tool exists to replace. --init adds an EMPTY list and never content.
+    # --init is the only way to create the key this tool is the sole writer of.
+    # It adds an EMPTY list, never content, so ABSENT and EMPTY stay distinct.
     if a.init:
         if not err:
             print(f"CANNOT ANSWER: {KEY} already exists — --init refuses to clobber a record",

@@ -298,9 +298,8 @@ with _tf.TemporaryDirectory() as td:
           f"rc={r.returncode} {r.stdout}{r.stderr}")
 
 
-# --init is the ONLY way to create the record, and it must never be able to destroy one.
-# Without it the tool -- the sole writer of held_item_ids -- could not bootstrap a host
-# that never had the key, so the mechanism was unreachable exactly where it was needed.
+# --init creates the record and must never destroy one: without it the sole writer
+# of held_item_ids could not bootstrap a host that never had the key.
 with _tf.TemporaryDirectory() as td:
     f = _os.path.join(td, "s.json")
     open(f, "w").write(json.dumps({"streak": 3, "noop_total": 7}))
