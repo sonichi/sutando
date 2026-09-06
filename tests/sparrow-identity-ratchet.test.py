@@ -344,7 +344,8 @@ def _scope_nodes(body_node):
         # A nested scope has its own walk; an assignment's subtree is
         # handled at the assignment, value before targets.
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                              ast.ClassDef, ast.Assign, ast.AnnAssign, ast.If)):
+                              ast.ClassDef, ast.Assign, ast.AnnAssign, ast.If,
+                              ast.Try, ast.Match)):
             continue
         yield from _scope_nodes(child)
 
@@ -456,12 +457,26 @@ def _certified_nodes(tree, bindings: set) -> set:
             for node in nodes:
                 step(node)
 
+        def _arms_of(node):
+            # Every construct whose branches are ALTERNATIVES, not a sequence. `finally`
+            # is excluded on purpose: it runs on every path, so it is not an arm.
+            if isinstance(node, ast.If):
+                visit_expr(node.test)
+                return [node.body, node.orelse or []]
+            if isinstance(node, ast.Try):
+                for h in node.handlers:
+                    if h.type is not None:
+                        visit_expr(h.type)
+                return ([node.body + (node.orelse or [])]
+                        + [h.body for h in node.handlers])
+            visit_expr(node.subject)
+            return [c.body for c in node.cases]
+
         def branch_merge(node):
             # Alternatives cannot both execute: certification survives only where EVERY
             # arm keeps it, while shadowing spreads from any arm so invalidation is never lost.
-            visit_expr(node.test)
             base_c, base_s = set(cert), set(shadowed)
-            arms = [node.body, node.orelse or []]
+            arms = _arms_of(node)
             results = []
             for arm in arms:
                 cert.clear(); cert.update(base_c)
@@ -472,9 +487,11 @@ def _certified_nodes(tree, bindings: set) -> set:
             merged_s = set.union(*(sh for _, sh in results)) if results else base_s
             cert.clear(); cert.update(merged_c)
             shadowed.clear(); shadowed.update(merged_s)
+            if isinstance(node, ast.Try) and node.finalbody:
+                run(_scope_nodes(ast.Module(body=node.finalbody, type_ignores=[])))
 
         def step(node):
-            if isinstance(node, ast.If):
+            if isinstance(node, (ast.If, ast.Try, ast.Match)):
                 branch_merge(node)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for name in _import_bindings(node):
@@ -787,6 +804,31 @@ class BranchCertificationIsPerPath(unittest.TestCase):
                          "source order of the two arms changed the census")
         self.assertEqual(self._arms(self.RAW, self.CANON), {("probe.py", "mint"): 1},
                          "a raw value on either arm must leave the use counted")
+
+    def test_every_alternative_construct_merges_per_path(self):
+        """`if` is not the only place alternatives appear. try/except and match/case
+        thread the same shared state, and `finally` runs on every path so it is not an arm."""
+        C, R = "delivery_id(item, ts)", 'f"{item}#{ts}"'
+        TRY = (self.HDR + 'def mint(item, ts, rec):\n    try:\n        k = %s\n'
+               '    except Exception:\n        k = %s\n    rec["delivery_id"] = k\n    return rec\n')
+        MAT = (self.HDR + 'def mint(x, item, ts, rec):\n    match x:\n        case 1:\n'
+               '            k = %s\n        case _:\n            k = %s\n'
+               '    rec["delivery_id"] = k\n    return rec\n')
+        for name, tmpl in (("try/except", TRY), ("match/case", MAT)):
+            with self.subTest(construct=name):
+                self.assertEqual(self._d(tmpl % (C, R)), self._d(tmpl % (R, C)),
+                                 f"{name}: arm order changed the census")
+                self.assertEqual(self._d(tmpl % (R, C)), {("probe.py", "mint"): 1})
+                self.assertEqual(self._d(tmpl % (C, C)), {},
+                                 f"{name} control: every arm canonical stays exempt")
+                self.assertEqual(self._d(tmpl % (R, R)), {("probe.py", "mint"): 1},
+                                 f"{name} control: no arm canonical is counted")
+        finally_rebinds = (self.HDR + 'def mint(item, ts, rec):\n    try:\n'
+                           '        k = delivery_id(item, ts)\n    except Exception:\n'
+                           '        k = delivery_id(item, ts)\n    finally:\n        k = "raw"\n'
+                           '    rec["delivery_id"] = k\n    return rec\n')
+        self.assertEqual(self._d(finally_rebinds), {("probe.py", "mint"): 1},
+                         "`finally` runs on every path, so a rebind there revokes certification")
 
     def test_certification_still_works_and_invalidation_survives(self):
         # Without this pair, a change that simply stopped certifying anything would
