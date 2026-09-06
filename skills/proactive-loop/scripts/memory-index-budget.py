@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -88,12 +90,167 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
             "delta_bytes": a_bytes - b_bytes}
 
 
+# MEMORY_DIR is derived from THIS process's cwd, not from the tree the session
+# loads; a checkout can host several. Resolve by IDENTITY, never by freshness.
+
+
+def _host_label(repo: Path) -> "str | None":
+    """Delegate to src/util_paths._host_label; a private copy drifts from the
+    per-host contract the rest of the workspace addresses."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_mib_util_paths", repo / "src" / "util_paths.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        label = (mod._host_label() or "").strip()
+        return label or None
+    except Exception:
+        return None
+
+
+def _host_pointer_path(workspace: Path, repo: Path) -> "Path | None":
+    """Where THIS host records which corpus it loads, or None if the label owner
+    cannot answer -- guessing the label is what the delegation exists to stop.
+
+    Anchored on the resolved workspace, never on the index's own ancestors: an
+    external SUTANDO_MEMORY_DIR would otherwise write state outside the workspace."""
+    label = _host_label(repo)
+    if not label:
+        return None
+    return workspace / "hosts" / label / "memory-corpus"
+
+
+def _host_stated_index(workspace: Path, repo: Path) -> "tuple[Path | None, str]":
+    """(index, why) from the pointer; (None, "") when unrecorded -- absent is
+    absent, so the caller still refuses rather than inferring."""
+    ptr = _host_pointer_path(workspace, repo)
+    if ptr is None:
+        return None, ""
+    try:
+        raw = ptr.read_text().strip()
+    except OSError:
+        return None, ""
+    if not raw:
+        return None, ""
+    return Path(raw).expanduser(), f"{ptr}"
+
+
+def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
+    """(index, note); index None means refuse and the note says why. Freshness is
+    not identity -- an mtime cannot say which corpus this session loads."""
+    default = memory_dir / "MEMORY.md"
+    # MEMORY_DIR is already derived FROM this override when it is set, so the
+    # caller's memory_dir is owner-stated identity -- do not re-read the var.
+    if os.environ.get("SUTANDO_MEMORY_DIR"):
+        if default.is_file():
+            return default, ""
+        return None, f"CANNOT ANSWER: SUTANDO_MEMORY_DIR resolves to {default}, which is not a file"
+    projects = memory_dir.parent.parent
+    stated, why = _host_stated_index(workspace, repo)
+    if stated is not None:
+        if stated.is_file():
+            return stated, ""
+        return None, (f"CANNOT ANSWER: {why} names {stated}, which is not a file — "
+                      f"fix that pointer rather than guessing past it.")
+    try:
+        cands = sorted(p for p in projects.glob("*/memory/MEMORY.md") if p.is_file())
+    except OSError as e:
+        # A failed scan establishes nothing about uniqueness, so falling back to
+        # the cwd-derived default is the same fail-open this resolver exists to close.
+        return None, (f"CANNOT ANSWER: could not scan {projects} ({e}) — uniqueness "
+                      f"unestablished. Pass --index or set SUTANDO_MEMORY_DIR.")
+    if not cands:
+        if default.is_file():
+            return default, ""
+        return None, f"CANNOT ANSWER: no index at {default} and none under {projects}"
+    if len(cands) == 1:
+        return cands[0], ""
+    names = ", ".join(c.parent.parent.name for c in cands)
+    ptr = _host_pointer_path(workspace, repo) or "<hosts/<label>/memory-corpus>"
+    ambiguity = (
+        f"AMBIGUOUS CORPUS: {len(cands)} candidate indexes under {projects} and nothing "
+        f"authoritative names one ({names}). An mtime says which was edited last, not "
+        f"which one this session loads.\n"
+        f"RECORD IT ONCE -- this host then answers unattended forever:\n"
+        f"    memory-index-budget.py --record <abs path to the MEMORY.md this session loads>\n"
+        f"    (writes {ptr}, validated and atomic)\n"
+        f"(or set SUTANDO_MEMORY_DIR, or pass --index for a one-off.)")
+    # Callers gate on the exit code, so an answer with a caveat attached is still
+    # an answer. --record is the cure that did not exist when this answered instead.
+    return None, "CANNOT ANSWER: " + ambiguity
+
+
+
+def record_pointer(workspace: Path, repo: Path, target: Path,
+                   force: bool = False) -> "tuple[int, str]":
+    """THE writer for this host's corpus pointer. Validates, then writes atomically.
+
+    A pointer naming nothing turns every later call into a refusal that reads as a
+    missing corpus, so the validation is the contract, not a courtesy.
+    """
+    ptr = _host_pointer_path(workspace, repo)
+    if ptr is None:
+        return 2, ("CANNOT ANSWER: this host's label is unresolvable, so there is no "
+                   "pointer path to write. Set SUTANDO_HOST_LABEL or pass --index.")
+    target = target.expanduser()
+    if not target.is_file():
+        return 2, f"REFUSED: {target} is not a file — a pointer must name an existing index."
+    if target.name != "MEMORY.md":
+        return 2, f"REFUSED: {target} is not named MEMORY.md — that is not an index."
+    # Bootstrap only. A writer that overwrites silently can retarget a host that was
+    # already correct, and this record is the one input the reader cannot sanity-check.
+    if ptr.exists() and not force:
+        try:
+            cur = ptr.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            cur = f"<unreadable: {e}>"
+        return 2, (f"REFUSED: {ptr} already records {cur!r}. This operation bootstraps a "
+                   "missing pointer; pass --force to retarget an existing one deliberately.")
+    resolved = target.resolve()
+    try:
+        ptr.parent.mkdir(parents=True, exist_ok=True)
+        fd, staged = tempfile.mkstemp(prefix=f".{ptr.name}.", suffix=".tmp", dir=str(ptr.parent))
+    except OSError as e:
+        return 2, f"REFUSED: cannot stage a write next to {ptr} ({e})."
+    tmp = Path(staged)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(resolved) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if force:
+            os.replace(tmp, ptr)
+        else:
+            # link() fails if ptr exists, so concurrent bootstraps cannot both win.
+            os.link(tmp, ptr)
+            os.unlink(tmp)
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        try:
+            cur = ptr.read_text(encoding="utf-8").strip()
+        except OSError:
+            cur = "<unreadable>"
+        return 2, (f"REFUSED: {ptr} already records {cur!r} (published concurrently). "
+                   "Pass --force to retarget an existing pointer deliberately.")
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return 0, f"recorded: {ptr} -> {resolved}"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]),
                     help="repo holding src/health-check.py (default: this checkout)")
     ap.add_argument("--index", help="path to MEMORY.md (default: from the repo's MEMORY_DIR)")
+    ap.add_argument("--record", metavar="MEMORY_MD",
+                    help="record THIS host's corpus pointer (validated, atomic) and exit")
+    ap.add_argument("--force", action="store_true",
+                    help="with --record: retarget a pointer that already exists")
     ap.add_argument("--adding")
     ap.add_argument("--adding-file")
     ap.add_argument("--at-top", action="store_true")
@@ -106,7 +263,27 @@ def main(argv=None) -> int:
               "than measuring with a private copy of the limit", file=sys.stderr)
         return 2
 
-    index = Path(a.index) if a.index else Path(getattr(mod, "MEMORY_DIR", "")) / "MEMORY.md"
+    if a.record:
+        ws = getattr(mod, "WORKSPACE_DIR", None)
+        if ws is None:
+            print("CANNOT ANSWER: health-check exposes no resolved workspace, so the "
+                  "pointer has no canonical destination", file=sys.stderr)
+            return 2
+        rc, msg = record_pointer(Path(ws), repo, Path(a.record), force=a.force)
+        print(msg, file=sys.stderr if rc else sys.stdout)
+        return rc
+
+    if a.index:
+        index, note = Path(a.index), ""
+    else:
+        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")), repo,
+                                  Path(getattr(mod, "WORKSPACE_DIR", repo / "workspace")))
+        # A note now travels with a RESOLVED index too, carrying the caveat that
+        # made it ambiguous; only a None index is a refusal.
+        if note:
+            print(note, file=sys.stderr)
+        if index is None:
+            return 2
     if not index.is_file():
         print(f"CANNOT ANSWER: no index at {index}", file=sys.stderr)
         return 2
