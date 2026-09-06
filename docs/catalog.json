@@ -462,6 +462,17 @@
    "status": "active",
    "canonical_for": "server v0 runtime-api surface and the read-only agent identity card mapping",
    "last_verified": "2026-08-30"
+  },
+  "docs/interaction-semantics.md": {
+   "title": "Interaction semantics — the AG2 contract (V1)",
+   "audience": [
+    "contributors",
+    "maintainers",
+    "agents"
+   ],
+   "status": "draft",
+   "canonical_for": "the owner-settled V1 vocabulary of semantic interaction requests, the responsibility boundaries (agent/runtime/client), and the semantics-to-A2UI compilation pipeline",
+   "last_verified": "2026-09-03"
   }
  }
 }
