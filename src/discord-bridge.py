@@ -687,6 +687,42 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     )
 
 
+async def _process_sibling_attachment(att, author_str: str):
+    """Download one referenced-user (sibling) attachment and build its task note.
+
+    Returns ``(attachment_ref, note_fragment)``, or ``(None, "")`` if the
+    download failed. The transcription subprocess is synchronous with a long
+    timeout, so it is offloaded with ``asyncio.to_thread`` — scanning up to five
+    sibling attachments must never block the gateway event loop and starve
+    heartbeats. A voice attachment
+    yields a transcript note, anything else a file note; image attachments are
+    additionally pushed for the core's multimodal context. Kept a module-level
+    helper (out of the un-coverable I/O handler) so the offload is unit-testable.
+    """
+    s_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
+    try:
+        await att.save(s_path)
+    except Exception as e:
+        print(f"  [sibling-attach] download failed: {e}", flush=True)
+        return None, ""
+    ref = _ref_from_attachment(att, s_path)
+    # Offload the blocking, long-timeout transcription off the event loop.
+    transcript = await asyncio.to_thread(_transcribe_via_skill, str(s_path))
+    if transcript:
+        note = f"\n[Voice transcript (from {author_str}'s recent message): {transcript}]"
+    else:
+        note = f"\n[File attached (from {author_str}'s recent message): {s_path}]"
+    try:
+        ct = (getattr(att, "content_type", "") or "").lower()
+        if ct.startswith("image/") or str(s_path).lower().endswith(
+            (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        ):
+            _push_vision_image(str(s_path), source="discord")
+    except Exception:
+        pass
+    return ref, note
+
+
 def _safe_attachment_basename(filename: str) -> str:
     """Sanitize a Discord attachment filename for safe filesystem +
     downstream-shell use.
@@ -730,6 +766,52 @@ def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef"
         filename=_safe_attachment_basename(getattr(att, "filename", "") or ""),
         size=(getattr(att, "size", 0) or 0),
     )
+
+
+def _select_sibling_attachments(history, referenced_ids, cutoff, cap=5):
+    """Pick attachments that belong to a *referenced* user's recent sibling
+    messages — the case the primary loop and the reply-context loop both miss.
+
+    When someone pings the bot with text but no media of their own and mentions
+    another user ("@bot make the video @Alice sent"), the media usually lives on
+    that user's own earlier, un-mentioned messages. Those messages neither invoke
+    the bot nor are replied-to, so nothing downloads them.
+
+    Pure selection logic, kept out of the async I/O loop so it is unit-testable
+    without a live discord channel. `history` is an iterable of message-like
+    objects (`.author.id`, `.created_at`, `.attachments`) in Discord's
+    newest-first order (as `channel.history(before=...)` yields). Returns a list
+    of ``(author_str, attachment)`` pairs, oldest-first for natural task reading,
+    limited to messages authored by a referenced user no older than ``cutoff``
+    and capped at ``cap`` attachments (nearest-to-the-trigger kept).
+    """
+    picked = []
+    groups = []  # (author_str, [attachments]) per qualifying message, newest-first
+    total = 0
+    for msg in history:
+        # history is newest-first, so the first out-of-window message means
+        # every remaining one is older too.
+        if msg.created_at < cutoff:
+            break
+        if msg.author.id not in referenced_ids:
+            continue
+        atts = list(getattr(msg, "attachments", None) or [])
+        if not atts:
+            continue
+        # The bottom break keeps total < cap on entry, so cap - total >= 1 here;
+        # take at most that many (nearest-to-the-trigger, upload order within a msg).
+        atts = atts[:cap - total]
+        groups.append((str(msg.author), atts))
+        total += len(atts)
+        if total >= cap:
+            break
+    # Oldest message first, but each message keeps its upload order — reversing
+    # the flat list would also invert the attachments inside each message.
+    picked = []
+    for author_str, atts in reversed(groups):
+        picked.extend((author_str, att) for att in atts)
+    return picked
+
 
 
 # Optional: deterministic ownership for team/other-tier tasks across nodes.
@@ -3771,6 +3853,31 @@ async def _handle_discord_message(message, force=False):
                         print(f"  [reply-context] parent attachment download failed: {e}", flush=True)
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
+
+    # Media a mention refers to often sits on that user's own earlier messages.
+    if not attachment_note and _message_mentions_bot(message):  # pragma: no cover
+        referenced_ids = {
+            u.id for u in message.mentions
+            if client.user is None or u.id != client.user.id
+        }
+        if referenced_ids:
+            try:
+                from datetime import timedelta
+                cutoff = message.created_at - timedelta(minutes=15)
+                # Time window only, no message-count ceiling: a busy channel can
+                # push an in-window attachment past any cap and silently drop it.
+                history = [
+                    m async for m in message.channel.history(
+                        limit=None, after=cutoff, before=message, oldest_first=False
+                    )
+                ]
+                for author_str, att in _select_sibling_attachments(history, referenced_ids, cutoff):
+                    ref, note = await _process_sibling_attachment(att, author_str)
+                    if ref is not None:
+                        attachment_refs.append(ref)
+                        attachment_note += note
+            except Exception as e:
+                print(f"  [sibling-attach] history scan failed: {e}", flush=True)
 
     if not text and not attachment_note:
         # Bare mention — user deliberately pinged the bot with no content.
