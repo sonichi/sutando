@@ -8,7 +8,8 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, appendRejection, requestModel, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { createProxyServer, appendRejection, requestModel, decodeRejectionBody, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { gzipSync, brotliCompressSync, zstdCompressSync } from 'node:zlib';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -69,6 +70,33 @@ test('a 429 credits rejection is forwarded unchanged AND recorded with status, p
 	assert.equal(recorded[0].path, '/v1/messages?beta=true');
 	assert.equal(recorded[0].ts, new Date(NOW).toISOString(), 'stamped from the injected clock');
 	assert.match(recorded[0].snippet, /out of usage credits/);
+});
+
+test('a COMPRESSED rejection body is decoded before it is recorded', async () => {
+	// The upstream compresses whatever the client's accept-encoding asked for, so an
+	// uncompressed fixture cannot see this: every real snippet on a live host was mojibake.
+	const body = '{"error":{"type":"invalid_request_error","message":"credit balance is too low"}}';
+	for (const [enc, compress] of [['gzip', gzipSync], ['br', brotliCompressSync], ['zstd', zstdCompressSync]] as const) {
+		recorded = [];
+		upstreamHandler = (_req, res) => {
+			res.writeHead(400, { 'content-type': 'application/json', 'content-encoding': enc });
+			res.end(compress(Buffer.from(body)));
+		};
+		const port = await startProxy();
+		await call(port);
+		await settle();
+		assert.equal(recorded.length, 1, enc);
+		assert.match(recorded[0].snippet, /credit balance is too low/, `${enc} body must be readable`);
+		assert.equal(recorded[0].content_encoding, enc, `${enc} must be recorded`);
+	}
+});
+
+test('an undecodable body says so instead of emitting mojibake', () => {
+	const garbage = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe]);   // gzip header, truncated
+	assert.match(decodeRejectionBody(garbage, 'gzip'), /^<undecodable gzip body: 6 bytes>$/);
+	assert.match(decodeRejectionBody(garbage, 'weird-codec'), /content-encoding: weird-codec/);
+	assert.equal(decodeRejectionBody(Buffer.from('plain'), ''), 'plain', 'no encoding is still plain text');
+	assert.equal(decodeRejectionBody(Buffer.from('plain'), 'identity'), 'plain');
 });
 
 test('the record attributes the rejection to the requesting client: model from the body, user-agent, peer port', async () => {
