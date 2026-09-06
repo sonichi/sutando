@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import roster_identity as ri  # noqa: E402
+from roster_union import roster_login  # noqa: E402
 
 HUMAN, STAND = "human", "stand"
 
@@ -653,7 +654,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         claims.setdefault(id_, {})
     # A declared login is the SOLE join key, matched case-insensitively: the
     # local-key fallback crosses axes, and case-sensitivity splits one person.
-    join = entry.get("github") or key
+    join = roster_login(entry)[0] or key
     hit = (triage_people or {}).get(str(join).casefold())
     tp, src = (hit[1] or {}, f"people.{hit[0]}") if hit else ({}, f"people.{join}")
     if str(join).casefold() != str(key).casefold() and \
@@ -839,7 +840,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "An id no source classifies lives in `unresolved_discord_ids` and "
             "answers no lookup."),
     }
-    aliased = {str(e.get("github") or k).casefold() for k, e in doc.items()
+    aliased = {str(roster_login(e)[0] or k).casefold() for k, e in doc.items()
                if ri.is_person_key(k) and isinstance(e, dict)}
     known = {str(k).casefold() for k in doc}
     extra = {orig: {} for ck, (orig, _v) in canon.items()
@@ -872,7 +873,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         out[key] = new
         # The MATCHED source, not the local key: reading triage_people[key] on
         # an aliased row printed "triage human = -" while filling after_human.
-        _src = canon.get(str(entry.get("github") or key).casefold(), (None, {}))[1]
+        _src = canon.get(str(roster_login(entry)[0] or key).casefold(), (None, {}))[1]
         rows.append({
             "key": key,
             "before_discord_id": entry.get("discord_id"),

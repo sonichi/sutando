@@ -2672,5 +2672,79 @@ class AStandAncestorIsCoveredOnTheProductionPath(_InProcessCli, unittest.TestCas
         self.assertEqual(rec.get("stand_discord_id"), self.R, err)
 
 
+
+
+class JoinKeyComesFromTheSharedResolver(unittest.TestCase):
+    """The join key is `roster_union.roster_login()`, not a local `entry.get("github")`.
+
+    Both spellings are deployed in one file — 5 rows say `gh`, 2 say `github`. A
+    migration that knows only `github` joins every `gh` row under its local roster
+    key instead, so the same reviewer splits into two identities or merges under a
+    different login depending on which consumer reads the store.
+
+    Three cases below FAIL with the local derivation restored and three do not; the
+    second group is what makes the first group evidence about this change rather
+    than about any edit to the file.
+    """
+
+    HUMAN = "1025828152183885925"
+    BOT = "1504316176686120980"
+    TRIAGE = {"people": {"john-the-dev": {"discord": HUMAN, "bots": [BOT]}}}
+
+    def _migrate(self, roster):
+        """Drive the production migration; never rebuild its file list here."""
+        script = str(Path(__file__).resolve().parents[1]
+                     / "skills/collaboration-intelligence/scripts/migrate_roster_identity.py")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "r.json").write_text(json.dumps(roster))
+        (d / "t.json").write_text(json.dumps(self.TRIAGE))
+        out = d / "o.json"
+        rc = subprocess.run([sys.executable, script, "--roster", str(d / "r.json"),
+                             "--triage-config", str(d / "t.json"), "--out", str(out)],
+                            capture_output=True, text=True).returncode
+        doc = json.loads(out.read_text()) if out.exists() else {}
+        rec = next((v for k, v in doc.items() if k != "_schema"), {})
+        return rc, rec.get("human_discord_id")
+
+    # --- the three that fail when the shared resolver is bypassed ---
+
+    def test_a_gh_spelled_row_joins_on_its_declared_login(self):
+        rc, human = self._migrate({"rui": {"gh": "john-the-dev", "discord_id": self.BOT}})
+        self.assertEqual(rc, 0, "a gh-spelled row must reach the triage entry for its login")
+        self.assertEqual(human, self.HUMAN, "joined under the local key instead of `gh`")
+
+    def test_gh_wins_over_github_when_they_disagree(self):
+        rc, human = self._migrate({"rui": {"gh": "john-the-dev",
+                                           "github": "someone-else",
+                                           "discord_id": self.BOT}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(human, self.HUMAN,
+                         "precedence is IDENTITY_FIELDS order, not whichever field a reader knows")
+
+    def test_a_padded_login_is_trimmed_before_the_join(self):
+        rc, human = self._migrate({"rui": {"gh": "  john-the-dev  ", "discord_id": self.BOT}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(human, self.HUMAN, "an untrimmed login misses its triage entry")
+
+    # --- the three that must NOT change: they pin the fix to gh-handling ---
+
+    def test_a_github_spelled_row_is_unaffected(self):
+        rc, human = self._migrate({"rui": {"github": "john-the-dev", "discord_id": self.BOT}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(human, self.HUMAN)
+
+    def test_a_malformed_gh_falls_through_to_github(self):
+        rc, human = self._migrate({"rui": {"gh": 123, "github": "john-the-dev",
+                                           "discord_id": self.BOT}})
+        self.assertEqual(rc, 0, "a non-string login is rejected, not stringified")
+        self.assertEqual(human, self.HUMAN)
+
+    def test_a_row_declaring_no_login_still_joins_on_its_key(self):
+        rc, human = self._migrate({"john-the-dev": {"discord_id": self.BOT}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(human, self.HUMAN, "the local-key fallback must survive the change")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
