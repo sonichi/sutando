@@ -208,6 +208,14 @@ class WorkSignal(unittest.TestCase):
         beat.unlink()
         self.assertEqual(reading(1060.0 + 1200.0), "unknown", "no heartbeat and a 20-minute-old window")
 
+    def test_an_explicit_unhealthy_runtime_outranks_every_pane_reading(self):
+        # The contradictory inputs: a fresh, explicit runtime_healthy=False beside a healthy-looking pane.
+        for sig in ("idle", "working", "wedged", "unknown"):
+            s = S(runtime_healthy=False, active_runs=1, max_concurrency=4, last_heartbeat_at=1000.0, work_signal=sig)
+            self.assertEqual(av.availability(s, 1001.0), "unknown", sig)
+        self.assertEqual(av.availability(S(runtime_healthy=False, disconnected=True, work_signal="idle")), "offline", "a disconnect is still the stronger fact")
+        self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1000.0, work_signal="idle"), 1001.0), "available", "control")
+
     def test_no_reading_falls_back_to_the_heartbeat_rule(self):
         self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1000.0), 1001.0), "available")
         self.assertEqual(av.availability(S(runtime_healthy=True, last_heartbeat_at=1.0), 1000.0), "unknown", "stale is unknown")

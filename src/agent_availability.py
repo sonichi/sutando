@@ -92,6 +92,8 @@ def availability(state: AgentRuntimeState, now: float | None = None) -> str:
     Never derived from 'has a running task' alone: 2 of 4 runs active is busy_accepting."""
     if state.disconnected:
         return "offline"
+    if state.runtime_healthy is False:
+        return "unknown"  # a known-unhealthy runtime never advertises capacity, whatever the pane says
     # A heartbeat and a status file stay fresh on a wedged core; the pane reading outranks them.
     if state.work_signal == "wedged":
         return "busy_unavailable"
