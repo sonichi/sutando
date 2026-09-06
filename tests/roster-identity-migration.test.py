@@ -2438,6 +2438,17 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
                 _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
                 self.assertIsNone(rec.get("human_discord_id"), obj)
 
+    def test_a_referent_word_does_not_licence_the_words_beside_it(self):
+        """qingyun-wu 5124973175 at 7102c665: asking whether the segment STATES a
+        principal admitted any object that also carried a referent token, so
+        `human.integration.id` refused while `human.human_integration.id` passed.
+        Both sides of the join, because one referent word is not a container."""
+        for obj in ("human_integration", "integration_human", "foo_human_bar",
+                    "stand_channel", "agent_room", "room_stand"):
+            with self.subTest(container=obj):
+                _rc, _e, rec = self._human({"discord": True, obj: {"id": self.R}})
+                self.assertIsNone(rec.get("human_discord_id"), obj)
+
     def test_an_object_NOBODY_anticipated_is_refused_by_default(self):
         """The control that separates a bounded allowlist from a longer denylist:
         a name in neither list, which no future provider noun can be added to."""

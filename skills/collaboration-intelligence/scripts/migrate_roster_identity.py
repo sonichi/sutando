@@ -211,6 +211,8 @@ _PROSE_EVIDENCE_KEYS = frozenset({"stand_status"})
 # The ONLY intervening containers that may stand between a principal and a bare
 # `id`. Positive and bounded: an unanticipated object name is refused by default.
 _TRANSPARENT_CONTAINERS = frozenset({"account", "identity", "identities", "wrapper", "profile"})
+# Qualifier words the suite documents beside a principal (`secondary_agent`).
+_CONTAINER_QUALIFIERS = frozenset({"secondary", "primary", "other", "status", "profile"})
 
 
 def _principal_slot(field: str) -> bool:
@@ -251,13 +253,12 @@ def _principal_container(segment: str) -> bool:
     words = {w.lower() for w in _WORDS.findall(str(segment))}
     if not words:
         return False
-    if not (words - _ID_WORDS):
-        return True                                   # pure namespace, e.g. `discord`
     if str(segment).strip().lower() in _TRANSPARENT_CONTAINERS:
         return True
-    # A denylist of provider objects only ever refuses the nouns already thought of;
-    # `integration`, `poll` and five more walked straight through one.
-    return bool(_verdicts_from_field(segment))
+
+    # EVERY word must be allowed: one referent word does not licence the rest,
+    # which is how `human_integration` laundered while `integration` refused.
+    return not (words - _ID_WORDS - _HUMAN_WORDS - _STAND_WORDS - _CONTAINER_QUALIFIERS)
 
 
 def _identity_leaf(key: str) -> bool:
