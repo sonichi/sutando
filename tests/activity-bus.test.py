@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -160,6 +161,55 @@ class Acceptance(unittest.TestCase):
         st = self.store.apply(T("t6", "RUNNING", ts=1, message_event_id="$m"))
         st = self.store.apply(T("t6", "COMPLETED", ts=2, into="$holder"))
         self.assertEqual((self.rows[-1]["line"], self.rows[-1]["task"]["into"]), ("consolidated", "$holder"))
+
+
+class IdempotentProjection(unittest.TestCase):
+    """Reviewer's case: the real row writer appends the row, then raises while saving its index. The
+    row stays owed; the replay must not publish it twice, and the summary must land exactly once."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp()); (self.ws / "state").mkdir()
+
+    def rows(self):
+        return [json.loads(l)["line"] for l in card.log_path(self.ws).read_text().splitlines()]
+
+    def test_a_failure_after_the_append_is_replayed_exactly_once(self):
+        import activity_rows
+        store = ActivityStore(self.ws)
+        store.apply(T("task-i1", "RUNNING", ts=1, message_event_id="$m"))
+        self.assertEqual(self.rows(), ["picked up"])
+        real = activity_rows._save_index
+        calls = {"n": 0}
+        def flaky(ip, idx):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("index disk full")  # AFTER the log append and the summary write
+            real(ip, idx)
+        with unittest.mock.patch.object(activity_rows, "_save_index", flaky):
+            st = store.apply(T("task-i1", "COMPLETED", ts=2))
+        self.assertEqual((st.phase, len(st.pending)), ("COMPLETED", 1), "committed, row still owed")
+        self.assertEqual(self.rows(), ["picked up", "replied"], "the row DID land before the failure")
+        self.assertTrue(all("pid" in json.loads(l) for l in card.log_path(self.ws).read_text().splitlines()))
+        fresh = ActivityStore(self.ws)  # a restart: the drain replays the owed row
+        fresh._drain(fresh.load("task-i1"))
+        self.assertEqual(self.rows(), ["picked up", "replied"], "replayed, not duplicated")
+        self.assertEqual(len(fresh.load("task-i1").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([(x["task"]["id"], x["rows"]) for x in sums], [("task-i1", 2)], "one summary, exact")
+        self.assertNotIn("task-i1", card.open_task_index(self.ws))
+
+    def test_a_replay_of_a_landed_row_leaves_the_index_count_exact(self):
+        # The other half: index saved, then the drained snapshot save lost (a crash) — the same pid
+        # projected again must not count the row twice.
+        t = {"id": "task-i2"}
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-i2:1:1")
+        card.append("picked up", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-i2:1:1")
+        self.assertEqual(self.rows(), ["picked up"])
+        self.assertEqual(card.open_task_index(self.ws)["task-i2"]["rows"], 1)
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i2:1:2")
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i2:1:2")
+        self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "one summary")
+        self.assertEqual(self.rows(), ["picked up", "replied"])
 
 
 if __name__ == "__main__":

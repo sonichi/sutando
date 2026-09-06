@@ -45,6 +45,7 @@ class TaskActivityState:
     phase: str = "RECEIVED"
     generation: int = 0  # bumps each time the task enters RUNNING: one per run
     seq: int = 0  # last runtime-event sequence applied, across sessions
+    emitted: int = 0
     message_event_id: str | None = None
     room: str | None = None
     sender: str | None = None
@@ -108,7 +109,11 @@ def _task_dict(state: TaskActivityState) -> dict:
 
 
 def _row(state: TaskActivityState, kind: str, line: str, ts: float, done: bool = False) -> dict:
-    return {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done}
+    # The pid rides in the snapshot's pending list, so a replay projects the same identity again
+    # and the row writer applies it once.
+    state.emitted += 1
+    return {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done,
+            "pid": f"{state.task_id}:{state.generation}:{state.emitted}"}
 
 
 _PHASE_ROW = {
@@ -200,7 +205,7 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws)
+                   workspace=self.ws, pid=row.get("pid"))
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"

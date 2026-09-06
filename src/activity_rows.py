@@ -82,11 +82,23 @@ def default_room(workspace: Path | None = None) -> str | None:
     return d.get("channel_id") if d.get("channel") == "ag2space" else None
 
 
+def _pid_in_log(path: Path, pid: str) -> bool:
+    try:
+        return any(json.loads(l).get("pid") == pid for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
+    except (OSError, ValueError):
+        return False
+
+
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
-           done: bool = False, workspace: Path | None = None, live_rows: int | None = None) -> dict:
+           done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
+           pid: str | None = None) -> dict:
+    """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
+    index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     rec: dict = {"ts": time.time(), "line": line.strip(), "kind": kind}
+    if pid:
+        rec["pid"] = pid
     if room:
         rec["room"] = room
     if task:
@@ -99,13 +111,16 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     # an inode that a concurrent rotation replaces.
     with open(path.with_suffix(".lock"), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if not (pid and _pid_in_log(path, pid)):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if task and isinstance(task.get("id"), str):
             ip = index_path(workspace)
             idx = _load_index(ip)
             e = idx.get(task["id"]) or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
-            e["rows"] = int(e.get("rows", 0)) + 1
+            if not (pid and e.get("last_pid") == pid):
+                e["rows"] = int(e.get("rows", 0)) + 1
+                e["last_pid"] = pid
             e["started"] = min(float(e.get("started", rec["ts"])), rec["ts"])
             e["task"] = dict(e.get("task") or {}, **task)
             if room:
@@ -129,7 +144,11 @@ def summarize(done_rec: dict, entry: dict, workspace: Path | None = None) -> dic
                "days": day_range(started, done_rec["ts"]), "line": done_rec["line"], "task": done_rec["task"]}
     if done_rec.get("room"):
         summary["room"] = done_rec["room"]
+    if done_rec.get("pid"):
+        summary["pid"] = done_rec["pid"]
     sp = summaries_path(workspace)
+    if done_rec.get("pid") and sp.exists() and _pid_in_log(sp, done_rec["pid"]):
+        return summary  # this done row's summary already landed: a replay writes nothing
     with open(sp, "a", encoding="utf-8") as f:
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
     return summary
