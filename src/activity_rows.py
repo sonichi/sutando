@@ -175,14 +175,14 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
             ip = index_path(workspace)
             idx = _load_index(ip)
             e = idx.get(task["id"]) or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
-            # Applied evidence is the highest emitted counter per generation, saved with the count in
-            # the same record: a replay never counts twice, whatever landed in between.
+            # A row that landed just now is new by construction; a replay counts only above the
+            # generation's applied high-water mark, saved with the count in the same record.
             gen, emitted = _pid_counter(pid)
             applied = dict(e.get("applied") or {})
-            if gen is None or emitted > int(applied.get(gen, 0)):
+            if not landed or emitted > int(applied.get(gen, 0)):
                 e["rows"] = int(e.get("rows", 0)) + 1
-                if gen is not None:
-                    applied[gen] = emitted
+            if gen is not None:
+                applied[gen] = max(int(applied.get(gen, 0)), emitted)
             e["applied"] = applied
             e.pop("last_pid", None)
             e["started"] = min(float(e.get("started", rec["ts"])), rec["ts"])

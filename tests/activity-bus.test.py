@@ -335,6 +335,20 @@ class IdempotentProjection(unittest.TestCase):
             self.assertEqual(len(mine), expect, f"fault={fault} hook={hook}: actual rows")
             self.assertEqual([x["rows"] for x in sums], [expect], f"fault={fault} hook={hook}: the summary counts each row once")
 
+    def test_a_lower_counter_landing_late_still_counts_and_its_replay_still_does_not(self):
+        # yixuan's axis: the watermark alone would under-count a lower counter arriving after a
+        # higher one. A row that lands now is new whatever its counter; only a replay defers to it.
+        t = {"id": "task-o1"}
+        card.append("second", kind="working", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:2", ts=2.0)
+        card.append("first, late", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:1", ts=1.0)
+        card.append("first, late", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:1", ts=1.0)  # a replay
+        card.append("second", kind="working", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:2", ts=2.0)  # a replay
+        idx = json.loads(card.index_path(self.ws).read_text())["task-o1"]
+        self.assertEqual((idx["rows"], idx["applied"]), (2, {"1": 2}))
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-o1:1:3", ts=3.0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3])
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.
@@ -391,6 +405,25 @@ class Wiring(unittest.TestCase):
         self.assertEqual((st.phase, st.room, st.sender, st.text, st.message_event_id), ("RUNNING", "!r:s", "@q:s", "Fix it", "$m1"))
         self.assertEqual([(r["kind"], r["line"], r["task"]["event"]) for r in self.rows()],
                          [("notice", "queued", "$m1"), ("processing", "picked up", "$m1")])
+
+    def test_cli_task_id_and_event_paths_and_a_parse_error_all_return_zero(self):
+        self.assertEqual(bus.main(["transition", "RUNNING", "--task-id", "task-c1", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(ActivityStore(self.ws).load("task-c1").phase, "RUNNING")
+        kind = bus.EVENT_KINDS[0]
+        self.assertEqual(bus.main(["event", "task-c1", kind, "--session", "S1", "--seq", "1", "--text", "hi", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(ActivityStore(self.ws).load("task-c1").seq, 1)
+        with unittest.mock.patch("sys.stderr", new=__import__("io").StringIO()):
+            self.assertEqual(bus.main(["transition", "NOT_A_PHASE", "--workspace", str(self.ws)]), 0)
+
+    def test_the_hitl_and_outbox_callers_survive_a_broken_bus(self):
+        # The delivery and HITL paths must never fail because the card could not be updated.
+        import hitl.manager as manager
+        import outbox
+        with unittest.mock.patch.object(bus, "ActivityStore", side_effect=RuntimeError("bus down")):
+            manager._activity(["task-h1"], "WAITING", "approval")
+            outbox._activity_completed("task-o9")
+        manager._activity([], "WAITING", "approval")
+        outbox._activity_completed("not-a-task")
 
     def test_cli_never_fails_the_caller(self):
         self.assertEqual(bus.main(["transition", "RUNNING", "--task-file", "/nonexistent/task-x.txt", "--workspace", str(self.ws)]), 0)
