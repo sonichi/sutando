@@ -118,7 +118,7 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		'requests — NEVER because the conversation merely mentions search/searching, and never on filler ' +
 		'or garbled speech; when unsure, fire nothing.',
 	parameters: z.object({
-		preset: z.enum(['search', 'no-search', 'latest-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web.'),
+		preset: z.enum(['search', 'no-search', 'latest-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web. "latest-search" = 3.1+Web grounding.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
