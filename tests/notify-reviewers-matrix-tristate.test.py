@@ -21,6 +21,8 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "skills" / "collaboration-intelligence" / "scripts" / "notify_reviewers.py"
 MENTION = REPO / "skills" / "agent-room-ops" / "mention.py"
+SAY = REPO / "skills" / "agent-room-ops" / "say.py"
+RECEIPT = REPO / "skills" / "agent-room-ops" / "receipt.py"
 ROSTER = {"m": {"stand": "@m-stand:x", "room": "!triage:x", "allowlisted": True}}
 MSG = ["--message", "re-review https://github.com/o/r/pull/7"]
 
@@ -156,6 +158,66 @@ class MentionCarriesTheReceiptState(unittest.TestCase):
     def test_the_control_an_http_refusal_is_failed(self):
         res = self._send(self.m.HTTPError("u", 403, "forbidden", {}, None))
         self.assertEqual((res["ok"], res.get("state")), (False, "failed"))
+
+    def test_a_3xx_is_unknown_because_the_write_may_have_applied(self):
+        # A redirect loop applies the POST and then fails the client. `>= 500`
+        # called that a proven non-delivery, which licenses a duplicate send.
+        for code in (302, 399):
+            with self.subTest(code=code):
+                res = self._send(self.m.HTTPError("u", code, "redirect", {}, None))
+                self.assertEqual(res.get("state"), "unknown")
+
+
+class SayAndMentionReadOneStatusRule(unittest.TestCase):
+    """`say` set no state at all, so EVERY HTTPError read as a proven refusal --
+    including the 5xx that `mention` had already learned to park on. Two files
+    deciding the same question is how the two answers drifted apart."""
+
+    def setUp(self):
+        self.m = _load(MENTION, "mention_d")
+        self.s = _load(SAY, "say_d")
+        self.r = _load(RECEIPT, "receipt_d")
+
+    def _say(self, code):
+        with patch.object(self.s, "gate_allows", return_value=True), \
+             patch.object(self.s, "gateway", return_value=("http://x", {})), \
+             patch.object(self.s, "http_json",
+                          side_effect=self.s.HTTPError("u", code, "e", {}, None)):
+            return self.s.say("hi", "!r:x", "@me:x", gate={})
+
+    def _mention(self, code):
+        with patch.object(self.m, "resolve_user", return_value={"ok": True, "mxid": "@p:x"}), \
+             patch.object(self.m, "gate_allows", return_value=True), \
+             patch.object(self.m, "gateway", return_value=("http://x", {})), \
+             patch.object(self.m, "http_json",
+                          side_effect=self.m.HTTPError("u", code, "e", {}, None)):
+            return self.m.mention("@p:x", "hi", "!r:x", "@me:x", gate={})
+
+    def test_say_parks_a_5xx_instead_of_calling_it_proven_failure(self):
+        # The drift itself: this returned "failed" while mention returned "unknown".
+        self.assertEqual(self._say(500).get("state"), "unknown")
+        self.assertEqual(self._say(503).get("state"), "unknown")
+
+    def test_say_and_mention_agree_on_every_status(self):
+        for code in (302, 399, 400, 403, 404, 429, 500, 502, 503):
+            with self.subTest(code=code):
+                self.assertEqual(self._say(code).get("state"),
+                                 self._mention(code).get("state"),
+                                 "the two callers disagree, so the policy has two owners again")
+
+    def test_both_take_the_answer_from_receipt_not_from_a_local_copy(self):
+        # Patch the OWNER; a caller carrying its own rule keeps the old answer.
+        for mod in (self.m, self.s):
+            with patch.object(mod._receipt, "http_error_state", return_value="sentinel"):
+                res = (self._say(403) if mod is self.s else self._mention(403))
+                self.assertEqual(res.get("state"), "sentinel", "a local copy re-grew")
+
+    def test_the_control_the_owner_matches_the_repo_delivery_contract(self):
+        # src/outbox_adapter.classify_response: 4xx refused, every other error unknown.
+        self.assertEqual([self.r.http_error_state(c) for c in (400, 404, 499)],
+                         ["failed"] * 3)
+        self.assertEqual([self.r.http_error_state(c) for c in (302, 500, 599, None)],
+                         ["unknown"] * 4)
 
 
 if __name__ == "__main__":

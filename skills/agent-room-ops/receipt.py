@@ -26,6 +26,22 @@ FAILED = "failed"
 UNKNOWN = "unknown"
 
 
+def http_error_state(code) -> str:
+    """The receipt state for an HTTP error status, for `say` and `mention` alike.
+
+    ONLY 4xx is a definite refusal. Every other error status may have APPLIED the
+    write -- a 3xx redirect loop applies the POST and then fails the client -- so
+    it is UNKNOWN and must park rather than settle as proven non-delivery. This
+    mirrors `src/outbox_adapter.classify_response`, which this repo already treats
+    as the delivery contract; a second reading of it here is how the two drifted.
+    """
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return UNKNOWN
+    return FAILED if 400 <= code < 500 else UNKNOWN
+
+
 def event_id_of(parsed) -> str | None:
     """The only accepted proof: a non-empty string event id in a dict body."""
     if isinstance(parsed, dict):

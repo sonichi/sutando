@@ -129,10 +129,10 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
             {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid], **rel, **stamp},
         )
     except HTTPError as e:
-        # 4xx is a definite refusal; 5xx may have APPLIED the write, so it is UNKNOWN
-        # and must park rather than release the reservation as proven failure.
+        # The status->state rule is receipt.py's, not this file's: `say` reads the
+        # same envelope and the two drifted the moment each decided for itself.
         return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code),
-                       state=(_receipt.UNKNOWN if e.code >= 500 else _receipt.FAILED))
+                       state=_receipt.http_error_state(e.code))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, mxid=mxid, reason=f"network error: {e}",
                        state=_receipt.UNKNOWN)
