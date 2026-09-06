@@ -426,12 +426,13 @@ def main() -> int:
     for k in ("acks", "results"):
         STATE[k].clear()
 
-    # keweichen: the fallback must RETIRE, not merely stop logging. One stamped
-    # pin proves the broker speaks source, so id-only is no longer control.
-    seat6._pin_stamp_seen = False
+    # keweichen: a process-memory latch is NOT a bound -- it resets on restart and
+    # the id-only path destroys ordinary work again. The stamp is the only bound.
     check(seat6._consume_worker_pin(
-        {"id": "worker-pin-1756000000002-feedface", "task": "legacy pin"}) is True,
-          "before any stamp, a source-less pin still rides the legacy id-only path")
+        {"id": "worker-pin-1756000000002-feedface", "task": "legacy pin"}) is False,
+          "a source-less pin is NEVER control, with or without a prior stamp")
+    check(STATE["acks"] == [] and STATE["results"] == [],
+          f"and it was neither acked nor closed: {STATE['acks']} {STATE['results']}")
     for k in ("acks", "results"):
         STATE[k].clear()
     check(seat6._consume_worker_pin(dict(exact, source="worker-picker")) is True,
@@ -440,10 +441,9 @@ def main() -> int:
         STATE[k].clear()
     check(seat6._consume_worker_pin(
         {"id": "worker-pin-1756000000003-0badcafe", "task": "an ordinary ask"}) is False,
-          "AFTER the stamp, a source-less exact-grammar task is USER WORK, not control")
+          "and a source-less exact-grammar task is STILL user work, not control")
     check(STATE["acks"] == [] and STATE["results"] == [],
           f"and it was neither acked nor closed: {STATE['acks']} {STATE['results']}")
-    seat6._pin_stamp_seen = False
     for k in ("acks", "results"):
         STATE[k].clear()
 
@@ -482,7 +482,8 @@ def main() -> int:
     real_queue = seat7._queue_review_control_result
     seat7._queue_review_control_result = _explode
     try:
-        seat7._consume_worker_pin({"id": "worker-pin-777-beef", "task": "pin"})
+        seat7._consume_worker_pin({"id": "worker-pin-777-beef", "task": "pin",
+                                   "source": "worker-picker"})
     except RuntimeError:
         pass
     finally:
@@ -494,7 +495,8 @@ def main() -> int:
 
     for k in ("acks", "results"):
         STATE[k].clear()
-    check(seat7._consume_worker_pin({"id": "worker-pin-778-cafe", "task": "pin"}) is True,
+    check(seat7._consume_worker_pin({"id": "worker-pin-778-cafe", "task": "pin",
+                                     "source": "worker-picker"}) is True,
           "the normal path still consumes the pin")
     check(STATE["acks"] == [("/v1/tasks/worker-pin-778-cafe/ack",
                              {"id": "worker-pin-778-cafe"})],
@@ -504,6 +506,26 @@ def main() -> int:
     seat7._retry_review_control_results()
     check(STATE["results"] == [{"id": "worker-pin-778-cafe", "body": "[no-send]"}],
           f"a second drain does not re-post the close: {STATE['results']}")
+
+    # keweichen: a process-memory latch resets on restart, so the id-only path came
+    # back and destroyed ordinary work again. Reload over the SAME workspace to prove it.
+    seat7b = _load("wqc_pin_restart", ws7, port, SUTANDO_WORKER_ID="cloud-1",
+                   SUTANDO_WORKER_LOCATION="cloud")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    check(seat7b._consume_worker_pin({"id": "worker-pin-901-cafebabe",
+                                      "source": "worker-picker", "task": "pin"}) is True,
+          "restart control: a STAMPED pin is still consumed by the fresh module")
+    for k in ("acks", "results"):
+        STATE[k].clear()
+    ordinary = {"id": "worker-pin-902-d15ea5e0", "task": "Please inspect the failing build",
+                "timestamp": "2026-09-06T00:00:01Z"}
+    check(seat7b._WORKER_PIN_RE.fullmatch(ordinary["id"]) is not None,
+          "PRECONDITION: the ordinary id really matches the pin grammar, or this is vacuous")
+    check(seat7b._consume_worker_pin(ordinary) is False,
+          "AFTER a restart, a source-less exact-grammar task is user work, not control")
+    check(STATE["acks"] == [] and STATE["results"] == [],
+          f"restart: it was neither acked nor closed: {STATE['acks']} {STATE['results']}")
 
     # A relay that 422s un-advertised keys must still receive the documented
     # {id, body}; before the fix `metadata` rode every result and was refused.
@@ -605,7 +627,7 @@ def main() -> int:
 
     seat10._retry_review_control_results = _die
     try:
-        seat10._consume_worker_pin({"id": PIN, "task": "pin"})
+        seat10._consume_worker_pin({"id": PIN, "task": "pin", "source": "worker-picker"})
     except RuntimeError:
         pass
     check(STATE["acks"] == [(f"/v1/tasks/{PIN}/ack", {"id": PIN})],
@@ -673,7 +695,8 @@ def main() -> int:
                 SUTANDO_WORKER_ID="cloud-3", SUTANDO_WORKER_LOCATION="cloud")
     PIN12 = "worker-pin-424-b0b0"
     STATE["results_decline"] = True
-    check(d12._consume_worker_pin({"id": PIN12, "task": "pin"}) is True,
+    check(d12._consume_worker_pin({"id": PIN12, "task": "pin",
+                                   "source": "worker-picker"}) is True,
           "the pin is consumed")
     check(len(STATE["results"]) == 1,
           f"one close attempt was made: {STATE['results']}")
