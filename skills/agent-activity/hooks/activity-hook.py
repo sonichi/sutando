@@ -74,6 +74,22 @@ def open_tasks(log: Path) -> dict[str, dict]:
     return out
 
 
+def indexed_open_tasks(ws: Path) -> dict[str, dict]:
+    """{task_id: {"task", "room"}} from the writer's index, in the shape open_tasks() returns."""
+    try:
+        sys.path.insert(0, str(WRITER.parent))
+        from activity import open_task_index
+        idx = open_task_index(ws)
+    except Exception:  # noqa: BLE001 - the hook never fails the tool it observed
+        return {}
+    out: dict[str, dict] = {}
+    for tid, e in idx.items():
+        t = e.get("task") if isinstance(e, dict) else None
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            out[tid] = {"task": t, "room": e.get("room") if isinstance(e.get("room"), str) else None}
+    return out
+
+
 def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     """The open task this session is bound to; None when none is (fail closed)."""
     binds = load_json(p["bind"], {})
@@ -324,6 +340,10 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])
+        # A long task's rows may have rotated out of the live log; the writer's index still holds it
+        # open, so its result write still closes it and still leaves a summary.
+        for tid, e in indexed_open_tasks(p["ws"]).items():
+            opened.setdefault(tid, e)
         # The result write closes the task only once the file exists: the tool ran, was not denied,
         # and produced the artifact. The text says what the result did (a marker body reached nobody).
         for tid in result_file_refs(blob):
