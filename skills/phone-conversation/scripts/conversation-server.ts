@@ -56,6 +56,7 @@ import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { HEADER_KEY_ALTERNATION } from '../../../src/header_keys.js';
 
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
@@ -202,20 +203,9 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (42 keys) — injection-guard-sweep
-// asserts this regex covers every py key. reply_chain_ids added with PR #2310.
-const _CONF_HEADER_RE = new RegExp(
-	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
-	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
-	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
-	'author_name|author_id|' +
-	'chat_id|thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
-	'thread_root|source_room_id|' +
-	'receiving_instance|' +
-	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker)\\s*:',
-	'i',
-);
+// Generated from local_task_protocol.KNOWN_HEADER_KEYS — a hand-counted
+// mirror here drifted key by key, most recently at 41 -> 42.
+const _CONF_HEADER_RE = new RegExp(`^(?:${HEADER_KEY_ALTERNATION})\\s*:`, 'i');
 const _CONF_FENCE_RE = /^={3,}/;
 // Fold every str.splitlines() separator to '\n' so the guard's line-set
 // matches the reader's (else \v \f \x1c-\x1e \x85 LS PS smuggle a forged line).

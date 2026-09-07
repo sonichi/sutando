@@ -14,6 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
+import { HEADER_KEYS } from './header_keys.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
@@ -82,26 +83,12 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Kept in lockstep with local_task_protocol.KNOWN_HEADER_KEYS (the Python
-// guard's source of truth). TS can't import the Python tuple, so this list is
-// the mirror; injection-guard-sweep asserts parity so drift fails CI. Synced to
-// the full 38-key set on the 2026-07-13 main merge (main widened the Python side
-// from 14 → 38; the TS guard must defang the same keys or forged interaction_type:
-// / attachments: / media_form: lines slip through here).
-const _HEADER_KEYS = [
-	'id', 'timestamp', 'session_scope', 'task', 'source', 'access_tier', 'user_id',
-	'channel_id', 'priority', 'interaction_type', 'source_message_id',
-	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
-	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
-	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
-	'thread_root', 'source_room_id',
-	'receiving_instance',
-	'from', 'call_sid', 'hint', 'instructions', 'transcript',
-	'schedule_name', 'schedule_slot',
-	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker',
-];
-const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
+// Generated from local_task_protocol.KNOWN_HEADER_KEYS: a key the Python
+// reader accepts but this guard misses is a forged-header hole.
+const _HEADER_KEYS = HEADER_KEYS;
+// Exported so a test can prove the CONSTRUCTED guard covers every generated
+// key; a source grep passes on a literal that silently drops one.
+export const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
 // Every separator str.splitlines() / universal-newline readers treat as a
 // line boundary — fold ALL to '\n' so the guard's line-set matches the
