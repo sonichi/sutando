@@ -127,6 +127,15 @@ class ResetFallback(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("cannot resolve reset times", out)
 
+    def test_no_window_lines_at_all_is_a_refusal_not_a_traceback(self):
+        """read-quota prints this whenever the credential proxy is off — a state
+        health-check rates ok — and the loop's step 0.5 then got no TIER line."""
+        for text in ("No quota-state.json found. Is the credential proxy running?\n", ""):
+            rc, out = self._run(text)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("cannot read quota windows", out)
+            self.assertNotIn("Traceback", out)
+
 
 class FreshWindowZeroBurn(unittest.TestCase):
     """A just-reset 7d window has used7 == 0, so `burn` is 0 and then divides.
