@@ -94,18 +94,21 @@ def this_host() -> str:
         return platform.node().split(".")[0]
 
 
-def _heartbeat_started_at(path: Path) -> float | None:
-    """When this host's heartbeat writer started: a snapshot written before it belongs to an earlier life."""
+def _session_started_at(ws: Path) -> float | None:
+    """When this core session's task watcher started: it dispatches every task that gets a snapshot and
+    dies with the session, so its pid file's mtime is the session boundary (the heartbeat writer is not)."""
     try:
-        v = json.loads(path.read_text(encoding="utf-8")).get("started_at")
-        return float(v) if isinstance(v, (int, float)) else None
-    except (OSError, ValueError, TypeError):
+        return (ws / "state" / "watch-tasks-stream.pid").stat().st_mtime
+    except OSError:
         return None
 
 
-def snapshot_is_live(written_at: float, now: float, core_started_at: float | None) -> bool:
-    """A RUNNING snapshot counts as work only while a live core could still be writing it."""
-    if core_started_at is not None and written_at < core_started_at:
+def snapshot_is_live(written_at: float, now: float, task_file_present: bool, session_started_at: float | None) -> bool:
+    """A RUNNING snapshot counts as work while its task is still in the queue; once the task file is gone,
+    only a run of this session, still within a live run's event cadence, can be finishing it."""
+    if task_file_present:
+        return True
+    if session_started_at is not None and written_at < session_started_at:
         return False
     return now - written_at <= ACTIVE_SNAPSHOT_MAX_AGE_S
 
@@ -117,13 +120,13 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
     ws = workspace or resolve_workspace()
     host = host or this_host()
     now = now if now is not None else time.time()
-    beat = ws / "state" / "cores" / f"{host}.alive"
-    core_started_at = _heartbeat_started_at(beat) if beat.exists() else None
+    session_started_at = _session_started_at(ws)
     active = 0
     for p in (ws / "state" / "activity").glob("task-*.json"):
         try:
             phase = json.loads(p.read_text(encoding="utf-8")).get("phase")
-            if phase in ACTIVE_PHASES and snapshot_is_live(p.stat().st_mtime, now, core_started_at):
+            task_file_present = (ws / "tasks" / f"{p.stem}.txt").exists()
+            if phase in ACTIVE_PHASES and snapshot_is_live(p.stat().st_mtime, now, task_file_present, session_started_at):
                 active += 1
         except (OSError, ValueError):
             continue

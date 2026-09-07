@@ -104,36 +104,51 @@ class Fallbacks(unittest.TestCase):
 
 
 class StaleSnapshots(unittest.TestCase):
-    """yixuan's gap: a core that dies between RUNNING and a terminal phase leaves the snapshot behind;
-    a fresh heartbeat cannot mask it, so the snapshot itself must be bounded like the other inputs."""
+    """yixuan's gap: a core that dies between RUNNING and a terminal phase leaves the snapshot behind and a
+    fresh heartbeat cannot mask it. The boundary that shares the task lifecycle is the task watcher (it
+    dispatches every task and dies with the core session), never the heartbeat writer."""
 
-    def _ws(self, beat_started_at=None):
+    def _ws(self, watcher_started_at=None):
         ws = Path(tempfile.mkdtemp()); (ws / "state" / "activity").mkdir(parents=True); (ws / "state" / "cores").mkdir(); (ws / "tasks").mkdir()
-        beat = ws / "state" / "cores" / "h.alive"
-        beat.write_text(json.dumps({"started_at": beat_started_at} if beat_started_at is not None else {}))
+        (ws / "state" / "cores" / "h.alive").write_text("{}")
+        if watcher_started_at is not None:
+            pf = ws / "state" / "watch-tasks-stream.pid"; pf.write_text("1"); os.utime(pf, (watcher_started_at, watcher_started_at))
         return ws
 
-    def _snapshot(self, ws, written_at):
+    def _snapshot(self, ws, written_at, task_file=False):
         p = ws / "state" / "activity" / "task-s1.json"; p.write_text(json.dumps({"task_id": "task-s1", "phase": "RUNNING"}))
         os.utime(p, (written_at, written_at))
+        if task_file:
+            (ws / "tasks" / "task-s1.txt").write_text("id: task-s1\n")
+
+    def _runs(self, ws, now):
+        os.utime(ws / "state" / "cores" / "h.alive", (now, now))
+        return av.read_runtime_state(ws, host="h", now=now)
 
     def test_a_stale_running_snapshot_beside_a_fresh_heartbeat_is_not_work(self):
         now = time.time()
         for age in (24 * 3600.0, 365 * 24 * 3600.0):
-            ws = self._ws(); self._snapshot(ws, now - age); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
-            s = av.read_runtime_state(ws, host="h", now=now)
+            ws = self._ws(); self._snapshot(ws, now - age)
+            s = self._runs(ws, now)
             self.assertEqual((s.active_runs, s.runtime_healthy), (0, True), f"age {age}")
             self.assertEqual(av.availability(s), "available")
-        ws = self._ws(); self._snapshot(ws, now - 60.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
-        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 1, "control: a live run still counts")
+        ws = self._ws(); self._snapshot(ws, now - 60.0)
+        self.assertEqual(self._runs(ws, now).active_runs, 1, "control: a live run still counts")
 
-    def test_a_snapshot_written_before_this_core_started_is_a_leftover(self):
+    def test_a_previous_sessions_snapshot_is_a_leftover_however_the_heartbeat_writer_lived(self):
+        # Retained heartbeat writer + core restart: the watcher is new, the task file is gone, the
+        # snapshot is 5 minutes old — a leftover, not work.
         now = time.time()
-        ws = self._ws(beat_started_at=now - 120.0); self._snapshot(ws, now - 300.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
-        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 0, "5 min old but older than the core: stale")
-        ws = self._ws(beat_started_at=now - 600.0); self._snapshot(ws, now - 300.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
-        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 1, "control: written after the core started")
-        self.assertFalse(av.snapshot_is_live(now - 10.0, now, now - 5.0)); self.assertTrue(av.snapshot_is_live(now - 10.0, now, None))
+        ws = self._ws(watcher_started_at=now - 120.0); self._snapshot(ws, now - 300.0)
+        self.assertEqual(self._runs(ws, now).active_runs, 0)
+        # Heartbeat writer restarted under a still-running core: the watcher predates the snapshot and
+        # the task is still in the queue — a live, silent run keeps counting.
+        ws = self._ws(watcher_started_at=now - 3600.0); self._snapshot(ws, now - 2400.0, task_file=True)
+        self.assertEqual(self._runs(ws, now).active_runs, 1)
+        # A task re-dispatched after a restart is in the queue again: live, whatever its snapshot's age.
+        ws = self._ws(watcher_started_at=now - 120.0); self._snapshot(ws, now - 300.0, task_file=True)
+        self.assertEqual(self._runs(ws, now).active_runs, 1)
+        self.assertFalse(av.snapshot_is_live(now - 10.0, now, False, now - 5.0)); self.assertTrue(av.snapshot_is_live(now - 10.0, now, False, None))
 
 
 class Reading(unittest.TestCase):
