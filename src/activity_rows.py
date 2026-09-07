@@ -113,7 +113,7 @@ def _task_rows_on_disk(workspace: Path | None, task_id: str, since: float, until
     day, last = min(since, until), max(since, until)
     while day <= last + 86400 and len(names) < 400:
         names.append(f"{live.stem}.archive.{day_of(day)}.jsonl"); day += 86400
-    count, applied = 0, {}
+    count, applied, seen = 0, {}, set()
     for name in dict.fromkeys(names):
         try:
             lines = live.with_name(name).read_text(encoding="utf-8").splitlines()
@@ -126,8 +126,13 @@ def _task_rows_on_disk(workspace: Path | None, task_id: str, since: float, until
                 continue
             if (rec.get("task") or {}).get("id") != task_id:
                 continue
+            pid = rec.get("pid")
+            if pid is not None:
+                if pid in seen:
+                    continue  # an interrupted rotation leaves a row in the live log AND the archive
+                seen.add(pid)
             count += 1
-            gen, emitted = _pid_counter(rec.get("pid"))
+            gen, emitted = _pid_counter(pid)
             if gen is not None:
                 applied[gen] = max(int(applied.get(gen, 0)), emitted)
     return count, applied

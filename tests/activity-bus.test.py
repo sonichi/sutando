@@ -409,6 +409,35 @@ class IdempotentProjection(unittest.TestCase):
             sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
             self.assertEqual([x["rows"] for x in sums], [3], f"rotate={rotate}: pickup + waiting + replied, the lost count restored")
 
+    def test_recovery_across_the_format_change_counts_a_pid_rotated_twice_once(self):
+        # rotate() archives the oldest rows BEFORE replacing the live file: one failed replacement leaves
+        # them in both places and the next rotation archives them again; count identities, not copies.
+        import activity_rows
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+        store.apply(T("task-dup", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        store.apply(T("task-dup", "WAITING", ts=1_757_000_001.0, reason="approval"))
+        live = card.log_path(ws); real = os.replace; faults = []
+        def fail_live_once(src, dst):
+            if not faults and Path(dst) == live:
+                faults.append(1); raise OSError("one live-log replacement fault")
+            return real(src, dst)
+        with unittest.mock.patch.object(activity_rows.os, "replace", fail_live_once):
+            for i in range(card.LIVE_ROWS + 1):
+                try:
+                    card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+                except OSError:
+                    pass  # the producer that hit the fault; the rows it archived stay archived
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"more {i}", kind="notice", room=None, workspace=ws)
+        archived = [json.loads(l).get("pid") for p in live.parent.glob(f"{live.stem}.archive.*.jsonl") for l in p.read_text().splitlines()]
+        self.assertEqual((len(faults), archived.count("task-dup:1:1")), (1, 2), "precondition: the interrupted rotation archived the pickup twice")
+        ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-dup"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = "task-dup:1:2"; ip.write_text(json.dumps(idx))  # the old format
+        fresh = ActivityStore(ws); fresh.apply(T("task-dup", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-dup").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + waiting + replied: a pid archived twice counts once")
+
     def test_a_rebuild_that_cannot_read_an_archive_leaves_the_row_owed_and_the_old_index_intact(self):
         # The old writer counted two rotated rows; the rebuild's first archive read fails. Nothing may
         # be published on partial evidence: the row stays owed, the index stays old-format, a retry lands.
