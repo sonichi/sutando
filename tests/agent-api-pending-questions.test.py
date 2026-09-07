@@ -27,6 +27,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -294,6 +295,26 @@ class TestPython39AndTimezones(unittest.TestCase):
         _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
         self.assertIsNotNone(dt.tzinfo, "a Z heading must parse as aware UTC")
         self.assertEqual(0, dt.utcoffset().total_seconds())
+
+    def test_age_is_identical_across_host_timezones(self):
+        """The age must be a property of the heading, not of the host's $TZ. Pins the
+        production side: a naive local now() there diverges by a day away from UTC."""
+        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
+        saved = os.environ.get("TZ")
+        ages = {}
+        try:
+            for zone in ("UTC", "Etc/GMT+12", "Etc/GMT-14"):
+                os.environ["TZ"] = zone
+                time.tzset()
+                with _frozen_utc_clock():
+                    ages[zone] = api.parse_pending_questions(dated)[0]["age_days"]
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+        self.assertEqual(1, len(set(ages.values())), f"age varies with host timezone: {ages}")
 
     def test_a_future_dated_heading_does_not_sort_first(self):
         """Clock skew or a typo gives a negative age, which -(age) would rank ahead of all."""
