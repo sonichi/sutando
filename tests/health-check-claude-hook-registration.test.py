@@ -311,9 +311,8 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
         (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
-            # The default must track the installer's CURRENT archive shape. Pinning a
-            # literal here made all three over-trigger controls fail on the shape
-            # change itself rather than on any probe behaviour.
+            # Must track the installer's CURRENT archive shape: a literal here made
+            # all three over-trigger controls fail on the shape change itself.
             "PreCompact": [{"hooks": [
                 {"command": archive_command or
                  f'bash {r}/src/archive-transcript.sh "$HOME/Desktop/sutando-conversations/"'},
