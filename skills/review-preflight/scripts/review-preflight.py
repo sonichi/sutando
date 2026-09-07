@@ -178,6 +178,16 @@ def _gh_json(run, args):
         return None
 
 
+def current_head(pr: str, runner=None, repo: "str | None" = None) -> "str | None":
+    """The PR's head sha right now, or None when it cannot be read."""
+    run = runner or (lambda a: subprocess.run(a, capture_output=True,
+                                              text=True, timeout=20))
+    pull = _gh_json(run, [f"repos/{resolve_repo(repo)}/pulls/{pr}"])
+    if pull is None:
+        return None
+    return ((pull.get("head") or {}).get("sha") or "") or None
+
+
 def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[dict] | None":
     """Approvals counted toward the gate whose reviewer has not seen the current head.
 
@@ -337,7 +347,44 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--guide", help="path to the review guide (default <repo>/REVIEW.md)")
     ap.add_argument("--repo", help="owner/name for the prior-art lookup; "
                     "defaults to $SUTANDO_REVIEW_REPO, then the git remote")
+    ap.add_argument("--assert-head", metavar="SHA",
+                    help="exit 3 unless the PR's head still equals SHA; run this "
+                         "immediately before posting, with the sha you verified at")
     args = ap.parse_args(argv)
+
+    # `is not None`, not truthiness: argparse gives "" for an explicit
+    # `--assert-head ''`, and a falsy value must not skip the whole check.
+    if args.assert_head is not None:
+        if not args.pr:
+            print("review-preflight: --assert-head needs the PR number", file=sys.stderr)
+            return 2
+        # A prefix compare accepts short shas, so a 1-char argument would match
+        # almost any head: too short is a usage error, never a quiet pass.
+        if len(args.assert_head) < 7:
+            print(f"review-preflight: --assert-head {args.assert_head!r} is too short; "
+                  "give at least 7 characters (git's short-sha length)", file=sys.stderr)
+            return 2
+        # A sha is hex and at most 40 chars. Without this, a longer argument that
+        # merely STARTS with the head passed the symmetric compare below.
+        if len(args.assert_head) > 40 or any(
+                c not in "0123456789abcdefABCDEF" for c in args.assert_head):
+            print(f"review-preflight: --assert-head {args.assert_head!r} is not a sha "
+                  "(hex, at most 40 characters)", file=sys.stderr)
+            return 2
+        head = current_head(args.pr, repo=args.repo)
+        if head is None:
+            print(f"review-preflight: could not read the head of #{args.pr} — "
+                  "treat as MOVED, not as unchanged", file=sys.stderr)
+            return 3
+        # ONE-DIRECTIONAL: the argument must ABBREVIATE the head. The symmetric
+        # form also accepted head+suffix, so a wrong longer value read as a match.
+        if not head.startswith(args.assert_head.lower()):
+            print(f"review-preflight: head MOVED — verified at {args.assert_head}, "
+                  f"now {head}. Re-read before posting.", file=sys.stderr)
+            return 3
+        print(f"review-preflight: head unchanged at {head} — safe to post")
+        return 0
+
 
     guide = resolve_guide(args.guide)
     if not guide.is_file():
