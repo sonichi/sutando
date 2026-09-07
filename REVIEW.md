@@ -455,6 +455,65 @@ and loads whichever repo it reviews.
     mode *at settle time* — which is also what made it testable under node.
     Cheap form: for each side effect in a newly-async continuation, name the state it
     depends on and check the continuation re-reads it rather than closing over it.
+22. **A mutation-test `SURVIVED` is untrusted until the bytecode cache is invalidated.**
+    Two mutants of the *same byte length*, written within the same mtime second, share a
+    `__pycache__` entry **when the cache is CPython's default timestamp mode** (`flags == 0`):
+    that mode validates on source `int(st_mtime)` + byte size, so the second mutant silently
+    executes the first one's compiled code. It reports SURVIVED, and SURVIVED is the direction
+    that sends someone to "fix" a gap that is not there.
+
+    The mode matters, so check it before reaching for this explanation. Driving all three
+    invalidation modes through `spec_from_file_location`, same path, same size, same
+    `int(mtime)` (CPython 3.13.5 and 3.14.6 agree):
+
+    ```
+    timestamp       flags=0  serves STALE bytecode   <-- the collision above
+    checked-hash    flags=3  detects the rewrite
+    unchecked-hash  flags=1  serves STALE bytecode, and needs neither condition
+    ```
+
+    A `checked-hash` cache does not collide at all, so a SURVIVED under one is not explained
+    by this lesson; an `unchecked-hash` cache is worse than described, because it never
+    revalidates and so stays stale even when size and mtime both change.
+    *Re-derived on `scripts/my-stale-approvals.py` (11,285 B at `fcbd3539`) + its 45-test suite.
+    Mutating one line each, the five variants are 11,259 / 11,286 / 11,286 / 11,259 / 11,268 B —
+    two same-size pairs, m1/m4 and m2/m3:*
+
+    ```
+    mutant                       alone, cache CLEARED   after a same-size predecessor
+    m1 parent-count -> True      CAUGHT                 -
+    m2 staleness   > -> >=       SURVIVED               -   (genuinely uncaught)
+    m3 commits_after > -> >=     CAUGHT                 SURVIVED   <-- the collision
+    m4 decisive drops bar        CAUGHT                 -
+    m5 decisive drops blockers   CAUGHT                 -
+    ```
+
+    **The flip is not a property of m3. It is a property of m3 written after m2** — same byte
+    length, same `int(st_mtime)`, cache not cleared between them. Run alone against a cleared
+    cache, m3 is CAUGHT; run immediately after its same-size partner, the suite executes m2's
+    compiled bytes and reports SURVIVED about a mutation the suite catches by design, by a test
+    named for it (`test_a_commit_AT_the_approval_timestamp_does_not_count_as_after`, docstring
+    "Pins the boundary so widening `>` to `>=` cannot pass silently").
+
+    That distinction is the practical warning, and it is why a harness matters more than a rule:
+    a loop that restores the pristine file between mutants never collides, because the pristine
+    size differs from every mutant's. A loop that goes mutant-to-mutant does collide, and only
+    for the same-size pairs. So the danger is not "mutation testing is unreliable" — it is
+    "consecutive same-size variants share a cache entry", which a per-mutant restore removes.
+
+    **m2's SURVIVED is real and must not be swept up in this.** Against a cleared cache it still
+    survives: the suite genuinely does not catch `staleness > -> >=`. A reader who blames the
+    cache for every SURVIVED here would discard a true uncaught mutation along with the artifact.
+    **Cure — and one obvious candidate is not one.** `PYTHONDONTWRITEBYTECODE=1` (and `-B`) stops
+    *writing* a `.pyc`, never *reading* one, so it does nothing once a cache exists — which is the
+    normal state, because the ordinary suite run before you start mutating leaves one. Measured on
+    3.14.6 with a populated cache: source `BBB`, `-B` plus the env var still returned the cached
+    `AAA`; unlinking first returned the new value. Reported on 3.12.14 by @qingyun-air, reproduced
+    here. What works: **unlink `importlib.util.cache_from_source(...)` between mutants**, or point
+    `PYTHONPYCACHEPREFIX` at a fresh temp dir per run (verified: stale `DDD` plain, correct `EEE`
+    and `FFF` under a per-run prefix). **And run one mutant per invocation**, printing the
+    failing test's name for a CAUGHT and ending with a restore-control — a batch loop that
+    restores between iterations is itself stateful, and this collision is invisible inside it.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
