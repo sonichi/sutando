@@ -27,6 +27,8 @@ NARROWING = {"available": frozenset({"available", "busy_accepting", "busy_unavai
              "offline": frozenset({"offline", "unknown"}), "unknown": frozenset({"unknown"})}
 ACTIVE_PHASES = frozenset({"RUNNING", "WAITING"})
 HEARTBEAT_MAX_AGE_S = 90.0  # matches the core liveness rule: younger than ~90 s is alive
+# A live run keeps writing its snapshot (events, transitions); one silent this long is a leftover.
+ACTIVE_SNAPSHOT_MAX_AGE_S = 1800.0
 
 
 @dataclass
@@ -92,6 +94,22 @@ def this_host() -> str:
         return platform.node().split(".")[0]
 
 
+def _heartbeat_started_at(path: Path) -> float | None:
+    """When this host's heartbeat writer started: a snapshot written before it belongs to an earlier life."""
+    try:
+        v = json.loads(path.read_text(encoding="utf-8")).get("started_at")
+        return float(v) if isinstance(v, (int, float)) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def snapshot_is_live(written_at: float, now: float, core_started_at: float | None) -> bool:
+    """A RUNNING snapshot counts as work only while a live core could still be writing it."""
+    if core_started_at is not None and written_at < core_started_at:
+        return False
+    return now - written_at <= ACTIVE_SNAPSHOT_MAX_AGE_S
+
+
 def read_runtime_state(workspace: Path | None = None, host: str | None = None,
                        max_concurrency: int = 1, now: float | None = None) -> AgentRuntimeState:
     """The private numbers from what the engine already writes: task snapshots under state/activity
@@ -99,10 +117,13 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
     ws = workspace or resolve_workspace()
     host = host or this_host()
     now = now if now is not None else time.time()
+    beat = ws / "state" / "cores" / f"{host}.alive"
+    core_started_at = _heartbeat_started_at(beat) if beat.exists() else None
     active = 0
     for p in (ws / "state" / "activity").glob("task-*.json"):
         try:
-            if json.loads(p.read_text(encoding="utf-8")).get("phase") in ACTIVE_PHASES:
+            phase = json.loads(p.read_text(encoding="utf-8")).get("phase")
+            if phase in ACTIVE_PHASES and snapshot_is_live(p.stat().st_mtime, now, core_started_at):
                 active += 1
         except (OSError, ValueError):
             continue
@@ -112,5 +133,6 @@ def read_runtime_state(workspace: Path | None = None, host: str | None = None,
     beats = [cores / f"{host}.alive"] if (cores / f"{host}.alive").exists() else []
     if beats:
         healthy = any(now - b.stat().st_mtime < HEARTBEAT_MAX_AGE_S for b in beats)
+    # accepting_work: the scheduler's pause control sets it later; this reader never does.
     return AgentRuntimeState(active_runs=active, max_concurrency=max_concurrency, queue_depth=queue,
                              runtime_healthy=healthy, accepting_work=True)

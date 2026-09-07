@@ -103,6 +103,39 @@ class Fallbacks(unittest.TestCase):
         self.assertEqual(av.read_runtime_state(ws, host="h", now=1.0).active_runs, 1)
 
 
+class StaleSnapshots(unittest.TestCase):
+    """yixuan's gap: a core that dies between RUNNING and a terminal phase leaves the snapshot behind;
+    a fresh heartbeat cannot mask it, so the snapshot itself must be bounded like the other inputs."""
+
+    def _ws(self, beat_started_at=None):
+        ws = Path(tempfile.mkdtemp()); (ws / "state" / "activity").mkdir(parents=True); (ws / "state" / "cores").mkdir(); (ws / "tasks").mkdir()
+        beat = ws / "state" / "cores" / "h.alive"
+        beat.write_text(json.dumps({"started_at": beat_started_at} if beat_started_at is not None else {}))
+        return ws
+
+    def _snapshot(self, ws, written_at):
+        p = ws / "state" / "activity" / "task-s1.json"; p.write_text(json.dumps({"task_id": "task-s1", "phase": "RUNNING"}))
+        os.utime(p, (written_at, written_at))
+
+    def test_a_stale_running_snapshot_beside_a_fresh_heartbeat_is_not_work(self):
+        now = time.time()
+        for age in (24 * 3600.0, 365 * 24 * 3600.0):
+            ws = self._ws(); self._snapshot(ws, now - age); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
+            s = av.read_runtime_state(ws, host="h", now=now)
+            self.assertEqual((s.active_runs, s.runtime_healthy), (0, True), f"age {age}")
+            self.assertEqual(av.availability(s), "available")
+        ws = self._ws(); self._snapshot(ws, now - 60.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
+        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 1, "control: a live run still counts")
+
+    def test_a_snapshot_written_before_this_core_started_is_a_leftover(self):
+        now = time.time()
+        ws = self._ws(beat_started_at=now - 120.0); self._snapshot(ws, now - 300.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
+        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 0, "5 min old but older than the core: stale")
+        ws = self._ws(beat_started_at=now - 600.0); self._snapshot(ws, now - 300.0); os.utime(ws / "state" / "cores" / "h.alive", (now, now))
+        self.assertEqual(av.read_runtime_state(ws, host="h", now=now).active_runs, 1, "control: written after the core started")
+        self.assertFalse(av.snapshot_is_live(now - 10.0, now, now - 5.0)); self.assertTrue(av.snapshot_is_live(now - 10.0, now, None))
+
+
 class Reading(unittest.TestCase):
     def test_the_private_numbers_come_from_what_the_engine_already_writes(self):
         ws = Path(tempfile.mkdtemp())
