@@ -382,6 +382,33 @@ class IdempotentProjection(unittest.TestCase):
         sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
         self.assertEqual([x["rows"] for x in sums], [3], "pickup + hook + replied; the replayed pickup counted once")
 
+    def test_recovery_across_the_format_change_adds_the_count_an_old_index_save_lost(self):
+        # The previous writer appended row + ack, then its index save failed: the entry (rows=1,
+        # last_pid=:1:1) does not include the owed WAITING row that is on disk. Both arms: rows live, rows rotated.
+        import activity_rows
+        for rotate in (False, True):
+            ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+            store.apply(T("task-ix", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+            real = activity_rows._save_index; calls = []
+            def fail_once(path, data):
+                if not calls:
+                    calls.append(1)
+                    raise OSError("one index publication fault")
+                return real(path, data)
+            with unittest.mock.patch.object(activity_rows, "_save_index", fail_once):
+                store.apply(T("task-ix", "WAITING", ts=1_757_000_001.0, reason="approval"))
+            self.assertEqual(len(store.load("task-ix").pending), 1, "the WAITING row is owed; it landed with its ack")
+            ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-ix"]
+            self.assertEqual(e["rows"], 1); e.pop("applied"); e["last_pid"] = "task-ix:1:1"; ip.write_text(json.dumps(idx))  # the old format
+            if rotate:
+                for i in range(card.LIVE_ROWS + 1):
+                    card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+                self.assertNotIn("task-ix", card.log_path(ws).read_text(), "precondition: rotated into the day archive")
+            fresh = ActivityStore(ws); fresh.apply(T("task-ix", "COMPLETED", ts=1_757_000_002.0))
+            self.assertEqual(len(fresh.load("task-ix").pending), 0)
+            sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+            self.assertEqual([x["rows"] for x in sums], [3], f"rotate={rotate}: pickup + waiting + replied, the lost count restored")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.

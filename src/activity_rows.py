@@ -105,6 +105,34 @@ def _pid_counter(pid: str | None) -> tuple[str | None, int]:
     return parts[1], int(parts[2])
 
 
+def _task_rows_on_disk(workspace: Path | None, task_id: str, since: float, until: float) -> tuple[int, dict]:
+    """Every row of one task still on disk — the live log and the archive day files its span names —
+    with the highest emitted counter per generation. The migration's only exact evidence."""
+    live = log_path(workspace)
+    names = [live.name, f"{live.stem}.archive.jsonl"]
+    day, last = min(since, until), max(since, until)
+    while day <= last + 86400 and len(names) < 400:
+        names.append(f"{live.stem}.archive.{day_of(day)}.jsonl"); day += 86400
+    count, applied = 0, {}
+    for name in dict.fromkeys(names):
+        try:
+            lines = live.with_name(name).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if (rec.get("task") or {}).get("id") != task_id:
+                continue
+            count += 1
+            gen, emitted = _pid_counter(rec.get("pid"))
+            if gen is not None:
+                applied[gen] = max(int(applied.get(gen, 0)), emitted)
+    return count, applied
+
+
 def _ack(workspace: Path | None, task_id: str, pid: str) -> None:
     d = acks_dir(workspace)
     d.mkdir(parents=True, exist_ok=True)
@@ -179,15 +207,12 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
             # A row that landed just now is new by construction; a replay counts only above the
             # generation's applied high-water mark, saved with the count in the same record.
             gen, emitted = _pid_counter(pid)
-            # An entry the previous writer left has no applied map: every row that landed under it
-            # was counted then, so a landed replay never counts; its last_pid seeds the map if kept.
-            old_format = existing is not None and "applied" not in existing
             applied = dict(e.get("applied") or {})
-            if old_format and e.get("last_pid"):
-                old_gen, old_emitted = _pid_counter(e["last_pid"])
-                if old_gen is not None:
-                    applied[old_gen] = old_emitted
-            if not landed or (not old_format and emitted > int(applied.get(gen, 0))):
+            if existing is not None and "applied" not in existing:
+                # The previous writer counted a row only when its index save landed, so neither the
+                # entry nor a landed row says which rows it counted: rebuild once from the rows on disk.
+                e["rows"], applied = _task_rows_on_disk(workspace, task["id"], float(e.get("started", rec["ts"])), max(rec["ts"], time.time()))
+            elif not landed or emitted > int(applied.get(gen, 0)):
                 e["rows"] = int(e.get("rows", 0)) + 1
             if gen is not None:
                 applied[gen] = max(int(applied.get(gen, 0)), emitted)
