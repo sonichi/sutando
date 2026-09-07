@@ -921,7 +921,18 @@ def load_tier_map() -> dict:
     try:
         data = json.loads(ACCESS_FILE.read_text())
         tier_map = data.get("tierMap")
-        return tier_map if isinstance(tier_map, dict) else {}
+        if not isinstance(tier_map, dict):
+            return {}
+        out = {}
+        for uid, raw in tier_map.items():
+            tier = local_task_protocol.canonical_access_tier(raw)
+            # collaborator is per-channel and comes only from the serving
+            # channel's list; a global map entry may grant at most team.
+            if tier == "collaborator":
+                print(f"  [tier-map] {uid}: 'collaborator' is not a global tier; read as team", flush=True)
+                tier = "team"
+            out[uid] = tier
+        return out
     except Exception:
         return {}
 
@@ -3091,14 +3102,11 @@ def resolve_team_collaborator(access_data, access_tier, sender_id, serving_chann
 def select_rulebook_key(access_tier, is_collaborator):
     """Pick which `tier_instructions` rulebook a task gets.
 
-    A collaborator gets the `team-collaborator` "engage" rulebook (reply
-    in-channel, fold in their input) regardless of their `team` wire-tier;
-    everyone else gets their own tier's rulebook. Keeping this separate from the
-    serialized `access_tier` is deliberate — the wire tier stays `team` so every
-    existing team consumer is unchanged, and only the in-band rulebook (the
-    enforcement surface the core agent follows) swaps.
+    A collaborator — by tier, or by the legacy flag on a team wire-tier — gets
+    the `collaborator` "engage" rulebook (reply in-channel, fold in their
+    input); everyone else gets their own tier's rulebook.
     """
-    return "team-collaborator" if is_collaborator else access_tier
+    return "collaborator" if (is_collaborator or access_tier == "collaborator") else access_tier
 
 
 async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
@@ -3825,8 +3833,8 @@ async def _handle_discord_message(message, force=False):
     access_tier = "guest"
     # is_collaborator: a TEAM sender the owner has listed under the SERVING
     # channel's `collaborators` array in access.json. Collaborators get the
-    # `team-collaborator` "engage" rulebook (reply in-channel, fold in their
-    # input) instead of the default RUN-CODEX/NO-REPLY team rulebook — a
+    # `collaborator` tier and its "engage" rulebook (reply in-channel, fold in
+    # their input) instead of the default RUN-CODEX/NO-REPLY team rulebook — a
     # first-class, per-channel structural path for "cooperate with this person
     # here" that does NOT elevate them to global owner. The authority boundary
     # is unchanged: irreversible / system-mutating actions still require the
@@ -3873,6 +3881,10 @@ async def _handle_discord_message(message, force=False):
             is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
+    if is_collaborator:
+        # The list sets the tier; the `collaborator: true` line below stays one
+        # release for consumers that still key on the flag.
+        access_tier = "collaborator"
 
     # Dedup: skip if we've already processed this Discord message ID.
     # EXCEPTION: force=True means on_message_edit is reprocessing because the
@@ -4087,7 +4099,7 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "team-collaborator": engage_rulebook(
+        "collaborator": engage_rulebook(
             "channel", DISCORD_PROVENANCE, "results/task-{id}.txt"
         ),
         "team": (
@@ -4262,11 +4274,8 @@ async def _handle_discord_message(message, force=False):
         # try, so a failure in this f-string build is logged as a FAILED
         # line (see the instrumentation note above) instead of raising
         # before the logging is reached.
-        # Collaborators keep `access_tier: team` (so every existing team consumer —
-        # priority, progress-streamer, dedup — behaves exactly as before) and get an
-        # orthogonal `collaborator: true` marker plus the engage rulebook. The
-        # rulebook is the in-band enforcement surface the core agent follows, so
-        # swapping it is what actually changes handling.
+        # Collaborators carry `access_tier: collaborator`; the `collaborator: true`
+        # marker is kept one release for consumers that still read the flag.
         collaborator_line = "collaborator: true\n" if is_collaborator else ""
         rulebook_key = select_rulebook_key(access_tier, is_collaborator)
         return (
@@ -4961,7 +4970,8 @@ async def poll_results():
                                   if line.startswith("collaborator:")]
                         # exactly one "true": conflicting or malformed stamps
                         # fail CLOSED, same as resolve_access_tier's tier guard
-                        _task_collab = _cvals == ["true"]
+                        _task_collab = (_cvals == ["true"]
+                                        or _resolve_task_tier(_tf_c) == "collaborator")
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't

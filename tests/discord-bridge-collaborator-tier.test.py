@@ -34,6 +34,7 @@ Exit code: 0 on pass, 1 on fail.
 
 import contextlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -131,6 +132,13 @@ def load_bridge(config_root: Path):
     # sees this exec-loaded code under "<string>" and reports 0% on the file.
     code = compile(src, str(BRIDGE), "exec")
     exec(code, bridge.__dict__)
+    # Rebind both writer paths under the temp root: with no canonical file the
+    # resolver may fall back to the real ~/.claude access.json.
+    bridge.ACCESS_FILE = env_dir / "access.json"
+    bridge.ACCESS_BACKUP_FILE = env_dir / "discord-access-backup.json"
+    for pth in (bridge.ACCESS_FILE, bridge.ACCESS_BACKUP_FILE):
+        if Path(config_root).resolve() not in Path(pth).resolve().parents:
+            raise RuntimeError(f"bridge path escaped the temp root: {pth}")
     return bridge
 
 
@@ -169,6 +177,17 @@ def behavioral(bridge) -> list:
     if ric(access_no_collab, SUSAN, SERVING) is not False:
         fails.append("team sender absent from collaborators should resolve False")
 
+    # 3b. FAILURE MODE: a global tierMap "collaborator" must load as team —
+    #     the tier is per-channel; owner stays owner, legacy other reads guest.
+    bridge.ACCESS_FILE.write_text(json.dumps({
+        "allowFrom": [OWNER, "777"], "groups": {},
+        "tierMap": {"777": "collaborator", OWNER: "owner", "888": "other"}}))
+    loaded = bridge.load_tier_map()
+    if loaded.get("777") != "team":
+        fails.append(f"tierMap 'collaborator' must load as team, got {loaded.get('777')!r}")
+    if loaded.get(OWNER) != "owner" or loaded.get("888") != "guest":
+        fails.append(f"tierMap owner/other must load as owner/guest, got {loaded!r}")
+
     # 4. Unknown sender / unknown channel → False (fail-closed).
     if ric(access, "999", SERVING) is not False:
         fails.append("sender not in the serving channel's collaborators should resolve False")
@@ -184,9 +203,11 @@ def behavioral(bridge) -> list:
         except Exception as e:
             fails.append(f"malformed config {bad!r} raised {e!r} (must fail-closed, not raise)")
 
-    # 6. Rulebook selection: collaborator → team-collaborator; else own tier.
-    if srk("team", True) != "team-collaborator":
-        fails.append("select_rulebook_key(team, is_collaborator=True) must be 'team-collaborator'")
+    # 6. Rulebook selection: collaborator (tier or legacy flag) → collaborator; else own tier.
+    if srk("team", True) != "collaborator":
+        fails.append("select_rulebook_key(team, is_collaborator=True) must be 'collaborator'")
+    if srk("collaborator", False) != "collaborator":
+        fails.append("select_rulebook_key(collaborator, False) must be 'collaborator' — the tier alone selects the engage rulebook")
     if srk("team", False) != "team":
         fails.append("select_rulebook_key(team, False) must stay 'team'")
     if srk("guest", False) != "guest":
@@ -209,6 +230,10 @@ def structural() -> list:
     # is_collaborator defaults False (fail-closed) before the tier checks.
     if not re.search(r"is_collaborator\s*=\s*False", src):
         fails.append("is_collaborator should default to False (fail-closed)")
+
+    # The collaborators list SETS the tier; the flag line is the legacy companion.
+    if not re.search(r'if\s+is_collaborator\s*:\s*\n(?:\s*#.*\n)*\s*access_tier\s*=\s*"collaborator"', src):
+        fails.append("a resolved collaborator must be assigned access_tier = \"collaborator\"")
 
     # Tier resolution calls the helper with the serving channel id.
     if not re.search(r"is_collaborator\s*=\s*resolve_team_collaborator\(\s*_acc\s*,\s*access_tier\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
@@ -233,8 +258,8 @@ def structural() -> list:
     # The team-collaborator rulebook exists and reasserts the owner-only boundary.
     # RENDER the rulebook instead of regexing the source for a literal: the text
     # moved to src/team_guardrail.py, and a source-shape assertion cannot see it.
-    if not re.search(r'"team-collaborator"\s*:\s*engage_rulebook\(', src):
-        fails.append("tier_instructions must map 'team-collaborator' to engage_rulebook(...)")
+    if not re.search(r'"collaborator"\s*:\s*engage_rulebook\(', src):
+        fails.append("tier_instructions must map 'collaborator' to engage_rulebook(...)")
     sys.path.insert(0, str(BRIDGE.parent))
     try:
         from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE

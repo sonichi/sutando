@@ -40,6 +40,7 @@ _SOURCE = {
 _TIER_TO_SCHEMA = {
     "owner": "owner",
     "team": "team",
+    "collaborator": "team",  # engaged like team in the schema's accounting
     "guest": "public",
     "other": "public",
     "public": "public",

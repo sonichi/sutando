@@ -157,6 +157,10 @@ check("owner streams (caps/space)", ps.should_stream_task("  Owner ") is True)
 check("None tier streams (legacy owner)", ps.should_stream_task(None) is True)
 check("team does NOT stream", ps.should_stream_task("team") is False)
 check("other does NOT stream", ps.should_stream_task("other") is False)
+check("collaborator TIER streams without the legacy flag",
+      ps.should_stream_task("collaborator") is True)
+check("collaborator tier streams with the flag too",
+      ps.should_stream_task("collaborator", True) is True)
 
 # --- read_core_status (never raises) ---
 with tempfile.TemporaryDirectory() as d:
@@ -420,7 +424,7 @@ check("hoist: unlisted team sender is NOT collaborator",
 
 # The reviewer's exact table: with is_collaborator=True, only team streams
 # (owner streams via its own arm; None is the platform's missing-field=owner).
-for _tier, _want in [("owner", True), ("team", True), ("other", False),
+for _tier, _want in [("owner", True), ("collaborator", True), ("team", True), ("other", False),
                      ("guest", False), ("ambient", False), (None, True)]:
     check(f"tier-gate: collab flag with tier={_tier} -> {_want}",
           ps.should_stream_task(_tier, is_collaborator=True) is _want)

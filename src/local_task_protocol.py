@@ -119,13 +119,17 @@ PRIORITIES = ("urgent", "normal", "low")
 # canonical completion marker); archived = under tasks/archive/.
 LIFECYCLE_STATES = ("pending", "result_written", "archived")
 
-# `owner` is full, `team` is workspace-write sandboxed, `guest` is read-only,
-# and `ambient` is sandboxed observation — never instructions.
-ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
+# `owner` is full, `collaborator` is engaged directly under the engage rulebook,
+# `team` is workspace-write sandboxed and `guest` is read-only (rank: owner > collaborator > guest).
+ACCESS_TIERS = ("owner", "collaborator", "team", "guest", "other")
 
-# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits
-# the value; removal is gated on the writers, not on a release count.
-LEGACY_ACCESS_TIER_ALIASES = {"other": "guest"}
+# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits the
+# value; removal is gated on the writers. `ambient` = provenance as a tier: guest + promoted.
+LEGACY_ACCESS_TIER_ALIASES = {"other": "guest", "ambient": "guest"}
+
+# Provenance is its own axis: `promoted` = taskify built the task from room
+# events; absent/`direct` = a sender wrote it. Never an authorization boundary.
+ORIGINS = ("direct", "promoted")
 
 
 def canonical_access_tier(value) -> str:
@@ -136,6 +140,19 @@ def canonical_access_tier(value) -> str:
     """
     tier = str(value or "").strip().lower()
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
+
+
+def task_origin(headers) -> str:
+    """Provenance of a parsed task: `promoted` or `direct`.
+
+    Reads the `origin` header; a legacy ambient tier counts as promoted so
+    tasks written before the split keep their provenance.
+    """
+    origin = str(headers.get("origin") or "").strip().lower()
+    if origin in ORIGINS:
+        return origin
+    tier = str(headers.get("access_tier") or "").strip().lower()
+    return "promoted" if tier == "ambient" else "direct"
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -188,6 +205,9 @@ KNOWN_HEADER_KEYS = (
     # Which worker the sender asked for. INTENT, not placement: the pool's
     # own binding table decides, and no claim path consults this header.
     "requested_worker",
+    # Provenance (`promoted` for taskify output). Header status defangs a
+    # forged body copy; the tier, not this field, is the authorization boundary.
+    "origin",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 

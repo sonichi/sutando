@@ -144,13 +144,13 @@ out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-team ec
 [ "$out" = "ran-despite-team" ] || fail "team-tier task must NOT defer, got '$out'"
 ok "access_tier: team does not trigger deferral"
 
-for tier in other ambient guest; do
+for tier in other ambient guest collaborator; do
   rm -f "$TMPDIR/tasks/"task-*.txt
   printf 'id: t\naccess_tier: %s\n' "$tier" > "$TMPDIR/tasks/task-$tier-1.txt"
   out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-$tier echo "ran-$tier" 2>&1)"
   [ "$out" = "ran-$tier" ] || fail "access_tier: $tier must NOT defer, got '$out'"
 done
-ok "access_tier: other / ambient / guest do not trigger deferral"
+ok "access_tier: other / ambient / guest / collaborator do not trigger deferral"
 
 # --- but an OWNER task still defers, even beside non-owner ones ---------------
 printf 'id: t\naccess_tier: owner\ntask: real owner work\n' > "$TMPDIR/tasks/task-owner-1.txt"

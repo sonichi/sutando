@@ -108,12 +108,12 @@ def resolve_access_tier(task_file) -> str:
     if len(normed) > 1:
         return "guest"
     tier = normed.pop()
-    return tier if tier in {"owner", "team", "guest"} else "guest"
+    return tier if tier in {"owner", "collaborator", "team", "guest"} else "guest"
 
 
 def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
-    """Disable only for paired Team collaborator and filter-off stamps."""
-    if tier != "team":
+    """Disable only for a collaborator (tier, or paired Team stamp) with filter-off."""
+    if tier not in ("team", "collaborator"):
         return True
     try:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
@@ -132,7 +132,8 @@ def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
         for line in before_task
         if line.startswith("collaborator:")
     ]
-    return filter_values != ["false"] or collaborator_values != ["true"]
+    is_collaborator = tier == "collaborator" or collaborator_values == ["true"]
+    return filter_values != ["false"] or not is_collaborator
 
 
 def load_team_result_scanner(repo: Path):

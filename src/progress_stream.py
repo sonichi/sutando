@@ -86,10 +86,10 @@ def should_stream_task(access_tier: Optional[str],
         # Missing tier field is the platform's owner default (CLAUDE.md).
         return True
     tier = str(access_tier).strip().lower()
-    if tier == "owner":
+    if tier in ("owner", "collaborator"):
         return True
-    # Collaborator is a TEAM designation; any other tier carrying the flag is
-    # inconsistent input — fail closed rather than trust the boolean alone.
+    # The legacy flag is honoured only on the team wire-tier it used to ride;
+    # any other tier carrying it is inconsistent input — fail closed.
     return is_collaborator and tier == "team"
 
 
