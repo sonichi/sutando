@@ -1578,6 +1578,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
     "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
+    "dismissed-questions.json",  # per-host, alongside pending-questions.md
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",

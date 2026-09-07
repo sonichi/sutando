@@ -537,6 +537,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
   #dynamic-region .dr-questions .q-item { color: #ddd; padding: 10px 0; border-bottom: 1px solid #2e281844; }
   #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
+  #dynamic-region .q-queue-meta { display: flex; gap: 10px; align-items: baseline; font-size: 11px; color: #8a8a99; margin-bottom: 6px; }
+  #dynamic-region .q-wait { color: #f0ad4e; font-weight: 600; }
+  #dynamic-region .q-blocks { color: #7c83ff; }
+  #dynamic-region .q-recheck { font-size: 11px; margin: 6px 0; padding: 5px 8px; border-radius: 6px; background: #2e281844; color: #f0ad4e; }
+  #dynamic-region .q-recheck.q-stale { background: #1d3a2a; color: #4ecca3; }
+  #dynamic-region .q-nav { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  #dynamic-region .q-nav .q-btn { flex: 0 0 auto; }
+  #dynamic-region .q-empty { color: #666; font-size: 12px; text-align: center; padding: 12px; }
   #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
     padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
@@ -2934,10 +2942,7 @@ function answerQuestion(qid, answer) {
         if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim()) + '</span>';
       }
       // Remove after brief delay so user sees confirmation
-      setTimeout(function() {
-        window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
-        updateDynamicRegion();
-      }, 1500);
+      setTimeout(function() { dropQuestionFromQueue(qid); }, 1500);
       // Show in transcript too
       var el = document.createElement('div');
       el.className = 't-entry t-system';
@@ -3248,6 +3253,7 @@ window._drTaskCount = 0;
 window._drTabsRendered = false;
 
 function switchDRTab(tab) {
+  window._drQueueChecked = false;
   window._drActiveTab = tab;
   window._drLocalContent = true; // prevent poll from clearing content
   updateTabHighlights();
@@ -3386,25 +3392,13 @@ function renderTabContent() {
     });
 
   } else if (tab === 'questions') {
-    var questions = window._drQuestions || [];
-    if (questions.length === 0) {
-      container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No pending questions</div>';
-    } else {
-      container.innerHTML = '<div class="dr-questions">' +
-        questions.map(function(q) {
-          return '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
-            (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
-            '<div class="q-actions">' +
-            (q.options ? q.options.map(function(opt) {
-              return '<button class="q-btn" data-qid="' + q.id + '" data-ans="' + esc(opt) + '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
-            }).join('') :
-            '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
-            '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>') +
-            '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
-            '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
-            '</div></div>';
-        }).join('') + '</div>';
+    // Re-check immediately before display, once per visit rather than per re-render.
+    if (!window._drQueueChecked) {
+      window._drQueueChecked = true;
+      refreshQuestionQueue().then(function() { updateDynamicRegion(); });
     }
+    if (!window._drQueue) window._drQueue = window._drQuestions || [];
+    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0);
 
   } else if (tab === 'activity') {
     fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
@@ -3553,12 +3547,144 @@ function updateDynamicRegion() {
   }
 }
 
+// ─── Pending-question triage queue helpers
+// Pure: they take rows and a cursor and return HTML. The queue shows ONE question,
+// so every fact the owner needs to rank it has to be on the card itself.
+function questionWaitLabel(q) {
+  var age = q && q.age_days;
+  if (age === null || age === undefined) return 'age unknown';
+  if (age === 0) return 'asked today';
+  return 'waiting ' + age + (age === 1 ? ' day' : ' days');
+}
+
+function questionBlocksLabel(q) {
+  var refs = (q && q.refs) || [];
+  var blocks = (q && q.blocks) || 0;
+  if (!refs.length) return '';
+  if (!blocks) return 'nothing still blocked';
+  return 'blocking ' + blocks + (blocks === 1 ? ' item' : ' items');
+}
+
+// A re-check that could not decide returns nothing rather than a reassuring note:
+// silence here means "not checked", never "checked and fine".
+function questionRecheckHtml(q) {
+  var rc = q && q.recheck;
+  if (!rc || !rc.note) return '';
+  var stale = rc.status === 'stale';
+  var lead = stale ? 'Re-checked just now: everything this blocks is done ('
+                   : 'Re-checked just now: partly resolved (';
+  return '<div class="q-recheck' + (stale ? ' q-stale' : '') + '">' +
+    esc(lead + rc.note + ')') + '</div>';
+}
+
+function questionQueueCursor(rows, index) {
+  var n = (rows || []).length;
+  if (!n) return 0;
+  return ((index % n) + n) % n;
+}
+
+function renderQuestionQueue(rows, index) {
+  rows = rows || [];
+  if (!rows.length) {
+    return '<div class="q-empty">No pending questions</div>';
+  }
+  var i = questionQueueCursor(rows, index);
+  var q = rows[i];
+  var blocks = questionBlocksLabel(q);
+  var answerBtns = q.options
+    ? q.options.map(function(opt) {
+        return '<button class="q-btn" data-qid="' + esc(q.id) + '" data-ans="' + esc(opt) +
+          '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
+      }).join('')
+    : '<button class="q-btn q-yes" data-qid="' + esc(q.id) + '" data-ans="Approved">Approve</button>' +
+      '<button class="q-btn q-no" data-qid="' + esc(q.id) + '" data-ans="Rejected">Reject</button>';
+  return '<div class="dr-questions"><div class="q-item">' +
+    '<div class="q-queue-meta">' +
+      '<span>' + esc((i + 1) + ' of ' + rows.length) + '</span>' +
+      '<span class="q-wait">' + esc(questionWaitLabel(q)) + '</span>' +
+      (blocks ? '<span class="q-blocks">' + esc(blocks) + '</span>' : '') +
+    '</div>' +
+    '<b>' + esc(q.text) + '</b>' +
+    questionRecheckHtml(q) +
+    (q.detail && q.detail !== q.text
+      ? '<div style="color:#999;font-size:11px;margin-top:4px;white-space:pre-wrap">' + esc(q.detail) + '</div>'
+      : '') +
+    '<div class="q-actions">' + answerBtns +
+      '<input class="q-input" data-qid="' + esc(q.id) + '" placeholder="Or type a response...">' +
+      '<button class="q-btn q-send" data-qid="' + esc(q.id) + '">Send</button>' +
+    '</div>' +
+    '<div class="q-nav">' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="reply">Reply in chat</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="next">Next</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="dismiss" style="border-color:#66333366;color:#c77">Dismiss</button>' +
+    '</div>' +
+    '</div></div>';
+}
+// ─── End pending-question triage queue helpers
+
+// Re-check runs when the queue is shown or advanced — human cadence, not the 3s poll.
+function refreshQuestionQueue() {
+  return fetch(API_BASE + '/questions/queue')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.questions) {
+        window._drQueue = data.questions;
+        window._drQuestions = data.questions;
+      }
+      return window._drQueue;
+    })
+    .catch(function() { return window._drQueue; });
+}
+
+function advanceQuestionQueue(step) {
+  window._drQueueIndex = questionQueueCursor(
+    window._drQueue || [], (window._drQueueIndex || 0) + step);
+  updateDynamicRegion();
+}
+
+function dropQuestionFromQueue(qid) {
+  window._drQueue = (window._drQueue || []).filter(function(q) { return q.id !== qid; });
+  window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
+  window._drQueueIndex = questionQueueCursor(window._drQueue, window._drQueueIndex || 0);
+  updateDynamicRegion();
+}
+
+function dismissQuestion(qid) {
+  fetch(API_BASE + '/question/dismiss', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: qid})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.ok) dropQuestionFromQueue(qid);
+    else alert('Failed: ' + ((d && d.error) || 'unknown error'));
+  }).catch(function() { alert('Could not reach agent API'); });
+}
+
+function replyToQuestionInChat(qid) {
+  var rows = window._drQueue || [];
+  var q = null;
+  for (var i = 0; i < rows.length; i++) { if (rows[i].id === qid) { q = rows[i]; break; } }
+  var input = document.getElementById('textInput');
+  if (!input) return;
+  input.value = 'Re: ' + ((q && q.text) || qid) + ' — ';
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
 // Event delegation for question actions
 document.addEventListener('click', function(e) {
   var btn = e.target.closest && e.target.closest('[data-qid]');
   if (!btn) return;
   var qid = btn.dataset.qid;
-  if (btn.dataset.ans) {
+  var qact = btn.dataset.qact;
+  if (qact === 'next') {
+    // Free by construction: no request, no write. The row stays and comes back round.
+    advanceQuestionQueue(1);
+  } else if (qact === 'dismiss') {
+    dismissQuestion(qid);
+  } else if (qact === 'reply') {
+    replyToQuestionInChat(qid);
+  } else if (btn.dataset.ans) {
     answerQuestion(qid, btn.dataset.ans);
   } else if (btn.classList.contains('q-send')) {
     var inp = document.querySelector('.q-input[data-qid="' + qid + '"]');
