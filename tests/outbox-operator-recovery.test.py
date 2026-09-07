@@ -318,6 +318,54 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 3,
                              "second run restored nothing and moved nothing")
 
+    def test_a_named_instance_recovers_with_both_ids(self):
+        """The record and the body are filed under DIFFERENT ids on a named
+        instance, so one argument cannot address both.
+
+        `_delivery_core` publishes under the BROKER id while the result file —
+        and therefore its quarantined copy — carries the instance-qualified
+        LOCAL id (`task-<inst>~<broker>`). Passing the local id finds no record
+        (`absent`); passing the broker id requeues the record but restores
+        nothing. Recovery has to carry both.
+        """
+        with TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            results.mkdir()
+            root = results / ".outbox-dev"
+            broker_id, local_id = "task-abc", "task-dev~task-abc"
+            _parked(root, broker_id)
+            (results / f"{local_id}.txt").write_text("the reply", encoding="utf-8")
+            uq.quarantine(results / f"{local_id}.txt", results, when=1700000000)
+
+            # the local id addresses no record
+            self.assertEqual(
+                outbox_cli.main(["--root", str(root), "requeue", local_id]), 2,
+                "the record is keyed by the broker id, so the local id is absent")
+
+            # the broker id alone requeues the record and restores nothing
+            self.assertEqual(
+                outbox_cli.main(["--root", str(root), "requeue", broker_id]), 0)
+            self.assertFalse((results / f"{local_id}.txt").exists(),
+                             "the broker id cannot name the local body file")
+            self.assertEqual(len(uq.find_quarantined(results, local_id)), 1)
+
+            # both ids together complete the recovery
+            self.assertEqual(outbox_cli.main(
+                ["--root", str(root), "requeue", broker_id,
+                 "--body-id", local_id]), 0)
+            self.assertTrue((results / f"{local_id}.txt").exists(),
+                            "--body-id must restore the body filed under the local id")
+            self.assertEqual(len(uq.find_quarantined(results, local_id)), 0)
+
+    def test_body_id_defaults_to_the_record_id(self):
+        """The primary instance has one id for both; the flag must stay optional
+        or every unnamed lane's recovery would need a redundant argument."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            self.assertEqual(outbox_cli.main(
+                ["--root", str(root), "requeue", ITEM]), 0)
+            self.assertTrue((results / f"{ITEM}.txt").exists())
+
     def test_outcome_distinguishes_absent_from_refused(self):
         """`None` for both left the operator unable to tell 'the body is gone'
         from 'a newer reply is already queued'."""

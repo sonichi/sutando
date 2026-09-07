@@ -3382,12 +3382,19 @@ def _delivery_core() -> DeliveryCore:
 def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
-    rescanned every pass and the refusal is invisible."""
+    rescanned every pass and the refusal is invisible.
+
+    The printed command must carry BOTH ids on a named instance: the record is
+    keyed by the broker id and the body file by the local one, so neither alone
+    recovers both halves.
+    """
     try:
         undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
         _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox requeue "
-             f"{tid} --results-dir <dir>` restores it")
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
+             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"requeue {_broker_tid(tid)} "
+             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")

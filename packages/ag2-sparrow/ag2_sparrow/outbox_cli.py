@@ -101,7 +101,9 @@ def cmd_requeue(args) -> int:
         if result is outbox.RequeueOutcome.REQUEUED:
             payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
         results_dir = args.results_dir or Path(args.root).parent
-        outcome, path = undelivered_quarantine.restore(results_dir, args.item_id)
+        body_id = getattr(args, "body_id", None) or args.item_id
+        outcome, path = undelivered_quarantine.restore(results_dir, body_id)
+        payload["body_id"] = body_id
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
@@ -137,6 +139,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="override where result bodies live; defaults to the "
                          "outbox root's parent, which is where every lane "
                          "puts it (RESULTS_DIR/.outbox-*)")
+    rq.add_argument("--body-id", dest="body_id",
+                    help="task id the QUARANTINED BODY is filed under, when it "
+                         "differs from the outbox record id. A named gateway "
+                         "instance keys the record by the broker id and names "
+                         "the body file by the instance-qualified local id, so "
+                         "one id cannot address both.")
     rq.add_argument("--operator", help="recorded as who did it")
     rq.add_argument("--reason", help="recorded as why")
     rq.set_defaults(func=cmd_requeue)
