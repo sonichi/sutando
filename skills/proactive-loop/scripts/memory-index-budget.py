@@ -150,8 +150,10 @@ def main(argv=None) -> int:
     # one scarce resource here: a permanent index line. Fitting is not warrant.
     if r["mode"] == "adding":
         mem_dir = index.parent
+        # Indexes differ on whether a target carries `.md` — MEMORY.md omits it,
+        # MEMORY-archive.md keeps it — so accept either rather than assuming one.
         missing = [g for g in re.findall(r"\]\(([A-Za-z0-9_./-]+)\)", addition)
-                   if not (mem_dir / f"{g}.md").is_file()]
+                   if not ((mem_dir / g).is_file() or (mem_dir / f"{g}.md").is_file())]
         if missing:
             print("\n⚠ CREATES A NEW MEMORY FILE — fitting is not the same as warranted:")
             for g in missing[:5]:
