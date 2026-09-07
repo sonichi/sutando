@@ -69,18 +69,21 @@ def drain(body: str, default_room: str):
     posts: list[dict] = []
 
     def _fake_req(method, path, payload=None, timeout=None):
-        posts.append({"path": path, "payload": payload})
+        if method == "POST":  # the routing lookup is a GET, not a send
+            posts.append({"path": path, "payload": payload})
         return {"ok": True, "event_id": "$evt"}
 
     saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
              gb._req, gb.PROACTIVE_CLAIM_GATE)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
     gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = default_room, _fake_req, None
+    gb._ROUTING.update(owner_dm=default_room, loaded=True, next=gb.time.time() + 3600)  # the owner DM reading
     try:
         gb._post_proactive()
     finally:
         (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
          gb._req, gb.PROACTIVE_CLAIM_GATE) = saved
+        gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
     return posts, sorted(p.name for p in tmp.iterdir() if p.is_file())
 
 
@@ -182,7 +185,7 @@ def main() -> int:
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp3, tmp3 / "archive"
     gb.PROACTIVE_ROOM = ""
     gb._req = lambda m, path, payload=None, timeout=None: (
-        posts3.append(payload) or {"ok": True, "event_id": "$evt"})
+        (posts3.append(payload) if m == "POST" else None) or {"ok": True, "event_id": "$evt"})
     gb.PROACTIVE_CLAIM_GATE = None
     gb._proactive_route = _vanishing_route
     try:
