@@ -14,10 +14,18 @@ if [ -z "$DEST" ]; then
   exit 2
 fi
 
-TRANSCRIPT="${2:-}"  # Optional explicit path (manual invocations)
-if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
-  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+# Resolution is shared with session-handoff.sh — one reader, so a change to
+# hook-payload parsing cannot land on one and miss the other (#4001 review).
+__HELPER="$(cd "$(dirname "$0")" && pwd)/hook_transcript_path.sh"
+if [ -f "$__HELPER" ]; then
+  # shellcheck source=hook_transcript_path.sh
+  . "$__HELPER"
+  TRANSCRIPT="$(resolve_hook_transcript_path "${2:-}")"
+else
+  echo "✗ archive-transcript: hook_transcript_path.sh not found alongside this script" >&2
+  exit 7
 fi
+unset __HELPER
 
 # Fail LOUD. A hook's non-zero exit is not surfaced, but silence here is what
 # made the original defect invisible for as long as it was.
