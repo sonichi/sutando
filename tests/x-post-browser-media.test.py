@@ -66,6 +66,25 @@ class ArgvGuards(unittest.TestCase):
         run("post", "text", "--media", "/no/such/file.png")
         self.assertLess(time.monotonic() - t0, 5.0)
 
+    def test_a_DIRECTORY_is_refused_before_any_launch(self):
+        """existsSync is true for a directory, so the first guard let one through
+        to the browser launch — the eviction this check exists to prevent."""
+        r = run("post", "text", "--media", tempfile.gettempdir())
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("not a regular file", r.stderr)
+        self.assertNotIn("not signed in", r.stderr)
+
+    def test_an_UNREADABLE_file_is_refused_before_any_launch(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            path = f.name
+        pathlib.Path(path).chmod(0o000)
+        try:
+            r = run("post", "text", "--media", path)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("not readable", r.stderr)
+        finally:
+            pathlib.Path(path).chmod(0o600); pathlib.Path(path).unlink()
+
     def test_usage_names_the_flag(self):
         r = run()
         self.assertIn("--media", r.stderr)
@@ -78,6 +97,12 @@ class AttachWaitsForX(unittest.TestCase):
         launch — that launch is what evicts a live login window."""
         self.assertLess(SRC.index("--media: no such file"),
                         SRC.index("launchPersistentContext"))
+
+    def test_the_attach_block_is_gated_on_MEDIA_alone(self):
+        """Reviewer's mutation: `if (false && MEDIA)` disables the whole attach
+        and every source-token arm still passed. Pin the condition itself."""
+        self.assertIn("if (MEDIA) {", SRC)
+        self.assertNotIn("&& MEDIA", SRC)
 
     def test_it_targets_the_HIDDEN_input_not_the_button(self):
         self.assertIn('input[type="file"]', SRC)

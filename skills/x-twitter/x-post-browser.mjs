@@ -38,7 +38,7 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,8 +94,19 @@ const MEDIA = (() => {
     console.error('--media needs a file path');
     process.exit(2);
   }
-  if (!existsSync(p)) {
+  // A readable REGULAR file, not merely something that exists: existsSync is
+  // true for a directory, which then reached the launch that evicts a login.
+  let st;
+  try { st = statSync(p); } catch {
     console.error(`--media: no such file: ${p}`);
+    process.exit(2);
+  }
+  if (!st.isFile()) {
+    console.error(`--media: not a regular file: ${p}`);
+    process.exit(2);
+  }
+  try { accessSync(p, constants.R_OK); } catch {
+    console.error(`--media: not readable: ${p}`);
     process.exit(2);
   }
   return resolve(p);
