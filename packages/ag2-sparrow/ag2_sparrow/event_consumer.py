@@ -28,7 +28,6 @@ MEANINGFUL_TYPES = frozenset({
     "member.joined", "member.left",
     # artifact.updated (be#190, deployed 2026-07-24): vault/doc writes fan out
     # as events — a doc change in an observed room is exactly the kind of
-    # ambient activity taskify should batch for the Core's attention.
     "artifact.updated",
 })
 
@@ -49,15 +48,16 @@ class TaskifyHandler:
     task file into `task_dir`. Skips self events and non-meaningful types."""
 
     def __init__(self, task_dir: str, agent_mxid: "str | None",
-                 threshold: int = 5, log=print):
+                 threshold: int = 5, log=print, types=None):
         self.task_dir = task_dir
         self.agent_mxid = agent_mxid
         self.threshold = max(1, int(threshold))
         self._log = log
+        # Per-source meaningful-type set (e.g. bee.* from the Bee inbox sink);
+        # default preserves the room-activity behavior exactly.
+        self.types = frozenset(types) if types else MEANINGFUL_TYPES
         # Batches are PARTITIONED BY ROOM (review P1: one global batch mixed
         # rooms into a single task, attributing a private room's events to the
-        # last room seen — a provenance/context boundary crossing). Each room
-        # gets its own pending list + seen set and promotes independently.
         self._batch: dict = {}           # room_id -> list[event]
         self._seen: dict = {}            # room_id -> set[event_id]
         self.last_path: "str | None" = None
@@ -70,7 +70,7 @@ class TaskifyHandler:
         re-drain (idempotent), so re-processing never double-counts a batch."""
         eid = str(event.get("event_id") or "")
         etype = event.get("type")
-        if etype not in MEANINGFUL_TYPES:
+        if etype not in self.types:
             return [eid] if eid else []          # noise → settled, skip
         if self.agent_mxid and event.get("actor_id") == self.agent_mxid:
             return [eid] if eid else []          # self-echo → settled, never wakes Core
@@ -80,8 +80,6 @@ class TaskifyHandler:
         if not eid or eid in seen:
             # Re-drained held event. If this room's batch is threshold-ready,
             # RETRY the flush — a previously failed promotion (transient disk/
-            # permission error) would otherwise never retry until some new
-            # event arrived (review P1: seen-before-promote swallowed retries).
             if len(batch) >= self.threshold:
                 return self._try_flush(room)
             return []
@@ -125,8 +123,6 @@ class TaskifyHandler:
                       "cursor_range": [cursors[0], cursors[-1]] if cursors else [None, None]}
         # Bounded, explicitly UNTRUSTED per-event summaries: without them the
         # task said "review and act" but carried nothing to review (review P1).
-        # type + actor + first line (120 chars) of text; room-controlled
-        # content — the in-band block reiterates observation-not-instruction.
         summaries = []
         for ev in batch[:20]:
             content = ev.get("content") or {}
@@ -168,10 +164,6 @@ class TaskifyHandler:
             os.close(dfd)
         # Anonymous product telemetry — #2274 parity for the taskify surface: the
         # promotion writes its task file directly (never through the relay loop's
-        # _write_task), so it must emit its own task_processed. Placed after the
-        # atomic publish and behind the already-promoted early return above, so
-        # idempotent re-drains aren't double-counted. Same fail-open shape as the
-        # bridges: a standalone PyPI install has no telemetry module and no-ops.
         try:
             from telemetry import task_processed
             task_processed("events-promotion")
@@ -200,9 +192,6 @@ class EventConsumer:
         after: "int | None" = None
         # Page through the WHOLE unconsumed backlog, anchoring each page past
         # the previous one by cursor. Held (sub-threshold) rows stay unconsumed
-        # for crash recovery, but they can no longer pin the read window — a
-        # later event that completes some room's batch is always reached
-        # (review P1: 100 held single-event rooms starved every newer event).
         while True:
             events = self._inbox.unconsumed(self._batch, after=after)
             if not events:
@@ -220,7 +209,6 @@ class EventConsumer:
                 break
         # Mark consumed ONLY settled events (skipped or in a flushed batch).
         # Events still held in the handler's pending batch stay UNCONSUMED, so a
-        # crash re-drains them (no loss); the handler dedups them on re-drain.
         self._inbox.mark_consumed(settled)
         return {"seen": seen, "promoted": promoted, "consumed": len(settled)}
 
