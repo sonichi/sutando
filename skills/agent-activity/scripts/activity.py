@@ -23,25 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402,F401
 from activity_rows import (  # noqa: E402,F401  (the writer lives in core; the CLI keeps these names)
     KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, default_room, index_path, log_path, open_task_index,
-    rotate, summaries_path, summarize,
+    rotate, summaries_path, summarize, task_from_file,
 )
-
-
-def task_from_file(path: Path) -> tuple[dict, str | None]:
-    """({id, from, text}, room) read from a task file's headers; text is the first task: line."""
-    fields: dict = {}
-    for l in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        k, _, v = l.partition(":")
-        if k in ("id", "user_id", "task", "channel_id", "source_message_id") and k not in fields:
-            fields[k] = v.strip()
-    task = {"id": fields.get("id") or path.stem}
-    if fields.get("user_id"):
-        task["from"] = fields["user_id"]
-    if fields.get("task"):
-        task["text"] = fields["task"][:TEXT_MAX]
-    if fields.get("source_message_id"):
-        task["event"] = fields["source_message_id"]  # the client mounts the card under this message
-    return task, fields.get("channel_id") or None
 
 
 def queued(task_file: Path, workspace: Path | None = None) -> int:
