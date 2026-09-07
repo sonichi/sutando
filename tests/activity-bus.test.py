@@ -365,6 +365,23 @@ class IdempotentProjection(unittest.TestCase):
         sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
         self.assertEqual([x["rows"] for x in sums], [2], "pickup + replied, the replayed pickup counted once")
 
+    def test_recovery_across_the_format_change_survives_a_pidless_hook_that_nulled_last_pid(self):
+        # The previous writer counted pickup + hook (rows=2) and its slot reads None after the hook;
+        # the owed pickup's replay under the new writer must not count a third time.
+        store = ActivityStore(self.ws)
+        store.apply(T("task-up2", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        card.append("hook detail", kind="working", room="!r:s", task={"id": "task-up2"}, workspace=self.ws)
+        ip = card.index_path(self.ws); idx = json.loads(ip.read_text()); e = idx["task-up2"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = None  # the old format after a pidless row
+        ip.write_text(json.dumps(idx))
+        st = store.load("task-up2"); st.pending = [{"kind": "processing", "line": "picked up", "ts": 1_757_000_000.0, "room": "!r:s",
+                                                    "task": {"id": "task-up2"}, "done": False, "pid": "task-up2:1:1", "attempts": 1}]
+        store.save(st)
+        fresh = ActivityStore(self.ws); fresh.apply(T("task-up2", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-up2").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + hook + replied; the replayed pickup counted once")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.

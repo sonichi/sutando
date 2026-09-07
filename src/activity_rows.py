@@ -174,16 +174,20 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         if task and isinstance(task.get("id"), str):
             ip = index_path(workspace)
             idx = _load_index(ip)
-            e = idx.get(task["id"]) or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
+            existing = idx.get(task["id"])
+            e = existing or {"started": rec["ts"], "rows": 0, "task": task, "room": room}
             # A row that landed just now is new by construction; a replay counts only above the
             # generation's applied high-water mark, saved with the count in the same record.
             gen, emitted = _pid_counter(pid)
+            # An entry the previous writer left has no applied map: every row that landed under it
+            # was counted then, so a landed replay never counts; its last_pid seeds the map if kept.
+            old_format = existing is not None and "applied" not in existing
             applied = dict(e.get("applied") or {})
-            if not applied and e.get("last_pid"):  # an entry the previous writer left: its evidence carries over
+            if old_format and e.get("last_pid"):
                 old_gen, old_emitted = _pid_counter(e["last_pid"])
                 if old_gen is not None:
                     applied[old_gen] = old_emitted
-            if not landed or emitted > int(applied.get(gen, 0)):
+            if not landed or (not old_format and emitted > int(applied.get(gen, 0))):
                 e["rows"] = int(e.get("rows", 0)) + 1
             if gen is not None:
                 applied[gen] = max(int(applied.get(gen, 0)), emitted)
