@@ -979,7 +979,7 @@ def main() -> int:
     rtc.PROACTIVE_ROOM = ""
     rtc._post_proactive()
     check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
-          "a gateway launched with no pin leaves an unaddressed file alone (the pin is eligibility, never a destination)")
+          "the primary with no owner DM reading holds an unaddressed file (the pin is never a destination)")
     # A reading → delivered as op:message to the owner DM, file archived. The harness's reading is the
     # same room the pin names, so every count-based arm below reads as before.
     rtc.PROACTIVE_ROOM = "!owner:example.org"
@@ -1290,12 +1290,13 @@ def main() -> int:
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
     rtc._ROUTING["next"] = 0.0
     check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity, the persisted reading returns")
-    _pin = rtc.PROACTIVE_ROOM; rtc.PROACTIVE_ROOM = ""  # a named secondary: launched with no pin, DM reading present
+    check(rtc.GATEWAY_INSTANCE == "" and bool(rtc.PROACTIVE_ROOM), "precondition: the harness bridge is the primary, pin set")
+    _inst = rtc.GATEWAY_INSTANCE; rtc.GATEWAY_INSTANCE = "dev"  # a named secondary: pin set AND a DM reading present
     n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1f.txt").write_text("the primary's nudge\n")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
-          "a gateway launched with no pin never consumes an unaddressed nudge, whatever DM the registry names")
-    (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.PROACTIVE_ROOM = _pin
+          "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
+    (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
     STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
     rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
     rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
