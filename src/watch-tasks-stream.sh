@@ -193,6 +193,8 @@ publish_terminal_failure() {
   # Reading then mutating a path a provider can still claim has no safe ordering.
   if ln "$temporary" "$result" 2>/dev/null; then
     rc=0
+    # The scheduler's FAILED: the task ends here, whatever a provider observed.
+    ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$TASKS_DIR/$filename" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
   elif handler_result_exists "$filename"; then
     rc=0
   else
@@ -340,6 +342,7 @@ drain_dispatch_queue() {
       "$WATCH_RUNTIME_DIR/events" \
       "$(basename "$marker")" &
     printf '%s\n' "$!" > "$worker_receipt"
+    activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
     running_count=$((running_count + 1))
   done
   shopt -u nullglob
@@ -370,8 +373,9 @@ queue_handler_task() {
 dispatch_task() {
   local task_path="$1" rc filename
   filename="$(basename "$task_path")"
+  queued_activity_row "$filename"
   if [ -z "$DISPATCH_DIR" ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
     return
   fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
@@ -384,10 +388,10 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      printf 'TASK_FILE: %s\n' "$filename" || exit 0
+      emit_dispatch_task_file "$filename"
       return
     fi
-    queue_handler_task "$task_path" "fallback" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$filename"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
@@ -396,10 +400,10 @@ dispatch_task() {
       publish_terminal_failure "$filename" "could not be queued" || true
     fi
   elif [ "$rc" -eq 3 ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$filename"
   fi
 }
 

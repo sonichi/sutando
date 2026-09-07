@@ -757,6 +757,18 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
     if destination:
         d["destination"] = destination
     _write_item(Path(root), item_id, d)
+    _activity_completed(item_id)
+
+
+def _activity_completed(item_id: str) -> None:
+    """A delivered task result is the scheduler's COMPLETED. Never breaks delivery."""
+    if not str(item_id).startswith("task-"):
+        return
+    try:
+        import activity_bus as _bus
+        _bus.ActivityStore().apply(_bus.LifecycleTransition(item_id, "COMPLETED", reason="delivered"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def item_status(root: Path, item_id: str) -> Optional[str]:

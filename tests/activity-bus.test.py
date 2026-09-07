@@ -305,6 +305,169 @@ class IdempotentProjection(unittest.TestCase):
         card.append("fresh", kind="notice", room=None, task=t, workspace=self.ws, pid="task-h1:1:9")
         self.assertEqual(card.log_path(self.ws).read_text().count('"pid": "task-h1:1:9"'), 1, "control: a new pid appends once")
 
+    def test_the_index_never_counts_a_replayed_pid_twice_whatever_landed_between(self):
+        # The drained-snapshot save fails once AFTER row, ack and index landed; a same-task hook row
+        # lands through the shared writer; the replay must not count the pickup again (4 arms).
+        import activity_rows
+        for fault, hook in ((False, False), (True, False), (False, True), (True, True)):
+            ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+            store = ActivityStore(ws); real_save = store.save; hit = {"n": 0}
+            def faulty_save(state):
+                if fault and not state.pending and hit["n"] == 0:
+                    hit["n"] += 1
+                    raise OSError("snapshot disk full")  # the drained snapshot never publishes
+                real_save(state)
+            store.save = faulty_save
+            if fault:
+                with self.assertRaises(OSError):
+                    store.apply(T("task-x1", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+                self.assertEqual(len(store.load("task-x1").pending), 1, "the pickup row is still owed")
+            else:
+                store.apply(T("task-x1", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+            if hook:
+                card.append("hook detail", kind="working", room="!r:s", task={"id": "task-x1"}, workspace=ws)
+            fresh = ActivityStore(ws); fresh.apply(T("task-x1", "COMPLETED", ts=1_757_000_002.0))
+            self.assertEqual(len(fresh.load("task-x1").pending), 0)
+            rows = [json.loads(l) for p in (ws / "state").glob("agent-activity*.jsonl") if "summaries" not in p.name for l in p.read_text().splitlines()]
+            mine = sorted((r for r in rows if r.get("task", {}).get("id") == "task-x1"), key=lambda r: r["ts"])
+            sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+            expect = 3 if hook else 2
+            self.assertEqual(len(mine), expect, f"fault={fault} hook={hook}: actual rows")
+            self.assertEqual([x["rows"] for x in sums], [expect], f"fault={fault} hook={hook}: the summary counts each row once")
+
+    def test_a_lower_counter_landing_late_still_counts_and_its_replay_still_does_not(self):
+        # yixuan's axis: the watermark alone would under-count a lower counter arriving after a
+        # higher one. A row that lands now is new whatever its counter; only a replay defers to it.
+        t = {"id": "task-o1"}
+        card.append("second", kind="working", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:2", ts=2.0)
+        card.append("first, late", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:1", ts=1.0)
+        card.append("first, late", kind="processing", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:1", ts=1.0)  # a replay
+        card.append("second", kind="working", room="!r:s", task=t, workspace=self.ws, pid="task-o1:1:2", ts=2.0)  # a replay
+        idx = json.loads(card.index_path(self.ws).read_text())["task-o1"]
+        self.assertEqual((idx["rows"], idx["applied"]), (2, {"1": 2}))
+        card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-o1:1:3", ts=3.0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3])
+
+    def test_recovery_across_the_index_format_change_counts_the_old_pickup_once(self):
+        # The previous writer left rows=1 and last_pid (no applied map) with the pickup row still
+        # owed; the new writer's replay must carry that evidence over, not count the pickup again.
+        store = ActivityStore(self.ws)
+        store.apply(T("task-up", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))  # row, ack, index landed
+        ip = card.index_path(self.ws); idx = json.loads(ip.read_text()); e = idx["task-up"]
+        self.assertEqual(e["rows"], 1); e.pop("applied"); e["last_pid"] = "task-up:1:1"  # the old format on disk
+        ip.write_text(json.dumps(idx))
+        st = store.load("task-up"); st.pending = [{"kind": "processing", "line": "picked up", "ts": 1_757_000_000.0, "room": "!r:s",
+                                                   "task": {"id": "task-up"}, "done": False, "pid": "task-up:1:1", "attempts": 1}]
+        store.save(st)  # the drained snapshot never published: the pickup is still owed
+        fresh = ActivityStore(self.ws); fresh.apply(T("task-up", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-up").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [2], "pickup + replied, the replayed pickup counted once")
+
+    def test_recovery_across_the_format_change_survives_a_pidless_hook_that_nulled_last_pid(self):
+        # The previous writer counted pickup + hook (rows=2) and its slot reads None after the hook;
+        # the owed pickup's replay under the new writer must not count a third time.
+        store = ActivityStore(self.ws)
+        store.apply(T("task-up2", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        card.append("hook detail", kind="working", room="!r:s", task={"id": "task-up2"}, workspace=self.ws)
+        ip = card.index_path(self.ws); idx = json.loads(ip.read_text()); e = idx["task-up2"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = None  # the old format after a pidless row
+        ip.write_text(json.dumps(idx))
+        st = store.load("task-up2"); st.pending = [{"kind": "processing", "line": "picked up", "ts": 1_757_000_000.0, "room": "!r:s",
+                                                    "task": {"id": "task-up2"}, "done": False, "pid": "task-up2:1:1", "attempts": 1}]
+        store.save(st)
+        fresh = ActivityStore(self.ws); fresh.apply(T("task-up2", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-up2").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + hook + replied; the replayed pickup counted once")
+
+    def test_recovery_across_the_format_change_adds_the_count_an_old_index_save_lost(self):
+        # The previous writer appended row + ack, then its index save failed: the entry (rows=1,
+        # last_pid=:1:1) does not include the owed WAITING row that is on disk. Both arms: rows live, rows rotated.
+        import activity_rows
+        for rotate in (False, True):
+            ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+            store.apply(T("task-ix", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+            real = activity_rows._save_index; calls = []
+            def fail_once(path, data):
+                if not calls:
+                    calls.append(1)
+                    raise OSError("one index publication fault")
+                return real(path, data)
+            with unittest.mock.patch.object(activity_rows, "_save_index", fail_once):
+                store.apply(T("task-ix", "WAITING", ts=1_757_000_001.0, reason="approval"))
+            self.assertEqual(len(store.load("task-ix").pending), 1, "the WAITING row is owed; it landed with its ack")
+            ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-ix"]
+            self.assertEqual(e["rows"], 1); e.pop("applied"); e["last_pid"] = "task-ix:1:1"; ip.write_text(json.dumps(idx))  # the old format
+            if rotate:
+                for i in range(card.LIVE_ROWS + 1):
+                    card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+                self.assertNotIn("task-ix", card.log_path(ws).read_text(), "precondition: rotated into the day archive")
+            fresh = ActivityStore(ws); fresh.apply(T("task-ix", "COMPLETED", ts=1_757_000_002.0))
+            self.assertEqual(len(fresh.load("task-ix").pending), 0)
+            sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+            self.assertEqual([x["rows"] for x in sums], [3], f"rotate={rotate}: pickup + waiting + replied, the lost count restored")
+
+    def test_recovery_across_the_format_change_counts_a_pid_rotated_twice_once(self):
+        # rotate() archives the oldest rows BEFORE replacing the live file: one failed replacement leaves
+        # them in both places and the next rotation archives them again; count identities, not copies.
+        import activity_rows
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+        store.apply(T("task-dup", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        store.apply(T("task-dup", "WAITING", ts=1_757_000_001.0, reason="approval"))
+        live = card.log_path(ws); real = os.replace; faults = []
+        def fail_live_once(src, dst):
+            if not faults and Path(dst) == live:
+                faults.append(1); raise OSError("one live-log replacement fault")
+            return real(src, dst)
+        with unittest.mock.patch.object(activity_rows.os, "replace", fail_live_once):
+            for i in range(card.LIVE_ROWS + 1):
+                try:
+                    card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+                except OSError:
+                    pass  # the producer that hit the fault; the rows it archived stay archived
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"more {i}", kind="notice", room=None, workspace=ws)
+        archived = [json.loads(l).get("pid") for p in live.parent.glob(f"{live.stem}.archive.*.jsonl") for l in p.read_text().splitlines()]
+        self.assertEqual((len(faults), archived.count("task-dup:1:1")), (1, 2), "precondition: the interrupted rotation archived the pickup twice")
+        ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-dup"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = "task-dup:1:2"; ip.write_text(json.dumps(idx))  # the old format
+        fresh = ActivityStore(ws); fresh.apply(T("task-dup", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-dup").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + waiting + replied: a pid archived twice counts once")
+
+    def test_a_rebuild_that_cannot_read_an_archive_leaves_the_row_owed_and_the_old_index_intact(self):
+        # The old writer counted two rotated rows; the rebuild's first archive read fails. Nothing may
+        # be published on partial evidence: the row stays owed, the index stays old-format, a retry lands.
+        import activity_rows
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+        store.apply(T("task-ar", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        store.apply(T("task-ar", "WAITING", ts=1_757_000_001.0, reason="approval"))
+        ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-ar"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = "task-ar:1:2"; ip.write_text(json.dumps(idx))  # the old format
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+        self.assertNotIn("task-ar", card.log_path(ws).read_text(), "precondition: both rows rotated")
+        real = Path.read_text; hits = []
+        def faulty(self_, *a, **k):
+            if ".archive." in self_.name and self_.exists() and not hits:
+                hits.append(str(self_))
+                raise OSError("one transient archive read failure")
+            return real(self_, *a, **k)
+        fresh = ActivityStore(ws)
+        with unittest.mock.patch.object(Path, "read_text", faulty):
+            fresh.apply(T("task-ar", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(hits and len(hits), 1, "the fault fired once")
+        self.assertEqual(len(fresh.load("task-ar").pending), 1, "the done row stays owed")
+        self.assertFalse(card.summaries_path(ws).exists(), "nothing published on partial evidence")
+        idx = json.loads(ip.read_text()); self.assertEqual((idx["task-ar"]["rows"], "applied" in idx["task-ar"]), (2, False), "old index intact")
+        ActivityStore(ws).apply(T("task-ar", "COMPLETED", ts=1_757_000_002.0))  # the retry, archive readable
+        self.assertEqual(len(ActivityStore(ws).load("task-ar").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + waiting + replied once the archive could be read")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.
@@ -342,6 +505,151 @@ class IdempotentProjection(unittest.TestCase):
         card.append("replied", kind="done", room="!r:s", task=t, done=True, workspace=self.ws, pid="task-i2:1:2")
         self.assertEqual(len(card.summaries_path(self.ws).read_text().splitlines()), 1, "one summary")
         self.assertEqual(self.rows(), ["picked up", "replied"])
+class Visibility(unittest.TestCase):
+    """Two fields, two questions: audience is who may receive, projection is what they see. Lifecycle
+    rows are the room's TASK_STATUS, observations are the owner's RUNTIME_DETAIL."""
+
+    def test_lifecycle_rows_are_the_rooms_task_status_and_observations_the_owners_detail(self):
+        s = TaskActivityState("t")
+        s, r1 = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m"))
+        s, r2 = reduce(s, E("t", "S1", 1, "Thinking", text="checking", ts=2))
+        s, r3 = reduce(s, E("t", "S1", 2, "InteractionRequired", text="pick one", ts=3))
+        self.assertEqual([(r["audience"], r["projection"]) for r in r1 + r2],
+                         [("room", "TASK_STATUS"), ("owner", "RUNTIME_DETAIL")])
+        self.assertEqual([(r["audience"], r["projection"]) for r in r3], [("room", "TASK_STATUS")],
+                         "the WAITING transition an observation caused is still lifecycle")
+
+    def test_the_shared_projection_carries_no_summary_and_the_private_one_does(self):
+        s = TaskActivityState("t")
+        s, _ = reduce(s, T("t", "RUNNING", ts=1, message_event_id="$m", worker="air"))
+        s, _ = reduce(s, E("t", "S1", 1, "Working", text="Running tests", ts=2))
+        shared, private = bus.shared_projection(s), bus.private_projection(s)
+        self.assertEqual((shared["phase"], shared["worker"], shared["audience"], shared["projection"]),
+                         ("RUNNING", "air", "room", "TASK_STATUS"))
+        self.assertNotIn("summary", shared)
+        self.assertEqual((private["summary"], private["seq"], private["audience"], private["projection"]),
+                         ("Running tests", 1, "owner", "RUNTIME_DETAIL"))
+
+    def test_the_writer_persists_audience_and_projection_on_the_row(self):
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir()
+        ActivityStore(ws).apply(T("t", "QUEUED", ts=1, room="!r:s", message_event_id="$m"))
+        row = json.loads(card.log_path(ws).read_text().splitlines()[-1])
+        self.assertEqual((row["audience"], row["projection"]), ("room", "TASK_STATUS"))
+        rec = card.append("x", kind="working", room=None, workspace=ws)
+        self.assertNotIn("audience", rec, "a row with no stated audience carries none: the client's rule applies")
+
+
+class Wiring(unittest.TestCase):
+    """The scheduler's emit points reach the bus: the CLI from shell, the manager and the outbox in-process."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "state").mkdir(); (self.ws / "tasks").mkdir()
+        (self.ws / "tasks" / "task-w1.txt").write_text(
+            "id: task-w1\nchannel_id: !r:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Fix it\nsource_message_id: $m1\nsource: ag2space\n")
+
+    def rows(self):
+        return [json.loads(l) for l in card.log_path(self.ws).read_text().splitlines()]
+
+    def test_cli_transitions_from_a_task_file_carry_room_sender_text_and_event(self):
+        for to in ("QUEUED", "RUNNING"):
+            self.assertEqual(bus.main(["transition", to, "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--workspace", str(self.ws)]), 0)
+        st = ActivityStore(self.ws).load("task-w1")
+        self.assertEqual((st.phase, st.room, st.sender, st.text, st.message_event_id), ("RUNNING", "!r:s", "@q:s", "Fix it", "$m1"))
+        self.assertEqual([(r["kind"], r["line"], r["task"]["event"]) for r in self.rows()],
+                         [("notice", "queued", "$m1"), ("processing", "picked up", "$m1")])
+
+    def test_cli_task_id_and_event_paths_and_a_parse_error_all_return_zero(self):
+        self.assertEqual(bus.main(["transition", "RUNNING", "--task-id", "task-c1", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(ActivityStore(self.ws).load("task-c1").phase, "RUNNING")
+        kind = bus.EVENT_KINDS[0]
+        self.assertEqual(bus.main(["event", "task-c1", kind, "--session", "S1", "--seq", "1", "--text", "hi", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(ActivityStore(self.ws).load("task-c1").seq, 1)
+        with unittest.mock.patch("sys.stderr", new=__import__("io").StringIO()):
+            self.assertEqual(bus.main(["transition", "NOT_A_PHASE", "--workspace", str(self.ws)]), 0)
+
+    def test_the_hitl_and_outbox_callers_survive_a_broken_bus(self):
+        # The delivery and HITL paths must never fail because the card could not be updated.
+        import hitl.manager as manager
+        import outbox
+        with unittest.mock.patch.object(bus, "ActivityStore", side_effect=RuntimeError("bus down")):
+            manager._activity(["task-h1"], "WAITING", "approval")
+            outbox._activity_completed("task-o9")
+        manager._activity([], "WAITING", "approval")
+        outbox._activity_completed("not-a-task")
+
+    def test_cli_never_fails_the_caller(self):
+        self.assertEqual(bus.main(["transition", "RUNNING", "--task-file", "/nonexistent/task-x.txt", "--workspace", str(self.ws)]), 0)
+        self.assertEqual(bus.main(["transition", "RUNNING", "--workspace", str(self.ws)]), 0)
+
+    def test_a_cancel_instruction_names_its_target(self):
+        self.assertEqual(bus.cancel_target("CANCEL_INSTRUCTION: stop processing task-abc12 if still in flight."), "task-abc12")
+        self.assertIsNone(bus.cancel_target("please cancel my subscription"))
+
+    def test_a_consolidated_completion_resolves_the_holder_event_from_its_task_file(self):
+        (self.ws / "tasks" / "task-h1.txt").write_text("id: task-h1\nchannel_id: !r:s\ntask: holder\nsource_message_id: $holder\n")
+        bus.main(["transition", "RUNNING", "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--workspace", str(self.ws)])
+        bus.main(["transition", "COMPLETED", "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--into-task", "task-h1", "--workspace", str(self.ws)])
+        self.assertEqual((self.rows()[-1]["line"], self.rows()[-1]["task"]["into"]), ("consolidated", "$holder"))
+
+    def test_a_queued_that_lands_after_its_running_is_history_not_a_regression(self):
+        # The emitter's QUEUED and RUNNING are independent processes: RUNNING (stamped later) can take
+        # the lock first. The earlier-stamped QUEUED still writes its row and never regresses the phase.
+        store = ActivityStore(self.ws)
+        st = store.apply(T("task-w1", "RUNNING", ts=10.0, message_event_id="$m1", room="!r:s"))
+        st = store.apply(T("task-w1", "QUEUED", ts=9.0))
+        self.assertEqual((st.phase, st.generation), ("RUNNING", 1))
+        self.assertEqual([(r["kind"], r["line"]) for r in self.rows()], [("processing", "picked up"), ("notice", "queued")])
+        st = store.apply(T("task-w1", "QUEUED", ts=9.0))  # replay: once
+        self.assertEqual(len(self.rows()), 2)
+        st = store.apply(T("task-w1", "QUEUED", ts=11.0))  # a later QUEUED is a replay by key: no row, no regression
+        self.assertEqual((st.phase, len(self.rows())), ("RUNNING", 2))
+
+    def test_the_hitl_manager_stays_silent_for_a_policy_answered_requirement(self):
+        import hitl.manager as hm
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase))
+        class Req:
+            blocked_task_ids = ["task-w1"]; kind = "permission"; status = "in_progress"; decided_by = hm.POLICY_DECIDER
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            if Req.decided_by != hm.POLICY_DECIDER and Req.status not in hm.TERMINAL_STATUSES:
+                hm._activity(Req.blocked_task_ids, "WAITING", Req.kind)
+        self.assertEqual(calls, [], "policy answered it: nobody is waiting")
+        src = open(os.path.join(_SRC, "hitl", "manager.py")).read()
+        self.assertIn("if req.decided_by != POLICY_DECIDER and req.status not in TERMINAL_STATUSES:", src)
+
+    def test_the_emitter_and_the_watcher_route_through_the_bus(self):
+        emit = open(os.path.join(_SRC, "task-emit.sh")).read()
+        watcher = open(os.path.join(_SRC, "watch-tasks-stream.sh")).read()
+        for phase in ("QUEUED", "RUNNING", "CANCELLED"):
+            self.assertIn(phase, emit, f"task-emit.sh does not transition {phase}")
+        self.assertIn("activity_bus.py", emit)
+        self.assertIn("transition FAILED", watcher)
+        self.assertNotIn("( python3 ", emit + watcher, "the watcher's resolved interpreter, never PATH's python3")
+        self.assertIn("--ts", emit, "each transition is stamped so ordering survives independent processes")
+        self.assertNotIn("activity.py", emit, "the emitter must not write rows around the bus")
+
+    def test_the_hitl_manager_marks_waiting_and_running(self):
+        import hitl.manager as hm
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase, item.reason))
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            hm._activity(["task-w1"], "WAITING", "selection")
+            hm._activity(["task-w1"], "RUNNING", "resolved")
+            hm._activity([], "WAITING", "none")
+        self.assertEqual(calls, [("task-w1", "WAITING", "selection"), ("task-w1", "RUNNING", "resolved")])
+
+    def test_the_outbox_marks_completed_for_task_results_only(self):
+        import outbox
+        calls = []
+        class FakeStore:
+            def apply(self, item): calls.append((item.task_id, item.to_phase))
+        with unittest.mock.patch.object(bus, "ActivityStore", lambda *a, **k: FakeStore()):
+            outbox._activity_completed("task-w1")
+            outbox._activity_completed("proactive-123")
+        self.assertEqual(calls, [("task-w1", "COMPLETED")])
 
 
 if __name__ == "__main__":

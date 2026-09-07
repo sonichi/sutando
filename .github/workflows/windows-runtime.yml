@@ -94,6 +94,15 @@ jobs:
         shell: bash
         run: bash tests/python-binary-windows.test.sh
 
+      - name: Verify ESLint diff scope
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/eslint-workflow-scope-gate.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'eslint-workflow-scope-gate.test.py failed' }
+
       - name: Validate startup and dispatcher with a Claude cmd shim
         shell: pwsh
         run: |
@@ -196,8 +205,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
           python tests/agent-activity.test.py
           if ($LASTEXITCODE -ne 0) { throw 'agent-activity.test.py failed' }
-          python tests/activity-bus.test.py Acceptance StateMachine
+          python tests/activity-bus.test.py Acceptance StateMachine Visibility Wiring
           if ($LASTEXITCODE -ne 0) { throw 'activity-bus.test.py failed' }
+          python tests/agent-availability.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'agent-availability.test.py failed' }
           python tests/core-input-watch-chat-escalation.test.py
           if ($LASTEXITCODE -ne 0) { throw 'core-input-watch-chat-escalation.test.py failed' }
           python tests/current-track-rotate.test.py
