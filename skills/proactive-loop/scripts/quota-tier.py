@@ -96,7 +96,14 @@ def main(argv=None) -> int:
     ap.add_argument("--reset7", help="7d reset, ISO")
     ap.add_argument("--reset7oi", help="top-tier (7d_oi) weekly reset, ISO")
     a = ap.parse_args(argv)
-    q = parse(sys.stdin.read())
+    try:
+        q = parse(sys.stdin.read())
+    except ValueError as e:
+        # No quota-state.json is a NORMAL state (credential proxy off), which
+        # health-check rates ok — so it must refuse like every other window.
+        print(f"quota-tier: cannot read quota windows ({e}); nothing to tier. "
+              f"Is the credential proxy running? Nothing guessed.", file=sys.stderr)
+        return 2
     now = datetime.datetime.now()
     r5 = datetime.datetime.fromisoformat(a.reset5) if a.reset5 else None
     r7 = datetime.datetime.fromisoformat(a.reset7) if a.reset7 else None
