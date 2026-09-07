@@ -1297,6 +1297,28 @@ def main() -> int:
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
     (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    check(rtc.proactive_room() == "!dm:example.org", "seeded for the malformed-registry case")
+    rtc._reenroll_identity = lambda: "@new-agent:example.org"  # re-enrolled while running
+    STATE["agents"] = "MALFORMED"  # the registry answers {"agents": null}
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "" and json.loads(rtc._routing_file().read_text())["identity"] == "@agent-t:example.org",
+          "a malformed registry answer after an identity change revives nothing: held, and the old reading stays bound to the old identity")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity with a healthy answer, the DM reading returns")
+    _inst = rtc.GATEWAY_INSTANCE; rtc.GATEWAY_INSTANCE = "dev"; _real_route = rtc._proactive_route; _calls = []
+    def _target_vanishes(body):  # peek sees an explicit room; the post-claim re-read sees an unaddressed body
+        _calls.append(1); return ("send", "!here:example.org" if len(_calls) == 1 else None, "rewritten after the peek")
+    rtc._proactive_route = _target_vanishes
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1g.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    rtc._post_proactive()
+    check(len(_calls) == 2 and len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1g.txt").exists(),
+          "a secondary hands back a file whose target vanished after the claim, whatever DM it has read")
+    rtc._proactive_route = _real_route; rtc.GATEWAY_INSTANCE = _inst; (rtc.RESULTS_DIR / "proactive-t1g.txt").unlink()
     STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
     rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
     rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state

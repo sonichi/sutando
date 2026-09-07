@@ -718,6 +718,7 @@ def _read_private_json(path: Path) -> "dict | None":
 
 def _gateway_owner() -> str:
     global _GATEWAY_OWNER_DM_HINT
+    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
     identity = _reenroll_identity()
     answer = _req("GET", "/v1/agents")
     agents = answer.get("agents") if isinstance(answer, dict) else None
@@ -3391,9 +3392,9 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
-                route == "send" and room_override is None and not proactive_room()):
-            # Hand back rather than eat: a foreign target seen only post-claim,
-            # or one that vanished with no default (room_id=None loses the body).
+                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+            # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
+            # and left an unaddressed body this instance may not own or cannot place.
             try:
                 claim.rename(f)
             except OSError:
