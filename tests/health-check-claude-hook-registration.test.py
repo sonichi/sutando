@@ -311,9 +311,12 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
         (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            # The default must track the installer's CURRENT archive shape. Pinning a
+            # literal here made all three over-trigger controls fail on the shape
+            # change itself rather than on any probe behaviour.
             "PreCompact": [{"hooks": [
                 {"command": archive_command or
-                 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
+                 f'bash {r}/src/archive-transcript.sh "$HOME/Desktop/sutando-conversations/"'},
                 {"command": handoff}]}],
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
@@ -402,13 +405,14 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         _ev, _marker, cmd = line.strip('"').split("|", 2)
         toks = self.hc._shell_tokens(self.hc._unwrap_installer_command(cmd))
         self.assertEqual(len(toks), 3, f"archive template did not tokenize cleanly: {toks}")
-        self.assertEqual(toks[0], "cp")
+        self.assertEqual(toks[0], "bash")
+        self.assertTrue(toks[1].endswith("/src/archive-transcript.sh"), toks[1])
         for t in toks:
             self.assertNotIn('"', t, f"stray quote survived tokenization: {t!r}")
 
-    def test_the_genuine_archive_cp_still_registers(self):
-        # Over-trigger control. The real command interpolates $HOME and $(date …),
-        # so this must not become a shape-pinning test that warns on healthy hosts.
+    def test_the_genuine_archive_command_still_registers(self):
+        # Over-trigger control. The real command interpolates $HOME, so this must not
+        # become a shape-pinning test that warns on healthy hosts.
         out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
         self.assertEqual(out["status"], "ok", out["detail"])
 
