@@ -72,6 +72,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Location", "http://evil.example/steal")
                 self.end_headers(); return
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+        if self.path == "/v1/agents":
+            if STATE.get("agents") is None:
+                self.send_response(404); self.end_headers(); return
+            body = json.dumps({"agents": STATE["agents"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -1197,6 +1204,39 @@ def main() -> int:
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
 
+    # 3.5b the gateway's owner DM outranks the pinned room; the pin is the fallback (owner 2026-09-07)
+    os.environ["AGENT_MXID"] = "@agent-t:example.org"
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["checked"] = 0.0
+    (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
+          "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # no DM on the row
+    rtc._ROUTING["checked"] = 0.0
+    (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("to the pin\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!owner:example.org",
+          "no owner_dm_room on the row falls back to the pinned room")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["checked"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "refresh picks the DM up again")
+    STATE["agents"] = None  # the agents endpoint 404s: keep the last reading rather than drop to the pin
+    rtc._ROUTING["checked"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "an unreachable gateway keeps the last owner DM reading")
+    STATE["agents"] = []
+    rtc._ROUTING["checked"] = 0.0
+    rtc._ROUTING["owner_dm"] = ""
+    check(rtc.proactive_room() == "!owner:example.org", "no row at all falls back to the pinned room")
+    check(rtc.resolve_destination(rtc.CURRENT_ROOM, room_id="!here:example.org") == "!here:example.org"
+          and rtc.resolve_destination(rtc.SELECTED_MEMBERS, recipients=["@a:x", "@b:x"]) == ["@a:x", "@b:x"]
+          and rtc.resolve_destination(rtc.SYSTEM) == "!owner:example.org",
+          "the resolver answers every audience from one place")
+    (rtc.RESULTS_DIR / "proactive-t1d.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!here:example.org",
+          "a [channel:] redirect is the CURRENT_ROOM audience, untouched by the owner DM")
+    os.environ.pop("AGENT_MXID", None)
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the

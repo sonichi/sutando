@@ -1214,7 +1214,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if not PROACTIVE_ROOM:
+    room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
+    if not room:
         return 0
     if time.monotonic() < _HITL_BACKOFF["until"]:
         return 0
@@ -1236,7 +1237,7 @@ def _project_hitl(log=print) -> int:
         return 0
     try:
         done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       PROACTIVE_ROOM)
+                       room)
     except Exception:
         _hitl_backoff_bump(log)  # a raising sender is a refusal too
         raise
@@ -1323,6 +1324,48 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
+# connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
+_ROUTING: dict = {"owner_dm": "", "checked": 0.0}
+ROUTING_REFRESH_S = 300.0
+OWNER_PRIVATE = "owner_private"
+CURRENT_ROOM = "current_room"
+SELECTED_MEMBERS = "selected_members"
+SYSTEM = "system"
+
+
+def refresh_routing(force: bool = False) -> None:
+    """Pull the agent's routing state from the gateway; an unreachable gateway keeps the last reading."""
+    now = time.monotonic()
+    if not force and now - _ROUTING["checked"] < ROUTING_REFRESH_S:
+        return
+    _ROUTING["checked"] = now
+    try:
+        _gateway_owner()
+        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+    except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
+        pass
+
+
+def resolve_destination(audience: str, *, room_id: str | None = None, recipients: list | None = None):
+    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM (the pinned
+    room only until the gateway has answered once); CURRENT_ROOM is the triggering room; SELECTED_MEMBERS
+    are explicit recipients; SYSTEM is the configured destination."""
+    if audience == OWNER_PRIVATE:
+        refresh_routing()
+        return _ROUTING["owner_dm"] or PROACTIVE_ROOM or ""
+    if audience == CURRENT_ROOM:
+        return room_id or ""
+    if audience == SELECTED_MEMBERS:
+        return list(recipients or [])
+    if audience == SYSTEM:
+        return PROACTIVE_ROOM or ""
+    raise ValueError(f"unknown audience {audience!r}")
+
+
+def proactive_room() -> str:
+    """Owner-directed by default: a proactive message or an owner-private card goes to the owner."""
+    return resolve_destination(OWNER_PRIVATE)
 
 # Runtime self-report (#3279 verification layer 3): a host loader may inject
 # {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
@@ -3258,7 +3301,7 @@ def _post_proactive() -> None:
             continue
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
+        if route == "send" and peek_room is None and not proactive_room():
             continue
         if PROACTIVE_CLAIM_GATE is not None:
             try:
@@ -3289,7 +3332,7 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
-                route == "send" and room_override is None and not PROACTIVE_ROOM):
+                route == "send" and room_override is None and not proactive_room()):
             # Hand back rather than eat: a foreign target seen only post-claim,
             # or one that vanished with no default (room_id=None loses the body).
             try:
@@ -3328,7 +3371,7 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
-        dest_room = room_override or PROACTIVE_ROOM
+        dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
@@ -4103,6 +4146,7 @@ def main() -> None:
     backoff = 1
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
+    refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
