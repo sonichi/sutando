@@ -504,6 +504,72 @@ class CorePolicy(unittest.TestCase):
                          "no worker identity in the key")
 
 
+class LegacyKeyDomain(unittest.TestCase):
+    """The shipped provider key is opaque by contract: delegating its
+    derivation must not narrow which item_ids it accepts (reviewer P1)."""
+
+    def _core(self, td, item):
+        backend = DesignAClaimBackend(Path(td) / "root")
+        backend.publish(item, b"payload")
+        return backend, DeliveryCore(backend, _KeyProbe(), None)
+
+    def test_opaque_item_ids_keep_their_shipped_bytes(self):
+        # The outbox supports opaque ids via a digest-suffixed safe key, so a
+        # path separator reaches this derivation and must survive it verbatim.
+        for item in ("a/b", "a/b/c", "a\\b", "plain"):
+            with self.subTest(item=item):
+                self.assertEqual(idempotency_key(item), f"{item}#0")
+
+    def test_opaque_item_id_reaches_the_provider_through_the_real_core(self):
+        for item in ("a/b", "a/b/c"):
+            with self.subTest(item=item), tempfile.TemporaryDirectory() as td:
+                _, core = self._core(td, item)
+                core.deliver_one(item, b"payload")
+                self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
+                                 "provider saw a different key than was shipped")
+
+    def test_long_and_newline_item_ids_reach_the_provider_once(self):
+        # The cap ran BEFORE the opaque bypass, so these raised pre-claim on
+        # every drain and sat READY forever; the parent's domain was every string.
+        for item in ("x" * 199, "a\nb"):
+            with self.subTest(item=repr(item[:6])), tempfile.TemporaryDirectory() as td:
+                _, core = self._core(td, item)
+                core.deliver_one(item, b"payload")
+                core.deliver_one(item, b"payload")
+                self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
+                                 "expected exactly one provider call with the shipped key")
+
+    def test_empty_item_id_keeps_the_parent_domain_through_the_real_core(self):
+        # main accepted "" at publish and drained it under key "#0"; the real
+        # core must still reach the provider exactly once with that key.
+        item = ""
+        with tempfile.TemporaryDirectory() as td:
+            backend, core = self._core(td, item)
+            core.deliver_one(item, b"payload")
+            core.deliver_one(item, b"payload")
+            self.assertEqual(core.provider.calls, [(item, "#0")],
+                             "expected exactly one provider call with the shipped key")
+
+
+class _KeyProbe:
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def capabilities(self):
+        return ProviderCapabilities(reconcile_capable=False,
+                                    idempotent_send=True)
+
+    def deliver(self, item_id, payload, idempotency_key):
+        self.calls.append((item_id, idempotency_key))
+        return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                               provider_ref="probe", detail=None,
+                               destination="d")
+
+    def reconcile(self, attempt):
+        return None
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name in BACKENDS:
@@ -511,6 +577,7 @@ def load_tests(loader, tests, pattern):
                     {"backend_name": name})
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(loader.loadTestsFromTestCase(CorePolicy))
+    suite.addTests(loader.loadTestsFromTestCase(LegacyKeyDomain))
     return suite
 
 

@@ -168,6 +168,8 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_identity.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_identity_wheel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py

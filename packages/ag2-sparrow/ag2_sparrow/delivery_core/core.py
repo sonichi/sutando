@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..identity import legacy_idempotency_key
 from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
                        ProviderRefused, RecoverReport)
@@ -35,8 +36,13 @@ class RetryPolicy:
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
     """Stable per logical side effect; NEVER derived from claim material.
-    resend_epoch changes only on a DELIBERATE operator re-send."""
-    return f"{item_id}#{resend_epoch}"
+    resend_epoch changes only on a DELIBERATE operator re-send.
+
+    Derivation belongs to ag2_sparrow.identity, the single owner of identity
+    grammar; this stays the delivery core's public name for the same key. The
+    bytes are unchanged and must remain so — a provider has already seen them
+    for every item in flight."""
+    return legacy_idempotency_key(item_id, resend_epoch).value
 
 
 class DeliveryCore:
@@ -83,7 +89,10 @@ class DeliveryCore:
         return resolved.outcome, getattr(resolved, "destination", None)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
-        """Claim -> deliver -> classify -> complete, with retry accounting."""
+        """Derive -> claim -> deliver -> classify -> complete, with retries."""
+        # Derive BEFORE claiming: a key that cannot be derived must not leave
+        # this worker holding an item no drain will ever deliver.
+        key = idempotency_key(item_id)
         token = self.backend.claim(item_id, self.worker)
         if token is None:
             # No provider call either way, so nothing external is ambiguous.
@@ -91,7 +100,6 @@ class DeliveryCore:
             if self.backend.is_terminal(item_id):
                 return DrainResult(status=DrainStatus.TERMINAL)
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
-        key = idempotency_key(item_id)
         outcome, destination = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
