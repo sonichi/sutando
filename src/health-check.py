@@ -4900,34 +4900,24 @@ AGENT_ACTIVE_SEC = 30 * 60
 # the check this whole probe exists to make actionable (qingyun, #2445).
 NON_PROXY_RUNTIMES = {"codex"}
 
-# The two launch records are stamped by SEPARATE `date +%s` calls in the same
-# launcher — `src/agent/codex/cli/start-cli.sh:240` writes core-runtime.json and
-# :243 appends session-starts.log — so one launch can legitimately produce
-# started_at=N and session_started_at=N+1 if the second rolls between them. A
-# strict `<` then reads a CURRENT marker as stale and emits the exact false proxy
-# warning this check exists to suppress (qingyun, #2446).
-#
-# A few seconds of slack cannot mask a real previous-core marker: that marker is
-# separated from the next launch by the entire lifetime of the core that wrote it,
-# which is minutes at the very least. So the margin is generous on purpose — it
-# costs nothing on the true-positive side and closes the whole race, rather than
-# assuming the gap is exactly one second.
+# Absorbs the older launcher's two separate `date +%s` calls, which could write
+# started_at=N and session_started_at=N+1; a strict `<` reads that as stale.
 LAUNCH_RECORD_SKEW_SEC = 5
 
 
 def _runtime_may_skip_proxy() -> bool:
     """True when this core's runtime is not expected to produce Anthropic quota headers.
 
-    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
-    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
-    resolves), so its ABSENCE positively excludes Codex rather than merely being
-    unknown — which is why absence is treated as proxy-routed instead of silencing the
-    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
-    treated as non-proxy and stays silent: a corrupted status file must not manufacture
-    a health warning.
+    Read from `state/core-runtime.json`. BOTH launchers write it, through the shared
+    `src/core_runtime_marker.py`, and only once their session is verifiably live — so
+    ABSENCE no longer positively excludes Codex; it means no launcher stamped, which
+    now includes a launch that failed. Absence stays treated as proxy-routed rather
+    than silencing the check everywhere. An unreadable or malformed file cannot rule
+    Codex out, so it is treated as non-proxy and stays silent: a corrupted status file
+    must not manufacture a health warning.
 
-    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
-    this file and nothing resets it, so after a Codex -> Claude switch a stale
+    A marker left by a PREVIOUS core is ignored. Nothing resets this file, so after a
+    Codex -> Claude switch a stale
     `{"runtime": "codex"}` sits there describing a core that is no longer running
     (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
     silence this check on a host that IS proxy-routed — the mirror of the false
@@ -5079,10 +5069,11 @@ def _marker_predates_running_core(marker: dict) -> bool:
     evidence of staleness.
 
     The skew tolerance is IDENTITY-AWARE, and only sound that way. It exists solely
-    because the Codex launcher stamps the marker and the session line with two separate
-    `date +%s` calls (`src/agent/codex/cli/start-cli.sh:240` and `:242`), so one real
-    launch can record `started_at=N` and `session_started_at=N+1`. That case always
-    carries `"runtime":"codex"` on BOTH records. Granting the same margin when the
+    because the older launcher stamped the marker and the session line with two separate
+    `date +%s` calls, so one real launch could record `started_at=N` and
+    `session_started_at=N+1`. That case always carries the same `runtime` on BOTH
+    records. The shared writer makes the two equal by construction, so the margin now
+    only covers records predating it. Granting the same margin when the
     runtimes do not positively agree would swallow the fast Codex -> Claude switch: a
     stale Codex marker at N against a Claude launch at N+1 is a genuinely different core,
     and Claude is proxy-routed, so silencing it there hides stale quota telemetry
@@ -5090,8 +5081,8 @@ def _marker_predates_running_core(marker: dict) -> bool:
     independently reproduced on f887b2a7).
 
     So the margin applies only on a positive runtime match; otherwise the comparison is
-    strict. A Claude launch record carries no `runtime` field at all, which is exactly
-    the ambiguity that must NOT earn the tolerance.
+    strict. A record written before the shared writer carries no `runtime` field at
+    all, which is exactly the ambiguity that must NOT earn the tolerance.
     """
     try:
         started = float(marker.get("started_at"))

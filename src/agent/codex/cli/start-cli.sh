@@ -59,6 +59,18 @@ session_runtime() {
     | sed -n 's/^SUTANDO_CORE_RUNTIME=//p' || true
 }
 
+# Publish only once the session exists and is verifiably ours: a failed launch
+# must not replace a truthful marker for a runtime that never became live.
+stamp_runtime_codex() {
+  session_exists "$SESSION" || return 0
+  [ "$(session_runtime)" = "codex" ] || return 0
+  local _ws
+  _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$_ws" ] || return 0
+  "${PY:-python3}" "$REPO/src/core_runtime_marker.py" \
+    "$_ws" codex "$SESSION" "${1:-start-cli}" > /dev/null 2>&1 || true
+}
+
 # Codex is installed by the desktop app into ~/.npm-global/bin, which a login
 # shell does not necessarily have on PATH: .zprofile is written with the
 # bundled git and python3 but not this one. Put the known install dir on PATH
@@ -427,13 +439,6 @@ if ! command -v fswatch >/dev/null 2>&1; then
 fi
 
 apply_tmux_defaults
-if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
-  mkdir -p "$ws/state"
-  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json"
-  printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
-    "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    >> "$ws/state/session-starts.log"
-fi
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
@@ -445,6 +450,7 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
+    stamp_runtime_codex
   else
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi
@@ -462,6 +468,7 @@ else
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
+    stamp_runtime_codex
   else
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi

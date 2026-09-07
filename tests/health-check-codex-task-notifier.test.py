@@ -186,8 +186,8 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
                 self.assertEqual(tmux.calls, [])
 
     def test_non_codex_core_does_not_require_notifier(self):
-        # The Codex launcher owns core-runtime.json, so this file can remain
-        # stale after a config switch to Claude.
+        # Only a launch rewrites core-runtime.json, so it can still read "codex"
+        # after a config switch to Claude that has not relaunched yet.
         self.write_local_core(runtime="codex")
         tmux = FakeTmux(core_runtime="claude", panes=None)
         with (

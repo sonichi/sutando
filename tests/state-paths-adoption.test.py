@@ -191,6 +191,9 @@ ALLOWLIST = {
     # mention_gate.py: every path is composed FROM a caller-injected workspace
     # (bridge/CLI resolve it) — task_archive.py's caller-supplies-the-path rationale.
     "src/mention_gate.py",
+    # The writer never resolves the workspace — both launchers pass it in; a
+    # resolver import here would let it pick its own destination instead.
+    "src/core_runtime_marker.py",
 }
 
 

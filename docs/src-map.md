@@ -51,6 +51,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
+- **`core_runtime_marker.py`** — Sole writer of the marker and session-start log; launchers inject runtime/session/source.
 - **`crash-only.ts`** — crash-only.ts — voice-agent fatal-path helpers (design 1d; impl plan WS1 Steps 1–2, amendments R1/R2).
 - **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).

@@ -107,6 +107,27 @@ restore_shutdown_sentinel() {
   rm -f "$_SENTINEL_STASH" 2>/dev/null || true
   _SENTINEL_STASH=""
 }
+
+_RUNTIME_STASH=""
+# Paired with restore_runtime_marker: exec cannot roll back once it replaces us,
+# so the prior record is captured through the shared writer before we publish.
+stash_runtime_marker() {
+  _RUNTIME_STASH=""
+  _rw="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$_rw" ] || return 0
+  _RUNTIME_STASH="$("${PY:-python3}" "$REPO/src/core_runtime_marker.py" --stash "$_rw" 2>/dev/null)" \
+    || _RUNTIME_STASH=""
+}
+# Only reachable when exec FAILED: exec never returns on success.
+restore_runtime_marker() {
+  [ -n "$_RUNTIME_STASH" ] || return 0
+  _rw="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  "${PY:-python3}" "$REPO/src/core_runtime_marker.py" --restore "$_rw" "$_RUNTIME_STASH" \
+    > /dev/null 2>&1 \
+    || echo "start-cli.sh: the runtime claim may outlive the launch that failed" >&2
+  _RUNTIME_STASH=""
+}
+
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
@@ -668,6 +689,16 @@ ensure_core_monitor() {
   fi
 }
 
+# Must run on EVERY path that launches a core: the heal path exits before the
+# create path's stamp, and restart-core takes it. Schema/atomicity: shared writer.
+stamp_runtime_claude() {
+  local _ws
+  _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$_ws" ] || return 0
+  "${PY:-python3}" "$REPO/src/core_runtime_marker.py" \
+    "$_ws" claude "$SESSION" "${1:-start-cli}" > /dev/null 2>&1 || true
+}
+
 # Already running — attach if interactive, else exit cleanly. A managed core is
 # live when the tmux session exists AND a `claude --name sutando-core` process
 # runs under it (tmux_core_session_running). Re-running the script is idempotent:
@@ -728,6 +759,9 @@ if tmux_session_exists; then
   # Make the healed core the active window so attach/Console show it, not the
   # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
   tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
+  # A healed window IS a Claude launch — stamp it before the exits below, and
+  # before ensure_core_monitor, which cannot write its pid file until state/ exists.
+  stamp_runtime_claude "start-cli-heal"
   ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
   # child lives; poll before opening intake, same bound as the fresh-start path.
@@ -758,16 +792,8 @@ if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   brew install tmux 2>&1 | tail -3
 fi
 
-# Stamp the core session start into an append-only per-boot log. One JSONL
-# line per launch; consecutive entries bound each session's lifetime, which
-# is what session-recap tooling needs to pick the right transcript (owner
-# ask 2026-07-13). Best-effort: never block the launch on it.
-if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
-  mkdir -p "$_ws/state" 2>/dev/null || true
-  printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
-    "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    >> "$_ws/state/session-starts.log" 2>/dev/null || true
-fi
+# Published per launch path, not here: the detached path can verify the session
+# came up, so a failed launch must not replace a truthful marker.
 
 # Fall back to a bare `exec claude` if tmux is still missing.
 if ! command -v tmux > /dev/null 2>&1; then
@@ -779,7 +805,10 @@ if ! command -v tmux > /dev/null 2>&1; then
     exit 127
   fi
   stash_shutdown_sentinel
+  stash_runtime_marker
   clear_shutdown_sentinel
+  # exec replaces this process, so this is the last point that can publish.
+  stamp_runtime_claude "start-cli"
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e
@@ -789,7 +818,8 @@ if ! command -v tmux > /dev/null 2>&1; then
   _exec_rc=$?
   set -e
   restore_shutdown_sentinel
-  echo "  ⚠ claude failed to exec — shutdown sentinel restored, no core is live." >&2
+  restore_runtime_marker
+  echo "  ⚠ claude failed to exec — sentinel and runtime marker restored, no core is live." >&2
   exit "$_exec_rc"
 fi
 
@@ -834,6 +864,8 @@ if [ -t 1 ]; then
     exit 1
   fi
   clear_shutdown_sentinel
+  # Detached launch verified above, so publish only for a session that is live.
+  stamp_runtime_claude "start-cli"
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
@@ -860,6 +892,7 @@ else
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  stamp_runtime_claude "start-cli"   # verified live; a failed launch exited above
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
