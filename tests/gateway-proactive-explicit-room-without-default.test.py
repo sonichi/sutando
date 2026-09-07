@@ -69,7 +69,8 @@ def drain(body: str, default_room: str):
     posts: list[dict] = []
 
     def _fake_req(method, path, payload=None, timeout=None):
-        posts.append({"path": path, "payload": payload})
+        if method == "POST":  # the routing lookup is a GET, not a send
+            posts.append({"path": path, "payload": payload})
         return {"ok": True, "event_id": "$evt"}
 
     saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,

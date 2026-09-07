@@ -1204,30 +1204,44 @@ def main() -> int:
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
 
-    # 3.5b the gateway's owner DM outranks the pinned room; the pin is the fallback (owner 2026-09-07)
-    os.environ["AGENT_MXID"] = "@agent-t:example.org"
+    # 3.5b the owner DM comes from the gateway; the pin is bootstrap only (owner 2026-09-07)
+    _real_identity, _real_state = rtc._reenroll_identity, rtc._STATE
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"  # the row match, not an env var the CI box lacks
+    rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
-    rtc._ROUTING["checked"] = 0.0
     (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
-    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # no DM on the row
-    rtc._ROUTING["checked"] = 0.0
-    (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("to the pin\n")
+    check(json.loads(rtc._routing_file().read_text()).get("owner_dm") == "!dm:example.org",
+          "the reading is persisted under the state dir")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # the row lost its field
+    rtc._ROUTING["next"] = 0.0
+    (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("still to the dm\n")
     rtc._post_proactive()
-    check(STATE["room_posts"][-1]["room_id"] == "!owner:example.org",
-          "no owner_dm_room on the row falls back to the pinned room")
-    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
-    rtc._ROUTING["checked"] = 0.0
-    check(rtc.proactive_room() == "!dm:example.org", "refresh picks the DM up again")
-    STATE["agents"] = None  # the agents endpoint 404s: keep the last reading rather than drop to the pin
-    rtc._ROUTING["checked"] = 0.0
+    check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
+          "a row without owner_dm_room keeps the last owner DM reading, never the pin")
+    STATE["agents"] = []  # a gateway that answers but has no row for me
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "an answer without my row keeps the last owner DM reading")
+    STATE["agents"] = None  # the agents endpoint 404s
+    rtc._ROUTING["next"] = 0.0
     check(rtc.proactive_room() == "!dm:example.org", "an unreachable gateway keeps the last owner DM reading")
-    STATE["agents"] = []
-    rtc._ROUTING["checked"] = 0.0
-    rtc._ROUTING["owner_dm"] = ""
-    check(rtc.proactive_room() == "!owner:example.org", "no row at all falls back to the pinned room")
+    check(0 < rtc._ROUTING["next"] - time.time() <= rtc.ROUTING_RETRY_S,
+          "a failed refresh books the short retry, not the five-minute window")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm2:example.org"}]
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm2:example.org", "a later answer with a new DM replaces the reading")
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a restart: memory gone, the file not
+    STATE["agents"] = []  # and the gateway has lost my registration meanwhile
+    check(rtc.proactive_room() == "!dm2:example.org", "after a restart the persisted reading survives an answer without my row")
+    rtc._routing_file().unlink()
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a fresh bridge with no reading ever
+    STATE["agents"] = None
+    check(rtc.proactive_room() == "!owner:example.org", "with no reading ever, the pin bootstraps")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["next"] = 0.0
     check(rtc.resolve_destination(rtc.CURRENT_ROOM, room_id="!here:example.org") == "!here:example.org"
           and rtc.resolve_destination(rtc.SELECTED_MEMBERS, recipients=["@a:x", "@b:x"]) == ["@a:x", "@b:x"]
           and rtc.resolve_destination(rtc.SYSTEM) == "!owner:example.org",
@@ -1236,7 +1250,9 @@ def main() -> int:
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!here:example.org",
           "a [channel:] redirect is the CURRENT_ROOM audience, untouched by the owner DM")
-    os.environ.pop("AGENT_MXID", None)
+    STATE["agents"] = None  # teardown: the sections below expect a gateway that knows nothing of routing
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
+    rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the

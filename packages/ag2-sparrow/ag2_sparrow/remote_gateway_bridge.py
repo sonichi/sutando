@@ -1326,31 +1326,60 @@ PROACTIVE_ROOM = (
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "checked": 0.0}
+_ROUTING: dict = {"owner_dm": "", "next": 0.0, "loaded": False}
 ROUTING_REFRESH_S = 300.0
+ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
 CURRENT_ROOM = "current_room"
 SELECTED_MEMBERS = "selected_members"
 SYSTEM = "system"
 
 
-def refresh_routing(force: bool = False) -> None:
-    """Pull the agent's routing state from the gateway; an unreachable gateway keeps the last reading."""
-    now = time.monotonic()
-    if not force and now - _ROUTING["checked"] < ROUTING_REFRESH_S:
+def _routing_file() -> Path:
+    return _STATE / f"owner-routing{_INST_SUFFIX}.json"
+
+
+def _load_routing() -> None:
+    if _ROUTING["loaded"]:
         return
-    _ROUTING["checked"] = now
+    _ROUTING["loaded"] = True
+    try:
+        _ROUTING["owner_dm"] = str(json.loads(_routing_file().read_text(encoding="utf-8")).get("owner_dm") or "")
+    except (OSError, ValueError, AttributeError):
+        pass  # no reading yet: the pinned room bootstraps until the gateway answers with one
+
+
+def refresh_routing(force: bool = False) -> None:
+    """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    _load_routing()
+    now = time.time()
+    if not force and now < _ROUTING["next"]:
+        return
     try:
         _gateway_owner()
-        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
     except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
-        pass
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _GATEWAY_OWNER_DM_HINT and _GATEWAY_OWNER_DM_HINT != _ROUTING["owner_dm"]:
+        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+        try:
+            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"owner_dm": _GATEWAY_OWNER_DM_HINT}), encoding="utf-8")
+            os.replace(tmp, f)
+        except OSError:
+            pass  # the reading still holds in memory; the next refresh writes again
+    _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
-def resolve_destination(audience: str, *, room_id: str | None = None, recipients: list | None = None):
-    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM (the pinned
-    room only until the gateway has answered once); CURRENT_ROOM is the triggering room; SELECTED_MEMBERS
-    are explicit recipients; SYSTEM is the configured destination."""
+def resolve_destination(audience: str, *, room_id: str | None = None,
+                        recipients: list | None = None) -> str | list[str]:
+    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM, the last
+    reading kept across restarts and outages; until one exists it is the pinned room, whose privacy
+    is the operator's choice, not a gateway guarantee. CURRENT_ROOM is the triggering room;
+    SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
+    configured destination."""
     if audience == OWNER_PRIVATE:
         refresh_routing()
         return _ROUTING["owner_dm"] or PROACTIVE_ROOM or ""
