@@ -475,31 +475,35 @@ and loads whichever repo it reviews.
     A `checked-hash` cache does not collide at all, so a SURVIVED under one is not explained
     by this lesson; an `unchecked-hash` cache is worse than described, because it never
     revalidates and so stays stale even when size and mtime both change.
-    *Measured on `scripts/my-stale-approvals.py` + its suite, five mutants, two arms:*
+    *Re-derived on `scripts/my-stale-approvals.py` (11,285 B at `fcbd3539`) + its 45-test suite.
+    Mutating one line each, the five variants are 11,259 / 11,286 / 11,286 / 11,259 / 11,268 B —
+    two same-size pairs, m1/m4 and m2/m3:*
 
     ```
-    mutant                       cache KEPT   cache CLEARED   mutant size
-    m1 parent-count -> True      CAUGHT       CAUGHT          8217
-    m2 staleness   > -> >=       SURVIVED     SURVIVED        8270
-    m3 commits_after > -> >=     SURVIVED     CAUGHT          8270   <-- flips
-    m4 decisive drops bar        SURVIVED     SURVIVED        8243
-    m5 decisive drops blockers   CAUGHT       CAUGHT          8252
+    mutant                       alone, cache CLEARED   after a same-size predecessor
+    m1 parent-count -> True      CAUGHT                 -
+    m2 staleness   > -> >=       SURVIVED               -   (genuinely uncaught)
+    m3 commits_after > -> >=     CAUGHT                 SURVIVED   <-- the collision
+    m4 decisive drops bar        CAUGHT                 -
+    m5 decisive drops blockers   CAUGHT                 -
     ```
 
-    The only mutant that flips is **inside** the colliding pair — m3 — while its partner m2
-    (same 8270 bytes) and the three distinctly-sized mutants are unchanged. That asymmetry
-    *localizes* the cause to the colliding pair, which is what makes the cache hypothesis worth
-    testing; it does not by itself rule out flakiness, because a stochastic or input-correlated
-    failure need not move mutants at random sizes. What establishes the cause is the direct
-    pair of controls — stale bytecode kept vs. cache cleared — not the shape of the table.
-    **m2 and m4 survive a CLEARED cache, so they are not artifacts** — the suite genuinely does
-    not catch `staleness > -> >=` or the dropped-bar mutation. Only m3's SURVIVED was false.
-    That is stated explicitly because a reader who takes "cache collision" as the explanation for every
-    SURVIVED here would discard two real uncaught mutations along with the artifact. m3's
-    mutation is caught by a test *named for it* — `test_a_commit_AT_the_approval_timestamp_does_not_count_as_after`, docstring "Pins the boundary so widening `>` to `>=` cannot pass
-    silently" — so the harness reported SURVIVED about a mutant the suite catches by design.
-    Acting on that report meant nearly replacing a deliberate documented semantic with its
-    opposite, in the name of rigour.
+    **The flip is not a property of m3. It is a property of m3 written after m2** — same byte
+    length, same `int(st_mtime)`, cache not cleared between them. Run alone against a cleared
+    cache, m3 is CAUGHT; run immediately after its same-size partner, the suite executes m2's
+    compiled bytes and reports SURVIVED about a mutation the suite catches by design, by a test
+    named for it (`test_a_commit_AT_the_approval_timestamp_does_not_count_as_after`, docstring
+    "Pins the boundary so widening `>` to `>=` cannot pass silently").
+
+    That distinction is the practical warning, and it is why a harness matters more than a rule:
+    a loop that restores the pristine file between mutants never collides, because the pristine
+    size differs from every mutant's. A loop that goes mutant-to-mutant does collide, and only
+    for the same-size pairs. So the danger is not "mutation testing is unreliable" — it is
+    "consecutive same-size variants share a cache entry", which a per-mutant restore removes.
+
+    **m2's SURVIVED is real and must not be swept up in this.** Against a cleared cache it still
+    survives: the suite genuinely does not catch `staleness > -> >=`. A reader who blames the
+    cache for every SURVIVED here would discard a true uncaught mutation along with the artifact.
     **Cure — and one obvious candidate is not one.** `PYTHONDONTWRITEBYTECODE=1` (and `-B`) stops
     *writing* a `.pyc`, never *reading* one, so it does nothing once a cache exists — which is the
     normal state, because the ordinary suite run before you start mutating leaves one. Measured on
