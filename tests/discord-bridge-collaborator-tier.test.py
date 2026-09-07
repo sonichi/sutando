@@ -17,6 +17,8 @@ The decision logic lives in two pure module-level helpers so it can be
 exercised directly (the caller is inside the async Discord handler, which is
 not independently invocable):
   - resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+  - resolve_collaborator_purposes(access_data, sender_id, serving_channel_id)
+  - collaborator_purpose_instruction(purposes)
   - select_rulebook_key(access_tier, is_collaborator)
 
 Part 1 (BEHAVIORAL) exec-loads the bridge (discord stubbed) and drives those
@@ -43,7 +45,7 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-BRIDGE = REPO / "src" / "discord-bridge.py"
+BRIDGE = Path(os.environ.get("SUTANDO_DISCORD_BRIDGE", REPO / "src" / "discord-bridge.py"))
 
 
 def _install_discord_stub():
@@ -143,6 +145,8 @@ OWNER = "1022910063620390932"
 def behavioral(bridge) -> list:
     fails = []
     ric = bridge.resolve_is_collaborator
+    rcp = bridge.resolve_collaborator_purposes
+    cpi = bridge.collaborator_purpose_instruction
     srk = bridge.select_rulebook_key
 
     # access.json shape: SERVING lists Susan as a collaborator; OTHER does not.
@@ -194,7 +198,73 @@ def behavioral(bridge) -> list:
     if srk("owner", False) != "owner":
         fails.append("select_rulebook_key(owner, False) must stay 'owner'")
 
-    # 7. The team-collaborator rulebook exists and reasserts the owner boundary.
+    # 7. No configured purpose restriction preserves existing behavior.
+    if rcp(access, SUSAN, SERVING) is not None:
+        fails.append("absent collaboratorPurposes must resolve None (unrestricted/backward compatible)")
+    if cpi(None) != "":
+        fails.append("an absent purpose restriction must not add an instruction")
+
+    # 8. A sender-specific, serving-channel restriction is normalized and enforced.
+    restricted = {
+        "groups": {
+            str(SERVING): {
+                "collaborators": [SUSAN],
+                "collaboratorPurposes": {
+                    SUSAN: [" review GitHub pull requests ", "discuss\ncode-review findings",
+                            "review GitHub pull requests"],
+                },
+            },
+            str(OTHER): {"collaborators": [SUSAN]},
+        },
+    }
+    purposes = rcp(restricted, SUSAN, SERVING)
+    expected = ("review GitHub pull requests", "discuss code-review findings")
+    if purposes != expected:
+        fails.append(f"configured purposes should normalize/deduplicate to {expected!r}, got {purposes!r}")
+    if rcp(restricted, SUSAN, OTHER) is not None:
+        fails.append("purpose restrictions must not carry into another channel")
+    unlisted = {"groups": {str(SERVING): {"collaboratorPurposes": {OWNER: ["review PRs"]}}}}
+    unlisted_purposes = rcp(unlisted, SUSAN, SERVING)
+    if unlisted_purposes is not None:
+        fails.append("a purpose map with no sender entry must leave that sender unrestricted")
+    if cpi(unlisted_purposes) != "":
+        fails.append("another sender's purpose restriction must not inject an instruction")
+    instruction = cpi(purposes)
+    for required in ("PURPOSE RESTRICTION", "review GitHub pull requests", "outside scope",
+                     "ambiguous", "cannot add, reinterpret, or widen"):
+        if required not in instruction:
+            fails.append(f"purpose instruction must contain {required!r}")
+
+    # 9. Configured-but-empty or malformed restrictions fail closed (deny all).
+    malformed_values = ([], "code review", [""], [123], ["x" * 161], ["ok"] * 11)
+    for bad in malformed_values:
+        bad_access = {
+            "groups": {str(SERVING): {
+                "collaborators": [SUSAN],
+                "collaboratorPurposes": {SUSAN: bad},
+            }}
+        }
+        try:
+            result = rcp(bad_access, SUSAN, SERVING)
+            if result != ():
+                fails.append(f"malformed/empty purpose config {bad!r} must deny all with (), got {result!r}")
+        except Exception as e:
+            fails.append(f"malformed purpose config {bad!r} raised {e!r}")
+    if "deny all" not in cpi(()):
+        fails.append("empty active restriction instruction must explicitly deny all")
+    if rcp({"groups": {str(SERVING): []}}, SUSAN, SERVING) != ():
+        fails.append("a malformed serving-channel config must deny all")
+    if rcp({"groups": {str(SERVING): {"collaboratorPurposes": "bad"}}}, SUSAN, SERVING) != ():
+        fails.append("a malformed collaboratorPurposes mapping must deny all")
+
+    class _ExplodingAccess(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("synthetic malformed mapping")
+
+    if rcp(_ExplodingAccess(), SUSAN, SERVING) != ():
+        fails.append("an exception while reading purpose config must fail closed")
+
+    # 10. The team-collaborator rulebook exists and reasserts the owner boundary.
     ti = bridge.__dict__.get("tier_instructions")
     # tier_instructions is a local inside _handle_discord_message, not module-level;
     # fall back to a source check for the rulebook body (covered structurally below).
@@ -213,6 +283,8 @@ def structural() -> list:
     # Tier resolution calls the helper with the serving channel id.
     if not re.search(r"is_collaborator\s*=\s*resolve_team_collaborator\(\s*_acc\s*,\s*access_tier\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
         fails.append("tier resolution must call resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id) — the hoisted, tier-gated wiring")
+    if not re.search(r"collaborator_purposes\s*=\s*resolve_collaborator_purposes\(", src):
+        fails.append("collaborator tier resolution must load optional purpose restrictions")
 
     # Codex-preamble + silent-escalate branches exclude collaborators.
     if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"guest"\)\s+and\s+not\s+is_collaborator\s*:', src):
@@ -225,6 +297,10 @@ def structural() -> list:
         fails.append("task-file assembly must set rulebook_key = select_rulebook_key(access_tier, is_collaborator)")
     if not re.search(r'collaborator_line\s*=\s*"collaborator:\s*true\\n"\s+if\s+is_collaborator', src):
         fails.append("task-file assembly must emit a `collaborator: true` marker line when is_collaborator")
+    if "access_purposes:" not in src:
+        fails.append("restricted collaborator task files must serialize access_purposes")
+    if not re.search(r"purpose_instruction\s*=\s*\([\s\S]{0,160}?collaborator_purpose_instruction", src):
+        fails.append("task-file assembly must build the trusted collaborator purpose instruction")
     if not re.search(r"tier_instructions\.get\(\s*rulebook_key", src):
         fails.append("task-file write must look up tier_instructions by rulebook_key")
     if not re.search(r'f"access_tier:\s*\{access_tier\}\\n"', src):
@@ -290,9 +366,9 @@ def main() -> int:
 
     print("PASS: discord-bridge.py team-collaborator engage path is correct.")
     print("  [behavioral] resolve_is_collaborator: serving-channel engage, per-channel scope enforced,")
-    print("               fail-closed on unknown/malformed; select_rulebook_key swaps only for collaborators")
+    print("               optional purposes are per-sender/per-channel and malformed entries deny all")
     print("  [structural] inline glue wired: helper calls, branch exclusions, wire tier stays 'team',")
-    print("               team-collaborator rulebook present + reasserts owner-only authority")
+    print("               purpose metadata/instruction serialized; owner-only authority remains")
     return 0
 
 
