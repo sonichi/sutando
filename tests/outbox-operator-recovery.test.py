@@ -275,6 +275,49 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertTrue((results / f"{ITEM}.txt").exists(),
                             "requeue with no flag must still restore the body")
 
+    def test_a_failed_restore_is_recoverable_by_re_running(self):
+        """Interrupt exactly BETWEEN the two commits, then retry.
+
+        `requeue_item` commits PARKED -> QUEUED and `restore()` moves the body;
+        they are separate commits. Gating the restore on the REQUEUED transition
+        meant a restore that raised left the record QUEUED with the body still
+        quarantined, and every retry answered `not-parked` and skipped the
+        restore — the user's result stranded outside every drain, permanently,
+        while the operator was told the recovery had happened.
+        """
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            live = results / f"{ITEM}.txt"
+
+            real = uq.restore
+            outbox_cli.undelivered_quarantine.restore = \
+                lambda *a, **k: (_ for _ in ()).throw(OSError("simulated rename failure"))
+            try:
+                with self.assertRaises(OSError):
+                    outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            finally:
+                outbox_cli.undelivered_quarantine.restore = real
+
+            # the record moved, the body did not: the half-committed state
+            self.assertEqual((outbox.read_item(root, ITEM) or {}).get("status"), "QUEUED")
+            self.assertFalse(live.exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
+            # the retry must COMPLETE the recovery, not refuse it
+            rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 0, "a retry that restored the body did work, so not 3")
+            self.assertTrue(live.exists(), "the body must be back in the drain's view")
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 0)
+
+    def test_a_retry_with_nothing_to_do_still_reports_nothing_to_do(self):
+        """The exit code must not become 0 for every already-queued item, or the
+        idempotent re-run loses the distinction the code exists to carry."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 0)
+            self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 3,
+                             "second run restored nothing and moved nothing")
+
     def test_outcome_distinguishes_absent_from_refused(self):
         """`None` for both left the operator unable to tell 'the body is gone'
         from 'a newer reply is already queued'."""

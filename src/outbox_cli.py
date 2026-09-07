@@ -94,16 +94,19 @@ def cmd_requeue(args) -> int:
         operator=args.operator or _default_operator(),
         reason=args.reason)
     payload = {"item_id": args.item_id, "result": result.value}
-    if result is outbox.RequeueOutcome.REQUEUED:
-        payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
-        # The record is only half the recovery: the BODY was moved out of the
-        # drain's view, and nothing re-reads the quarantine directory.
+    # NOT_PARKED too, not just REQUEUED: the two halves commit separately, so
+    # gating the restore on the transition strands the body on every retry.
+    restored = False
+    if result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
+        if result is outbox.RequeueOutcome.REQUEUED:
+            payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
         results_dir = args.results_dir or Path(args.root).parent
         outcome, path = undelivered_quarantine.restore(results_dir, args.item_id)
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
+        restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
     _emit(payload, args.json)
-    if result is outbox.RequeueOutcome.REQUEUED:
+    if result is outbox.RequeueOutcome.REQUEUED or restored:
         return 0
     return 2 if result is outbox.RequeueOutcome.ABSENT else 3
 
