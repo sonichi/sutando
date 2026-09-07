@@ -264,10 +264,8 @@ class CallSitePassesTheResolvedTranscript(unittest.TestCase):
         the call. A re-typed copy could not observe the argument bug."""
         text = SCRIPT.read_text()
         assign = re.search(r'^TRANSCRIPT="\$1".*$', text, re.M)
-        # Resolution moved into src/hook_transcript_path.sh (#4001) so the two
-        # hooks that parse a payload share one reader. Still EXTRACTED, never
-        # re-typed — that is what lets this observe an argument bug at the real
-        # call site. REPO is supplied below so the sourced helper resolves.
+        # Still EXTRACTED, never re-typed — that is what observes a call-site bug.
+        # REPO is supplied below so the sourced helper resolves.
         parse = re.search(r'^__TP_HELPER=.*?^unset __TP_HELPER$', text, re.S | re.M)
         call = re.search(r'^record_compaction_event .*$', text, re.M)
         for name, m in (("assignment", assign), ("stdin parse", parse), ("call site", call)):
