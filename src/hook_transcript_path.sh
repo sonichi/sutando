@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+#!/bin/bash
 # Shared resolver for a Claude Code hook's transcript path. Source, don't exec.
 #
 # Claude Code passes transcript_path via stdin JSON ONLY — there is no
