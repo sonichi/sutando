@@ -328,8 +328,10 @@ print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', []) for h 
 ")"
 ok "operator's custom transcript-archive command survives re-run" \
    "$(echo "$CCMDS" | grep -q 'CUSTOM_TRANSCRIPT_PATH' && echo 0 || echo 1)"
+# Match OUR script, not just the destination: the operator's custom command above
+# also names sutando-conversations, so a destination-only grep passes vacuously.
 ok "our archive hook is still installed alongside it" \
-   "$(echo "$CCMDS" | grep -q '"\$TRANSCRIPT_PATH".*sutando-conversations' && echo 0 || echo 1)"
+   "$(echo "$CCMDS" | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
 ok "and the repo-path hook is still installed on the same event" \
    "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
 rm -rf "$CROOT"
