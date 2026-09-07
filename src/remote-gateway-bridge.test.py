@@ -1216,8 +1216,22 @@ def main() -> int:
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
-    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "owner_dm": "!dm:example.org"},
-          "the reading is persisted under the state dir, bound to this identity")
+    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org"},
+          "the reading is persisted under the state dir, bound to this identity and this gateway")
+    _real_replace = rtc.os.replace; _faults = []
+    def _fail_routing_once(src, dst):
+        if not _faults and Path(dst) == rtc._routing_file():
+            _faults.append(1); raise OSError("one cache publication fault")
+        return _real_replace(src, dst)
+    rtc._routing_file().unlink(); rtc._ROUTING.update(persisted="", next=0.0)
+    rtc.os.replace = _fail_routing_once
+    check(rtc.proactive_room() == "!dm:example.org" and not rtc._routing_file().exists()
+          and 0 < rtc._ROUTING["next"] - time.time() <= rtc.ROUTING_RETRY_S,
+          "a failed cache publication keeps the reading in memory and books the short retry")
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org" and rtc._routing_file().exists(),
+          "the next refresh publishes the same unchanged reading; a failed write is retried, not skipped")
+    rtc.os.replace = _real_replace
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # the row lost its field
     rtc._ROUTING["next"] = 0.0
     (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("still to the dm\n")
@@ -1242,6 +1256,10 @@ def main() -> int:
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)
     check(rtc.proactive_room() == "", "a persisted reading bound to another identity is not mine: held")
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    _real_url = rtc.URL; rtc.URL = "http://other-gateway.example.org"  # the same agent, repointed
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    check(rtc.proactive_room() == "", "a persisted reading from another gateway is not this gateway's: held")
+    rtc.URL = _real_url
     rtc._routing_file().unlink()
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a fresh bridge with no reading ever
     n_posts = len(STATE["room_posts"])

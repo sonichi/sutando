@@ -1327,7 +1327,7 @@ PROACTIVE_ROOM = (
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "next": 0.0, "loaded": False, "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "next": 0.0, "loaded": False, "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1348,8 +1348,9 @@ def _load_routing() -> None:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity():  # another agent's reading is nobody's
-        _ROUTING["owner_dm"] = str(d.get("owner_dm") or "")
+    # another agent's reading, or this agent's reading from another gateway, authorizes nothing
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
 
 
 def refresh_routing(force: bool = False) -> None:
@@ -1364,16 +1365,19 @@ def refresh_routing(force: bool = False) -> None:
     except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
         _ROUTING["next"] = now + ROUTING_RETRY_S
         return
-    if _GATEWAY_OWNER_DM_HINT and _GATEWAY_OWNER_DM_HINT != _ROUTING["owner_dm"]:
+    if _GATEWAY_OWNER_DM_HINT:
         _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
         try:
             f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
             tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "owner_dm": _GATEWAY_OWNER_DM_HINT}),
-                           encoding="utf-8")
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
             os.replace(tmp, f)
+            _ROUTING["persisted"] = _ROUTING["owner_dm"]
         except OSError:
-            pass  # the reading still holds in memory; the next refresh writes again
+            _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
+            return
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
