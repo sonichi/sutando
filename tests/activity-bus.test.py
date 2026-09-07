@@ -409,6 +409,36 @@ class IdempotentProjection(unittest.TestCase):
             sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
             self.assertEqual([x["rows"] for x in sums], [3], f"rotate={rotate}: pickup + waiting + replied, the lost count restored")
 
+    def test_a_rebuild_that_cannot_read_an_archive_leaves_the_row_owed_and_the_old_index_intact(self):
+        # The old writer counted two rotated rows; the rebuild's first archive read fails. Nothing may
+        # be published on partial evidence: the row stays owed, the index stays old-format, a retry lands.
+        import activity_rows
+        ws = Path(tempfile.mkdtemp()); (ws / "state").mkdir(); store = ActivityStore(ws)
+        store.apply(T("task-ar", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))
+        store.apply(T("task-ar", "WAITING", ts=1_757_000_001.0, reason="approval"))
+        ip = card.index_path(ws); idx = json.loads(ip.read_text()); e = idx["task-ar"]
+        self.assertEqual(e["rows"], 2); e.pop("applied"); e["last_pid"] = "task-ar:1:2"; ip.write_text(json.dumps(idx))  # the old format
+        for i in range(card.LIVE_ROWS + 1):
+            card.append(f"noise {i}", kind="notice", room=None, workspace=ws)
+        self.assertNotIn("task-ar", card.log_path(ws).read_text(), "precondition: both rows rotated")
+        real = Path.read_text; hits = []
+        def faulty(self_, *a, **k):
+            if ".archive." in self_.name and self_.exists() and not hits:
+                hits.append(str(self_))
+                raise OSError("one transient archive read failure")
+            return real(self_, *a, **k)
+        fresh = ActivityStore(ws)
+        with unittest.mock.patch.object(Path, "read_text", faulty):
+            fresh.apply(T("task-ar", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(hits and len(hits), 1, "the fault fired once")
+        self.assertEqual(len(fresh.load("task-ar").pending), 1, "the done row stays owed")
+        self.assertFalse(card.summaries_path(ws).exists(), "nothing published on partial evidence")
+        idx = json.loads(ip.read_text()); self.assertEqual((idx["task-ar"]["rows"], "applied" in idx["task-ar"]), (2, False), "old index intact")
+        ActivityStore(ws).apply(T("task-ar", "COMPLETED", ts=1_757_000_002.0))  # the retry, archive readable
+        self.assertEqual(len(ActivityStore(ws).load("task-ar").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [3], "pickup + waiting + replied once the archive could be read")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.

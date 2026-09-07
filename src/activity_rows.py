@@ -117,8 +117,8 @@ def _task_rows_on_disk(workspace: Path | None, task_id: str, since: float, until
     for name in dict.fromkeys(names):
         try:
             lines = live.with_name(name).read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
+        except FileNotFoundError:
+            continue  # a day the span names but nothing rotated into; any other failure propagates
         for line in lines:
             try:
                 rec = json.loads(line)
