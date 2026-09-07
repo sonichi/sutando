@@ -90,8 +90,8 @@ caps this file and refuses date stamps in it).
    (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
 7.5. **Memory index.** Before adding a row to `MEMORY.md`:
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>"` (0 safe · 1 refuse,
-   casualty named · 2 cannot answer). On refusal run `scripts/memory-hub-containment.py` before trimming;
-   which rows go is the owner's call.
+   casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+   from its hub before removing it; which rows go is the owner's call.
 8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
    placed by importance (only the top 5 render anywhere), and assert with the reader:
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
