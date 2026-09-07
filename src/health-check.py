@@ -3169,6 +3169,112 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+# A git write holds index.lock for well under a second; five minutes is ~300x
+# the slowest legitimate case measured here and 113x below the incident's 9.4h.
+GIT_LOCK_STALE_S = 300.0
+
+# `git rev-parse --local-env-vars` (git 2.50) plus the two discovery bounds. Any
+# of these inherited makes git answer for ANOTHER repository despite `-C`.
+GIT_REPO_SELECTION_ENV = frozenset({
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
+
+def _git_dir(repo: Path) -> "Path | None":
+    """The real .git directory, as GIT resolves it.
+
+    Asking git is what proves the answer belongs to THIS checkout. A
+    hand-parsed `gitdir:` pointer can name any existing directory, and the
+    probe would then advise removing an unrelated repository's lock; git's own
+    resolver also sidesteps `Path.resolve()`, whose symlink-loop RuntimeError
+    would escape an always-on sweep. Unresolvable means no remedy, not a guess.
+    """
+    import subprocess as _sp
+    env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_SELECTION_ENV}
+    try:
+        r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
+                    capture_output=True, text=True, timeout=20, env=env)
+    except (OSError, ValueError, _sp.SubprocessError):
+        return None
+    # Only the record terminator comes off: a trailing space in the path is
+    # significant, and stripping it names a different directory.
+    raw = r.stdout.removesuffix("\n")
+    if r.returncode != 0 or not raw:
+        return None
+    try:
+        g = Path(raw)
+        return g if g.is_dir() else None
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def check_git_index_lock(repo_dir: "Path | None" = None,
+                         now: "float | None" = None) -> dict:
+    """Warn when `.git/index.lock` has outlived any plausible git operation.
+
+    A crashed or killed git leaves the lock behind, and from then on EVERY
+    write in that checkout fails with "Another git process seems to be
+    running" — add, checkout, commit, stash, rebase. Nothing else surfaces it:
+    the failure is per-command, so a seat that does not happen to write sees a
+    healthy repo, and a seat that does write reads the message as a transient
+    collision and retries later. Measured on the live checkout 2026-09-04: a
+    ZERO-byte lock, 9.4 hours old, with no process holding it, had been
+    silently failing git writes for the whole night.
+
+    Read-only and warn-only: a lock younger than the threshold is an ordinary
+    in-flight write, and an unreadable repo is not this probe's business.
+    """
+    name = "git-index-lock"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    gitdir = _git_dir(repo)
+    if gitdir is None:
+        return {"name": name, "status": "ok",
+                "detail": f"{repo} is not a git checkout — nothing to lock"}
+    lock = gitdir / "index.lock"
+    try:
+        # lstat, not stat: a DANGLING symlink named index.lock still occupies the
+        # directory entry, so git's exclusive create fails while stat() says absent.
+        st = lock.lstat()
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no index.lock — git writes are unblocked"}
+    except (OSError, ValueError, RuntimeError) as e:
+        # Only a missing file is an absence; any other stat error leaves the
+        # question unanswered, and "unblocked" would state an unmade measurement.
+        return {"name": name, "status": "warn",
+                "detail": (f"cannot tell whether {lock} exists "
+                           f"({type(e).__name__}: {getattr(e, 'strerror', None) or e}) "
+                           f"— this is UNMEASURED, not a clean checkout")}
+    age = (now if now is not None else time.time()) - st.st_mtime
+    if age < 0:
+        # A future mtime makes every age comparison meaningless, and "in flight"
+        # would report an in-progress write this probe never observed.
+        return {"name": name, "status": "warn",
+                "detail": (f"{lock} is dated {-age:.0f}s in the FUTURE — its age is UNMEASURED, "
+                           f"not young; git writes may be blocked. Check the clock, then inspect "
+                           f"the lock by hand")}
+    if age < GIT_LOCK_STALE_S:
+        return {"name": name, "status": "ok",
+                "detail": f"index.lock present but only {age:.0f}s old — a git write is in flight"}
+    hrs = age / 3600.0
+    when = f"{hrs:.1f}h" if hrs >= 1 else f"{age / 60:.0f}m"
+    # A path with spaces splits into separate argv words, so an unquoted
+    # command would probe — and remove — operands that are not the lock.
+    q = shlex.quote(str(lock))
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{lock} is {when} old ({st.st_size} bytes) — every git write in this checkout "
+                   f"is failing with \"Another git process seems to be running\". Confirm nothing "
+                   f"holds it (`lsof {q}`; a real writer also keeps a git process in `ps`), "
+                   f"then `rm {q}`"),
+    }
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -11575,6 +11681,7 @@ def run_all_checks() -> list[dict]:
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_git_index_lock())
     checks.append(check_live_checkout_branch())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
