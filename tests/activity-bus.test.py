@@ -349,6 +349,22 @@ class IdempotentProjection(unittest.TestCase):
         sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
         self.assertEqual([x["rows"] for x in sums], [3])
 
+    def test_recovery_across_the_index_format_change_counts_the_old_pickup_once(self):
+        # The previous writer left rows=1 and last_pid (no applied map) with the pickup row still
+        # owed; the new writer's replay must carry that evidence over, not count the pickup again.
+        store = ActivityStore(self.ws)
+        store.apply(T("task-up", "RUNNING", ts=1_757_000_000.0, message_event_id="$m"))  # row, ack, index landed
+        ip = card.index_path(self.ws); idx = json.loads(ip.read_text()); e = idx["task-up"]
+        self.assertEqual(e["rows"], 1); e.pop("applied"); e["last_pid"] = "task-up:1:1"  # the old format on disk
+        ip.write_text(json.dumps(idx))
+        st = store.load("task-up"); st.pending = [{"kind": "processing", "line": "picked up", "ts": 1_757_000_000.0, "room": "!r:s",
+                                                   "task": {"id": "task-up"}, "done": False, "pid": "task-up:1:1", "attempts": 1}]
+        store.save(st)  # the drained snapshot never published: the pickup is still owed
+        fresh = ActivityStore(self.ws); fresh.apply(T("task-up", "COMPLETED", ts=1_757_000_002.0))
+        self.assertEqual(len(fresh.load("task-up").pending), 0)
+        sums = [json.loads(l) for l in card.summaries_path(self.ws).read_text().splitlines()]
+        self.assertEqual([x["rows"] for x in sums], [2], "pickup + replied, the replayed pickup counted once")
+
     def test_a_fresh_row_never_reads_the_archive(self):
         # Bounded cost: the archive is consulted only on a replay. Fresh bus rows and hook rows pay
         # the live-log read they always paid, and nothing more, however large the day file grows.

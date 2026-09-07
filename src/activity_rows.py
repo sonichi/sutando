@@ -179,6 +179,10 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
             # generation's applied high-water mark, saved with the count in the same record.
             gen, emitted = _pid_counter(pid)
             applied = dict(e.get("applied") or {})
+            if not applied and e.get("last_pid"):  # an entry the previous writer left: its evidence carries over
+                old_gen, old_emitted = _pid_counter(e["last_pid"])
+                if old_gen is not None:
+                    applied[old_gen] = old_emitted
             if not landed or emitted > int(applied.get(gen, 0)):
                 e["rows"] = int(e.get("rows", 0)) + 1
             if gen is not None:
