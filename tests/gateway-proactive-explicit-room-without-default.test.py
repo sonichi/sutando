@@ -78,15 +78,11 @@ def drain(body: str, default_room: str):
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
     gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = default_room, _fake_req, None
     gb._ROUTING.update(owner_dm=default_room, loaded=True, next=gb.time.time() + 3600)  # the owner DM reading
-    gb._ROUTING.update(owner_dm=default_room, loaded=True, next=gb.time.time() + 3600)  # the owner DM reading
-    gb._ROUTING.update(owner_dm=default_room, loaded=True, next=gb.time.time() + 3600)  # the owner DM reading
     try:
         gb._post_proactive()
     finally:
         (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
          gb._req, gb.PROACTIVE_CLAIM_GATE) = saved
-        gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
-        gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
         gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
     return posts, sorted(p.name for p in tmp.iterdir() if p.is_file())
 
