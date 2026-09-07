@@ -131,11 +131,20 @@ def durable_endpoints(entry: dict) -> set:
     if not isinstance(dm_id, (str, int, type(None))):
         dm_id = None
     out = set()
-    if stand and room:
+    # Identity is what the row declares; route completeness is durable_endpoint's.
+    # Gating here made one person read as two and satisfy the two-reviewer minimum.
+    if stand:
         out.add(stand)
-    if dm_id and entry.get("home_channel"):
+    if dm_id:
         out.add(f"discord:{dm_id}")
     return out
+
+
+def _routable(entry: dict, endpoint: str) -> bool:
+    """Whether THIS endpoint can actually be sent on — the half identity drops."""
+    if endpoint.startswith("discord:"):
+        return bool(entry.get("home_channel"))
+    return bool(entry.get("room"))
 
 
 def durable_endpoint(entry: dict) -> "str | None":
@@ -144,7 +153,7 @@ def durable_endpoint(entry: dict) -> "str | None":
     Selects from the plural rather than re-deriving: a second copy of the
     normalisation drifts from the one the park writes.
     """
-    eps = durable_endpoints(entry)
+    eps = {e for e in durable_endpoints(entry) if _routable(entry, e)}
     # Matrix first, preserving the route these rows have always been sent on.
     return next((e for e in sorted(eps) if not e.startswith("discord:")),
                 next(iter(sorted(eps)), None))
