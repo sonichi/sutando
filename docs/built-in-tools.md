@@ -62,6 +62,49 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"  
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
+**Google Contacts — writable in practice, but NOT via a contract Google supports.** The entry above
+is macOS Contacts and is lookup-only. It is not the only contacts path: on 2026-09-04 an agent that
+had been told no write path existed created a contact on a live Google account using **only the Gmail
+app password already held for IMAP/SMTP** — `PROPFIND` returned 207, `PUT` of a vCard returned 201,
+and a `GET` read it back (#3903).
+
+**Read that as an observation, not as Google's credential contract.** Google's own CardDAV
+documentation specifies OAuth 2.0 with a registered application, tells clients to begin at
+`https://www.googleapis.com/.well-known/carddav` rather than hardcoding a discovered URI, and
+documents `POST` of a vCard as the insert operation (`PUT` being the update path). The app-password
+Basic-auth flow below matches none of that. It is legacy behaviour that happened to work once, on one
+account, and Google can withdraw it without notice.
+
+So: **probe before you rely on it, and never present it to the owner as a supported integration.**
+
+```bash
+# 1. DISCOVER — do not hardcode the principal URL; Google says it can change.
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PROPFIND \
+     https://www.googleapis.com/.well-known/carddav -H 'Depth: 0'
+# 2. PROBE the collection you discovered. 207 = this legacy path is still open for this account;
+#    401/403 = it is not — stop, and say so, rather than assuming the 2026-09-04 result still holds.
+BASE="<collection URL from step 1>"     # observed then: .../carddav/v1/principals/$USER_EMAIL/lists/default/
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PROPFIND "$BASE" -H 'Depth: 1'
+# 3. CREATE. Google documents POST for insert; PUT with `If-None-Match: *` is what was observed to
+#    work, and is create-only, so a retry cannot silently overwrite an existing card.
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PUT "$BASE<uid>.vcf" \
+     -H 'Content-Type: text/vcard; charset=utf-8' -H 'If-None-Match: *' \
+     --data-binary @contact.vcf
+curl -su "$USER_EMAIL:$APP_PASSWORD" "$BASE<uid>.vcf"                      # read it back
+```
+
+Get the app password from the vault (`secret-vault.py get <KEY>`); never inline it. If the probe in
+step 2 fails, the supported route is OAuth 2.0 against the People API or CardDAV with a registered
+client — build that rather than retrying Basic auth with the owner's secret.
+
+**⚠ The general rule this entry exists to teach: a credential's reach is not the name of the tool you
+got it for.** A Google app password is accepted by IMAP and SMTP, and — as above — was accepted by
+CardDAV. Before telling the owner "I have no way to do X", spend one probe on what your *held
+credentials* actually reach, rather than answering from what this catalog happens to list. Answering
+from the catalog is how a capability that already existed gets reported as missing. The probe is also
+what keeps the answer honest in the other direction: it distinguishes "this works" from "this worked
+once for someone else."
+
 **iMessage** — send and read iMessages:
 ```bash
 imsg send --to "+14155551234" --text "Hello!"    # send message
