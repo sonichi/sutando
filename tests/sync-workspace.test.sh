@@ -332,6 +332,74 @@ fi
 
 # ============================================================================
 echo
+echo "==== Test 2c: a PARTIAL per-host build_log is withheld from the push, then rolled forward ===="
+# Publish root once cleanly so the per-host copy is an owned, recorded snapshot.
+printf 'seeded build log\n' > "$FIXTURE_WS/build_log.md"
+run_sync --push-only >/dev/null 2>&1 || true
+PARTIAL_DST="$FIXTURE_WS/hosts/$HOST/build_log.md"
+if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
+  echo "  OK: precondition — per-host copy published from root"; pass=$((pass+1))
+else
+  echo "  FAIL: precondition — per-host copy not published from root"; fail=$((fail+1))
+fi
+# Grow root past one block, then a one-block RLIMIT_FSIZE on the --replace/--rollforward
+# interpreters only (via the `sutando-config.sh python-bin` resolver) makes every in-place write stop short.
+awk 'BEGIN{for(i=0;i<200;i++)printf "vault-visible line %04d ........................................\n", i}' \
+  >> "$FIXTURE_WS/build_log.md"
+SHIM_DIR="$TEST_ROOT/fsize-shim"; mkdir -p "$SHIM_DIR"
+cat > "$SHIM_DIR/python3" <<SHIM
+#!/bin/bash
+case "\$2" in --replace|--rollforward) ulimit -S -f 1 ;; esac
+exec "$(command -v python3)" "\$@"
+SHIM
+chmod +x "$SHIM_DIR/python3"
+mv "$FIXTURE_REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/sutando-config.real.sh"
+cat > "$FIXTURE_REPO/scripts/sutando-config.sh" <<WRAP
+#!/bin/bash
+case "\$1" in python-bin) echo "$SHIM_DIR/python3"; exit 0 ;; esac
+exec bash "$FIXTURE_REPO/scripts/sutando-config.real.sh" "\$@"
+WRAP
+chmod +x "$FIXTURE_REPO/scripts/sutando-config.sh"
+VAULT_BEFORE=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+partial_out=$(run_sync --push-only 2>&1 || true)
+mv -f "$FIXTURE_REPO/scripts/sutando-config.real.sh" "$FIXTURE_REPO/scripts/sutando-config.sh"
+assert_contains "the tick says why it is not pushing" "not pushing this tick" "$partial_out"
+VAULT_AFTER=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+if [ "$VAULT_BEFORE" = "$VAULT_AFTER" ]; then
+  echo "  OK: the vault branch did NOT advance while the per-host copy was partial"; pass=$((pass+1))
+else
+  echo "  FAIL: a partial per-host build_log was pushed ($VAULT_BEFORE -> $VAULT_AFTER)"; fail=$((fail+1))
+fi
+dst_n=$(wc -c < "$PARTIAL_DST" | tr -d ' '); root_n=$(wc -c < "$FIXTURE_WS/build_log.md" | tr -d ' ')
+if [ "$dst_n" -gt 0 ] && [ "$dst_n" -lt "$root_n" ] && head -c "$dst_n" "$FIXTURE_WS/build_log.md" | cmp -s - "$PARTIAL_DST"; then
+  echo "  OK: the per-host copy is a strict prefix of root (partial, recoverable)"; pass=$((pass+1))
+else
+  echo "  FAIL: the per-host copy is not a partial prefix of root (dst=$dst_n root=$root_n)"; fail=$((fail+1))
+fi
+# The next tick, with a working interpreter, arrives a scheduler interval later (900s, past
+# the 10-minute stage grace) and must still roll forward and push the whole file.
+touch -t 202601010000 "$PARTIAL_DST".snap.* "$(dirname "$PARTIAL_DST")/.build_log.snapshot-sha.next"
+rollfwd_out=$(run_sync --push-only 2>&1 || true)
+if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
+  echo "  OK: the next tick rolled the per-host copy forward to the whole root"; pass=$((pass+1))
+else
+  echo "  FAIL: the per-host copy was not rolled forward: $rollfwd_out"; fail=$((fail+1))
+fi
+VAULT_ROLLED=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+if [ "$VAULT_ROLLED" != "$VAULT_AFTER" ]; then
+  echo "  OK: the roll-forward tick pushed"; pass=$((pass+1))
+else
+  echo "  FAIL: the roll-forward tick did not push: $rollfwd_out"; fail=$((fail+1))
+fi
+if [ "$(git --git-dir="$FIXTURE_VAULT" ls-tree -r --name-only "$HOST_BRANCH" | grep -c 'build_log\.md\.snap\.')" = "0" ]; then
+  echo "  OK: no staged copy reached the vault"; pass=$((pass+1))
+else
+  echo "  FAIL: a staged copy was vaulted"; fail=$((fail+1))
+fi
+rm -rf "$SHIM_DIR"
+
+# ============================================================================
+echo
 echo "==== Test 3: idempotent re-init ===="
 out_reinit=$(run_sync --init 2>&1)
 if echo "$out_reinit" | grep -q "already a git repo"; then
@@ -1444,6 +1512,54 @@ case "$t28_noop" in
   *"previously-unpushed"*) echo "  FAIL: re-pushed when remote already up to date: $t28_noop"; fail=$((fail+1)) ;;
   *) echo "  FAIL: unexpected no-op output: $t28_noop"; fail=$((fail+1)) ;;
 esac
+
+# ============================================================================
+echo
+echo "==== Test 29: reserved snapshot temps never reach the vault on the DEFAULT path, even with an operator-edited exclude ===="
+# The default (bidirectional) tick commits local edits BEFORE the pull; an operator-edited exclude
+# is kept as-is, so it may lack the built-in denies. The guard must hold at that boundary too.
+t29_run() {  # $1 root  $2 host  $3 operator|canonical  -> prints "<snap in vault> <repair in vault> <build_log in vault>"
+  local root="$1" host="$2" mode="$3" vault="$1/vault.git" ws="$1/ws" br="refs/heads/host/$2/t29ws" repo="$1/repo"
+  # Own fixture repo: hosts/*/ is carried only when the config lists it (the shared fixture does not).
+  mkdir -p "$ws/hosts/$host" "$repo/scripts" "$repo/src"; git init -q --bare "$vault"; git init -q "$repo"; touch "$repo/CLAUDE.md"
+  cp "$FIXTURE_REPO/scripts/"*.sh "$repo/scripts/"; cp "$FIXTURE_REPO/src/sutando_config.py" "$repo/src/"
+  printf '%s\n' '{"workspace":{"path":"${REPO_DIR}/workspace"},"vault":{"enabled":false,"sync":{"include":["notes/","build_log.md","hosts/*/"],"exclude":[]}}}' > "$repo/sutando.config.json"
+  local envv=(SUTANDO_REPO_DIR="$repo" SUTANDO_WORKSPACE="$ws" SUTANDO_TEST_MODE=1 SUTANDO_WS_ID_OVERRIDE=t29ws SUTANDO_HOST_OVERRIDE="$host" SUTANDO_SYNC_LOCK_DIR="$root/lock.d")
+  env "${envv[@]}" bash "$repo/scripts/sync-workspace.sh" --vault-url "$vault" --init >/dev/null 2>&1
+  if [ "$mode" = operator ]; then
+    # An exclude from before the denies existed, with one operator rule so the refresh is refused.
+    grep -v 'snap\.??????\|repair\.??????' "$ws/.git/info/exclude" > "$ws/.git/info/exclude.new" && mv "$ws/.git/info/exclude.new" "$ws/.git/info/exclude"
+    echo '!my/operator/rule' >> "$ws/.git/info/exclude"
+  fi
+  printf 'log\n'  > "$ws/hosts/$host/build_log.md"
+  printf 'temp\n' > "$ws/hosts/$host/build_log.md.snap.AB12cd"
+  printf 'sha\n'  > "$ws/hosts/$host/.build_log.snapshot-sha.repair.CD34ef"
+  SUTANDO_FORCE_SYNC=1 env "${envv[@]}" bash "$repo/scripts/sync-workspace.sh" --vault-url "$vault" >/dev/null 2>&1
+  local a=0 b=0 c=0
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/build_log.md.snap.AB12cd" 2>/dev/null && a=1
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/.build_log.snapshot-sha.repair.CD34ef" 2>/dev/null && b=1
+  git --git-dir="$vault" cat-file -e "$br:hosts/$host/build_log.md" 2>/dev/null && c=1
+  echo "$a $b $c"
+}
+T29_OP="$TEST_ROOT/t29-operator"; mkdir -p "$T29_OP"
+t29_op="$(t29_run "$T29_OP" t29host operator)"
+if [ "$t29_op" = "0 0 1" ]; then
+  echo "  OK: operator-edited exclude, default path: build_log vaulted, neither reserved temp is (snap repair log = $t29_op)"; pass=$((pass+1))
+else
+  echo "  FAIL: operator-edited exclude, default path: snap repair log = $t29_op (want 0 0 1)"; fail=$((fail+1))
+fi
+if grep -q '!my/operator/rule' "$T29_OP/ws/.git/info/exclude" && ! grep -q 'snap\.??????' "$T29_OP/ws/.git/info/exclude"; then
+  echo "  OK: ...and the operator's exclude was left as-is (rule kept, denies still absent) — the guard, not the exclude, did it"; pass=$((pass+1))
+else
+  echo "  FAIL: the operator's exclude was rewritten, so this run did not exercise the guard"; fail=$((fail+1))
+fi
+T29_CN="$TEST_ROOT/t29-canonical"; mkdir -p "$T29_CN"
+t29_cn="$(t29_run "$T29_CN" t29ctl canonical)"
+if [ "$t29_cn" = "0 0 1" ]; then
+  echo "  OK: control — canonical exclude, default path: same outcome (snap repair log = $t29_cn)"; pass=$((pass+1))
+else
+  echo "  FAIL: control — canonical exclude: snap repair log = $t29_cn (want 0 0 1)"; fail=$((fail+1))
+fi
 
 # ============================================================================
 echo

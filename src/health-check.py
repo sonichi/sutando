@@ -1896,7 +1896,10 @@ def _carrier_carveout_patterns() -> "set[str]":
     failure mode #2566 was opened for.
     """
     patterns = {
-        # Hard-deny block — keep in step with sync-workspace.sh:461-482.
+        # Keep in step with sync-workspace.sh's generator. The snapshot temp is
+        # denied on purpose; omitting it read a crash temp as a dropped file.
+        "hosts/*/build_log.md.snap.??????",
+        "hosts/*/.build_log.snapshot-sha.repair.??????",
         ".env*", "*.heartbeat", "*.alive", "*.sentinel", "*.pid",
         "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
         "*.pem", "*.key", "*.p12", "*.pfx", "*.ppk", "*.keystore", "*.jks",

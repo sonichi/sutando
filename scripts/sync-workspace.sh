@@ -126,6 +126,11 @@ SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 unset _self
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# A bare `python3` can be the Xcode-CLT stub on a LaunchAgent PATH; resolve
+# through the repo's cascade. Empty when nothing resolves — callers decide.
+SYNC_PY="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+[ -n "$SYNC_PY" ] && [ -x "$SYNC_PY" ] || SYNC_PY=""
+
 # Load .env from the sutando workspace early — non-interactive shells (cron,
 # launchd) don't run user shell startup.
 if [ -f "$SCRIPT_PARENT/.env" ]; then
@@ -252,6 +257,10 @@ LOG="${SYNC_WORKSPACE_LOG:-${TMPDIR:-/tmp}/sync-workspace.log}"
 
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+# log() alone writes only to $LOG and the caller returns success, so a refusal
+# that stops backups indefinitely looks identical to a clean sync.
+warn_operator() { log "$1"; color_warn "$1"; }
 
 color_warn() {
     if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -550,6 +559,10 @@ _compose_exclude_content() {
 
     echo ""
     echo "# Hard-deny credentials regardless of carrier set"
+    # Cleanup runs only when control RETURNS from the replace, so a mid-stage kill
+    # leaves one under a carried hosts/*/ path that `git add -A` would vault.
+    echo "hosts/*/build_log.md.snap.??????"
+    echo "hosts/*/.build_log.snapshot-sha.repair.??????"
     echo ".env*"
     echo "*.heartbeat"
     echo "*.alive"
@@ -613,8 +626,34 @@ _exclude_rules_only() {
     grep -vE '^[[:space:]]*(#|$)' "$1" | sort
 }
 
-# A previously-generated exclude whose ONLY difference is carve-outs the shipped
-# config now adds is safe to refresh: no operator-authored rule is lost.
+# Operator-authored COMMENTS are content too: the rule comparison cannot see them,
+# so a refresh that drops one looks safe while discarding the operator's note.
+_exclude_comments_only() {
+    grep -E '^[[:space:]]*#' "$1" | sort
+}
+
+# Built-in deny rules this script owns and may migrate into an existing generated
+# file. Deliberately explicit: anything listed is adopted without operator review.
+_adoptable_builtin_denies() {
+    printf '%s\n' 'hosts/*/build_log.md.snap.??????' 'hosts/*/.build_log.snapshot-sha.repair.??????'
+}
+
+# A generated exclude differing ONLY by shipped carve-outs is safe to refresh.
+# Carry dropped comments forward: the rules refresh, the operator keeps theirs.
+_preserve_dropped_comments() {
+    # The marker is OURS: counting it as a dropped operator comment would nest each
+    # tick's marker under a fresh one and grow the file forever.
+    local marker='# --- preserved from the previous exclude (sync-workspace) ---'
+    local existing="$1" desired="$2" dropped
+    dropped="$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired") \
+        | grep -vxF -- "$marker" || true)"
+    [ -n "$dropped" ] || return 0
+    {
+        printf '\n%s\n' "$marker"
+        printf '%s\n' "$dropped"
+    } >> "$desired"
+}
+
 _is_safe_carveout_addition() {
     local existing="$1" desired="$2" shipped shipped_rules line path widened rc
     # Compare against the HOST-WIDENED existing content: the two safe migrations are
@@ -623,7 +662,6 @@ _is_safe_carveout_addition() {
     _widen_legacy_host_scope "$existing" > "$widened"
     existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
     # Compare against what the composer EMITS, not the raw config value: a
     # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
     shipped_rules=""
@@ -631,9 +669,13 @@ _is_safe_carveout_addition() {
         [ -n "$path" ] || continue
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
-    shipped="$shipped_rules"
+    # The script-owned deny merges unconditionally: it only ever excludes MORE,
+    # and `vault.sync.exclude: []` is a supported value that must not gate it.
+    shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
+    [ -n "$(printf '%s' "$shipped" | grep -vE '^[[:space:]]*$')" ] || { rm -f "$widened"; return 1; }
     rc=0
-    # Refuse if the refresh would DROP any rule the existing file carries.
+    # Refuse if the refresh would DROP any RULE the existing file carries.
+    # Comments are not a refusal reason — _preserve_dropped_comments carries them.
     if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
         rc=1
     else
@@ -708,9 +750,11 @@ generate_exclude() {
         if ! grep -qE '^[^#]' "$exclude_path" 2>/dev/null; then
             log "generate_exclude: existing $exclude_path is stock comments only; overwriting"
         elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
+            _preserve_dropped_comments "$exclude_path" "$tmp_path"
             log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
             color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
         elif _is_safe_carveout_addition "$exclude_path" "$tmp_path"; then
+            _preserve_dropped_comments "$exclude_path" "$tmp_path"
             log "generate_exclude: refreshed a previously-generated exclude with shipped carve-outs only"
             color_warn "sync-workspace: added shipped carve-out(s) to the existing exclude file; no operator rule was removed"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
@@ -770,6 +814,19 @@ _enforce_carrier_set_pre() {
         log "_enforce_carrier_set_pre: untracked $_untracked_n newly-excluded file(s) from the vault index"
         echo "sync-workspace: carrier-set enforcement untracked $_untracked_n file(s) that exclude rules no longer cover (content stays on disk; untrack propagates via vault)" >&2
     fi
+}
+
+# The reserved snapshot temps stay out of every commit whatever the exclude file says: an
+# operator-edited file is kept as-is (refused refresh), so it may predate the built-in denies.
+_unstage_reserved_temps() {
+    local _p _n=0
+    while IFS= read -r -d '' _p; do
+        git rm -q --cached -- "$_p" >/dev/null 2>&1 || true
+        _n=$((_n + 1))
+    done < <(git diff --cached --name-only -z --diff-filter=AM -- \
+        'hosts/*/build_log.md.snap.??????' 'hosts/*/.build_log.snapshot-sha.repair.??????' 2>/dev/null)
+    [ "$_n" -gt 0 ] && log "_unstage_reserved_temps: kept $_n reserved snapshot temp(s) out of the commit"
+    return 0
 }
 
 # Carrier-set enforcement, post-stage half — refuse credential-shaped files
@@ -853,13 +910,22 @@ _refuse_foreign_host_deletions() {
 # reader prefer a stale snapshot over the live root file.
 #
 # Secret-safe: copies ONLY access.json, never the sibling .env (bot tokens).
-# Non-fatal by construction: every step tolerates failure and the function
-# returns 0, so a snapshot hiccup can never block the push.
+
+# Config copies are best-effort (return 0). A PARTIAL build_log copy returns 3 and the
+# caller withholds that tick's push rather than vault a truncated log.
 _snapshot_per_host_config() {
     local _cfg
     _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
+
+    # An interrupted stage cannot clean up after itself: host-scoped, past the grace window,
+    # and never while a live intent names it (the scheduler tick outlives the grace; recovery decides).
+    [ -f "$_host_dir/.build_log.snapshot-sha.next" ] ||
+    find "$_host_dir" -maxdepth 1 -type f -name 'build_log.md.snap.??????' \
+        -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
+    find "$_host_dir" -maxdepth 1 -type f -name '.build_log.snapshot-sha.repair.??????' \
+        -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
 
     if [ -f "$_cfg/settings.json" ]; then
         cp -p "$_cfg/settings.json" "$_host_dir/settings.json" 2>/dev/null || true
@@ -875,14 +941,342 @@ _snapshot_per_host_config() {
         cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
     done
 
-    # build_log.md is per-host (F1 decision) but its loop-writer keeps it at the
-    # workspace root and reads it from there — so it's snapshot-model like the
-    # files above (live at root, backup here; nothing reads the hosts/ copy live,
-    # so no read/write skew). Its root entry is dropped from vault.sync.include
-    # in tandem with this (it was colliding across hosts as a bare carried path);
-    # this snapshot is what carries it per-host instead.
+    # Ownership is provenance, never mtime — the re-hash before the swap cannot see a
+    # writer holding an open fd. Prints the sha only for a lone 64-hex token.
+    _usable_sig_record() {
+        local _hex
+        _hex="$(od -An -v -tx1 -- "$1" 2>/dev/null | tr -d ' \n')"
+        printf '%s' "$_hex" | LC_ALL=C grep -qE '^(3[0-9]|6[1-6]){64}(0a)*$' || return 0
+        tr -d '\n' < "$1" 2>/dev/null
+    }
+    # With no record, writer direction comes only from the append-only relationship:
+    # root-live (dest is a prefix of root), host-live (root is a prefix of dest), diverged.
+    _append_only_direction() {
+        local _r="$1" _d="$2" _rn _dn
+        _rn="$(wc -c < "$_r" 2>/dev/null | tr -d ' ')"
+        _dn="$(wc -c < "$_d" 2>/dev/null | tr -d ' ')"
+        if [ -z "$_rn" ] || [ -z "$_dn" ]; then
+            echo diverged
+        elif [ "$_dn" -eq 0 ]; then
+            echo root-live           # an empty copy holds nothing that root could lose
+        elif [ "$_rn" -eq 0 ]; then
+            echo host-live
+        elif [ "$_dn" -le "$_rn" ] && head -c "$_dn" "$_r" | cmp -s - "$_d"; then
+            echo root-live
+        elif head -c "$_rn" "$_d" | cmp -s - "$_r"; then
+            echo host-live
+        else
+            echo diverged
+        fi
+    }
+    # Replace the destination's BYTES, never its inode (an open O_APPEND descriptor keeps landing).
+    # Exit 2 = refused under the lock; exit 3 = dst left a PREFIX of staged (--rollforward finishes it).
+    _replace_in_place() {
+        local _py="${SYNC_PY:-}"
+        if [ -z "$_py" ] || [ ! -f "$_py" ] || [ ! -x "$_py" ]; then
+            _py="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+        fi
+        [ -n "$_py" ] && [ -f "$_py" ] && [ -x "$_py" ] || return 1
+        "$_py" - "$@" <<'PY' 2>/dev/null
+import fcntl, hashlib, os, sys
+mode, src, dst = sys.argv[1:4]
+expected = sys.argv[4] if len(sys.argv) > 4 else None
+with open(src, "rb") as f:
+    data = f.read()
+fd = os.open(dst, os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with open(fd, "rb", closefd=False) as f:
+        cur = f.read()
+    if mode == "--replace":
+        # An empty `expected` means the caller saw NO destination: only a fresh, empty file qualifies.
+        if hashlib.sha256(cur).hexdigest() != expected and not (expected == "" and not cur):
+            sys.exit(2)
+        view = memoryview(data)
+    else:
+        if cur == data:
+            sys.exit(0)
+        # A short write leaves a prefix; anything else is not ours to finish. Only the
+        # missing suffix is written, so a second failure still leaves a longer prefix.
+        if not data.startswith(cur):
+            sys.exit(2)
+        view = memoryview(data)[len(cur):]
+    partial = mode != "--replace"
+    try:
+        if mode == "--replace":
+            os.ftruncate(fd, 0)
+            partial = True
+            os.lseek(fd, 0, os.SEEK_SET)
+        else:
+            os.lseek(fd, len(cur), os.SEEK_SET)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    except OSError:
+        sys.exit(3 if partial else 1)
+finally:
+    os.close(fd)
+PY
+    }
+    # fsync a path AND its directory: a rename is only durable once the parent
+    # directory entry is on disk.
+    _fsync_path_and_dir() {
+        # Resolve lazily too: this function is loaded standalone by its test, so
+        # it cannot assume the script-level SYNC_PY exists.
+        local _py="${SYNC_PY:-}"
+        if [ -z "$_py" ] || [ ! -f "$_py" ] || [ ! -x "$_py" ]; then
+            _py="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+        fi
+        # No verified interpreter -> no durability guarantee. Fail, never pretend.
+        [ -n "$_py" ] && [ -f "$_py" ] && [ -x "$_py" ] || return 1
+        "$_py" - "$1" <<'PY' 2>/dev/null || return 1
+import os, sys
+p = sys.argv[1]
+fd = os.open(p, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+d = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+try:
+    os.fsync(d)
+finally:
+    os.close(d)
+PY
+    }
+
+    # The staged copy whose bytes the intent names, if one survived; empty otherwise.
+    _staged_copy_matching() {
+        local _f
+        for _f in "$1".snap.??????; do
+            [ -f "$_f" ] || continue
+            if [ "$(shasum -a 256 "$_f" 2>/dev/null | cut -d' ' -f1)" = "$2" ]; then
+                printf '%s' "$_f"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    # An interrupted publish leaves an INTENT beside the signature; recovery trusts the
+    # destination's bytes, not the intent. Malformed, stale and ambiguous fail closed.
+    _recover_snapshot_publish() {
+        local _d="$1" _s="$2" _i="$3" _want _have
+        [ -f "$_i" ] || return 0
+        _want="$(_usable_sig_record "$_i")"
+        if [ -z "$_want" ]; then
+            rm -f "$_i" 2>/dev/null || true
+            log "snapshot: discarded a malformed publish intent (no usable sha); provenance unchanged"
+            return 0
+        fi
+        [ -f "$_d" ] && _have="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
+        if [ "$_have" != "$_want" ]; then
+            # A durable staged copy that matches the intent turns a partial destination
+            # (short write, kill mid-write) into a roll-forward instead of a discard.
+            local _staged _rrc=0
+            _staged="$(_staged_copy_matching "$_d" "$_want")" || _staged=""
+            if [ -n "$_staged" ]; then
+                _replace_in_place --rollforward "$_staged" "$_d" || _rrc=$?
+                if [ "$_rrc" -eq 0 ]; then
+                    rm -f "$_staged" 2>/dev/null || true
+                    if ! _fsync_path_and_dir "$_d"; then
+                        log "snapshot: rolled-forward destination not confirmed durable; intent left for the next tick"
+                        return 0
+                    fi
+                    _have="$_want"
+                    log "snapshot: rolled hosts/$(_host)/build_log.md forward from its staged copy"
+                elif [ "$_rrc" -eq 2 ]; then
+                    rm -f "$_i" "$_staged" 2>/dev/null || true
+                    warn_operator "snapshot: hosts/$(_host)/build_log.md matches neither its publish intent nor a prefix of the staged copy — a writer changed it mid-publish; intent and staged copy discarded, per-host copy left as found (root build_log.md still holds the intended content)"
+                    return 0
+                else
+                    log "snapshot: roll-forward of hosts/$(_host)/build_log.md failed; staged copy and intent kept for the next tick"
+                    return 3
+                fi
+            fi
+        fi
+        if [ -n "$_have" ] && [ "$_have" = "$_want" ]; then
+            # The move landed; only the promote was lost. Finish it.
+            mv -f "$_i" "$_s" 2>/dev/null || {
+                log "snapshot: could not promote a verified intent; leaving it for the next tick"
+                return 0
+            }
+            # The rename CONSUMED the only recovery record, so a non-durable signature must
+            # re-create the intent — otherwise the completion line below would be a lie.
+            if ! _fsync_path_and_dir "$_s"; then
+                if printf '%s\n' "$_want" > "$_i" 2>/dev/null && _fsync_path_and_dir "$_i"; then
+                    log "snapshot: promoted signature not confirmed durable; intent re-created for the next tick"
+                else
+                    warn_operator "snapshot: promoted signature for hosts/$(_host)/build_log.md is NOT confirmed durable and the recovery intent could not be re-created; provenance may be lost on a crash"
+                fi
+                return 0
+            fi
+            log "snapshot: completed an interrupted publish from its intent record"
+        elif _dest_is_partial_of_root "$_d" "$_s"; then
+            # Partial and no source to roll forward from: pushing it would vault a truncated
+            # log, so the intent stays and this tick keeps withholding.
+            warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL and its staged copy is gone; intent kept, this sync will not push it (root build_log.md still holds the whole content)"
+            return 3
+        else
+            # The move never landed (or landed as something else): the intent
+            # describes content that is not there, so it grants nothing.
+            rm -f "$_i" 2>/dev/null || true
+            log "snapshot: discarded a stale publish intent (destination does not match it)"
+        fi
+    }
+    # Partial = a strict prefix of root that the signature does not vouch for (an old
+    # complete copy is also a prefix, but its sha is the recorded one).
+    _dest_is_partial_of_root() {
+        local _d="$1" _s="$2" _r="$WORKSPACE_DIR/build_log.md" _dn _rn _dsha _rec
+        [ -f "$_d" ] && [ -f "$_r" ] || return 1
+        _dn="$(wc -c < "$_d" 2>/dev/null | tr -d ' ')"; _rn="$(wc -c < "$_r" 2>/dev/null | tr -d ' ')"
+        [ -n "$_dn" ] && [ -n "$_rn" ] && [ "$_dn" -gt 0 ] && [ "$_dn" -lt "$_rn" ] || return 1
+        head -c "$_dn" "$_r" 2>/dev/null | cmp -s - "$_d" || return 1
+        _dsha="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
+        _rec=""; [ -f "$_s" ] && _rec="$(_usable_sig_record "$_s")"
+        [ "$_dsha" != "$_rec" ]
+    }
+
+    # Record a sha as the destination's provenance through the SAME durable contract as a
+    # publish (temp, fsync, rename, fsync); an in-place write risks a partial record.
+    _stamp_snapshot_sig() {
+        local _s="$1" _sha="$2" _rtmp
+        _rtmp="$(mktemp "${_s}.repair.XXXXXX" 2>/dev/null)" || _rtmp=""
+        if [ -z "$_rtmp" ]; then
+            log "snapshot: could not stage a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+        elif ! printf '%s\n' "$_sha" > "$_rtmp" 2>/dev/null ||
+            ! _fsync_path_and_dir "$_rtmp"; then
+            rm -f "$_rtmp" 2>/dev/null || true
+            log "snapshot: signature repair not confirmed durable before promotion; provenance left unchanged"
+        elif ! mv -f "$_rtmp" "$_s" 2>/dev/null; then
+            rm -f "$_rtmp" 2>/dev/null || true
+            log "snapshot: could not promote a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+        elif ! _fsync_path_and_dir "$_s"; then
+            # Nothing to recover TO — the record describes bytes already in place. Report
+            # unconfirmed and stop; the next tick re-checks it.
+            log "snapshot: repaired signature for hosts/$(_host)/build_log.md is not confirmed durable; it will be re-checked next tick"
+        else
+            return 0
+        fi
+        return 1
+    }
+
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
-        cp -p "$WORKSPACE_DIR/build_log.md" "$_host_dir/build_log.md" 2>/dev/null || true
+        local _src="$WORKSPACE_DIR/build_log.md"
+        local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
+        local _int="$_host_dir/.build_log.snapshot-sha.next"
+        local _partial=0
+        _recover_snapshot_publish "$_dst" "$_sig" "$_int" || _partial=$?
+        # A destination still partial after recovery must not be pushed as if it were whole.
+        [ "$_partial" -eq 3 ] && return 3
+        local _cur="" _rec=""
+        [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+        # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
+        # NUL-damaged record would collapse to 64 clean hex and gain authority.
+        [ -f "$_sig" ] && _rec="$(_usable_sig_record "$_sig")"
+        local _dir=""
+        if [ -f "$_dst" ] && [ -n "$_cur" ] && [ -z "$_rec" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+            # A missing or damaged record grants nothing by itself: only a copy that root
+            # strictly extends is adopted (nothing in it can be lost); every other shape refuses.
+            _dir="$(_append_only_direction "$_src" "$_dst")"
+            if [ "$_dir" = root-live ] && _stamp_snapshot_sig "$_sig" "$_cur"; then
+                _rec="$_cur"
+                log "snapshot: adopted hosts/$(_host)/build_log.md — no usable provenance record and root strictly extends it; stamped its current sha and refreshing from root"
+            fi
+        fi
+        if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
+            # Equal content is safe to re-own; nothing to propagate.
+            if [ "$_cur" != "$_rec" ]; then
+                _stamp_snapshot_sig "$_sig" "$_cur" || true
+            fi
+        elif [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
+            # Ours or absent -> stage beside the dest, swap only if the dest still
+            # matches. The recorded sha comes from the temp, never a post-swap read.
+            local _tmp
+            _tmp="$(mktemp "${_dst}.snap.XXXXXX" 2>/dev/null)" || _tmp=""
+            if [ -n "$_tmp" ] && cp -p "$_src" "$_tmp" 2>/dev/null; then
+                local _new _now=""
+                _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
+                [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                if [ "$_now" = "$_cur" ]; then
+                    # The staged copy is the roll-forward source and the INTENT names it; both must be
+                    # durable BEFORE the destination is truncated. Every step fails CLOSED; none may be skipped.
+                    local _rrc=0
+                    if ! _fsync_path_and_dir "$_tmp"; then
+                        rm -f "$_tmp" 2>/dev/null || true
+                        warn_operator "snapshot refused: could not make the staged copy of hosts/$(_host)/build_log.md durable; per-host copy and provenance left unchanged"
+                        _rrc=1
+                    elif ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
+                        ! _fsync_path_and_dir "$_int"; then
+                        rm -f "$_tmp" "$_int" 2>/dev/null || true
+                        warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
+                        _rrc=1
+                    else
+                        _replace_in_place --replace "$_tmp" "$_dst" "$_cur" || _rrc=$?
+                        if [ "$_rrc" -ne 0 ] && [ "$_rrc" -ne 2 ]; then
+                            # Anything but a clean refusal is an UNKNOWN outcome (a killed writer exits by signal,
+                            # not 3): verify the destination, else roll forward from the staged copy; never assume.
+                            local _after=""
+                            [ -f "$_dst" ] && _after="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                            if [ "$_after" = "$_cur" ]; then
+                                log "snapshot: in-place replace of hosts/$(_host)/build_log.md failed (rc $_rrc) before touching the destination; temp removed, per-host copy and provenance left unchanged"
+                                _rrc=4
+                            elif _replace_in_place --rollforward "$_tmp" "$_dst"; then
+                                log "snapshot: in-place write of hosts/$(_host)/build_log.md stopped short; rolled forward from the staged copy in the same tick (writer exit $_rrc)"
+                                _rrc=0
+                            else
+                                _rrc=3
+                            fi
+                        fi
+                    fi
+                    if [ "$_rrc" -eq 0 ]; then
+                        rm -f "$_tmp" 2>/dev/null || true
+                        # The destination must be durable BEFORE the signature claims it; if it is not,
+                        # leave the intent for the next tick to verify or discard.
+                        if ! _fsync_path_and_dir "$_dst"; then
+                            log "snapshot: destination not confirmed durable; intent left for recovery, signature not promoted"
+                        elif ! mv -f "$_int" "$_sig" 2>/dev/null; then
+                            # Promotion is atomic-rename ONLY — an in-place write
+                            # here would reintroduce the partial signature.
+                            log "snapshot: could not promote the publish intent; intent left for recovery, signature unchanged"
+                        elif ! _fsync_path_and_dir "$_sig"; then
+                            # Same asymmetry as the recovery path: the promote rename consumed the intent, so
+                            # a non-durable signature must leave a fresh one behind.
+                            if printf '%s\n' "$_new" > "$_int" 2>/dev/null && _fsync_path_and_dir "$_int"; then
+                                log "snapshot: signature promoted but not confirmed durable; intent re-created for the next tick"
+                            else
+                                warn_operator "snapshot: signature for hosts/$(_host)/build_log.md is NOT confirmed durable and the recovery intent could not be re-created; provenance may be lost on a crash"
+                            fi
+                        fi
+                    elif [ "$_rrc" -eq 3 ]; then
+                        # The staged copy is vault-excluded and the intent names it: both stay so the
+                        # next tick's recovery rolls forward. Returning 3 keeps this tick from pushing.
+                        _partial=3
+                        warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL — the in-place write did not complete and the roll-forward also failed; staged copy and intent kept for the next tick, this sync will not push it"
+                    elif [ "$_rrc" -ne 1 ]; then
+                        rm -f "$_tmp" "$_int" 2>/dev/null || true
+                        [ "$_rrc" -eq 2 ] && warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
+                    fi
+                else
+                    rm -f "$_tmp" 2>/dev/null || true
+                    warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
+                fi
+            else
+                [ -n "$_tmp" ] && rm -f "$_tmp" 2>/dev/null || true
+            fi
+        elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+            if [ "$_dir" = host-live ]; then
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md extends root and has NO USABLE provenance record — root is a stale relic beside a live per-host log; not clobbering. pick ONE writer and archive the other"
+            elif [ "$_dir" = diverged ]; then
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md and root have DIVERGED with NO USABLE provenance record — writer direction cannot be established; not clobbering. pick ONE writer and archive the other"
+            elif [ -z "$_rec" ]; then
+                # Only reachable when the adoption stamp above was not confirmed durable.
+                warn_operator "snapshot: hosts/$(_host)/build_log.md has NO USABLE provenance record and could not be adopted this tick (its new record was not confirmed durable) — per-host copy left unchanged, retried next sync; this is NOT evidence of an independent writer"
+            else
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
+            fi
+        fi
+        return "$_partial"
     fi
     return 0
 }
@@ -997,6 +1391,7 @@ _init_impl() {
     # inner/outer boundary that the in-tree .gitignore previously breached
     # (2026-06-04 leak fix).
     git add -A 2>/dev/null || true
+    _unstage_reserved_temps
     _refuse_staged_secrets
     # First-init must push a host branch to the vault even on an empty
     # workspace (no carrier-set files yet). The pre-(6) layout had an
@@ -1271,6 +1666,7 @@ _migrate_flat_anchor() {
 _commit_local_pre_pull() {
     generate_exclude 2>/dev/null || true
     git add --ignore-removal . 2>/dev/null || true
+    _unstage_reserved_temps
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
             && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"
@@ -1453,8 +1849,17 @@ _push_only_impl() {
     # credential-shaped paths AFTER (see the two functions' rationale).
     # Back up per-host config ($CLAUDE_CONFIG_DIR settings.json + channel
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
-    # a rebuild. Non-fatal: never blocks the push.
-    _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    # a rebuild. Config failures are non-fatal; a PARTIAL build_log snapshot (rc 3) is
+    # the one case that withholds the push — see the branch below.
+    local _snap_rc=0
+    _snapshot_per_host_config || _snap_rc=$?
+    if [ "$_snap_rc" -eq 3 ]; then
+        # A partial per-host build_log must not be vaulted as if whole; the next tick rolls it forward.
+        color_warn "sync-workspace: per-host build_log snapshot is PARTIAL after a failed write; not pushing this tick"
+        return 1
+    elif [ "$_snap_rc" -ne 0 ]; then
+        color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    fi
     # Rescue this host's anchor BEFORE carrier enforcement can untrack it
     # (#2567/#2607). `--push-only` never reaches `_pull_only_impl`, so without
     # this call the enforcement below regenerates the exclude, untracks the
@@ -1465,6 +1870,7 @@ _push_only_impl() {
     _migrate_flat_anchor
     _enforce_carrier_set_pre
     git add -A
+    _unstage_reserved_temps
     _refuse_staged_secrets
     if ! _refuse_foreign_host_deletions; then
         return 1
@@ -1596,9 +2002,9 @@ cmd_default_bidirectional() {
 _report_unmerged_conflicts() {
     local script="$REPO_DIR/scripts/sync-conflicts-report.py"
     [ -f "$script" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
+    [ -n "${SYNC_PY:-}" ] || return 0
     local out
-    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    out="$("$SYNC_PY" "$script" "$WORKSPACE_DIR" 2>&1)" || true
     # Only speak up when there is something to merge back; the clean case is
     # silent so a 30-minute cron does not grow a nag nobody reads.
     case "$out" in
