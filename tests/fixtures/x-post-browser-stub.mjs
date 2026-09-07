@@ -14,7 +14,7 @@ const page = {
   keyboard: { async type(t) { rec('type'); page._typed = t; } },
   async $(sel) { return sel.includes('tweetTextarea') || sel.includes('SideNav') ? handle(sel) : null; },
   async $$(){ return []; },
-  async $eval(sel, fn) { return page._typed ?? ''; },
+  async $eval(_sel, _fn) { return page._typed ?? ''; },
   async $$eval() { return []; },
   async waitForSelector(sel) {
     if (sel.includes('attachments')) {
@@ -32,9 +32,9 @@ const page = {
   },
   async evaluate() { return page._typed ?? ''; },
 };
-const handle = (sel) => ({
+const handle = (_sel) => ({
   async click() { rec('click'); },
-  async setInputFiles(p) { rec('setInputFiles'); },
+  async setInputFiles(_p) { rec('setInputFiles'); },
   async innerText() { return page._typed ?? ''; },
   async textContent() { return page._typed ?? ''; },
   async evaluate() { return page._typed ?? ''; },
