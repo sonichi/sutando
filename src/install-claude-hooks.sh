@@ -100,7 +100,7 @@ HOOKS=(
 )
 
 # The transcript archiver writes OUTSIDE the workspace (~/Desktop). Omitting it
-# drops it from HOOKS, which every phase iterates, so an existing opt-in survives.
+# drops it from HOOKS, which every phase iterates, so a registered one is untouched.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()
   for _h in "${HOOKS[@]}"; do
@@ -141,8 +141,8 @@ DEPRECATED_HOOKS=(
 # This PR changed the archiver's command: phase 0 cannot migrate the old one (it
 # embeds no repo path) and phase 1 matches exactly, so both would fire.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
-  # Only when installing it. Under the omit flag, replacing an inert opt-in with
-  # a working archiver would start real egress an unattended run must not decide.
+  # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
+  # ungated removal here would delete a registered hook and install no successor.
   DEPRECATED_HOOKS+=(
     "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
   )
