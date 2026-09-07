@@ -137,6 +137,29 @@ with tempfile.TemporaryDirectory() as d:
     hc.write_text("raise RuntimeError('broken')\n")
     check("a health-check.py that raises on import -> None", mib._health_check(pathlib.Path(d)) is None)
 
+# --- a new index row whose slug has no file behind it is a CREATE (costs an index line)
+with tempfile.TemporaryDirectory() as d:
+    mem = pathlib.Path(d)
+    idx = mem / "MEMORY.md"
+    idx.write_text("# Memory Index\n- [kept](feedback_kept)\n")
+    (mem / "feedback_kept.md").write_text("body\n")
+
+    def run(addition):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mib.main(["--repo", str(REPO), "--index", str(idx), "--adding", addition])
+        return rc, buf.getvalue()
+
+    rc, out = run("[kept](feedback_kept)")
+    check("a slug WITH a file behind it does not warn about creating one",
+          "CREATES A NEW MEMORY FILE" not in out, f"rc={rc}")
+
+    rc, out = run("[new](feedback_no_such_memory_file)")
+    check("a slug with NO file behind it warns that the row is a CREATE",
+          "CREATES A NEW MEMORY FILE" in out and "feedback_no_such_memory_file" in out, f"rc={rc}")
+    check("the create warning does not BLOCK — it stays advisory (rc unchanged)",
+          rc == 0, f"rc={rc}")
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

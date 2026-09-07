@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -145,6 +146,19 @@ def main(argv=None) -> int:
     if r["addition_loads"] is False:
         bad = True
         print("\n✗ REFUSE — the addition itself lands past the cut and would never load.")
+    # A row whose slug has no file behind it is a CREATE, and a create spends the
+    # one scarce resource here: a permanent index line. Fitting is not warrant.
+    if r["mode"] == "adding":
+        mem_dir = index.parent
+        missing = [g for g in re.findall(r"\]\(([A-Za-z0-9_./-]+)\)", addition)
+                   if not (mem_dir / f"{g}.md").is_file()]
+        if missing:
+            print("\n⚠ CREATES A NEW MEMORY FILE — fitting is not the same as warranted:")
+            for g in missing[:5]:
+                print(f"    {g}  (no file behind this slug)")
+            print("  Appending the lesson to an existing memory costs NO index line;")
+            print("  only the line is scarce, the file body is not.")
+
     if not bad:
         print("\n✓ safe — no row that loads today stops loading, and the addition loads.")
     return 1 if (bad or r["already_dropped"]) else 0
