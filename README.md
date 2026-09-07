@@ -167,8 +167,11 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything — core, menu-bar app, and the dashboard in your browser
+# Start everything on macOS / Linux — core, app, and dashboard
 ./start.sh
+
+# Start everything on Windows
+pwsh -File src/startup.ps1
 ```
 
 That is the whole first run. `start.sh` is a thin front door: it delegates to `src/startup.sh --with-app` and opens the dashboard once it answers. Extra arguments pass straight through (`./start.sh --runtime codex`). Set `SUTANDO_OPEN_DASHBOARD=0` to skip the browser, or `SUTANDO_DASHBOARD_URL` to point it elsewhere. If the dashboard never comes up the core still starts — the browser open is backgrounded and can never gate it.
@@ -211,6 +214,78 @@ First run needs Accessibility granted in System Settings → Privacy & Security.
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
 **macOS permissions** — on first run, macOS will ask you to grant Screen Recording, Accessibility, and Microphone access. See [Security](#security) for what each permission is used for.
+
+## Windows support
+
+Sutando started life on macOS and most of its app-automation surface — AppleScript-driven Chrome/QuickTime control, Cmd+Ctrl+F fullscreen, the Sutando menu-bar Swift app — has no portable Windows equivalent. The core Sutando loop nevertheless runs on Windows; what's there is the headless agent: voice, screen capture, clipboard, notifications, the task bridge, the dashboard, and the messaging bridges.
+
+**Works on Windows:**
+- Voice agent (Gemini Live WebSocket on :9900) — talk to Sutando in the browser
+- Web client (:8080) and Dashboard (:7844) and Agent API (:7843)
+- Screen capture (:7845) — uses PowerShell `System.Drawing.Bitmap` instead of `screencapture`
+- Task bridge — file-based; uses a PowerShell `FileSystemWatcher` shim in place of `fswatch`
+- Clipboard (Get-Clipboard / Set-Clipboard) and desktop notifications (balloon-tip)
+- Telegram, Discord, Slack bridges (any feature that runs in the core agent)
+- Capture screen + describe screen tools
+
+Dashboard and `/tasks/active` use platform process probes, not a fixed `pgrep` path.
+Missing process tools do not abort either response; the macOS-only Sutando app reports as not running on Windows.
+
+**Returns a `macOSOnly` error on Windows (the voice agent stays up; Gemini tells the user):**
+- `switch_app`, `press_key`, `type_text`, `volume`, `brightness`, `fullscreen`, `slide_control`, `toggle_tasks`
+- `scroll`, `switch_tab`, `close_tab`, `open_url`, `click`, `point_at` (browser AppleEvents)
+- `join_gmeet`, `call_contact` (Chrome AppleScript)
+- `screen_record`, `play_video`, `pause_video`, `resume_video`, `replay_video`, `close_video`, `scroll_and_describe` (QuickTime + Chrome)
+- Sutando.app menu-bar shortcuts (Swift/Cocoa), Twilio + ngrok auto-launch from startup
+
+**Windows quickstart:**
+
+```powershell
+# Clone (PowerShell)
+git clone https://github.com/sonichi/sutando.git
+cd sutando
+
+# Configure
+Copy-Item .env.example .env
+# Edit .env in your editor; set GEMINI_API_KEY
+
+# Install dependencies + start everything
+pwsh -File src/startup.ps1
+
+# Stop everything
+pwsh -File src/stop.ps1
+
+# Restart
+pwsh -File src/restart.ps1
+```
+
+The Windows scripts mirror their `.sh` twins:
+- `src/startup.ps1` — launches voice agent + web client + dashboard + agent API + screen capture (+ optional bridges)
+- `src/restart.ps1` — stops everything, then starts (matches `restart.sh`)
+- `src/stop.ps1` — stops everything without restarting (matches `stop.sh`; shortcut for `restart.ps1 -StopOnly`)
+- `src/notify.ps1 "msg"` — desktop notification + Discord DM (matches `notify.sh`)
+- `src/watch-tasks-stream.ps1` — task-folder watcher; emits `TASK_FILE: …` per new file
+
+**Prerequisites:**
+- Windows 10/11
+- PowerShell 7+ (`winget install Microsoft.PowerShell` — `pwsh` shim)
+- Node.js 22+ from [nodejs.org](https://nodejs.org)
+- Python 3.11+ from [python.org](https://python.org) (used by the dashboard, agent API, and bridges)
+- Claude Code installed and logged in (`claude` once)
+
+**Workspace:** identical contract as macOS — defaults to `<repo>/workspace/`; override via `sutando.config.local.json` (see [docs/workspace-config.md](docs/workspace-config.md)).
+
+**What's not ported (and why):**
+- **Sutando.app menu bar** — Swift / AppKit, no Windows equivalent. The global ⌃C / ⌃V / ⌃M shortcuts aren't available; use the web client UI instead.
+- **AppleScript-driven app automation** — Windows has no equivalent of System Events that's portable from the CLI. UIAutomation via PowerShell could replace some of this if there's demand.
+- **Phone-call flow** — `startup.ps1` skips Twilio + ngrok auto-launch. If you want phone calls on Windows, start ngrok manually and set `WEBHOOK_BASE_URL` in `.env`.
+- **macOS permissions block** — Windows has no TCC; screen capture and microphone "just work" once you grant Chrome microphone access.
+
+**Task-loop architecture (Windows-specific).** macOS Claude Code exposes a `Monitor` tool that streams stdout from a long-running command (e.g. `bash src/watch-tasks-stream.sh`) and wakes the agent on every `TASK_FILE:` event. Claude Code 2.1.168 on Windows **does not include the `Monitor` tool** (verified: not in the agent's tool list, and the literal string `"Monitor"` is absent from `claude.exe`). Without Monitor, there's no push-based file-watch primitive available to the agent, so the long-running `sutando-core` TUI would only pick up new tasks on its `*/5` proactive-loop cron tick — fine for autonomous work, far too slow for chat.
+
+The Windows port works around this with `src/task-dispatcher.ps1`, a standalone process auto-launched by `src/startup.ps1`. It uses `FileSystemWatcher` to watch `tasks/`, claims new files via atomic rename, and runs each one through `claude --print` as a one-shot subprocess. End-to-end chat latency is ~5s. The long-running core still handles autonomous proactive-loop work + cron jobs; the dispatcher only intercepts user-driven chat tasks.
+
+**Trade-off:** each dispatched task is its own `claude --print` subprocess, so there's no shared conversational context across chat turns. If you say "what's the weather" and follow up with "and in Tokyo?", the second call won't know about the first. If you want continuity, opt out via `pwsh -File src/startup.ps1 -SkipDispatcher` and accept the cron-tick latency.
 
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it

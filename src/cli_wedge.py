@@ -23,7 +23,6 @@ this module writes is owner-only from birth (0600 in a 0700 directory).
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -36,6 +35,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from file_lock import locked_file  # noqa: E402
+from sutando_platform import is_windows, process_snapshot  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402 — the one sanctioned resolver
 
 RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
@@ -296,9 +297,18 @@ def _pid_ancestors(pid: Optional[int] = None, runner: Callable = subprocess.run,
     """This process's pid and its parents, upward, stopping at pid 1 (never included)."""
     pid = os.getpid() if pid is None else pid
     chain, seen = [], set()
+    parents = {}
+    if is_windows():
+        for line in (process_snapshot() or "").splitlines():
+            parts = line.strip().split(maxsplit=2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                parents[int(parts[0])] = int(parts[1])
     while pid and pid > 1 and pid not in seen and len(chain) < limit:
         seen.add(pid)
         chain.append(pid)
+        if is_windows():
+            pid = parents.get(pid, 0)
+            continue
         try:
             proc = runner(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
             out = (getattr(proc, "stdout", "") or "").strip()
@@ -434,9 +444,7 @@ def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane:
     path = window_path(workspace, slot)
     _private_dir(path.parent)
     lock = path.with_name(path.name + ".lock")
-    fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with locked_file(lock, create_mode=0o600):
         entries = load_window(path)
         # Hashes and pattern names only — no pane text is ever persisted here.
         entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
@@ -446,9 +454,6 @@ def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane:
         entries.append(entry)
         entries = entries[-keep:]
         _write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
     return entries
 
 

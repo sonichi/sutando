@@ -31,6 +31,10 @@ class CliWedgeProbe(unittest.TestCase):
         (ws / "tasks").mkdir()
         self.ws = ws
         self._saved = (hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env)
+        import cli_wedge
+        self._cli_wedge = cli_wedge
+        self._saved_pid_ancestors = cli_wedge._pid_ancestors
+        cli_wedge._pid_ancestors = lambda: [os.getpid(), os.getppid()]
         # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
         self._saved_time = hc.time
         import time as _time
@@ -50,8 +54,8 @@ class CliWedgeProbe(unittest.TestCase):
         # a real-looking identity, and — like tmux with two windows — no bare `=sutando-core`.
         self.frames_file = ws / "frames.txt"
         self.idx = ws / "frames.idx"
-        self.tmux = ws / "tmux"
-        self.tmux.write_text(
+        script = ws / ("tmux.py" if os.name == "nt" else "tmux")
+        script.write_text(
             "#!/usr/bin/env python3\n"
             "import sys, pathlib\n"
             "a = sys.argv\n"
@@ -72,7 +76,12 @@ class CliWedgeProbe(unittest.TestCase):
             "idx.write_text(str(i + 1))\n"
             "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
         )
-        self.tmux.chmod(0o755)
+        script.chmod(0o755)
+        if os.name == "nt":
+            self.tmux = ws / "tmux.cmd"
+            self.tmux.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        else:
+            self.tmux = script
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
         hc._resolve_launch_env = lambda: dict(os.environ)
 
@@ -100,6 +109,7 @@ class CliWedgeProbe(unittest.TestCase):
         hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env = self._saved
         hc._local_host_labels = self._saved_labels
         hc.time = self._saved_time
+        self._cli_wedge._pid_ancestors = self._saved_pid_ancestors
         self.tmp.cleanup()
 
     def test_missing_detector_module_is_a_detail_not_a_failure(self):

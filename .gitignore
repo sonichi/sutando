@@ -72,6 +72,7 @@ tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.ps1
 !tests/*.test.mjs
 tests/__pycache__/
 !tests/*.txt
@@ -137,6 +138,8 @@ workspace/*
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt
 
+# IDE / editor workspace state — per-user, never shared.
+.vscode/
 # coverage-gate artifacts (scripts/coverage-gate.sh)
 .coverage
 .coverage.*

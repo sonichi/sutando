@@ -30,6 +30,11 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
 2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
+   **Windows:** the `Monitor` tool is unavailable, so `src/startup.ps1` starts
+   `src/task-dispatcher.ps1`, an external `FileSystemWatcher` that invokes `claude --print` for each
+   task. The core handles cron-driven autonomous work; starting another watcher would duplicate task
+   processing.
+
 ## Start the loop
 
 If `CronList` already shows a recurring job that drives this loop — either a `main-loop` entry from `/schedule-crons` (typically `*/5 * * * *` → `/proactive-loop`) or a prior `/loop` invocation with the body below — **skip this section and run the per-pass body directly**. That cron is the canonical driver; adding another would compound on every fire — each `/proactive-loop` invocation would re-run `/loop`, scheduling another recurring job and growing the cron list unboundedly.
@@ -152,6 +157,10 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 ## The numbered loop
 
 1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
+   - When the core itself consumes a task, move the source from `tasks/<id>.txt` to
+     `tasks/archive/<id>.txt` after writing its result. Long-lived bridges and the Windows dispatcher
+     archive their own claims. A source left in `tasks/` is re-emitted when a watcher restarts because
+     its seen set is process-local.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result.

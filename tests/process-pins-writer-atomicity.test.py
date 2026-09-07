@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -149,6 +150,41 @@ class WriterValidatesAndBounds(unittest.TestCase):
             json.loads(self.path.read_text())            # probe CAN detect it
         self.assertEqual(process_pins.load_pins(self.path), [])  # reader fails open
 
+    def test_windows_replace_retries_a_transient_sharing_violation(self) -> None:
+        real_replace = process_pins.os.replace
+        fake_os = mock.Mock(wraps=process_pins.os)
+        fake_os.name = "nt"
+        calls = 0
+
+        def transient(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError("sharing violation")
+            return real_replace(source, destination)
+
+        with mock.patch.object(process_pins, "os", fake_os), \
+                mock.patch.object(fake_os, "replace", side_effect=transient), \
+                mock.patch.object(process_pins.time, "sleep") as sleep:
+            process_pins.save_pins(self.path, [GOOD])
+        self.assertEqual(process_pins.load_pins(self.path), [GOOD])
+        sleep.assert_called_once_with(process_pins._WINDOWS_REPLACE_DELAY_S)
+
+    def test_windows_replace_retry_is_bounded_and_raises(self) -> None:
+        fake_os = mock.Mock(wraps=process_pins.os)
+        fake_os.name = "nt"
+        with mock.patch.object(process_pins, "os", fake_os), \
+                mock.patch.object(
+                    fake_os, "replace",
+                    side_effect=PermissionError("sharing violation")) as replace, \
+                mock.patch.object(process_pins.time, "sleep") as sleep, \
+                self.assertRaises(PermissionError):
+            process_pins.save_pins(self.path, [GOOD])
+        self.assertEqual(
+            replace.call_count, process_pins._WINDOWS_REPLACE_ATTEMPTS)
+        self.assertEqual(
+            sleep.call_count, process_pins._WINDOWS_REPLACE_ATTEMPTS - 1)
+
     def test_16_simultaneous_unique_arms_ALL_persist(self) -> None:
         procs = [multiprocessing.Process(target=_arm_one,
                                          args=(str(self.path), w))
@@ -172,7 +208,12 @@ class WriterValidatesAndBounds(unittest.TestCase):
         observations = 0
         while any(pr.is_alive() for pr in procs):
             if self.path.exists():
-                raw = self.path.read_text()
+                try:
+                    raw = self.path.read_text()
+                except PermissionError:
+                    if sys.platform == "win32":
+                        continue
+                    raise
                 if raw == "":
                     self.fail("reader observed an EMPTY snapshot")
                 data = json.loads(raw)   # torn write -> JSONDecodeError -> fail

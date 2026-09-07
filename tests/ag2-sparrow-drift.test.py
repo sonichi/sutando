@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CI guard: every module the package bundles from src/ must stay in sync with it.
 
-The bundled set is `MAP` in tools/sync_from_src.py — 14 modules today, including
+The bundled set is `MAP` in tools/sync_from_src.py — 15 modules today, including
 outbox.py and outbox_adapter.py. Only what is NOT in MAP is package-canonical and
 intentionally divergent (remote_gateway_bridge, _dirs, send_allowlist). This
 docstring used to name three modules, which read as "outbox is not covered" long

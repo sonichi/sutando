@@ -6,10 +6,12 @@ cross-process lock around read-modify-write."""
 
 import json
 import multiprocessing
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -85,7 +87,7 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("hitl_custom-1", [r.id for r in store.all()])  # saved => enumerated
 
     def test_concurrent_creates_of_one_interaction_yield_one_record(self):
-        ctx = multiprocessing.get_context("fork")
+        ctx = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
         procs = [ctx.Process(target=_spawn_create, args=(str(self.root), "hook:race")) for _ in range(6)]
         for p in procs:
             p.start()
@@ -130,6 +132,15 @@ class ForeignRecordTests(unittest.TestCase):
         self.assertEqual(store.last_skipped, ("hitl_bad000001.json",))
         self.assertIn("1 unreadable record(s) skipped", logs.output[0])
         self.assertIn("hitl_bad000001.json", logs.output[0])
+
+    def test_transiently_unreadable_record_is_skipped_not_fatal(self):
+        store = self._store()
+        blocked = store.root / "hitl_busy000001.json"
+        blocked.write_text(json.dumps({"requirement": {"id": "hitl_busy000001"}}))
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("busy")), \
+                self.assertLogs("hitl.store", level="WARNING"):
+            self.assertEqual(store.all(), [])
+        self.assertEqual(store.last_skipped, ("hitl_busy000001.json",))
 
     def test_a_clean_store_leaves_no_trace(self):
         store = self._store()

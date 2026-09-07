@@ -37,6 +37,8 @@ def run_crashing(fn, after_n):
             r = real[name](*a, **k)
             n['i'] += 1
             if n['i'] == after_n:
+                if name == 'open':
+                    os.close(r)
                 raise Crash(f"after mutation #{after_n} ({name})")
             return r
         return f

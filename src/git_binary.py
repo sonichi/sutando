@@ -36,6 +36,7 @@ raise a modal system dialog on a machine that never asked for developer tools.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from typing import Callable, Optional
@@ -64,6 +65,7 @@ def path_candidates(
     name: str = "git",
     path_env: Optional[str] = None,
     is_exec: Optional[Callable[[str], bool]] = None,
+    which: Callable = shutil.which,
 ) -> list:
     """Every executable `name` on PATH, in PATH order.
 
@@ -71,18 +73,19 @@ def path_candidates(
     stub-first PATH puts /usr/bin ahead of a real install, `which` hands back
     the stub and a later runnable git is never considered — contradicting this
     module's own stated order (@john-the-dev, reviewing #2469). Service PATHs
-    routinely look like that.
+    routinely look like that. Resolving each directory separately also honors
+    Windows PATHEXT (`git.EXE`) without losing later candidates.
     """
     env = os.environ.get("PATH", "") if path_env is None else path_env
-    if is_exec is None:
-        def is_exec(p: str) -> bool:  # noqa: E306
-            return os.path.isfile(p) and os.access(p, os.X_OK)
     out = []
     for directory in env.split(os.pathsep):
         if not directory:
             continue
-        candidate = os.path.join(directory, name)
-        if is_exec(candidate):
+        if is_exec is not None:
+            candidate = os.path.join(directory, name)
+        else:
+            candidate = which(name, path=directory)
+        if candidate and (is_exec is None or is_exec(candidate)):
             out.append(candidate)
     return out
 

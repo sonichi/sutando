@@ -114,19 +114,14 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         This is the same unmeasured-absence the probe fix closes, one layer
         down in the helper: `subprocess.run(...).stdout` is `""` for rc=1.
         """
-        ok = subprocess.CompletedProcess(args=["ps"], returncode=0, stdout="", stderr="")
-        bad = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="",
-                                          stderr="ps: permission denied")
-        with patch.object(hc.subprocess, "run", return_value=ok):
+        with patch.object(hc, "_platform_process_snapshot", return_value=""):
             self.assertEqual(hc._ps_snapshot(), "", "rc=0 + empty stdout IS a clean scan")
-        with patch.object(hc.subprocess, "run", return_value=bad):
+        with patch.object(hc, "_platform_process_snapshot", return_value=None):
             self.assertIsNone(hc._ps_snapshot(), "rc!=0 must be UNAVAILABLE, not empty")
 
     def test_a_failed_ps_that_returns_normally_still_warns(self):
         """End to end: the nonzero exit must reach the probe's verdict."""
-        bad = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="",
-                                          stderr="ps: permission denied")
-        with patch.object(hc.subprocess, "run", return_value=bad):
+        with patch.object(hc, "_platform_process_snapshot", return_value=None):
             out = hc.check_task_watcher()
         self.assertNotEqual(out["status"], "ok", f"false green on a failed ps: {out!r}")
         self.assertIn("ps unavailable", out["detail"])

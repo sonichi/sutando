@@ -2,8 +2,8 @@
 """voice-lock.py — the single implementation of the voice-agent PID-lock
 transaction (design 1b; impl plan WS1 Step 3, amendments R3/S4/U1/Z1).
 
-Serialization is an advisory ``fcntl.flock(LOCK_EX)`` on a *guard* file held
-across each whole transaction; the JSON lock file
+Serialization is an advisory lock on a *guard* file held across each whole
+transaction (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows); the JSON lock file
 (``<workspace>/state/locks/voice-agent.pid``; root path pre-#2722) is owner *metadata* only. Every creator AND
 replacer of the lock must hold the guard for the whole
 stale-owner-resolution + acquisition sequence — delete-then-create without it
@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import json
 import os
 import shutil
@@ -71,6 +70,16 @@ import subprocess
 import sys
 import time
 import uuid
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None
 
 SCHEMA_V = 1
 START_TIME_TOLERANCE_MS = 2000
@@ -104,6 +113,25 @@ def pid_alive(pid):
     """True when a RUNNING process exists with this pid. A zombie (exited,
     unreaped — `ps` state Z) counts as dead: it runs nothing, holds no port,
     and `os.kill(pid, 0)` alone would wedge every wait loop that polls it."""
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, int(pid)
+        )
+        if not handle:
+            # Access denied still proves that the PID exists.
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -121,6 +149,15 @@ def pid_alive(pid):
 def pid_start_time_ms(pid):
     """Start time of `pid` in epoch ms via `ps -o lstart=` — the single
     algorithm every caller shares (comparisons use ±2 s tolerance)."""
+    if os.name == "nt":
+        out = _run([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "([DateTimeOffset](Get-Process -Id %d -ErrorAction Stop).StartTime).ToUnixTimeMilliseconds()" % pid,
+        ]).strip()
+        try:
+            return int(float(out))
+        except ValueError:
+            return None
     out = _ps(["-p", str(pid), "-o", "lstart="]).strip()
     if not out:
         return None
@@ -196,12 +233,26 @@ class Guard:
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        if os.name == "nt":
+            if msvcrt is None:
+                raise RuntimeError("msvcrt unavailable on Windows")
+            if os.path.getsize(self.path) == 0:
+                os.write(self.fd, b"\0")
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)
+        else:
+            if fcntl is None:
+                raise RuntimeError("fcntl unavailable on POSIX")
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            if os.name == "nt":
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
         finally:
             os.close(self.fd)
         return False

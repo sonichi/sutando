@@ -5,9 +5,9 @@ current-track.md is the per-host goal anchor the proactive loop reads first
 every pass. It is chronological and append-only, so it grows without bound
 (222 KB on one host, 2026-09-06); rotation keeps the pinned preamble plus the
 newest entries under a byte budget and moves the older entries to
-current-track-archive.md beside it. Rotation reads the whole file and replaces
-it, so an append landing between that read and that replace would be lost:
-both operations take the same flock on <file>.lock.
+current-track-archive.md beside it. Rotation reads the whole file and replaces it, so an append landing between
+that read and that replace would be lost: both operations take the same
+cross-platform advisory lock on <file>.lock.
 
     append(path, text)                -> None
     replace(path, text)               -> None   (create or rewrite the whole head)
@@ -38,12 +38,13 @@ still over budget" -- the archive and the head ARE written, because shrinking a
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+from file_lock import locked_file
 
 ENTRY = re.compile(r"^##+ ", re.M)
 DEFAULT_KEEP = 32 * 1024
@@ -64,12 +65,8 @@ def lock_path(path: Path) -> Path:
 @contextmanager
 def locked(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path(path), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lk, fcntl.LOCK_UN)
+    with locked_file(lock_path(path), create_mode=0o600):
+        yield
 
 
 def append(path: Path, text: str) -> None:

@@ -14,7 +14,14 @@ import assert from 'node:assert/strict';
  *   5. Neither set -> undefined (no warning).
  */
 
-import { memoryDirEnv, personalPath } from '../src/util_paths.js';
+import { claudeProjectSlug, memoryDirEnv, personalPath } from '../src/util_paths.js';
+
+describe('claudeProjectSlug', () => {
+	it('matches Claude Code project names for POSIX and Windows paths', () => {
+		assert.equal(claudeProjectSlug('/Users/test/GitHub/sutando'), '-Users-test-GitHub-sutando');
+		assert.equal(claudeProjectSlug('Q:\\Repos\\sutando'), 'Q--Repos-sutando');
+	});
+});
 
 function clearEnv() {
 	delete process.env.SUTANDO_MEMORY_DIR;

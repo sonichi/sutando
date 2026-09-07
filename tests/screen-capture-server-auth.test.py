@@ -167,8 +167,9 @@ def test_load_creates_new_token_when_missing() -> None:
             token = sc._load_or_create_capture_token()
         ok("creates token when missing", bool(token) and len(token) >= 32,
            f"got {token!r}")
-        ok("token file created 0600",
-           os.path.exists(tok_path) and (os.stat(tok_path).st_mode & 0o777) == 0o600,
+        mode_ok = os.name == "nt" or (os.stat(tok_path).st_mode & 0o777) == 0o600
+        ok("token file created with platform-secure permissions",
+           os.path.exists(tok_path) and mode_ok,
            f"mode={oct(os.stat(tok_path).st_mode) if os.path.exists(tok_path) else 'missing'}")
 
 
@@ -185,6 +186,8 @@ def test_load_reuses_existing_valid_token() -> None:
 
 
 def test_load_rejects_wrong_permissions() -> None:
+    if os.name == "nt":
+        return
     with tempfile.TemporaryDirectory() as td:
         tok_path = os.path.join(td, "screen-capture-token")
         # Write with 0644 — world-readable, should be rejected
@@ -237,6 +240,7 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
          unittest.mock.patch("os.makedirs"), \
          unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_platform_capture_screen", return_value=True), \
          unittest.mock.patch.object(sc, "_downscale_frame", return_value=True) as downscale:
         handler._handle_capture()
     ok("capture passes bounded JPEG options to downscale", downscale.call_args.args[1:] == (1280, 60),
@@ -248,6 +252,7 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
          unittest.mock.patch("os.makedirs"), \
          unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_platform_capture_screen", return_value=True), \
          unittest.mock.patch.object(sc, "_downscale_frame", return_value=False):
         failed._handle_capture()
     ok("capture rejects a frame that cannot meet the downscale budget", failed._response_code == 500,

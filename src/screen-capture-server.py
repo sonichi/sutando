@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
+Screen capture HTTP server — runs in a terminal (has Screen Recording permission
+on macOS; needs no special setup on Windows).
 The voice agent calls http://localhost:7845/capture to get instant screenshots.
 
 Usage: python3 src/screen-capture-server.py
-(Run in a terminal window — NOT as a launchd daemon)
+(On macOS: run in a terminal window — NOT as a launchd daemon, because the
+terminal app holds the Screen Recording TCC grant.)
 """
 
 import http.server
@@ -15,10 +17,17 @@ import os
 import secrets
 import signal
 import stat
+import sys
 import threading
 import urllib.request
 import os as _os
 from datetime import datetime
+from pathlib import Path
+
+# Cross-platform OS helpers. `sutando_platform.notify` + `sutando_platform.capture_screen`
+# branch on sys.platform so the legacy macOS code paths stay verbatim.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sutando_platform import capture_screen as _platform_capture_screen, notify as _platform_notify, is_macos, is_windows  # noqa: E402
 
 PORT = 7845
 # Per-user temp dir — same treatment as browser.mjs in this PR: a shared
@@ -44,8 +53,12 @@ def _load_or_create_capture_token() -> str | None:
     try:
         if _os.path.lexists(_CAPTURE_TOKEN_PATH):
             st = _os.lstat(_CAPTURE_TOKEN_PATH)
-            if (stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600
-                    and st.st_uid == _os.getuid()):
+            regular = stat.S_ISREG(st.st_mode)
+            secure = regular and (
+                _os.name == "nt"
+                or ((st.st_mode & 0o777) == 0o600 and st.st_uid == _os.getuid())
+            )
+            if secure:
                 with open(_CAPTURE_TOKEN_PATH) as _f:
                     existing = _f.read().strip()
                 if existing:
@@ -53,8 +66,9 @@ def _load_or_create_capture_token() -> str | None:
             _os.unlink(_CAPTURE_TOKEN_PATH)
         _os.makedirs(_os.path.dirname(_CAPTURE_TOKEN_PATH), exist_ok=True)
         tok = secrets.token_urlsafe(32)
+        nofollow = getattr(_os, "O_NOFOLLOW", 0)
         fd = _os.open(_CAPTURE_TOKEN_PATH,
-                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | _os.O_NOFOLLOW, 0o600)
+                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | nofollow, 0o600)
         _os.write(fd, tok.encode())
         _os.close(fd)
         return tok
@@ -145,18 +159,14 @@ def _signal_seeing():
 
 
 def _notify_capture_blocking():
-    """Fire a macOS notification that Sutando captured the screen. Chi's ask
+    """Fire a desktop notification that Sutando captured the screen. Chi's ask
     per 2026-04-18 Discord: "shall we use a notification when taking
-    screenshots?". Uses osascript (no additional deps). Debounced to
-    avoid notification-center spam during describe_screen loops."""
+    screenshots?". Routed through `sutando_platform.notify` so the macOS osascript
+    backend and the Windows PowerShell balloon-tip backend both work without
+    branching here. Debounced to avoid notification-center spam during
+    describe_screen loops."""
     try:
-        import subprocess as _sp
-        _sp.run(
-            ["osascript", "-e",
-             'display notification "Captured screen" with title "Sutando"'],
-            timeout=1.0,
-            capture_output=True,
-        )
+        _platform_notify("Captured screen")
     except Exception:
         pass  # Best-effort; notification absence is never critical.
 
@@ -191,7 +201,7 @@ def _downscale_frame(path: str, maxdim: int | None, quality: int | None) -> bool
 
 
 def _notify_capture():
-    """Debounced fire-and-forget macOS notification."""
+    """Debounced fire-and-forget desktop notification."""
     global _last_notify_ts
     if not NOTIFY_ENABLED:
         return
@@ -410,16 +420,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fmt = "png"
         ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
         type_flag = "jpg" if ext == "jpg" else "png"
-        # P7 D7.4: optional downscale/recompress executed HERE, in the capture
-        # server's process (sips subprocess) — vision compression must never
-        # compete with the voice event loop. maxdim bounds the longest edge;
-        # quality is JPEG percent (jpg only). Bounded to sane ranges.
+        # Downscale in the capture process so compression never competes with voice.
+        # maxdim bounds the longest edge; quality is bounded JPEG percent.
         maxdim_raw = query.get("maxdim", [None])[0]
         maxdim = int(maxdim_raw) if maxdim_raw and maxdim_raw.isdigit() and 320 <= int(maxdim_raw) <= 3840 else None
         quality_raw = query.get("quality", [None])[0]
         quality = int(quality_raw) if quality_raw and quality_raw.isdigit() and 10 <= int(quality_raw) <= 100 else None
         try:
-            if capture_all:
+            # macOS supports per-display capture; Windows falls back to one
+            # virtual-screen capture for `all` and `display`.
+            if capture_all and is_macos():
                 # Capture all displays separately
                 paths = []
                 for d in range(1, 5):  # up to 4 displays
@@ -432,15 +442,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         except Exception: pass
                         break  # no more displays
                 path = paths[0] if paths else f"{DIR}/screen-{ts}.{ext}"
-            else:
-                suffix = f"-d{display}" if display else ""
-                path = f"{DIR}/screen-{ts}{suffix}.{ext}"
+            elif is_macos() and display:
+                path = f"{DIR}/screen-{ts}-d{display}.{ext}"
                 paths = [path]
                 cmd = ["screencapture", "-x", "-t", type_flag]
-                if display:
-                    cmd.append(f"-D{display}")
+                cmd.append(f"-D{display}")
                 cmd.append(path)
                 subprocess.run(cmd, timeout=5, check=True)
+            else:
+                path = os.path.join(DIR, f"screen-{ts}.{ext}")
+                paths = [path]
+                ok = _platform_capture_screen(path, fmt=ext)
+                if not ok:
+                    raise RuntimeError(
+                        "capture_screen returned False — check Screen Recording "
+                        "permission (macOS) or PowerShell availability (Windows)"
+                    )
             if maxdim or (quality and ext == "jpg"):
                 for p in paths:
                     if not _downscale_frame(p, maxdim, quality if ext == "jpg" else None):

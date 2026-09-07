@@ -1,0 +1,259 @@
+name: Windows runtime
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  windows-runtime:
+    name: PowerShell + Windows runtime
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # bodhi-realtime-agent ships a prebuilt dist, but its git dependency
+      # postinstall uses POSIX `[ ... ]` syntax that cmd.exe cannot parse.
+      # Skipping lifecycle scripts is the Windows clean-install path; the next
+      # step fails closed if the required prebuilt package is absent.
+      - name: Install dependencies (Windows)
+        run: npm ci --ignore-scripts
+
+      - name: Verify prebuilt runtime dependency
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'node_modules/bodhi-realtime-agent/dist')) {
+            throw 'bodhi-realtime-agent prebuilt dist is missing'
+          }
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Load manifest tools through Windows file URLs
+        shell: pwsh
+        run: |
+          .\node_modules\.bin\tsx.cmd -e "import('./src/inline-tools.ts').then(m => { const names=m.inlineTools.map(t=>t.name); for (const n of ['summon','activate_screen_companion']) if (!names.includes(n)) throw new Error('missing manifest tool '+n); })"
+          if ($LASTEXITCODE -ne 0) { throw 'manifest tool import failed' }
+
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem -Recurse -File -Filter '*.ps1' |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' } |
+            ForEach-Object {
+              $tokens = $null
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$tokens, [ref]$errors
+              )
+              foreach ($error in $errors) {
+                Write-Host "::error file=$($_.FullName),line=$($error.Extent.StartLineNumber)::$($error.Message)"
+                $failed += $_.FullName
+              }
+            }
+          if ($failed.Count) {
+            throw "$($failed.Count) PowerShell parse error(s)"
+          }
+
+      - name: Verify bash and PowerShell workspace resolvers agree
+        shell: pwsh
+        run: |
+          $git = (Get-Command git -ErrorAction Stop).Source
+          $gitRoot = Split-Path (Split-Path $git -Parent) -Parent
+          $gitBash = Join-Path $gitRoot 'bin\bash.exe'
+          if (-not (Test-Path $gitBash)) {
+            throw "Git Bash not found at $gitBash"
+          }
+          $bashWorkspace = (& $gitBash scripts/sutando-config.sh workspace).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $bashWorkspace) {
+            throw 'bash workspace resolver failed'
+          }
+          . .\src\workspace_default.ps1
+          $pwshWorkspace = Resolve-SutandoWorkspace
+          if ([IO.Path]::GetFullPath($bashWorkspace) -ne [IO.Path]::GetFullPath($pwshWorkspace)) {
+            throw "workspace mismatch: bash=$bashWorkspace pwsh=$pwshWorkspace"
+          }
+
+      - name: Verify Windows Python launcher fallback
+        shell: bash
+        run: bash tests/python-binary-windows.test.sh
+
+      - name: Verify ESLint diff scope
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/eslint-workflow-scope-gate.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'eslint-workflow-scope-gate.test.py failed' }
+
+      - name: Validate startup and dispatcher with a Claude cmd shim
+        shell: pwsh
+        run: |
+          $shimDir = Join-Path $env:RUNNER_TEMP 'sutando-test-bin'
+          $testWorkspace = Join-Path $env:RUNNER_TEMP 'sutando-windows-workspace'
+          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+          Set-Content -Path (Join-Path $shimDir 'claude.cmd') -Value '@exit /b 0' -Encoding ascii
+          $env:PATH = "$shimDir;$env:PATH"
+          $env:SUTANDO_TEST_MODE = '1'
+          $env:SUTANDO_WORKSPACE = $testWorkspace
+          Set-Content -Path '.env' -Value 'GEMINI_API_KEY=ci-placeholder' -Encoding ascii
+          & pwsh -NoProfile -File src/startup.ps1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) { throw "startup validation exited $LASTEXITCODE" }
+          & pwsh -NoProfile -File src/task-dispatcher.ps1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) { throw "dispatcher validation exited $LASTEXITCODE" }
+
+      - name: Run dispatcher owner/non-owner live integration
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/windows-dispatcher-live.test.ps1
+
+      - name: Run Windows process and lock regressions
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          python tests/find-pids.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
+          python tests/http-process-probes.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'http-process-probes.test.py failed' }
+          python tests/health-check-secret-scanner-live-interpreter.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-secret-scanner-live-interpreter.test.py failed' }
+          python tests/cwd-lint.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cwd-lint.test.py failed' }
+          python tests/task-id-delegation.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'task-id-delegation.test.py failed' }
+          python tests/task-archive.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'task-archive.test.py failed' }
+          python tests/local-task-protocol-atomic-write.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'local-task-protocol-atomic-write.test.py failed' }
+          python tests/git-binary-resolution.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'git-binary-resolution.test.py failed' }
+          python tests/health-check-live-tree-drift.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-live-tree-drift.test.py failed' }
+          python tests/health-check-held-no-consumer.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-held-no-consumer.test.py failed' }
+          python tests/health-check-punctuality-completed-unpublished.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-punctuality-completed-unpublished.test.py failed' }
+          python tests/health-check-context-read-budget.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-context-read-budget.test.py failed' }
+          python tests/health-check-gateway-stale-lane.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-gateway-stale-lane.test.py failed' }
+          python tests/health-check-stale-proactive-backlog.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-stale-proactive-backlog.test.py failed' }
+          python tests/health-check-memory-dir-override.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-memory-dir-override.test.py failed' }
+          python tests/core-heartbeat.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'core-heartbeat.test.py failed' }
+          python tests/cli-wedge.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cli-wedge.test.py failed' }
+          python tests/cli-wedge-health-probe.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cli-wedge-health-probe.test.py failed' }
+          python tests/single-instance.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
+          python tests/file-lock.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/outbox-windows.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'outbox-windows.test.py failed' }
+          python tests/sparrow-outbox-claim-protocol.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'sparrow-outbox-claim-protocol.test.py failed' }
+          python tests/outbox-race.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'outbox-race.test.py failed' }
+          python tests/process-pins.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins.test.py failed' }
+          python tests/process-pins-reader-rejects-what-writer-rejects.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins-reader-rejects-what-writer-rejects.test.py failed' }
+          python tests/process-pins-writer-atomicity.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins-writer-atomicity.test.py failed' }
+          python tests/hitl-manager-identity.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'hitl-manager-identity.test.py failed' }
+          python tests/hitl-schema.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'hitl-schema.test.py failed' }
+          python tests/comment-signature-guard.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'comment-signature-guard.test.py failed' }
+          python tests/notify-reviewers-body-file.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'notify-reviewers-body-file.test.py failed' }
+          python tests/body-file-read.test.py ReaderContract
+          if ($LASTEXITCODE -ne 0) { throw 'body-file-read.test.py failed' }
+          python tests/anchored-edit.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'anchored-edit.test.py failed' }
+          python tests/shutdown-sentinel.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'shutdown-sentinel.test.py failed' }
+          python tests/cron-state-lock-windows.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cron-state-lock-windows.test.py failed' }
+          python tests/idle-surface-canonical-hash.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'idle-surface-canonical-hash.test.py failed' }
+          python tests/proactive-loop-idle-surface-hash.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'proactive-loop-idle-surface-hash.test.py failed' }
+          python tests/delivery-primitives-single-owner.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'delivery-primitives-single-owner.test.py failed' }
+          python tests/access-store-concurrency.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
+          python tests/agent-activity.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'agent-activity.test.py failed' }
+          python tests/activity-bus.test.py Acceptance StateMachine Visibility Wiring
+          if ($LASTEXITCODE -ne 0) { throw 'activity-bus.test.py failed' }
+          python tests/agent-availability.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'agent-availability.test.py failed' }
+          python tests/core-input-watch-chat-escalation.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'core-input-watch-chat-escalation.test.py failed' }
+          python tests/current-track-rotate.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'current-track-rotate.test.py failed' }
+          python tests/workspace-lock.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'workspace-lock.test.py failed' }
+          python tests/runtime-api-dispatcher.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-dispatcher.test.py failed' }
+          python tests/runtime-api-human-action.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-human-action.test.py failed' }
+          python tests/runtime-api-tasks-view.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-tasks-view.test.py failed' }
+          python tests/runtime-api-identity-view.test.py TestAuthorityBoundaries
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-identity-view.test.py failed' }
+          python tests/task-workstreams.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
+          python tests/report-feedback.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'report-feedback.test.py failed' }
+          python tests/signal-room-tasks.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'signal-room-tasks.test.py failed' }
+          python tests/voice-lock-windows.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'voice-lock-windows.test.py failed' }
+          python tests/quota-projection.test.py RecordSample.test_cross_process_acks_all_survive RecordSample.test_concurrent_writers_lose_no_acknowledged_sample
+          if ($LASTEXITCODE -ne 0) { throw 'quota-projection.test.py failed' }
+          python -c "import sys; sys.path.insert(0, 'src'); import quota_projection"
+          if ($LASTEXITCODE -ne 0) { throw 'quota_projection Windows import failed' }
+          python -c "import sys; sys.path.insert(0, 'src'); import task_workstreams"
+          if ($LASTEXITCODE -ne 0) { throw 'task_workstreams Windows import failed' }
+
+      - name: Run Windows TypeScript integrations
+        shell: pwsh
+        run: |
+          .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\task-bridge-result-scan-error.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'task-bridge-result-scan-error.test.ts failed' }
+          .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\voice-agent-crash-only.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'voice-agent-crash-only.test.ts failed' }
+
+      - name: Compile Windows Python entry points
+        run: >-
+          python -m py_compile
+          src/screen-capture-server.py
+          src/sutando_platform.py
+          src/health-check.py
+          src/cli_wedge.py
+          src/file_lock.py
+          src/task_workstreams.py

@@ -88,7 +88,7 @@ if ps_available():
     check("_ps_snapshot lists this process", _snap is not None and str(os.getpid()) in _snap)
 else:
     skip("_ps_snapshot live-OS probes")
-with patch.object(hc.subprocess, "run", side_effect=OSError("boom")):
+with patch.object(hc, "_platform_process_snapshot", return_value=None):
     check("_ps_snapshot returns None when ps cannot run", hc._ps_snapshot() is None)
 
 if ps_available():

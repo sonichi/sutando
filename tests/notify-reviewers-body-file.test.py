@@ -18,7 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parent.parent
 TOOL = REPO / "skills" / "collaboration-intelligence" / "scripts" / "notify_reviewers.py"
 
 FAILURES = []
@@ -34,8 +34,9 @@ def check(label, got, want):
 
 def run(*args):
     """Plan mode — no --send, so nothing is delivered by any arm here."""
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, str(TOOL), *args],
-                          capture_output=True, text=True, cwd=str(REPO))
+                          capture_output=True, text=True, cwd=str(REPO), env=env)
 
 
 # The body that motivated this: a backtick pair and an apostrophe, which a
@@ -82,11 +83,14 @@ with tempfile.TemporaryDirectory() as td:
     r = run("--reviewers", "x", "--body-file", str(missing))
     check("a missing file is an ERROR, not an empty body",
           "cannot read --body-file" in (r.stdout + r.stderr), True)
-    fifo = Path(td) / "fifo"
-    os.mkfifo(fifo)
-    r = run("--reviewers", "x", "--body-file", str(fifo))
-    check("a FIFO is refused rather than blocking forever",
-          "not a regular file" in (r.stdout + r.stderr), True)
+    if hasattr(os, "mkfifo"):
+        fifo = Path(td) / "fifo"
+        os.mkfifo(fifo)
+        r = run("--reviewers", "x", "--body-file", str(fifo))
+        check("a FIFO is refused rather than blocking forever",
+              "not a regular file" in (r.stdout + r.stderr), True)
+    else:
+        print("  note FIFO refusal is covered by the shared reader's POSIX suite")
 
 print("\ncase: resolve_body, in-process")
 # In-process as well as via the CLI: a subprocess run is invisible to coverage,

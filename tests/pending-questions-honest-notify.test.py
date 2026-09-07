@@ -104,6 +104,11 @@ class TestUndrainedDetection(unittest.TestCase):
             self.assertFalse(self.m.notify_macos(1, ["t"]), "a failed osascript must not read as delivered")
             subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0})()
             self.assertTrue(self.m.notify_macos(1, ["t"]))
+            subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError())
+            self.assertFalse(
+                self.m.notify_macos(1, ["t"]),
+                "a host without osascript must degrade to a failed optional path",
+            )
         finally:
             subprocess.run = real
 

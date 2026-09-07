@@ -1,6 +1,15 @@
 /**
- * Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
- * Shared between voice-agent.ts and phone conversation-server.ts.
+ * Inline tools — lightweight platform actions that execute instantly without
+ * going through the core agent. Shared between voice-agent.ts and the phone
+ * conversation-server.ts.
+ *
+ * Originally macOS-only (osascript, pbcopy/pbpaste, screencapture, …). On
+ * Windows, the platform-specific call sites delegate to src/platform.ts so
+ * clipboard, notifications, and screen capture work; AppleScript-only tools
+ * (switch_app, type_text, press_key against a specific app, Chrome JS-injected
+ * scroll, QuickTime control) return a clear `macOSOnly` error rather than
+ * silently failing. The error is surfaced to Gemini so the voice/phone agent
+ * can fall back to telling the user instead of pretending it ran the action.
  *
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
@@ -8,11 +17,13 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname, delimiter } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { isMacOS, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
+import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
@@ -57,14 +68,14 @@ import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
+		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
 		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
-		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. ' +
-		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
+		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. ' +
+		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
 		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
@@ -105,14 +116,20 @@ export const openFileTool: ToolDefinition = {
 			// into a shell string.
 			//
 			// Resolution per issue #560:
-			//   1. Explicit `app` arg → `open -a <app> <path>`
-			//   2. No `app` → `open <path>` (macOS LaunchServices picks default)
+			//   1. Explicit `app` arg → `open -a <app> <path>` (macOS)
+			//   2. No `app` → `open <path>` (macOS LaunchServices picks default) / ShellExecute (Windows)
 			// Contextual inference (rule 2 from issue) is the model's job — Gemini
 			// reads the conversation and decides whether to pass `app`. The tool
 			// only honors what it's told.
-			const openArgs = app ? ['-a', app, filePath] : [filePath];
-			execFileSync('open', openArgs, { timeout: 5_000 });
-			if (fullscreen) {
+			if (isMacOS()) {
+				const openArgs = app ? ['-a', app, filePath] : [filePath];
+				execFileSync('open', openArgs, { timeout: 5_000 });
+			} else {
+				// Windows + Linux: app-specific open isn't portable; defer to default
+				// handler via ShellExecute / xdg-open. Surfaced in the tool description.
+				openWithDefault(filePath);
+			}
+			if (fullscreen && isMacOS()) {
 				// Brief delay so the just-opened app becomes frontmost before
 				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
 				// toggle — every app that supports fullscreen handles it (QT
@@ -140,7 +157,7 @@ export const openFileTool: ToolDefinition = {
 			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
 				try {
 					const fs = await import('node:fs');
-					fs.writeFileSync('/tmp/sutando-playback-path', filePath);
+					fs.writeFileSync(PLAYBACK_PATH, filePath);
 					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
 				} catch {}
 			}
@@ -184,6 +201,11 @@ export const pressKeyTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
+		// Cross-platform note: this tool drives macOS AppleScript System Events.
+		// Windows has no portable equivalent for "send keystroke X with modifiers
+		// to app Y" from the command line — gate cleanly so Gemini knows to fall
+		// back rather than silently dropping the keystroke.
+		if (!isMacOS()) return macOSOnlyError('press_key');
 		// Activate target app if specified. Escape `app` before embedding
 		// in the AppleScript string literal — without this, a value like
 		// `"; do shell script "rm -rf ~"; tell application "Finder` would
@@ -263,6 +285,7 @@ export const switchAppTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		let { app } = args as { app: string };
+		if (!isMacOS()) return macOSOnlyError('switch_app');
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
 		// Escape for AppleScript string literals — no shell layer needed with execFileSync.
 		const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -332,6 +355,7 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const a = args as { text: string; mode?: 'replace_all' | 'append' | 'at_caret'; append?: boolean };
+		if (!isMacOS()) return macOSOnlyError('type_text');
 		const text = a.text;
 		// Resolve effective mode. Explicit `mode` wins; legacy `append: true` → 'append';
 		// otherwise default to 'at_caret' (the long-standing default behavior pre-2026-06-01).
@@ -415,6 +439,7 @@ export const volumeTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { level, mute } = args as { level?: number; mute?: boolean };
+		if (!isMacOS()) return macOSOnlyError('volume');
 		try {
 			if (mute === true) {
 				execFileSync('osascript', ['-e', 'set volume with output muted'], { timeout: 5_000 });
@@ -542,6 +567,7 @@ export const brightnessTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		let { level } = args as { level: number };
+		if (!isMacOS()) return macOSOnlyError('brightness');
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		level = Math.max(0, Math.min(100, level));
@@ -594,7 +620,7 @@ export const brightnessTool: ToolDefinition = {
 export const clipboardTool: ToolDefinition = {
 	name: 'clipboard',
 	description:
-		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant.',
+		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant. Cross-platform (macOS pbcopy/pbpaste, Windows PowerShell Get-Clipboard/Set-Clipboard).',
 	parameters: z.object({
 		action: z.enum(['read', 'write']).describe('"read" to get clipboard contents, "write" to set them'),
 		text: z.string().optional().describe('Text to write to clipboard (only for action="write")'),
@@ -604,12 +630,12 @@ export const clipboardTool: ToolDefinition = {
 		const { action, text } = args as { action: 'read' | 'write'; text?: string };
 		try {
 			if (action === 'read') {
-				const content = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 5_000 });
+				const content = clipboardRead();
 				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				execFileSync('pbcopy', [], { input: text, timeout: 5_000 });
+				clipboardWrite(text);
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}
@@ -737,6 +763,7 @@ export const toggleTasksTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { action, taskIndex } = args as { action: 'collapse' | 'expand'; taskIndex?: number };
+		if (!isMacOS()) return macOSOnlyError('toggle_tasks');
 		// Set data attribute on body — MutationObserver in the page picks it up and updates state.
 		// When taskIndex is set, encode as "expand:N" / "collapse:N"; handler in web-client.ts parses the suffix.
 		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
@@ -834,6 +861,7 @@ export const slideControlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		if (!isMacOS()) return macOSOnlyError('slide_control');
 		try {
 			// All slide navigation uses DOM manipulation for reliability, and is
 			// LAYOUT-AGNOSTIC: it addresses slides by VISUAL POSITION (1-indexed) via the
@@ -881,6 +909,7 @@ export const fullscreenTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('fullscreen');
 		try {
 			const script = `
 tell application "System Events"
@@ -1290,7 +1319,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
-				const mod = await import(toolsPath);
+				// Node's ESM loader rejects raw Windows drive paths (`Q:\...`)
+				// because it interprets the drive letter as a URL scheme. A
+				// file URL works on every platform and preserves spaces safely.
+				const mod = await import(pathToFileURL(toolsPath).href);
 				if (Array.isArray(mod.tools)) {
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);

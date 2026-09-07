@@ -14,7 +14,6 @@ A task legitimately runs RUNNING → WAITING → RUNNING many times; each is its
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -26,6 +25,7 @@ from typing import Callable
 
 from activity_rows import append as append_row
 from activity_rows import task_from_file
+from file_lock import locked_file
 from workspace_default import resolve_workspace
 
 PHASES = ("RECEIVED", "QUEUED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED")
@@ -327,8 +327,7 @@ class ActivityStore:
         that fails leaves its rows pending in the snapshot; the next apply on that task drains them
         first, so a row is projected exactly once, later, never lost and never twice."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.dir / f".{item.task_id}.lock", "w") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX)
+        with locked_file(self.dir / f".{item.task_id}.lock", create_mode=0o600):
             state = self.load(item.task_id)
             self._drain(state)
             state, rows = reduce(state, item)
