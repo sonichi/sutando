@@ -72,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Location", "http://evil.example/steal")
                 self.end_headers(); return
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
-        if self.path == "/v1/agents":
+        if self.path == "/v1/agents":  # pragma: no cover - the server thread is outside the gate's trace
             if STATE.get("agents") is None:
                 self.send_response(404); self.end_headers(); return
             body = json.dumps({"agents": STATE["agents"]}).encode()
@@ -979,7 +979,7 @@ def main() -> int:
     rtc.PROACTIVE_ROOM = ""
     rtc._post_proactive()
     check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
-          "an owner-directed file is held without an owner DM reading (the pin is not a destination)")
+          "a gateway launched with no pin leaves an unaddressed file alone (the pin is eligibility, never a destination)")
     # A reading → delivered as op:message to the owner DM, file archived. The harness's reading is the
     # same room the pin names, so every count-based arm below reads as before.
     rtc.PROACTIVE_ROOM = "!owner:example.org"
@@ -1279,8 +1279,25 @@ def main() -> int:
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!here:example.org",
           "a [channel:] redirect is the CURRENT_ROOM audience, untouched by the owner DM")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    check(rtc.proactive_room() == "!dm:example.org", "seeded for the in-process identity change")
+    rtc._reenroll_identity = lambda: "@new-agent:example.org"  # re-enrolled while the bridge keeps running
+    STATE["agents"] = []
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "", "an in-process identity change discards the cached DM: held until the new identity has a reading")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity, the persisted reading returns")
+    _pin = rtc.PROACTIVE_ROOM; rtc.PROACTIVE_ROOM = ""  # a named secondary: launched with no pin, DM reading present
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1f.txt").write_text("the primary's nudge\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
+          "a gateway launched with no pin never consumes an unaddressed nudge, whatever DM the registry names")
+    (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.PROACTIVE_ROOM = _pin
     STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
-    rtc._ROUTING.update(owner_dm="!owner:example.org", next=time.time() + 3600, loaded=True)
+    rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
     rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is

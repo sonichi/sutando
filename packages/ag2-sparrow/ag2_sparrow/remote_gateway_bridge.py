@@ -1214,6 +1214,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
+    if not PROACTIVE_ROOM:
+        return 0  # only the primary gateway (the one launched with a pin) projects the owner's cards
     room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
     if not room:
         _held("the runtime prompt card")
@@ -1327,7 +1329,8 @@ PROACTIVE_ROOM = (
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "next": 0.0, "loaded": False, "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
+                  "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1344,6 +1347,7 @@ def _load_routing() -> None:
     if _ROUTING["loaded"]:
         return
     _ROUTING["loaded"] = True
+    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1357,6 +1361,12 @@ def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
     window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
     _load_routing()
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
+    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
+        _ROUTING.update(owner_dm="", persisted="", loaded=False)
+        _load_routing()
+        force = True
     now = time.time()
     if not force and now < _ROUTING["next"]:
         return
@@ -1395,7 +1405,8 @@ def resolve_destination(audience: str, *, room_id: str | None = None,
     reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
     caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
     SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
-    configured destination."""
+    configured destination. The pin's other role is instance eligibility: a gateway launched with it
+    empty (a named secondary) owns no unaddressed nudge and projects no card."""
     if audience == OWNER_PRIVATE:
         refresh_routing()
         return _ROUTING["owner_dm"]
@@ -3346,6 +3357,8 @@ def _post_proactive() -> None:
             continue
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
+        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
+            continue  # a secondary gateway (launched with no pin) never owns unaddressed nudges
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
