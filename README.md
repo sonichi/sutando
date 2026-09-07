@@ -228,6 +228,9 @@ Sutando started life on macOS and most of its app-automation surface — AppleSc
 - Telegram, Discord, Slack bridges (any feature that runs in the core agent)
 - Capture screen + describe screen tools
 
+Dashboard and `/tasks/active` use platform process probes, not a fixed `pgrep` path.
+Missing process tools do not abort either response; the macOS-only Sutando app reports as not running on Windows.
+
 **Returns a `macOSOnly` error on Windows (the voice agent stays up; Gemini tells the user):**
 - `switch_app`, `press_key`, `type_text`, `volume`, `brightness`, `fullscreen`, `slide_control`, `toggle_tasks`
 - `scroll`, `switch_tab`, `close_tab`, `open_url`, `click`, `point_at` (browser AppleEvents)

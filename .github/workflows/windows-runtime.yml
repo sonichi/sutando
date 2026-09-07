@@ -131,6 +131,8 @@ jobs:
         run: |
           python tests/find-pids.test.py
           if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
+          python tests/http-process-probes.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'http-process-probes.test.py failed' }
           python tests/health-check-secret-scanner-live-interpreter.test.py
           if ($LASTEXITCODE -ne 0) { throw 'health-check-secret-scanner-live-interpreter.test.py failed' }
           python tests/cwd-lint.test.py
