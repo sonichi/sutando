@@ -59,9 +59,49 @@ session_runtime() {
     | sed -n 's/^SUTANDO_CORE_RUNTIME=//p' || true
 }
 
+# Codex is installed by the desktop app into ~/.npm-global/bin, which a login
+# shell does not necessarily have on PATH: .zprofile is written with the
+# bundled git and python3 but not this one. Put the known install dir on PATH
+# ourselves rather than trusting what we inherited.
+CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
+# `codex` is a node script (#!/usr/bin/env node) and a fresh Mac ships no
+# system node, so the app's bundled runtime must be reachable or every codex
+# invocation dies with "env: node: No such file or directory" (exit 127) —
+# which the auth probe below would otherwise misreport as "not authenticated".
+# The engine lives at <app-support>/engine; this script runs from
+# <app-support>/engine/sutando, so the runtime is one level up from $REPO.
+CODEX_NODE_BIN="${CODEX_NODE_BIN:-$(cd "$REPO/.." 2>/dev/null && pwd)/runtime/node/bin}"
+# APPEND, never prepend: an operator (or a test harness) who put a codex or
+# node earlier on PATH must keep winning; we only add a fallback.
+for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
+  [ -d "$_d" ] || continue
+  case ":$PATH:" in
+    *":$_d:"*) ;;
+    *) PATH="$PATH:$_d" ;;
+  esac
+done
+export PATH
+
+# The core can be launched while the app is still installing Codex (observed:
+# engine unpacked at :25, codex landed at :32 of the following minute). Exiting
+# on the first miss leaves a dead window that never recovers even once the
+# install finishes, so wait briefly for it to appear before giving up.
+CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
 if ! command -v codex >/dev/null 2>&1; then
-  echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
-  exit 127
+  echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
+  _codex_waited=0
+  while [ "$_codex_waited" -lt "$CODEX_WAIT_TIMEOUT" ]; do
+    sleep 2
+    _codex_waited=$((_codex_waited + 2))
+    command -v codex >/dev/null 2>&1 && break
+  done
+  if command -v codex >/dev/null 2>&1; then
+    echo "  ✓ Codex CLI appeared after ${_codex_waited}s" >&2
+  else
+    echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
+    echo "  (looked on PATH and in $CODEX_INSTALL_BIN)" >&2
+    exit 127
+  fi
 fi
 
 # Use the configured CODEX_HOME (or another env name chosen by the operator).
@@ -74,7 +114,18 @@ if [ -n "$config_env" ] && [ -n "$config_value" ]; then
   echo "  ✓ $config_env=$config_value"
 fi
 
-if ! codex login status >/dev/null 2>&1; then
+# `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
+# probe — the exit code IS the signal here, not a failure.
+_codex_auth_rc=0
+codex login status >/dev/null 2>&1 || _codex_auth_rc=$?
+if [ "$_codex_auth_rc" -eq 127 ]; then
+  # 127 is "could not execute", not "not logged in" — almost always a missing
+  # node on PATH. Saying "run codex login" here sends people the wrong way.
+  echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
+  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
+  exit 127
+fi
+if [ "$_codex_auth_rc" -ne 0 ]; then
   echo "Codex CLI is not authenticated for ${CODEX_HOME:-~/.codex}. Run 'codex login' and retry." >&2
   exit 1
 fi
@@ -188,9 +239,29 @@ ensure_core_monitor() {
 # migrate schedules and then silently suppress every fire. Start it here (once).
 # Guard on the $REPO-anchored path so the check is per-checkout (won't cross-match
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
+# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
+# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
+# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
+# parent, so stop and start would each resolve on their own and could disagree.
+_HB_PY=""
+resolve_heartbeat_python() {
+  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
+}
+heartbeat_python() {
+  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
+}
 ensure_core_heartbeat() {
   pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
-  python3 "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
+  local _py
+  _py="$(heartbeat_python)"
+  if [ -z "$_py" ]; then
+    echo "WARN no runnable python3 for the core heartbeat — not started; cron-runner fires will stay suppressed" >&2
+    return 0
+  fi
+  "$_py" "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
 }
 
 ensure_durable_schedules() {
@@ -250,10 +321,18 @@ ensure_codex_scheduler() {
 # five-minute main loop while this runtime is selected.
 ensure_durable_schedules
 ensure_codex_scheduler
+resolve_heartbeat_python
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+  # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
+  _hb_py="$(heartbeat_python)"
+  if [ -n "$_hb_py" ]; then
+    "$_hb_py" "$REPO/src/core_heartbeat.py" --stop >/dev/null 2>&1 || echo "WARN heartbeat handoff (--stop) failed — old writer may still be running" >&2
+  else
+    echo "WARN no runnable python3 for the heartbeat handoff — old writer left running" >&2
+  fi
 elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
   # Sessions created before runtime markers existed are Claude sessions. Never
   # attach a selected Codex launcher to an unknown/foreign canonical session.
@@ -280,9 +359,66 @@ if session_exists "$SESSION"; then
   exit 0
 fi
 
+# Past the attach/reuse exit above, so this is a genuine Codex core boot. The
+# sentinel is cleared at each launch site below, never before one can fail.
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  # The one interpreter resolved above serves the policy read too: one resolution per launch.
+  _sd_py="$_HB_PY"
+else
+  _sd_py=""
+fi
+clear_shutdown_sentinel() {
+  if [ -n "$_sd_py" ]; then
+    "$_sd_py" "$REPO/src/shutdown.py" clear >/dev/null \
+      || echo "start-cli.sh: shutdown.py clear failed — the intake gate may hold tasks" >&2
+  else
+    echo "start-cli.sh: no runnable interpreter — shutdown sentinel NOT cleared" >&2
+  fi
+}
+# Clearing the sentinel before a launch that never yields a live core opens
+# intake with nothing serving, so exec paths stash it and restore on failure.
+_SENTINEL_STASH=""
+# Without execfail bash exits 127 on a failed exec, which would make every
+# restore-after-exec below unreachable dead code.
+shopt -s execfail
+stash_shutdown_sentinel() {
+  _SENTINEL_STASH=""
+  [ -n "$_sd_py" ] || return 0
+  _sp="$("$_sd_py" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
+  [ -n "$_sp" ] && [ -f "$_sp" ] || return 0
+  _SENTINEL_STASH="$(mktemp "${TMPDIR:-/tmp}/sutando-sentinel.XXXXXX" 2>/dev/null)" || return 0
+  cp "$_sp" "$_SENTINEL_STASH" 2>/dev/null || _SENTINEL_STASH=""
+}
+# Only reachable when exec FAILED: exec never returns on success.
+restore_shutdown_sentinel() {
+  [ -n "$_SENTINEL_STASH" ] && [ -f "$_SENTINEL_STASH" ] || return 0
+  _sp="$("$_sd_py" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
+  if [ -n "$_sp" ]; then
+    mkdir -p "$(dirname "$_sp")" 2>/dev/null || true
+    cp "$_SENTINEL_STASH" "$_sp" 2>/dev/null \
+      || echo "start-cli.sh: could not restore the shutdown sentinel after a failed launch" >&2
+  fi
+  rm -f "$_SENTINEL_STASH" 2>/dev/null || true
+  _SENTINEL_STASH=""
+}
+
 if ! tmux_available; then
   echo "  ⚠ tmux not found — Codex will run, but file-bridge task wakeups are unavailable" >&2
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
+    exit 127
+  fi
+  stash_shutdown_sentinel
+  clear_shutdown_sentinel
+  # errexit would exit on the failed exec before the restore below is reached;
+  # drop it just around the exec and re-raise the exec's own status.
+  set +e
   exec codex "${CODEX_ARGS[@]}"
+  _exec_rc=$?
+  set -e
+  restore_shutdown_sentinel
+  echo "  ⚠ codex failed to exec — shutdown sentinel restored, no core is live." >&2
+  exit "$_exec_rc"
 fi
 
 if ! command -v fswatch >/dev/null 2>&1; then
@@ -301,12 +437,34 @@ fi
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
+  # has-session failing. Poll before opening intake rather than assuming.
+  for _ in $(seq 1 25); do
+    session_exists "$SESSION" && break
+    sleep 0.2
+  done
+  if session_exists "$SESSION"; then
+    clear_shutdown_sentinel
+  else
+    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+  fi
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
+  # has-session failing. Poll before opening intake rather than assuming.
+  for _ in $(seq 1 25); do
+    session_exists "$SESSION" && break
+    sleep 0.2
+  done
+  if session_exists "$SESSION"; then
+    clear_shutdown_sentinel
+  else
+    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+  fi
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat

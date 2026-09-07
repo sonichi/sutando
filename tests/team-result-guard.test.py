@@ -412,6 +412,26 @@ def main() -> int:
                     v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
                     assert v.kind == guard.VERDICT_DELIVER, (body, tier, filt.__name__)
                     assert v.body == body, (body, tier, "suppression body was rewritten")
+    # honor_suppressions=False is the published-text mode (/scan-text): the caller
+    # delivers the body itself and executes no markers, so skip markers exempt nothing.
+    v = guard.classify_result_for_tier("[no-send]\nsecret text", "team", REPO,
+                                       secret_filter=_leaky,
+                                       honor_suppressions=False)
+    assert v.kind == guard.VERDICT_LEAK, "published-text mode must scan skip-marker bodies"
+    v = guard.classify_result_for_tier("[no-send]\nhide", "team", REPO,
+                                       secret_filter=_clean,
+                                       honor_suppressions=False)
+    assert v.kind == guard.VERDICT_DELIVER and v.body == "[no-send]\nhide", (
+        "a clean skip-marker body still delivers in published-text mode")
+    _b, _reason = guard.guard_result_for_tier(
+        "[no-send]\nsecret text", "team", REPO, secret_filter=_leaky,
+        honor_suppressions=False)
+    assert _reason is not None, "guard wrapper must thread honor_suppressions through"
+    # The fail-closed outage reason is machine-detectable by prefix, so a
+    # transport-owning consumer can map outage (not content) to an error.
+    v = guard.classify_result_for_tier("plain body", "team", REPO, secret_filter=_raises)
+    assert v.kind == guard.VERDICT_LEAK and v.reason.startswith(guard.SCANNER_UNAVAILABLE), (
+        "scanner outage must carry the SCANNER_UNAVAILABLE prefix")
     assert not hasattr(guard, "suppression_stub_for_tier"), (
         "the stub minter must be gone, not merely unused — it is what parsed and "
         "validated a dedup target inside the guard")

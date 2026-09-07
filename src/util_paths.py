@@ -359,38 +359,38 @@ def claude_project_slug(path: str | Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
-def channel_access_path(source: str) -> Path:
-    """Resolve `channels/<source>/access.json` with the ~30-day legacy fallback.
+def default_memory_dir() -> Path:
+    """Claude Code's memory dir for THIS checkout, ignoring any override.
 
-    Prefer the canonical claude_home_path() location. If that file does NOT
-    exist but the pre-migration `~/.claude/channels/<source>/access.json`
-    does, return the legacy path and emit a one-line stderr deprecation
-    warning — per the CLAUDE.md migration policy (readers prefer canonical,
-    fall back to legacy for ~30 days).
-
-    Why this exists: bridges restarted under a fresh $CLAUDE_CONFIG_DIR
-    before the channel-bridge migrate step copies channels/ would otherwise
-    see no access.json at all — Telegram/Slack then re-arm TOFU onboarding
-    and the next DM sender auto-enrolls as owner. Falling back to the
-    populated legacy allowlist keeps access control continuous across the
-    migration window. Writers (TOFU onboarding, /discord:access) use the
-    same resolved path, so the legacy file stays the single source of truth
-    until it is actually migrated.
+    Composed here so `SUTANDO_MEMORY_DIR`'s divergence check and every reader
+    of the corpus agree on what the un-overridden location is.
     """
-    canonical = claude_home_path("channels", source, "access.json")
-    if canonical.exists():
-        return canonical
-    legacy = Path.home() / ".claude" / "channels" / source / "access.json"
-    if legacy != canonical and legacy.exists():
-        print(
-            f"[util_paths] DEPRECATION: using legacy {legacy} — canonical "
-            f"{canonical} missing. Run the channel-bridge migrate step "
-            f"(scripts/sutando-migrate.sh) to relocate; this fallback is "
-            f"removed ~30 days post-migration.",
-            file=sys.stderr,
-        )
-        return legacy
-    return canonical
+    repo = Path(__file__).parent.parent.resolve()
+    return claude_home_path("projects", claude_project_slug(repo), "memory")
+
+
+def memory_dir() -> Path:
+    """The core-memory dir a reader should actually read.
+
+    Resolves through `_memory_dir_env()`, exactly as `personal_path()` and
+    `shared_personal_path()` do, so a host on the legacy `SUTANDO_PRIVATE_DIR`
+    alias reads its real corpus instead of an empty default path.
+    """
+    root = _memory_dir_env()
+    return Path(os.path.expanduser(root)) if root else default_memory_dir()
+
+
+def channel_access_path(source: str) -> Path:
+    """Resolve `channels/<source>/access.json` inside the configured Claude home.
+
+    The pre-migration `~/.claude/channels/<source>/access.json` fallback shipped
+    2026-06-21 for a ~30-day window and is retired: it let any process whose
+    canonical file was absent — a bridge under a fresh $CLAUDE_CONFIG_DIR, or a
+    test that isolated one — read and WRITE the operator's real home. An absent
+    canonical file is now a migration to run (`scripts/sutando-migrate.sh`), not
+    a reason to reach outside the configured home.
+    """
+    return claude_home_path("channels", source, "access.json")
 
 
 # ---------------------------------------------------------------------------
