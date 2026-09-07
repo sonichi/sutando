@@ -30,13 +30,17 @@ Stand), false (it bounced), null/absent (never observed — send, then record).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import datetime
 import re
 import subprocess
+import threading
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 _REPO = Path(__file__).resolve().parents[3]
 # Bare `python3` can resolve to the Xcode CLT stub on a clean macOS host, which
@@ -111,6 +115,50 @@ def load_roster() -> dict:
     return roster_union(paths)
 
 
+def durable_endpoints(entry: dict) -> set:
+    """EVERY immutable recipient id this row holds, for IDENTITY.
+
+    A row carrying both transports is one person on two routes; tagging only the
+    route we would send on let a second row for that person miss the match and
+    count as a separate reviewer.
+    """
+    if not isinstance(entry, dict):
+        return set()
+    stand, room = entry.get("stand"), entry.get("room")
+    dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
+    if not isinstance(stand, (str, type(None))):
+        stand = None
+    if not isinstance(dm_id, (str, int, type(None))):
+        dm_id = None
+    out = set()
+    # Identity is what the row declares; route completeness is durable_endpoint's.
+    # Gating here made one person read as two and satisfy the two-reviewer minimum.
+    if stand:
+        out.add(stand)
+    if dm_id:
+        out.add(f"discord:{dm_id}")
+    return out
+
+
+def _routable(entry: dict, endpoint: str) -> bool:
+    """Whether THIS endpoint can actually be sent on — the half identity drops."""
+    if endpoint.startswith("discord:"):
+        return bool(entry.get("home_channel"))
+    return bool(entry.get("room"))
+
+
+def durable_endpoint(entry: dict) -> "str | None":
+    """The ONE route to send on, or None. Identity uses durable_endpoints().
+
+    Selects from the plural rather than re-deriving: a second copy of the
+    normalisation drifts from the one the park writes.
+    """
+    eps = {e for e in durable_endpoints(entry) if _routable(entry, e)}
+    # Matrix first, preserving the route these rows have always been sent on.
+    return next((e for e in sorted(eps) if not e.startswith("discord:")),
+                next(iter(sorted(eps)), None))
+
+
 def stated_reason(entry: dict) -> str:
     """The roster's own words for why an entry refuses, if it gave any.
 
@@ -130,6 +178,11 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
     actor_of, covered = _actor_map(roster), {}
+    # The component comes from the WHOLE roster, so a connector row that is
+    # unrequested, unroutable or off-allowlist still joins the people it links.
+    component = identity_components(roster)
+    cands = []
+
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -145,38 +198,59 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             if entry.get(field):
                 label = field[: -len("_caveat")].upper().replace("_", " ")
                 print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
-        if not stand or not room:
-            # a human id alone cannot be a target: person-mentions trigger no Stand
-            print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
-                  f"(human-only = not Stand addressing)", file=sys.stderr)
-            # Without this the refusal reads as a data gap, and the obvious
-            # repair — populate the fields — silently overrides the refusal.
+        dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
+        channel = entry.get("home_channel")
+        if stand and room:
+            transport = "matrix"
+        elif dm_id and channel:
+            transport = "discord"
+        else:
+            # Distinguish NO ROUTE from A ROUTE THIS TOOL CANNOT DRIVE. Collapsing
+            # them made every refusal read as "this reviewer is unreachable".
+            if stand and not room:
+                detail = (f"has a Stand ({stand}) but no 'room' — a Stand mxid is "
+                          "room-scoped, so it cannot be addressed without one")
+            elif dm_id and not channel:
+                detail = (f"has a Discord id ({dm_id}) but no 'home_channel' — "
+                          "no channel to mention them in")
+            else:
+                detail = ("carries no addressable route at all (a human handle "
+                          "alone triggers no Stand)")
+            print(f"UNUSABLE entry '{name}': {detail}", file=sys.stderr)
+            # The roster's own words, so the obvious repair (populate the
+            # fields) cannot silently override a stated refusal.
             if why:
                 print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            # State the FLAG, never a cause: nothing sets allowlisted=False after
-            # a detected bounce, so any history claim here would be a guess.
-            print(f"OFF-ALLOWLIST '{name}': {stand} is not allowlisted for mentions"
-                  + (f" — {why}" if why else "")
+            # From main: state the FLAG, never a cause — nothing sets
+            # allowlisted=False after a bounce, so a history claim is a guess.
+            who = stand or dm_id
+            print(f"OFF-ALLOWLIST '{name}': {who} is not allowlisted for mentions"
+                  + (f" — {stated_reason(entry)}" if stated_reason(entry) else "")
                   + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
+        endpoint = durable_endpoint(entry)
         # One person can hold several roster keys, so counting NAMES lets the
         # two-reviewer gate in main() pass on one recipient addressed twice.
         actor = actor_of.get(name, name)
-        # Tagged keys: a single dict would alias a roster key against an mxid.
-        prior = covered.get(("actor", actor)) or covered.get(("stand", stand))
+        cands.append((component.get(name, ("actor", actor)), name, {
+            "name": name, "transport": transport, "stand": stand,
+            "room": room, "discord_id": dm_id, "channel": channel,
+            "endpoint": endpoint, "human": entry.get("human")}))
+
+    for root, name, target in cands:
+        prior = covered.get(root)
         if prior is not None:
             print(f"DUPLICATE '{name}': same person as '{prior}' "
-                  f"({stand}) — already covered, not a second reviewer",
-                  file=sys.stderr)
+                  f"({target['endpoint'] or actor_of.get(name, name)}) — "
+                  "already covered, not a second reviewer", file=sys.stderr)
             continue
-        covered[("actor", actor)] = covered[("stand", stand)] = name
-        out.append({"name": name, "stand": stand, "room": room,
-                    "human": entry.get("human")})
+        covered[root] = name
+        out.append(target)
     return out, worst
 
 
@@ -206,6 +280,7 @@ def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
     return None, f"unverified (permission={perm!r})"
 
 
+
 def _is_collaborator(repo: str, login: str) -> bool:
     try:
         p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
@@ -213,6 +288,7 @@ def _is_collaborator(repo: str, login: str) -> bool:
     except Exception:                            # noqa: BLE001 - probe must not raise
         return True                              # unknown -> the milder wording
     return p.returncode == 0
+
 
 
 def _github_login(name: str, roster: dict) -> "tuple[str, str]":
@@ -243,6 +319,7 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     return name, "no login found for this key"
 
 
+
 def _is_github_user(login: str) -> bool:
     try:
         p = subprocess.run(["gh", "api", f"users/{login}", "-q", ".login"],
@@ -250,7 +327,6 @@ def _is_github_user(login: str) -> bool:
     except Exception:                            # noqa: BLE001 - probe must not raise
         return False
     return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
-
 
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
@@ -288,6 +364,66 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     return target["stand"] in ids, f"{len(ids)} members"
 
 
+def discord_reachable(target: dict) -> "tuple[bool, str]":
+    """Can this id be checked at all? Never a positive absence.
+
+    `allowFrom` is INBOUND AUTHORIZATION -- who may send to a channel -- not
+    membership, and the bridge also grants via a global superset this file
+    cannot see. So an omission is not evidence of absence and never returns one.
+    """
+    try:
+        # Inside the probe's own try, not above it: a tree without src/ raises
+        # ModuleNotFoundError, and this probe must answer UNVERIFIED, never raise.
+        from util_paths import claude_home_path
+        access = claude_home_path("channels", "discord", "access.json")
+        data = json.loads(access.read_text())
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return True, f"unverified ({type(exc).__name__})"
+    if not isinstance(data, dict):
+        return True, "unverified (non-object access map)"
+    for section in ("groups", "channels"):
+        sect = data.get(section)
+        # A truthy non-object has no .get, and a scalar allowFrom ITERATES:
+        # "1" answers per character. Unusable shapes are unverified, not answers.
+        if sect is not None and not isinstance(sect, dict):
+            return True, f"unverified ({section} is {type(sect).__name__}, not an object)"
+        entry = (sect or {}).get(str(target["channel"]))
+        if isinstance(entry, dict):
+            raw = entry.get("allowFrom")
+            if raw is not None and not isinstance(raw, (list, tuple, set)):
+                return True, f"unverified (allowFrom is {type(raw).__name__}, not a list)"
+            # [{"id": "111"}], [None], [True] all stringify, so a check on
+            # the container alone yields a verdict computed from garbage.
+            items = list(raw or [])
+            if any(not isinstance(x, (str, int)) or isinstance(x, bool) for x in items):
+                return True, f"unverified ({section} allowFrom holds non-scalar entries)"
+            allowed = {str(x) for x in items}
+            if not allowed:
+                return True, f"unverified ({section} entry has no allowFrom)"
+            if str(target["discord_id"]) in allowed:
+                # A HIT is no more a membership witness than a miss: the field
+                # answers "who may send TO this channel", not who reads it.
+                return True, (f"unverified (listed in {section} allowFrom, which is "
+                              "inbound authorization rather than membership)")
+            # NOT an absence. allowFrom answers "who may send", and the bridge
+            # grants via a global superset this file cannot see.
+            return True, (f"unverified (not in {section} allowFrom, which is inbound "
+                          "authorization rather than membership)")
+    return True, "unverified (channel not in the access map)"
+
+
+def discord_command_for(target: dict, message: str) -> "list[str]":
+    """Post into the channel discord_reachable actually validated.
+
+    bot2bot-post always resolves the bot2bot channel and `--to` only picks the
+    mention, so routing through it validated one channel and delivered to another.
+    """
+    return [_PY, str(_REPO / "skills" / "collaboration-intelligence" / "scripts"
+                     / "send_channel_message.py"),
+            str(target["channel"]), str(target["discord_id"]),
+            f"<@{target['discord_id']}> {message}"]
+
+
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
     # Roster "human" is a room handle for some entries and a structured record
@@ -300,6 +436,37 @@ def command_for(target: dict, message: str) -> "list[str]":
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+
+
+def _canon_repo(r):
+    """GitHub owner/name is case-insensitive, so the park must be too: a
+    re-cased URL is the SAME pull request, not a second one to ask about."""
+    return r.lower() if isinstance(r, str) else r
+
+
+def _refs(message: str) -> set:
+    """Case-canonical (repo, pr) refs. One reader so a writer and a checker
+    cannot disagree about which PR a URL names."""
+    return {(_canon_repo(m.group(1)), int(m.group(2)))
+            for m in _PR_URL.finditer(message or "")}
+
+
+def _refs_spelled(message: str) -> list:
+    """(as-written repo, pr) per distinct canonical ref, for PERSISTENCE only.
+
+    Rows keep the request's own spelling so a pre-canonicalization reader
+    (rollback) still recognizes them by exact match; every reader in THIS
+    revision canonicalizes through _row(), so both revisions dedup the row.
+    """
+    out, seen = [], set()
+    for m in _PR_URL.finditer(message or ""):
+        key = (_canon_repo(m.group(1)), int(m.group(2)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((m.group(1), int(m.group(2))))
+    return out
+
 
 # `owner/repo#12` and a bare `#12`. Two digits minimum is a DELIBERATE trade, not
 # an oversight: `#7` is a real PR and passes silently, but `#1` is usually prose.
@@ -326,27 +493,770 @@ def unrecordable_pr_refs(message: str) -> list:
     return out
 
 def ledger_path() -> Path:
+    # Overridable so a test can exercise the real reserve/settle path against a
+    # scratch file. Two cases sharing one ledger park each other.
+    override = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+    if override:
+        return Path(override)
     from workspace_default import resolve_workspace
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str) -> int:
-    """Log a room ask so pr-unattended can see it. GitHub's timeline records only
-    review_requested events, and the owner's rule is to ask in the room and never
-    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
-    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
-    if not refs:
+#: Outcomes that must block a repeat. `pending` is a reservation written BEFORE
+#: the spawn, so a crash between POST and outcome still parks.
+_UNSAFE_OUTCOMES = {"pending", "unknown"}
+
+#: A definite non-delivery. Nothing was posted, so it is neither a park nor an
+#: ask — counting it refuses the retry it exists to permit.
+_NOT_AN_ASK = {"failed"}
+
+#: The child's codes for proven non-delivery. Everything else — a crash, a
+#: signal, an unassigned code — is ambiguous and must park.
+_PROVEN_NOT_DELIVERED = {2, 10}
+
+#: Outcomes proving a post reached the channel, or may have.
+_DID_ASK = {"confirmed", "unknown"}
+
+
+#: Every outcome `record_asks` writes. A value outside this set is a malformed
+#: row, never a settlement.
+_KNOWN_OUTCOMES = {"pending", "unknown", "confirmed", "failed"}
+
+#: Delivery history — a post that landed or may have. ONLY these carry
+#: `reviewer`, the field a pre-outcome reader mistakes for a completed ask.
+_DELIVERY_OUTCOMES = {"unknown", "confirmed"}
+
+#: The one comparable form. Every accepted stamp is normalized to it, so the
+#: lexical comparisons downstream order correctly across writers.
+_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _norm_ts(ts: str) -> "str | None":
+    """A real instant rendered as fixed-width UTC, or None.
+
+    Shape is not enough: `0000-00-00T00:00:00Z` and `+99:99` match a regex and
+    are not instants, and mixed offsets do not sort against Z at all.
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return None                 # naive: no instant, only a wall clock
+
+        # OverflowError raises HERE, not at parse; uncaught it crashes the
+        # reader instead of preserving a park.
+        return dt.astimezone(datetime.timezone.utc).strftime(_TS_FMT)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+#: Accepted row schema. A field of the wrong type is a malformed ROW, not a
+#: reason to crash a reader or to misattribute the stream it belongs to.
+def _row(d) -> "tuple | None":
+    """(repo, pr, identity, outcome, ts) for a well-formed record, else None."""
+    if not isinstance(d, dict):
+        return None                     # valid JSON, not a record
+    repo, pr = d.get("repo"), d.get("pr")
+    actor = d.get("actor")
+    if actor is not None and not (isinstance(actor, str) and actor):
+        return None                     # PRESENT but wrong: not an absent actor
+    # EVERY present identity field: a valid endpoint must not smuggle a list.
+    for f in ("endpoint", "reviewer"):
+        v = d.get(f)
+        if v is not None and not (isinstance(v, str) and v):
+            return None
+    # The endpoint is durable identity; a roster alias is a renameable spelling.
+    who = d.get("endpoint") or actor or d.get("reviewer")
+    outcome, ts = d.get("outcome"), d.get("ts")
+    if not isinstance(repo, (str, type(None))) or not isinstance(who, str) or not who:
+        return None
+    if not isinstance(pr, (str, int)) or isinstance(pr, bool):
+        return None
+    # Checked BEFORE coercion: `x or ""` turns 0, False, [] and {} into an
+    # accepted empty string, so the type check never sees what was written.
+    if ts is not None and not isinstance(ts, str):
+        return None
+    # Normalized, not just shaped: an impossible date matches a regex, and a
+    # mixed offset does not order against a Z stamp at all.
+    if ts:
+        ts = _norm_ts(ts)
+        if ts is None:
+            return None
+    # A closed set. An unrecognised outcome must not become the latest one and
+    # settle a possibly-landed post; the row is malformed, so the park holds.
+    if outcome is not None and (not isinstance(outcome, str)
+                                or outcome not in _KNOWN_OUTCOMES):
+        return None                     # type first: a list is unhashable
+    # Malformed persisted identity drops the row; a park is never guessed.
+    if "membership" in d and valid_tags(d.get("membership")) is None:
+        return None
+    return _canon_repo(repo), str(pr), who, outcome, ts or ""
+
+
+def _streams(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> compact state, folded line by line.
+
+    THE one owner of the ledger's read contract: file access, malformed-line and
+    malformed-ROW skipping, identity, key shape, and order. Retaining the rows
+    made memory grow with the ledger for a result of fixed size.
+    """
+    out = {}
+    if not led.exists():
+        return out
+    with open(led) as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            row = _row(d)
+            if row is None:
+                continue                # one bad row never hides a later good one
+            repo, pr, who, outcome, ts = row
+            st = out.setdefault((repo, pr, who),
+                                {"last": None, "first_ask": None,
+                                 "first_ask_outcome": None, "n": 0,
+                                 "identity": {}, "first_identity": {},
+                                 "last_identity": {}, "by_reviewer": {},
+                                 "membership": []})
+            # PER EVENT, not per stream: one slot stamped the newest spelling
+            # onto every retained row, losing asks made under an older alias.
+            ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
+                     if isinstance(d.get(f), str) and d.get(f)}
+            # As-written spelling rides the EVENT, so compaction can re-emit
+            # it and a pre-canonicalization reader (rollback) still matches.
+            if isinstance(d.get("repo"), str) and d.get("repo"):
+                ident["spelled_repo"] = d["repo"]
+            # REPLACES on a newer claim, matching the uncompacted reader that
+            # `_membership_overlap` uses: a union revives retired links.
+            mem = valid_tags(d.get("membership"))
+            if mem is not None:
+                st["membership"] = sorted(mem)
+            st["identity"].update(ident)
+            st["last_identity"] = ident
+            # One delivery row per distinct legacy spelling survives compaction.
+            if (outcome is None or outcome in _DELIVERY_OUTCOMES) and ident.get("reviewer"):
+                st["by_reviewer"][ident["reviewer"]] = (outcome, ts, ident)
+            st["last"] = (outcome, ts)
+            st["n"] += 1
+            # A row predating the outcome field records a send that happened:
+            # absence is legacy, not a claim that nothing was posted.
+            if (outcome is None or outcome in _DID_ASK) and (
+                    st["first_ask"] is None or ts < st["first_ask"]):
+                st["first_ask"], st["first_ask_outcome"] = ts, outcome
+                st["first_identity"] = ident
+    return out
+
+
+#: Compaction trigger and hard ceiling. Compaction alone cannot bound BREADTH,
+#: so settled streams are evicted oldest-first to reach the ceiling.
+_COMPACT_ABOVE = 2000
+_MAX_ROWS = 4000
+
+#: Never evicted: an unresolved reservation or a possibly-landed post is the
+#: safety state the park is made of. Retention gives way to it, not the reverse.
+_ACTIVE = _UNSAFE_OUTCOMES
+
+
+def _physical_rows(led: Path) -> int:
+    """Every line on disk, malformed ones included — the file is what grows."""
+    if not led.exists():
         return 0
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    p = ledger_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a") as fh:
-        for repo, num in sorted(refs):
-            fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
-                                 "ts": ts, "channel": "room"}) + "\n")
+    with open(led) as fh:
+        return sum(1 for _ in fh)
+
+
+def _retained(st: dict) -> list:
+    """THE retained-row set: (outcome, ts, identity) per row compaction keeps.
+
+    One owner so `_rows_for` and `_rewrite` cannot disagree about the cost."""
+    keep = []
+    if st["first_ask"] is not None:
+        keep.append((st["first_ask_outcome"], st["first_ask"],
+                     st.get("first_identity") or st.get("identity") or {}))
+    if st["last"] and (not keep or st["last"] != (keep[0][0], keep[0][1])):
+        keep.append((st["last"][0], st["last"][1],
+                     st.get("last_identity") or st.get("identity") or {}))
+    spelt = {k[2].get("reviewer") for k in keep if k[2].get("reviewer")}
+    extra = [(o, t, i) for r, (o, t, i) in sorted((st.get("by_reviewer") or {}).items())
+             if r not in spelt]
+    if not keep:
+        return extra or [(None, "", st.get("identity") or {})]
+    # The SEMANTIC last event must stay the LAST physical row: `_streams` reads
+    # latest state by line order, so an alias row after it flips the verdict.
+    return keep[:-1] + extra + keep[-1:]
+
+
+def _rows_for(st: dict) -> int:
+    """Rows this stream costs after compaction."""
+    return len(_retained(st))
+
+
+def _maybe_compact(led: Path) -> None:
+    """Caller MUST hold the ledger lock. Compacts, then evicts SETTLED streams
+    oldest-first until the file is under _MAX_ROWS. Active safety state is never
+    evicted, and failing to reach the ceiling is reported rather than hidden."""
+    if _physical_rows(led) <= _COMPACT_ABOVE:
+        return
+    compact(led)
+    if _physical_rows(led) <= _MAX_ROWS:
+        return
+    streams = _streams(led)
+    cost = {k: _rows_for(st) for k, st in streams.items()}
+    total = sum(cost.values())
+    # str() on every component: `repo` may legitimately be None, and a tuple
+    # sort then compares None with a string when timestamps tie.
+    settled = sorted(((st["last"][1] if st["last"] else "",
+                       tuple(str(x) for x in k), k)
+                      for k, st in streams.items()
+                      if not (st["last"] and st["last"][0] in _ACTIVE)))
+    for _ts, _sortkey, k in settled:
+        if total <= _MAX_ROWS:
+            break
+        total -= cost[k]
+        streams.pop(k)
+    _rewrite(led, streams)
+    if _physical_rows(led) > _MAX_ROWS:
+        print(f"  WARNING: ask ledger holds {_physical_rows(led)} rows, above the "
+              f"{_MAX_ROWS} ceiling; every remaining stream carries active park "
+              "state, which is never evicted", file=sys.stderr)
+
+
+def _rewrite(led: Path, streams: dict) -> int:
+    """Atomically replace the ledger with the rows these streams imply.
+    Caller MUST hold the ledger lock."""
+    rows = []
+    for (repo, num, who), st in sorted(
+            streams.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+        for outcome, ts, identity in _retained(st):
+            # The reader's normalized string: int() renamed "007" to "7".
+            row = {"repo": identity.get("spelled_repo") or repo, "pr": num,
+                   "ts": ts, "channel": "room", "outcome": outcome}
+            row["actor"] = identity.get("actor") or who
+            if identity.get("endpoint"):
+                row["endpoint"] = identity["endpoint"]
+            # Same rule as the append, plus legacy: a row predating the outcome
+            # field IS a delivery, so compacting it must not drop `reviewer`.
+            if outcome is None or outcome in _DELIVERY_OUTCOMES:
+                row["reviewer"] = identity.get("reviewer") or who
+            # Only the UNRESOLVED rows need it: those are what a later retry
+            # admission reads, and a settled row's component is spent.
+            if outcome in _ACTIVE and st.get("membership"):
+                row["membership"] = st["membership"]
+            rows.append(json.dumps(row))
+    tmp = led.with_suffix(led.suffix + ".compact")
+    mode = led.stat().st_mode & 0o777 if led.exists() else _LEDGER_MODE
+    # Opened at its final private mode: writing under umask and chmod-ing after
+    # leaves the payload readable for the whole write-and-fsync window.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
+        fh.write("".join(r + "\n" for r in rows))
         fh.flush()
         os.fsync(fh.fileno())
+    os.chmod(tmp, mode)                 # umask can still have narrowed the open
+    os.replace(tmp, led)                # atomic: a reader sees one file or the other
+    return len(rows)
+
+
+def compact(led: Path) -> int:
+    """Rewrite to the smallest history the projections cannot tell from the
+    original: per raw stream, the earliest real ask and the latest outcome.
+    Caller MUST hold the ledger lock. Returns rows written."""
+    return _rewrite(led, _streams(led))
+
+
+def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
+    """Project each RAW stream's state, then fold onto the canonical actor.
+
+    Reducing before folding is the invariant both readers need: one alias's
+    definite failure settles only its own reservation.
+    """
+    canon = canonical or (lambda w: w)
+    out = {}
+    for (repo, num, who), st in streams.items():
+        v = per_stream(st)
+        if v is None:
+            continue
+        k = (repo, num, canon(who))
+        out[k] = combine(out[k], v) if k in out else v
+    return out
+
+
+def _latest_outcomes(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> (outcome, ts) from the LAST row of that stream.
+
+    Raw keys only. Folding this onto a canonical actor is the defect the park
+    was fixed for, so the API does not offer it rather than leaving it callable.
+    """
+    return _fold(_streams(led), lambda st: st["last"], lambda a, b: b)
+
+
+def _latest_with_identity(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> ((outcome, ts), identity-as-written).
+
+    The identity rides along so a reader can compare on the AXIS the row used.
+    A raw spelling alone cannot: one person's endpoint and another's roster key
+    can be the same text, and resolving that by a fixed axis order aliases them.
+    """
+    return _fold(_streams(led),
+                 lambda st: (st["last"], dict(st.get("last_identity") or {})),
+                 lambda a, b: b)
+
+
+def _first_ask(led: Path, canonical=None) -> dict:
+    """(repo, pr, actor) -> earliest ts at which an ask actually reached them."""
+    def per_stream(st):
+        if st["first_ask"] is not None:
+            return st["first_ask"]
+        # A standing reservation may have posted, so it counts as an ask at its
+        # own ts until it settles; a settled `failed` never posted.
+        return st["last"][1] if st["last"] and st["last"][0] == "pending" else None
+
+    def earliest(a, b):
+        return min(x for x in (a, b) if x) if (a and b) else (a or b)
+
+    return _fold(_streams(led), per_stream, earliest, canonical=canonical)
+
+
+def retry_clause(kind: str) -> str:
+    """What an unsafe send may truthfully promise about repeating itself.
+    Only an ask claims a park, so only an ask has protection to report."""
+    if kind == "ask":
+        return ("the park holds, so a repeat is refused — check the channel "
+                "before clearing one")
+    return ("NO retry record was written (a notice does not park). Re-running "
+            "will attempt another post and MAY duplicate a delivered notice — "
+            "check the channel before resending")
+
+
+def unknown_parked(message: str, reviewer: str, actor: str = None,
+                   canonical=None, endpoint: str = None) -> bool:
+    """True when this ACTOR's latest row for this PR is unsafe to repeat.
+
+    Keyed by canonical actor, not roster spelling: two aliases of one person are
+    one endpoint, and keying by spelling lets the second alias resend.
+
+    The ledger is append-only, so a later row supersedes an earlier one; the
+    verdict is the LAST row per (repo, pr, actor), never any matching row.
+    """
+    who = actor or reviewer
+    refs = _refs(message)
+    led = ledger_path()
+    if not refs or not led.exists():
+        return False
+    try:
+        # Per RAW spelling, then OR across the actor: alpha's definite failure
+        # settles alpha's reservation and proves nothing about beta's post.
+        latest = _latest_with_identity(led)
+    except OSError:
+        # Cannot read the park state, so cannot prove this was NOT parked. Fail
+        # closed: refusing a send is recoverable, a duplicated unsafe post is not.
+        return True
+    canon = canonical or (lambda w: w)
+    for (repo, num, row_who), ((outcome, _ts), ident) in latest.items():
+        # Compare on the axis the ROW recorded: a bare `row_who` is ambiguous,
+        # since one person's endpoint can be another's roster key.
+        row_endpoint = ident.get("endpoint")
+        row_names = {ident.get(f) for f in ("reviewer", "actor")} - {None}
+        if row_endpoint and endpoint:
+            # Both sides name a recipient: the endpoint decides, alone. Falling
+            # back to names here re-aliases two people who share a roster key.
+            if row_endpoint != endpoint:
+                continue
+        elif row_endpoint or row_names:
+            cands = row_names or {row_endpoint}
+            if not any(canon(n) == canon(who) or n in (who, reviewer)
+                       for n in cands):
+                continue
+        # Legacy rows carry no identity fields at all; fall back to the raw key.
+        elif canon(row_who) != canon(who) and row_who not in (who, reviewer):
+            continue
+        if any(_canon_repo(repo) in (r, None) and num == str(n)
+               for r, n in refs):
+            if outcome in _UNSAFE_OUTCOMES:
+                return True
+    return False
+
+
+#: The ledger holds who was asked about what; it is user state, not world
+#: readable. A fresh file under umask 022 would be 0644.
+_LEDGER_MODE = 0o600
+
+#: flock is per-fd, so a nested take deadlocks. Re-entrant PER THREAD AND PER
+#: LEDGER: a process-global counter let another thread skip flock entirely.
+_LOCK_STATE = threading.local()
+
+
+@contextlib.contextmanager
+def _ledger_lock(led: Path):
+    """The ledger's ONE mutual-exclusion point. Every writer takes it, so an
+    append can never land inside a compactor's snapshot-then-replace window."""
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = _LOCK_STATE.held = set()
+    key = str(led.resolve() if led.exists() else led)
+    if key in held:
+        yield                           # this thread already holds THIS ledger
+        return
+    led.parent.mkdir(parents=True, exist_ok=True)
+    lock = led.with_suffix(led.suffix + ".lock")
+    with open(lock, "a") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.discard(key)
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def reserve_ask(a, t, who, person_of, roster, require_ref=True):
+    """Reserve the retry park for one ask. TRANSPORT-INDEPENDENT by contract.
+
+    Returns (proceed, bucket, note). A park that only one transport honours is
+    not a park: an alias on the other transport walks past a landed send."""
+    if a.kind != "ask":
+        return True, None, None
+    if not _PR_URL.search(a.message):
+        if require_ref:
+            return False, "failure", (
+                f"{t['name']}: REFUSED — the message carries no full PR URL, so an "
+                "unknown outcome could not be recorded and a repeat could duplicate "
+                "it. Use the full URL, not a short #ref.")
+        # Unkeyable: no park can exist for it, so return BEFORE the ledger
+        # rather than adding a dependency this path does not need.
+        return True, None, None
+    try:
+        reserved = claim_park(a.message, t["name"], who, canonical=person_of,
+                              endpoint=t.get("endpoint"),
+                              membership=component_tags(roster, t["name"]))
+    except MembershipTooLarge as e:
+        return False, "failure", (
+            f"{t['name']}: REFUSED — {e}; the no-repeat contract cannot be upheld "
+            "for an identity that will not persist. Nothing was sent.")
+    except OSError as e:
+        return False, "failure", (
+            f"{t['name']}: REFUSED — could not reserve the park ({e}); sending now "
+            "would be unrepeatable-but-unrecorded. Nothing was sent.")
+    if reserved is None:
+        return False, "unknown", (
+            f"{t['name']}: PARKED — a previous send to {who} is UNSAFE to repeat "
+            "(it landed, or may have); check the channel")
+    if not reserved:
+        if not require_ref:
+            return True, None, None
+        return False, "failure", (
+            f"{t['name']}: REFUSED — no PR reference to key the park on; "
+            "nothing was sent")
+    return True, None, None
+
+
+def settler(a, t, who, parked=True):
+    """The matching settlement for reserve_ask, on either transport.
+
+    `parked` is what reserve_ask actually reserved. An unkeyable ask holds no
+    park, so a failure there blocks nothing and must not claim it does.
+    """
+    def _settle(outcome, detail):
+        # A NOTICE never claimed, so it has nothing to supersede — and a row
+        # here would be projected into ask history by `_first_ask`.
+        if a.kind != "ask":
+            return 0
+        try:
+            return record_asks(a.message, t["name"], outcome=outcome, actor=who,
+                               detail=detail, endpoint=t.get("endpoint")) or 0
+        except OSError as err:
+            # Which way this fails depends on whether anything was reserved.
+            if parked:
+                print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the park "
+                      "holds, so a repeat is blocked until it is cleared",
+                      file=sys.stderr)
+            else:
+                print(f"  WARNING: {t['name']} is UNRECORDED ({err}) — this ask "
+                      "carries no PR URL, so NO park was claimed and a repeat is "
+                      "NOT blocked; re-running may send it again", file=sys.stderr)
+            return None
+    return _settle
+
+
+def claim_park(message: str, reviewer: str, actor: str = None,
+               canonical=None, endpoint: str = None,
+               membership=None) -> "int | None":
+    """Atomically claim the park, or None if someone else already holds it.
+
+    Check-then-append is not a claim: two callers both read "not parked", both
+    append `pending`, and both post. The check and the write happen under one
+    exclusive lock so exactly one caller can win.
+    """
+    who = actor or reviewer
+    led = ledger_path()
+    led.parent.mkdir(parents=True, exist_ok=True)
+    if not led.exists():
+        os.close(os.open(led, os.O_CREAT | os.O_WRONLY, _LEDGER_MODE))
+    with _ledger_lock(led):
+        # Overlap-then-UNION runs BEFORE the spelling check: returning early
+        # on a spelling match skips the union, losing the history it carries.
+        hit = _membership_overlap(led, message, membership) if membership else None
+        if hit is not None:
+            prior, ident, matched = hit
+            # Only the streams that overlapped may learn `unknown`: a PR in the
+            # same message that was never sent has nothing possibly-landed.
+            merged = prior | set(membership)
+            # component_tags bounds ONE component; the UNION of two can exceed
+            # the same bound, and the reader rejects it after the send decision.
+            if len(merged) > _MAX_TAGS:
+                raise MembershipTooLarge(
+                    f"{reviewer}: the union of this component with the parked one is "
+                    f"{len(merged)} identity tags, over the {_MAX_TAGS} bound")
+            record_asks(message, ident.get("reviewer") or reviewer,
+                        outcome="unknown", actor=ident.get("actor"),
+                        endpoint=ident.get("endpoint"),
+                        membership=merged, only=matched)
+            return None
+        if unknown_parked(message, reviewer, who, canonical=canonical,
+                          endpoint=endpoint):
+            return None
+        return record_asks(message, reviewer, outcome="pending", actor=who,
+                           endpoint=endpoint, membership=membership)
+
+
+def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
+    """An unresolved OUTCOME_UNKNOWN record for this notice whose persisted
+    membership intersects the candidate's component: (tags, identity, matched),
+    where `matched` is the set of canonical (repo, pr) refs that overlapped."""
+    refs = {(r, str(n)) for r, n in _refs(message)}
+    if not refs or not led.exists():
+        return None
+    # _streams() is the one reader: folded state, string-validated identity —
+    # a raw shape cannot crash this or be re-emitted (44 KB vs 6.7 MB reparse).
+    best, matched, all_tags = None, set(), set()
+    try:
+        streams = _streams(led)
+    except OSError:
+        return None
+    for (repo, pr, _who), st in streams.items():
+        if (repo, pr) not in refs and (None, pr) not in refs:
+            continue
+        outcome = (st["last"] or (None, None))[0]
+        if outcome not in _UNSAFE_OUTCOMES:
+            continue
+        tags = set(st["membership"] or ())
+        if not tags or not (tags & set(cand)):
+            continue
+        matched.add((repo, int(pr)))
+        all_tags |= tags
+        best = {k: st["last_identity"].get(k) for k in ("reviewer", "actor", "endpoint")}
+    if best is None:
+        return None
+    return all_tags, best, matched
+
+def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
+                actor: str = None, detail: str = None,
+                endpoint: str = None, membership=None, only=None) -> int:
+    """Locked public writer. Every append serialises against the compactor.
+    `only`: canonical (repo, pr) set; when given, refs outside it are not written."""
+    if not _PR_URL.search(message or ""):
+        return 0        # nothing to write, so no path to resolve and no lock
+    led = ledger_path()
+    with _ledger_lock(led):
+        return _append(led, message, reviewer, outcome, actor, detail,
+                       endpoint, membership, only)
+
+
+def _append(p: Path, message: str, reviewer: str, outcome: str,
+            actor: str = None, detail: str = None,
+            endpoint: str = None, membership=None, only=None) -> int:
+    """Log a room ask so pr-unattended can see it. GitHub's timeline records only
+    review_requested events, and the owner's rule is to ask in the room and never
+    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
+
+    `outcome="unknown"` records a send that MAY have landed. It must be written:
+    the receipt is RetrySafety.UNSAFE, so an unrecorded unknown invites the
+    repeat that duplicates the ping."""
+    refs = _refs_spelled(message)
+    if only is not None:
+        refs = [(r, n) for r, n in refs if (_canon_repo(r), n) in only]
+    if not refs:
+        return 0
+    if not isinstance(outcome, str) or outcome not in _KNOWN_OUTCOMES:
+        # Type first: a list is unhashable and raised instead of validating.
+        # The writer holds the reader's schema, so an unwritable outcome fails.
+        raise ValueError(f"outcome {outcome!r} is not one of {sorted(_KNOWN_OUTCOMES)}")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime(_TS_FMT)
+    p = ledger_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = ""
+    for repo, num in sorted(refs):
+        row = {"repo": repo, "pr": num,
+               "ts": ts, "channel": "room", "outcome": outcome}
+        if outcome in _DELIVERY_OUTCOMES:
+            row["reviewer"] = reviewer
+        if actor:
+            row["actor"] = actor
+        if endpoint:
+            row["endpoint"] = endpoint
+        if detail:
+            row["detail"] = detail
+        if membership:
+            row["membership"] = sorted(membership)
+        # The COMPLETE row, through the reader's own validator: appending one
+        # the reader drops is a silent write, and a list outcome raised instead.
+        if _row(row) is None:
+            raise ValueError(f"refusing to append a row the reader rejects: {row!r}")
+        payload += json.dumps(row) + "\n"
+    # One write under O_APPEND: a reader never sees half a batch, and two
+    # writers never interleave rows within one.
+
+    # Created private: a fresh ledger under umask 022 would be 0644.
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LEDGER_MODE)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        _maybe_compact(p)
+    except Exception as exc:            # noqa: BLE001 - the append already succeeded
+
+        # Maintenance after a durable write: failing it must not convert that
+        # write into a failed claim, parking an ask nobody sent.
+        print(f"  WARNING: ledger compaction failed ({type(exc).__name__}: {exc}); "
+              "the append stands", file=sys.stderr)
     return len(refs)
+
+
+def identity_components(roster) -> dict:
+    """name -> canonical identity key, over the WHOLE roster and BOTH axes.
+
+    Built before ANY selection, route, capability or allowlist filtering:
+    filtering decides which endpoint may send, never who the person is.
+    """
+    actor_of = _actor_map(roster or {})
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+        return find(a)
+
+    rows = [(k, v) for k, v in (roster or {}).items()
+            if isinstance(v, dict) and not k.startswith("_")]
+    for name, entry in rows:
+        akey = ("actor", actor_of.get(name, name))
+        # EVERY endpoint, not just the send route: a row holding both transports
+        # is the connector between its person's two rows.
+        endpoints = sorted(durable_endpoints(entry))
+        # An off-allowlist or unroutable row still NAMES its person, so it still
+        # carries the link; dropping it here is what let a connector disappear.
+        for endpoint in endpoints:
+            union(akey, ("endpoint", endpoint))
+        if not endpoints:
+            find(akey)
+    return {name: find(("actor", actor_of.get(name, name))) for name, _ in rows}
+
+
+#: A persisted membership is attacker-adjacent state read back into a safety
+#: decision, so it is bounded and typed; anything else fails closed.
+_MAX_TAGS = 512
+#: Values are percent-encoded, so `:` is structure and never content — an
+#: mxid-shaped actor used to build a tag its own reader rejected.
+_TAG_RE = re.compile(r"^(actor:[^\s:]+|endpoint:(?:discord|mx):[^\s:]+)$")
+#: Rows written before the encoding: the endpoint tail carried a raw mxid.
+_LEGACY_TAG_RE = re.compile(r"^endpoint:(discord|mx):(\S+)$")
+
+
+class MembershipTooLarge(Exception):
+    """A component cannot be represented within the persisted tag bound."""
+
+
+def _tag(kind: str, *parts: str) -> str:
+    """One typed tag whose value segments cannot escape their slot."""
+    return kind + ":" + ":".join(quote(p, safe="") for p in parts)
+
+
+def _canon_tag(t: str) -> "str | None":
+    """`t` in canonical encoded form, or None when it is malformed."""
+    if _TAG_RE.match(t):
+        return t
+    m = _LEGACY_TAG_RE.match(t)
+    return _tag("endpoint", m.group(1), m.group(2)) if m else None
+
+
+def valid_tags(value) -> "set | None":
+    """The persisted tag set canonicalized, or None when malformed (park stays on).
+
+    Legacy rows are re-encoded so they still overlap a freshly computed set.
+    """
+    if not isinstance(value, list) or len(value) > _MAX_TAGS:
+        return None
+    out = set()
+    for t in value:
+        if not isinstance(t, str):
+            return None
+        c = _canon_tag(t)
+        if c is None:
+            return None
+        out.add(c)
+    return out
+
+
+def component_tags(roster, name: str) -> set:
+    """The candidate's full-roster component, as bounded typed tags.
+
+    Namespaced so an actor named like an id cannot collide with an endpoint.
+    """
+    comp = identity_components(roster)
+    actor_of = _actor_map(roster or {})
+    root = comp.get(name)
+    tags = {_tag("actor", actor_of.get(name, name))}
+    for other, r in comp.items():
+        # No root means the row vanished between roster reads. Admitting every
+        # component there associates one ask with every remaining reviewer.
+        if root is None or r != root:
+            continue
+        tags.add(_tag("actor", actor_of.get(other, other)))
+        for endpoint in durable_endpoints((roster or {}).get(other) or {}):
+            scheme, _, rest = endpoint.partition(":")
+            tags.add(_tag("endpoint", "discord", rest)
+                     if scheme == "discord" else _tag("endpoint", "mx", endpoint))
+    if len(tags) > _MAX_TAGS:
+        # Truncating discards arbitrary identities and accepts the claim anyway,
+        # so a later send to the same person reads as un-parked.
+        raise MembershipTooLarge(
+            f"{name}: {len(tags)} identity tags exceeds the {_MAX_TAGS} bound")
+    return tags
+
+
+def component_resolver(roster):
+    """Any roster name, canonical actor or durable endpoint -> ONE person key.
+
+    The ledger stores raw spellings — sometimes a name, sometimes an endpoint —
+    so both axes must land on the same key or an alias steps around a park.
+    """
+    comp = identity_components(roster)
+    actor_of = _actor_map(roster or {})
+    axes = {"name": {}, "actor": {}, "endpoint": {}}
+    for name, root in comp.items():
+        key = f"person:{root[0]}:{root[1]}"
+        axes["name"][name] = key
+        axes["actor"].setdefault(actor_of.get(name, name), key)
+        for endpoint in durable_endpoints((roster or {}).get(name) or {}):
+            axes["endpoint"].setdefault(endpoint, key)
+
+    def canon(w):
+        # Most specific axis wins: one person's roster key equalling another's
+        # endpoint used to overwrite it, so both resolved to the second person.
+        for axis in ("name", "actor", "endpoint"):
+            if w in axes[axis]:
+                return axes[axis][w]
+        return w
+    return canon
 
 
 def _actor_map(roster) -> dict:
@@ -377,7 +1287,9 @@ def _actor_map(roster) -> dict:
             continue
         find(k)
         other = v.get("same_actor_as")
-        if other:
+        # A non-string is unhashable in the union map, and ONE unrelated bad
+        # row used to raise for every reviewer in the batch.
+        if isinstance(other, str) and other:
             union(k, other)
     return {k: find(k) for k in parent}
 
@@ -393,34 +1305,62 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     Fails OPEN on any uncertainty — a notifier that blocks on its own bug is
     worse than one that over-notifies.
     """
-    refs = _PR_URL.findall(message or "")
+    # Through `_refs()`, like the writer: parsing raw here let an upper-cased
+    # URL name a "different" PR and permit a repeat ask.
+    refs = sorted(_refs(message))
     if not refs:
         return False, ""
     repo, num = refs[0]
     ledger = ledger_path()
     if not ledger.exists():
         return False, ""
-    import json as _j
+    actor_of = _actor_map(roster)
     prior, earliest = set(), None
     try:
-        for line in ledger.read_text().splitlines():
-            try:
-                d = _j.loads(line)
-            except ValueError:
-                continue
-            if str(d.get("pr")) != str(num) or d.get("repo") not in (repo, None):
-                continue
-            prior.add(d.get("reviewer"))
-            ts = d.get("ts") or ""
-            if ts and (earliest is None or ts < earliest):
-                earliest = ts
+        # Canonical actors on one axis: mixing spellings makes the subset test
+        # below answer about names rather than people.
+        asked = _first_ask(ledger, canonical=lambda w: actor_of.get(w, w))
     except OSError:
         return False, ""
-    if not prior or earliest is None:
+    per_actor = {}
+    for (r, n, who), ts in asked.items():
+        if n != str(num) or r not in (repo, None):
+            continue
+        prior.add(who)
+        if ts and (who not in per_actor or ts < per_actor[who]):
+            per_actor[who] = ts
+    if not prior:
         return False, ""
-    names = {x["name"] for x in targets}
-    if not names or not names.issubset(prior):
-        return False, ""            # at least one NEW name -> this IS widening
+    # Every endpoint in an actor's component, because two aliases of one person
+    # can hold different ones and either may be the recorded spelling.
+    by_actor: dict = {}
+    for k, v in (roster or {}).items():
+        for ep in durable_endpoints(v):
+            by_actor.setdefault(actor_of.get(k, k), set()).add(ep)
+
+    def _ids(t):
+        # From the ROSTER too: a caller may pass a bare {"name": ...} target,
+        # and deriving from the dict alone left those on the name axis only.
+        actor = actor_of.get(t["name"], t["name"])
+        got = {actor, t["name"], t.get("endpoint")}
+        got |= durable_endpoints((roster or {}).get(t["name"]) or {})
+        got |= by_actor.get(actor, set())
+        return {i for i in got if i}
+
+    tids = [_ids(x) for x in targets]
+    if not tids or not all(s & prior for s in tids):
+        return False, ""            # at least one NEW target -> this IS widening
+
+    # Per target its EARLIEST ask, then the NEWEST across targets: someone
+    # else's older ask says nothing here.
+    ours = []
+    for s in tids:
+        got = [per_actor[i] for i in s if per_actor.get(i)]
+        if got:
+            ours.append(min(got))
+    earliest = max(ours) if ours else None
+    if earliest is None:
+        return False, ""
     try:
         age = (datetime.datetime.now(datetime.timezone.utc)
                - datetime.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
@@ -430,13 +1370,17 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         return False, ""
     # One human can hold several roster keys (jsun-m IS johnm-desktop). Listing
     # both overstates the pool and re-asks one person under two names.
-    actor_of = _actor_map(roster)
     seen_actors, unasked = set(), []
     for k, v in sorted((roster or {}).items()):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         actor = actor_of.get(k, k)
-        if k in prior or k == "keweichen":
+        # The SAME component-wide set the verdict uses: this row's own endpoint
+        # alone offered an already-asked person under an earlier-sorting alias.
+        ids = {actor, k} | durable_endpoints(v) | by_actor.get(actor, set())
+        # keweichen is deliberately never offered as a widen target; the
+        # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
+        if (ids & prior) or k == "keweichen":
             seen_actors.add(actor)
             continue
         if actor in seen_actors:
@@ -493,10 +1437,13 @@ def main() -> int:
                          "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
     a.message = resolve_body(a.message, a.body_file)
-    names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
-    targets, refusal_rc = resolve(names, load_roster())
-    # Gates run on RESOLVED targets before any send, so no partial batch notifies
-    # one person; plan mode is exempt because only a real ASK can strand a PR.
+    names = list(dict.fromkeys(n.strip() for n in a.reviewers.split(",") if n.strip()))
+    # ONE snapshot for the whole invocation. Re-reading later let the row change
+    # between resolution and use: the login GATED and the endpoint SENT diverged.
+    roster = load_roster()
+    # resolve() dedups per person, so the two-reviewer gate counts PEOPLE, not
+    # roster rows; gates then run on RESOLVED targets, never a partial batch.
+    targets, refusal_rc = resolve(names, roster)
     # A read-only approval looks identical in the UI and discharges nothing, so
     # ask the repo named in the message rather than trusting a cached tier.
     if a.kind == "ask" and targets:
@@ -510,7 +1457,7 @@ def main() -> int:
                   file=sys.stderr)
         if refs:
             repo = refs[0][0]
-            roster_now = load_roster()
+            roster_now = roster
             kept = []
             for t in targets:
                 login, why_login = _github_login(t["name"], roster_now)
@@ -532,6 +1479,8 @@ def main() -> int:
                           file=sys.stderr)
                 kept.append(t)
             targets = kept
+    # Gates run on RESOLVED targets before any send, so no partial batch notifies
+    # one person; plan mode is exempt because only a real ASK can strand a PR.
     # The two-reviewer rule exists so one person being busy cannot stall a PR.
     # A notice asks for nothing, so it cannot stall anything by going to one.
     if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
@@ -551,13 +1500,124 @@ def main() -> int:
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
             return 7
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
+    stale, why = _stale_repeat_ask(a.message, targets, roster) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
         return 6
-    failures = unlogged = 0
+    failures = unlogged = unknowns = 0
+    # One person may hold several roster spellings; the park keys the endpoint,
+    # so resolve the canonical actor once rather than per send.
+    actors = _actor_map(roster)
+    # Retry admission keys the PERSON, not a spelling: an outcome-unknown park
+    # must block every alias and endpoint in that person's component.
+    person_of = component_resolver(roster)
     for t in targets:
+        if t["transport"] == "discord":
+            # No room-relocation branch: a Discord mention is channel-scoped and
+            # --room names a Matrix room, so it cannot apply to this target.
+            here, why = discord_reachable(t)
+            if not here:
+                print(f"{t['name']}: ABSENT from channel {t['channel']} ({why}) — "
+                      f"{t['discord_id']} is not on its allowFrom; a mention there "
+                      "reaches nobody. Resolve this person's channel.", file=sys.stderr)
+                failures += 1
+                continue
+            if why.startswith("unverified"):
+                print(f"{t['name']}: UNVERIFIED for channel {t['channel']} ({why}) — "
+                      "sending unchecked; this is not a confirmation.", file=sys.stderr)
+            argv = discord_command_for(t, a.message)
+            if not a.send:
+                print("PLAN:", " ".join(argv))
+                continue
+            who = actors.get(t["name"], t["name"])
+            # Claim BEFORE the POST: a later reservation cannot cover a crash
+            # between the two. Shared with the Matrix path — see reserve_ask.
+            proceed, bucket, note = reserve_ask(a, t, who, person_of, roster)
+            if not proceed:
+                print(note, file=sys.stderr)
+                if bucket == "unknown":
+                    unknowns += 1
+                else:
+                    failures += 1
+                continue
+            _settle = settler(a, t, who)
+
+            try:
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            except OSError as e:
+                # No child ran, so no POST was possible: release the reservation
+                # rather than stranding an ask that never started.
+                _settle("failed", f"no spawn: {type(e).__name__}")
+                print(f"{t['name']}: SEND FAILED before spawn ({type(e).__name__}: {e})"
+                      " — nothing was sent; safe to retry", file=sys.stderr)
+                failures += 1
+                continue
+            except subprocess.TimeoutExpired as e:
+                # A timeout is not a failure: the post may have landed, so the
+                # reservation settles to UNKNOWN and the batch continues.
+                _settle("unknown", f"timeout: {type(e).__name__}")
+                print(f"{t['name']}: UNKNOWN outcome ({type(e).__name__}) — the post "
+                      "may have landed; not retrying", file=sys.stderr)
+                unknowns += 1
+                continue
+            if p.returncode == 3:
+                # A CONFIRMED receipt with a message id: the post LANDED and
+                # merely missed the mention, so a repeat duplicates it.
+                _settle("unknown", "posted without the target in mentions")
+                print(f"{t['name']}: LANDED BUT DID NOT TRIGGER on channel "
+                      f"{t['channel']} — the post exists and must not be repeated; "
+                      "the mention resolved to someone else, or to nobody. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                unknowns += 1
+                continue
+            if p.returncode == 0:
+                # The child prints the message id. Swallowing it leaves no
+                # artifact naming what actually landed.
+                mid = (p.stdout or "").strip()
+                print(f"{t['name']}: SENT to channel {t['channel']}"
+                      + (f" as message {mid}" if mid else ""))
+                # Same bookkeeping as the Matrix path: without it a delivered
+                # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
+                try:
+                    n_logged = (record_asks(a.message, t["name"], actor=who,
+                                            endpoint=t.get("endpoint"))
+                                if a.kind == "ask" else 0)
+                except OSError as e:
+                    unlogged += 1
+                    print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT "
+                          f"recorded ({e}) — pr-unattended will under-report this PR "
+                          "as unasked", file=sys.stderr)
+                else:
+                    if n_logged:
+                        print(f"  logged {n_logged} PR ask(s) for {t['name']}",
+                              file=sys.stderr)
+            elif p.returncode == 4:
+                # OUTCOME_UNKNOWN: the post may have landed, and the receipt is
+                # UNSAFE to retry, so the reservation settles to UNKNOWN.
+                _settle("unknown", "child reported an unknown outcome")
+                unknowns += 1
+                print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
+                      f"the post may have landed; {retry_clause(a.kind)}. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}",
+                      file=sys.stderr)
+            elif p.returncode in _PROVEN_NOT_DELIVERED:
+                # Only these prove nothing was posted. rc 1 does not: the
+                # interpreter exits 1 on any uncaught exception, post-POST too.
+                _settle("failed", f"child rc={p.returncode}")
+                print(f"{t['name']}: SEND FAILED rc={p.returncode} "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                failures += 1
+            else:
+                # A crash, a signal, or a code nobody assigned: the post MAY
+                # have landed, so it parks rather than releasing.
+                _settle("unknown", f"ambiguous child exit rc={p.returncode}")
+                unknowns += 1
+                print(f"{t['name']}: AMBIGUOUS EXIT rc={p.returncode} — the post may "
+                      f"have landed; {retry_clause(a.kind)}. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}",
+                      file=sys.stderr)
+            continue
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
             # THIS room, and sending would relocate the thread and report ok.
@@ -604,16 +1664,35 @@ def main() -> int:
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
+        who = actors.get(t["name"], t["name"])
+        # Same reservation as the Discord path: an alias on this transport must
+        # not walk past a park an ask on the other one is still holding.
+        keyable = bool(_PR_URL.search(a.message))
+        proceed, bucket, note = reserve_ask(a, t, who, person_of, roster,
+                                            require_ref=False)
+        if not proceed:
+            print(note, file=sys.stderr)
+            if bucket == "unknown":
+                unknowns += 1
+            else:
+                failures += 1
+            continue
+        _settle = settler(a, t, who, parked=keyable)
         # Per-target boundary: a raise here would drop every remaining target
         # AND skip the return, so the caller sees no asks and no failure code.
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
-            print(f"{t['name']}: ok=False reason=room_ops exceeded the 60s timeout",
+            # May have landed. Park it rather than counting a clean failure —
+            # the Discord path has always done this; this one used to not.
+            _settle("unknown", "timeout: TimeoutExpired")
+            print(f"{t['name']}: UNKNOWN outcome (room_ops exceeded the 60s timeout)"
+                  f" — the post may have landed; {retry_clause(a.kind)}",
                   file=sys.stderr)
-            failures += 1
+            unknowns += 1
             continue
         except OSError as e:
+            _settle("failed", f"no spawn: {type(e).__name__}")
             print(f"{t['name']}: ok=False reason=could not run room_ops ({e})",
                   file=sys.stderr)
             failures += 1
@@ -625,25 +1704,36 @@ def main() -> int:
             payload = None
         # A non-object payload has no .get and a non-string event_id breaks
         # the slice; an unusable one must not occupy `reason` and hide stderr.
+        state = ""
         if isinstance(payload, dict):
             ok = bool(payload.get("ok"))
             event = str(payload.get("event_id") or "")
             reason = str(payload.get("reason") or "")
+            state = str(payload.get("state") or "")
             fallback = "no reason reported"
         else:
             fallback = "unparseable room_ops output"
+        # The receipt tri-state outranks `ok`: a timeout inside room_ops and a
+        # 200 without an event id both MAY have landed, so the park must hold.
+        if isinstance(payload, dict) and (state == "unknown" or (ok and not event)):
+            detail = reason or ("posted without an event id" if ok else fallback)
+            _settle("unknown", f"room_ops {state or 'unconfirmed'}: {detail[:80]}")
+            print(f"{t['name']}: UNKNOWN outcome ({detail[:80]}) — the post may have "
+                  f"landed; {retry_clause(a.kind)}", file=sys.stderr)
+            unknowns += 1
+            continue
         # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
             print(f"{t['name']}: ok=True event={event[:24]}")
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
-            try:
-                n_logged = record_asks(a.message, t["name"]) if a.kind == "ask" else 0
-            except OSError as e:
+            # Supersede the reservation this send claimed, same as Discord.
+            n_logged = _settle("confirmed", f"event={event[:24]}")
+            if n_logged is None:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
-                      f"({e}) — pr-unattended will under-report this PR as unasked",
+                      "— pr-unattended will under-report this PR as unasked",
                       file=sys.stderr)
             else:
                 if a.kind == "notice":
@@ -657,14 +1747,31 @@ def main() -> int:
                     print(f"  note: nothing recorded for {t['name']} — the message "
                           f"names no github.com/<owner>/<repo>/pull/<n> URL, so any "
                           f"PR it refers to will read as unasked", file=sys.stderr)
-        else:
+        elif isinstance(payload, dict):
+            # room_ops refuses in-band at rc 0: a parsed ok=false PROVES nothing
+            # was posted, so the reservation releases and a retry stays allowed.
             detail = reason or p.stderr.strip()[:120] or fallback
+            _settle("failed", f"room_ops ok=false: {detail[:80]}")
+            print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
+            failures += 1
+        else:
+            # Unreadable output says nothing about whether the post landed: settle
+            # UNKNOWN so the park holds. The failure exit code is pinned elsewhere.
+            detail = reason or p.stderr.strip()[:120] or fallback
+            _settle("unknown", f"unparseable room_ops output: {detail[:60]}")
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
     if unlogged:
         print(f"{unlogged} ask(s) were delivered but not recorded — the ledger "
               "under-reports and pr-unattended will read this PR as unasked",
               file=sys.stderr)
+    if unknowns:
+        print(f"{unknowns} send(s) are UNSAFE to repeat — each landed or may have; "
+              f"{retry_clause(a.kind)}.", file=sys.stderr)
+    # Unknown outranks a definite failure in a mixed batch: a failure is safe to
+    # retry and an unknown is not, so collapsing to 1 invites the duplicate.
+    if unknowns:
+        return 4
     if failures or unlogged:
         return 1
     return refusal_rc

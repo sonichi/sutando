@@ -113,7 +113,8 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
             {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
         )
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, reason=degrade_reason(e.code),
+                       state=_receipt.http_error_state(e.code))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     # Shared with mention via receipt.classify — one reading of the envelope.
