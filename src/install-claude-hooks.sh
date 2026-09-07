@@ -100,7 +100,7 @@ HOOKS=(
 )
 
 # The transcript archiver writes OUTSIDE the workspace (~/Desktop). Omitting it
-# is install-only: phase 0 skips it anyway (no repo path), so an opt-in survives.
+# drops it from HOOKS, which every phase iterates, so an existing opt-in survives.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()
   for _h in "${HOOKS[@]}"; do
@@ -137,6 +137,16 @@ DEPRECATED_HOOKS=(
   # added in #1083 follow-up.
   "Stop|watch-tasks-stream.pid"
 )
+
+# This PR changed the archiver's command: phase 0 cannot migrate the old one (it
+# embeds no repo path) and phase 1 matches exactly, so both would fire.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  # Only when installing it. Under the omit flag, replacing an inert opt-in with
+  # a working archiver would start real egress an unattended run must not decide.
+  DEPRECATED_HOOKS+=(
+    "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  )
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for atomic settings.json edit" >&2
