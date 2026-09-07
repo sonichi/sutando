@@ -84,13 +84,12 @@ class AttachWaitsForX(unittest.TestCase):
         self.assertIn("setInputFiles", SRC)
 
     def test_it_waits_for_the_upload_to_land(self):
-        """removeMedia appears per file once X has it; without this wait the
-        post can publish before the image attaches. Match the SELECTOR CALL,
-        not the bare word — the word also occurs in the comment above it, so a
-        substring check passed even with the wait deleted."""
+        """`attachments` appears in the composer only once the upload lands, and
+        the earlier guess `removeMedia` does not exist on the page at all."""
         import re
-        call = re.search(r'waitForSelector\(\s*\'\[data-testid="removeMedia"\]\'', SRC)
-        self.assertIsNotNone(call, "no waitForSelector on removeMedia")
+        call = re.search(r'waitForSelector\(\s*\'\[data-testid="attachments"\]\'', SRC)
+        self.assertIsNotNone(call, "no waitForSelector on attachments")
+        self.assertNotIn("removeMedia", SRC)
         self.assertLess(SRC.index("setInputFiles"), call.start(),
                         "the wait must follow setInputFiles")
 

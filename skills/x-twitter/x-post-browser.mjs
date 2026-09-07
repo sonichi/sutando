@@ -356,9 +356,9 @@ try {
       const input = await page.waitForSelector('input[type="file"][accept*="image"]',
                                                { state: 'attached', timeout: 15000 });
       await input.setInputFiles(MEDIA);
-      // Attached, not merely requested: X renders a removeMedia control per file
-      // once the upload lands, and posting before it does silently drops the image.
-      await page.waitForSelector('[data-testid="removeMedia"]', { timeout: 60000 });
+      // Attached, not merely requested: posting before the upload lands drops the
+      // image silently. `attachments` is measured to appear only once it has.
+      await page.waitForSelector('[data-testid="attachments"]', { timeout: 60000 });
     }
     const typedDry = await readComposer(page);
     if (!composerMatches(arg, typedDry)) failComposerMismatch(arg, typedDry);
