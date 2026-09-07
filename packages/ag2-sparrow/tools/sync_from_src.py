@@ -43,6 +43,10 @@ MAP = {
     # so the coverage gate (source = src) can see them.
     "outbox.py": "outbox.py",
     "outbox_adapter.py": "outbox_adapter.py",
+    # operator recovery surface; src-canonical for the same reason as outbox.py
+    "outbox_cli.py": "outbox_cli.py",
+    # quarantine naming: the bridge moves results in, requeue moves them back
+    "undelivered_quarantine.py": "undelivered_quarantine.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

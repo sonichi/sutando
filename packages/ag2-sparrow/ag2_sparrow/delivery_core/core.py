@@ -39,6 +39,13 @@ def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
     return f"{item_id}#{resend_epoch}"
 
 
+def _resend_epoch(backend, item_id: str) -> int:
+    """0 for a backend that does not track re-sends: the key stays `id#0`,
+    which is exactly the pre-existing behaviour."""
+    fn = getattr(backend, "resend_epoch", None)
+    return int(fn(item_id)) if callable(fn) else 0
+
+
 class DeliveryCore:
     def __init__(self, backend: ClaimBackend, provider: DeliveryProvider,
                  policy: RetryPolicy | None = None,
@@ -91,7 +98,9 @@ class DeliveryCore:
             if self.backend.is_terminal(item_id):
                 return DrainResult(status=DrainStatus.TERMINAL)
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
-        key = idempotency_key(item_id)
+        # A requeued item must present a NEW logical side effect, or the
+        # provider dedupes the re-send against the attempt that parked it.
+        key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
         outcome, destination = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
