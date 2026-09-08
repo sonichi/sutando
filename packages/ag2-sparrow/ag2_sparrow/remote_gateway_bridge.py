@@ -294,6 +294,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -990,6 +991,11 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "applied" and getattr(handler, "last_turn", False):
+        # Recorded, and the requirement asked for a turn: the same relay task goes on to
+        # the core (idempotent by id) with a header saying it is a click, not an order.
+        task["hitl_click"] = "true"
+        return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
         # A non-owner typed a label as a reply: that is a message, not a click
         # to decline; it must reach _write_task like any other text.
@@ -1703,6 +1709,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
                 "requested_worker", "priority",
+                # A card click already recorded in the HITL store, passed on for the turn it
+                # causes: the core answers [no-send] and lets its Stop hook do the work.
+                "hitl_click",
                 "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2016,8 +2025,12 @@ def _one_line(value) -> str:
     practice and a stray newline only ever indicates an injection attempt.
 
     Load-bearing: this producer does no body defanging, so the flatten is the
-    only thing stopping a field from forging a registered header line."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    only thing stopping a field from forging a registered header line.
+
+    Folds on str.splitlines()' own set, not on CR/LF: readers split with
+    splitlines(), so any narrower set leaves a separator that is one line to
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
@@ -3584,13 +3597,19 @@ def _delivery_core() -> DeliveryCore:
 def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
-    rescanned every pass and the refusal is invisible."""
+    rescanned every pass and the refusal is invisible.
+
+    The printed command must carry BOTH ids on a named instance: the record is
+    keyed by the broker id and the body file by the local one, so neither alone
+    recovers both halves.
+    """
     try:
-        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        rfile.rename(UNDELIVERABLE_RESULTS_DIR /
-                     f"{rfile.stem}-{int(time.time())}.txt")
+        undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
         _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/, it will NOT be re-sent")
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
+             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"requeue {_broker_tid(tid)} "
+             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")

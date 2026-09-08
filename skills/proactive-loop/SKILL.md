@@ -77,7 +77,7 @@ caps this file and refuses date stamps in it).
 6.5. **Idle surface.** Record the pass:
    `python3 skills/proactive-loop/scripts/idle-surface-hash.py --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop`.
    The held set is edited only through
-   `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate>`
+   `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
    (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
    retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
    `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run with

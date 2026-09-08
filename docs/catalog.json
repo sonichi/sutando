@@ -391,7 +391,7 @@
    ],
    "status": "canonical",
    "canonical_for": "hosts/<hostname> workspace convention",
-   "last_verified": null
+   "last_verified": "2026-09-08"
   },
   "docs/workspace-per-host-paths.md": {
    "title": "Per-host carried paths",

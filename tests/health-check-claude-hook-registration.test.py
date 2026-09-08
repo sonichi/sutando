@@ -87,6 +87,27 @@ class TestHookRegistration(unittest.TestCase):
         self.assertIn("2 NOT registered", out["detail"])
         self.assertNotIn("Stop:", out["detail"], "a registered hook must not be reported missing")
 
+    def test_remedy_omits_the_archive_hook_when_other_hooks_are_missing(self):
+        # The bare installer registers the transcript archiver. Anyone repairing an unrelated
+        # missing hook by following this text would enable an egress the owner has not opted into.
+        h = self._all_registered()
+        del h["Stop"]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", out["detail"])
+
+    def test_remedy_does_not_prescribe_a_repair_when_only_the_archiver_is_missing(self):
+        # --fix already refuses this case; the text used to prescribe the bare command anyway.
+        h = self._all_registered()
+        h["PreCompact"] = [{"hooks": [{"command": f"bash {self.repo}/src/session-handoff.sh"}]}]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("explicit opt-in", out["detail"])
+        self.assertIn("only if you intend", out["detail"])
+        self.assertNotIn("re-run", out["detail"], "an opt-in is not a repair instruction")
+
     def test_registered_but_pointing_at_ANOTHER_checkout_warns(self):
         # The failure that looks healthiest: present, so an existence check passes,
         # but aimed at a stale copy — this host ran a 5-day-old script for days.
@@ -311,9 +332,11 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
         (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            # Must track the installer's CURRENT archive shape: a literal here made
+            # all three over-trigger controls fail on the shape change itself.
             "PreCompact": [{"hooks": [
                 {"command": archive_command or
-                 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
+                 f'bash {r}/src/archive-transcript.sh "$HOME/Desktop/sutando-conversations/"'},
                 {"command": handoff}]}],
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
@@ -402,13 +425,14 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         _ev, _marker, cmd = line.strip('"').split("|", 2)
         toks = self.hc._shell_tokens(self.hc._unwrap_installer_command(cmd))
         self.assertEqual(len(toks), 3, f"archive template did not tokenize cleanly: {toks}")
-        self.assertEqual(toks[0], "cp")
+        self.assertEqual(toks[0], "bash")
+        self.assertTrue(toks[1].endswith("/src/archive-transcript.sh"), toks[1])
         for t in toks:
             self.assertNotIn('"', t, f"stray quote survived tokenization: {t!r}")
 
-    def test_the_genuine_archive_cp_still_registers(self):
-        # Over-trigger control. The real command interpolates $HOME and $(date …),
-        # so this must not become a shape-pinning test that warns on healthy hosts.
+    def test_the_genuine_archive_command_still_registers(self):
+        # Over-trigger control. The real command interpolates $HOME, so this must not
+        # become a shape-pinning test that warns on healthy hosts.
         out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
         self.assertEqual(out["status"], "ok", out["detail"])
 
