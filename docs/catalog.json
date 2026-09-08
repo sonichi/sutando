@@ -463,6 +463,26 @@
    "status": "canonical",
    "canonical_for": "Recovery issue identity, event lifecycle, and rate query semantics",
    "last_verified": "2026-09-11"
+  },
+  "docs/worker-pool-design.md": {
+   "title": "Worker pool — design (v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the v1 worker pool: the single local pool supervisor, the executor interface and runtime adapters, the transactional task state machine, room-to-worker binding and routing, worker lifecycle and health, and the staged PRs",
+   "last_verified": "2026-09-07"
+  },
+  "docs/worker-pool-design-notes.md": {
+   "title": "Worker pool — design notes",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the record behind the v1 worker-pool design: rejected alternatives, the failure model inherited from the #3860 draft, and the owner decisions it encodes",
+   "last_verified": "2026-09-07"
   }
  }
 }
