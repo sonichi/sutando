@@ -717,8 +717,7 @@ not a new capability. It is bounded by the PENDING directory, which is small by
 construction because tasks are consumed and archived promptly (measured on this host
 while writing: 1 pending against 8,442 archived). If that ever stops holding, the
 answer is an index, and the index is what this section would then owe. That IS a step-2 prerequisite, and
-it is written into the step-2 list rather than asserted to be there — an earlier
-revision asserted a listing it never made.
+it is written into the step-2 list rather than asserted to be there.
 
 **Step 3 owns the wedge path, INSIDE THE SWEEP.** That answers the ownership question
 the staging otherwise leaves open, and it is forced by how routing actually runs:
