@@ -104,5 +104,95 @@ class Render(unittest.TestCase):
         self.assertIn("nobody", line)
 
 
+class Gh(unittest.TestCase):
+    """The subprocess boundary: a non-zero gh must raise, never return a partial answer."""
+
+    def _run(self, rc, out="", err=""):
+        class R:
+            returncode, stdout, stderr = rc, out, err
+        return lambda *a, **k: R()
+
+    def test_a_clean_call_returns_parsed_json(self):
+        orig = g.subprocess.run
+        g.subprocess.run = self._run(0, '[{"type": "pull_request"}]')
+        try:
+            self.assertEqual(g._gh(["x"]), [{"type": "pull_request"}])
+        finally:
+            g.subprocess.run = orig
+
+    def test_a_failing_call_raises_rather_than_returning_empty(self):
+        orig = g.subprocess.run
+        g.subprocess.run = self._run(1, "", "Not Found")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                g._gh(["x"])
+            self.assertIn("Not Found", str(cm.exception))
+        finally:
+            g.subprocess.run = orig
+
+
+class RequiredApprovals(unittest.TestCase):
+    def _with(self, payload):
+        orig = g._gh
+        g._gh = lambda args: payload
+        self.addCleanup(lambda: setattr(g, "_gh", orig))
+
+    def test_it_reads_the_count_off_the_pull_request_rule(self):
+        self._with([{"type": "deletion", "parameters": {}},
+                    {"type": "pull_request",
+                     "parameters": {"required_approving_review_count": 2}}])
+        self.assertEqual(g.required_approvals("o/r", "main"), 2)
+
+    def test_no_pull_request_rule_means_no_bar(self):
+        self._with([{"type": "deletion", "parameters": {}}])
+        self.assertEqual(g.required_approvals("o/r", "main"), 0)
+
+
+class Main(unittest.TestCase):
+    def _stub(self, rules, reviews_by_pr):
+        orig = g._gh
+
+        def fake(args):
+            if "rules/branches" in args[0]:
+                return rules
+            pr = args[0].split("/pulls/")[1].split("/")[0]
+            got = reviews_by_pr.get(pr)
+            if isinstance(got, Exception):
+                raise got
+            return got
+        g._gh = fake
+        self.addCleanup(lambda: setattr(g, "_gh", orig))
+
+    RULES = [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]
+
+    def test_recruit_exits_1(self):
+        self._stub(self.RULES, {"7": [rv("a", "APPROVED")]})
+        self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"]), 1)
+
+    def test_a_met_bar_exits_0(self):
+        self._stub(self.RULES, {"7": [rv("a", "APPROVED"), rv("b", "APPROVED")]})
+        self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"]), 0)
+
+    def test_a_blocked_pr_exits_0_because_recruiting_is_premature(self):
+        self._stub(self.RULES, {"7": [rv("a", "CHANGES_REQUESTED")]})
+        self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"]), 0)
+
+    def test_an_unreadable_pr_exits_2_and_does_not_abort_the_rest(self):
+        self._stub(self.RULES, {"7": RuntimeError("boom"), "8": [rv("a", "APPROVED")]})
+        self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7", "8"]), 2)
+
+    def test_an_unreadable_RULESET_exits_2_without_reading_any_pr(self):
+        orig = g.required_approvals
+        g.required_approvals = lambda *a: (_ for _ in ()).throw(RuntimeError("404"))
+        self.addCleanup(lambda: setattr(g, "required_approvals", orig))
+        self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"]), 2)
+
+    def test_repeatable_shared_login_reaches_classify(self):
+        self._stub(self.RULES, {"7": [rv(SHARED[0], "APPROVED"), rv(SHARED[1], "APPROVED")]})
+        rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0],
+                     "--shared-login", SHARED[1], "7"])
+        self.assertEqual(rc, 0, "the bar is met, so it is thin -- not a recruit")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
