@@ -603,8 +603,7 @@ latency instead of stranding the task, in step 2 and step 3 alike.
 "Only tasks addressed to me" is not enumerable: `requested_worker` and the room id
 live INSIDE flat task files, the pin is mutable, and suppression leaves no receipt —
 so after a repin, no event tells the new target that an existing file now addresses
-it. It can learn that only by looking. The same argument binds the CORE harder, and for a
-different reason than an earlier revision gave: a dead worker emits no further beat, so
+it. It can learn that only by looking. The same argument binds the CORE harder, for a different reason: a dead worker emits no further beat, so
 the core's tick must consider tasks addressed ELSEWHERE — not to claim them, but because
 rule 6's verdict is defined over exactly those tasks (the oldest unclaimed task addressed
 to that instance). The core scans other instances' work to WRITE the eligibility verdict;
