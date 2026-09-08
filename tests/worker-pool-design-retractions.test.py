@@ -1251,6 +1251,18 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertIn("unresolved implementation obligation", f)
         self.assertIn("durable selector", f)
 
+    def test_the_neverclobber_invariant_does_NOT_claim_to_cover_every_publication(self):
+        """keweichen's block: the universal form contradicts the result section 90 lines
+        later, and the existing pins pass either way because none of them mention it."""
+        f = self._flat()
+        self.assertNotIn("every publication lands on a name", f,
+            "the never-clobber claim must be scoped to the publications it enumerates")
+
+    def test_result_publication_is_named_as_the_exception_to_neverclobber(self):
+        f = self._flat()
+        self.assertIn("Result publication is the EXCEPTION", f)
+        self.assertIn("this invariant does not cover it", f)
+
     def test_a_first_writer_only_primitive_is_called_insufficient(self):
         self.assertIn("NOT solved by a first-writer-only primitive", self._flat())
 

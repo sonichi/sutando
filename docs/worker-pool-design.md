@@ -1831,7 +1831,11 @@ and become the duplication above.
 **A stale writer is REFUSED rather than allowed to overwrite — structurally,
 because v1 has no generation to check.** No lease generation travels with an offer
 and no arbiter exists to compare one against, so refusal is bought at the
-filesystem instead: every publication lands on a name exactly one caller can win.
+filesystem instead, for the three publications this paragraph enumerates: the claim, the
+accept record and the probation allowance each land on a name exactly one caller can win.
+**Result publication is the EXCEPTION and this invariant does not cover it** — it is temp-file
+plus a clobbering `os.replace`, so a revoked late writer is not refused, and the durable
+selector that would refuse it is an unresolved implementation obligation named below.
 `acquire_task_claim` hard-links and the first linker wins; the accept record is
 published by hard link on the same terms, so a losing link means another executor
 took it first and this one suppresses; the probation allowance is
