@@ -88,6 +88,52 @@ class FreshnessSeesDeclaredLedgers(unittest.TestCase):
         with self.assertRaises(self.m.ExtrasError):
             self.m.live_inputs(self.d, self.d)
 
+    def test_the_CARRIED_declaration_wins_over_a_legacy_state_copy(self):
+        # Reading state/EXTRAS directly selects NOTHING where the ledgers are
+        # declared in the carried copy, and an empty selection is stable.
+        ws = self.d / "ws"
+        (ws / "state").mkdir(parents=True)
+        (ws / "hosts" / "H").mkdir(parents=True)
+        (ws / "state" / self.m.EXTRAS).write_text(json.dumps({"suites": []}))
+        (ws / "hosts" / "H" / self.m.EXTRAS).write_text(
+            json.dumps({"ledgers": ["pr-flag-reviewed.json"]}))
+        (ws / "state" / "pr-flag-reviewed.json").write_text("{}")
+        resolved = self.m.extras_path(ws, "H")
+        self.assertEqual(resolved.parent.name, "H", "extras_path did not prefer the carried copy")
+        got = self.m.live_inputs(ws / "state", resolved)
+        self.assertEqual([p.name for p in got], ["pr-flag-reviewed.json"])
+        # And the legacy path alone yields nothing -- the shape of the bug.
+        self.assertEqual(self.m.live_inputs(ws / "state", ws / "state"), [])
+
+    def test_the_WIRING_selects_the_carried_ledger_not_just_the_helper(self):
+        # Reverting main to pass the state dir left every helper test passing,
+        # because an empty selection is stable. This asserts the wiring itself.
+        ws = self.d / "ws2"
+        (ws / "state").mkdir(parents=True)
+        (ws / "hosts" / "H").mkdir(parents=True)
+        (ws / "state" / self.m.EXTRAS).write_text(json.dumps({"suites": []}))
+        (ws / "hosts" / "H" / self.m.EXTRAS).write_text(
+            json.dumps({"ledgers": ["pr-flag-reviewed.json"]}))
+        led = ws / "state" / "pr-flag-reviewed.json"
+        led.write_text("{}")
+        got = self.m.freshness_inputs(ws, "H", [], [])
+        self.assertEqual([p.name for p in got], ["pr-flag-reviewed.json"],
+                         "the wiring did not reach the carried declaration")
+
+    def test_the_wiring_moves_newest_when_the_declared_ledger_moves(self):
+        ws = self.d / "ws3"
+        (ws / "state").mkdir(parents=True)
+        (ws / "hosts" / "H").mkdir(parents=True)
+        (ws / "hosts" / "H" / self.m.EXTRAS).write_text(
+            json.dumps({"ledgers": ["pr-flag-reviewed.json"]}))
+        led = ws / "state" / "pr-flag-reviewed.json"
+        led.write_text("{}")
+        before = self.m.newest_mtime(self.m.freshness_inputs(ws, "H", [], []))
+        time.sleep(0.01)
+        led.write_text('{"1": {"sha": "z"}}')
+        after = self.m.newest_mtime(self.m.freshness_inputs(ws, "H", [], []))
+        self.assertGreater(after, before)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

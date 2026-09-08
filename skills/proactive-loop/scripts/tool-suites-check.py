@@ -201,6 +201,17 @@ def live_inputs(statedir: Path, decl_or_statedir: Path):
             if (statedir / n).is_file()]
 
 
+def freshness_inputs(ws: Path, host, tools, suites):
+    """Every path whose mtime may retire the freshness skip.
+
+    Exists so the WIRING is assertable: passing the state dir here instead of
+    the resolved extras path selects nothing on a host that declares its
+    ledgers in the carried `hosts/<host>/` copy, and an empty selection is
+    stable, so a churn test still passes.
+    """
+    return list(tools) + list(suites) + live_inputs(ws / "state", extras_path(ws, host))
+
+
 def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple[bool, str]":
     if not state:
         return True, "no previous run recorded"
@@ -261,7 +272,8 @@ def main(argv=None) -> int:
     tools, suites = tools_and_suites(candidates)
     try:
         host = a.host or resolve_host(Path(a.repo).resolve())
-        extras = extra_suites(extras_path(ws, host), Path(a.repo).resolve())
+        decl = extras_path(ws, host)
+        extras = extra_suites(decl, Path(a.repo).resolve())
     except ExtrasError as e:
         print(f"CANNOT ANSWER: {e}", file=sys.stderr)
         return 2
@@ -274,7 +286,7 @@ def main(argv=None) -> int:
     sf = statedir / SENTINEL
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     now = time.time()
-    newest = newest_mtime(tools + suites + live_inputs(statedir, statedir))
+    newest = newest_mtime(freshness_inputs(ws, host, tools, suites))
     go, why = should_run(state, newest, a.max_age_hours * 3600, now)
     if a.force:
         go, why = True, "--force"
