@@ -5,10 +5,12 @@ A `</script>` inside any string value must not end that block early; the
 route must also keep serving the baked sample when the runtime is absent."""
 
 import http.client
+import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -51,6 +53,32 @@ def with_run(fake, fn):
         return fn()
     finally:
         dashboard.subprocess.run = real
+
+
+class FakeSocket:
+    """Enough of a socket for BaseHTTPRequestHandler to serve one request
+    on the calling thread (coverage tracers do not always follow server threads)."""
+
+    def __init__(self, raw):
+        self.rfile, self.out = io.BytesIO(raw), io.BytesIO()
+
+    def makefile(self, mode, *a, **k):
+        return self.rfile if "r" in mode else self.out
+
+    def sendall(self, b):
+        self.out.write(b)
+
+    def settimeout(self, _):
+        pass
+
+    def close(self):
+        pass
+
+
+def handle_inline(path):
+    sock = FakeSocket(b"GET " + path.encode() + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    dashboard.Handler(sock, ("127.0.0.1", 0), None)
+    return sock.out.getvalue().decode()
 
 
 def get(port, path):
@@ -100,6 +128,24 @@ def main():
               "<\\/script>" in html and BREAKOUT not in html)
     finally:
         httpd.shutdown()
+
+    print("stand-card: /stand-card served on the calling thread")
+    raw = with_run(FakeRun(stdout=json.dumps(LIVE)), lambda: handle_inline("/stand-card"))
+    check("inline handler answers 200 text/html",
+          raw.startswith("HTTP/1.0 200") and "Content-Type: text/html" in raw)
+    check("inline handler body carries the escaped payload",
+          "<\\/script>" in raw and BREAKOUT not in raw)
+
+    print("stand-card: page file missing -> 404, never a 500")
+    real_file = dashboard.__file__
+    with tempfile.TemporaryDirectory() as tmp:
+        dashboard.__file__ = str(Path(tmp) / "dashboard.py")
+        try:
+            code, ctype, body = dashboard.stand_card_response()
+        finally:
+            dashboard.__file__ = real_file
+    check("404 text/plain when dashboard-stand-card.html is absent",
+          code == 404 and ctype == "text/plain" and b"missing" in body)
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
     return 1 if failures else 0
