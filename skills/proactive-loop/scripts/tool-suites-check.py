@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import re
 import os
 import subprocess
 import tempfile
@@ -171,21 +170,35 @@ def newest_mtime(paths) -> float:
     return max((p.stat().st_mtime for p in paths), default=0.0)
 
 
-def live_inputs(statedir, suites):
-    """State files some SUITE NAMES, excluding this script's own sentinel.
+def declared_ledgers(decl_or_statedir: Path):
+    """Ledger filenames a suite asserts over, declared beside the extra suites.
 
-    Scoped to what a suite actually references: `state/` also holds continuously
-    written runtime status, so a blanket glob moves `newest` every few seconds
-    and disables the gate instead of tightening it.
+    Declared rather than globbed or inferred: `state/` also holds service
+    heartbeats rewritten every few seconds, and no pattern separates a ledger
+    from telemetry -- only the person who wrote the suite knows which it is.
     """
-    named = set()
-    for s in suites:
-        try:
-            named.update(re.findall(r"[\w.-]+\.json", s.read_text()))
-        except OSError:
-            continue
-    named.discard(SENTINEL)
-    return [statedir / n for n in sorted(named) if (statedir / n).is_file()]
+    f = decl_or_statedir
+    if f.is_dir():
+        f = f / EXTRAS
+    if not f.is_file():
+        return []
+    try:
+        decl = json.loads(f.read_text()).get("ledgers", [])
+    except Exception as e:
+        raise ExtrasError(f"{f} is unreadable: {e}") from e
+    if not isinstance(decl, list):
+        raise ExtrasError(f"{f}: 'ledgers' must be a list, got {type(decl).__name__}")
+    return [d for d in decl if isinstance(d, str) and d.strip() and d != SENTINEL]
+
+
+def live_inputs(statedir: Path, decl_or_statedir: Path):
+    """The declared ledgers that exist, EXCLUDING this script's own sentinel.
+
+    Freshness over tool+suite mtimes alone skips a suite whose fixture is a live
+    ledger -- the ledger moves, the suite file does not.
+    """
+    return [statedir / n for n in sorted(set(declared_ledgers(decl_or_statedir)))
+            if (statedir / n).is_file()]
 
 
 def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple[bool, str]":
@@ -261,7 +274,7 @@ def main(argv=None) -> int:
     sf = statedir / SENTINEL
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     now = time.time()
-    newest = newest_mtime(tools + suites + live_inputs(statedir, suites))
+    newest = newest_mtime(tools + suites + live_inputs(statedir, statedir))
     go, why = should_run(state, newest, a.max_age_hours * 3600, now)
     if a.force:
         go, why = True, "--force"
