@@ -170,6 +170,15 @@ def newest_mtime(paths) -> float:
     return max((p.stat().st_mtime for p in paths), default=0.0)
 
 
+def live_inputs(statedir):
+    """State files a suite may assert over, EXCLUDING this script's own sentinel.
+
+    Freshness over tool+suite mtimes alone skips a suite whose fixtures are its
+    inputs -- a hand-maintained ledger changes while the suite file does not.
+    """
+    return [p for p in sorted(statedir.glob("*.json")) if p.name != SENTINEL]
+
+
 def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple[bool, str]":
     if not state:
         return True, "no previous run recorded"
@@ -243,7 +252,7 @@ def main(argv=None) -> int:
     sf = statedir / SENTINEL
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     now = time.time()
-    newest = newest_mtime(tools + suites)
+    newest = newest_mtime(tools + suites + live_inputs(statedir))
     go, why = should_run(state, newest, a.max_age_hours * 3600, now)
     if a.force:
         go, why = True, "--force"
