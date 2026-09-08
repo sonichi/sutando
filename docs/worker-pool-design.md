@@ -1846,9 +1846,23 @@ refuse a LATE one whose ownership has already been revoked: a worker whose claim
 `retire_stale_claim` has removed still computes the same result path as the
 instance that took the task over, and nothing in v1 tells those two apart at the
 moment of the write. What bounds it is the done flag, which stops the external
-effect happening twice — the duplicate result is not refused, it is made harmless.
-That is a smaller guarantee than a generation check, and this document should
-claim the smaller one.
+effect happening twice. The duplicate result is not refused, and it is NOT made
+harmless: the done flag fences the EFFECT, it does not select which body is
+authoritative. `find_result` (`src/local_task_protocol.py`) reads the live path
+first and falls back to the archive only when it is absent, so a revoked late
+writer's `os.replace` onto the same path is returned in preference to the
+winner's — before delivery, and again on any later retrieval once the winner's
+copy has been archived. That is a smaller guarantee than a generation check, and
+smaller than this document previously claimed.
+
+**So v1 carries an unresolved implementation obligation, named here rather than
+asserted away.** Selecting the authoritative result writer is NOT solved by a
+first-writer-only primitive, which refuses a second writer while admitting a late
+revoked one. The implementing PR owes a durable selector — a generation, epoch or
+claim token that the publication path checks — and must pin BOTH late-writer
+orders (late-after-winner, and late-after-archival) as tests. Until that lands,
+the v1 fence should be read as bounding duplicate EFFECTS only, and a result body
+retrieved during a revocation window is not guaranteed to be the winner's.
 
 **Recovery is the sweep and the ticker that already exist.** A restart gets no
 scan of its own: the watcher's startup listing IS the first reconciliation pass,
