@@ -1233,6 +1233,23 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertGreaterEqual(self._flat().count("DISPUTED — see"), 4,
             "each contested site needs its own inline pointer, not just the index")
 
+    def test_the_probation_clock_names_a_NORMATIVE_source(self):
+        """[P2] asked which of the three is normative; naming three and picking none
+        is what left it open. The model's token_at is a fourth and cannot be it."""
+        f = self._flat()
+        self.assertIn("`probation.since` is normative", f)
+        self.assertIn("a FOURTH source, not one of the three", f)
+
+    def test_the_gate_schedule_reports_a_RESULT_not_an_intention(self):
+        f = self._flat()
+        self.assertIn("0 of 4 when it is read before", f)
+        self.assertNotIn("nothing here shows the protocol survives it", f)
+
+    def test_the_ABC_schedule_reports_a_RESULT_not_an_intention(self):
+        f = self._flat()
+        self.assertIn("erases the journal while its claimant is still live", f)
+        self.assertNotIn("prevent the double claim is unproven", f)
+
     def test_each_open_obligation_is_individually_named(self):
         f = self._flat()
         for claim in ("READ, not a claim fence",

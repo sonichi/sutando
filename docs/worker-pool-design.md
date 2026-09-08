@@ -34,13 +34,20 @@ implementing PR owes each one a schedule that fails before it passes.
 
 - **The request-or-directory gate is a READ, not a claim fence.** A worker can read "no request",
   pause, let a kick publish, and still commit its ordinary batch. The split model can now express
-  that pause (`worker_read` / `worker_commit`); nothing here shows the protocol survives it.
+  that pause (`worker_read` / `worker_commit`), and the schedule has since been RUN: the gate refuses
+  4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a
+  published request bounds nothing already in flight. The protocol does NOT survive it.
 - **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with
-  no admission record. `as_claimant()` can now hold a paused claimant beside its successor; whether
-  the allowance rules prevent the double claim is unproven.
+  no admission record. `as_claimant()` can now hold a paused claimant beside its successor, and the A/B/C schedule has since
+  been RUN: the rollback returns the allowance AND erases the journal while its claimant is still live,
+  so the hold leaves no durable record. The allowance rules do NOT prevent it.
 - **The probation window names three clock sources** — `probation.since`, the journal mtime, and the
-  `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at`, and changing it leaves
-  the suite green, so the suite does not choose a contract. Which clock is normative is undecided.
+  `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` — a FOURTH source, not one of the three — and changing
+  it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.**
+  It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime
+  are both written by the subject of the probation, so a slow worker moves the deadline it is judged
+  against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111,
+  then 212 as its worker progresses.
 - **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop,
   against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.
 
