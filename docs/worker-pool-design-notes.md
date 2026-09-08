@@ -319,6 +319,39 @@ on its own: its coordination contract keys the claim on the canonical task id
 rather than the basename, on the ground that the lifecycle rename it prescribes
 would otherwise hand the renamed file a key nobody holds.
 
+## Lessons from real traffic
+
+Three failure modes observed while running the lead-follower pool, each removed
+by construction here rather than left to be tuned.
+
+- **A no-claim cooldown that clears at the instant it should still exclude.** In
+  the running lead the no-claim cooldown equals the stuck-assignment window
+  (`NOCLAIM_COOLDOWN_S == ASSIGN_STUCK_S`, 300 s) and the eligibility check clears
+  with `>=`, so a seat marked non-claiming becomes eligible again at the same
+  instant its unclaimed task is repooled — seen live as one task ping-ponging
+  between two seats without ever running. It is a guard whose failing case is
+  unreachable. This design carries no cooldown heuristic: the supervisor offers
+  each task once under a generation and holds the lease, so there is no second
+  claimant to exclude and no window constant to tune.
+- **Keystrokes into a TUI are not a delivery contract.** The running pool nudges
+  a Codex worker by typing into its tmux pane, and real traffic surfaced three
+  faults: a staged-entry arm that reported success while the prompt never
+  cleared, a classifier that misread an ANSI-wrapped prompt, and a seat whose
+  launchd plist declared one runtime while its pane ran another and so was typed
+  the wrong keystrokes. This design offers work through the executor adapter
+  (Claude Monitor, Codex App Server turn, ACP session/prompt): delivery is an
+  offer the executor accepts with an echoed `assignment_id`, never an interpreted
+  screen, so a runtime mismatch cannot misroute a keystroke that no longer
+  exists.
+- **The per-worker `/proactive-loop-pool pass` sweep is replaced, not retained.**
+  In the running pool every worker runs a periodic `/proactive-loop-pool pass` to
+  catch an assignment its watcher missed. Here a worker has no proactive loop: the
+  supervisor's event-driven offer is the primary path, and its periodic
+  reconciliation backstop (offer and lease expiry, restart convergence) catches
+  whatever an event missed. The missed-assignment case is covered once,
+  centrally, instead of by N per-worker timers — which is why no
+  `proactive-loop-pool` skill ships for a worker.
+
 ## What this supersedes
 
 - **#3860 at head `d2e41ace3`** — the draft of this same v1. Its architecture
