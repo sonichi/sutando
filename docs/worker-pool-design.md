@@ -185,12 +185,8 @@ not have to know the publisher's cadence to judge freshness: a bound stated as
 publisher's configuration, and that includes the core, an operator reading the
 file by hand, and any later consumer. The publisher says it outright.
 
-An earlier draft justified this by a **step-2 reader** predating the sweep. That
-reason was wrong and contradicted this document in three other places
-(`:89-100`, `:162-177`, `:929-934`): **step 2 ships no reader at all**, and the
-reader arrives with the step-3 publisher. The conclusion survives its retracted
-premise — self-describing staleness is right because a consumer should not need
-the producer's config, not because of a staging gap that does not exist. `instances` maps an instance name to the enum
+Staleness is self-describing because a consumer should not need the producer's
+config to judge a record it is reading. `instances` maps an instance name to the enum
 `eligible` | `wedged`, and nothing else. **Probation is not a third value of that enum.** A
 probationed instance is published as `wedged` in `instances` — so a reader that implements only
 this matrix fails closed — and its probation state rides a sibling key, `probation`, which the
