@@ -1812,6 +1812,15 @@ exists — a claim's owner and its liveness, a result's presence, a name a recov
 can `stat` — and never by a timestamp, because an mtime cannot say which of two
 writes had landed.
 
+**So the flag is a FENCE, not a receipt, and the seam it opens is reachable.** Durable *before*
+the effect means a crash between the two writes leaves `flag=yes, effect=no`. The flag answers
+whether a reclaim may repeat the action; it never says the action happened, and no row of the
+source-of-truth table above reports that outcome. The acknowledgement that the work completed is
+the result file, written afterwards — so across that seam the effect's outcome is simply UNKNOWN,
+and a reader that treats the flag as completion turns an unperformed action into a reported one
+while the fence suppresses its retry. Anywhere the design must know an effect occurred, that is a
+separate acknowledgement with its own crash semantics, not this flag.
+
 **A receipt is an unconsumed inbox message, not a second copy of state.** The
 `direct/` receipt says one admission is outstanding; it does not say a task is
 running, and the ticker stopped asking it that. The accept record says an offer
