@@ -888,7 +888,10 @@ def stand_card_response() -> tuple[int, str, bytes]:
         ).stdout
         data = json.loads(out)
         if isinstance(data, dict) and "stand" in data:
-            inject = "<script>window.SUTANDO_STAND_RAW = %s;</script>\n<script>" % json.dumps(data)
+            # `</` inside any string value would end the <script> element early;
+            # `<\/` is equivalent JSON, so the page reads the same payload.
+            payload = json.dumps(data).replace("</", "<\\/")
+            inject = "<script>window.SUTANDO_STAND_RAW = %s;</script>\n<script>" % payload
             html = html.replace("<script>", inject, 1)
     except Exception:
         pass
