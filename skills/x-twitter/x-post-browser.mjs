@@ -377,7 +377,7 @@ try {
       const shot = `${SHOT_DIR}/x-dryrun-${Date.now()}.png`;
       await page.screenshot({ path: shot });
       // report what the composer ACTUALLY holds, not what we asked for
-      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, verified: true, screenshot: shot }));
+      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, composer_matched: true, screenshot: shot }));
       process.exit(0);
     }
     // Publish: inline compose button (tweetButtonInline) or modal (tweetButton).
@@ -390,8 +390,27 @@ try {
     const finalText = await readComposer(page);
     if (!composerMatches(arg, finalText)) failComposerMismatch(arg, finalText);
     await btn.click();
-    await page.waitForTimeout(3000);
-    console.log(JSON.stringify({ posted: true, text: finalText, verified: true }));
+    // A click is not a post. X confirms a landing with a toast carrying the new
+    // /status/ link; without that link within the wait, nothing is claimed.
+    // TOAST ONLY: a bare /status/ link once matched a stranger's "View analytics" link.
+    // The toast is the one element X renders for OUR post; href must be /<handle>/status/<id>.
+    let landed = await page.waitForSelector('[data-testid="toast"] a[href*="/status/"]',
+      { timeout: 15000 }).catch(() => null);
+    if (landed) {
+      const h = await landed.getAttribute('href');
+      if (!/^(https:\/\/x\.com)?\/[A-Za-z0-9_]+\/status\/\d+$/.test(h)) landed = null;
+    }
+    if (!landed) {
+      const shot = `${SHOT_DIR}/x-post-nolanding-${Date.now()}.png`;
+      await page.screenshot({ path: shot });
+      const alert = await page.$eval('[role="alert"]', (el) => el.innerText).catch(() => '');
+      console.log(JSON.stringify({ posted: false, clicked: true, composer_matched: true,
+        reason: 'no /status/ link observed after click', alert, screenshot: shot }));
+      process.exit(4);  // 3 is the pre-click composer refusal; 4 = clicked, nothing landed
+    }
+    const href = await landed.getAttribute('href');
+    const url = href.startsWith('http') ? href : `https://x.com${href}`;
+    console.log(JSON.stringify({ posted: true, url, text: finalText, composer_matched: true }));
     process.exit(0);
   }
 } catch (err) {
