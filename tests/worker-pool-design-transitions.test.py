@@ -118,7 +118,7 @@ class Supervisor:
             self.delivered.append((task_id, row["attempt"], target))
         return target
 
-    def reconcile(self, deliver=True):
+    def reconcile_leases(self, deliver=True):
         """Order is normative: expire, then settle from disk, then re-route.
         Settling before re-routing is what stops a finished task being re-offered."""
         for tid in list(self.store.rows):
@@ -133,7 +133,7 @@ class Supervisor:
 
     def restart(self):
         self.delivered = []
-        self.reconcile()
+        self.reconcile_leases()
 
 
 def seed(sup, task_id="task-1", room="room-A", requested=None):
@@ -244,31 +244,31 @@ class BoundButUnavailableStaysPending(unittest.TestCase):
     def test_it_never_silently_runs_on_the_core(self):
         for _ in range(20):
             self.clock.advance(LEASE_S)
-            self.sup.reconcile()
+            self.sup.reconcile_leases()
             self.assertEqual(self.store.rows[self.t]["state"], "PENDING")
             self.assertIsNone(self.store.rows[self.t]["assigned_worker"])
         self.assertEqual(self.sup.delivered, [])
 
     def test_process_with_core_is_the_explicit_release(self):
         self.sup.run_on_core.add("room-A")
-        self.sup.reconcile()
+        self.sup.reconcile_leases()
         self.assertEqual(self.store.rows[self.t]["assigned_worker"], "core")
 
     def test_rebind_routes_to_the_new_worker(self):
         self.sup.bindings["room-A"] = ["worker-3"]
         self.sup.health["worker-3"] = "HEALTHY"
-        self.sup.reconcile()
+        self.sup.reconcile_leases()
         self.assertEqual(self.store.rows[self.t]["assigned_worker"], "worker-3")
 
     def test_restart_probing_admits_only_after_healthy(self):
         for state in ("WEDGED", "PROBING"):
             self.sup.health["worker-2"] = state
-            self.sup.reconcile()
+            self.sup.reconcile_leases()
             self.assertIsNone(self.store.rows[self.t]["assigned_worker"],
                               "%s is not eligible for ordinary work" % state)
         self.clock.advance(PROBE_TIMEOUT_S)
         self.sup.health["worker-2"] = "HEALTHY"
-        self.sup.reconcile()
+        self.sup.reconcile_leases()
         self.assertEqual(self.store.rows[self.t]["assigned_worker"], "worker-2")
 
 
@@ -284,7 +284,7 @@ class EveryScheduleConverges(unittest.TestCase):
         sup.bindings["room-A"] = ["worker-2"]
         sup.health["worker-2"] = health
         t = seed(sup)
-        sup.reconcile()
+        sup.reconcile_leases()
         for step in order:
             if step == "crash":
                 break
