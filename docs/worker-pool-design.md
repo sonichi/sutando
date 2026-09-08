@@ -55,7 +55,7 @@ exactly the outage it exists to act in. That is the principle already keeping a
 resource-exhaustion report out of the exhausted session, applied one row further:
 to the scheduler itself.
 
-Saturation is something the supervisor **reports** in `state/pool-status.json`.
+Saturation is something the supervisor **reports** in `state/pool-status.json`, computed from the per-task timing it appends to `data/pool-metrics.jsonl` on every completion (see **The journal in one table**).
 Creating a worker is a spend decision and requires an owner command.
 
 ## Task state machine
@@ -124,9 +124,9 @@ reporter is answered with that fact instead of retrying blind.
 | 3 | `OFFERED` → `ACCEPTED` | supervisor, on the executor's accept event | set `state`, set `lease_until`, clear `offer_expires_at` |
 | 4 | `ACCEPTED` → `RUNNING` | supervisor, on the executor's start event | set `state` and extend `lease_until` |
 | 5 | lease renewal | supervisor, on the executor's heartbeat event | extend `lease_until` alone |
-| 6 | `RUNNING` → `SUCCEEDED` | supervisor, on the executor's completion event | set `state`, clear `executor_id`, `assignment_id` and `lease_until`, then write the outbox record |
+| 6 | `RUNNING` → `SUCCEEDED` | supervisor, on the executor's completion event | write the result and the outbox record (the durable delivery intent, keyed on the task id), **then** set `state` and clear `executor_id`, `assignment_id` and `lease_until`. The delivery intent is durable before the identity is cleared, so a crash in the seam re-drives it from the outbox and never drops a completed reply |
 | 7 | `RUNNING` → `FAILED` | supervisor, on the executor's failure event | row 6's write with `state` set to `FAILED` |
-| 8 | lease expiry → `PENDING` | supervisor reconciliation | increment `lease_generation`, clear `executor_id`, `assignment_id`, `lease_until` and `offer_expires_at` |
+| 8 | offer or lease expiry → `PENDING` | supervisor reconciliation | increment `lease_generation`, clear `executor_id`, `assignment_id`, `lease_until` and `offer_expires_at`. The deadline is state-specific: `offer_expires_at` for an `OFFERED` record, `lease_until` for an `ACCEPTED` or `RUNNING` one |
 | 9 | owner cancel → `FAILED` | supervisor, on a `pool_command` task | row 7's write from any non-terminal state, exempt from the generation check because the owner holds no lease |
 
 **`lease_generation` is the anti-replay token.** An offer carries the generation
@@ -141,11 +141,12 @@ on it too, so a report from any other executor about that task is refused. The
 pin table records intent and is what the status surface reads; `executor_id`
 records possession and is what the check guards alongside the generation.
 
-**A non-terminal record always carries a `lease_until` in the future or is
+**A non-terminal record always carries a deadline in the future or is
 reconcilable.** There is no state in which a task is owned by nobody and also not
-re-offerable — `PENDING` has no lease and is re-offerable, and every other
-non-terminal state carries a lease that either renews or expires into row 8. That
-is the invariant the backstop enforces and the transitions test pins.
+re-offerable — `PENDING` has none and is re-offerable, an `OFFERED` record carries
+`offer_expires_at`, and an `ACCEPTED` or `RUNNING` record carries `lease_until`;
+each either renews or expires into row 8. That is the invariant the backstop
+enforces and the transitions test pins.
 
 **Task payloads are not in the journal.** `tasks/<task-id>.txt` holds the body,
 is written once, and is never renamed; the journal holds control state only, and
@@ -223,7 +224,8 @@ schema changes are hand-designed and hand-migrated.
 | executor reports | a socket notification with a durable receipt behind it |
 | result | `results/<task-id>/<generation>.txt` |
 | delivery | a separate durable outbox |
-| recovery | on start the supervisor scans non-terminal records and unconsumed receipts |
+| recovery | on start the supervisor scans non-terminal records, unconsumed receipts, and outbox records without a delivered sentinel |
+| timing | one line per completed task appended to `data/pool-metrics.jsonl` (`task_id`, `executor`, `source`, `arrived_at`, `finished_at`, `duration_s`) — the substrate the saturation report reads, written on completion, never the delivery path |
 
 ## Routing table
 
@@ -345,6 +347,11 @@ returns to `UNAVAILABLE` and the ordinary probe decides. Failing toward re-probi
 is deliberate: a worker stranded by a record nobody clears is invisible, because
 it is up and simply never runs anything.
 
+**A heartbeat proves the process is up, not that it can work** — a worker keeps beating with dead credentials. Two adapter-observed failures are handled apart from the states above:
+
+- **Authentication failure** — a `401` or expired credentials: the worker is recycled in place (`launchctl kickstart -k`), not merely marked unavailable, because a re-login elsewhere reaches only newly started processes.
+- **Transport failure** — timeouts or `5xx`: the supervisor backs off and retries the offer and does not touch the session; the fault is the network or the provider, not the worker.
+
 **The kick cycle is the only exit from `WEDGED`, and it is commanded.** A wedged
 worker cannot demonstrate recovery through ordinary work, because being wedged is
 what stops work reaching it.
@@ -367,7 +374,7 @@ The backstop runs on a fixed period and does four things, in this order:
 
 1. Consume every receipt under `executor-events/`, applying the ones that pass
    the generation check and archiving the rest under `stale-results/`.
-2. Apply row 8 to every non-terminal record whose `lease_until` has passed.
+2. Apply row 8 to every non-terminal record whose deadline has passed — `offer_expires_at` for an `OFFERED` record, `lease_until` for an `ACCEPTED` or `RUNNING` one. An `OFFERED` record carries no `lease_until`, so keying expiry on `lease_until` alone would strand an offer no executor ever accepted.
    **Step 1 runs before this one, and that order is normative** — see the
    completion-before-release row of the failure matrix.
 3. Re-route every `PENDING` record, applying the routing table.
@@ -435,6 +442,10 @@ reader (the supervisor):
   to stop work.
 - **Only `pinned: true` binds.** A bare entry without it does not constrain
   routing.
+- **The room key is the provider-native identifier** — a Matrix room id, a Discord
+  `channel_id`, a Telegram `chat_id` — and the binding lookup matches the same key the
+  envelope carries. A lookup that knew only one provider's key would read a pinned chat
+  on another provider as unbound.
 - **`instances` is an unordered membership set.** Position carries no meaning and
   there is no primary and no failover order. The lease decides which member takes
   which task, and a room is unserved only when **every** member is ineligible.

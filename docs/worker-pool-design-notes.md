@@ -265,10 +265,11 @@ The critique closes with the one-sentence adjustment this design is built around
 
 Do not let N watchers make the routing outcome "emerge" from suppress, claim, receipt, accept and ticker together; let one Sutando supervisor that depends on no LLM session decide routing explicitly, and let the Claude/Codex sessions only accept and execute tasks.
 
-## Owner decision, 2026-09-07 (terminal): the store is a supervisor-owned file journal
+## Design decision (terminal): the store is a supervisor-owned file journal
 
-Given to worker-1 directly, after the Pro-Main critique above. The decision,
-in the owner's terms:
+The critique above resolves to four principles this design adopts. They are
+stated as the design's own rationale, not as a quotation of any private
+discussion:
 
 *What is actually needed is a single supervisor and clear state ownership.*
 
@@ -278,7 +279,7 @@ in the owner's terms:
 
 *Every fact has exactly one authoritative source.*
 
-The replacement sentence the owner gave for the PR:
+The sentence this design adopts:
 
 > Supervisor-owned durable task journal, implemented as immutable task payloads plus atomically replaced per-task state records.
 

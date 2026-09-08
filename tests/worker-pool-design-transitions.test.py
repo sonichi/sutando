@@ -12,8 +12,9 @@ EVENT_STATES = {"accept": ("OFFERED", "ACCEPTED"), "start": ("ACCEPTED", "RUNNIN
                 "complete": ("RUNNING", "SUCCEEDED"), "fail": ("RUNNING", "FAILED")}
 FIELDS = ("version", "task_id", "state", "room_id", "requested_worker",
           "executor_id", "assignment_id", "lease_generation", "lease_until",
-          "updated_at")
+          "offer_expires_at", "updated_at")
 LEASE_S = 60
+OFFER_S = 60
 PROBE_TIMEOUT_S = 30
 
 
@@ -34,7 +35,8 @@ class Journal:
         self.records[task_id] = dict(
             version=1, task_id=task_id, state="PENDING", room_id=room_id,
             requested_worker=requested_worker, executor_id=None, assignment_id=None,
-            lease_generation=0, lease_until=None, updated_at=now)
+            lease_generation=0, lease_until=None, offer_expires_at=None,
+            updated_at=now)
         return 1
 
     def stage(self, task_id, now, **fields):
@@ -78,6 +80,7 @@ class Supervisor:
         self.bindings, self.health = {}, {"core": "HEALTHY"}
         self.receipts, self.stale = {}, []
         self.run_on_core, self.delivered, self.assignments = set(), [], 0
+        self.outbox, self.results_delivered = {}, []
 
     def advance(self, secs):
         self.now += secs
@@ -106,8 +109,8 @@ class Supervisor:
         assignment = "assign-%d" % self.assignments
         self.journal.replace(
             task_id, self.now, state="OFFERED", executor_id=target,
-            assignment_id=assignment, lease_until=self.now + LEASE_S,
-            lease_generation=rec["lease_generation"] + 1)
+            assignment_id=assignment, offer_expires_at=self.now + OFFER_S,
+            lease_until=None, lease_generation=rec["lease_generation"] + 1)
         if deliver:
             self.delivered.append((task_id, assignment, target))
         return target
@@ -132,8 +135,16 @@ class Supervisor:
         if rec["state"] != frm:
             return False
         fields = dict(state=to, lease_until=self.now + LEASE_S)
+        if to == "ACCEPTED":
+            fields["offer_expires_at"] = None
         if to in TERMINAL:
-            fields.update(executor_id=None, assignment_id=None, lease_until=None)
+            # Delivery intent is durable BEFORE the lease identity is cleared, so a
+            # crash in the seam re-drives from the outbox, never dropping a reply.
+            if to == "SUCCEEDED":
+                self.outbox[ev["task_id"]] = dict(
+                    generation=rec["lease_generation"], delivered=False)
+            fields.update(executor_id=None, assignment_id=None,
+                          lease_until=None, offer_expires_at=None)
         self.journal.replace(ev["task_id"], self.now, **fields)
         return True
 
@@ -148,11 +159,15 @@ class Supervisor:
         rec = self.journal.read(task_id)
         if rec is None or rec["state"] in TERMINAL + ("PENDING",):
             return 0
-        if rec["lease_until"] is None or rec["lease_until"] >= self.now:
+        # State-specific deadline: an OFFERED record carries offer_expires_at and no
+        # lease_until, so keying on lease_until alone strands an unaccepted offer.
+        deadline = (rec["offer_expires_at"] if rec["state"] == "OFFERED"
+                    else rec["lease_until"])
+        if deadline is None or deadline >= self.now:
             return 0
         return self.journal.replace(
             task_id, self.now, state="PENDING", executor_id=None,
-            assignment_id=None, lease_until=None,
+            assignment_id=None, lease_until=None, offer_expires_at=None,
             lease_generation=rec["lease_generation"] + 1)
 
     def consume_receipts(self):
@@ -163,10 +178,19 @@ class Supervisor:
             for ev in inbox:
                 self.apply_event(ev)
 
+    def drive_outbox(self):
+        """Re-drive any delivery intent without a delivered sentinel, keyed on the
+        task id, so a cleared lease identity never strands a completed reply."""
+        for task_id, entry in self.outbox.items():
+            if not entry["delivered"]:
+                entry["delivered"] = True
+                self.results_delivered.append(task_id)
+
     def reconcile_leases(self, deliver=True):
         """Order is normative: consume receipts, then expire, then re-route.
         Consuming first is what stops a finished task being re-offered."""
         self.consume_receipts()
+        self.drive_outbox()
         for task_id in list(self.journal.records):
             self.expire(task_id)
         for task_id, rec in list(self.journal.records.items()):
@@ -193,6 +217,7 @@ def complete(sup, who, task_id, socket_up=True):
     sup.receipts.setdefault(who, []).append(ev)
     if socket_up:
         sup.consume_receipts()
+        sup.drive_outbox()
     return ev
 
 
@@ -373,6 +398,32 @@ class CrashWindows(unittest.TestCase):
         self.assertEqual(self.sup.delivered, [],
                          "a finished task must not be re-offered")
 
+    def test_an_unaccepted_offer_expires_on_offer_expires_at(self):
+        t = seed(self.sup)
+        self.sup.offer(t, deliver=False)
+        rec = self.journal.read(t)
+        self.assertIsNotNone(rec["offer_expires_at"])
+        self.assertIsNone(rec["lease_until"], "an OFFERED record holds no lease")
+        self.assertEqual(self.sup.expire(t), 0, "not yet past offer_expires_at")
+        self.sup.advance(OFFER_S + 1)
+        self.assertEqual(self.sup.expire(t), 1, "expires on offer_expires_at")
+        self.assertEqual(self.journal.read(t)["state"], "PENDING")
+
+    def test_a_completed_reply_survives_the_identity_clear(self):
+        t = seed(self.sup, requested="worker-2")
+        self.sup.offer(t)
+        self.sup.apply_event(report(self.sup, "worker-2", "accept", t))
+        self.sup.apply_event(report(self.sup, "worker-2", "start", t))
+        complete(self.sup, "worker-2", t)
+        self.assertIn(t, self.sup.results_delivered)
+        self.assertIsNone(self.journal.read(t)["executor_id"])
+        stale = dict(type="complete", task_id=t, executor_id="worker-2",
+                     assignment_id="assign-1", lease_generation=99)
+        self.sup.receipts.setdefault("worker-2", []).append(stale)
+        self.sup.restart()
+        self.assertIn(t, self.sup.results_delivered,
+                      "delivery intent is durable independent of the lease")
+
 
 class BoundButUnavailableStaysPending(unittest.TestCase):
     """A bound room with no healthy worker waits. Nothing else may take the work,
@@ -441,9 +492,12 @@ class EveryScheduleConverges(unittest.TestCase):
             with self.subTest(order=order):
                 rec, sup = self._run(order)
                 self.assertIn(rec["state"], TERMINAL + ("PENDING", "OFFERED"))
-                if rec["state"] in NON_TERMINAL and rec["lease_until"] is not None:
-                    self.assertGreaterEqual(rec["lease_until"], sup.now,
-                                            "an expired lease survived a pass")
+                if rec["state"] in NON_TERMINAL and rec["state"] != "PENDING":
+                    deadline = (rec["offer_expires_at"] if rec["state"] == "OFFERED"
+                                else rec["lease_until"])
+                    if deadline is not None:
+                        self.assertGreaterEqual(deadline, sup.now,
+                                                "an expired deadline survived a pass")
 
     def test_an_unavailable_binding_never_leaks_to_the_core(self):
         for order in itertools.permutations(self.STEPS):
@@ -461,8 +515,8 @@ class EveryScheduleConverges(unittest.TestCase):
         sup.restart()
         rec = journal.read(t)
         self.assertEqual(rec["state"], "OFFERED")
-        self.assertLess(rec["lease_until"], sup.now,
-                        "without expiry the record is stuck past its lease")
+        self.assertLess(rec["offer_expires_at"], sup.now,
+                        "without expiry the record is stuck past its offer deadline")
 
 
 if __name__ == "__main__":
