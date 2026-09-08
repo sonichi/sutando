@@ -240,10 +240,6 @@ must not be the supervisor**. Every other decision above stands.
 
 On holding the pin-fallback commits:
 
-> "pin fallback：直接落在 reviewer 明确要求移除的 per-worker proactive loop 路径里，存在方向性冲突。"
-
-and, in English in the same message:
-
 > "Hold the pin-fallback commits for now. Since that code sits in the per-worker
 > proactive loop that #3604 has been asked to remove, merging it into #3604 would
 > work against the requested reshape even if the implementation itself is correct.
@@ -251,13 +247,9 @@ and, in English in the same message:
 > enforcement and, if so, move it to the surviving centralized claim/assignment
 > boundary rather than reintroducing it through the old fallback path."
 
-The decision rule that follows, quoted verbatim:
+The decision rule that follows:
 
-> "如果新架构仍可能由多个 seat 抢同一任务，就把 pin guard 移到统一的 claim/assignment
-> 层；如果新的 server-side routing 已经保证唯一 seat，则不应继续保留 follower-loop
-> fallback。"
-
-English rendering: *if the new architecture can still have several seats
+*if the new architecture can still have several seats
 contending for one task, move the pin guard to the unified claim/assignment
 layer; if the new server-side routing already guarantees a unique seat, the
 follower-loop fallback should not be kept.*
@@ -269,43 +261,30 @@ arbitrate. Therefore no fallback survives in any executor, and pin enforcement i
 not a guard at all — it is the routing table, evaluated in the one place that
 assigns.
 
-The critique closes with the one-sentence adjustment this design is built around, quoted verbatim:
+The critique closes with the one-sentence adjustment this design is built around:
 
-> 不要让 N 个 watcher 通过 suppress、claim、receipt、accept 和 ticker 共同“涌现”出路由结果；让一个不依赖任何 LLM session 的 Sutando supervisor 明确决定路由，Claude/Codex session 只负责接受和执行任务。
+Do not let N watchers make the routing outcome "emerge" from suppress, claim, receipt, accept and ticker together; let one Sutando supervisor that depends on no LLM session decide routing explicitly, and let the Claude/Codex sessions only accept and execute tasks.
 
-In English: do not let N watchers make the routing outcome "emerge" from suppress, claim, receipt, accept and ticker together; let one Sutando supervisor that depends on no LLM session decide routing explicitly, and let the Claude/Codex sessions only accept and execute tasks.
+## Owner decision, 2026-09-07 (terminal): the store is a supervisor-owned file journal
 
-## Owner decision, 2026-09-07 (terminal): a supervisor-owned file journal, not SQLite
+Given to worker-1 directly, after the Pro-Main critique above. The decision,
+in the owner's terms:
 
-Given to worker-1 directly, after the Pro-Main critique above. Quoted verbatim,
-each with a one-line English rendering.
-
-> 真正需要的是单一 supervisor 和明确的状态所有权，不是 SQLite 本身。
-
-*What is actually needed is a single supervisor and clear state ownership, not SQLite itself.*
-
-> 需要避免的不是“文件系统”，而是多个 watcher 分别用不同文件表达同一个状态。只要切换成 supervisor 单写者，文件协议同样可以保持清晰、可靠。
+*What is actually needed is a single supervisor and clear state ownership.*
 
 *What must be avoided is not "the filesystem" but several watchers each expressing the same state through a different file; once the supervisor is the single writer, a file protocol stays just as clear and reliable.*
 
-> 只有 supervisor 写权威状态；每个权威文件通过 temp + fsync + rename 原子替换；跨进程通信使用可重放 receipt，而不是让多个进程共同修改状态。
-
 *Only the supervisor writes authoritative state; every authoritative file is replaced atomically by temp + fsync + rename; cross-process communication uses replayable receipts rather than several processes jointly modifying state.*
-
-> 每项事实只有一个权威来源。
 
 *Every fact has exactly one authoritative source.*
 
-The replacement sentence the owner gave for the PR, quoted verbatim:
+The replacement sentence the owner gave for the PR:
 
 > Supervisor-owned durable task journal, implemented as immutable task payloads plus atomically replaced per-task state records.
 
 **What it replaced.** The previous head of this PR held all task control state in
-one SQLite table — `tasks(task_id TEXT PRIMARY KEY, room_id, requested_worker,
-assigned_worker, state, lease_owner, lease_until, attempt, …)` in
-`state/pool/pool.sqlite3` — with each of the nine transitions written as a single
-conditional `UPDATE` whose `WHERE` clause was the concurrency control. The table
-and those statements are gone. The contract file now specifies
+a single database-backed store, updated in place on each transition. That
+store is gone. The contract file now specifies
 `tasks/<task-id>.txt` as an immutable payload that is never renamed,
 `task-state/<task-id>/state.json` as the one authoritative record, replaced whole
 by temp file plus `fsync` plus `os.replace()`, `lease_generation` with
@@ -350,8 +329,7 @@ would otherwise hand the renamed file a key nobody holds.
 - **`docs/lead-follower-pool.md`** — the lead-inside-the-runtime-daemon placement
   and the lead-managed assignment it rests on are replaced by the pool supervisor
   as its own process.
-- **The SQLite task store** of this PR's own previous head — one `tasks` table
-  under `state/pool/pool.sqlite3` with nine conditional `UPDATE` statements —
+- **The database-backed task store** of this PR's own previous head —
   replaced by the journal, per **Owner decision, 2026-09-07 (terminal)** above.
   The state names, the lease semantics, the routing table and the crash-window
   enumeration are unchanged by that reversal; only the store is.

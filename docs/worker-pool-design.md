@@ -501,7 +501,7 @@ Each merges before the next opens.
 
 ## Out of scope for v1
 
-- **A database-backed store — SQLite or otherwise — is not used.** The journal
+- **A database-backed store is not used.** The journal
   under **Task state machine** is the store.
 - **Auto-scale** in either direction. The supervisor reports saturation; it never
   resizes the pool.
