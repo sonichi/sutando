@@ -4,12 +4,14 @@ window, the I/O edge with fakes, and the record/replay/probe CLI end to end."""
 import contextlib
 import io
 import json
+import argparse
 import os
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -406,6 +408,25 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     return script
 
 
+class Identity(unittest.TestCase):
+    # Outside Cli: that class pins _local_host_label to 'host' for every probe.
+
+    def test_local_host_label_comes_from_util_paths_or_the_short_hostname(self):
+        # Coverage of the resolver itself (the class pins it elsewhere): the shared helper when it
+        # imports, the short hostname when it cannot.
+        import socket
+        self.assertIsInstance(w._local_host_label(), str)
+        with patch.dict(sys.modules, {"util_paths": None}):
+            self.assertEqual(w._local_host_label(), socket.gethostname().split(".")[0])
+
+    def test_an_unreadable_pane_is_an_unknown_verdict_for_that_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; (ws / "state" / "cores").mkdir(parents=True)
+            with patch.object(w, "capture_pane", return_value=None):
+                v = w.probe_one(argparse.Namespace(socket="/s", tmux="tmux", workspace=str(ws), work_file=None, work_outstanding=None, now=None, warn_after=None, sample=None), ws, "=core-9:0", "worker")
+            self.assertEqual((v["kind"], v["reason"], v["role"]), ("unknown", "pane not readable", "worker"))
+
+
 class Cli(unittest.TestCase):
     """main() is driven IN-PROCESS so coverage sees it; one subprocess test keeps the entry point honest."""
 
@@ -468,9 +489,217 @@ class Cli(unittest.TestCase):
             self.assertEqual([o["sample_count"] for o in outs], [1, 1, 2, 2], outs)
             self.assertIn("no work signal", outs[0]["work_detail"])
             self.assertFalse(w.window_path(ws).exists(), "an explicit target must not write the core's window")
-            self.assertTrue(w.window_path(ws, "=worker-1:1").exists())
-            self.assertNotEqual(w.window_path(ws, "=worker-1:1"), w.window_path(ws, "=worker-2:1"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=worker-1:1")).exists())
+            self.assertNotEqual(w.window_path(ws, w.window_slot("/s", "=worker-1:1")), w.window_path(ws, w.window_slot("/s", "=worker-2:1")))
             self.assertEqual(w.window_path(ws), w.window_path(ws, None))
+
+    def test_probe_takes_the_callers_work_signal_for_a_worker(self):
+        # The deliverer knows what a worker owes; the core's queue does not. A work file keyed by
+        # target, or an explicit flag, replaces the core-queue read for explicit targets.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=worker-1:1": {"outstanding": True, "detail": "task-abc handed 40s ago, no result"},
+                                      "=worker-2:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((rc, v["work_outstanding"], v["work_detail"], v["target"]), (0, True, "task-abc handed 40s ago, no result", "=worker-1:1"))
+            rc, out = self.run_main(*base, "--target", "=worker-2:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "work file: nothing outstanding"))
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual(v["work_outstanding"], False)
+            self.assertIn("no work signal for '=worker-9:1'", v["work_detail"])
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-outstanding")
+            self.assertEqual(json.loads(out)["work_outstanding"], True)
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--no-work")
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "caller says nothing outstanding"))
+            # a missing or broken work file is a missing signal, never a verdict input
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(Path(d) / "absent.json"))
+            self.assertIn("work file unreadable", json.loads(out)["work_detail"])
+            # the core's own pane still reads its own queue (no explicit target)
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            rc, out = self.run_main(*base)
+            self.assertIn("queued task", json.loads(out)["work_detail"])
+
+    def test_a_work_file_never_silences_the_cores_own_queue(self):
+        # --work-file keyed for workers plus the core in --targets: the core still reads its queue
+        # (no key for it), and a key for the core's own target is honoured when present.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True)
+            for i in range(3):
+                (ws / "tasks" / f"task-{i}.txt").write_text("x")
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1,=sutando-core:0"]
+            with patch.object(w, "_local_host_label", return_value="host"):
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual(by["=sutando-core:0"]["role"], "core")
+                self.assertTrue(by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"])
+                self.assertIn("queued task", by["=sutando-core:0"]["work_detail"])
+                self.assertNotIn("None", by["=sutando-core:0"]["work_detail"])
+                self.assertEqual(by["=w1:1"]["work_outstanding"], False)
+                wf.write_text(json.dumps({"=sutando-core:0": {"outstanding": False, "detail": "deliverer says drained"}}))
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual((by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"]["work_detail"]), (False, "deliverer says drained"))
+
+    def test_an_invalid_work_file_never_silences_the_core_but_still_silences_a_worker(self):
+        # Missing file, bad JSON, non-boolean record: the core falls back to its queue; a worker
+        # keeps the fail-closed missing-signal result.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); (ws / "tasks").mkdir(); (ws / "tasks" / "task-1.txt").write_text("x")
+            truth = w.work_outstanding(ws, 0.0)
+            self.assertTrue(truth[0])
+            missing = str(ws / "absent.json")
+            bad = ws / "bad.json"; bad.write_text("{not json")
+            nonbool = ws / "nb.json"; nonbool.write_text(json.dumps({"=sutando-core:0": {"outstanding": "false"}}))
+            for wf in (missing, str(bad), str(nonbool)):
+                self.assertEqual(w.work_signal("=sutando-core:0", ws, 0.0, work_file=wf, core=True), truth, wf)
+                got = w.work_signal("=w1:1", ws, 0.0, work_file=wf)
+                self.assertFalse(got[0], (wf, got))
+                self.assertIn("no work signal", got[1])
+
+    def test_probe_targets_gives_one_verdict_per_worker_with_its_own_signal(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": True, "detail": "owes task-1"}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1, =w2:1", "--work-file", str(wf)]
+            rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((rc, v["socket"], sorted(v["targets"])), (0, "/s", ["=w1:1", "=w2:1"]))
+            self.assertEqual((v["targets"]["=w1:1"]["work_outstanding"], v["targets"]["=w1:1"]["work_detail"]), (True, "owes task-1"))
+            self.assertFalse(v["targets"]["=w2:1"]["work_outstanding"])
+            rc, out = self.run_main(*base)
+            v2 = json.loads(out)
+            self.assertEqual([v2["targets"][k]["sample_count"] for k in ("=w1:1", "=w2:1")], [2, 2])
+            self.assertFalse(w.window_path(ws).exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=w1:1")).exists() and w.window_path(ws, w.window_slot("/s", "=w2:1")).exists())
+
+    def setUp(self):
+        super().setUp()
+        p = patch.object(w, "_local_host_label", return_value="host"); p.start(); self.addCleanup(p.stop)
+
+    def _alive(self, ws: Path, session: str, socket: str = "/s") -> None:
+        cores = ws / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
+        (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": socket, "session": session, "schema_version": 4}))
+
+    def test_core_identity_reads_this_hosts_heartbeat_only(self):
+        # A shared workspace holds other hosts' heartbeats; a fresher peer record must not become the
+        # local core, and with no local record the identity is the configured default, never the env.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": "/s", "session": "sutando-core"}))
+            (cores / "peer.alive").write_text(json.dumps({"host": "peer", "socket": "/p", "session": "core-9"}))
+            os.utime(cores / "host.alive", (1, 1))  # the peer's record is the newer one
+            with patch.object(w, "_local_host_label", return_value="host"):
+                self.assertEqual(w.core_identity(ws), ("/s", "sutando-core"))
+                (cores / "host.alive").unlink()
+                with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                    self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
+                (cores / "host.alive").write_text("not json")
+                self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
+
+    def test_a_malformed_socket_in_the_heartbeat_is_an_unreadable_record(self):
+        # One bad socket must not crash the diagnostic at realpath(), nor cost the core its session.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            with patch.object(w, "_local_host_label", return_value="host"):
+                for bad in (["/s"], {"path": "/s"}, 7, True):
+                    (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": bad, "session": "core-2"}))
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), bad)
+                for absent in ({"host": "host", "session": "core-2"}, {"host": "host", "socket": None, "session": "core-2"}, {"host": "host", "socket": "", "session": "core-2"}):
+                    (cores / "host.alive").write_text(json.dumps(absent))
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), absent)
+
+    def test_role_comes_from_identity_not_from_how_the_session_was_spelled(self):
+        # The heartbeat record names the core's session. Naming that session explicitly is still the
+        # core; a worker reached through the environment with no flag is still a worker.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(12)))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--session", "sutando-core")        # explicit, but it IS the core
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("core", True), v)
+            self.assertIn("queued task", v["work_detail"])
+            self.assertTrue(w.window_path(ws).exists())
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):     # env names a WORKER, no flag
+                rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False), v)
+            self.assertIn("no work signal", v["work_detail"])
+            self.assertEqual(v["target"], "=core-2:0")
+            rc, out = self.run_main(*base, "--target", "=sutando-core:0")       # explicit target that IS the core
+            self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "sutando-core", "--role", "worker")   # the override wins
+            v = json.loads(out); self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False))
+            rc, out = self.run_main(*base, "--target", "=core-9:0", "--role", "core")
+            self.assertEqual(json.loads(out)["role"], "core")
+            # no heartbeat record: the configured default is the core, a named other session a worker,
+            # and a session named only by the environment is a worker too (never promoted to core)
+            (ws / "state" / "cores" / "host.alive").unlink()
+            rc, out = self.run_main(*base); self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "core-3"); self.assertEqual(json.loads(out)["role"], "worker")
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                rc, out = self.run_main(*base)
+            v = json.loads(out); self.assertEqual((v["role"], v["target"]), ("worker", "=core-2:0"), v)
+
+    def test_windows_are_keyed_by_socket_as_well_as_target(self):
+        # Two tmux servers on one host can both hold =core-2:1; the same target on two sockets must not
+        # share a window (alternating pane identities would split every sample into a new run).
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            counts = []
+            for sock in ("/s1", "/s2", "/s1", "/s2"):
+                rc, out = self.run_main("probe", "--socket", sock, "--target", "=core-2:1", "--workspace", str(ws), "--tmux", str(tmux))
+                counts.append(json.loads(out)["sample_count"])
+            self.assertEqual(counts, [1, 1, 2, 2])
+            self.assertNotEqual(w.window_slot("/s1", "=core-2:1"), w.window_slot("/s2", "=core-2:1"))
+            self.assertEqual(w.window_slot("/s1", "=x"), w.window_slot("/s1", "=x"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s1", "=core-2:1")).exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s2", "=core-2:1")).exists())
+            self.assertFalse(w.window_path(ws).exists())
+
+    def test_work_signal_precedence(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); wf = Path(d) / "w.json"
+            wf.write_text(json.dumps({"outstanding": True, "detail": "flat record"}))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf)), (True, "flat record"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf), say=False), (False, "caller says nothing outstanding"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0), (False, "no work signal for an explicit --target"))
+            wf.write_text("{not json")
+            self.assertIn("unreadable", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
+            # `outstanding` is a JSON boolean or it is no signal: nothing is coerced.
+            for val, want in (("false", False), ("true", False), (0, False), (1, False), (None, False), (True, True), (False, False)):
+                wf.write_text(json.dumps({"=t:1": {"outstanding": val}}))
+                got = w.work_signal("=t:1", ws, 0.0, work_file=str(wf))
+                self.assertEqual(got[0], want, (val, got))
+                if type(val) is not bool:
+                    self.assertIn("is not a boolean", got[1], (val, got))
+            wf.write_text(json.dumps({"=t:1": {"detail": "no key"}}))
+            self.assertIn("no work signal", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
 
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:

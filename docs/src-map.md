@@ -23,6 +23,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
+- **`archive-transcript.sh`** — Archive the conversation transcript on PreCompact.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
@@ -84,6 +85,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
+- **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
@@ -112,6 +114,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`osascript-setup-hint.ts`** — Extract the user-actionable sentence from an osascript failure.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
+- **`outbox_cli.py`** — Operator recovery for the delivery outbox: list / inspect / requeue.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
@@ -190,6 +193,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
+- **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
