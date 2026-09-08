@@ -1752,7 +1752,7 @@ remembers is the one a sweep reads.
 | may that instance claim right now | the `eligibility` key of `state/pool-status.json`, and — before every read of it — the directory `state/pool-probation/<instance>.admit/` |
 | is that instance's process up | its own `.alive` |
 | has that instance run out of credit | `state/pool/quiesced/<instance>.json` |
-| has an external side effect already happened | the done flag `state/cores/<name>/done/task-X.flag` |
+| may a reclaim repeat this task's external side effect | the done flag `state/cores/<name>/done/task-X.flag` |
 | did the work finish | the result file under `results/` |
 | how many admissions are outstanding | a listing of `DISPATCH_DIR`, never a counter |
 | how long the task waited | `data/pool-metrics.jsonl` |
