@@ -749,21 +749,23 @@ if tmux_session_exists; then
   # Make the healed core the active window so attach/Console show it, not the
   # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
   tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
-  # A healed window IS a Claude launch — stamp it before the exits below, and
-  # before ensure_core_monitor, which cannot write its pid file until state/ exists.
-  stamp_runtime_claude "start-cli-heal"
-  ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
-  # child lives; poll before opening intake, same bound as the fresh-start path.
+  # child lives; poll before publishing anything, in the same ORDER the
+  # fresh-start path uses — nothing is stamped until the core is verified live.
   for _ in $(seq 1 25); do
     tmux_core_session_running && break
     sleep 0.2
   done
-  if tmux_core_session_running; then
-    clear_shutdown_sentinel
-  else
-    echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+  if ! tmux_core_session_running; then
+    echo "  ⚠ healed window did not come up within ~5s — nothing stamped, sentinel NOT cleared, no core is serving." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: healed core did not come up within ~5s"
+    exit 1
   fi
+  clear_shutdown_sentinel
+  # Verified live, so a marker written here cannot outlive a core that never
+  # served. Stamp first: ensure_core_monitor needs state/ to exist.
+  stamp_runtime_claude "start-cli-heal"
+  ensure_core_monitor
   if [ -t 1 ]; then
     echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
