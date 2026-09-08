@@ -30,23 +30,38 @@ class FreshnessSeesLiveInputs(unittest.TestCase):
         self.m = _load()
         self.d = pathlib.Path(tempfile.mkdtemp())
 
-    def test_a_changed_ledger_is_an_input(self):
+    def _suite(self, body: str):
+        s = self.d / "s.test.py"
+        s.write_text(body)
+        return [s]
+
+    def test_a_ledger_a_suite_names_is_an_input(self):
         led = self.d / "pr-flag-reviewed.json"
         led.write_text(json.dumps({"1": {"sha": "a"}}))
-        self.assertIn(led, self.m.live_inputs(self.d))
+        got = self.m.live_inputs(self.d, self._suite('LEDGER = "pr-flag-reviewed.json"'))
+        self.assertIn(led, got)
+
+    def test_runtime_status_no_suite_names_is_NOT_an_input(self):
+        # state/ holds ~70 continuously-written files; globbing them all would
+        # move `newest` every few seconds and disable the gate.
+        (self.d / "quota-state.json").write_text("{}")
+        got = self.m.live_inputs(self.d, self._suite('LEDGER = "pr-flag-reviewed.json"'))
+        self.assertEqual(got, [], "an unreferenced runtime file leaked into the input set")
 
     def test_the_scripts_own_sentinel_is_excluded(self):
         # Including it would make every run look changed, since this script writes it.
         (self.d / self.m.SENTINEL).write_text("{}")
-        self.assertEqual(self.m.live_inputs(self.d), [])
+        got = self.m.live_inputs(self.d, self._suite(f'X = "{self.m.SENTINEL}"'))
+        self.assertEqual(got, [])
 
     def test_a_ledger_edit_moves_the_freshness_clock(self):
         led = self.d / "pr-flag-reviewed.json"
         led.write_text("{}")
-        before = self.m.newest_mtime(self.m.live_inputs(self.d))
+        su = self._suite('LEDGER = "pr-flag-reviewed.json"')
+        before = self.m.newest_mtime(self.m.live_inputs(self.d, su))
         time.sleep(0.01)
         led.write_text('{"1": {"sha": "b"}}')
-        after = self.m.newest_mtime(self.m.live_inputs(self.d))
+        after = self.m.newest_mtime(self.m.live_inputs(self.d, su))
         self.assertGreater(after, before, "editing a ledger did not move the clock")
 
     def test_should_run_fires_when_the_ledger_is_newer_than_the_last_run(self):

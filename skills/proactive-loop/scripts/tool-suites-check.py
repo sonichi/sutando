@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 import os
 import subprocess
 import tempfile
@@ -170,13 +171,21 @@ def newest_mtime(paths) -> float:
     return max((p.stat().st_mtime for p in paths), default=0.0)
 
 
-def live_inputs(statedir):
-    """State files a suite may assert over, EXCLUDING this script's own sentinel.
+def live_inputs(statedir, suites):
+    """State files some SUITE NAMES, excluding this script's own sentinel.
 
-    Freshness over tool+suite mtimes alone skips a suite whose fixtures are its
-    inputs -- a hand-maintained ledger changes while the suite file does not.
+    Scoped to what a suite actually references: `state/` also holds continuously
+    written runtime status, so a blanket glob moves `newest` every few seconds
+    and disables the gate instead of tightening it.
     """
-    return [p for p in sorted(statedir.glob("*.json")) if p.name != SENTINEL]
+    named = set()
+    for s in suites:
+        try:
+            named.update(re.findall(r"[\w.-]+\.json", s.read_text()))
+        except OSError:
+            continue
+    named.discard(SENTINEL)
+    return [statedir / n for n in sorted(named) if (statedir / n).is_file()]
 
 
 def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple[bool, str]":
@@ -252,7 +261,7 @@ def main(argv=None) -> int:
     sf = statedir / SENTINEL
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     now = time.time()
-    newest = newest_mtime(tools + suites + live_inputs(statedir))
+    newest = newest_mtime(tools + suites + live_inputs(statedir, suites))
     go, why = should_run(state, newest, a.max_age_hours * 3600, now)
     if a.force:
         go, why = True, "--force"
