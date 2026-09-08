@@ -134,6 +134,13 @@ class FreshnessSeesDeclaredLedgers(unittest.TestCase):
         after = self.m.newest_mtime(self.m.freshness_inputs(ws, "H", [], []))
         self.assertGreater(after, before)
 
+    def test_an_unreadable_declaration_raises_rather_than_selecting_nothing(self):
+        # Silently returning [] here is the failure mode this PR exists to fix:
+        # nothing watched, and a stable `newest` that looks like correct scoping.
+        (self.d / self.m.EXTRAS).write_text("{not json")
+        with self.assertRaises(self.m.ExtrasError):
+            self.m.live_inputs(self.d, self.d)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
