@@ -158,19 +158,30 @@ record: a miss means "consult the full store," not "does not exist." Shape in
 
 ## Where the map is stored
 
-Under Sutando, the map is per-user state, so it lives under the **workspace**, never in the code checkout:
+Under Sutando, the map is per-user state, so it lives under the **workspace**, never in the code checkout — and the roster is under `hosts/<label>/`, one subtree per machine:
 
 ```
+<workspace>/hosts/<host-label>/data/collaboration-intelligence/
+  reviewer-stands.json  # THE roster the readers load
+
 <workspace>/data/collaboration-intelligence/
   quick-lookup.yaml     # the bounded hot set (see above)
+  reviewer-stands.json  # LEGACY. `roster_union.host_rosters()` still reads it, under the
+                        # key "legacy", after every per-host roster. Do not write here.
   ...                   # the full record, per references/schema.md
 ```
+
+`<host-label>` is `bash scripts/sutando-config.sh host-label`. `scripts/roster_union.py` globs
+`hosts/*/data/collaboration-intelligence/reviewer-stands.json` and unions every peer host's roster,
+so **an absent flat file is normal, not a missing store.** `lookup.py` distinguishes the two in its
+own output: `MAP EMPTY at <dir>` means no store loaded, `QUERY 'x' -> 0 hit(s)` means it loaded and
+matched nothing. Read that line before concluding anything about the store.
 
 Resolve `<workspace>` with `bash scripts/sutando-config.sh workspace` — never hardcode a path and never use a bare relative path, because the process CWD is the repo, not the workspace.
 
 **The store belongs to the running core's workspace, not to whichever checkout the process happens to sit in.** That resolver answers per-checkout, so on a machine with more than one (an installed engine plus a developer-mode clone) the same command returns two different roots. An agent invoked from the second one writes a *second, divergent* map, and nothing reports a conflict: each store is internally consistent and neither knows the other exists. Resolve against the core that owns the session, and if you cannot establish which core that is, say so rather than writing into the checkout you were launched from.
 
-**`data/` is not in the default vault sync include set** (`notes/`, `talks/`, `hosts/` are), so the map is per-host by default and will not follow the user to another machine. That is the safe default — a collaboration map is host-local observation, not a document — but it should be a stated choice. A user who wants it to travel adds `data/collaboration-intelligence/` to `vault.sync.include`.
+**Two different things are called "per-host" here; keep them apart.** The roster's *location* is per-host (`hosts/<label>/…`, above). Separately, the rest of `data/` is not in the default vault sync include set (`notes/`, `talks/`, `hosts/` are), so **that** part of the map is per-host in the sense of not syncing — same flat path, one copy per machine — and will not follow the user to another machine. That is the safe default — a collaboration map is host-local observation, not a document — but it should be a stated choice. A user who wants it to travel adds `data/collaboration-intelligence/` to `vault.sync.include`.
 
 **Why this location and not the checkout.** The engine tree is REPLACED on app update; anything written there is destroyed without warning. A skill whose whole purpose is a *durable* map is the worst possible thing to lose that way, and the loss is silent — the next run finds no store, builds a task-local view, and reports "persistence unavailable" as if that were normal.
 
