@@ -22,8 +22,11 @@ the worst refusal becomes the exit — 0 all resolved; 2 unknown reviewer;
 3 entry unusable (no stand/room); 4 allowlist known-false (route via owner).
 
 Roster: <workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-stands.json
-  (unioned across every host by roster_union.host_rosters(); the flat
-   <workspace>/data/... path is LEGACY and read last, under the key "legacy")
+  (unioned across every host by roster_union.host_rosters(). The flat
+   <workspace>/data/... path is the LEGACY location and is still read. Note
+   the order: host_rosters() lists it LAST, but roster_paths() below puts
+   this host's SELECTED file first -- and roster_path() selects the flat one
+   while this host is unmigrated, so a stale flat row then WINS a collision.)
   {"rui": {"human": "@rui:ag2.space", "stand": "@sutando-rui:ag2.space",
            "room": "!triage:ag2.space", "allowlisted": true, "gh": "john-the-dev"}}
 `allowlisted` is evidence, not hope: true (a mention has triggered this
