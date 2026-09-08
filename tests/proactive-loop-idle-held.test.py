@@ -515,5 +515,34 @@ check("...and an unrelated pre-existing note survives that write",
 _rc, _, _ = run(["--state", str(_wp), "--remove", "z", "--reason", "done"])
 check("a removal still needs no --note", _rc == 0)
 
+
+# A blank explanation passes a COUNT check and satisfies nothing: the audit sees the
+# key present and does not even list it among the missing (qingyun-wu, #4042).
+for _flag, _val, _label in (("--note", "", "an empty"), ("--note", "   ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--add", "blank:owner", _flag, _val, "--write"])
+    check(f"{_label} --note is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --note leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The sibling flag has the same shape, and an unauditable REMOVAL is the silent
+# shrink this tool exists to stop.
+for _val, _label in (("", "an empty"), ("  ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--remove", "ds-pr-12", "--reason", _val, "--write"])
+    check(f"{_label} --reason is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --reason leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The guard must not over-refuse: a non-PR explanation is explicitly allowed.
+_op = state(list(BASE))
+_rc, _, _ = run(["--state", str(_op), "--add", "prose:owner", "--note", "no PR; owner judgement", "--write"])
+check("a non-PR --note is still accepted", _rc == 0)
+_op2 = state(list(BASE))
+_rc2, _, _ = run(["--state", str(_op2), "--remove", "ds-pr-12", "--reason", "landed", "--write"])
+check("a plain --reason is still accepted", _rc2 == 0)
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

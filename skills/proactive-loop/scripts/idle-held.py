@@ -125,6 +125,17 @@ def apply_ops(items, adds, removes):
 BRANCH_SHA = re.compile(r"`?([\w./-]+/[\w./-]+)`?\s*@\s*`?([0-9a-f]{7,40})`?")
 
 
+def refuse_blank(values, flag: str, paired: str) -> "str | None":
+    """A present-but-blank explanation passes a count check and satisfies nothing:
+    the audit sees the key and does not even list it as missing."""
+    for i, v in enumerate(values):
+        if not str(v).strip():
+            return (f"REFUSED: {flag} #{i + 1} is blank. A count check cannot tell a "
+                    f"blank explanation from a real one, so {paired} would record an "
+                    f"unauditable entry with the key present.")
+    return None
+
+
 def audit_notes(doc, repo) -> int:
     """A sha written into a note is a COPY of a fact git owns, and copies drift.
 
@@ -334,6 +345,13 @@ def main(argv=None) -> int:
 
     if a.audit_notes:
         return audit_notes(doc, a.audit_notes)
+
+    for _vals, _flag, _paired in ((a.reason, "--reason", "--remove"),
+                                 (a.note, "--note", "--add")):
+        _err = refuse_blank(_vals, _flag, _paired)
+        if _err:
+            print(_err, file=sys.stderr)
+            return 1
 
     if a.remove and len(a.reason) != len(a.remove):
         print(f"REFUSED: {len(a.remove)} --remove but {len(a.reason)} --reason. "
