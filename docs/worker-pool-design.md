@@ -1019,9 +1019,7 @@ rooms must be kept off the same worker:
   | the worker comes back | it re-reads the binding, finds itself still a member, and resumes. Nothing was reassigned, so nothing has to be revoked |
   | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** before the new binding is written — see "What stopping a worker actually takes" below, because `launchctl bootout` alone does NOT stop it. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
 
-  **What stopping a worker actually takes, and what it costs.** An earlier revision named
-  `launchctl bootout` on the plist as the enforcer. Measured against the reference implementation at
-  #3604's pinned `6c0b416e`, that is insufficient in three independent ways, and
+  **What stopping a worker actually takes, and what it costs.** `launchctl bootout` on the plist is not the enforcer. Measured against the reference implementation at #3604's pinned `6c0b416e`, it is insufficient in three independent ways, and
   `scripts/uninstall-core-pool.sh` says so in its own header: *removing a core is three steps, not
   one*. Its `remove_core()` runs `bootout`, then `rm` on the plist, then `tmux kill-session`, then
   removes `state/cores/core-<N>.alive`. Each of the three extra steps closes a distinct hole:
@@ -1114,8 +1112,7 @@ rooms must be kept off the same worker:
   owner's equal-members ruling already admits two members driving two different tasks in one room at
   once. First-pin's window is bounded by that same standing condition rather than being
   narrower than it: **its cardinality is EVERY TASK ALREADY CLAIMED WHEN THE PIN LANDS, not one.**
-  An earlier revision wrote "one task" here and in the trace summary, which is the claim-then-re-read
-  rule's scope (that rule serializes one task) mistaken for the window's scope. The two differ
+  "One task" is the claim-then-re-read rule's scope (that rule serializes one task), not the window's. The two differ
   whenever more than one task is in flight in the room at pin time, which is exactly the case the
   equal-members ruling makes ordinary. What IS bounded: one transition, and self-clearing as soon as
   the claimants in flight at pin time finish — no new task enters the window after the pin lands. So
@@ -1340,8 +1337,7 @@ gap. So removing W runs in this order, and the order is the contract:
    is UNBOUND, and unbound work reaches the core under rule 3 — the ordinary path, not a stand-in.
 4. **Then** the installer records the removal.
 
-**Marking W ineligible is NOT a substitute for step 1, and an earlier revision of this list made
-exactly that mistake.** Eligibility is a value the worker READS before claiming (`:85-91`), so a W
+**Marking W ineligible is NOT a substitute for step 1.** Eligibility is a value the worker READS before claiming (`:85-91`), so a W
 that read `eligible` and then suspended can resume after the verdict flips and claim against its
 stale view. A read-gated flag cannot fence a process that is already past the read; only stopping the
 process can. That ordering also contradicted the re-bind fence above, which has always ended the
@@ -1464,7 +1460,7 @@ itself to a room whose worker might still come back.
    | neither | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
 
    Each row is one `stat`, so each is atomic on its own — and **the two together are NOT
-   order-independent, which an earlier draft of this section claimed.** `spent` is created BEFORE the
+   order-independent.** `spent` is created BEFORE the
    token leaves and is not removed until probation ends, so there is no instant at which both are
    absent while an allowance exists. That invariant is true and it is not sufficient: recovery acts on
    the CONJUNCTION of two sequential reads, and a conjunction that holds at no single instant is
