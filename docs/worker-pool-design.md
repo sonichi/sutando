@@ -6,19 +6,9 @@
 > design is expected to satisfy. It is placed first, ahead of the design, on the
 > owner's instruction.
 >
-> ⚠ **Two conflicts with the design that follows are left UNRECONCILED on purpose,
-> for the owner to settle — they are not editorial and merging them silently would
-> destroy the question:**
->
-> 1. **Vocabulary and topology.** These requirements name a **router** — a process
->    installed with worker 1 and stopped with the last worker. The design below names
->    a **pool supervisor** that holds no LLM session and is the only scheduler. The
->    two are not the same object, and #3860's own title says *no router process*.
-> 2. **Status dates.** These requirements are dated *owner-decided 2026-09-03*; the
->    design below is dated *owner-decided 2026-09-07*. Which supersedes which is the
->    owner's call, not this file's.
->
-> Nothing below this block was altered.
+> ⚠ These requirements and the design below **conflict in four substantive ways**.
+> They are recorded, not merged — see **[Discussion — conflicting inputs](#discussion--conflicting-inputs-unresolved)**
+> immediately after this block. Nothing below was altered.
 
 ---
 
@@ -170,6 +160,67 @@ base after step 3.
 Auto-scale in either direction; fan-out; burst consolidation for `[deduped:]`;
 router-minted task ids (the admission / census gap stays its own track, and
 bridges keep minting ids as they do today).
+
+---
+
+## Discussion — conflicting inputs (unresolved)
+
+The requirements above (PR #3860, owner-decided 2026-09-03) and the design below
+(owner-decided 2026-09-07) disagree in four substantive ways. **None is
+editorial** — each changes what gets built — so they are recorded here rather
+than reconciled. Choosing one silently would destroy the question.
+
+**1. Task files: renamed, or immutable?** *(the sharpest one — the two are not
+implementable together)*
+
+- Requirements: *"the router renames `tasks/task-X.txt` to
+  `tasks/task-X.assigned-<worker>.txt`, one atomic rename. Assignment is the
+  schedule."*
+- Design: `tasks/task-123.txt  # immutable task payload, never renamed`, with
+  assignment held in `task-state/task-123/state.json`.
+- Consequence: two incompatible on-disk protocols. Every assign, claim, reclaim
+  and crash-recovery path differs, and the existing pool's `.assigned-` /
+  `.claimed-` filenames are load-bearing today.
+
+**2. Coordination primitive: atomic rename + done-flags, or lease + generation?**
+
+- Requirements: claim by rename to `.claimed-<worker>`; `done/task-X.flag`
+  written before any external side effect; `.alive` 30 s beat, 90 s stale.
+- Design: `assignment_id` + `lease_generation` with receipts, where *"a stale
+  generation is refused, never overwritten."*
+- Consequence: the at-most-once floor is enforced by a different mechanism in
+  each. Both are defensible; they are not composable.
+
+**3. Does the scheduler exist before the first worker?**
+
+- Requirements: *"The router does not exist until the first worker does: the
+  command that creates worker 1 installs the router with it, and removing the
+  last worker stops the router."*
+- Design: *"A fresh install runs the supervisor and the core agent and nothing
+  else."*
+- Consequence: whether a zero-worker install carries a scheduler process at all —
+  which decides whether single-worker mode is a state to detect or simply the
+  absence of a pool.
+
+**4. Degraded mode when the scheduler is down**
+
+- Requirements: *"workers fall back to leaderless atomic-rename claiming of
+  unassigned tasks, and return to assignment-only the moment the beat is fresh.
+  No election, no consensus."*
+- Design: no leaderless fallback appears; recovery is the supervisor finishing a
+  complete record on restart.
+- Consequence: whether the pool keeps draining work while the scheduler is down,
+  or stops until it returns.
+
+**Naming follows from 1-4, not the reverse.** *router* (created with worker 1,
+stopped with the last) and *pool supervisor* (always-on, sole scheduler, holds no
+LLM session) are different objects, so the vocabulary cannot be settled before
+the topology is. Note #3860's own title reads *"no router process"*.
+
+**Not in dispute:** workers are task-only with no proactive loop; auto-scale is
+out of v1 and saturation is reported to the owner rather than acted on;
+`target_worker` / `fan_out` headers are gone; per-worker model choice is required
+and #3604's single captured `CLAUDE_CONFIG_DIR` is the gap to close.
 
 ---
 
