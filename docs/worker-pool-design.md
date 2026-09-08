@@ -561,6 +561,40 @@ candidate while a canonical-id claim does not — so shipping the canonical key 
 stop suppressing handler-owned work, and shipping the skip change alone would look up a key that is
 not there.
 
+### Delivery is not admission, and an unaccepted offer has no clock
+
+The migration above prescribes a fix; the requirement behind it outlives the fix
+and is worth stating apart from it. **Delivery is not admission.** Publishing a
+wake, writing a claim addressed to an instance and handing it a path are all
+things the SENDER does, and none of them is evidence the receiver took the work.
+Any rule that reads an address as a possession rebuilds the deadlock somewhere
+else, with the same signature: durable and unsubmitted, which is worse than lost
+because every surface reports it as pending.
+
+**v1 buys the evidence and owes the clock.** The accept record supplies the first
+half — an offer delivered and never taken is now visible AS untaken, and the
+four-row table above recovers it whenever the publishing watcher dies. What has
+no expiry is that same state while the watcher LIVES. Three rules this document
+already states compose into the gap exactly:
+
+- the four-row table reads `claim live, no accept` as *in flight, nobody has
+  taken it yet*, and prescribes **leave it**;
+- the reconciliation ticker re-lists the pending directory and skips an already
+  claimed task by the claim rather than by an age test, so it never revisits one;
+- §3 rule 6 measures the oldest UNCLAIMED task addressed to an instance and
+  requires that instance to hold no claimed task, so a claimed-but-unaccepted
+  task fails both halves and the instance reads as ordinary busy work.
+
+So an offer nobody took is indistinguishable from work in progress for as long as
+the publishing watcher survives, and no mechanism in v1 ends that state. The
+supervisor-shaped answer — the offer carries a lease that expires it back to
+PENDING — is not available here: there is no party holding a lease and none to
+expire it. What IS owed, by the implementing PR rather than invented in this
+document, is an expiry on the untaken state whose recovery reuses the path a dead
+watcher's claim already takes. Naming it as owed is the point. Of the four rows,
+`leave it` is the only one with no exit, and a row with no exit is how the
+previous version of this defect stayed invisible.
+
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
 revision had the ticker count "claims made this pass" and add that to the directory count. That
 was wrong three ways at once, and the first is the one this section had already condemned in
@@ -1702,6 +1736,117 @@ itself to a room whose worker might still come back.
 There is no election, no consensus and no degraded mode: the core is the only
 process whose absence stops work, which is already true of every install today.
 
+## One authoritative source per fact
+
+No record holds a task's whole control state. v1 spreads that state over the
+artifacts the coordination contract above names, and that is workable under one
+rule only: **each artifact answers exactly one question, and no question is
+answered twice.** Two artifacts answering one question drift, and the copy nobody
+remembers is the one a sweep reads.
+
+| question | sole source |
+|---|---|
+| may this task be executed, and by which instance | the hard-link claim `state/task-event-handler-claims/<canonical task id>` |
+| was the offer TAKEN, and by which executor | the accept record `state/task-event-handler-accepts/<canonical task id>` |
+| which instances serve this room | `state/pool/bindings.json` |
+| may that instance claim right now | the `eligibility` key of `state/pool-status.json`, and — before every read of it — the directory `state/pool-probation/<instance>.admit/` |
+| is that instance's process up | its own `.alive` |
+| has that instance run out of credit | `state/pool/quiesced/<instance>.json` |
+| has an external side effect already happened | the done flag `state/cores/<name>/done/task-X.flag` |
+| did the work finish | the result file under `results/` |
+| how many admissions are outstanding | a listing of `DISPATCH_DIR`, never a counter |
+| how long the task waited | `data/pool-metrics.jsonl` |
+
+The rule is already doing work in three places above, which is the argument for
+stating it once rather than deriving it three more times.
+`state/cores/channel-<room-id>.handler` is deleted rather than consulted, because
+two files answering "whose room is this" is worse than either alone. The admitted
+count is derived by listing `direct/`, so removing the file IS the decrement and
+there is no second number to fall out of step. And the direct receipt's `phase`
+became provenance the moment the ticker began branching on the task's CLAIM state
+instead: a field nothing decides on is a note for an operator, not a rival source.
+
+**A derived value is not a second source, and the discriminator is who is allowed
+to disagree with it.** "Eligible" is computed from a beat, a published verdict and
+a probation directory; it is computed ONCE, by the sweep, and every other reader
+takes the answer as given. The defect begins when a second party recomputes it
+from the same inputs and can land somewhere else — which is why that record has
+one writer, and why the core's own handler routes on beats instead of reading back
+what its sweep just wrote.
+
+**Where v1 breaks this rule, said plainly rather than argued away.** The claimant
+renames `tasks/task-X.txt` to `tasks/task-X.claimed-<name>.txt`, so "is this task
+claimed" is expressed BOTH by the hard link and by the filename. The coordination
+contract keeps the rename deliberately — it is the durable record the sweep reads,
+and a hard link under `state/` is invisible to anyone listing `tasks/` — but the
+cost is exactly the one this section names: the two can disagree, a rename can
+outlive the claim behind it, and the dispatch path has to exclude `.claimed-*` by
+name so the second expression cannot re-enter as a first one. A duplication with a
+stated reason and a stated cost, not an exemption.
+
+## Executor reports: a write order, with a receipt behind it
+
+There is no process to report TO. v1 runs no scheduler outside the core, so an
+executor has no live channel and no acknowledgement: it makes durable writes and
+the parties that care read them on their own schedule. The consumer is
+asynchronous by construction, so **the order of those writes is the whole
+protocol.** A channel would have an instant at which a report was accepted; this
+has none, and ordering is the only guarantee left.
+
+**An executor writes only facts it is the sole possible observer of.** A worker
+publishes three things about a task, and no other party can see any of them: the
+accept record (it took the offer), the done flag (it is about to cause an external
+effect), and the result. It writes none of the facts another component owns — not
+the `eligibility` record, whose single writer is the core's sweep; not the pin
+table; not another instance's beat. That is what makes the table above enforceable
+rather than aspirational: a fact with one owner has one writer, and everyone else
+reads.
+
+**The order, on completion.** The done flag is durable before any external side
+effect, so a reclaim behind it cannot repeat one. The result is written by temp
+file plus `os.replace`, the temp in the DESTINATION directory, so no consumer can
+read a partial one. The receipt under `direct/` is unlinked in the same step that
+publishes the result, so a released slot never outlives the work it was counting.
+Every crash between two of those writes is decided by a predicate that already
+exists — a claim's owner and its liveness, a result's presence, a name a recovery
+can `stat` — and never by a timestamp, because an mtime cannot say which of two
+writes had landed.
+
+**A receipt is an unconsumed inbox message, not a second copy of state.** The
+`direct/` receipt says one admission is outstanding; it does not say a task is
+running, and the ticker stopped asking it that. The accept record says an offer
+was taken; it does not say the work finished. The moment a receipt begins
+answering a question some other artifact answers, it has stopped being an inbox
+and become the duplication above.
+
+**A stale writer is REFUSED rather than allowed to overwrite — structurally,
+because v1 has no generation to check.** No lease generation travels with an offer
+and no arbiter exists to compare one against, so refusal is bought at the
+filesystem instead: every publication lands on a name exactly one caller can win.
+`acquire_task_claim` hard-links and the first linker wins; the accept record is
+published by hard link on the same terms, so a losing link means another executor
+took it first and this one suppresses; the probation allowance is
+`create(spent, O_EXCL)` and `rename(token, held/<task_id>)`, one winner and
+`ENOENT` for the rest. Where a value genuinely is superseded — the eligibility
+record — the single writer replaces it whole, and a reader that cannot validate
+what it finds reads ABSENT rather than merging two versions.
+
+**What a generation would buy that never-clobber does not, stated as a cost rather
+than as a solved problem.** Never-clobber refuses a SECOND writer. It does not
+refuse a LATE one whose ownership has already been revoked: a worker whose claim
+`retire_stale_claim` has removed still computes the same result path as the
+instance that took the task over, and nothing in v1 tells those two apart at the
+moment of the write. What bounds it is the done flag, which stops the external
+effect happening twice — the duplicate result is not refused, it is made harmless.
+That is a smaller guarantee than a generation check, and this document should
+claim the smaller one.
+
+**Recovery is the sweep and the ticker that already exist.** A restart gets no
+scan of its own: the watcher's startup listing IS the first reconciliation pass,
+the ticker is that same pass on a timer, and the four-row table under the accept
+record decides each case it meets. A second enumerator of one question is the same
+defect as a second source for one fact.
+
 ## Lifecycle: one owner, one trigger, one on-disk state per phase
 
 | phase | owner | trigger | state left on disk / user-visible effect |
@@ -1774,6 +1919,50 @@ latency is the sweep interval, not the sub-second watcher latency a Claude
 worker gets, and one wedged inside a turn reads as healthy. v1 states this as a
 known limit of Codex workers rather than pretending the task-only,
 watcher-driven rule covers them; a Codex-side notifier is its own later PR.
+
+## Executor interface and runtime adapters
+
+Everything above is runtime-independent: routing is a field and a table, the claim
+is a hard link, every record has a named writer. What differs per runtime is only
+how a task reaches a session and how that session says it took the work. So that
+difference gets a boundary, and a second runtime becomes an adapter rather than an
+edit to the pool.
+
+No scheduler process exists to call these, so the direction column names the POOL
+— whichever watcher is routing — and never a daemon:
+
+| call | direction | contract |
+|---|---|---|
+| `deliver(task)` | pool → adapter | put the offer in front of the session: the canonical task id, the payload's path, and the claim it was published under. Answers only whether delivery was ATTEMPTED. It is not an accept |
+| `accept(task)` | adapter → pool | the session has taken the task. Publishes `state/task-event-handler-accepts/<canonical task id>` by hard link, carrying the accepting pid, the instance id and the watcher it accepted from. Owed by every runtime |
+| `release(task)` | adapter → pool | the task reached a terminal state — a result written and archived, or the claim released after a failure. Both paths release; only the terminal state differs |
+| `beat()` | adapter → pool | the per-process `.alive`, 30 s beat, 90 s stale. Answers "is the process up", and nothing else |
+| `health()` | pool → adapter | answers this instance's class for the table above. **Must not require a model call**, because the class it most needs to report is the one that makes model calls fail |
+
+There is no `start()`, and the absence is a decision rather than an omission. v1
+has no RUNNING state distinct from accepted — the accept record is the last
+transition anything branches on — so a start call would publish a fact with no
+reader, and an unread fact is the second source this document keeps removing.
+There is no `cancel()` either: v1's command set carries none, and an adapter is
+not where a command the pool cannot issue should first appear.
+
+`health()`'s constraint is the quiesce rule restated at the boundary: *the
+reporter of a resource exhaustion must not depend on that resource.* An adapter
+that answers by asking its session is useless in exactly the outage the answer
+exists for, which is why the pane capture and not the session is the input.
+
+| adapter | delivery | accept | health |
+|---|---|---|---|
+| **Claude** | the watcher's `TASK_FILE:` line, read by the session's `Monitor` | the session publishes the accept record. Its skip rule needs no change because it has none; the write is owed all the same | its `.alive`, plus the wrapper's pane capture for the quota class |
+| **Codex** | `task-notifier.sh` re-scans the queue on the wake, so `next_pending_task` must consult the accept record before skipping AND must key on the canonical id, in one change — see the migration table under the routing rule | the CLI loop, once `next_pending_task` has selected a candidate | the wrapper's `tmux pipe-pane` capture; with no in-session watcher the claim-latency bound is the sweep interval |
+
+**The boundary does not by itself make a runtime without an in-session watcher a
+first-class worker, and v1 does not claim that it does.** The interface says what
+a Codex adapter owes; it does not supply the notifier that would close the latency
+gap, which stays a known limit stated above rather than one absorbed into a table.
+What the boundary buys is that the notifier can land later as one component
+without touching routing, claiming, or any record contract — which is the whole
+return on drawing it now.
 
 ## The durable record of pool timing
 
