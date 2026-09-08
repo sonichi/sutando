@@ -24,7 +24,7 @@ _TOOLS = [
 ]
 
 
-def _run_heal() -> tuple[Path, str]:
+def _run_heal(core_comes_up: bool = True) -> tuple[Path, str]:
     """Pre-create a core-less tmux session, run the launcher, return (ws, stderr)."""
     td = Path(tempfile.mkdtemp())
     bind = td / "bin"
@@ -46,12 +46,20 @@ def _run_heal() -> tuple[Path, str]:
     if not (bind / "tmux").exists():
         return (ws, "SKIP: tmux not available")
 
-    # claude must not actually run; the healed window just needs to spawn cleanly.
-    (bind / "claude").write_text("#!/bin/bash\nsleep 5\n")
+    # The healed window's claude marks itself live, because publication is now
+    # gated on the liveness poll rather than on tmux having accepted new-window.
+    live = ': > "$HOME/.core-alive"\n' if core_comes_up else ""
+    (bind / "claude").write_text(f'#!/bin/bash\n{live}sleep 5\n')
     (bind / "claude").chmod(0o755)
-    # pgrep finds no core claude -> core_claude_running false -> heal, not attach.
-    (bind / "pgrep").write_text("#!/bin/bash\nexit 1\n")
+    # No core before the heal, one after the stub runs; `-f` asks about
+    # supervisors, and yes there keeps real daemons out of the test.
+    (bind / "pgrep").write_text(
+        '#!/bin/bash\n[ "$1" = "-f" ] && exit 0\n'
+        '[ -f "$HOME/.core-alive" ] || exit 1\necho "4242 claude"\n')
     (bind / "pgrep").chmod(0o755)
+    (bind / "ps").write_text(
+        '#!/bin/bash\n[ -f "$HOME/.core-alive" ] && echo "claude --name %s -- /startup"\nexit 0\n' % SESSION)
+    (bind / "ps").chmod(0o755)
 
     env = {
         "PATH": f"{bind}:/usr/bin:/bin",
@@ -140,9 +148,27 @@ def case_heal_is_distinguishable_in_the_log() -> list[str]:
     return fails
 
 
+def case_failed_heal_publishes_nothing() -> list[str]:
+    """The other direction: tmux accepting new-window is not evidence the child
+    lived, so a heal whose core never comes up must publish nothing at all."""
+    ws, out = _run_heal(core_comes_up=False)
+    if out.startswith("SKIP:"):
+        print(f"  ~ skipped — {out[5:].strip()}")
+        return []
+    if "healing core window" not in out:
+        return ["never entered the heal path"]
+    fails = []
+    if (ws / "state" / "core-runtime.json").exists():
+        fails.append("a heal whose core never came up still wrote core-runtime.json")
+    if "no core is serving" not in out:
+        fails.append(f"failed heal did not report the failure; said {out.strip()[-160:]!r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("heal path stamps core-runtime.json", case_heal_stamps_marker),
+        ("a failed heal publishes nothing", case_failed_heal_publishes_nothing),
         ("heal launch is attributable in session-starts.log", case_heal_is_distinguishable_in_the_log),
     ]
     bad = 0
