@@ -14,9 +14,7 @@ ticker**, which answers its O(N) objection rather than dropping it.
 **It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the
 binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per
 context group*, enforced by the lead refusing to create the second one. This design is
-room-keyed and has no lead, so neither survives: **the refusing party does not exist.** An
-earlier revision of this document claimed that cutting the `exclusions` rule dissolved the
-conflict. It did not, and that claim is retracted here — `exclusions` was one way grouped
+room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped
 rooms ended up on non-coordinating workers, never the reason the binding unit is a room.
 What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by
 the claim, not per group by an assigner.** Two rooms of one former context group may run
@@ -137,9 +135,7 @@ why one reader per decision is load-bearing rather than tidy, is set out under t
 record's contract below; this rule is step 3's, and step 2 routes on beats alone.
 
 **That publisher is a step-3 component, and so is its reader — so across the step-2
-window the wedge feature is ABSENT, not defaulted.** An earlier revision of this
-paragraph called step 2 "a consumer with no producer" and then, eleven lines later,
-said step 2 ships no reader at all. Both cannot hold: a stage with no reader is not
+window the wedge feature is ABSENT, not defaulted.** **step 2 ships no reader at all**; the reader arrives with the step-3 publisher. Both cannot hold: a stage with no reader is not
 a consumer, and the two descriptions imply different failures — a consumer with no
 producer is a latent no-op that could misroute, while an absent feature cannot fire
 at all. The second is the true one and it is the weaker claim, which is why the
@@ -256,10 +252,7 @@ no publisher yet — the default stated above (absent record means every fresh-b
 target is eligible) is therefore the *whole* rule in that window, not a fallback
 inside it.
 
-**That does NOT make the zero-candidate schedule go away, and an earlier revision of
-this section claimed it did.** The claim was that beats are observed directly rather
-than raced through a file, so two instances cannot disagree. False, and the trace
-below already says why: each watcher samples an AGING beat independently. The core
+**That does NOT make the zero-candidate schedule go away.** The trace below says why: each watcher samples an AGING beat independently. The core
 reads worker-2 fresh and suppresses; the beat crosses stale; worker-2 reads itself
 stale and suppresses. Nobody claims. The pin swap has the same shape in reverse — a
 worker reads the old pin and suppresses, the pin swaps, the new target reads the new
@@ -268,8 +261,7 @@ belongs to suppress-based routing over independently-sampled state, not to the
 record**, so removing the record does not remove it.
 
 **So suppression is never terminal, and the re-evaluation is owned by the WATCHER,
-on its own 30s reconciliation.** An earlier revision put it on the heartbeat, which has
-no execution path to it: `src/core_heartbeat.py` is a detached liveness sidecar started
+on its own 30s reconciliation.** The heartbeat has no execution path to it: `src/core_heartbeat.py` is a detached liveness sidecar started
 as its own process (`startup.sh:690-697`) and contains ZERO references to
 `dispatch_task`, `acquire_task_claim` or `TASK_FILE` — routing and claiming live in
 `src/watch-tasks-stream.sh:127-147,370-404`. "On its own beat each instance re-runs the
@@ -285,8 +277,7 @@ tick the watcher re-lists the pending task directory and runs each file through
 `dispatch_task` exactly as a Created event would; the ordinary claim arbitrates whoever
 wakes, and a task this instance is not a candidate for suppresses as always.
 
-**No age gate, and that is a decision rather than an omission.** An earlier draft
-admitted only files older than one beat, which buys nothing and costs three things: a
+**No age gate, and that is a decision rather than an omission.** An age gate on file mtime buys nothing and costs three things: a
 suppress/suppress pair can then need TWO ticks rather than one, a 29-second-old urgent
 task waits while an older low-priority one is admitted ahead of it, and a file with a
 future mtime is either never eligible or immediately eligible depending on a comparison
@@ -353,8 +344,7 @@ is the correction that matters, because putting the primitive inside it left the
 bypassing admission entirely.
 
 **A direct receipt is created by TRANSITION or by ADMISSION, and which one is a property of the
-exit, not of the design.** These are two contracts and an earlier draft of this section stated only
-the first, as though it held for every direct dispatch. It does not.
+exit, not of the design.** These are two contracts, not one.
 
 The discriminator is whether a receipt for that task already exists when the exit runs:
 

@@ -951,9 +951,14 @@ class DecisionsTwoAndThreeAreSupersededExplicitly(unittest.TestCase):
         f = self._flat()
         self.assertRegex(f, r"the refusing party does not exist")
 
-    def test_the_dissolution_claim_is_retracted_in_place(self):
+    def test_the_dissolution_claim_is_NOT_asserted(self):
+        """Was: assert the retraction sentence is present. The retraction narration
+        is gone by owner direction, so the coverage inverts -- pin the ABSENCE of the
+        wrong claim rather than the presence of a paragraph apologising for it."""
         f = self._flat()
-        self.assertRegex(f, r"that claim is retracted here")
+        self.assertNotIn("cutting the `exclusions` rule dissolved", f)
+        self.assertNotIn("exclusions rule dissolved the conflict", f)
+        self.assertIn("`exclusions` is not why the binding unit is a room", f)
 
     def test_the_replacement_semantics_are_stated(self):
         """A supersession that removes a guarantee without naming what replaces it moves
