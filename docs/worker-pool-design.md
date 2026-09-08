@@ -392,9 +392,7 @@ returns, and the holder renews `lease_until` on the same beat as its `.alive`.
 | any | expired | **claimed, unfinished** | a worker holds it. **Never re-admit.** The receipt stands until the task reaches a terminal state |
 | any | expired | **terminal** (result written and archived) | the work is done. Release the receipt; its slot returns |
 
-**The discriminator is the task's claim state, NOT the task file's existence.** An earlier revision of
-this table keyed the ambiguous row on *task present* and read that as proof the publish had landed.
-It is not: the task file is written **before** the notification, so it is present on both sides of the
+**The discriminator is the task's claim state, NOT the task file's existence.** Task presence is not proof the publish landed: the task file is written **before** the notification, so it is present on both sides of the
 emit and a crash in between takes the "already emitted" branch — the receipt then consumes a slot
 forever for a task nobody ever received. Measured on the production `dispatch_task` by a reviewer:
 `before emit: task_present=True phase=admitted emitted=0` / `after emit: task_present=True phase=admitted
@@ -463,8 +461,7 @@ event. The task stays durable and unsubmitted — not lost, but never delivered,
 lost because every surface reports it as pending.
 
 **The transition is a SECOND record written by the EXECUTOR, not a field in the watcher's claim.**
-An earlier revision of this section put the accepting executor's name on line 4 of the claim and
-called that the handoff. It is not: **the claim is written by the watcher BEFORE the emit, so every
+The accepting executor's name cannot live on the claim: **the claim is written by the watcher BEFORE the emit, so every
 byte of it is identical whether or not anyone ever received the wake.** A name written by the sender
 is an ADDRESS; acceptance is an OBSERVATION, and only the receiver can make it. The two crash
 windows below are indistinguishable in the claim, however line 4 is spelled.
@@ -591,8 +588,7 @@ to 0, `fallback` to 1 and everything else to 2 = unknown, with only the first tw
 live-core branches, so a `direct` value is excluded by default. Both found by keweichen, checking a
 claim I had made without checking it.
 
-**The startup sweep obeys the same bound**, restated because an earlier revision of this
-section dropped the sentence while rewriting around it: production loops every pre-existing
+**The startup sweep obeys the same bound**: production loops every pre-existing
 `tasks/*.txt` through `dispatch_task` at boot, so without this a restart carrying a backlog
 claims and emits the whole of it before any ticker exists. Startup IS the first
 reconciliation pass, bounded like every other, and its control uses a backlog larger than
@@ -603,7 +599,7 @@ CLAIMS, is measured over total outstanding, and belongs to the ticker — becaus
 has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
 
-**It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
+**It IS a scan.**
 "Only tasks addressed to me" is not enumerable: `requested_worker` and the room id
 live INSIDE flat task files, the pin is mutable, and suppression leaves no receipt —
 so after a repin, no event tells the new target that an existing file now addresses
@@ -640,9 +636,7 @@ still-pending file to the live core every 30 s, forever, on the majority
 configuration. Deactivation is that edge in reverse: removing the last worker disarms
 the ticker and the install is again exactly what it was.
 
-**And "pool member" is not a new signal — it is the registry.** An earlier revision made
-membership load-bearing without saying what reads it, which is a gate with no defined
-input and cannot be implemented. The source of truth is the one `## Registry touchpoints`
+**And "pool member" is not a new signal — it is the registry.** Membership is not a gate in its own right: a gate with no defined input cannot be implemented. The source of truth is the one `## Registry touchpoints`
 already names: a worker registers `role: "worker"` and `pool: <name>` in its instance
 manifest, and the core discovers workers *through the registry, never by scanning*. No
 second file, no sentinel, no count cached anywhere — a membership record that can disagree
@@ -737,8 +731,7 @@ event handler keeps routing on beats exactly as in step 2 and never consults the
 record. Workers read the record to gate THEMSELVES. One reader per decision, and the
 one party that could disagree with the file is the party that wrote it.
 
-This paragraph is about the STEP-3 residue only, and an earlier revision let it
-deny the step-2 contract as well. To be explicit, because the two sit close enough
+This paragraph is about the STEP-3 residue only. To be explicit, because the two sit close enough
 to be read as one rule: **step 2 DOES owe a periodic re-evaluation** — the
 watcher's 30s reconciliation specified above and again in the step-2 prerequisite
 list — and running it on a timer the watcher owns rather than folding it into an
