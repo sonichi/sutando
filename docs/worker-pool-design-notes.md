@@ -98,7 +98,7 @@ previous one. The chain exists because the hole is real.
 **A single supervisor cannot produce the schedule.** The zero-candidate outcome is
 a property of *distributed* suppression: N parties, N independent samples of one
 changing state, and a decline that leaves no trace. One party that reads the state
-once, decides a target, takes the lease in the same transaction, and notifies that
+once, decides a target, takes the lease in the same pass, and notifies that
 target has no interleaving in which every candidate declines — there is only one
 candidate-picker. This is why the normative design's periodic reconciliation is
 scoped to lease expiry and restart convergence: it is not repairing a routing
@@ -128,8 +128,8 @@ The draft's fix was a second hard-link directory,
 consumer's skip rule and its key at the same time.
 
 **What the normative design takes from this:** delivery is not admission. An
-executor must explicitly accept, and the accept is a store transition rather than
-a file whose presence has to be interpreted. An offer that is delivered and never
+executor must explicitly accept, and the accept is a journal write by the
+supervisor rather than a file whose presence has to be interpreted. An offer that is delivered and never
 accepted expires with its lease and is re-offered, so the deadlock's failure mode
 — durable, unsubmitted, invisible — is not reachable.
 
@@ -169,10 +169,13 @@ That table is correct, and it is also the point: an ordering rule between two
 three clocks, so the verdict can never end — an existence test standing in for a
 state test, one layer down from where the same defect was already fixed.
 
-Every one of those seams is a single conditional `UPDATE` in the store design.
-`spent`, `token`, `held/`, `claimed/`, the claim directory, the accept directory
-and the receipt phases have no counterpart in the normative file, and none should
-be reintroduced.
+Every one of those seams collapses once one process owns the write. In the
+journal design each is a single atomic replacement of one supervisor-owned
+record, so `spent`, `token`, `held/`, `claimed/`, the claim directory and the
+accept directory have no counterpart in the normative file and none should be
+reintroduced. The one file an executor still writes for the supervisor is a
+receipt, and a receipt is an inbox message consumed exactly once — it is never a
+second expression of the task's state.
 
 ## The crash-window analysis, carried forward as the failure model
 
@@ -189,21 +192,22 @@ notification, so it is present on both sides of the emit
 (`before emit: task_present=True` / `after emit: task_present=True`, with the
 bytes identical). The draft's conclusion — branch on the task's claim state, never
 on the file's existence — is right and survives into this design as: branch on the
-stored row, never on the filesystem.
+supervisor-owned state record, never on whether some other file exists.
 
 The normative failure matrix is that enumeration re-expressed, with a fourth
-window added because the store makes it visible:
+window added because the journal makes it visible:
 
-| draft window | normative window | store state |
+| draft window | normative window | record state |
 |---|---|---|
-| `receipt-before-emit` | offer-before-delivery | `OFFERED`, lease expired, `accepted_at` NULL |
-| `emit-before-ack` | delivery-before-accept | `OFFERED`, lease expired, `accepted_at` NULL, offer delivered |
-| — | accept-before-completion | `ACCEPTED` or `RUNNING`, lease expired |
-| `ack-before-release` | completion-before-release | `RUNNING`, lease expired, result present on disk |
+| `receipt-before-emit` | offer-before-delivery | `OFFERED` at generation N, offer expired, no receipt |
+| `emit-before-ack` | delivery-before-accept | `OFFERED` at generation N, offer expired, no receipt, offer delivered |
+| — | accept-before-completion | `ACCEPTED` or `RUNNING` at generation N, lease expired |
+| `ack-before-release` | completion-before-release | `RUNNING` at generation N, lease expired, receipt unconsumed |
 
-The first two share a row state and are distinguished only by whether delivery
+The first two share a record state and are distinguished only by whether delivery
 happened — which is exactly why the recovery for both is the same transition, and
-why the design does not need to tell them apart.
+why the design does not need to tell them apart. The contract file adds two more
+rows the journal makes distinct: supervisor-down and stale-generation completion.
 
 ## Owner decisions, 2026-09-03 (PR-triage room)
 
@@ -259,8 +263,8 @@ layer; if the new server-side routing already guarantees a unique seat, the
 follower-loop fallback should not be kept.*
 
 **How this design answers it.** The second branch applies. One pool supervisor
-routes each task once and takes the lease in the same transaction, so exactly one
-seat is ever offered a given task; there is no contention for a pin guard to
+routes each task once and takes the lease in the same pass, so exactly one seat is
+ever offered a given task; there is no contention for a pin guard to
 arbitrate. Therefore no fallback survives in any executor, and pin enforcement is
 not a guard at all — it is the routing table, evaluated in the one place that
 assigns.
@@ -271,11 +275,59 @@ The critique closes with the one-sentence adjustment this design is built around
 
 In English: do not let N watchers make the routing outcome "emerge" from suppress, claim, receipt, accept and ticker together; let one Sutando supervisor that depends on no LLM session decide routing explicitly, and let the Claude/Codex sessions only accept and execute tasks.
 
+## Owner decision, 2026-09-07 (terminal): a supervisor-owned file journal, not SQLite
+
+Given to worker-1 directly, after the Pro-Main critique above. Quoted verbatim,
+each with a one-line English rendering.
+
+> 真正需要的是单一 supervisor 和明确的状态所有权，不是 SQLite 本身。
+
+*What is actually needed is a single supervisor and clear state ownership, not SQLite itself.*
+
+> 需要避免的不是“文件系统”，而是多个 watcher 分别用不同文件表达同一个状态。只要切换成 supervisor 单写者，文件协议同样可以保持清晰、可靠。
+
+*What must be avoided is not "the filesystem" but several watchers each expressing the same state through a different file; once the supervisor is the single writer, a file protocol stays just as clear and reliable.*
+
+> 只有 supervisor 写权威状态；每个权威文件通过 temp + fsync + rename 原子替换；跨进程通信使用可重放 receipt，而不是让多个进程共同修改状态。
+
+*Only the supervisor writes authoritative state; every authoritative file is replaced atomically by temp + fsync + rename; cross-process communication uses replayable receipts rather than several processes jointly modifying state.*
+
+> 每项事实只有一个权威来源。
+
+*Every fact has exactly one authoritative source.*
+
+The replacement sentence the owner gave for the PR, quoted verbatim:
+
+> Supervisor-owned durable task journal, implemented as immutable task payloads plus atomically replaced per-task state records.
+
+**What it replaced.** The previous head of this PR held all task control state in
+one SQLite table — `tasks(task_id TEXT PRIMARY KEY, room_id, requested_worker,
+assigned_worker, state, lease_owner, lease_until, attempt, …)` in
+`state/pool/pool.sqlite3` — with each of the nine transitions written as a single
+conditional `UPDATE` whose `WHERE` clause was the concurrency control. The table
+and those statements are gone. The contract file now specifies
+`tasks/<task-id>.txt` as an immutable payload that is never renamed,
+`task-state/<task-id>/state.json` as the one authoritative record, replaced whole
+by temp file plus `fsync` plus `os.replace()`, `lease_generation` with
+`assignment_id` in place of `attempt` with `lease_owner`, a Unix domain socket
+plus a durable receipt inbox under `executor-events/` in place of the
+transaction, and `bindings/rooms.json` as the pin table.
+
+**Why.** The failure the store was chosen to close was never the filesystem. It
+was several watchers expressing one state through different files, with no single
+writer and therefore no seam that any mechanism could close. A single supervisor
+removes that directly, and once it is the only writer, atomic replacement gives
+each record the all-or-nothing property the `UPDATE` provided, while the
+generation check carries the anti-replay duty `WHERE attempt = ?` carried. What
+the journal does not carry — cross-object transactions, indexed queries, a
+migration engine — is stated as accepted cost in the contract file rather than
+left implicit.
+
 ## The 2026-09-07 identity measurement
 
 A task's on-disk filename is transient: written as `task-<id>.txt`, renamed while
 in flight, archived under the canonical name. A classifier that derived identity
-from `path.stem` accumulated **254 store rows under names that no longer exist**,
+from `path.stem` accumulated **254 records under names that no longer exist**,
 including a non-numeric `claimed-core-legacy` suffix.
 
 Two normative rules follow, and both are in the contract file: derive identity
@@ -292,12 +344,17 @@ would otherwise hand the renamed file a key nobody holds.
 - **#3860 at head `d2e41ace3`** — the draft of this same v1. Its architecture
   (core as both executor and control plane; per-watcher routing with suppression;
   a filesystem protocol of claims, accepts, receipts and probation tokens) is
-  replaced by the pool supervisor, the transactional store and the explicit
-  accept. Its vocabulary decisions, its routing decisions and its crash-window
-  enumeration are carried forward.
+  replaced by the pool supervisor, the supervisor-owned task journal and the
+  explicit accept. Its vocabulary decisions, its routing decisions and its
+  crash-window enumeration are carried forward.
 - **`docs/lead-follower-pool.md`** — the lead-inside-the-runtime-daemon placement
   and the lead-managed assignment it rests on are replaced by the pool supervisor
   as its own process.
+- **The SQLite task store** of this PR's own previous head — one `tasks` table
+  under `state/pool/pool.sqlite3` with nine conditional `UPDATE` statements —
+  replaced by the journal, per **Owner decision, 2026-09-07 (terminal)** above.
+  The state names, the lease semantics, the routing table and the crash-window
+  enumeration are unchanged by that reversal; only the store is.
 - **Decision 4 of `docs/core-pool-standing-sessions.md`** ("fixed N is replaced by
   lead-managed sizing") — sizing is an owner command executed by the supervisor;
   no component derives N for itself.

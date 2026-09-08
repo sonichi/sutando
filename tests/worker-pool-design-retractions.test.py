@@ -60,9 +60,10 @@ REJECTED = [
     (r"task-event-handler-claims|task-event-handler-accepts|pool-probation"
      r"|\bfallbacks/|\bdirect/|\bsettled/|\.admit/"
      r"|`token`|`spent`|`held/|`claimed/",
-     "lease_until",
-     "the claims/accepts/receipts/token file protocol. A multi-file state "
-     "change has no transaction, so every seam needs a prose ordering rule."),
+     "os.replace",
+     "the claims/accepts/receipts/token file protocol. Several writers "
+     "expressing one state through different files is the defect; one writer "
+     "plus one atomically replaced record is the answer."),
     (r"TASK_FILE",
      "Executor.offer",
      "TASK_FILE on stdout as the delivery abstraction. Delivery is the "
@@ -70,6 +71,36 @@ REJECTED = [
     (r"_pick\(\)|five-tier|five tier",
      "Routing table",
      "a five-tier _pick(). Routing is one table evaluated once by one party."),
+    (r"presence of (?:a|the) (?:claim|running|accept)[ -]?(?:file|marker)"
+     r"|(?:claim|running|accept) (?:file|marker) "
+     r"(?:is|means|marks|records|indicates|signals)",
+     "state.json",
+     "a claim, running or accept marker file as the source of task state. One "
+     "fact has one authoritative source, and task state is the journal record."),
+    (r"renam(?:e|es|ed|ing) (?:the |a )?task file"
+     r"|`?claimed`? suffix (?:in|on) the (?:task )?filename "
+     r"(?:is|marks|records|means)"
+     r"|(?:the )?filename (?:encodes|carries|records|marks) (?:the )?state"
+     r"|state (?:lives|is stored) in the (?:task )?filename",
+     "stable and immutable",
+     "a `claimed` suffix, or any rename of tasks/<task-id>.txt, as a state "
+     "mechanism. The payload is written once and never renamed."),
+    (r"executors? (?:writes?|updates?|replaces?|owns?) "
+     r"(?:the |its |their )?(?:`?state\.json`?|authoritative (?:state|record))"
+     r"|(?:the )?executor (?:writes|updates) the (?:state )?record",
+     "Executors never write authoritative state",
+     "an executor writing state.json or any other authoritative record. The "
+     "supervisor is the single writer; executors report events and receipts."),
+    (r"\bPID file\b|\bpidfile\b|\bpid-file\b",
+     "pool-supervisor.lock",
+     "a PID file as the single-instance guard. A PID is reused and the gap "
+     "between reading one and acting on it is a race; the guard is an OS "
+     "advisory lock."),
+    (r"\bSQLite\b|\bsqlite3?\b|CREATE TABLE|UPDATE\s+tasks"
+     r"|conditional `?UPDATE`?|`?WHERE`? clause",
+     "atomically replaced",
+     "SQLite, or any CREATE TABLE / UPDATE ... WHERE store, as the normative "
+     "store. Owner decision 2026-09-07: the journal is the store."),
 ]
 
 
@@ -176,6 +207,11 @@ _PROBES = {
     REJECTED[5][0]: "A winner writes a receipt under task-event-handler-claims and continues.",
     REJECTED[6][0]: "Delivery is a TASK_FILE line printed on stdout.",
     REJECTED[7][0]: "Placement runs through the five-tier _pick() ladder.",
+    REJECTED[8][0]: "The presence of a running marker file marks the task as executing.",
+    REJECTED[9][0]: "A worker renames the task file so its filename records the state.",
+    REJECTED[10][0]: "Each executor writes state.json for the task it holds.",
+    REJECTED[11][0]: "Single instance is guaranteed by a PID file written at startup.",
+    REJECTED[12][0]: "Every transition is one conditional UPDATE against the tasks table in SQLite.",
 }
 
 
@@ -208,14 +244,23 @@ class TheChosenContractIsPinned(unittest.TestCase):
     nothing is re-worded, so nothing trips it. Pin the chosen side directly."""
 
     PRESENT = [
-        ("tasks(", "the store's table must be declared, not described"),
-        ("TEXT PRIMARY KEY, -- canonical task ID", "the canonical id is the primary key"),
+        ("tasks/<task-id>.txt", "the payload path is declared, not described"),
+        ("task-state/", "the journal directory is named"),
+        ("state.json", "the one authoritative record is named"),
+        ("os.replace", "the atomic replacement rule is written down"),
+        ("bindings/rooms.json", "the pin table is one atomically replaced file"),
+        ("results/<task-id>/<generation>.txt", "a result is keyed by generation"),
+        ("executor-events/", "the receipt inbox is named"),
+        ("stale-results/", "a refused stale completion is kept, never applied"),
+        ("pool-supervisor.sock", "executors report over the socket, not the journal"),
+        ("pool-supervisor.lock", "the single-instance guard is an advisory lock"),
         ("PENDING", "the state machine's re-offerable state"),
         ("OFFERED", "delivery is not admission, so OFFERED is a real state"),
         ("ACCEPTED", "an executor must explicitly accept"),
         ("SUCCEEDED", "a terminal state"),
-        ("lease_owner", "possession is guarded on the executor identity"),
-        ("attempt", "the anti-replay token in the accept guard"),
+        ("executor_id", "possession is guarded on the executor identity"),
+        ("assignment_id", "the offer's identity is echoed in every event"),
+        ("lease_generation", "the anti-replay token in the generation check"),
         ("PROBING", "the only exit from WEDGED is commanded"),
         ("QUIESCED", "resource exhaustion is a health state, not a mood"),
         ("Process with core", "the bound-but-unavailable wait must be user-visible"),
