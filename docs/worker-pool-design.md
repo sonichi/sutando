@@ -2018,10 +2018,18 @@ production-path tests; the staged list below marks which those are.
 >
 > | blocked step | obligation that blocks it | why that step cannot be written yet |
 > |---|---|---|
-> | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is |
-> | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename — every site |
+> | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance; **untaken-offer expiry**; **durable late-result selector** | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is; it also publishes results and consumes offers, and neither the expiry on a live-watcher untaken offer nor the selector that refuses a revoked late writer exists yet |
+> | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness; **untaken-offer expiry** | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename — every site |
 > | 4 — installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all |
 >
+> **Two of these obligations are added by this layer, not inherited**, and the gate is the
+> operative rule for them too. `claim live, no accept -> leave it` has no exit while the
+> publishing watcher LIVES — this document says no v1 mechanism ends that state and owes the
+> implementing PR an expiry. And result publication is the stated EXCEPTION to one-caller-wins:
+> a clobbering `os.replace` does not refuse a revoked late writer, and the durable selector that
+> would is named here as unresolved, with BOTH late-writer orders owed a pin. Raised by
+> `keweichen`, whose scan of the merged document found each named once in the prose and zero
+> times in the gate — so the gate could have lifted step 2 with both still open.>
 > Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
 > document) is not gated — naming an open obligation is what it is for.
 >
