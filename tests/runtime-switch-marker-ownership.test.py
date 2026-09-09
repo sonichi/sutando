@@ -55,19 +55,117 @@ class MarkerOwnership(unittest.TestCase):
                           f"(nearest if: {gate.strip()!r}) — a launch that never came up "
                           f"would overwrite a truthful marker")
 
-    def test_no_publish_call_precedes_the_launch(self):
-        """The sibling test above indexes FORWARD from `new-session -d`, so an
-        ungated publish placed BEFORE the launch is invisible to it — exactly the
-        defect a merge introduced here on 2026-09-03."""
+    # Region keys. Each is asserted UNIQUE before use: a non-unique anchor plus
+    # str.index() silently slices the wrong region and the suite still passes.
+    HEAL_OPEN = "if tmux_session_exists; then"
+    BARE_OPEN = "if ! command -v tmux > /dev/null 2>&1; then"
+    TTY_INNER = "ensure_core_monitor   # backgrounded child survives the exec below"
+    DET_INNER = "ensure_core_monitor   # canonical session now exists"
+    TTY_OPEN = "if [ -t 1 ]; then"
+
+    def _unique(self, src, pat, label):
+        self.assertEqual(src.count(pat), 1,
+                         f"{label} anchor is not unique ({src.count(pat)} matches) — "
+                         f"region slicing would silently move")
+        return src.index(pat)
+
+    @staticmethod
+    def _matching_fi(src, open_off):
+        """Offset just past the `fi` that closes the branch opening at open_off.
+        Without this the regions tile contiguously, every offset belongs to some
+        shape, and "outside every shape" becomes unreachable."""
+        depth = 0
+        for m in re.finditer(r"^[ \t]*(if|fi)\b", src[open_off:], re.M):
+            depth += 1 if m.group(1) == "if" else -1
+            if depth == 0:
+                return open_off + m.end()
+        return len(src)
+
+    def _regions(self, src):
+        """[(name, start, end)] for the four launch shapes, each sliced from the
+        branch that opens it to that branch's own `fi` — gaps are common code."""
+        heal = self._unique(src, self.HEAL_OPEN, "heal")
+        bare = self._unique(src, self.BARE_OPEN, "bare")
+        tty_in = self._unique(src, self.TTY_INNER, "tty-inner")
+        det_in = self._unique(src, self.DET_INNER, "detached-inner")
+        tty = src.rindex(self.TTY_OPEN, 0, tty_in)
+        els = src.rindex("\nelse\n", tty_in, det_in)
+        self.assertLess(heal, bare, "heal must precede the bare path")
+        self.assertLess(bare, tty, "bare path must precede the tty/detached block")
+        return [("heal", heal, self._matching_fi(src, heal)),
+                ("bare no-tmux", bare, self._matching_fi(src, bare)),
+                ("tty", tty, els),
+                ("detached", els, self._matching_fi(src, tty))]
+
+    def _publish_calls(self, src):
+        return [i for i in range(len(src))
+                if src.startswith("publish_active_runtime", i)
+                and not src.startswith("publish_active_runtime() {", i)]
+
+    def test_every_publish_call_lives_inside_a_known_launch_shape(self):
+        """Replaces the old positional guard, which used "before the first
+        `new-session -d`" as a proxy for ungated. That proxy held only while the
+        detached branch was both the first launch and the sole publisher."""
         src = CLAUDE.read_text(encoding="utf-8")
-        launch = src.index("new-session -d")
+        regions = self._regions(src)
+        calls = self._publish_calls(src)
+        self.assertTrue(calls, "the launcher never publishes at all")
+        for i in calls:
+            owner = [n for n, a, b in regions if a <= i < b]
+            self.assertTrue(owner, f"publish at offset {i} sits outside every "
+                                   f"known launch shape (common region)")
+
+    def test_each_launch_shape_publishes(self):
+        """A fifth shape, or one that quietly stops publishing, must declare itself
+        here. The bare path is included: its publish is paired with a restore."""
+        src = CLAUDE.read_text(encoding="utf-8")
+        calls = self._publish_calls(src)
+        for name, a, b in self._regions(src):
+            self.assertTrue([i for i in calls if a <= i < b],
+                            f"the {name} shape never publishes")
+
+    def test_the_fresh_tty_launch_publishes_after_its_gate(self):
+        """It verifies liveness then execs attach, and published nothing — so a
+        Codex->Claude switch from a terminal left the marker naming codex."""
+        src = CLAUDE.read_text()
+        attach = src.rindex('exec tmux -S "$TMUX_SOCKET" attach')   # LAST = fresh launch
+        gate = src.rindex("tmux_core_session_running", 0, attach)
+        pub = src.rindex("publish_active_runtime", 0, attach)
+        self.assertGreater(pub, gate, "must publish AFTER the liveness gate")
+        self.assertLess(pub, attach, "must publish BEFORE it execs attach")
+
+    def test_the_heal_path_publishes_inside_its_liveness_gate(self):
+        """A heal starts a real Claude core in an existing session. Not named in
+        the review; found by enumerating every attach site rather than two."""
+        src = CLAUDE.read_text()
+        heal = src.index('echo "Attaching to healed')
+        gate = src.rindex("if tmux_core_session_running; then", 0, heal)
+        pub = src.rindex("publish_active_runtime", 0, heal)
+        self.assertGreater(pub, gate,
+                           "the heal path must publish inside its liveness gate")
+
+    def test_attaching_to_an_ALREADY_RUNNING_core_must_not_publish(self):
+        """The control on the three fixes above. That core may be codex; attaching
+        does not make it claude, so a publish-everywhere correction breaks this."""
+        src = CLAUDE.read_text()
+        existing = src.index('echo "Attaching to existing')
+        attach = src.index('exec tmux -S "$TMUX_SOCKET" attach', existing)
+        gate = src.rindex("if tmux_core_session_running; then", 0, existing)
+        between = src[gate:attach]   # window must reach the ATTACH, not just the echo
+        self.assertNotIn("publish_active_runtime", between,
+                         "attaching to an existing core must NOT claim the runtime")
+
+    def test_the_publish_function_is_defined_before_every_call(self):
+        """Shell resolves functions at call time, so a call above the definition is
+        'command not found' at runtime and `bash -n` cannot see it."""
+        src = CLAUDE.read_text()
+        definition = src.index("publish_active_runtime() {")
         calls = [i for i in range(len(src))
                  if src.startswith("publish_active_runtime", i)
                  and not src.startswith("publish_active_runtime() {", i)]
-        self.assertTrue(calls, "the launcher never publishes at all")
-        early = [i for i in calls if i < launch]
-        self.assertFalse(early, "a publish call precedes the launch, so a runtime that "
-                                "never comes up can overwrite a truthful marker")
+        self.assertTrue(calls, "no call sites at all")
+        self.assertTrue(all(i > definition for i in calls),
+                        "a publish call precedes the function definition")
 
     def test_a_refused_switch_leaves_the_previous_marker_truthful(self):
         """Codex->Claude: the switch runs, the restart never does."""
@@ -106,6 +204,107 @@ class MarkerOwnership(unittest.TestCase):
         launch = src.index("new-session -d")
         self.assertGreater(src.index("publish_active_runtime", launch), launch,
                            "codex must publish only after tmux new-session")
+
+    # Claude executable branch controls. Slices are asserted unique before use,
+    # because a non-unique anchor silently slices the wrong region.
+    HEAL_BLOCK = (r'(?m)^  if tmux_core_session_running; then\n'
+                  r'    clear_shutdown_sentinel\n(?:.*\n)*?  fi\n')
+    NEG_GATE = (r'(?m)^  if ! tmux_core_session_running; then\n'
+                r'(?:.*\n)*?  fi\n(?:.*\n)*?^  publish_active_runtime.*\n')
+    BARE_PUBLISH = r'(?m)^  if stash_active_runtime; then publish_active_runtime; fi\n'
+    BARE_RESTORE = r'(?m)^  restore_active_runtime\n'
+
+    def _claude_fns(self, src, *names):
+        out = []
+        for n in names:
+            i = src.index(n + "() {")
+            out.append(src[i:src.index("\n}\n", i) + 3])
+        return "".join(out)
+
+    def _drive_claude(self, tmp, body, live, fns=("publish_active_runtime",)):
+        """Run a real sliced branch with liveness forced to `live`. Returns the
+        marker's content afterwards, or None when no marker exists."""
+        ws = Path(tmp) / "workspace"
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        src = CLAUDE.read_text(encoding="utf-8")
+        harness = (
+            "set -uo pipefail\n"
+            f'REPO="{REPO}"\nSESSION="sutando-core"\nTMUX_SOCKET="/tmp/none"\n'
+            'RESTART_REQUESTED=""\nVISIBLE=0\n'
+            f'sutando_config() {{ printf "%s" "{ws}"; }}\n'
+            f"tmux_core_session_running() {{ return {0 if live else 1}; }}\n"
+            "clear_shutdown_sentinel() { :; }\nlog_restart_attempt() { :; }\n"
+            "ensure_core_monitor() { :; }\nopen_visible_terminal() { :; }\n"
+            "tmux_session_exists() { return 0; }\nstash_shutdown_sentinel() { :; }\n"
+            "tmux() { return 0; }\nsleep() { :; }\necho() { :; }\n"
+            "CORE_CMD=(true)\nhealed_idx=0\n"
+            + self._claude_fns(src, *fns).replace(
+                'bash "$REPO/scripts/sutando-config.sh" workspace', "sutando_config")
+            + "\n" + body + "\n"
+        )
+        try:
+            subprocess.run(["/bin/bash", "-c", harness], capture_output=True,
+                           text=True, cwd=tmp, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("sliced branch hung — a stub is missing")
+        f = ws / "state" / "core-runtime.json"
+        return f.read_text() if f.exists() else None
+
+    def _slice(self, pattern, label, expect=1, index=0):
+        src = CLAUDE.read_text(encoding="utf-8")
+        ms = list(re.finditer(pattern, src))
+        self.assertEqual(len(ms), expect,
+                         f"{label}: expected {expect} slice(s), found {len(ms)} — a "
+                         f"launch shape was added or removed without updating this test")
+        return ms[index].group(0)
+
+    def test_claude_shapes_publish_on_success_and_not_on_failed_start(self):
+        """Eight arms. A shape that publishes when liveness is FALSE is the
+        optimistic-write defect; one that stays silent when TRUE loses the switch."""
+        # Sliced from each branch OPENER, not its gate: an ungated publish placed
+        # before the launch must fall INSIDE the slice or the harness cannot see it.
+        src = CLAUDE.read_text(encoding="utf-8")
+        regions = {n: src[a:b] for n, a, b in self._regions(src)}
+        # A region sliced at its opener is unbalanced shell (`if..then` with no `fi`),
+        # so drop the opener line and run the body; inner if/fi pairs are intact.
+        def body(text):
+            head, _, rest = text.lstrip("\n").partition("\n")
+            self.assertRegex(head.strip(), r"^(if |else$)", "unexpected region opener")
+            return rest
+        shapes = (("heal", regions["heal"]), ("tty", body(regions["tty"])),
+                  ("detached", body(regions["detached"])))
+        for name, body in shapes:
+            for live in (True, False):
+                with tempfile.TemporaryDirectory() as tmp:
+                    got = self._drive_claude(tmp, body, live)
+                if live:
+                    self.assertIsNotNone(got, f"{name} did not publish on a live core")
+                    self.assertIn('"runtime":"claude"', got, f"{name} published junk")
+                else:
+                    self.assertIsNone(got, f"{name} published on a FAILED start — the "
+                                           f"optimistic-write defect")
+
+    def test_the_bare_path_publishes_on_success_and_restores_on_failure(self):
+        """Its exec IS the core, so it cannot verify first; the pairing is the proof.
+        absent != cleared for a marker, so the failure arm must UNLINK."""
+        pub = self._slice(self.BARE_PUBLISH, "bare-publish")
+        res = self._slice(self.BARE_RESTORE, "bare-restore")
+        fns = ("stash_active_runtime", "restore_active_runtime", "publish_active_runtime")
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._drive_claude(tmp, pub, True, fns=fns)
+        self.assertIsNotNone(got, "the bare path never published")
+        self.assertIn('"runtime":"claude"', got)
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._drive_claude(tmp, pub + res, True, fns=fns)
+        self.assertIsNone(got, "a failed exec with NO previous marker must leave none "
+                               "— copying back an empty stash forges a claude marker")
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace" / "state"
+            ws.mkdir(parents=True, exist_ok=True)
+            (ws / "core-runtime.json").write_text('{"runtime":"codex"}\n')
+            got = self._drive_claude(tmp, pub + res, True, fns=fns)
+        self.assertIsNotNone(got, "a failed exec erased a truthful previous marker")
+        self.assertIn('"runtime":"codex"', got, "the previous marker was not restored")
 
     def _run_codex_publish(self, tmp, tmux_rc):
         """The real publish function plus its real guarded call site, with tmux
