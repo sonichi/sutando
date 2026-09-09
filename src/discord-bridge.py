@@ -3051,10 +3051,9 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
     """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
     [attach:] markers here. Path authorization stays with the transport
     allowlist; [channel:] redirects stay blocked regardless. Default off."""
-    for section in ("groups", "channels"):
-        cfg = (access_data.get(section) or {}).get(str(channel_id))
-        if isinstance(cfg, dict):
-            return cfg.get("collaboratorAttachments") is True
+    cfg = (access_data.get("groups") or {}).get(str(channel_id))
+    if isinstance(cfg, dict):
+        return cfg.get("collaboratorAttachments") is True
     return False
 
 
