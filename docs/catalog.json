@@ -258,7 +258,7 @@
    ],
    "status": "canonical",
    "canonical_for": "Claude Code hook event mapping and privacy contract",
-   "last_verified": "2026-07-27"
+   "last_verified": "2026-09-08"
   },
   "docs/slack-bridge.md": {
    "title": "Slack bridge",
