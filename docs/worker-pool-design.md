@@ -559,23 +559,6 @@ ticker cannot tell a lost claim from a won one, so "do not count a loss" was not
 `queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
 `acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-**Three claims about this design that look reasonable and are false.** The falsifications are the
-useful part, so they are kept and the rest is not:
-
-- **a four-outcome `dispatch_task`** (`queued` / `direct` / `lost` / `suppressed`). The contract is
-  five: `refused-over-bound` is a distinct outcome from operational failure, and the `fallback`-mode
-  publish branch must tell
-  them apart instead of falling through to a generic `|| printf`.
-- **an ownerless `direct/` receipt** that step 2 would have to invent an owner for. For the **handler
-  fallback** exit this is not a new admission — disposition-1 transitions an already-claimed receipt
-  (`:255`, `:506`, `:542`), so it was counted at its first admission. That is the half this summary
-  used to state as though it were universal. It is not: an **initial probe-direct or operational
-  direct** exit has no prior receipt and therefore performs a fresh admission through the shared
-  primitive, per the contract table above. Which of the two applies is a property of the exit.
-- **`queue_handler_task` as the admission owner**, with the count-and-claim primitive placed inside
-  it. That left all four direct exits bypassing admission, and it is why `queue_handler_task` is now
-  a **downstream executor** instead.
-
 One measured correction is worth keeping in full because it kills an obvious-looking fix: the claim
 record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
 (`:101-109`), so every claim dies with its watcher and a restart retires the lot — the same restart
