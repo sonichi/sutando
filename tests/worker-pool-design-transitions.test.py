@@ -110,9 +110,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
     def as_owner(name, keep_live=True):
-        """(P1.3 seam) Run the next steps AS a named claimant, optionally leaving the
+        """(P1.3 seam) Run the next steps AS a named OWNER, optionally leaving the
         previous one LIVE. restart() replaces `me` and drops the old owner, so a paused
-        claimant cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+        owner cannot coexist with its successor -- which is why A/B/C is unrepresentable.
         """
         prev = me[0]
         if keep_live: d.live_owners.add(prev)
@@ -374,8 +374,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if verdict() == "probation" and d.journal is None and d.claimed_rec is None: gate_step1(f"t{claimed+1}")
 
     def restart():
-        # The old owner STOPS being live: a restart is not a second claimant.
-        # Use as_owner() when the schedule needs both alive at once.
+        # The old owner STOPS being live: a restart is not a second owner.
+        # Use as_owner() when the schedule needs both owner names alive at once.
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
     def contender_rename():
@@ -415,9 +415,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             claims      = {'t1': 'p1'}          <- ONE claim, held by the FIRST
             live_owners = {'p1', 'p-b', 'p-c'}
 
-        so stacking three adds three owner names and no second claim. A/B/C needs
-        three live CLAIMS and stays unrepresentable here; test_three_OWNERS_...
-        pins both states exactly so that limitation cannot be silently lifted.
+        so stacking three adds three owner names and no second claim. The obligation A/B/C
+        is about is TWO SIMULTANEOUS task claims across three resumable actors --
+        not three claims -- and the model holds one, so it cannot express it.
         """
         as_owner(name, keep_live=True)
 
@@ -1186,16 +1186,34 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         self.assertTrue(d.request, "the kick landed between the read and the commit")
 
     def test_a_second_OWNER_coexists_with_the_first(self):
-        """P1.3: restart() REPLACES the claimant; as_owner() adds one."""
+        """P1.3: restart() REPLACES the owner; as_owner() adds an owner name."""
         _, _, _, restarted = run(["kick", "sweep", "worker", "restart"])
         _, _, _, second = run(["kick", "sweep", "worker", "second_owner"])
         self.assertEqual(len(restarted.live_owners), len(second.live_owners) - 1,
-            "a restart drops the old owner; a second claimant keeps it live")
+            "a restart drops the old owner; a second owner keeps it live")
         self.assertIn("p-b", second.live_owners)
         self.assertIn("p1", second.live_owners)
 
-    def test_three_OWNERS_coexist_but_only_ONE_CLAIM_ever_exists(self):
-        """The old name said "THREE claimants can coexist"; the run produces three
+    def test_as_owner_SWITCHES_the_active_actor_not_only_the_owner_set(self):
+        """keweichen at e2b677cd: deleting `me[0] = name` -- so as_owner records a
+        name without making it act -- left the terminal owner set intact and the
+        whole suite GREEN at 82/82. The previous pins read final state, and the
+        defect is in the SCHEDULING seam, which final state cannot see.
+
+        His discriminating schedule, verbatim. With the switch, the second owner
+        does the work and the crash lands before any claim record; without it the
+        first owner keeps acting, so a claim record survives and the token is
+        spent."""
+        _, claimed, _, d = run(["kick", "sweep", "worker", "second_owner", "worker"],
+                               mode="crash_after_claim")
+        self.assertEqual(claimed, 0)
+        self.assertIsNone(d.claimed_rec,
+            "a claim record here means the FIRST owner was still acting")
+        self.assertTrue(d.token, "the token must be unspent when the switch happens")
+
+    def test_three_OWNERS_coexist_and_the_run_ENDS_with_one_claim(self):
+        """TERMINAL state only -- the name says so now. The old name said "THREE
+        claimants can coexist"; the run produces three
         OWNER names and a single claim, so the name asserted the very thing P1.3
         needs and the model cannot do.
 

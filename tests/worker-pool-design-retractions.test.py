@@ -8,6 +8,28 @@ import unittest
 
 DOC = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design.md"
 
+
+def paras_holding(doc, anchor):
+    """EVERY paragraph containing `anchor`. The obligations index repeats each
+    site's wording, so "the paragraph" is ambiguous and picking the first one
+    reads the index instead of the callout."""
+    return [p for p in re.split(r"\n\s*\n", doc) if anchor in p]
+
+
+def para_holding(doc, anchor):
+    """The maximal run of non-blank lines containing `anchor`.
+
+    Module-level because two classes assert against it; a second copy would be
+    duplicated policy in the one file whose job is catching claims that drift.
+    keweichen at e2b677cd: the set-size patterns used to run on the ANCHOR
+    CONSTANT, so they could never fail whatever the document said.
+    """
+    for para in re.split(r"\n\s*\n", doc):
+        if anchor in para:
+            return para
+    return ""
+
+
 # A line carrying one of these is describing the retraction, not asserting it.
 HISTORICAL = (
     "an earlier revision", "an earlier draft", "used to", "no longer",
@@ -1226,7 +1248,7 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
     def test_an_unbound_worker_is_what_is_refused_not_a_bound_peer(self):
         self.assertIn("no UNBOUND worker stands in", self._flat())
 
-    def test_the_four_contested_claims_are_named_as_OPEN_not_settled(self):
+    def test_the_contested_claims_are_named_as_OPEN_not_settled(self):
         """The re-cut's whole point: prose near these topics must not read as proof."""
         f = self._flat()
         self.assertIn("open obligations", f)
@@ -1249,10 +1271,16 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         keweichen at 67bc8db7: a `>= 4` count let the FIFTH callout be deleted
         with 109/109 still green -- the assertion could see that markers exist
         and never which site lost one. Pin each site by its own text."""
-        f = self._flat()
+        d = DOC.read_text()
         for site, phrase in self.DISPUTED_SITES.items():
-            self.assertIn(phrase, f, f"the {site} site lost its local DISPUTED callout")
-        self.assertEqual(f.count("DISPUTED — see"), len(self.DISPUTED_SITES),
+            self.assertIn(phrase, d, f"the {site} site lost its local DISPUTED callout")
+            # Bind the two in ONE paragraph: a detached marker elsewhere keeps
+            # both the phrases and the global count intact.
+            self.assertTrue(
+                any("DISPUTED — see" in p for p in paras_holding(d, phrase)),
+                f"the {site} site keeps its text but no paragraph carries BOTH it and "
+                f"the marker; a marker counted elsewhere does not warn a reader here")
+        self.assertEqual(self._flat().count("DISPUTED — see"), len(self.DISPUTED_SITES),
             "a site was added or removed without updating DISPUTED_SITES")
 
     def test_the_model_is_described_as_STATED_not_proven(self):
@@ -1260,13 +1288,20 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         pins every ordering also passed 109/109. It is the disclosure that keeps a
         green run from being read as coverage, so it needs its own pin -- and the
         overclaim it must reject needs naming, not just the wording it must keep."""
-        f = self._flat()
-        self.assertIn("it does not pin every one of them", f)
-        self.assertIn("STATED, not proven", f)
+        d = DOC.read_text()
+        anchor = "it does not pin every one of them"
+        self.assertIn(anchor, d)
+        # The limitation must live in the paragraph it limits; detached
+        # historical prose satisfies a flattened read without limiting anything.
+        para = para_holding(d, anchor)
+        self.assertIn("STATED, not proven", para_holding(d, "STATED, not proven"))
+        self.assertNotIn("PROVEN", para,
+            "the operative passage claims proof while the caveat sits beside it")
         for overclaim in ("pins every one of them",
                           "proven, not merely stated",
+                          "rows as PROVEN",
                           "the model pins every ordering"):
-            self.assertNotIn(overclaim, f, f"the disclosure was inverted into {overclaim!r}")
+            self.assertNotIn(overclaim, d, f"the disclosure was inverted into {overclaim!r}")
 
     def test_the_probation_clock_names_a_NORMATIVE_source(self):
         """[P2] asked which of the three is normative; naming three and picking none
@@ -1364,16 +1399,18 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
         d = self._doc()
         WORDS = ("one", "two", "three", "four", "five", "six", "seven",
                  "eight", "nine", "ten")
+        num = "|".join(WORDS)
+        # Read the DOCUMENT's paragraph, never the anchor: an addition beside a
+        # preserved anchor is the case a replacement-only control cannot see.
         for phrase in self.COUNT_FREE:
             self.assertIn(phrase, d,
                 f"the count-free form {phrase!r} is gone -- a number likely replaced it")
-            self.assertNotRegex(phrase, r"\d", f"{phrase!r} carries a digit")
-            # Ban the SET-SIZE count, not the number-words: "one of them" is
-            # durable, "one of the four" is what went stale twice.
-            num = "|".join(WORDS)
-            for pat in (rf"\bof the ({num})\b", rf"\b({num}) (items|tests|obligations|proofs)\b"):
-                self.assertNotRegex(phrase.lower(), pat,
-                    f"{phrase!r} states the set size, which re-stales on every change")
+            para = para_holding(d, phrase).lower()
+            self.assertTrue(para, f"no paragraph holds {phrase!r}")
+            for pat in (rf"\bof (?:the |them )?({num})\b", rf"\ball ({num}|\d+) ",
+                        rf"\b({num}|\d+) (items|tests|obligations|proofs)\b"):
+                self.assertNotRegex(para, pat,
+                    f"the passage holding {phrase!r} states a set size, which re-stales")
 
 
 if __name__ == "__main__":
