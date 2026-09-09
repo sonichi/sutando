@@ -7036,8 +7036,9 @@ _CRON_NOT_A_RUN = re.compile(
     r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
 
 
-#: Shell expansion left in a path — `$VAR`, `${VAR}`, `$(cmd)`, backticks, leading `~`.
-_CRON_UNEXPANDED = re.compile(r"[$`]|^~")
+#: Not a complete literal: shell expansion (`$VAR`, `$(cmd)`, backtick, leading
+#: `~`), a glob, or a brace list — none of which name one path by spelling.
+_CRON_NOT_LITERAL = re.compile(r"[$`*?\[\]{}]|^~")
 
 
 def _cron_missing_script(entry: dict) -> Optional[str]:
@@ -7058,7 +7059,12 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
     # `\b` is not a token boundary: `.` is a non-word char, so `\bsh` matched the
     # extension of any *.sh and captured a shell-expansion fragment (#3672).
     for m in re.finditer(r"(?:^|\s)(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
-        ref = m.group(1).strip("\"'").rstrip(";&|")
+        raw = m.group(1).rstrip(";&|")
+        # `\S+` stops at a space, so a quoted path containing one arrives
+        # truncated; the unbalanced quote is what shows the token was cut.
+        if raw[:1] in "\"'" and not raw.endswith(raw[:1]):
+            continue
+        ref = raw.strip("\"'")
         if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
             continue
         # A negation before the interpreter makes this a mention, not a run.
@@ -7068,9 +7074,9 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
         # against, and REPO_DIR is then the wrong one: doubt must read ok.
         if not ref.startswith("/") and re.search(r"(?:^|\s|&&|;)cd\s", cmd[:m.start()]):
             continue
-        # Shell expansion cannot be resolved statically: `$JOB_ROOT/live.sh` runs
-        # while its literal spelling never exists. Unknown must read ok, not missing.
-        if _CRON_UNEXPANDED.search(ref):
+        # Only a complete literal names one path: `$JOB_ROOT/live.sh` and
+        # `nightly-*.sh` both run while that spelling never exists on disk.
+        if _CRON_NOT_LITERAL.search(ref):
             continue
         # An absolute path resolves on its own; only a repo-relative one is
         # judged against REPO_DIR, so a valid /tmp script is never "missing".

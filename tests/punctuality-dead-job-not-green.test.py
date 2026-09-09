@@ -166,6 +166,30 @@ check("CONTROL: the SAME script named literally, and present, is not missing",
 check("CONTROL: a literal path with no expansion and no file still warns",
       hc._cron_missing_script({"prompt": f"bash {_gone}"}) == _gone)
 
+# A glob and a quoted path with a space are BOTH resolved by the shell and
+# neither names one file by spelling, so testing the spelling calls them dead.
+_spaced = os.path.join(_t, "scripts", "job.sh copy.sh")
+open(_spaced, "w").write("#!/bin/sh\necho job completed\n")
+check("a glob reads as unknown, not missing — the shell resolves it",
+      hc._cron_missing_script(
+          {"prompt": f"bash {_t}/scripts/li*e.sh"}) is None)
+check("a ? glob too",
+      hc._cron_missing_script(
+          {"prompt": f"bash {_t}/scripts/liv?.sh"}) is None)
+check("a [] class too",
+      hc._cron_missing_script(
+          {"prompt": f"bash {_t}/scripts/li[v]e.sh"}) is None)
+check("a brace list too",
+      hc._cron_missing_script(
+          {"prompt": f"bash {_t}/scripts/{{live,gone}}.sh"}) is None)
+check("a quoted path containing a space is not truncated at the space",
+      hc._cron_missing_script({"prompt": f'bash "{_spaced}"'}) is None)
+check("CONTROL: the truncated prefix alone WOULD be missing, so the case is real",
+      hc._cron_missing_script(
+          {"prompt": f"bash {_t}/scripts/job.sh"}) == f"{_t}/scripts/job.sh")
+check("CONTROL: a quoted absent path with no glob and no space still warns",
+      hc._cron_missing_script({"prompt": f'bash "{_gone}"'}) == _gone)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
