@@ -171,5 +171,33 @@ class DispatchWiring(unittest.TestCase):
         )
 
 
+class TestDeadHookRepair(FixHandlerGating):
+    """Dead entries are repaired by the installer that owns their family, which prunes them."""
+
+    def _dead(self, family, path="/var/folders/x/repo/src/hint.sh"):
+        return {"name": "claude-hooks", "status": "warn", "detail": "x",
+                "_dead_hooks": [{"event": "SessionStart", "command": f'bash "{path}"',
+                                 "path": path, "family": family}]}
+
+    def test_a_dead_compact_hint_runs_its_own_installer_once(self):
+        calls = self._run(self._dead("personal-claude-compact-hint.sh"))
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("install-personal-claude-hook.sh", " ".join(map(str, calls[0])))
+
+    def test_two_dead_entries_of_one_family_run_the_installer_once(self):
+        check = self._dead("schedule-crons-session-hint.sh")
+        check["_dead_hooks"].append(dict(check["_dead_hooks"][0], path="/elsewhere/hint.sh"))
+        calls = self._run(check)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("install-session-start-hook.sh", " ".join(map(str, calls[0])))
+
+    def test_a_foreign_family_is_reported_not_deleted(self):
+        import io
+        buf = io.StringIO()
+        calls = self._run(self._dead("someone-elses-tool.sh"), out=buf)
+        self.assertEqual(calls, [])
+        self.assertIn("not a family a Sutando installer owns", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
