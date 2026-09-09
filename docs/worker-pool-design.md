@@ -630,7 +630,7 @@ it never takes it. No fallthrough to the core exists for a bound room.
 
 ### The reconciliation ticker
 
-> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
+> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of them: two incompatible normative orders appear and neither is marked primary.
 
 **It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher
 owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven.

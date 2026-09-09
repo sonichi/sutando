@@ -1324,8 +1324,14 @@ class TheStageGateCarriesThisLayersObligations(unittest.TestCase):
             "writer does not exist yet and must gate it")
 
     def test_the_gate_requires_BOTH_late_writer_orders_pinned(self):
-        self.assertIn("late-writer order", self._gate(),
+        """keweichen: `assertIn("late-writer order")` also matches "one late-writer
+        order", so the one-word mutant passed 114/114. The normative phrase is the
+        assertion; full-paragraph removal is not the adjacent alternative."""
+        g = self._gate()
+        self.assertIn("BOTH late-writer orders", g,
             "one order pinned is not the obligation; the gate must say BOTH")
+        self.assertNotIn("one late-writer order", g,
+            "the singular form states a weaker requirement than the obligation")
 
     def test_the_gate_names_these_as_added_by_this_layer(self):
         """Without this the two could be read as inherited, and a future parent
