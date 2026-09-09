@@ -19,7 +19,6 @@ name: lint-agents-md-sync
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
   push:
     branches: [main, staging-interaction-planes]
 

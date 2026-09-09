@@ -113,7 +113,7 @@ def instance_view(manifest: dict) -> dict:
 def render_view(view: dict) -> str:
     mark = {True: "verified", False: "MISMATCH", None: "-"}[view.get("identityVerified")]
     lines = [
-        f"Sutando Instance",
+        "Sutando Instance",
         f"  ID:         {view['agentId']}",
         f"  Existence:  {view['existence']}",
         f"  Server:     {view['server']}",
