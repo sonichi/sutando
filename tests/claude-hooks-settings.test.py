@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""claude_hooks_settings: install once, prune dead copies of the same hook, touch nothing else.
+
+The live defect: three SessionStart entries pointing at deleted /var/folders/…/repo/src/
+personal-claude-compact-hint.sh copies, left by test runs; every compaction fired all four
+and three failed "No such file". Neither installer could remove an entry.
+
+Run: python3 tests/claude-hooks-settings.test.py
+Exit: 0 = all pass, 1 = failure
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+import claude_hooks_settings as chs  # noqa: E402
+
+_pass = 0
+_fail = 0
+
+
+def ok(label):
+    global _pass
+    print(f"  PASS: {label}")
+    _pass += 1
+
+
+def fail(label, detail=""):
+    global _fail
+    print(f"  FAIL: {label}" + (f" — {detail}" if detail else ""), file=sys.stderr)
+    _fail += 1
+
+
+def check(cond, label, detail=""):
+    ok(label) if cond else fail(label, detail)
+
+
+def entry(cmd, matcher="compact"):
+    return {"matcher": matcher, "hooks": [{"type": "command", "command": cmd}]}
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    live = tmp / "repo" / "src" / "personal-claude-compact-hint.sh"
+    live.parent.mkdir(parents=True)
+    live.write_text("#!/bin/bash\n")
+    live_cmd = f'bash "{live}"'
+    dead_cmds = [f'bash "{tmp}/gone{i}/repo/src/personal-claude-compact-hint.sh"' for i in range(3)]
+    foreign_dead = f'bash "{tmp}/gone/other-tool.sh"'
+    foreign_live = tmp / "mine.sh"
+    foreign_live.write_text("#!/bin/bash\n")
+
+    # ── script_path_of / family_of ────────────────────────────────────────────
+    check(chs.script_path_of(live_cmd) == str(live), "script path parsed from a quoted bash command")
+    check(chs.script_path_of("python3 '/x/y/z.py' --flag") == "/x/y/z.py", "script path parsed after an interpreter")
+    check(chs.family_of(dead_cmds[0]) == "personal-claude-compact-hint.sh", "family is the script basename")
+    check(chs.family_of("") == "", "an empty command has no family")
+
+    # ── fresh install ─────────────────────────────────────────────────────────
+    settings = tmp / "fresh" / ".claude" / "settings.json"
+    status, removed = chs.install(settings, event="SessionStart", command=live_cmd, matcher="compact")
+    data = json.loads(settings.read_text())
+    check(status == "installed" and removed == [], "fresh install reports installed, removes nothing")
+    check(data["hooks"]["SessionStart"] == [entry(live_cmd)], "fresh install writes one entry with the matcher")
+
+    # ── idempotent ────────────────────────────────────────────────────────────
+    status, removed = chs.install(settings, event="SessionStart", command=live_cmd, matcher="compact")
+    check(status == "already installed" and len(json.loads(settings.read_text())["hooks"]["SessionStart"]) == 1,
+          "a second install is a no-op")
+
+    # ── prune dead same-family entries, keep everything else ──────────────────
+    polluted = tmp / "polluted" / ".claude" / "settings.json"
+    polluted.parent.mkdir(parents=True)
+    polluted.write_text(json.dumps({"hooks": {
+        "SessionStart": [entry(live_cmd)] + [entry(c) for c in dead_cmds]
+                        + [entry(foreign_dead, matcher="")] + [entry(f'bash "{foreign_live}"', matcher="")],
+        "Stop": [entry('bash "/nowhere/personal-claude-compact-hint.sh"', matcher="")],
+    }}))
+    status, removed = chs.install(polluted, event="SessionStart", command=live_cmd, matcher="compact")
+    after = json.loads(polluted.read_text())
+    cmds = [h["command"] for e in after["hooks"]["SessionStart"] for h in e["hooks"]]
+    check(status == "already installed", "the live entry is recognised as present")
+    check(sorted(removed) == sorted(dead_cmds), "exactly the three dead same-family entries are removed",
+          f"removed={removed}")
+    check(live_cmd in cmds, "the live same-family entry stays")
+    check(foreign_dead in cmds, "a dead hook of ANOTHER family is left alone")
+    check(f'bash "{foreign_live}"' in cmds, "a live foreign hook is left alone")
+    check(len(after["hooks"]["Stop"]) == 1, "other events are untouched even for the same family")
+
+    # ── prepend ───────────────────────────────────────────────────────────────
+    first_cmd = f'bash "{foreign_live}"'
+    ordered = tmp / "ordered" / ".claude" / "settings.json"
+    chs.install(ordered, event="SessionStart", command=f'bash "{live}"', matcher="")
+    chs.install(ordered, event="SessionStart", command=first_cmd, matcher="", prepend=True)
+    data = json.loads(ordered.read_text())
+    check(data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == first_cmd, "prepend puts the entry first")
+
+    # ── CLI ───────────────────────────────────────────────────────────────────
+    cli_settings = tmp / "cli" / ".claude" / "settings.json"
+    cli_settings.parent.mkdir(parents=True)
+    cli_settings.write_text(json.dumps({"hooks": {"SessionStart": [entry(dead_cmds[0])]}}))
+    r = subprocess.run([sys.executable, str(REPO / "src" / "claude_hooks_settings.py"), "install",
+                        "--settings", str(cli_settings), "--command", live_cmd, "--matcher", "compact",
+                        "--label", "PERSONAL_CLAUDE compact-reinject hook"],
+                       capture_output=True, text=True, timeout=30)
+    check(r.returncode == 0 and "removed 1 dead personal-claude-compact-hint.sh entry" in r.stdout
+          and "PERSONAL_CLAUDE compact-reinject hook (installed)" in r.stdout,
+          "the CLI names what it removed and what it installed", r.stdout + r.stderr)
+
+    # ── malformed settings fail loudly, never silently succeed ────────────────
+    bad = tmp / "bad" / ".claude" / "settings.json"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("[]")
+    r = subprocess.run([sys.executable, str(REPO / "src" / "claude_hooks_settings.py"), "install",
+                        "--settings", str(bad), "--command", live_cmd], capture_output=True, text=True)
+    check(r.returncode == 1 and "not an object" in r.stderr, "a malformed settings file is refused with a reason")
+
+    # ── the real installer prunes too (it is what runs on every core launch) ──
+    work = tmp / "work"
+    (work / ".claude").mkdir(parents=True)
+    (work / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [entry(c) for c in dead_cmds]}}))
+    env = dict(os.environ, SUTANDO_CLAUDE_WORKING_DIR=str(work))
+    r = subprocess.run(["bash", str(REPO / "scripts" / "install-personal-claude-hook.sh")],
+                       capture_output=True, text=True, env=env, timeout=30)
+    data = json.loads((work / ".claude" / "settings.json").read_text())
+    fam = [h["command"] for e in data["hooks"]["SessionStart"] for h in e["hooks"]
+           if "personal-claude-compact-hint.sh" in h["command"]]
+    check(r.returncode == 0 and len(fam) == 1 and str(REPO) in fam[0] and "removed 3 dead" in r.stdout,
+          "install-personal-claude-hook.sh leaves exactly one live compact-hint entry", r.stdout + r.stderr)
+
+    r2 = subprocess.run(["bash", str(REPO / "scripts" / "install-session-start-hook.sh")],
+                        capture_output=True, text=True, env=env, timeout=30)
+    data = json.loads((work / ".claude" / "settings.json").read_text())
+    first = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    check(r2.returncode == 0 and "schedule-crons-session-hint.sh" in first,
+          "install-session-start-hook.sh still prepends its entry so it fires first", r2.stdout + r2.stderr)
+
+print(f"\n{_pass} passed, {_fail} failed")
+sys.exit(1 if _fail else 0)

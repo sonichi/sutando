@@ -42,6 +42,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
+- **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
