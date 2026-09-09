@@ -23,7 +23,7 @@ admission and group release are named as out of scope for v1 in the routing sect
 remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in
 v1 can express it. Every other decision in that record stands.
 
-## Four protocol claims are NOT established by this document — they are open obligations
+## The protocol claims NOT established by this document — they are open obligations
 
 This PR carries the design and a model that can express the interleavings the real system has.
 It does NOT carry proofs for the four items below. They were raised as blocking review findings
@@ -46,6 +46,15 @@ implementing PR owes each one a schedule that fails before it passes.
   are both written by the subject of the probation, so a slow worker moves the deadline it is judged
   against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111,
   then 212 as its worker progresses.
+- **Retirement is not crash-complete, and not serialized against admission.** The root rename and
+  the pool-status/probation write are separate durable operations, so a crash between them leaves
+  either an active token beside completed custody in the tombstone, or a directory still gating a
+  worker whose probation owner is gone. Admission racing retirement is worse: a worker past token
+  observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the
+  active gate is back — after which a later retirement over the non-empty tombstone fails
+  `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What
+  is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe
+  tombstones, and a model that exposes each durable write plus the worker interleavings.
 - **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop,
   against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.
 
@@ -621,7 +630,7 @@ it never takes it. No fallthrough to the core exists for a bound room.
 
 ### The reconciliation ticker
 
-> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
+> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
 
 **It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher
 owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven.
@@ -1300,7 +1309,7 @@ not justify a timer of their own, so no `proactive-loop-pool` skill ships.
 
 ## Coordination contract (claim-only; the primitives are #3604's)
 
-> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence — a worker can read "no request", pause, and still commit.
+> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence — a worker can read "no request", pause, and still commit.
 
 1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the
    CANONICAL task id — `state/task-event-handler-claims/<task-id>`, resolved by
@@ -1463,7 +1472,7 @@ itself to a room whose worker might still come back.
    exactly what an interleaved worker produces.
 
    **So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.**
-> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.
+> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.
  The schedule that separates
    the orders is a worker consuming between the two reads:
 
@@ -1589,7 +1598,7 @@ itself to a room whose worker might still come back.
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
    computed afresh; the allowance retired by the single rename below); or the window `stand_in_after_s` has
    elapsed — measured from `probation.since` while the token is unconsumed
-> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** — the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.
+> **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** — the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.
  (a worker that never
    reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
    the `claimed/<task_id>` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
@@ -1605,6 +1614,8 @@ itself to a room whose worker might still come back.
    allowance beside a task that has already completed. The single rename flips the worker's gate
    (does the directory exist?) and both of recovery's names (`token`, `spent`) at the same instant,
    which is the property the two-question split depends on.
+
+   > **DISPUTED — see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The prose below names the seam correctly; what is NOT established is a crash-recoverable protocol across it, nor its serialization against a racing admission. Both write orders were reproduced and neither is safe.
 
    **That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the
    verdict scalar live in the pool-status record — a different object, with its own write — so
@@ -1983,7 +1994,7 @@ production-path tests; the staged list below marks which those are.
 
 > ### STAGE GATE — steps 2, 3 and 4 are BLOCKED and must not be opened yet
 >
-> The [four open obligations](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations)
+> The [open obligations](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations)
 > are not decided, and each one governs a protocol an implementing PR would have to encode. This
 > gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the
 > obligation covering it is open.** A step is unblocked when its obligation names ONE operative
@@ -1991,11 +2002,25 @@ production-path tests; the staged list below marks which those are.
 > suite that passes either way does not lift the gate, because that is the condition the obligations
 > were filed under.
 >
+> **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the
+> actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control
+> showing the same suite passes at head. As written without this, the rule was satisfiable by
+> assertion — "the suite discriminates" is a claim about intent, and intent is what these
+> obligations were filed against. Neither half can be produced by a suite that does not really
+> discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite
+> whose names implied it covered a defect stayed green, exit 0, when that precise bug was
+> reintroduced.
+>
+> **A pass at head is not progress against any obligation.** 187 green tests here move none of
+> them: passing at head is silent on whether anything fails under the alternative. The two are
+> orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to
+> prevent.
+>
 > | blocked step | obligation that blocks it | why that step cannot be written yet |
 > |---|---|---|
 > | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is |
-> | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock | the sweep publishes the request, runs the rollback, and computes the probation deadline — all three sites |
-> | 4 — installer and plists | last-worker removal order | two incompatible orders are specified; an installer must pick one to be written at all |
+> | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename — every site |
+> | 4 — installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all |
 >
 > Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
 > document) is not gated — naming an open obligation is what it is for.
