@@ -1555,7 +1555,7 @@ itself to a room whose worker might still come back.
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
    computed afresh; the allowance retired by the single rename below); or the window `stand_in_after_s` has
    elapsed — measured from `probation.since` while the token is unconsumed
-> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth; which is normative is undecided.
+> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** — the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.
  (a worker that never
    reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
    the `claimed/<task_id>` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
@@ -1764,6 +1764,34 @@ repo. Each such change is its own PR with its own reason and its own
 production-path tests; the staged list below marks which those are.
 
 ## Staged PRs against main
+
+> ### STAGE GATE — steps 2, 3 and 4 are BLOCKED and must not be opened yet
+>
+> The [four open obligations](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations)
+> are not decided, and each one governs a protocol an implementing PR would have to encode. This
+> gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the
+> obligation covering it is open.** A step is unblocked when its obligation names ONE operative
+> rule and the model suite contains a schedule that FAILS under the rejected alternative — a green
+> suite that passes either way does not lift the gate, because that is the condition the obligations
+> were filed under.
+>
+> | blocked step | obligation that blocks it | why that step cannot be written yet |
+> |---|---|---|
+> | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is |
+> | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock | the sweep publishes the request, runs the rollback, and computes the probation deadline — all three sites |
+> | 4 — installer and plists | last-worker removal order | two incompatible orders are specified; an installer must pick one to be written at all |
+>
+> Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
+> document) is not gated — naming an open obligation is what it is for.
+>
+> **Provenance.** Two reviewers reached these sites independently: `qingyun-wu` at head `1132aad5`
+> (fencing/rollback, removal order, clock) and `keweichen` at head `d2e41ace` (fencing as finding 2,
+> clock as finding 4, each with a reproduced filesystem trace). Independent convergence on the same
+> sites is why this is a gate and not a wording dispute — and why the gate is preferred here over
+> adjudicating in this PR, which is the alternative `qingyun-wu` offered in the same review.
+>
+> This gate is itself an obligation: delete it in the PR that resolves the last item, not before.
+
 
 1. this document;
 2. worker side: the per-instance event handler (eligibility from
