@@ -120,22 +120,23 @@ def report(name, text, files):
             print(f"             +{len(hits) - SHOW_CANDIDATES} further candidate(s) NOT shown — "
                   f"narrow the claim to see them")
         return "parked"
-    body = []
+    hits_by_file = {}
     for tok in toks:
         for f in files:
-            ls = [i for i, line in enumerate(lines_of(f), 1)
-                  if tok.lower() in line.lower()]
-            if ls:
-                body.append((tok, display(f), ls[0], ls[-1], len(ls)))
-    if body:
-        # Parking files are append-only, so the NEWEST mention holds the current
-        # verdict; count every matching line, never one per file.
-        tok, fn, first, last, n = body[0]
-        total = sum(b[4] for b in body)
-        extra = ("" if len(body) == 1 else
-                 f", +{total - n} in {len(body) - 1} other token/file pair(s)")
+            for i, line in enumerate(lines_of(f), 1):
+                if tok.lower() in line.lower():
+                    hits_by_file.setdefault(display(f), {}).setdefault(i, tok)
+    if hits_by_file:
+        # Parking files are append-only, so the NEWEST line of the file holding
+        # the MOST mentions is the verdict; token order is not relevance.
+        total = sum(len(v) for v in hits_by_file.values())
+        fn, at = max(hits_by_file.items(), key=lambda kv: len(kv[1]))
+        ls = sorted(at)
+        first, last, n = ls[0], ls[-1], len(ls)
+        extra = ("" if len(hits_by_file) == 1 else
+                 f", +{total - n} in {len(hits_by_file) - 1} other file(s)")
         print(f"  NO HEADING {label:25} — but {n} body mention(s) in {fn}{extra}; "
-              f"NEWEST '{tok}' -> {fn}:{last}, oldest :{first}. "
+              f"NEWEST '{at[last]}' -> {fn}:{last}, oldest :{first}. "
               f"READ the newest first")
         return "parked"
     print(f"  NONE FOUND {label:25} — no heading, no body mention; genuinely "

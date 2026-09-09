@@ -77,7 +77,48 @@ class BodyMentionCount(unittest.TestCase):
         self.assertEqual(verdict, "parked")
         self.assertIn("CANDIDATES", out)
         self.assertNotIn("NO HEADING", out)
+class MultiTokenAxis(unittest.TestCase):
+    """Every test above uses ONE token; these pin the multi-token axis (sonichi, #4098).
 
+    A claim normally yields several tokens, so a line matching two of them was
+    counted twice, and the surfaced pair was chosen by token order rather than by
+    which file actually holds the record.
+    """
+
+    def test_a_line_matching_two_tokens_counts_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "build_log.md"
+            p.write_text("".join(f"- alpha-probe and beta-probe both here {i}\n"
+                                 for i in range(5)))
+            verdict, out = _run([p], claim="the `alpha-probe` and `beta-probe` paths")
+        self.assertEqual(verdict, "parked")
+        self.assertIn("5 body mention(s)", out)
+        self.assertNotIn("10 body mention(s)", out)
+        self.assertNotIn("+5", out)
+
+    def test_the_file_holding_the_record_is_surfaced_not_the_first_token(self):
+        """A 1-line aside must not outrank a 12-line standing instruction."""
+        with tempfile.TemporaryDirectory() as d:
+            aside = pathlib.Path(d) / "notes.md"
+            aside.write_text("aside: alpha-probe mentioned once in passing\n")
+            log = pathlib.Path(d) / "build_log.md"
+            log.write_text("".join(f"- beta-probe re-fired; DO NOT re-investigate {i}\n"
+                                   for i in range(12)))
+            verdict, out = _run([aside, log],
+                                claim="the `alpha-probe` and `beta-probe` paths")
+        self.assertEqual(verdict, "parked")
+        self.assertIn("12 body mention(s) in build_log.md", out)
+        self.assertIn("build_log.md:12", out)
+        self.assertNotIn("notes.md:1, oldest", out)
+
+    def test_the_newest_lines_own_token_is_the_one_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "build_log.md"
+            p.write_text("alpha-probe first\nfiller\nbeta-probe newest\n")
+            verdict, out = _run([p], claim="the `alpha-probe` and `beta-probe` paths")
+        self.assertEqual(verdict, "parked")
+        self.assertIn("NEWEST 'beta-probe'", out)
+        self.assertIn("build_log.md:3", out)
 
 if __name__ == "__main__":
     unittest.main()
