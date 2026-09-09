@@ -123,15 +123,20 @@ def report(name, text, files):
     body = []
     for tok in toks:
         for f in files:
-            for i, line in enumerate(lines_of(f), 1):
-                if tok.lower() in line.lower():
-                    body.append((tok, display(f), i)); break
+            ls = [i for i, line in enumerate(lines_of(f), 1)
+                  if tok.lower() in line.lower()]
+            if ls:
+                body.append((tok, display(f), ls[0], ls[-1], len(ls)))
     if body:
-        # "No heading" is NOT "nothing written" — material is often parked in a
-        # BODY under a neighbouring heading.
-        tok, fn, i = body[0]
-        print(f"  NO HEADING {label:25} — but {len(body)} body mention(s), first "
-              f"'{tok}' -> {fn}:{i}. READ before investigating")
+        # Parking files are append-only, so the NEWEST mention holds the current
+        # verdict; count every matching line, never one per file.
+        tok, fn, first, last, n = body[0]
+        total = sum(b[4] for b in body)
+        extra = ("" if len(body) == 1 else
+                 f", +{total - n} in {len(body) - 1} other token/file pair(s)")
+        print(f"  NO HEADING {label:25} — but {n} body mention(s) in {fn}{extra}; "
+              f"NEWEST '{tok}' -> {fn}:{last}, oldest :{first}. "
+              f"READ the newest first")
         return "parked"
     print(f"  NONE FOUND {label:25} — no heading, no body mention; genuinely "
           f"untriaged, OR every token missed (try one from the warn text)")
