@@ -163,5 +163,42 @@ class UnionToResolveRegression(unittest.TestCase):
         self.assertEqual(len(targets), 1)
 
 
+class PromotionPreservesLocalAuthority(unittest.TestCase):
+    """qingyun-wu @b974e7b5: promoting a peer row wholly REPLACED the local one,
+    so `allowlisted: false` was lost. notify_reviewers checks the refusal after
+    the bare-key lookup, so the @local copy does not protect delivery."""
+
+    def _union(self, local, peer):
+        d = tempfile.mkdtemp()
+        lp, pp = pathlib.Path(d, "l.json"), pathlib.Path(d, "p.json")
+        lp.write_text(json.dumps({"r": local}))
+        pp.write_text(json.dumps({"r": peer}))
+        return _load(SRC).roster_union([("local", lp), ("peer", pp)])
+
+    FULL = {"stand": "@peer:x", "room": "!peer:x"}
+
+    def test_local_refusal_survives_promotion(self):
+        u = self._union({"stand": None, "room": None, "allowlisted": False}, self.FULL)
+        self.assertEqual(u["r"]["stand"], "@peer:x", "routing should still be promoted")
+        self.assertIs(u["r"]["allowlisted"], False,
+                      "a local allowlisted:false is a refusal and must survive promotion")
+
+    def test_local_declared_identity_survives(self):
+        u = self._union({"stand": None, "room": None, "gh": "local-login"}, self.FULL)
+        self.assertEqual(u["r"]["gh"], "local-login",
+                         "promotion must not swap the declared identity")
+
+    def test_a_partial_local_row_is_NOT_overwritten(self):
+        """A row naming a stand but no room states an identity. Promoting over it
+        would route under the peer's stand instead."""
+        u = self._union({"stand": "@local:x", "room": None}, self.FULL)
+        self.assertEqual(u["r"]["stand"], "@local:x", "partial local row must win")
+        self.assertEqual(u["r@peer"]["stand"], "@peer:x", "peer kept under its suffix")
+
+    def test_the_placeholder_case_still_gets_fixed(self):
+        u = self._union({"stand": None, "room": None}, self.FULL)
+        self.assertEqual(u["r"]["room"], "!peer:x", "the original defect must stay fixed")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

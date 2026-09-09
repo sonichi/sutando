@@ -62,6 +62,33 @@ def _usable(row) -> bool:
     return bool(row.get("stand") and row.get("room"))
 
 
+_ROUTING = ("stand", "room")
+
+
+def _is_routing_placeholder(row) -> bool:
+    """No routing value of its own -- nothing of that kind is lost by promoting.
+
+    Applied WITH `not _usable(row)`, never instead of it: `_usable` is also true
+    for a refusal row, which carries no routing value and must still never be
+    overwritten. This adds the partial-identity case -- a row naming a stand but
+    no room states an identity, and promoting over it routes under the wrong one.
+    """
+    if not isinstance(row, dict):
+        return True
+    return not any(str(row.get(k) or "").strip() for k in _ROUTING)
+
+
+def _promote(winner: dict, local: dict) -> dict:
+    """Peer routing, local everything-else. `allowlisted: false` is a refusal and
+    survives; consumers check it AFTER the bare-key lookup, so an @local copy
+    does not protect delivery."""
+    out = dict(winner)
+    for field, value in (local if isinstance(local, dict) else {}).items():
+        if field not in _ROUTING and value is not None:
+            out[field] = value
+    return out
+
+
 def roster_union(paths) -> dict:
     """(host, path) pairs, NEAREST FIRST -> merged rows.
 
@@ -82,9 +109,10 @@ def roster_union(paths) -> dict:
             elif merged[key] != row:
                 # Precedence is by origin EXCEPT when exactly one row is usable:
                 # `stand: null` is a row, so it won a collision like a filled one.
-                if _usable(row) and not _usable(merged[key]):
+                if (_usable(row) and not _usable(merged[key])
+                        and _is_routing_placeholder(merged[key])):
                     merged[f"{key}@local"] = merged[key]
-                    merged[key] = row
+                    merged[key] = _promote(row, merged[key])
                 else:
                     merged[f"{key}@{host or 'legacy'}"] = row
     return merged
