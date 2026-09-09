@@ -402,11 +402,15 @@ class RemovalUnbindsBeforeTheInstaller(unittest.TestCase):
         PINNED an unsafe order: a suspended worker resumes and claims on a stale
         eligibility read. Stopping the process is the only fence."""
         t = self._text()
-        i_fence = t.find("FENCE W FIRST")
-        i_drain = t.find("Drain what it holds")
-        i_rewrite = t.find("REWRITE THE BINDINGS")
-        for name, i in (("fence", i_fence), ("drain", i_drain), ("rewrite", i_rewrite)):
-            self.assertNotEqual(i, -1, "no %s step is described" % name)
+        anchors = {"fence": "FENCE W FIRST", "drain": "Drain what it holds",
+                   "rewrite": "REWRITE THE BINDINGS"}
+        for name, a in anchors.items():
+            # find() takes the FIRST match, so a second copy anywhere silently
+            # decides this ordering. Unique today; assert it stays that way.
+            self.assertEqual(t.count(a), 1,
+                f"the {name} anchor appears {t.count(a)} times; positions would be "
+                f"compared against whichever copy comes first")
+        i_fence, i_drain, i_rewrite = (t.find(anchors[k]) for k in ("fence", "drain", "rewrite"))
         self.assertLess(i_fence, i_drain, "reclaiming before the worker is stopped lets "
                                           "the reclaimed path and W run the same task")
         self.assertLess(i_fence, i_rewrite, "publishing a new binding before W is stopped "
@@ -1319,10 +1323,13 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
             self.assertIn(required, para,
                 f"{required!r} left the operative paragraph; detached historical "
                 f"prose satisfies a document-wide read without limiting anything")
-        for overclaim in ("ESTABLISHES every row", "rows as PROVEN",
-                          "pins every one of them", "proven, not merely stated"):
-            self.assertNotIn(overclaim, para,
-                f"the operative paragraph was inverted into {overclaim!r}")
+        # Pin the claim SENTENCE, do not enumerate its inversions. My own control
+        # showed "it CERTIFIES all orderings" evading the list while the caveat stood.
+        self.assertIn(
+            "EXPRESSES the rows below as a no-write transition model (five pending "
+            "tasks, two runners) — but it does not pin every one of them", para,
+            "the model's claim sentence changed; a stronger verb was probably "
+            "inserted beside the caveat rather than replacing it")
 
     def test_the_probation_clock_names_a_NORMATIVE_source(self):
         """[P2] asked which of the three is normative; naming three and picking none
