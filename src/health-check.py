@@ -11048,10 +11048,8 @@ def check_claude_hook_registration(
             # Present, but not actually invoking this checkout's script — either aimed
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
-    # A registered hook whose script no longer exists fails on every fire ("No such file")
-    # and is invisible to the owned-list check above, which only asks whether OUR hooks are
-    # present. Scanned over every event and every entry; judged by path existence alone,
-    # a relative path resolving against the settings file's project.
+    # Present-but-dead is invisible to the owned-list check above: a registered hook whose
+    # script is gone fails on every fire. Relative paths resolve against the project.
     dead: list[str] = []
     dead_records: list[dict] = []
     project_dir = settings.resolve().parent.parent
