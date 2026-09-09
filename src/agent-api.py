@@ -1349,7 +1349,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         None,
                     )
                     if match:
-                        pq_file.write_text(answer_pending_question(content, match, answer, resolve=resolve))
+                        # Both readers read this one file: write it whole or not at all, so
+                        # neither can see a truncated state between them.
+                        rewritten = answer_pending_question(content, match, answer, resolve=resolve)
+                        tmp_pq = pq_file.with_suffix(pq_file.suffix + ".tmp")
+                        tmp_pq.write_text(rewritten)
+                        os.replace(tmp_pq, pq_file)
                         ts = int(datetime.now().timestamp() * 1000)
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:

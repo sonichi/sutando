@@ -422,6 +422,19 @@ class TestAnswer(unittest.TestCase):
         closed = api.answer_pending_question(twice, api.parse_pending_questions(twice)[0], "B")
         self.assertNotIn(qs[0]["text"], [q["text"] for q in api.parse_pending_questions(closed)])
 
+    def test_the_heuristic_errs_toward_closing_and_says_so(self):
+        """Stated, not hidden: without the flag, a reply that is not phrased as a question
+        ("say more") RESOLVES. That is the expensive direction (a silent close), and it is
+        reachable only from a client that sends no `resolve` — today the dashboard's Answer
+        form, where the human means an answer. The triage card always sends resolve=false."""
+        self.assertFalse(api.is_question_back("say more"))
+        qs = api.parse_pending_questions(FREE_FORM)
+        closed = api.answer_pending_question(FREE_FORM, qs[0], "say more",
+                                             resolve=not api.is_question_back("say more"))
+        self.assertIn("**Status:** Answered", closed)
+        kept = api.answer_pending_question(FREE_FORM, qs[0], "say more", resolve=False)
+        self.assertIn("**Status:** open — owner replied", kept)
+
     def test_a_question_back_is_recognised(self):
         self.assertTrue(api.is_question_back("decide what?"))
         self.assertTrue(api.is_question_back("  which one ?  "))
