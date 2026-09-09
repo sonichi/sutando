@@ -840,7 +840,7 @@ which all instances agree on it:
 | 89.9s | worker-2 | my own beat is fresh; `requested_worker` names me | **wins** | yes |
 | 90.1s | core | worker-2's beat now stale; the room is bound to worker-2 | **does not contend** | no |
 
-Under v1 this is no longer a race, and the reason is worth stating exactly: the core
+Under v1 this is not a race, because the core
 does not claim a bound room whatever the beat says, so the second claimant such arbitration would need does not exist. Either interleaving leaves at most one
 contender. Had worker-2 suppressed instead — its own gate finding a stale beat or a
 `wedged` verdict — the task would stay pending rather than pass to the core.
