@@ -1179,16 +1179,30 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         self.assertEqual(fused[:3], split[:3],
             "read-then-commit with no pause must equal the fused worker()")
         fd, sd = fused[3], split[3]
-        for field in ("record", "claims", "live_owners", "results", "journal",
-                      "claimed_rec", "token", "spent", "request", "probation"):
-            self.assertEqual(getattr(fd, field), getattr(sd, field),
-                f"disk field {field} diverges, so the composition is not equal")
+        # An enumerated field list exempted admit_dir, phase_dirs, tombstone,
+        # timestamps and writers; vars() cannot be outgrown by a new field.
+        self.assertEqual(vars(fd), vars(sd),
+            "the fused and split compositions must leave IDENTICAL disk state; "
+            "an enumerated field list silently exempts every field added later")
 
     def test_an_action_can_land_BETWEEN_the_read_and_the_commit(self):
         """The interleaving P1.2 describes: read, something happens, then commit."""
         v, c, p, d = run(["sweep", "worker_read", "kick", "worker_commit"])
         self.assertIsNotNone(v, "the schedule must run at all -- it could not be written before")
         self.assertTrue(d.request, "the kick landed between the read and the commit")
+
+    def test_the_commit_USES_THE_HELD_VERDICT_and_never_rereads(self):
+        """keweichen at a5022979: replacing `worker_commit(held[0])` with
+        `worker_commit(worker_read())` RE-FUSES the seam and all 83 tests passed --
+        the class claiming the split is expressible stayed green with it removed.
+
+        His discriminating schedule, verbatim. The drift makes the held verdict and
+        a fresh read disagree, so the outcome separates them."""
+        v, claimed, pending, _ = run(["sweep", "drift", "worker_read", "kick",
+                                      "worker_commit"])
+        self.assertEqual((v, claimed, pending), ("probation", 4, 1),
+            "the commit re-read instead of using the held verdict -- the re-read "
+            "mutant produces ('probation', 0, 5)")
 
     def test_a_second_OWNER_coexists_with_the_first(self):
         """P1.3: restart() REPLACES the owner; as_owner() adds an owner name."""
@@ -1223,7 +1237,9 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
             "second owner's live-other rollback -- it is cleared, not never-written")
         self.assertIsNone(d.claimed_rec,
             "a promoted admission record here means the FIRST owner was still acting")
-        self.assertTrue(d.token, "the token must be unspent when the switch happens")
+        self.assertTrue(d.token,
+            "the token is RETURNED BY the live-other rollback -- it is spent at the "
+            "switch and true only afterwards, so this reads the end state")
 
     def test_three_OWNERS_coexist_and_the_run_ENDS_with_one_claim(self):
         """TERMINAL state only -- the name says so now. The old name said "THREE

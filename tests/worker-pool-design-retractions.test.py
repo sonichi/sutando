@@ -177,7 +177,9 @@ def operative_block(doc, anchor, quoted=False):
             units.append("\n".join(cur))
     else:
         units = re.split(r"\n\s*\n", doc)
-    hits = [u for u in units if anchor in u]
+    # Match on the NORMALIZED unit: a formatting-only line wrap inside an anchor
+    # otherwise fails a block whose normalized text is unchanged (keweichen).
+    hits = [u for u in units if anchor in normalized(u)]
     if len(hits) != 1:
         raise AssertionError(f"{anchor!r} is in {len(hits)} units, not 1")
     return normalized(hits[0])
@@ -192,7 +194,7 @@ def neighbours(doc, anchor, quoted=False):
     defect these pins exist to close, reintroduced in the helper closing it.
     """
     paras = re.split(r"\n\s*\n", doc)
-    hits = [k for k, p in enumerate(paras) if anchor in p
+    hits = [k for k, p in enumerate(paras) if anchor in normalized(p)
             and (p.lstrip().startswith(">") if quoted else True)]
     if len(hits) != 1:
         raise AssertionError(f"{anchor!r} matches {len(hits)} units (quoted={quoted})")
@@ -1609,6 +1611,77 @@ class OperativeBlocksAreEqualityPinnedAndLocal(unittest.TestCase):
             self.assertNotIn(bad, stated)
         for bad in ("SETTLED", "proven correct"):
             self.assertNotIn(bad, gate)
+
+
+
+class AnalogousQualifiersAreLineExactAndSectionBound(unittest.TestCase):
+    """The four blocks pinned by equality were the ones a reviewer had named. I
+    audited the rest for the same property and SIX more relocate to EOF with the
+    suite green -- keweichen then confirmed independently that "analogous blocks
+    remain unpinned".
+
+    These are list ITEMS, a TABLE ROW and inline qualifiers rather than callouts,
+    so the unit is the line: exact text kills mutation, section membership kills
+    relocation, and document-uniqueness kills a decoy copy.
+    """
+
+    QUALIFIERS = [
+        {
+                "anchor": "Retirement is not crash-complete",
+                "heading": "The protocol claims NOT established by this document",
+                "line": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and"
+        },
+        {
+                "anchor": "a FOURTH source, not one of the three",
+                "heading": "The protocol claims NOT established by this document",
+                "line": "`claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing"
+        },
+        {
+                "anchor": "One owner, not \"sidecar or wrapper\"",
+                "heading": "What the core and the operator read to judge a worker",
+                "line": "| the report transport, named \u2014 and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not \"sidecar or wrapper\". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it \"already tails\" anything** \u2014 it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO \u2014 the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |"
+        },
+        {
+                "anchor": "`exclusions` is not why the binding unit is a room",
+                "neighbour": "the binding unit is the ROOM",
+                "heading": "Worker pool \u2014 design (v1)",
+                "line": "room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped"
+        },
+        {
+                "anchor": "only when EVERY bound member is ineligible",
+                "heading": "Coordination contract",
+                "line": "work stays PENDING only when EVERY bound member is ineligible. The core does"
+        },
+        {
+                "anchor": "no UNBOUND worker stands in",
+                "heading": "Coordination contract",
+                "line": "not claim it, and no UNBOUND worker stands in. Work an ineligible worker had"
+        }
+]
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_each_analogous_qualifier_is_exact_unique_and_in_its_section(self):
+        doc = self._doc()
+        flat = normalized(doc)
+        for q in self.QUALIFIERS:
+            self.assertEqual(flat.count(q["line"]), 1,
+                f"{q['anchor']!r}: its line is missing or duplicated -- exact text "
+                f"is the pin because a phrase check accepts a reworded qualifier")
+            if q.get("neighbour"):
+                # Its enclosing heading is the H1, which spans the document, so
+                # section membership is vacuous. Bind to the adjacent text.
+                para = normalized(sole_para_normalized(doc, q["anchor"]))
+                self.assertIn(q["neighbour"], para,
+                    f"{q['anchor']!r} moved away from {q['neighbour']!r}, the claim "
+                    f"it qualifies -- they must stay in one paragraph")
+                continue
+            sec = normalized(section_of(doc, q["heading"]))
+            self.assertIn(q["line"], sec,
+                f"{q['anchor']!r} left the {q['heading']!r} section. A list item or "
+                f"table row moved out leaves its container short while the text "
+                f"still exists somewhere")
 
 
 if __name__ == "__main__":
