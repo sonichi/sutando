@@ -1786,6 +1786,20 @@ production-path tests; the staged list below marks which those are.
 > suite that passes either way does not lift the gate, because that is the condition the obligations
 > were filed under.
 >
+> **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the
+> actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control
+> showing the same suite passes at head. As written without this, the rule was satisfiable by
+> assertion — "the suite discriminates" is a claim about intent, and intent is what these
+> obligations were filed against. Neither half can be produced by a suite that does not really
+> discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite
+> whose names implied it covered a defect stayed green, exit 0, when that precise bug was
+> reintroduced.
+>
+> **A pass at head is not progress against any obligation.** 187 green tests here move none of
+> them: passing at head is silent on whether anything fails under the alternative. The two are
+> orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to
+> prevent.
+>
 > | blocked step | obligation that blocks it | why that step cannot be written yet |
 > |---|---|---|
 > | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is |
