@@ -1208,9 +1208,16 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
             ("held wedged", ["sweep", "worker_read", "kick", "sweep",
                              "worker_commit"], ("probation", 0, 5)),
         ):
-            v, claimed, pending, _ = run(sched)
+            v, claimed, pending, d = run(sched)
             self.assertEqual((v, claimed, pending), want,
                 f"{label}: the commit re-read instead of using the held verdict")
+            if label == "held wedged":
+                # The tuple alone let a wedged commit run the FIRST durable half
+                # of an admission: same (verdict, claimed, pending), different disk.
+                _, _, _, noop = run([x for x in sched if x != "worker_commit"])
+                self.assertEqual(vars(d), vars(noop),
+                    "held wedged: the commit must be a NO-OP on durable state -- "
+                    "token, spent, journal and phase_dirs must be untouched")
 
     def test_a_second_OWNER_coexists_with_the_first(self):
         """P1.3: restart() REPLACES the owner; as_owner() adds an owner name."""
