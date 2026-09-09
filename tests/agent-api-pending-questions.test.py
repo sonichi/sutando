@@ -393,6 +393,41 @@ class TestAnswer(unittest.TestCase):
             self.assertNotIn(qs[0]["text"], waiting)
             self.assertIn("❓ Rebuild the Swift menu-bar app?", waiting)
 
+    def test_a_reply_keeps_the_question_open_for_both_readers(self):
+        """The owner's Reply is his words to the agent, not a decision. On 2026-09-08 his
+        counter-question ("decide what?") landed as an answer and CLOSED the item: the
+        notifier dropped it and the triage list lost it. A reply must stay open in the
+        agent API's own parse AND in check-pending-questions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pq = Path(tmp) / "pending-questions.md"
+            qs = api.parse_pending_questions(FREE_FORM)
+            updated = api.answer_pending_question(FREE_FORM, qs[0], "decide what?", resolve=False)
+            self.assertIn("**Status:** open — owner replied", updated)
+            self.assertIn("decide what?", updated)
+            self.assertNotIn("**Status:** Answered", updated)
+            still = [q["text"] for q in api.parse_pending_questions(updated)]
+            self.assertIn(qs[0]["text"], still)
+            pq.write_text(updated)
+            cpq.PQ_FILE = pq
+            waiting = [q["title"] for q in cpq.get_waiting_questions()]
+            self.assertIn(qs[0]["text"], waiting)
+
+    def test_a_second_reply_replaces_the_status_line_and_a_real_answer_still_closes(self):
+        qs = api.parse_pending_questions(FREE_FORM)
+        once = api.answer_pending_question(FREE_FORM, qs[0], "which one?", resolve=False)
+        twice = api.answer_pending_question(once, api.parse_pending_questions(once)[0], "and why?",
+                                            resolve=False)
+        self.assertEqual(twice.count("**Status:**"), 1)
+        self.assertIn("and why?", twice)
+        closed = api.answer_pending_question(twice, api.parse_pending_questions(twice)[0], "B")
+        self.assertNotIn(qs[0]["text"], [q["text"] for q in api.parse_pending_questions(closed)])
+
+    def test_a_question_back_is_recognised(self):
+        self.assertTrue(api.is_question_back("decide what?"))
+        self.assertTrue(api.is_question_back("  which one ?  "))
+        self.assertFalse(api.is_question_back("B, and ship it."))
+        self.assertFalse(api.is_question_back(""))
+
     def test_structured_status_line_is_updated_in_place(self):
         qs = api.parse_pending_questions(STRUCTURED)
         updated = api.answer_pending_question(STRUCTURED, qs[0], "Later")
