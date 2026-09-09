@@ -28,7 +28,7 @@ cd "$FIXTURE"
 # Hermeticity precondition. Asserts the OUTCOME rather than enumerating sources,
 # so an exclude channel nobody listed still trips it.
 mv .gitignore .gitignore.held
-if git -c core.excludesFile=/dev/null check-ignore -q .env.swp 2>/dev/null; then
+if git -c core.excludesFile=/dev/null check-ignore --no-index -q .env.swp 2>/dev/null; then
     echo "FATAL: .env.swp is ignored with NO .gitignore present — an ambient exclude" >&2
     echo "source is supplying the rules, so this suite would pass with the repo fix absent." >&2
     exit 2
@@ -40,7 +40,7 @@ fail=0
 
 check_ignored() {
     local path="$1" desc="$2"
-    if git -c core.excludesFile=/dev/null check-ignore -q "$path" 2>/dev/null; then
+    if git -c core.excludesFile=/dev/null check-ignore --no-index -q "$path" 2>/dev/null; then
         echo "OK: $desc"; pass=$((pass + 1))
     else
         echo "FAIL: $desc — '$path' is NOT ignored, so \`add -A\` would stage a secret"
@@ -49,7 +49,7 @@ check_ignored() {
 }
 refute_ignored() {
     local path="$1" desc="$2"
-    if git -c core.excludesFile=/dev/null check-ignore -q "$path" 2>/dev/null; then
+    if git -c core.excludesFile=/dev/null check-ignore --no-index -q "$path" 2>/dev/null; then
         echo "FAIL: $desc — '$path' IS ignored; the rule over-denied and hides a real file"
         fail=$((fail + 1))
     else
