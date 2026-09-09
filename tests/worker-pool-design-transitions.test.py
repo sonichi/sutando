@@ -109,7 +109,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
-    def as_claimant(name, keep_live=True):
+    def as_owner(name, keep_live=True):
         """(P1.3 seam) Run the next steps AS a named claimant, optionally leaving the
         previous one LIVE. restart() replaces `me` and drops the old owner, so a paused
         claimant cannot coexist with its successor -- which is why A/B/C is unrepresentable.
@@ -375,7 +375,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
 
     def restart():
         # The old owner STOPS being live: a restart is not a second claimant.
-        # Use as_claimant() when the schedule needs both alive at once.
+        # Use as_owner() when the schedule needs both alive at once.
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
     def contender_rename():
@@ -405,24 +405,28 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         """(P1.2 seam) act on the verdict held from an earlier step, never re-reading."""
         worker_commit(held[0])
 
-    def step_second_claimant(name="p-b"):
-        """(P1.3 seam) another live OWNER name, with the previous left in live_owners.
+    def step_second_owner(name="p-b"):
+        """(P1.3 seam) add another live OWNER name, leaving the previous in live_owners.
 
-        NAMING CAVEAT (keweichen): "claimant" overstates this. Stacking three adds
-        three `live_owners` entries; it does NOT give three of them a claim. The
-        A/B/C run ends with `claims={'t1': 'p-c'}` -- one claim, held by the last
-        name. See as_claimant above: a paused claimant cannot coexist with its
-        successor, which is exactly why A/B/C stays unrepresentable here. The keys
-        are kept because schedules reference them by string.
+        NOT a claimant, and the name used to say so. as_owner() touches `me` and
+        `live_owners` only; `gate_step2a` is the sole writer of a claim. MEASURED
+        end state of kick,sweep,worker,second_owner,third_owner:
+
+            claims      = {'t1': 'p1'}          <- ONE claim, held by the FIRST
+            live_owners = {'p1', 'p-b', 'p-c'}
+
+        so stacking three adds three owner names and no second claim. A/B/C needs
+        three live CLAIMS and stays unrepresentable here; test_three_OWNERS_...
+        pins both states exactly so that limitation cannot be silently lifted.
         """
-        as_claimant(name, keep_live=True)
+        as_owner(name, keep_live=True)
 
-    def step_third_claimant():
-        step_second_claimant("p-c")
+    def step_third_owner():
+        step_second_owner("p-c")
 
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
              "worker_read": step_worker_read, "worker_commit": step_worker_commit,
-             "second_claimant": step_second_claimant, "third_claimant": step_third_claimant,
+             "second_owner": step_second_owner, "third_owner": step_third_owner,
              "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
              "other_live_claim": other_live_claim, "tear": tear,
              "contender_rename": contender_rename}
@@ -1181,20 +1185,30 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         self.assertIsNotNone(v, "the schedule must run at all -- it could not be written before")
         self.assertTrue(d.request, "the kick landed between the read and the commit")
 
-    def test_a_second_claimant_coexists_with_the_first(self):
-        """P1.3: restart() REPLACES the claimant; as_claimant() adds one."""
+    def test_a_second_OWNER_coexists_with_the_first(self):
+        """P1.3: restart() REPLACES the claimant; as_owner() adds one."""
         _, _, _, restarted = run(["kick", "sweep", "worker", "restart"])
-        _, _, _, second = run(["kick", "sweep", "worker", "second_claimant"])
+        _, _, _, second = run(["kick", "sweep", "worker", "second_owner"])
         self.assertEqual(len(restarted.live_owners), len(second.live_owners) - 1,
             "a restart drops the old owner; a second claimant keeps it live")
         self.assertIn("p-b", second.live_owners)
         self.assertIn("p1", second.live_owners)
 
-    def test_THREE_claimants_can_coexist_for_the_A_B_C_schedule(self):
-        """P1.3 names three parties; two was not enough to write it."""
-        _, _, _, d = run(["kick", "sweep", "worker", "second_claimant", "third_claimant"])
-        for who in ("p1", "p-b", "p-c"):
-            self.assertIn(who, d.live_owners)
+    def test_three_OWNERS_coexist_but_only_ONE_CLAIM_ever_exists(self):
+        """The old name said "THREE claimants can coexist"; the run produces three
+        OWNER names and a single claim, so the name asserted the very thing P1.3
+        needs and the model cannot do.
+
+        Both states are pinned EXACTLY, not by membership: keweichen measured that
+        adding real shadow claims left all 82 tests green, so a model that grew the
+        ability to hold three claims would have silently satisfied a suite still
+        describing itself as unable to. Whichever way this changes -- the limitation
+        lifted, or a claim leaking in -- it now fails here and gets decided."""
+        _, _, _, d = run(["kick", "sweep", "worker", "second_owner", "third_owner"])
+        self.assertEqual(d.live_owners, {"p1", "p-b", "p-c"})
+        self.assertEqual(d.claims, {"t1": "p1"},
+            "one claim, held by the FIRST owner -- A/B/C needs three and is "
+            "unrepresentable here; do not restate this as three claimants")
 
     def test_restart_still_drops_the_previous_owner(self):
         """The existing semantics must NOT have changed -- this is a refactor."""

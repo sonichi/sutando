@@ -36,7 +36,7 @@ implementing PR owes each one a schedule that fails before it passes.
   4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a
   published request bounds nothing already in flight. The protocol does NOT survive it.
 - **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with
-  no admission record. `as_claimant()` was added to hold a paused claimant beside its successor, and a schedule was run
+  no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run
   showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C
   proof it was described as.** The model stacks owner names rather than holding two simultaneously
   live claimants, so it cannot express the schedule this obligation is about; the row is STATED,
@@ -1805,7 +1805,7 @@ production-path tests; the staged list below marks which those are.
 > whose names implied it covered a defect stayed green, exit 0, when that precise bug was
 > reintroduced.
 >
-> **A pass at head is not progress against any obligation.** 187 green tests here move none of
+> **A pass at head is not progress against any obligation.** The green tests here move none of
 > them: passing at head is silent on whether anything fails under the alternative. The two are
 > orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to
 > prevent.
