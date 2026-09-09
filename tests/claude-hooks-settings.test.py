@@ -160,5 +160,54 @@ with tempfile.TemporaryDirectory() as tmp:
     check(r2.returncode == 0 and "schedule-crons-session-hint.sh" in first,
           "install-session-start-hook.sh still prepends its entry so it fires first", r2.stdout + r2.stderr)
 
+    # ── the CLI and its branches, IN PROCESS (a subprocess is invisible to the coverage tracer) ──
+    import contextlib
+    import io
+    inproc = tmp / "inproc" / ".claude" / "settings.json"
+    inproc.parent.mkdir(parents=True)
+    inproc.write_text(json.dumps({"hooks": {"SessionStart": [entry(dead_cmds[0])]}}))
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = chs.main(["install", "--settings", str(inproc), "--command", live_cmd, "--matcher", "compact"])
+    check(rc == 0 and "removed 1 dead personal-claude-compact-hint.sh entry:" in out.getvalue()
+          and "personal-claude-compact-hint.sh SessionStart hook (installed)" in out.getvalue(),
+          "main(): one dead entry → singular 'entry', default label, rc 0", out.getvalue() + err.getvalue())
+    inproc.write_text(json.dumps({"hooks": {"SessionStart": [entry(c) for c in dead_cmds[:2]]}}))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = chs.main(["install", "--settings", str(inproc), "--command", live_cmd, "--label", "L"])
+    check(rc == 0 and "removed 2 dead personal-claude-compact-hint.sh entries:" in out.getvalue()
+          and "L (installed)" in out.getvalue(), "main(): two dead entries → plural, custom label", out.getvalue())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = chs.main(["install", "--settings", str(inproc), "--command", live_cmd, "--label", "L"])
+    check(rc == 0 and "✂" not in out.getvalue() and "L (already installed)" in out.getvalue(),
+          "main(): nothing to remove → no ✂ line, already installed", out.getvalue())
+    badp = tmp / "inproc-bad" / ".claude" / "settings.json"
+    badp.parent.mkdir(parents=True)
+    badp.write_text("[]")
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = chs.main(["install", "--settings", str(badp), "--command", live_cmd])
+    check(rc == 1 and "not an object" in err.getvalue() and out.getvalue() == "",
+          "main(): malformed settings → rc 1, reason on stderr, nothing on stdout", err.getvalue())
+
+    # ── parser branches ────────────────────────────────────────────────────────
+    check(chs.script_path_of('bash "/unbalanced/quote.sh') == "/unbalanced/quote.sh".join(['"', ""]) or
+          chs.script_path_of('bash "/unbalanced/quote.sh') == '"/unbalanced/quote.sh',
+          "an unbalanced quote falls back to whitespace splitting instead of raising")
+    check(chs.script_path_of("cp a b") == "cp", "a command with no interpreter yields its first token")
+    check(chs.script_path_of("--flag-only") is None, "a command of only flags yields None")
+    check(chs.script_path_of("bash") is None, "an interpreter with nothing after it yields None")
+    check(chs.script_path_of("   ") is None, "whitespace yields None")
+
+    # ── prune_dead edge branches ───────────────────────────────────────────────
+    check(chs.prune_dead({"hooks": {"SessionStart": [entry(dead_cmds[0])]}}, "SessionStart", "") == [],
+          "an empty family prunes nothing")
+    odd = {"hooks": {"SessionStart": ["not-a-dict", entry(dead_cmds[0])]}}
+    removed = chs.prune_dead(odd, "SessionStart", "personal-claude-compact-hint.sh")
+    check(removed == [dead_cmds[0]] and odd["hooks"]["SessionStart"][0] == "not-a-dict",
+          "a non-dict entry is kept in place while the dead one beside it is removed")
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
