@@ -699,10 +699,8 @@ event handler keeps routing on beats exactly as in step 2 and never consults the
 record. Workers read the record to gate THEMSELVES. One reader per decision, and the
 one party that could disagree with the file is the party that wrote it.
 
-This paragraph is about the STEP-3 residue only. To be explicit, because the two sit close enough
-to be read as one rule: **step 2 DOES owe a periodic re-evaluation** — the
-watcher's 30s reconciliation specified above and again in the step-2 prerequisite
-list — and running it on a timer the watcher owns rather than folding it into an
+**Step 2 owes a periodic re-evaluation of its own** — the watcher's 30s
+reconciliation — and running it on a timer the watcher owns rather than folding it into an
 existing beat does not make repeated work non-periodic. What is bounded HERE
 is a different race: a worker that
 suppresses on a `wedged` verdict the core has not yet acted on waits until the
