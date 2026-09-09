@@ -33,3 +33,11 @@ export async function readLanding(page, { timeout = 15000, shotDir, now = Date.n
   const url = href.startsWith('http') ? href : `https://x.com${href}`;
   return { posted: true, url };
 }
+
+// The decision-to-exit mapping is production logic too: 4 = clicked, nothing
+// landed (3 is the pre-click composer refusal). Kept here so a test can pin it;
+// left in the caller it was an untestable `process.exit` a mutation could flip to 0.
+export const EXIT_NO_LANDING = 4;
+export function landingExit(decision) {
+  return decision.posted ? 0 : EXIT_NO_LANDING;
+}

@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
-import { readLanding } from './landing-check.mjs';
+import { readLanding, landingExit } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -397,10 +397,10 @@ try {
     const decision = await readLanding(page, { timeout: 15000, shotDir: SHOT_DIR });
     if (!decision.posted) {
       console.log(JSON.stringify({ ...decision, composer_matched: true }));
-      process.exit(4);  // 3 is the pre-click composer refusal; 4 = clicked, nothing landed
+    } else {
+      console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
     }
-    console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
-    process.exit(0);
+    process.exit(landingExit(decision));
   }
 } catch (err) {
   console.error(`Error: ${err.message}`);

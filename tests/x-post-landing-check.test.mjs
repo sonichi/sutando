@@ -14,7 +14,7 @@
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readLanding } from '../skills/x-twitter/landing-check.mjs';
+import { readLanding, landingExit, EXIT_NO_LANDING } from '../skills/x-twitter/landing-check.mjs';
 
 let failures = 0;
 const check = (name, cond, detail = '') => {
@@ -81,6 +81,25 @@ const main = async () => {
   }
   check('mutation `if (false && !landed)` is caught (mutant mis-handles a timeout)',
     mutantBroke, 'the mutant still returned posted:false — the branch is not exercised');
+
+  // 5. The decision-to-exit mapping, the other half of the failure contract. The
+  //    caller once held a bare `process.exit(4)`; flipping it to 0 told automation a
+  //    failed post succeeded while every landing check stayed green. Pin both ends
+  //    through the importable mapping, then flip it in source and prove that breaks.
+  check('a timeout maps to exit 4', landingExit(timedOut) === 4, String(landingExit(timedOut)));
+  check('an analytics false-positive maps to exit 4', landingExit(analytics) === 4);
+  check('a real post maps to exit 0', landingExit(ok) === 0, String(landingExit(ok)));
+  check('EXIT_NO_LANDING is 4, distinct from the pre-click exit 3', EXIT_NO_LANDING === 4);
+  check('the caller routes exit through landingExit (no bare exit(4) in the publish path)',
+    /process\.exit\(landingExit\(decision\)\)/.test(readFileSync(new URL('../skills/x-twitter/x-post-browser.mjs', import.meta.url), 'utf8')),
+    'x-post-browser.mjs no longer calls landingExit(decision)');
+  const exitMutated = src.replace('decision.posted ? 0 : EXIT_NO_LANDING', 'decision.posted ? 0 : 0');
+  check('exit mutation actually changed the source', exitMutated !== src);
+  const exitMutPath = join(dir, 'landing-exit-mut.mjs');
+  writeFileSync(exitMutPath, exitMutated);
+  const { landingExit: mutExit } = await import(exitMutPath);
+  check('mutation exit(4) -> exit(0) on the failure branch is caught',
+    mutExit(timedOut) !== 4, 'the mutant still returned 4 — the mapping is not exercised');
 
   console.log(failures ? `\n${failures} FAILED` : '\nall ok');
   process.exit(failures ? 1 : 0);
