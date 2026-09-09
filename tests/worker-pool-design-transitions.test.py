@@ -37,26 +37,58 @@ def legacy_artifact_path(instance, phase, task):
     return f"{instance}.admit.{task}" + (".claimed" if phase == "claimed" else "")
 
 
-class _Dirs(set):
-    """A set that reports its own mutations, so an in-place change is traced too."""
-    def __init__(self, owner): super().__init__(); self._o = owner
-    def add(self, v): self._o._op(("phase_dirs+", v)); return super().add(v)
-    def discard(self, v): self._o._op(("phase_dirs-", v)); return super().discard(v)
-    def clear(self): self._o._op(("phase_dirs.clear",)); return super().clear()
+class _RecSet(set):
+    """A set whose every mutation is traced, including bulk and replacement."""
+    def __init__(self, owner, name, it=()): super().__init__(it); self._o, self._n = owner, name
+    def _ev(self, op, *a): self._o._op((f"{self._n}.{op}", *a))
+    def add(self, v): self._ev("add", v); return super().add(v)
+    def discard(self, v): self._ev("discard", v); return super().discard(v)
+    def remove(self, v): self._ev("remove", v); return super().remove(v)
+    def pop(self): self._ev("pop"); return super().pop()
+    def clear(self): self._ev("clear"); return super().clear()
+    def update(self, *a): self._ev("update", *[sorted(x) for x in a]); return super().update(*a)
+    def difference_update(self, *a):
+        self._ev("difference_update", *[sorted(x) for x in a]); return super().difference_update(*a)
+    def intersection_update(self, *a):
+        self._ev("intersection_update", *[sorted(x) for x in a]); return super().intersection_update(*a)
+
+
+class _RecDict(dict):
+    """A dict whose every mutation is traced; an add+delete pair cannot cancel."""
+    def __init__(self, owner, name, it=()): super().__init__(it); self._o, self._n = owner, name
+    def _ev(self, op, *a): self._o._op((f"{self._n}.{op}", *a))
+    def __setitem__(self, k, v): self._ev("set", k, v); return super().__setitem__(k, v)
+    def __delitem__(self, k): self._ev("del", k); return super().__delitem__(k)
+    def pop(self, *a): self._ev("pop", *a[:1]); return super().pop(*a)
+    def popitem(self): self._ev("popitem"); return super().popitem()
+    def setdefault(self, k, d=None): self._ev("setdefault", k, d); return super().setdefault(k, d)
+    def update(self, *a, **kw): self._ev("update", sorted(dict(*a, **kw).items())); return super().update(*a, **kw)
+    def clear(self): self._ev("clear"); return super().clear()
 
 
 class Disk:
-    # Every durable write appends here and nothing removes an entry, so a
-    # compensating restore leaves the trace longer than a true no-op's.
+    # EVERY modeled durable field, scalar or container. Nothing removes a trace
+    # entry, so an add+delete pair cannot cancel the way terminal state does.
     DURABLE = ("spent", "token", "journal", "journal_at", "claimed_rec",
-               "claimed_at", "admit_dir", "tombstone", "token_at", "request")
+               "claimed_at", "admit_dir", "tombstone", "token_at", "request",
+               "claims", "record", "probation", "results", "writers",
+               "live_owners", "phase_dirs", "computed_at", "torn")
+    _SETS = ("phase_dirs", "results", "writers", "live_owners")
+    _DICTS = ("claims", "record", "probation")
 
     def _op(self, ev):
         object.__getattribute__(self, "ops").append(ev)
 
     def __setattr__(self, k, v):
+        # Wholesale replacement of a container is itself a durable write, and the
+        # replacement must keep recording or later mutations go untraced.
+        if k in Disk._SETS and not isinstance(v, _RecSet):
+            v = _RecSet(self, k, v or ())
+        elif k in Disk._DICTS and not isinstance(v, _RecDict):
+            v = _RecDict(self, k, v or {})
         if k in Disk.DURABLE and "ops" in self.__dict__:
-            self._op((k, v if not isinstance(v, set) else sorted(v)))
+            self._op((k, sorted(v) if isinstance(v, (set, frozenset))
+                      else sorted(v.items()) if isinstance(v, dict) else v))
         object.__setattr__(self, k, v)
 
     def __init__(self):
@@ -68,7 +100,7 @@ class Disk:
         self.spent = False            # created BEFORE the token leaves; never moves
 
         self.tombstone = None         # <instance>.admit.retired.<verdict>: verdict rides the name
-        self.phase_dirs = _Dirs(self)  # which of held/ claimed/ EXIST -- a rename needs its parent
+        self.phase_dirs = set()       # which of held/ claimed/ EXIST -- a rename needs its parent
 
         self.torn = False             # a promotion lands between two directory reads
         self.token, self.journal, self.claimed_rec = False, None, None   # token / held/<t> / claimed/<t>

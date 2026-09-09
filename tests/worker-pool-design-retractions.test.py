@@ -216,7 +216,9 @@ def _line_kind(line):
     if len(lead) >= 4:
         return "code", len(lead), 0
     qdepth = marks.count(">")
-    inner = len(body) - len(body.lstrip())
+    # Spaces BEFORE the marker are the list's nesting depth; eating them into
+    # `lead` reported a two-space-nested item as top level.
+    inner = len(lead) + (len(body) - len(body.lstrip()))
     if inner >= 4 and qdepth == 0:
         return "code", inner, 0
     st = body.lstrip()
@@ -259,7 +261,13 @@ def semantic_units(doc):
         while (j < len(lines) and _line_kind(lines[j])[0] == "table"
                and _line_kind(lines[j])[2] == q0):
             j += 1
-        if any(_sep(lines[i]) for i in range(k, j)):
+        # GFM: the delimiter must FOLLOW the header immediately and match its
+        # cell count; any-delimiter-anywhere accepted a one-cell row and a swap.
+        def _cells(l):
+            b = re.sub(r"^ *(?:> ?)*", "", l).strip().strip("|")
+            return len(b.split("|"))
+        if (j - k >= 2 and _sep(lines[k + 1]) and not _sep(lines[k])
+                and _cells(lines[k]) == _cells(lines[k + 1])):
             for i in range(k, j):
                 table_ok[i] = True
         k = j
@@ -285,7 +293,7 @@ def semantic_units(doc):
             kind = "para"
         # Only a plain line CONTINUES a paragraph or list item. A heading or
         # table row always opens its own unit, and never absorbs the prose under it.
-        cont = (meta is not None and quoted == meta["quoted"]
+        cont = (meta is not None and qdepth == meta["qdepth"]
                 and kind == "para" and meta["kind"] in ("para", "list"))
         if not cont:
             flush(); meta = {"kind": kind, "depth": depth, "quoted": quoted, "qdepth": qdepth}
@@ -303,6 +311,21 @@ def _holders(doc, anchor, quoted=None):
     return [(k, u) for k, u in enumerate(semantic_units(doc))
             if anchor in normalized(u["text"])
             and (quoted is None or u["quoted"] == quoted)]
+
+
+def unit_ordinal(doc, anchor, heading, quoted=None):
+    """The unit's INDEX among the units of its own section.
+
+    Neighbours are preserved when a whole run of siblings moves together, so
+    one-hop locality cannot see a block relocated intact inside its own section.
+    """
+    sec = section_of(doc, heading)
+    units = [u for u in semantic_units(sec)]
+    hits = [k for k, u in enumerate(units)
+            if anchor in normalized(u["text"])
+            and (quoted is None or u["quoted"] == quoted)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} units in {heading!r}, not 1"
+    return hits[0], len(units)
 
 
 def semantic_unit(doc, anchor, quoted=None):
@@ -1762,7 +1785,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
-                    "next": "- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary."
+                    "next": "- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.",
+                    "ordinal": [
+                            5,
+                            9
+                    ]
             },
             {
                     "anchor": "a FOURTH source, not one of the three",
@@ -1772,7 +1799,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "- **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C proof it was described as.** The model stacks owner names rather than holding two simultaneously live claimants, so it cannot express the schedule this obligation is about; the row is STATED, not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect, and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found this bullet still claiming a result the retraction below had already withdrawn.",
-                    "next": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings."
+                    "next": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings.",
+                    "ordinal": [
+                            4,
+                            9
+                    ]
             },
             {
                     "anchor": "One owner, not \"sidecar or wrapper\"",
@@ -1782,7 +1813,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with \"a worker too broken to write its own record is simply never eligible\" \u2014 a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |",
-                    "next": "| routing exclusion | a quiesced instance is skipped at claim time (not \"in `instances` order\" \u2014 the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |"
+                    "next": "| routing exclusion | a quiesced instance is skipped at claim time (not \"in `instances` order\" \u2014 the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |",
+                    "ordinal": [
+                            17,
+                            23
+                    ]
             },
             {
                     "anchor": "`exclusions` is not why the binding unit is a room",
@@ -1792,7 +1827,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "**Status:** design, owner-decided 2026-09-03 (PR-triage room). This is step 1 of staging #3604 into PRs against `main`; #3604 stays open as the reference implementation and is not merged as one piece. It supersedes the \"lead = the runtime daemon\" and \"lead-managed sizing\" placements in #3604's `docs/lead-follower-pool.md` and Decision 4 of [`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), and Decision 5 of that record (the unclaimed-work backstop belongs to the lead; followers stay purely event-driven) \u2014 superseded because it sites the backstop on a lead this design no longer has, not because its reasoning was wrong; see **The reconciliation ticker**, which answers its O(N) objection rather than dropping it.",
-                    "next": "## The protocol claims NOT established by this document \u2014 they are open obligations"
+                    "next": "## The protocol claims NOT established by this document \u2014 they are open obligations",
+                    "ordinal": [
+                            2,
+                            448
+                    ]
             },
             {
                     "anchor": "work stays PENDING only when EVERY bound member is ineligible",
@@ -1802,7 +1841,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
-                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant.",
+                    "ordinal": [
+                            13,
+                            78
+                    ]
             },
             {
                     "anchor": "no UNBOUND worker stands in",
@@ -1812,7 +1855,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "depth": 0,
                     "qdepth": 0,
                     "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
-                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant.",
+                    "ordinal": [
+                            13,
+                            78
+                    ]
             }
     ]
 
@@ -1842,6 +1889,13 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
             sec = normalized(section_of(doc, q["heading"]))
             self.assertIn(u["text"], sec,
                 f"{q['anchor']!r} left the {q['heading']!r} section")
+            # Neighbours survive when a whole run of siblings moves together, so
+            # position inside the section is pinned as well.
+            self.assertEqual(list(unit_ordinal(doc, q["anchor"], q["heading"], False)),
+                             q["ordinal"],
+                f"{q['anchor']!r}: moved within its section, or the section's unit "
+                f"count changed -- an intact block relocated inside its own H2 "
+                f"keeps every neighbour and is invisible to one-hop locality")
 
 
 class EverySensitiveSiteIsOneTable(unittest.TestCase):
@@ -1944,7 +1998,7 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "**That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the verdict scalar live in the pool-status record \u2014 a different object, with its own write \u2014 so retirement is TWO durable writes and has a seam whichever order they take. Neither order is safe on its own, and the two fail in opposite directions:",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0,
+                    "depth": 3,
                     "qdepth": 1
             },
             {
@@ -1957,7 +2011,7 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "``` kick -> sweep -> worker probation held across the sweep; worker admits 1 (was: wedged, 0, 5) kick -> worker -> sweep worker admits 1, not 4; sweep sees probation, holds (was: eligible, 4, 1) kick -> multi-task backlog one token consumed; 4 stay pending event arrives in probation event path hits the same gate; admit already 0 -> pending crash after publish, before token next sweep re-issues the token; worker admits 1 crash after mkdir, worker gated no token exists to consume; the sweep finishes issuance once worker never reaches its gate window from `since` elapses -> wedged, allowance removed crash between R1 and R2 the tombstone is recognised; R2 replays, nothing is minted retirement races a live worker family moves under it; promotion ENOENTs, no second admission claimed, unfinished past window window from claimed/<task_id> elapses -> wedged ```",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0,
+                    "depth": 3,
                     "qdepth": 0
             }
     ]
