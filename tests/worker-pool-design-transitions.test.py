@@ -1206,15 +1206,21 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         defect is in the SCHEDULING seam, which final state cannot see.
 
         His discriminating schedule, verbatim. With the switch, the second owner
-        does the work and the crash lands before the claim is PROMOTED into the
-        admission journal -- the task claim `claims={'t1': 'p1'}` is already there,
-        and `claimed_rec` is what is absent. Without the switch the first owner
-        keeps acting, so the journal record survives and the token is spent."""
+        does the work and the crash lands before the HELD ADMISSION JOURNAL is
+        promoted to `claimed_rec`. Order matters and I had it backwards twice:
+        the token becomes the held journal FIRST, step 2 then acquires the task
+        claim, and `claimed_rec` is the PROMOTED ADMISSION RECORD -- not a "claim
+        record", and a claim is never "promoted into the journal"."""
         _, claimed, _, d = run(["kick", "sweep", "worker", "second_owner", "worker"],
                                mode="crash_after_claim")
         self.assertEqual(claimed, 0)
+        # Deleting the surviving live-other claim left 83/83 green with
+        # `claims={}`: the state was described, never pinned.
+        self.assertEqual(d.claims, {"t1": "p1"},
+            "the other owner's live claim must SURVIVE the crash")
+        self.assertIsNone(d.journal, "the journal must not be written before the crash")
         self.assertIsNone(d.claimed_rec,
-            "a claim record here means the FIRST owner was still acting")
+            "a promoted admission record here means the FIRST owner was still acting")
         self.assertTrue(d.token, "the token must be unspent when the switch happens")
 
     def test_three_OWNERS_coexist_and_the_run_ENDS_with_one_claim(self):
@@ -1231,8 +1237,9 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         _, _, _, d = run(["kick", "sweep", "worker", "second_owner", "third_owner"])
         self.assertEqual(d.live_owners, {"p1", "p-b", "p-c"})
         self.assertEqual(d.claims, {"t1": "p1"},
-            "one claim, held by the FIRST owner -- A/B/C needs TWO SIMULTANEOUS "
-            "claims across three actors, and one claim cannot express that")
+            "one PERSISTENT terminal claim, held by the FIRST owner -- A/B/C needs "
+            "TWO SIMULTANEOUS claims across three actors. A transient add/delete "
+            "claim is correctly outside this terminal assertion.")
 
     def test_restart_still_drops_the_previous_owner(self):
         """The existing semantics must NOT have changed -- this is a refactor."""

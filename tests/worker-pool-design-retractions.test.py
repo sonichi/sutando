@@ -15,6 +15,43 @@ def normalized(doc):
     return re.sub(r"\s+", " ", re.sub(r"^\s*>+\s?", "", doc, flags=re.M)).strip()
 
 
+def section_of(doc, heading_fragment):
+    """The ONE section whose heading contains `heading_fragment`, to the next
+    heading of the same or higher level.
+
+    keweichen at e50715ee: every locator here was document-GLOBAL, so it checked
+    that a passage EXISTS and is UNIQUE, never that it is where it belongs.
+    Moving a complete valid callout to EOF passed 110/110 three separate ways.
+    """
+    lines = doc.split("\n")
+    starts = [(i, len(m.group(1)))
+              for i, l in enumerate(lines)
+              for m in [re.match(r"^(#{1,6}) ", l)] if m and heading_fragment in l]
+    if len(starts) != 1:
+        raise AssertionError(
+            f"{heading_fragment!r} names {len(starts)} headings; a section-bound "
+            f"check cannot pick one of several")
+    start, level = starts[0]
+    for j in range(start + 1, len(lines)):
+        m = re.match(r"^(#{1,6}) ", lines[j])
+        if m and len(m.group(1)) <= level:
+            return "\n".join(lines[start:j])
+    return "\n".join(lines[start:])
+
+
+def sole_para_normalized(text, needle):
+    """The ONE paragraph whose NORMALIZED form holds `needle`.
+
+    Blockquote nesting means a raw paragraph never contains the collapsed
+    sentence, so matching must happen after normalization, per paragraph.
+    """
+    hits = [p for p in re.split(r"\n\s*\n", text) if needle in normalized(p)]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{needle!r} matches {len(hits)} paragraphs in this scope")
+    return hits[0]
+
+
 def blockquote_blocks(doc):
     """Every maximal run of consecutive blockquote lines.
 
@@ -1277,14 +1314,18 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertIn("open obligations", f)
         self.assertIn("NOT established by this document", f)
 
-    # Each contested site, keyed by a phrase only ITS callout carries. A count
-    # cannot name which one went missing, and four of the five share a heading.
+    # site -> (enclosing section, phrase only ITS callout carries); a global
+    # count cannot name which one went missing.
     DISPUTED_SITES = {
-        "removal order":  "two incompatible normative orders appear and neither is marked primary",
-        "request gate":   "is a READ, not a claim fence",
-        "one allowance":  "One allowance can still yield two live task claims",
-        "probation clock":"This window names three clock sources and the model returns a fourth",
-        "retirement seam":"nor its serialization against a racing admission",
+        "removal order":   ("The reconciliation ticker",
+                            "two incompatible normative orders appear and neither is marked primary"),
+        "request gate":    ("Coordination contract", "is a READ, not a claim fence"),
+        "one allowance":   ("Coordination contract",
+                            "One allowance can still yield two live task claims"),
+        "probation clock": ("Coordination contract",
+                            "This window names three clock sources and the model returns a fourth"),
+        "retirement seam": ("Coordination contract",
+                            "nor its serialization against a racing admission"),
     }
 
     def test_every_contested_SITE_carries_a_local_disputed_marker(self):
@@ -1295,17 +1336,18 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         with 109/109 still green -- the assertion could see that markers exist
         and never which site lost one. Pin each site by its own text."""
         d = DOC.read_text()
-        for site, phrase in self.DISPUTED_SITES.items():
-            self.assertIn(phrase, d, f"the {site} site lost its local DISPUTED callout")
-            # Bind the two in ONE paragraph: a detached marker elsewhere keeps
-            # both the phrases and the global count intact.
-            blocks = [b for b in blockquote_blocks(d) if phrase in b]
+        for site, (heading, phrase) in self.DISPUTED_SITES.items():
+            sec = section_of(d, heading)
+            self.assertIn(phrase, sec,
+                f"the {site} site left the {heading!r} section -- moving a valid "
+                f"callout elsewhere leaves the passage it qualifies uncaveated")
+            blocks = [b for b in blockquote_blocks(sec) if phrase in b]
             self.assertEqual(len(blocks), 1,
-                f"the {site} site should have exactly ONE callout carrying its text; "
+                f"the {site} site needs exactly ONE callout in its own section; "
                 f"found {len(blocks)}")
             self.assertIn("DISPUTED — see", blocks[0],
-                f"the {site} site keeps its text but its own CALLOUT lost the marker; "
-                f"a marker moved to the obligations index does not warn a reader here")
+                f"the {site} callout lost its marker; one counted elsewhere in the "
+                f"document does not warn a reader here")
         self.assertEqual(self._flat().count("DISPUTED — see"), len(self.DISPUTED_SITES),
             "a site was added or removed without updating DISPUTED_SITES")
 
@@ -1317,7 +1359,8 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         d = DOC.read_text()
         # ONE paragraph, found by a phrase unique to the operative passage: the
         # previous form asked a SECOND locator whether the caveat existed at all.
-        para = normalized(sole_para_holding(d, "The orderings this must hold under"))
+        para = normalized(sole_para_normalized(
+            section_of(d, "Coordination contract"), "The orderings this must hold under"))
         for required in ("EXPRESSES", "it does not pin every one of them",
                          "STATED, not proven"):
             self.assertIn(required, para,
@@ -1413,14 +1456,17 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
         self.assertIn("last-worker removal order", row[0],
             "the row must name the obligation that blocks it")
 
-    # The exact operative SENTENCE, not an anchor plus a list of forbidden
-    # spellings: keweichen evaded the pattern list with "(5 total)".
+    # The exact operative SENTENCE with the section that must contain it; a
+    # list of forbidden spellings was evaded by "(5 total)".
     COUNT_FREE_SENTENCES = (
-        "It does NOT carry proofs for the items below.",
-        "The last-worker removal order below is one of them: two incompatible "
-        "normative orders appear and neither is marked primary.",
-        "The green tests here move none of them: passing at head is silent on "
-        "whether anything fails under the alternative.",
+        ("The protocol claims NOT established by this document",
+         "It does NOT carry proofs for the items below."),
+        ("The reconciliation ticker",
+         "The last-worker removal order below is one of them: two incompatible "
+         "normative orders appear and neither is marked primary."),
+        ("Staged PRs against main",
+         "The green tests here move none of them: passing at head is silent on "
+         "whether anything fails under the alternative."),
     )
 
     def test_the_count_free_passages_are_pinned_SENTENCE_EXACT(self):
@@ -1428,13 +1474,23 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
         spellings were banned and a fourth walked through. Pinning the whole
         sentence inverts it: any inserted count changes the sentence, whatever
         its wording, and a decoy copy is caught by the uniqueness check."""
-        n = normalized(self._doc())
-        for sentence in self.COUNT_FREE_SENTENCES:
-            self.assertIn(sentence, n,
-                f"the operative sentence changed; a count was probably inserted:\n  {sentence}")
-            self.assertEqual(n.count(sentence), 1,
-                f"{sentence!r} appears more than once, so a guard cannot say which "
-                f"one it read")
+        doc = self._doc()
+        WORDS = ("one", "two", "three", "four", "five", "six", "seven",
+                 "eight", "nine", "ten")
+        num = "|".join(WORDS)
+        for heading, sentence in self.COUNT_FREE_SENTENCES:
+            sec = section_of(doc, heading)
+            self.assertIn(sentence, normalized(sec),
+                f"the operative sentence left the {heading!r} section")
+            self.assertEqual(normalized(doc).count(sentence), 1,
+                f"{sentence!r} also appears elsewhere -- a relocated decoy copy "
+                f"satisfies a global pin while the operative passage rots")
+            # The count sits BESIDE the sentence, so the paragraph is the unit.
+            para = normalized(sole_para_normalized(sec, sentence[:34])).lower()
+            for pat in (rf"\bof (?:the |them )?({num})\b", rf"\ball ({num}|\d+) ",
+                        rf"\b({num}|\d+) (items|tests|obligations|proofs)\b"):
+                self.assertNotRegex(para, pat,
+                    f"the paragraph holding {sentence[:30]!r} states a set size")
 
 
 if __name__ == "__main__":
