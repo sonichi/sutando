@@ -1,8 +1,11 @@
 # Worker pool — design (v1)
 
-**Status:** normative, owner-decided 2026-09-08/09. Step 1 of staging #3604 into
-PRs against `main`; #3604 stays open as reference and is not merged as one piece.
-Carries the requirements of #3860 and the protocol of #3314. The record behind each
+**Status:** normative, owner-decided 2026-09-08/09. Still **step 1 of staging #3604**
+into PRs against `main` — the *plan* is #3604's; the *code* is not. Implementation
+targets `main` directly and **starts with no luggage** (owner, 2026-09-09): nothing
+is ported from the rescue line, which is the **reference implementation** — read for
+what it learned, never merged, based on, or reconciled first. Carries the
+requirements of #3860 and the protocol of #3314. The record behind each
 decision is [`worker-pool-design-notes.md`](worker-pool-design-notes.md), which is
 not normative: where the two disagree, this file wins.
 
@@ -360,6 +363,11 @@ Sub-agent activity counts as progress. A future-dated beat counts as stale.
 
 ### Stage 1 — single-core delivery, no routing
 
+**No luggage.** New code on `main`, written to this document, against what `main`
+actually has: `watch-tasks-stream.sh`, the Task Bridge, and the core. The rescue line
+is consulted the way a reference is — for the failures it already paid for, named in
+the notes — and nothing is carried across.
+
 Scope: keep one recipient, `core`. Move its intake to `deliveries/core/`, give the watcher a supervision unit, add the boot sweep and residue rules.
 
 Acceptance, all four required:
@@ -381,6 +389,14 @@ Acceptance:
 - A missing roster refuses rather than defaulting to the core.
 - Concurrent claim and release leave exactly one winner, the loser seeing `OSError`.
 - Removing the last worker returns the install to the Stage 1 state, and the same code runs in both directions.
+
+### The rescue line
+
+The pool running today lives on an unmerged rescue branch in a separate checkout,
+carrying the affinity-era `state/pool/` this design retires. It is the reference,
+not the base. Two consequences, accepted deliberately: it diverges further while
+Stage 1 lands on `main`, and retiring the hosts running it is its own change,
+sequenced after Stage 1 proves out. Nothing here is blocked on it.
 
 ### Migration
 

@@ -73,6 +73,17 @@ REJECTED = [
      "A scheduling loop inside a worker",
      "a proactive loop inside a worker. Its crons are allowed; a self-driven "
      "loop that selects work is not."),
+    (r"task-event-handler-claims|task-event-handler-fallbacks"
+     r"|claims?/ *(?:and|\+) *(?:accepts|receipts|fallbacks)"
+     r"|(?:claim|accept|receipt) (?:file|marker|token) "
+     r"(?:is|means|marks|records|indicates)",
+     "renaming it claims",
+     "a second claim protocol expressed through separate claim, fallback and "
+     "receipt files. Several writers expressing one state through different "
+     "files is the defect; one atomically renamed record is the answer. Note "
+     "`watch-tasks-stream.sh` implements exactly this behind "
+     "SUTANDO_TASK_EVENT_HANDLER — the hook is fine, the protocol it starts "
+     "is not this design's."),
     (r"pool supervisor|the router (?:schedules|is the scheduler)",
      "router",
      "the scheduler framing. Owner decision 2026-09-08: the scheduler is a "
@@ -199,8 +210,9 @@ _PROBES = {
     REJECTED[6][0]: "The submitting client sets target_worker in the header and the queue honours it.",
     REJECTED[7][0]: "The placement pass hands the ticket to the least-loaded seat currently under its cap.",
     REJECTED[8][0]: "Each worker runs a per-worker proactive loop that wakes on a timer to look for work.",
-    REJECTED[9][0]: "The pool supervisor is the sole scheduler and holds every lease.",
-    REJECTED[10][0]: "Placement renames the task file so the assignment is a rename of the payload itself.",
+    REJECTED[9][0]: "A claim file marks that a seat took the ticket, and a receipt file records that it finished.",
+    REJECTED[10][0]: "The pool supervisor is the sole scheduler and holds every lease.",
+    REJECTED[11][0]: "Placement renames the task file so the assignment is a rename of the payload itself.",
 }
 
 
