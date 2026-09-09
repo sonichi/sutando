@@ -1232,11 +1232,41 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertIn("open obligations", f)
         self.assertIn("NOT established by this document", f)
 
+    # Each contested site, keyed by a phrase only ITS callout carries. A count
+    # cannot name which one went missing, and four of the five share a heading.
+    DISPUTED_SITES = {
+        "removal order":  "two incompatible normative orders appear and neither is marked primary",
+        "request gate":   "is a READ, not a claim fence",
+        "one allowance":  "One allowance can still yield two live task claims",
+        "probation clock":"This window names three clock sources and the model returns a fourth",
+        "retirement seam":"nor its serialization against a racing admission",
+    }
+
     def test_every_contested_SITE_carries_a_local_disputed_marker(self):
         """worker-2: the obligations section was the ONLY place in 1971 lines
-        carrying the caveat, so a reader landing mid-document never sees it."""
-        self.assertGreaterEqual(self._flat().count("DISPUTED — see"), 4,
-            "each contested site needs its own inline pointer, not just the index")
+        carrying the caveat, so a reader landing mid-document never sees it.
+
+        keweichen at 67bc8db7: a `>= 4` count let the FIFTH callout be deleted
+        with 109/109 still green -- the assertion could see that markers exist
+        and never which site lost one. Pin each site by its own text."""
+        f = self._flat()
+        for site, phrase in self.DISPUTED_SITES.items():
+            self.assertIn(phrase, f, f"the {site} site lost its local DISPUTED callout")
+        self.assertEqual(f.count("DISPUTED — see"), len(self.DISPUTED_SITES),
+            "a site was added or removed without updating DISPUTED_SITES")
+
+    def test_the_model_is_described_as_STATED_not_proven(self):
+        """keweichen at 67bc8db7: flipping this passage into a claim that the model
+        pins every ordering also passed 109/109. It is the disclosure that keeps a
+        green run from being read as coverage, so it needs its own pin -- and the
+        overclaim it must reject needs naming, not just the wording it must keep."""
+        f = self._flat()
+        self.assertIn("it does not pin every one of them", f)
+        self.assertIn("STATED, not proven", f)
+        for overclaim in ("pins every one of them",
+                          "proven, not merely stated",
+                          "the model pins every ordering"):
+            self.assertNotIn(overclaim, f, f"the disclosure was inverted into {overclaim!r}")
 
     def test_the_probation_clock_names_a_NORMATIVE_source(self):
         """[P2] asked which of the three is normative; naming three and picking none
@@ -1350,6 +1380,78 @@ class TheStageGateCarriesThisLayersObligations(unittest.TestCase):
         merge would silently drop them the way the first merge did."""
         g = self._gate()
         self.assertIn("added by this layer", g)
+
+
+
+class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
+    """keweichen at bb4578d6: deleting the fifth obligation, its Step 3/4 mappings,
+    or the membership-prerequisite row left all 105 parent tests green. I added
+    gate-scoped pins to the CHILD for the child's additions and never mirrored them
+    here, so the parent's own additions were unpinned — the same defect, one branch
+    over."""
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def _gate(self):
+        raw = self._doc()
+        start = raw.index("### STAGE GATE")
+        out = []
+        for line in raw[start:].split("\n"):
+            if line.startswith(">") or (not line.strip() and out):
+                if not line.strip() and out and not out[-1].startswith(">"):
+                    break
+                out.append(line)
+            elif out:
+                break
+        return "\n".join(out)
+
+    def test_retirement_crash_completeness_is_an_obligation(self):
+        self.assertIn("Retirement is not crash-complete", self._doc(),
+            "keweichen's finding 1 was covered by none of the original four")
+
+    def test_retirement_gates_BOTH_step_3_and_step_4(self):
+        g = self._gate()
+        rows = {n: [l for l in g.split("\n") if l.startswith(f"> | {n} ")] for n in (3, 4)}
+        for n in (3, 4):
+            self.assertTrue(rows[n], f"no step {n} row in the gate")
+            self.assertIn("retirement crash-completeness", rows[n][0],
+                f"step {n} performs the retirement rename; its row must gate it")
+
+    def test_the_membership_prerequisite_has_its_own_gate_row(self):
+        """It lands BEFORE step 2 and ships the disputed commit-then-notify order,
+        so gating it only at step 4 lets the unsettled rule ship ahead of the step
+        nominally gating it."""
+        g = self._gate()
+        row = [l for l in g.split("\n") if l.startswith("> | membership prerequisite")]
+        self.assertTrue(row, "the prerequisite needs its own row, not step 4's")
+        self.assertIn("last-worker removal order", row[0],
+            "the row must name the obligation that blocks it")
+
+    # The passages that have each carried a stale count. Scoped, because a
+    # document-wide numeric ban would fight every legitimate figure in it.
+    COUNT_FREE = ("proofs for the items below",
+                  "The last-worker removal order below is one of them:",
+                  "The green tests here move none of")
+
+    def test_the_count_free_passages_reject_ANY_number_not_just_the_old_one(self):
+        """keweichen at 67bc8db7: banning the string 'four' let 'five' through, so
+        the guard tracked one wrong wording instead of the rule. Assert the exact
+        intended forms are PRESENT -- a count of any size displaces them -- and
+        that no digit or number-word survives inside those passages."""
+        d = self._doc()
+        WORDS = ("one", "two", "three", "four", "five", "six", "seven",
+                 "eight", "nine", "ten")
+        for phrase in self.COUNT_FREE:
+            self.assertIn(phrase, d,
+                f"the count-free form {phrase!r} is gone -- a number likely replaced it")
+            self.assertNotRegex(phrase, r"\d", f"{phrase!r} carries a digit")
+            # Ban the SET-SIZE count, not the number-words: "one of them" is
+            # durable, "one of the four" is what went stale twice.
+            num = "|".join(WORDS)
+            for pat in (rf"\bof the ({num})\b", rf"\b({num}) (items|tests|obligations|proofs)\b"):
+                self.assertNotRegex(phrase.lower(), pat,
+                    f"{phrase!r} states the set size, which re-stales on every change")
 
 
 if __name__ == "__main__":
