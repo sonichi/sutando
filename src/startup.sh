@@ -976,8 +976,8 @@ else
   echo "  ✓ screen capture (already running)"
 fi
 
-# 5a. Sutando Server (SCP WSS :8787) + voice host (:8788) — the companion/
-# wearable chain. Opt-in via SUTANDO_SCP_WSS_ENABLE=1 in .env; the voice host
+# 5a. Sutando Server (SCP WebSocket :8787, cleartext ws://) + voice host
+# (:8788) — the companion/wearable chain. Opt-in via SUTANDO_SCP_WSS_ENABLE=1 in .env; the voice host
 # additionally needs GEMINI_API_KEY (voice.open fail-softs without it).
 if [ "${SUTANDO_SCP_WSS_ENABLE:-0}" = "1" ]; then
   if ! lsof -i :8788 > /dev/null 2>&1; then
