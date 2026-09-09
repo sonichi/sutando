@@ -1218,7 +1218,9 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         # `claims={}`: the state was described, never pinned.
         self.assertEqual(d.claims, {"t1": "p1"},
             "the other owner's live claim must SURVIVE the crash")
-        self.assertIsNone(d.journal, "the journal must not be written before the crash")
+        self.assertIsNone(d.journal,
+            "the journal WAS written at gate step 1b and must not SURVIVE the "
+            "second owner's live-other rollback -- it is cleared, not never-written")
         self.assertIsNone(d.claimed_rec,
             "a promoted admission record here means the FIRST owner was still acting")
         self.assertTrue(d.token, "the token must be unspent when the switch happens")
@@ -1229,11 +1231,11 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         OWNER names and a single claim, so the name asserted the very thing P1.3
         needs and the model cannot do.
 
-        Both states are pinned EXACTLY, not by membership: keweichen measured that
-        adding real shadow claims left all 82 tests green, so a model that grew the
-        ability to hold three claims would have silently satisfied a suite still
-        describing itself as unable to. Whichever way this changes -- the limitation
-        lifted, or a claim leaking in -- it now fails here and gets decided."""
+        SCOPE, stated because the previous docstring over-promised: this observes
+        PERSISTENT TERMINAL state only. A persistent second claim fails here; a
+        transient add/delete second claim passes, correctly, and is the narrower
+        assertion below. A/B/C needs TWO SIMULTANEOUS claims across three actors --
+        not three claims, which is what the old wording said."""
         _, _, _, d = run(["kick", "sweep", "worker", "second_owner", "third_owner"])
         self.assertEqual(d.live_owners, {"p1", "p-b", "p-c"})
         self.assertEqual(d.claims, {"t1": "p1"},

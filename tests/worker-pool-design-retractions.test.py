@@ -163,6 +163,45 @@ RETRACTED = [
 ]
 
 
+def operative_block(doc, anchor, quoted=False):
+    """The ONE complete unit holding `anchor` -- a quote block if `quoted`, else a
+    paragraph. Returned NORMALIZED so it can be compared for equality."""
+    if quoted:
+        units, cur = [], []
+        for line in doc.split("\n"):
+            if line.lstrip().startswith(">"):
+                cur.append(line)
+            elif cur:
+                units.append("\n".join(cur)); cur = []
+        if cur:
+            units.append("\n".join(cur))
+    else:
+        units = re.split(r"\n\s*\n", doc)
+    hits = [u for u in units if anchor in u]
+    if len(hits) != 1:
+        raise AssertionError(f"{anchor!r} is in {len(hits)} units, not 1")
+    return normalized(hits[0])
+
+
+def neighbours(doc, anchor, quoted=False):
+    """(previous, next) paragraphs, normalized -- relocation changes these even
+    when the block itself and its section are untouched.
+
+    `quoted` selects the blockquote occurrence: this anchor also appears in the
+    obligations list, and taking the first match read THAT -- the same first-match
+    defect these pins exist to close, reintroduced in the helper closing it.
+    """
+    paras = re.split(r"\n\s*\n", doc)
+    hits = [k for k, p in enumerate(paras) if anchor in p
+            and (p.lstrip().startswith(">") if quoted else True)]
+    if len(hits) != 1:
+        raise AssertionError(f"{anchor!r} matches {len(hits)} units (quoted={quoted})")
+    i = hits[0]
+    prev = normalized(paras[i - 1]) if i else ""
+    nxt = normalized(paras[i + 1]) if i + 1 < len(paras) else ""
+    return prev, nxt
+
+
 def live_hits(text, phrase):
     """Lines asserting `phrase`, excluding those narrating its retraction.
 
@@ -1491,6 +1530,85 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
                         rf"\b({num}|\d+) (items|tests|obligations|proofs)\b"):
                 self.assertNotRegex(para, pat,
                     f"the paragraph holding {sentence[:30]!r} states a set size")
+
+
+
+class OperativeBlocksAreEqualityPinnedAndLocal(unittest.TestCase):
+    """keweichen at a7d5d637: section_of() narrowed a document-global locator to a
+    SECTION-global one, and several sections are broad H2s. Same-section
+    relocation stayed green, and an added contradiction inside a valid block
+    stayed green, because every pin still asked about a PHRASE.
+
+    His prescription, stated twice: full normalized block equality. Any insertion,
+    reword or contradiction changes the block; neighbours catch relocation that
+    leaves the block itself intact.
+    """
+
+    # Captured from the document, so a legitimate edit updates them deliberately.
+    BLOCKS = {
+        "intro_caveat": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
+        "stated": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
+        "disputed_request_gate": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit."
+}
+
+    ANCHORS = {
+        "intro_caveat": ("It does NOT carry proofs for the items below.", False),
+        "stated": ("The orderings this must hold under", False),
+        "disputed_request_gate": ("is a READ, not a claim fence", True),
+    }
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_each_operative_block_is_EQUAL_not_merely_containing(self):
+        doc = self._doc()
+        for name, (anchor, quoted) in self.ANCHORS.items():
+            self.assertEqual(operative_block(doc, anchor, quoted), self.BLOCKS[name],
+                f"the {name} block changed. Equality is the pin BECAUSE a phrase "
+                f"check accepts a sentence added beside it -- an appended count, "
+                f"or a contradiction inside the same block")
+
+    def test_the_intro_caveat_still_precedes_the_list_it_calls_BELOW(self):
+        """It says "the items below"; moved after them the sentence is false while
+        its own text is untouched."""
+        prev, nxt = neighbours(self._doc(), "It does NOT carry proofs for the items below.")
+        self.assertIn("The protocol claims NOT established by this document", prev)
+        self.assertIn("The request-or-directory gate is a READ", nxt)
+
+    def test_each_DISPUTED_callout_sits_ON_what_it_qualifies(self):
+        """Equality cannot see relocation: the block is byte-identical wherever it
+        lands. keweichen at a7d5d637 moved a valid callout within its own H2 and
+        every check stayed green, because sharing a section is not site locality."""
+        doc = self._doc()
+        for anchor, heading, follows in (
+            ("is a READ, not a claim fence",
+             "Coordination contract", "**Claim:** exclusivity is the watcher's hard-link claim"),
+        ):
+            prev, nxt = neighbours(doc, anchor, quoted=True)
+            self.assertIn(heading, prev,
+                f"the {anchor[:24]!r} callout no longer opens its section")
+            self.assertIn(follows, nxt,
+                f"the {anchor[:24]!r} callout is no longer ON the rule it disputes")
+
+    def test_the_stage_caveat_stays_INSIDE_the_quoted_stage_gate(self):
+        """Moving it out of the quote leaves it under the same H2 and stops it
+        qualifying the gate -- which is the whole reason it is written there."""
+        doc = self._doc()
+        gates = [b for b in [operative_block(doc, "### STAGE GATE", True)] if b]
+        self.assertTrue(gates, "no quoted STAGE GATE block")
+        self.assertIn("The green tests here move none of them", gates[0],
+            "the stage caveat left the quoted gate")
+
+    def test_a_located_block_carries_no_CONTRADICTION_of_its_own_claim(self):
+        """Equality already rejects an addition; this names the specific inversions
+        so a failure reads as what it is rather than as a diff."""
+        doc = self._doc()
+        stated = operative_block(doc, "The orderings this must hold under", False)
+        gate = operative_block(doc, "is a READ, not a claim fence", True)
+        for bad in ("CERTIFIES all orderings", "are all PROVEN", "rows as PROVEN"):
+            self.assertNotIn(bad, stated)
+        for bad in ("SETTLED", "proven correct"):
+            self.assertNotIn(bad, gate)
 
 
 if __name__ == "__main__":
