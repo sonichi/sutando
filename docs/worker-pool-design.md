@@ -592,13 +592,9 @@ it never takes it. No fallthrough to the core exists for a bound room.
 > **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
 
 **It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher
-owns it -- not the heartbeat, and not the core's sweep. It supersedes Decision 5 of
-[`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), which sited the
-unclaimed-work backstop on the LEAD and required followers to stay purely
-event-driven — a placement this design cannot use, because the lead-as-daemon it
-rests on is itself superseded at the top of this file. Decision 5's *cost* argument
-is not superseded and is answered rather than dropped: it is O(N) wakeups, where N is
-the number of workers deliberately created, and at N=0 there is no ticker at all.
+owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven.
+Its cost is O(N) wakeups, where N is the number of workers deliberately created,
+and at N=0 there is no ticker at all.
 
 **Activation.** The ticker exists only while the instance is a pool member. A default
 install has no pool, so nothing arms it, and `## The starting point is zero workers`
