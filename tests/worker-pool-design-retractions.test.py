@@ -204,6 +204,35 @@ def neighbours(doc, anchor, quoted=False):
     return prev, nxt
 
 
+
+def line_neighbours(doc, anchor):
+    """The nearest non-blank NON-quote lines before and after the quote block
+    holding `anchor`, normalized.
+
+    Paragraph splitting cannot isolate some callouts, which left two sites with
+    no location pin at all -- and a site pinned only by block+section survives
+    relocation anywhere inside a broad H2 (keweichen).
+    """
+    lines = doc.split("\n")
+    i = next(k for k, l in enumerate(lines) if anchor in normalized(l)
+             and l.lstrip().startswith(">"))
+    a = i
+    while a > 0 and lines[a - 1].lstrip().startswith(">"):
+        a -= 1
+    b = i
+    while b + 1 < len(lines) and lines[b + 1].lstrip().startswith(">"):
+        b += 1
+    def back(k):
+        while k >= 0 and not lines[k].strip():
+            k -= 1
+        return normalized(lines[k]) if k >= 0 else ""
+    def fwd(k):
+        while k < len(lines) and not lines[k].strip():
+            k += 1
+        return normalized(lines[k]) if k < len(lines) else ""
+    return back(a - 1), fwd(b + 1)
+
+
 def live_hits(text, phrase):
     """Lines asserting `phrase`, excluding those narrating its retraction.
 
@@ -1682,6 +1711,141 @@ class AnalogousQualifiersAreLineExactAndSectionBound(unittest.TestCase):
                 f"{q['anchor']!r} left the {q['heading']!r} section. A list item or "
                 f"table row moved out leaves its container short while the text "
                 f"still exists somewhere")
+
+
+
+class EverySensitiveSiteIsOneTable(unittest.TestCase):
+    """ONE table over every count-free passage and every DISPUTED site.
+
+    keweichen at a5022979: equality covered 3 representative units while
+    COUNT_FREE had 3 passages and DISPUTED had 5, and "the current parallel
+    tables already drifted" -- two of them named the SAME callout, which is what
+    a second table costs. Each row carries its block, its section, and its exact
+    neighbouring units, so mutation, relocation and contradiction are one check.
+    """
+
+    SITES = [
+        {
+                "key": "count:intro",
+                "anchor": "It does NOT carry proofs for the items below.",
+                "heading": "The protocol claims NOT established by this document",
+                "quoted": False,
+                "block": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
+                "prev": "## The protocol claims NOT established by this document \u2014 th",
+                "next": "- **The request-or-directory gate is a READ, not a claim fen",
+                "pin": "equality"
+        },
+        {
+                "key": "count:removal",
+                "anchor": "removal order below is one of them",
+                "heading": "The reconciliation ticker",
+                "quoted": True,
+                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of them: two incompatible normative orders appear and neither is marked primary.",
+                "prev": "### The reconciliation ticker",
+                "next": "**It is a THIRD periodic mechanism, and it is gated on pool ",
+                "pin": "equality"
+        },
+        {
+                "key": "count:stage",
+                "anchor": "The green tests here move none of",
+                "heading": "Staged PRs against main",
+                "quoted": True,
+                "block": "### STAGE GATE \u2014 steps 2, 3 and 4 are BLOCKED and must not be opened yet The [open obligations](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations) are not decided, and each one governs a protocol an implementing PR would have to encode. This gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the obligation covering it is open.** A step is unblocked when its obligation names ONE operative rule and the model suite contains a schedule that FAILS under the rejected alternative \u2014 a green suite that passes either way does not lift the gate, because that is the condition the obligations were filed under. **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control showing the same suite passes at head. As written without this, the rule was satisfiable by assertion \u2014 \"the suite discriminates\" is a claim about intent, and intent is what these obligations were filed against. Neither half can be produced by a suite that does not really discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite whose names implied it covered a defect stayed green, exit 0, when that precise bug was reintroduced. **A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent. | blocked step | obligation that blocks it | why that step cannot be written yet | |---|---|---| | 2 \u2014 worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is | | 3 \u2014 core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename \u2014 every site | | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify \u2014 that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates | | 4 \u2014 installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all | Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this document) is not gated \u2014 naming an open obligation is what it is for. **Provenance.** Two reviewers reached these sites independently: `qingyun-wu` at head `1132aad5` (fencing/rollback, removal order, clock) and `keweichen` at head `d2e41ace` (fencing as finding 2, clock as finding 4, each with a reproduced filesystem trace). Independent convergence on the same sites is why this is a gate and not a wording dispute \u2014 and why the gate is preferred here over adjudicating in this PR, which is the alternative `qingyun-wu` offered in the same review. This gate is itself an obligation: delete it in the PR that resolves the last item, not before.",
+                "prev": "## Staged PRs against main",
+                "next": "1. this document;",
+                "pin": "membership"
+        },
+        {
+                "key": "disp:request",
+                "anchor": "is a READ, not a claim fence",
+                "heading": "Coordination contract",
+                "quoted": True,
+                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit.",
+                "prev": "## Coordination contract (claim-only; the primitives are #36",
+                "next": "1. **Claim:** exclusivity is the watcher's hard-link claim, ",
+                "pin": "equality"
+        },
+        {
+                "key": "disp:allowance",
+                "anchor": "One allowance can still yield two live task claims",
+                "heading": "Coordination contract",
+                "quoted": True,
+                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.",
+                "prev": "**So the order is mandated: `stat(token)` FIRST, then `stat(",
+                "next": "The schedule that separates",
+                "pin": "equality"
+        },
+        {
+                "key": "disp:clock",
+                "anchor": "This window names three clock sources",
+                "heading": "Coordination contract",
+                "quoted": True,
+                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** \u2014 the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.",
+                "prev": "elapsed \u2014 measured from `probation.since` while the token is",
+                "next": "(a worker that never",
+                "pin": "equality"
+        },
+        {
+                "key": "disp:retire",
+                "anchor": "nor its serialization against a racing admission",
+                "heading": "Coordination contract",
+                "quoted": True,
+                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The prose below names the seam correctly; what is NOT established is a crash-recoverable protocol across it, nor its serialization against a racing admission. Both write orders were reproduced and neither is safe.",
+                "prev": "which is the property the two-question split depends on.",
+                "next": "**That rename is atomic over the FAMILY, and not over retire",
+                "pin": "equality"
+        },
+        {
+                "key": "stated",
+                "anchor": "The orderings this must hold under",
+                "heading": "Coordination contract",
+                "quoted": False,
+                "block": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
+                "prev": "This is what bounds the risk to one task: reconciliation's `",
+                "next": "``` kick -> sweep -> worker probation held across the sweep;",
+                "pin": "equality"
+        }
+]
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_every_site_block_is_EQUAL_or_a_member_of_its_quoted_gate(self):
+        doc = self._doc()
+        for s in self.SITES:
+            got = operative_block(doc, s["anchor"], s["quoted"])
+            if s["pin"] == "equality":
+                self.assertEqual(got, s["block"],
+                    f"{s['key']}: block changed -- an appended count, a reworded "
+                    f"caveat or a contradiction inside it all land here")
+            else:
+                self.assertIn(s["anchor"], got,
+                    f"{s['key']}: left the quoted gate it must qualify")
+
+    def test_every_site_is_INSIDE_its_declared_section(self):
+        doc = self._doc()
+        for s in self.SITES:
+            sec = normalized(section_of(doc, s["heading"]))
+            self.assertIn(s["anchor"], sec,
+                f"{s['key']} left the {s['heading']!r} section -- equality pins its "
+                f"bytes and cannot see where they moved to")
+
+    def test_every_site_keeps_its_EXACT_neighbouring_units(self):
+        """Neighbours compared as whole normalized units, not substrings:
+        relocating a callout between two decoys that merely CONTAIN the expected
+        substrings passed the assertIn form (keweichen)."""
+        doc = self._doc()
+        for s in self.SITES:
+            if not (s["prev"] or s["next"]):
+                continue
+            prev, nxt = (line_neighbours(doc, s["anchor"]) if s["quoted"]
+                         else neighbours(doc, s["anchor"]))
+            if s["prev"]:
+                self.assertTrue(prev.startswith(s["prev"]),
+                    f"{s['key']}: the unit BEFORE it changed or it was relocated")
+            if s["next"]:
+                self.assertTrue(nxt.startswith(s["next"]),
+                    f"{s['key']}: the unit AFTER it changed or it was relocated")
 
 
 if __name__ == "__main__":
