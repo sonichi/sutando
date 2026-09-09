@@ -406,10 +406,14 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         worker_commit(held[0])
 
     def step_second_claimant(name="p-b"):
-        """(P1.3 seam) ANOTHER claimant, with the previous left live.
+        """(P1.3 seam) another live OWNER name, with the previous left in live_owners.
 
-        Takes a name so a schedule can stack three -- A holds a claim, B rolls the
-        token back, C consumes it -- which is the A/B/C shape P1.3 describes.
+        NAMING CAVEAT (keweichen): "claimant" overstates this. Stacking three adds
+        three `live_owners` entries; it does NOT give three of them a claim. The
+        A/B/C run ends with `claims={'t1': 'p-c'}` -- one claim, held by the last
+        name. See as_claimant above: a paused claimant cannot coexist with its
+        successor, which is exactly why A/B/C stays unrepresentable here. The keys
+        are kept because schedules reference them by string.
         """
         as_claimant(name, keep_live=True)
 

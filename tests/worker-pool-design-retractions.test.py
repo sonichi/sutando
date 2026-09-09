@@ -1275,5 +1275,58 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
                       "two incompatible normative orders"):
             self.assertIn(claim, f, f"open obligation not named: {claim}")
 
+class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
+    """keweichen at bb4578d6: deleting the fifth obligation, its Step 3/4 mappings,
+    or the membership-prerequisite row left all 105 parent tests green. I added
+    gate-scoped pins to the CHILD for the child's additions and never mirrored them
+    here, so the parent's own additions were unpinned — the same defect, one branch
+    over."""
+
+    def _doc(self):
+        return open(DOC).read()
+
+    def _gate(self):
+        raw = self._doc()
+        start = raw.index("### STAGE GATE")
+        out = []
+        for line in raw[start:].split("\n"):
+            if line.startswith(">") or (not line.strip() and out):
+                if not line.strip() and out and not out[-1].startswith(">"):
+                    break
+                out.append(line)
+            elif out:
+                break
+        return "\n".join(out)
+
+    def test_retirement_crash_completeness_is_an_obligation(self):
+        self.assertIn("Retirement is not crash-complete", self._doc(),
+            "keweichen's finding 1 was covered by none of the original four")
+
+    def test_retirement_gates_BOTH_step_3_and_step_4(self):
+        g = self._gate()
+        rows = {n: [l for l in g.split("\n") if l.startswith(f"> | {n} ")] for n in (3, 4)}
+        for n in (3, 4):
+            self.assertTrue(rows[n], f"no step {n} row in the gate")
+            self.assertIn("retirement crash-completeness", rows[n][0],
+                f"step {n} performs the retirement rename; its row must gate it")
+
+    def test_the_membership_prerequisite_has_its_own_gate_row(self):
+        """It lands BEFORE step 2 and ships the disputed commit-then-notify order,
+        so gating it only at step 4 lets the unsettled rule ship ahead of the step
+        nominally gating it."""
+        g = self._gate()
+        row = [l for l in g.split("\n") if l.startswith("> | membership prerequisite")]
+        self.assertTrue(row, "the prerequisite needs its own row, not step 4's")
+        self.assertIn("last-worker removal order", row[0],
+            "the row must name the obligation that blocks it")
+
+    def test_the_obligation_count_is_not_stated_as_a_number(self):
+        """A counted phrase re-stales every time the set changes; it already did
+        twice (":29" and the removal-order callout)."""
+        d = self._doc()
+        self.assertNotIn("proofs for the four items", d)
+        self.assertNotIn("is one of the four", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
