@@ -213,15 +213,22 @@ def line_neighbours(doc, anchor):
     no location pin at all -- and a site pinned only by block+section survives
     relocation anywhere inside a broad H2 (keweichen).
     """
+    # Locate the BLOCK whose normalized text holds the anchor, never a single
+    # line: a phrase wrapped across two lines is invisible to a per-line match.
     lines = doc.split("\n")
-    i = next(k for k, l in enumerate(lines) if anchor in normalized(l)
-             and l.lstrip().startswith(">"))
-    a = i
-    while a > 0 and lines[a - 1].lstrip().startswith(">"):
-        a -= 1
-    b = i
-    while b + 1 < len(lines) and lines[b + 1].lstrip().startswith(">"):
-        b += 1
+    spans, a = [], None
+    for k, l in enumerate(lines):
+        if l.lstrip().startswith(">"):
+            if a is None:
+                a = k
+        elif a is not None:
+            spans.append((a, k - 1)); a = None
+    if a is not None:
+        spans.append((a, len(lines) - 1))
+    hit = [s for s in spans if anchor in normalized("\n".join(lines[s[0]:s[1] + 1]))]
+    if len(hit) != 1:
+        raise AssertionError(f"{anchor!r} is in {len(hit)} quote blocks, not 1")
+    a, b = hit[0]
     def back(k):
         while k >= 0 and not lines[k].strip():
             k -= 1
@@ -1408,14 +1415,16 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         d = DOC.read_text()
         for site, (heading, phrase) in self.DISPUTED_SITES.items():
             sec = section_of(d, heading)
-            self.assertIn(phrase, sec,
+            # Normalize BOTH sides: this consumer still read raw text, so a
+            # formatting-only rewrap failed a callout that had not changed.
+            self.assertIn(phrase, normalized(sec),
                 f"the {site} site left the {heading!r} section -- moving a valid "
                 f"callout elsewhere leaves the passage it qualifies uncaveated")
-            blocks = [b for b in blockquote_blocks(sec) if phrase in b]
+            blocks = [b for b in blockquote_blocks(sec) if phrase in normalized(b)]
             self.assertEqual(len(blocks), 1,
                 f"the {site} site needs exactly ONE callout in its own section; "
                 f"found {len(blocks)}")
-            self.assertIn("DISPUTED — see", blocks[0],
+            self.assertIn("DISPUTED — see", normalized(blocks[0]),
                 f"the {site} callout lost its marker; one counted elsewhere in the "
                 f"document does not warn a reader here")
         self.assertEqual(self._flat().count("DISPUTED — see"), len(self.DISPUTED_SITES),
@@ -1693,11 +1702,16 @@ class AnalogousQualifiersAreLineExactAndSectionBound(unittest.TestCase):
 
     def test_each_analogous_qualifier_is_exact_unique_and_in_its_section(self):
         doc = self._doc()
-        flat = normalized(doc)
         for q in self.QUALIFIERS:
-            self.assertEqual(flat.count(q["line"]), 1,
-                f"{q['anchor']!r}: its line is missing or duplicated -- exact text "
-                f"is the pin because a phrase check accepts a reworded qualifier")
+            # EQUALITY on the whole unit. count() accepted the expected text as a
+            # PREFIX, so an appended contradiction left all six green (keweichen).
+            units = [normalized(l) for l in doc.split("\n")
+                     if q["anchor"] in normalized(l)]
+            self.assertEqual(len(units), 1,
+                f"{q['anchor']!r}: {len(units)} lines hold it, not 1")
+            self.assertEqual(units[0], q["line"],
+                f"{q['anchor']!r}: its line changed. Equality is the pin because "
+                f"containment accepts text appended after the qualifier")
             if q.get("neighbour"):
                 # Its enclosing heading is the H1, which spans the document, so
                 # section membership is vacuous. Bind to the adjacent text.

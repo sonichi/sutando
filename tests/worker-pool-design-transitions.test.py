@@ -1196,13 +1196,19 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         `worker_commit(worker_read())` RE-FUSES the seam and all 83 tests passed --
         the class claiming the split is expressible stayed green with it removed.
 
-        His discriminating schedule, verbatim. The drift makes the held verdict and
-        a fresh read disagree, so the outcome separates them."""
-        v, claimed, pending, _ = run(["sweep", "drift", "worker_read", "kick",
-                                      "worker_commit"])
-        self.assertEqual((v, claimed, pending), ("probation", 4, 1),
-            "the commit re-read instead of using the held verdict -- the re-read "
-            "mutant produces ('probation', 0, 5)")
+        Parameterized over ALL THREE verdict inputs: a mutant re-reading only when
+        the held verdict is probation/wedged passed the eligible case alone."""
+        for label, sched, want in (
+            ("held eligible", ["sweep", "drift", "worker_read", "kick",
+                               "worker_commit"], ("probation", 4, 1)),
+            ("held probation", ["kick", "sweep", "worker_read", "worker", "finish",
+                                "sweep", "worker_commit"], ("eligible", 1, 4)),
+            ("held wedged", ["sweep", "worker_read", "kick", "sweep", "worker",
+                             "finish", "sweep", "worker_commit"], ("eligible", 1, 4)),
+        ):
+            v, claimed, pending, _ = run(sched)
+            self.assertEqual((v, claimed, pending), want,
+                f"{label}: the commit re-read instead of using the held verdict")
 
     def test_a_second_OWNER_coexists_with_the_first(self):
         """P1.3: restart() REPLACES the owner; as_owner() adds an owner name."""
@@ -1234,7 +1240,10 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
             "the other owner's live claim must SURVIVE the crash")
         self.assertIsNone(d.journal,
             "the journal WAS written at gate step 1b and must not SURVIVE the "
-            "second owner's live-other rollback -- it is cleared, not never-written")
+            "live-other rollback / failed promotion -- cleared, not never-written")
+        self.assertEqual(d.live_owners, {"p1", "p-b"},
+            "the rollback must RETAIN the other live owner: dropping p1 left 84/84 "
+            "green while this test called its claim live")
         self.assertIsNone(d.claimed_rec,
             "a promoted admission record here means the FIRST owner was still acting")
         self.assertTrue(d.token,
