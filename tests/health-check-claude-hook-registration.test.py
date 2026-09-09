@@ -478,5 +478,30 @@ class TestDeadHookPaths(TestHookRegistration):
         self.assertEqual(got["status"], "ok", got["detail"])
 
 
+class TestHookScriptPathFallback(unittest.TestCase):
+    """An older checkout without claude_hooks_settings still gets a probe: the fallback parser."""
+
+    def test_fallback_parses_when_the_installer_module_is_unavailable(self):
+        import sys
+        hc = _load()
+        saved = sys.modules.get("claude_hooks_settings")
+        sys.modules["claude_hooks_settings"] = None  # importing a None entry raises ImportError
+        try:
+            self.assertEqual(hc._hook_script_path("bash /x/y.sh"), "/x/y.sh")
+            self.assertEqual(hc._hook_script_path("python3 '/x/y.py' --flag"), "/x/y.py")
+            self.assertIsNone(hc._hook_script_path("bash"))
+            self.assertEqual(hc._hook_script_path("cp a b"), "cp")
+            self.assertIsNone(hc._hook_script_path(""))
+        finally:
+            if saved is None:
+                sys.modules.pop("claude_hooks_settings", None)
+            else:
+                sys.modules["claude_hooks_settings"] = saved
+
+    def test_the_shared_parser_is_used_when_available(self):
+        hc = _load()
+        self.assertEqual(hc._hook_script_path('bash "/x/y z.sh"'), "/x/y z.sh")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

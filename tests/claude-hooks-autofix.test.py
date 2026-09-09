@@ -191,6 +191,24 @@ class TestDeadHookRepair(FixHandlerGating):
         self.assertEqual(len(calls), 1, calls)
         self.assertIn("install-session-start-hook.sh", " ".join(map(str, calls[0])))
 
+    def test_an_owning_installer_that_fails_warns_instead_of_raising(self):
+        import io
+        real, real_probe = subprocess.run, hc.check_claude_hook_registration
+
+        def boom(cmd, *a, **k):
+            raise OSError("bash vanished")
+
+        hc.subprocess.run = boom
+        hc.check_claude_hook_registration = lambda *a, **k: {"name": "claude-hooks", "status": "warn", "detail": "still dead"}
+        buf = io.StringIO()
+        try:
+            hc.apply_claude_hooks_fix([self._dead("personal-claude-compact-hint.sh")], stream=buf)
+        finally:
+            hc.subprocess.run = real
+            hc.check_claude_hook_registration = real_probe
+        self.assertIn("could not run install-personal-claude-hook.sh", buf.getvalue())
+        self.assertIn("bash vanished", buf.getvalue())
+
     def test_a_foreign_family_is_reported_not_deleted(self):
         import io
         buf = io.StringIO()
