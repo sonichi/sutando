@@ -31,6 +31,22 @@ try:
 except SystemExit:
     pass
 
+# The fixture schedules 07:12 and the probe allows 60 minutes' grace, so before
+# 08:12 "no artifact today" is correctly not-yet-due and the control cannot fail.
+_FROZEN_HOUR = 12
+
+
+class _FrozenNow(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return super().now(tz).replace(hour=_FROZEN_HOUR, minute=0,
+                                       second=0, microsecond=0)
+
+
+# health-check imports datetime inside the probe, so both it and the fixture
+# below read this one clock rather than the ambient hour.
+datetime.datetime = _FrozenNow
+
 failures = []
 
 
