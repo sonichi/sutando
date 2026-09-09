@@ -392,11 +392,15 @@ Acceptance:
 
 ### The rescue line
 
-The pool running today lives on an unmerged rescue branch in a separate checkout,
-carrying the affinity-era `state/pool/` this design retires. It is the reference,
-not the base. Two consequences, accepted deliberately: it diverges further while
-Stage 1 lands on `main`, and retiring the hosts running it is its own change,
-sequenced after Stage 1 proves out. Nothing here is blocked on it.
+The previous pool lived on an unmerged rescue branch in a separate checkout,
+carrying the affinity-era `state/pool/` this design retires. It is the **reference,
+not the base**: read for what it learned, never merged or built on.
+
+**It is no longer running** (2026-09-09). Both cores were stopped before Stage 1
+began, with an empty queue and no assignments in flight, so Stage 1 starts on a
+clear field rather than beside a live predecessor. What remains is dead state —
+`state/pool/affinity.json`, `assignments.json` and their siblings — which Stage 1
+neither reads nor migrates; removing it is a separate cleanup.
 
 ### Migration
 
