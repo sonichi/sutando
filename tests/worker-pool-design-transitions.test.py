@@ -37,16 +37,38 @@ def legacy_artifact_path(instance, phase, task):
     return f"{instance}.admit.{task}" + (".claimed" if phase == "claimed" else "")
 
 
+class _Dirs(set):
+    """A set that reports its own mutations, so an in-place change is traced too."""
+    def __init__(self, owner): super().__init__(); self._o = owner
+    def add(self, v): self._o._op(("phase_dirs+", v)); return super().add(v)
+    def discard(self, v): self._o._op(("phase_dirs-", v)); return super().discard(v)
+    def clear(self): self._o._op(("phase_dirs.clear",)); return super().clear()
+
+
 class Disk:
+    # Every durable write appends here and nothing removes an entry, so a
+    # compensating restore leaves the trace longer than a true no-op's.
+    DURABLE = ("spent", "token", "journal", "journal_at", "claimed_rec",
+               "claimed_at", "admit_dir", "tombstone", "token_at", "request")
+
+    def _op(self, ev):
+        object.__getattribute__(self, "ops").append(ev)
+
+    def __setattr__(self, k, v):
+        if k in Disk.DURABLE and "ops" in self.__dict__:
+            self._op((k, v if not isinstance(v, set) else sorted(v)))
+        object.__setattr__(self, k, v)
+
     def __init__(self):
         # record: sweep-only. token/journal/claimed: sweep creates, worker renames, sweep removes.
         # request: kick-pool. results: the worker finishing an admitted task.
+        object.__setattr__(self, 'ops', [])
         self.record, self.probation, self.request = {}, {}, False
         self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
         self.spent = False            # created BEFORE the token leaves; never moves
 
         self.tombstone = None         # <instance>.admit.retired.<verdict>: verdict rides the name
-        self.phase_dirs = set()       # which of held/ claimed/ EXIST -- a rename needs its parent
+        self.phase_dirs = _Dirs(self)  # which of held/ claimed/ EXIST -- a rename needs its parent
 
         self.torn = False             # a promotion lands between two directory reads
         self.token, self.journal, self.claimed_rec = False, None, None   # token / held/<t> / claimed/<t>

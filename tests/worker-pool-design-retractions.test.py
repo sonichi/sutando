@@ -206,18 +206,37 @@ def neighbours(doc, anchor, quoted=False):
 
 
 def _line_kind(line):
-    """(kind, depth, quoted) for one physical line, from its Markdown container."""
-    quoted = bool(re.match(r"\s*>", line))
-    body = re.sub(r"^\s*>+\s?", "", line)
-    depth = len(body) - len(body.lstrip())
+    """(kind, depth, qdepth) from the line's real Markdown container.
+
+    CommonMark allows a block marker 0-3 leading spaces; four opens an indented
+    code block, and quote depth is a COUNT, so `>>` is not `>` at another depth.
+    """
+    m = re.match(r"( *)((?:> ?)*)(.*)$", line)
+    lead, marks, body = m.group(1), m.group(2), m.group(3)
+    if len(lead) >= 4:
+        return "code", len(lead), 0
+    qdepth = marks.count(">")
+    inner = len(body) - len(body.lstrip())
+    if inner >= 4 and qdepth == 0:
+        return "code", inner, 0
     st = body.lstrip()
     if st.startswith("|"):
-        return "table", depth, quoted
+        return "table", inner, qdepth
     if re.match(r"(?:[-*+]\s|\d+[.)]\s)", st):
-        return "list", depth, quoted
+        return "list", inner, qdepth
     if st.startswith("#"):
-        return "heading", depth, quoted
-    return "para", depth, quoted
+        return "heading", inner, qdepth
+    return "para", inner, qdepth
+
+
+def _is_delim_row(line):
+    """A GFM delimiter row: every cell has >=1 hyphen and only -,: around it."""
+    kind, _, _ = _line_kind(line)
+    if kind != "table":
+        return False
+    body = re.sub(r"^ *(?:> ?)*", "", line).strip()
+    cells = [c.strip() for c in body.strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-+:?", c) for c in cells)
 
 
 def semantic_units(doc):
@@ -230,16 +249,15 @@ def semantic_units(doc):
     lines = doc.split("\n")
     # A blank line ends a GFM table, so a pipe line is a table row only inside
     # a contiguous run that carries a separator (|---|), however many adjoin it.
-    def _sep(l):
-        body = re.sub(r"^\s*>+\s?", "", l).strip()
-        return bool(body) and set(body) <= set("|-: ")
+    _sep = _is_delim_row
     table_ok = [False] * len(lines)
     k = 0
     while k < len(lines):
         if _line_kind(lines[k])[0] != "table":
             k += 1; continue
-        j = k
-        while j < len(lines) and _line_kind(lines[j])[0] == "table":
+        j, q0 = k, _line_kind(lines[k])[2]
+        while (j < len(lines) and _line_kind(lines[j])[0] == "table"
+               and _line_kind(lines[j])[2] == q0):
             j += 1
         if any(_sep(lines[i]) for i in range(k, j)):
             for i in range(k, j):
@@ -253,14 +271,16 @@ def semantic_units(doc):
         st = line.strip()
         if st.startswith("```"):
             if fence: cur.append(line); flush(); fence = False; continue
-            flush(); fence = True; meta = {"kind": "fence", "depth": 0,
-                                           "quoted": bool(re.match(r"\s*>", line))}
+            flush(); fence = True
+            meta = {"kind": "fence", "depth": 0,
+                    "quoted": _line_kind(line)[2] > 0, "qdepth": _line_kind(line)[2]}
             cur.append(line); continue
         if fence:
             cur.append(line); continue
         if not st or st == ">":
             flush(); continue
-        kind, depth, quoted = _line_kind(line)
+        kind, depth, qdepth = _line_kind(line)
+        quoted = qdepth > 0
         if kind == "table" and not table_ok[k]:
             kind = "para"
         # Only a plain line CONTINUES a paragraph or list item. A heading or
@@ -268,7 +288,7 @@ def semantic_units(doc):
         cont = (meta is not None and quoted == meta["quoted"]
                 and kind == "para" and meta["kind"] in ("para", "list"))
         if not cont:
-            flush(); meta = {"kind": kind, "depth": depth, "quoted": quoted}
+            flush(); meta = {"kind": kind, "depth": depth, "quoted": quoted, "qdepth": qdepth}
         cur.append(line)
     flush()
     return units
@@ -291,7 +311,7 @@ def semantic_unit(doc, anchor, quoted=None):
     assert len(hits) == 1, f"{anchor!r}: {len(hits)} semantic units hold it, not 1"
     u = hits[0]
     return {"text": normalized(u["text"]), "kind": u["kind"],
-            "depth": u["depth"], "quoted": u["quoted"]}
+            "depth": u["depth"], "quoted": u["quoted"], "qdepth": u.get("qdepth", 0)}
 
 
 def unit_neighbours(doc, anchor, quoted=None):
@@ -1740,6 +1760,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings.",
                     "kind": "list",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
                     "next": "- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary."
             },
@@ -1749,6 +1770,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
                     "kind": "list",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "- **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C proof it was described as.** The model stacks owner names rather than holding two simultaneously live claimants, so it cannot express the schedule this obligation is about; the row is STATED, not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect, and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found this bullet still claiming a result the retraction below had already withdrawn.",
                     "next": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings."
             },
@@ -1758,6 +1780,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "| the report transport, named \u2014 and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not \"sidecar or wrapper\". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it \"already tails\" anything** \u2014 it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO \u2014 the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |",
                     "kind": "table",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with \"a worker too broken to write its own record is simply never eligible\" \u2014 a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |",
                     "next": "| routing exclusion | a quiesced instance is skipped at claim time (not \"in `instances` order\" \u2014 the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |"
             },
@@ -1767,6 +1790,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "**It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per context group*, enforced by the lead refusing to create the second one. This design is room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped rooms ended up on non-coordinating workers, never the reason the binding unit is a room. What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by the claim, not per group by an assigner.** Two rooms of one former context group may run turns at the same time, and so may two members bound to one room. Group identity, group admission and group release are named as out of scope for v1 in the routing section and remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in v1 can express it. Every other decision in that record stands.",
                     "kind": "para",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "**Status:** design, owner-decided 2026-09-03 (PR-triage room). This is step 1 of staging #3604 into PRs against `main`; #3604 stays open as the reference implementation and is not merged as one piece. It supersedes the \"lead = the runtime daemon\" and \"lead-managed sizing\" placements in #3604's `docs/lead-follower-pool.md` and Decision 4 of [`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), and Decision 5 of that record (the unclaimed-work backstop belongs to the lead; followers stay purely event-driven) \u2014 superseded because it sites the backstop on a lead this design no longer has, not because its reasoning was wrong; see **The reconciliation ticker**, which answers its O(N) objection rather than dropping it.",
                     "next": "## The protocol claims NOT established by this document \u2014 they are open obligations"
             },
@@ -1776,6 +1800,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
                     "kind": "list",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
                     "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
             },
@@ -1785,6 +1810,7 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                     "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
                     "kind": "list",
                     "depth": 0,
+                    "qdepth": 0,
                     "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
                     "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
             }
@@ -1806,7 +1832,8 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
             u = semantic_unit(doc, q["anchor"], False)
             self.assertEqual(u["text"], q["unit"],
                 f"{q['anchor']!r}: its unit changed")
-            self.assertEqual((u["kind"], u["depth"]), (q["kind"], q["depth"]),
+            self.assertEqual((u["kind"], u["depth"], u["qdepth"]),
+                             (q["kind"], q["depth"], q["qdepth"]),
                 f"{q['anchor']!r}: container changed -- nesting it deeper or "
                 f"breaking its table leaves the text identical and the parent false")
             prev, nxt = unit_neighbours(doc, q["anchor"], False)
@@ -1838,7 +1865,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "- **The request-or-directory gate is a READ, not a claim fence.** A worker can read \"no request\", pause, let a kick publish, and still commit its ordinary batch. The split model can now express that pause (`worker_read` / `worker_commit`), and the schedule has since been RUN: the gate refuses 4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a published request bounds nothing already in flight. The protocol does NOT survive it.",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 0
             },
             {
                     "key": "count:removal",
@@ -1850,7 +1878,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "**It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven. Its cost is O(N) wakeups, where N is the number of workers deliberately created, and at N=0 there is no ticker at all.",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "count:stage",
@@ -1863,7 +1892,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "membership",
                     "unit": "**A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent.",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "disp:request",
@@ -1875,7 +1905,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the CANONICAL task id \u2014 `state/task-event-handler-claims/<task-id>`, resolved by `task_archive.task_id_for(path, accept=...)` (first link wins, a dead owner's claim retired by pid); the claimant then renames `tasks/task-X.txt` to `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads. Keying on the raw basename would hand the renamed file a key nobody holds. There is no assignment step; eligibility is `requested_worker` and the pin table.",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "disp:allowance",
@@ -1887,7 +1918,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "The schedule that separates the orders is a worker consuming between the two reads:",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "disp:clock",
@@ -1899,7 +1931,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "(a worker that never reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from the `claimed/<task_id>` record's mtime once the promotion has landed \u2014 in which case the verdict \u2192 `wedged`, the allowance is retired by the same single rename, and the request is NOT re-armed; a second kick needs a second command. `probation` is never the last word.",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "disp:retire",
@@ -1911,7 +1944,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "**That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the verdict scalar live in the pool-status record \u2014 a different object, with its own write \u2014 so retirement is TWO durable writes and has a seam whichever order they take. Neither order is safe on its own, and the two fail in opposite directions:",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 0
+                    "depth": 0,
+                    "qdepth": 1
             },
             {
                     "key": "stated",
@@ -1923,7 +1957,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "next": "``` kick -> sweep -> worker probation held across the sweep; worker admits 1 (was: wedged, 0, 5) kick -> worker -> sweep worker admits 1, not 4; sweep sees probation, holds (was: eligible, 4, 1) kick -> multi-task backlog one token consumed; 4 stay pending event arrives in probation event path hits the same gate; admit already 0 -> pending crash after publish, before token next sweep re-issues the token; worker admits 1 crash after mkdir, worker gated no token exists to consume; the sweep finishes issuance once worker never reaches its gate window from `since` elapses -> wedged, allowance removed crash between R1 and R2 the tombstone is recognised; R2 replays, nothing is minted retirement races a live worker family moves under it; promotion ENOENTs, no second admission claimed, unfinished past window window from claimed/<task_id> elapses -> wedged ```",
                     "pin": "equality",
                     "kind": "para",
-                    "depth": 3
+                    "depth": 0,
+                    "qdepth": 0
             }
     ]
 
@@ -1935,7 +1970,8 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
         for s in self.SITES:
             got = operative_block(doc, s["anchor"], s["quoted"])
             u = semantic_unit(doc, s["anchor"], s["quoted"])
-            self.assertEqual((u["kind"], u["depth"]), (s["kind"], s["depth"]),
+            self.assertEqual((u["kind"], u["depth"], u["qdepth"]),
+                             (s["kind"], s["depth"], s["qdepth"]),
                 f"{s['key']}: container changed -- nesting or a broken table "
                 f"leaves the normalized text identical and the parent false")
             if s["pin"] == "equality":
