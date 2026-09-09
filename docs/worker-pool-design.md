@@ -558,13 +558,11 @@ ticker cannot tell a lost claim from a won one, so "do not count a loss" was not
 `queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
 `acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-One measured correction is worth keeping in full because it kills an obvious-looking fix: the claim
-record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
+The claim record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
 (`:101-109`), so every claim dies with its watcher and a restart retires the lot — the same restart
 hole as the per-watcher `mktemp`, relocated. And `claim_disposition` (`:169-177`) maps `must-handle`
 to 0, `fallback` to 1 and everything else to 2 = unknown, with only the first two reaching the
-live-core branches, so a `direct` value is excluded by default. Both found by keweichen, checking a
-claim I had made without checking it.
+live-core branches, so a `direct` value is excluded by default. Both found by keweichen.
 
 **The startup sweep obeys the same bound**: production loops every pre-existing
 `tasks/*.txt` through `dispatch_task` at boot, so without this a restart carrying a backlog
@@ -572,7 +570,7 @@ claims and emits the whole of it before any ticker exists. Startup IS the first
 reconciliation pass, bounded like every other, and its control uses a backlog larger than
 the cap.
 
-`2 *` is a starting point and should be tuned; what is load-bearing is that the bound is on
+`2 *` is a starting point and should be tuned. The bound is on
 CLAIMS, is measured over total outstanding, and belongs to the ticker — because the event path
 has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
