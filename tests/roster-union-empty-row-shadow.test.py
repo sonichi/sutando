@@ -200,5 +200,43 @@ class PromotionPreservesLocalAuthority(unittest.TestCase):
         self.assertEqual(u["r"]["room"], "!peer:x", "the original defect must stay fixed")
 
 
+class IdentityIsPreservedAcrossAliases(unittest.TestCase):
+    """qingyun-wu @54b392ef: preservation was by FIELD NAME, so a local `github`
+    survived while the peer's higher-precedence `gh` outranked it and the login
+    resolved to the PEER's account. IDENTITY_FIELDS = ("gh", "github")."""
+
+    ROUTE = {"stand": "@x:y", "room": "!r:y"}
+
+    def _u(self, local, peer):
+        d = tempfile.mkdtemp()
+        lp, pp = pathlib.Path(d, "l.json"), pathlib.Path(d, "p.json")
+        lp.write_text(json.dumps({"r": local}))
+        pp.write_text(json.dumps({"r": peer}))
+        return _load(SRC), _load(SRC).roster_union([("local", lp), ("peer", pp)])["r"]
+
+    def test_local_github_beats_promoted_peer_gh(self):
+        m, row = self._u({"stand": None, "room": None, "github": "local-owner"},
+                         dict(self.ROUTE, gh="peer-owner"))
+        self.assertEqual(m.roster_login(row)[0], "local-owner",
+            "the peer's higher-precedence `gh` alias must not outrank a local `github`")
+
+    def test_local_same_actor_as_clears_the_peer_identity(self):
+        m, row = self._u({"stand": None, "room": None, "same_actor_as": "local-owner"},
+                         dict(self.ROUTE, gh="peer-owner"))
+        self.assertIsNone(row.get("gh"), "peer identity must not survive a local same_actor_as")
+        self.assertEqual(row.get("same_actor_as"), "local-owner")
+
+    def test_the_opposite_alias_pairing_also_holds(self):
+        m, row = self._u({"stand": None, "room": None, "gh": "local-owner"},
+                         dict(self.ROUTE, github="peer-owner"))
+        self.assertEqual(m.roster_login(row)[0], "local-owner")
+
+    def test_a_local_row_declaring_NO_identity_keeps_the_peers(self):
+        """The clearing is conditional: with nothing local to protect, the peer's
+        identity is the only one there and must survive."""
+        m, row = self._u({"stand": None, "room": None}, dict(self.ROUTE, gh="peer-owner"))
+        self.assertEqual(m.roster_login(row)[0], "peer-owner")
+
+
 if __name__ == "__main__":
     unittest.main()

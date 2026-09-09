@@ -83,7 +83,13 @@ def _promote(winner: dict, local: dict) -> dict:
     survives; consumers check it AFTER the bare-key lookup, so an @local copy
     does not protect delivery."""
     out = dict(winner)
-    for field, value in (local if isinstance(local, dict) else {}).items():
+    loc = local if isinstance(local, dict) else {}
+    # Identity is preserved semantically: roster_login ranks `gh` over `github`,
+    # so a surviving peer alias outranks the local spelling.
+    if roster_login(loc)[0] or str(loc.get("same_actor_as") or "").strip():
+        for alias in IDENTITY_FIELDS + ("same_actor_as",):
+            out.pop(alias, None)
+    for field, value in loc.items():
         if field not in _ROUTING and value is not None:
             out[field] = value
     return out
