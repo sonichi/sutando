@@ -190,6 +190,12 @@ check("CONTROL: the truncated prefix alone WOULD be missing, so the case is real
 check("CONTROL: a quoted absent path with no glob and no space still warns",
       hc._cron_missing_script({"prompt": f'bash "{_gone}"'}) == _gone)
 
+# DELIBERATE false negative: `(\S+)` cannot read a quoted path containing a
+# space, and an incomplete token cannot support a definitive absence claim.
+check("a quoted path with a space reads unknown even when ABSENT — by design",
+      hc._cron_missing_script(
+          {"prompt": f"bash '{_t}/scripts/gone y.sh'"}) is None)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
