@@ -68,6 +68,10 @@ def lines_of(path):
 # Component count is unbounded; the 3..40 length check below is the only size
 # bound. A cap truncates a hyphenated name and drops a snake_case one entirely.
 ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+)+)\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b|(?<!\w)(#\d{3,5})\b')
+# A truncated candidate list reads as a complete one. Must exceed the worst
+# real miss: 7 hits, answer 7th.
+SHOW_CANDIDATES = 12
+
 STOP = {"health-check", "not-running", "restart-needed", "session-read", "read-limit"}
 
 def tokens(name, text):
@@ -107,11 +111,14 @@ def report(name, text, files):
                         hits.append((tok, display(f), i, line.strip()[:92]))
                     break
     if hits:
-        # ALL candidates, not just the first. A probe warns for SEVERAL distinct
-        # conditions and a parking for one does NOT cover another.
+        # Hit order is token-then-file, NOT relevance, so a silent truncation
+        # hides an arbitrary subset. Anything withheld is counted out loud.
         print(f"  CANDIDATES {label:25} ({len(hits)}) — verify the CONDITION matches, not just the probe")
-        for tok, fn, i, line in hits[:3]:
+        for tok, fn, i, line in hits[:SHOW_CANDIDATES]:
             print(f"             via '{tok}' -> {fn}:{i}  {line}")
+        if len(hits) > SHOW_CANDIDATES:
+            print(f"             +{len(hits) - SHOW_CANDIDATES} further candidate(s) NOT shown — "
+                  f"narrow the claim to see them")
         return "parked"
     body = []
     for tok in toks:

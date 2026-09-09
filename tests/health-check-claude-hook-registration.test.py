@@ -95,6 +95,27 @@ class TestHookRegistration(unittest.TestCase):
         self.assertIn("2 NOT registered", out["detail"])
         self.assertNotIn("Stop:", out["detail"], "a registered hook must not be reported missing")
 
+    def test_remedy_omits_the_archive_hook_when_other_hooks_are_missing(self):
+        # The bare installer registers the transcript archiver. Anyone repairing an unrelated
+        # missing hook by following this text would enable an egress the owner has not opted into.
+        h = self._all_registered()
+        del h["Stop"]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", out["detail"])
+
+    def test_remedy_does_not_prescribe_a_repair_when_only_the_archiver_is_missing(self):
+        # --fix already refuses this case; the text used to prescribe the bare command anyway.
+        h = self._all_registered()
+        h["PreCompact"] = [{"hooks": [{"command": f"bash {self.repo}/src/session-handoff.sh"}]}]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("explicit opt-in", out["detail"])
+        self.assertIn("only if you intend", out["detail"])
+        self.assertNotIn("re-run", out["detail"], "an opt-in is not a repair instruction")
+
     def test_registered_but_pointing_at_ANOTHER_checkout_warns(self):
         # The failure that looks healthiest: present, so an existence check passes,
         # but aimed at a stale copy — this host ran a 5-day-old script for days.
@@ -518,6 +539,66 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         # If a future wrapper defeats the unwrap, warn; never silently accept.
         self.assertFalse(self.hc._hook_command_targets(
             "echo /repo/src/x.sh", Path("/repo/src/x.sh"), "somecmd $(unknown_wrapper x)"))
+
+class TestDeadHookPaths(TestHookRegistration):
+    """A registered hook whose script is gone fails on every fire and was invisible to the
+    owned-list check (live host, 2026-09-08: three deleted tmp-repo copies of the compact
+    hint fired at every compaction; the probe reported only the missing archiver)."""
+
+    def test_a_dead_hook_path_warns_and_carries_a_repair_marker(self):
+        hooks = self._all_registered()
+        dead = f"bash \"{self.repo}/gone/repo/src/personal-claude-compact-hint.sh\""
+        hooks.setdefault("SessionStart", []).extend(self._entry(dead))
+        self._settings(hooks)
+        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(got["status"], "warn")
+        self.assertIn("no longer exists", got["detail"])
+        self.assertIn("personal-claude-compact-hint.sh", got["detail"])
+        self.assertEqual([r["family"] for r in got["_dead_hooks"]], ["personal-claude-compact-hint.sh"])
+        self.assertNotIn("_unregistered_hooks", got)
+
+    def test_control_a_live_extra_hook_is_not_dead(self):
+        live = self.repo / "src" / "personal-claude-compact-hint.sh"
+        live.write_text("#!/bin/bash\n")
+        hooks = self._all_registered()
+        hooks.setdefault("SessionStart", []).extend(self._entry(f'bash "{live}"'))
+        self._settings(hooks)
+        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(got["status"], "ok", got["detail"])
+
+    def test_a_relative_path_is_judged_against_the_project_not_the_cwd(self):
+        (self.repo / "src" / "personal-claude-compact-hint.sh").write_text("#!/bin/bash\n")
+        hooks = self._all_registered()
+        hooks.setdefault("SessionStart", []).extend(self._entry('bash "src/personal-claude-compact-hint.sh"'))
+        self._settings(hooks)
+        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(got["status"], "ok", got["detail"])
+
+
+class TestHookScriptPathFallback(unittest.TestCase):
+    """An older checkout without claude_hooks_settings still gets a probe: the fallback parser."""
+
+    def test_fallback_parses_when_the_installer_module_is_unavailable(self):
+        import sys
+        hc = _load()
+        saved = sys.modules.get("claude_hooks_settings")
+        sys.modules["claude_hooks_settings"] = None  # importing a None entry raises ImportError
+        try:
+            self.assertEqual(hc._hook_script_path("bash /x/y.sh"), "/x/y.sh")
+            self.assertEqual(hc._hook_script_path("python3 '/x/y.py' --flag"), "/x/y.py")
+            self.assertIsNone(hc._hook_script_path("bash"))
+            self.assertEqual(hc._hook_script_path("cp a b"), "cp")
+            self.assertIsNone(hc._hook_script_path(""))
+        finally:
+            if saved is None:
+                sys.modules.pop("claude_hooks_settings", None)
+            else:
+                sys.modules["claude_hooks_settings"] = saved
+
+    def test_the_shared_parser_is_used_when_available(self):
+        hc = _load()
+        self.assertEqual(hc._hook_script_path('bash "/x/y z.sh"'), "/x/y z.sh")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -68,6 +68,22 @@ _FABLE_LIMIT_UNFOCUSED = _FABLE_LIMIT.replace(
     "  ❯ Switch to Opus 5 and continue\n    Continue with Fable 5.1",
     "    Switch to Opus 5 and continue\n  ❯ Continue with Fable 5.1")
 assert _FABLE_LIMIT_UNFOCUSED != _FABLE_LIMIT
+# The core's terminal on 2026-09-07 (#4015): every /startup was refused in 0-1s and the CLI
+# went straight back to its idle footer, so no gate was ever on screen.
+_REFUSAL_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+                 "or /model to switch models.")
+_IDLE_FOOTER = ("────────\n❯ \n────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+_REFUSED_TURNS = ("❯ /startup\n"
+                  f"  ⎿  {_REFUSAL_LINE}\n"
+                  "✻ Cooked for 1s · done 12:32 PM\n"
+                  "❯ /startup\n"
+                  f"  ⎿  {_REFUSAL_LINE}\n"
+                  "✻ Cogitated for 0s · done 12:42 PM\n")
+# A /startup that ran: agent output, a real duration, the same footer.
+_STARTUP_OK_TURN = ("❯ /startup\n"
+                    "● /startup complete: watcher streaming, 3 crons registered.\n"
+                    "✻ Worked for 2m 14s · done 12:55 PM\n")
 
 
 class TestClassify(unittest.TestCase):
@@ -317,6 +333,135 @@ class TestComposeState(unittest.TestCase):
         # detection is preserved.
         st2, *_ = compose_state("Running step 3...\n(no prompt, no footer)", "unknown", True)
         self.assertEqual(st2, "hung")
+
+
+class TestRefusedTurn(unittest.TestCase):
+    """#4015: a turn the CLI refuses is a FINISHED turn at the idle footer — no gate, no
+    affordance — so classify() cannot see it and every base health reads idle-ready.
+    The refused-turn detector must flag it as blocked-human/turn-rejected, carrying the
+    refusal line, and must leave every other idle pane exactly as it was."""
+
+    def test_the_pane_shows_no_gate(self):
+        # The blind spot itself: nothing for the gate classifier to match.
+        self.assertIsNone(classify(_REFUSED_TURNS + _IDLE_FOOTER))
+
+    def test_refused_turns_at_the_idle_footer_are_blocked_human(self):
+        for base in ("idle", "unknown", "working"):
+            st, detail, prompt, kind = compose_state(_REFUSED_TURNS + _IDLE_FOOTER, base, True)
+            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), base)
+            self.assertEqual(prompt, _REFUSAL_LINE, base)
+            self.assertIn("turn-rejected", detail)
+
+    def test_a_bare_done_line_counts(self):
+        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py).
+        pane = ("❯ /startup\n  ⎿  OAuth access token has expired · Please run /login\n"
+                "✻ Worked for 0s\n" + _IDLE_FOOTER)
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind), ("blocked-human", "turn-rejected"))
+        self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
+
+    def test_a_successful_last_turn_stays_idle_ready(self):
+        for base in ("idle", "unknown"):
+            st, *_ = compose_state(_STARTUP_OK_TURN + _IDLE_FOOTER, base, True)
+            self.assertEqual(st, "idle-ready", base)
+
+    def test_a_refusal_in_scrollback_under_a_later_success_stays_idle_ready(self):
+        st, *_ = compose_state(_REFUSED_TURNS + _STARTUP_OK_TURN + _IDLE_FOOTER, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_long_turn_that_mentions_the_words_is_not_a_refusal(self):
+        for done in ("✻ Worked for 12s · done 1:00 PM", "✻ Worked for 2m 3s · done 1:00 PM"):
+            pane = f"❯ /startup\n  ⎿  {_REFUSAL_LINE}\n{done}\n" + _IDLE_FOOTER
+            st, *_ = compose_state(pane, "idle", True)
+            self.assertEqual(st, "idle-ready", done)
+
+    def test_agent_output_in_a_short_turn_is_not_a_refusal(self):
+        # The words in the agent's own reply (`●`), not in a `⎿` result: the turn ran.
+        pane = ("❯ usage?\n● You are not out of usage credits; /usage-credits shows $12.\n"
+                "✻ Worked for 1s · done 1:00 PM\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_tool_result_carrying_the_words_is_not_a_refusal(self):
+        # `⎿` is also the tool-result marker. A short turn whose tool READ a refusal line
+        # (and whose agent then answered) ran: the result belongs to the tool, not the CLI.
+        pane = ("❯ check credits\n"
+                "⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_REFUSAL_LINE}\n"
+                "● The diagnostic was read successfully.\n"
+                "✻ Worked for 1s\n" + _IDLE_FOOTER)
+        for base in ("idle", "unknown"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind), ("idle-ready", None), (base, prompt))
+
+    def test_not_logged_in_inside_ordinary_output_is_not_a_refusal(self):
+        # Three common words: a slash-command result that merely contains them (no ⏺, ≤1s)
+        # must not escalate. Only the CLI's own line-start form or /login adjacency counts.
+        for line in ("gh: not logged in to github.com",
+                     "src/auth.py:42: raise RuntimeError('not logged in')",
+                     "shown to a visitor who is not logged in",
+                     "ok test_errors_when_not_logged_in"):
+            pane = f"❯ /somecommand\n  ⎿  {line}\n✻ Worked for 1s\n" + _IDLE_FOOTER
+            st, _d, prompt, kind = compose_state(pane, "idle", True)
+            self.assertEqual((st, kind), ("idle-ready", None), (line, prompt))
+
+    def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
+        for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
+                     "not logged in", "Run /login first: not logged in"):
+            pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
+            st, _d, prompt, kind = compose_state(pane, "idle", True)
+            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), line)
+            self.assertEqual(prompt, line)
+
+    def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
+        # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
+        pane = ("❯ check credits\n⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_REFUSAL_LINE}\n✻ Worked for 0s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_refused_turn_under_a_newer_active_turn_stays_running(self):
+        # History plus an active turn: the refusal completed, then a newer prompt started
+        # and is still spinning. The old completion must not be reused.
+        pane = (_REFUSED_TURNS
+                + "❯ try again\n"
+                + "● Checking the connection.\n"
+                + "✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER)
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind), ("running", None), prompt)
+
+    def test_a_refused_turn_under_a_newer_typed_prompt_is_not_reused(self):
+        # The owner has typed the next prompt but not sent it: the refusal is history.
+        pane = _REFUSED_TURNS + _IDLE_FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        self.assertIn("❯ try again", pane)
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind), ("idle-ready", None), prompt)
+
+    def test_a_short_result_without_the_words_is_not_a_refusal(self):
+        # The CLI's own `⎿` result, ended in 0s, but not one of the refusal lines.
+        pane = ("❯ /nosuch\n  ⎿  Unknown slash command: /nosuch\n"
+                "✻ Worked for 0s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_the_spinner_is_not_a_completed_turn(self):
+        pane = (f"❯ /startup\n  ⎿  {_REFUSAL_LINE}\n"
+                "✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_refusal_without_the_idle_footer_is_not_flagged(self):
+        # Mid-render: no footer yet, so no evidence the core came back to rest.
+        st, *_ = compose_state(_REFUSED_TURNS, "working", True)
+        self.assertEqual(st, "running")
+
+    def test_the_footer_alone_stays_idle_ready(self):
+        st, *_ = compose_state(_IDLE, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_refused_turn_is_never_auto_answered(self):
+        self.assertIsNone(auto_answer("turn-rejected"))
+        self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
 
 
 class TestAutoAnswer(unittest.TestCase):
