@@ -9064,7 +9064,31 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
-        if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
+        if c["name"] != "claude-hooks" or not (c.get("_unregistered_hooks") or c.get("_dead_hooks")):
+            continue
+        for rec in c.get("_dead_hooks") or []:
+            owner_script = _HOOK_FAMILY_INSTALLERS.get(str(rec.get("family")))
+            if not owner_script:
+                print(f"  {c['name']}: not repairing dead {rec.get('event')} hook "
+                      f"{rec.get('path')} — not a family a Sutando installer owns", file=out)
+                continue
+        for owner_script in sorted({_HOOK_FAMILY_INSTALLERS[r["family"]]
+                                    for r in c.get("_dead_hooks") or []
+                                    if r.get("family") in _HOOK_FAMILY_INSTALLERS}):
+            print(f"  {c['name']}: pruning dead entries via {Path(owner_script).name}", file=out)
+            try:
+                proc = subprocess.run(["bash", str(REPO_DIR / owner_script)],
+                                      capture_output=True, text=True, timeout=60)
+                emitted = (proc.stdout or "") + (proc.stderr or "")
+                lines = [ln for ln in emitted.splitlines() if ln.strip()]
+                print(f"  {c['name']}: " + (lines[-1].strip() if lines
+                                           else f"installer exited {proc.returncode}"), file=out)
+            except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
+                print(f"  {c['name']}: could not run {Path(owner_script).name} ({exc})", file=out)
+        if not c.get("_unregistered_hooks"):
+            fresh = check_claude_hook_registration()
+            c.clear()
+            c.update(fresh)
             continue
         installer = REPO_DIR / "src" / "install-claude-hooks.sh"
         # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
@@ -10862,6 +10886,39 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_script_path(command: str) -> Optional[str]:
+    """The script a hook command runs; the installer module owns the parse, this is a fallback."""
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from claude_hooks_settings import script_path_of
+        return script_path_of(command)
+    except Exception:  # noqa: BLE001 — an older checkout without the module still gets a probe
+        parts = command.split()
+        for i, tok in enumerate(parts):
+            if tok in ("bash", "sh", "python3", "python", "node"):
+                return parts[i + 1].strip("'\"") if i + 1 < len(parts) else None
+        return parts[0].strip("'\"") if parts else None
+
+
+def _runs_a_script(command: str) -> bool:
+    """True when the command hands a script FILE to an interpreter (bash/sh/python/node).
+
+    `bash -c '…'` runs inline text, not a file, and a command carrying an unexpanded `$VAR`
+    cannot be judged by path existence; both are skipped rather than read as dead.
+    """
+    parts = command.split()
+    if len(parts) < 2 or Path(parts[0]).name not in ("bash", "sh", "zsh", "python", "python3", "node"):
+        return False
+    return not parts[1].startswith("-") and "$" not in command
+
+
+#: Which installer re-adds (and, since it prunes, repairs) each Sutando-owned hook family.
+_HOOK_FAMILY_INSTALLERS = {
+    "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
+    "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+}
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -10991,10 +11048,40 @@ def check_claude_hook_registration(
             # Present, but not actually invoking this checkout's script — either aimed
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
-    if missing or foreign:
+    # Present-but-dead is invisible to the owned-list check above: a registered hook whose
+    # script is gone fails on every fire. Relative paths resolve against the project.
+    dead: list[str] = []
+    dead_records: list[dict] = []
+    project_dir = settings.resolve().parent.parent
+    # Owned families are judged above (present / missing / foreign); the dead scan covers
+    # the rest, and only commands that run a script through an interpreter.
+    owned_families = {Path(marker).name for _e, marker, _c in owned}
+    for event, groups in hooks.items():
+        for g in _as_list(groups):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                cmd = str(h.get("command", ""))
+                if not _runs_a_script(cmd):
+                    continue
+                script = _hook_script_path(cmd)
+                if not script or Path(script).name in owned_families:
+                    continue
+                target = Path(script) if Path(script).is_absolute() else project_dir / script
+                if not target.exists():
+                    family = Path(script).name
+                    dead.append(f"{event}:{family} -> {script}")
+                    dead_records.append({"event": event, "command": cmd,
+                                         "path": script, "family": family})
+    if missing or foreign or dead:
         bits = []
         if missing:
             bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if dead:
+            bits.append(f"{len(dead)} registered but the script no longer exists — every fire "
+                        f"fails 'No such file' ({', '.join(dead)})")
         if foreign:
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
@@ -11007,12 +11094,18 @@ def check_claude_hook_registration(
                   "you intend to enable it"
                   if only_archive else
                   "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
+        if dead and not missing and not foreign:
+            remedy = ("re-run the installer that owns each family — it prunes dead copies "
+                      "(`bash scripts/install-personal-claude-hook.sh`, "
+                      "`bash scripts/install-session-start-hook.sh`)")
         result = {"name": name, "status": "warn",
                   "detail": f"{'; '.join(bits)} in {settings} — {remedy}"}
         if missing:
             # Keyed structurally so --fix cannot fire on the warn branches the
             # installer can't repair; `foreign` excluded (displacement unverified).
             result["_unregistered_hooks"] = list(missing)
+        if dead_records:
+            result["_dead_hooks"] = dead_records
         return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
 
