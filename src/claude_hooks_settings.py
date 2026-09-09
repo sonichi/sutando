@@ -68,10 +68,21 @@ def save(settings_path: Path, settings: dict) -> None:
     os.replace(tmp, settings_path)
 
 
-def prune_dead(settings: dict, event: str, family: str) -> list[str]:
+def _exists(path: str, project_dir: Optional[Path]) -> bool:
+    """A relative script path is relative to the project the settings file belongs to."""
+    candidate = Path(path)
+    if not candidate.is_absolute() and project_dir is not None:
+        candidate = project_dir / candidate
+    return candidate.exists()
+
+
+def prune_dead(settings: dict, event: str, family: str,
+               project_dir: Optional[Path] = None) -> list[str]:
     """Remove hooks under ``event`` that run a script named ``family`` which no longer exists.
 
-    Returns the removed commands. Entries left with no hooks are dropped too.
+    Returns the removed commands. Entries left with no hooks are dropped too. A relative
+    script path is checked against ``project_dir`` (the settings file's project), never the
+    caller's cwd, so a live relative hook cannot read as dead.
     """
     if not family:
         return []
@@ -85,7 +96,7 @@ def prune_dead(settings: dict, event: str, family: str) -> list[str]:
         for hook in entry.get("hooks", []) or []:
             command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
             path = script_path_of(command)
-            if family_of(command) == family and path and not os.path.exists(path):
+            if family_of(command) == family and path and not _exists(path, project_dir):
                 removed.append(command)
                 continue
             kept_hooks.append(hook)
@@ -106,7 +117,9 @@ def install(
 ) -> tuple[str, list[str]]:
     """Prune dead same-family entries, then add ``command`` once. Returns (status, removed)."""
     settings = load(settings_path)
-    removed = prune_dead(settings, event, family_of(command))
+    # <project>/.claude/settings.json → the project is two levels up.
+    project_dir = settings_path.resolve().parent.parent
+    removed = prune_dead(settings, event, family_of(command), project_dir=project_dir)
     entries = settings.setdefault("hooks", {}).setdefault(event, [])
     present = any(
         isinstance(h, dict) and h.get("command", "") == command

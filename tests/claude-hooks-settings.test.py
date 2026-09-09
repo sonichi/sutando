@@ -91,6 +91,26 @@ with tempfile.TemporaryDirectory() as tmp:
     check(f'bash "{foreign_live}"' in cmds, "a live foreign hook is left alone")
     check(len(after["hooks"]["Stop"]) == 1, "other events are untouched even for the same family")
 
+    # ── a relative live path is judged against the project, not the cwd ──────
+    rel_proj = tmp / "relproj"
+    (rel_proj / "src").mkdir(parents=True)
+    (rel_proj / "src" / "personal-claude-compact-hint.sh").write_text("#!/bin/bash\n")
+    rel_settings = rel_proj / ".claude" / "settings.json"
+    rel_settings.parent.mkdir(parents=True)
+    rel_settings.write_text(json.dumps({"hooks": {"SessionStart": [
+        entry('bash "src/personal-claude-compact-hint.sh"'),
+        entry('bash "src/gone/personal-claude-compact-hint.sh"')]}}))
+    cwd = os.getcwd()
+    os.chdir(tmp)  # somewhere the relative path does NOT resolve from
+    try:
+        status, removed = chs.install(rel_settings, event="SessionStart", command=live_cmd, matcher="compact")
+    finally:
+        os.chdir(cwd)
+    kept_rel = [h["command"] for e in json.loads(rel_settings.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
+    check('bash "src/personal-claude-compact-hint.sh"' in kept_rel and len(removed) == 1
+          and "src/gone/" in removed[0], "a relative live path is kept and a relative dead one removed, judged from the project dir",
+          f"kept={kept_rel} removed={removed}")
+
     # ── prepend ───────────────────────────────────────────────────────────────
     first_cmd = f'bash "{foreign_live}"'
     ordered = tmp / "ordered" / ".claude" / "settings.json"
