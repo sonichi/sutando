@@ -45,6 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
+import { readLanding } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -390,27 +391,15 @@ try {
     const finalText = await readComposer(page);
     if (!composerMatches(arg, finalText)) failComposerMismatch(arg, finalText);
     await btn.click();
-    // A click is not a post. X confirms a landing with a toast carrying the new
-    // /status/ link; without that link within the wait, nothing is claimed.
-    // TOAST ONLY: a bare /status/ link once matched a stranger's "View analytics" link.
-    // The toast is the one element X renders for OUR post; href must be /<handle>/status/<id>.
-    let landed = await page.waitForSelector('[data-testid="toast"] a[href*="/status/"]',
-      { timeout: 15000 }).catch(() => null);
-    if (landed) {
-      const h = await landed.getAttribute('href');
-      if (!/^(https:\/\/x\.com)?\/[A-Za-z0-9_]+\/status\/\d+$/.test(h)) landed = null;
-    }
-    if (!landed) {
-      const shot = `${SHOT_DIR}/x-post-nolanding-${Date.now()}.png`;
-      await page.screenshot({ path: shot });
-      const alert = await page.$eval('[role="alert"]', (el) => el.innerText).catch(() => '');
-      console.log(JSON.stringify({ posted: false, clicked: true, composer_matched: true,
-        reason: 'no /status/ link observed after click', alert, screenshot: shot }));
+    // A click is not a post. The landing decision lives in readLanding so it can
+    // run against a stub page (tests/x-post-landing-check.test.mjs); here we only
+    // map its decision to output + exit code.
+    const decision = await readLanding(page, { timeout: 15000, shotDir: SHOT_DIR });
+    if (!decision.posted) {
+      console.log(JSON.stringify({ ...decision, composer_matched: true }));
       process.exit(4);  // 3 is the pre-click composer refusal; 4 = clicked, nothing landed
     }
-    const href = await landed.getAttribute('href');
-    const url = href.startsWith('http') ? href : `https://x.com${href}`;
-    console.log(JSON.stringify({ posted: true, url, text: finalText, composer_matched: true }));
+    console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
     process.exit(0);
   }
 } catch (err) {
