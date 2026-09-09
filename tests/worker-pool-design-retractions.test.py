@@ -240,6 +240,61 @@ def line_neighbours(doc, anchor):
     return back(a - 1), fwd(b + 1)
 
 
+def semantic_units(doc):
+    """The document as whole SEMANTIC units -- a list item (with its wrapped
+    continuation lines), a table row, a fenced block, or a paragraph.
+
+    keweichen r12 F2: comparing PHYSICAL lines let a list item rot beside the
+    pinned line, accepted a swap of two adjacent wrapped lines, and rejected a
+    harmless rewrap. A unit absorbs its own continuations, so re-wrapping is
+    invisible and any edit WITHIN the item lands on its text.
+    """
+    units, cur, fence = [], [], False
+    def flush():
+        if cur: units.append("\n".join(cur)); cur.clear()
+    for line in doc.split("\n"):
+        st = line.strip()
+        if st.startswith("```"):
+            cur.append(line)
+            if fence: flush()
+            fence = not fence
+            continue
+        if fence:
+            cur.append(line); continue
+        if not st or st == ">":
+            flush(); continue
+        body = re.sub(r"^\s*>+\s?", "", line)
+        starts = bool(re.match(r"\s*(?:[-*+]\s|\d+[.)]\s|\|)", body)) or body.startswith("#")
+        if starts:
+            flush()
+        cur.append(line)
+    flush()
+    return units
+
+
+def semantic_unit(doc, anchor):
+    """The ONE semantic unit whose normalized text holds `anchor`."""
+    hits = [u for u in semantic_units(doc) if anchor in normalized(u)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} semantic units hold it, not 1"
+    return normalized(hits[0])
+
+
+def unit_neighbours(doc, anchor):
+    """The FULL normalized units either side of the one holding `anchor`.
+
+    keweichen r12 F4: stored neighbour PREFIXES compared with startswith() let a
+    decoy paragraph opening with the same words stand in for the real one, so an
+    "exact neighbours" control proved only an ordinary move.
+    """
+    units = semantic_units(doc)
+    hits = [k for k, u in enumerate(units) if anchor in normalized(u)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} semantic units hold it, not 1"
+    k = hits[0]
+    prev = normalized(units[k - 1]) if k else ""
+    nxt = normalized(units[k + 1]) if k + 1 < len(units) else ""
+    return prev, nxt
+
+
 def live_hits(text, phrase):
     """Lines asserting `phrase`, excluding those narrating its retraction.
 
@@ -1664,68 +1719,75 @@ class AnalogousQualifiersAreLineExactAndSectionBound(unittest.TestCase):
     """
 
     QUALIFIERS = [
-        {
-                "anchor": "Retirement is not crash-complete",
-                "heading": "The protocol claims NOT established by this document",
-                "line": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and"
-        },
-        {
-                "anchor": "a FOURTH source, not one of the three",
-                "heading": "The protocol claims NOT established by this document",
-                "line": "`claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing"
-        },
-        {
-                "anchor": "One owner, not \"sidecar or wrapper\"",
-                "heading": "What the core and the operator read to judge a worker",
-                "line": "| the report transport, named \u2014 and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not \"sidecar or wrapper\". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it \"already tails\" anything** \u2014 it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO \u2014 the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |"
-        },
-        {
-                "anchor": "`exclusions` is not why the binding unit is a room",
-                "neighbour": "the binding unit is the ROOM",
-                "heading": "Worker pool \u2014 design (v1)",
-                "line": "room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped"
-        },
-        {
-                "anchor": "only when EVERY bound member is ineligible",
-                "heading": "Coordination contract",
-                "line": "work stays PENDING only when EVERY bound member is ineligible. The core does"
-        },
-        {
-                "anchor": "no UNBOUND worker stands in",
-                "heading": "Coordination contract",
-                "line": "not claim it, and no UNBOUND worker stands in. Work an ineligible worker had"
-        }
-]
+            {
+                    "anchor": "Retirement is not crash-complete",
+                    "heading": "The protocol claims NOT established by this document",
+                    "unit": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings.",
+                    "prev": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
+                    "next": "- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary."
+            },
+            {
+                    "anchor": "a FOURTH source, not one of the three",
+                    "heading": "The protocol claims NOT established by this document",
+                    "unit": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
+                    "prev": "- **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C proof it was described as.** The model stacks owner names rather than holding two simultaneously live claimants, so it cannot express the schedule this obligation is about; the row is STATED, not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect, and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found this bullet still claiming a result the retraction below had already withdrawn.",
+                    "next": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings."
+            },
+            {
+                    "anchor": "One owner, not \"sidecar or wrapper\"",
+                    "heading": "What the core and the operator read to judge a worker",
+                    "unit": "| the report transport, named \u2014 and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not \"sidecar or wrapper\". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it \"already tails\" anything** \u2014 it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO \u2014 the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |",
+                    "prev": "| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with \"a worker too broken to write its own record is simply never eligible\" \u2014 a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |",
+                    "next": "| routing exclusion | a quiesced instance is skipped at claim time (not \"in `instances` order\" \u2014 the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |"
+            },
+            {
+                    "anchor": "`exclusions` is not why the binding unit is a room",
+                    "heading": "Worker pool \u2014 design (v1)",
+                    "unit": "**It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per context group*, enforced by the lead refusing to create the second one. This design is room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped rooms ended up on non-coordinating workers, never the reason the binding unit is a room. What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by the claim, not per group by an assigner.** Two rooms of one former context group may run turns at the same time, and so may two members bound to one room. Group identity, group admission and group release are named as out of scope for v1 in the routing section and remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in v1 can express it. Every other decision in that record stands.",
+                    "prev": "**Status:** design, owner-decided 2026-09-03 (PR-triage room). This is step 1 of staging #3604 into PRs against `main`; #3604 stays open as the reference implementation and is not merged as one piece. It supersedes the \"lead = the runtime daemon\" and \"lead-managed sizing\" placements in #3604's `docs/lead-follower-pool.md` and Decision 4 of [`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), and Decision 5 of that record (the unclaimed-work backstop belongs to the lead; followers stay purely event-driven) \u2014 superseded because it sites the backstop on a lead this design no longer has, not because its reasoning was wrong; see **The reconciliation ticker**, which answers its O(N) objection rather than dropping it.",
+                    "next": "## The protocol claims NOT established by this document \u2014 they are open obligations"
+            },
+            {
+                    "anchor": "work stays PENDING only when EVERY bound member is ineligible",
+                    "heading": "Coordination contract",
+                    "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
+                    "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
+            },
+            {
+                    "anchor": "no UNBOUND worker stands in",
+                    "heading": "Coordination contract",
+                    "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
+                    "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant."
+            }
+    ]
 
     def _doc(self):
         return DOC.read_text()
 
-    def test_each_analogous_qualifier_is_exact_unique_and_in_its_section(self):
+    def test_each_analogous_qualifier_is_exact_unique_and_locally_anchored(self):
+        """Whole normalized SEMANTIC unit by equality, plus both full neighbours.
+
+        keweichen r12 F2: the physical-line form let five of six qualifiers move
+        to the end of their own section, accepted a swap of the two adjacent
+        Rule 5 lines, accepted a contradiction appended to a list item's
+        continuation line, and rejected a harmless rewrap.
+        """
         doc = self._doc()
         for q in self.QUALIFIERS:
-            # EQUALITY on the whole unit. count() accepted the expected text as a
-            # PREFIX, so an appended contradiction left all six green (keweichen).
-            units = [normalized(l) for l in doc.split("\n")
-                     if q["anchor"] in normalized(l)]
-            self.assertEqual(len(units), 1,
-                f"{q['anchor']!r}: {len(units)} lines hold it, not 1")
-            self.assertEqual(units[0], q["line"],
-                f"{q['anchor']!r}: its line changed. Equality is the pin because "
-                f"containment accepts text appended after the qualifier")
-            if q.get("neighbour"):
-                # Its enclosing heading is the H1, which spans the document, so
-                # section membership is vacuous. Bind to the adjacent text.
-                para = normalized(sole_para_normalized(doc, q["anchor"]))
-                self.assertIn(q["neighbour"], para,
-                    f"{q['anchor']!r} moved away from {q['neighbour']!r}, the claim "
-                    f"it qualifies -- they must stay in one paragraph")
-                continue
+            unit = semantic_unit(doc, q["anchor"])
+            self.assertEqual(unit, q["unit"],
+                f"{q['anchor']!r}: its unit changed. Equality on the WHOLE item "
+                f"catches a contradiction appended to any continuation line")
+            prev, nxt = unit_neighbours(doc, q["anchor"])
+            self.assertEqual(prev, q["prev"],
+                f"{q['anchor']!r}: the unit BEFORE it changed, or it was moved")
+            self.assertEqual(nxt, q["next"],
+                f"{q['anchor']!r}: the unit AFTER it changed, or it was moved")
             sec = normalized(section_of(doc, q["heading"]))
-            self.assertIn(q["line"], sec,
-                f"{q['anchor']!r} left the {q['heading']!r} section. A list item or "
-                f"table row moved out leaves its container short while the text "
-                f"still exists somewhere")
-
+            self.assertIn(unit, sec,
+                f"{q['anchor']!r} left the {q['heading']!r} section")
 
 
 class EverySensitiveSiteIsOneTable(unittest.TestCase):
@@ -1739,87 +1801,88 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
     """
 
     SITES = [
-        {
-                "key": "count:intro",
-                "anchor": "It does NOT carry proofs for the items below.",
-                "heading": "The protocol claims NOT established by this document",
-                "quoted": False,
-                "block": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
-                "prev": "## The protocol claims NOT established by this document \u2014 th",
-                "next": "- **The request-or-directory gate is a READ, not a claim fen",
-                "pin": "equality"
-        },
-        {
-                "key": "count:removal",
-                "anchor": "removal order below is one of them",
-                "heading": "The reconciliation ticker",
-                "quoted": True,
-                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of them: two incompatible normative orders appear and neither is marked primary.",
-                "prev": "### The reconciliation ticker",
-                "next": "**It is a THIRD periodic mechanism, and it is gated on pool ",
-                "pin": "equality"
-        },
-        {
-                "key": "count:stage",
-                "anchor": "The green tests here move none of",
-                "heading": "Staged PRs against main",
-                "quoted": True,
-                "block": "### STAGE GATE \u2014 steps 2, 3 and 4 are BLOCKED and must not be opened yet The [open obligations](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations) are not decided, and each one governs a protocol an implementing PR would have to encode. This gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the obligation covering it is open.** A step is unblocked when its obligation names ONE operative rule and the model suite contains a schedule that FAILS under the rejected alternative \u2014 a green suite that passes either way does not lift the gate, because that is the condition the obligations were filed under. **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control showing the same suite passes at head. As written without this, the rule was satisfiable by assertion \u2014 \"the suite discriminates\" is a claim about intent, and intent is what these obligations were filed against. Neither half can be produced by a suite that does not really discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite whose names implied it covered a defect stayed green, exit 0, when that precise bug was reintroduced. **A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent. | blocked step | obligation that blocks it | why that step cannot be written yet | |---|---|---| | 2 \u2014 worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is | | 3 \u2014 core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename \u2014 every site | | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify \u2014 that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates | | 4 \u2014 installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all | Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this document) is not gated \u2014 naming an open obligation is what it is for. **Provenance.** Two reviewers reached these sites independently: `qingyun-wu` at head `1132aad5` (fencing/rollback, removal order, clock) and `keweichen` at head `d2e41ace` (fencing as finding 2, clock as finding 4, each with a reproduced filesystem trace). Independent convergence on the same sites is why this is a gate and not a wording dispute \u2014 and why the gate is preferred here over adjudicating in this PR, which is the alternative `qingyun-wu` offered in the same review. This gate is itself an obligation: delete it in the PR that resolves the last item, not before.",
-                "prev": "## Staged PRs against main",
-                "next": "1. this document;",
-                "pin": "membership"
-        },
-        {
-                "key": "disp:request",
-                "anchor": "is a READ, not a claim fence",
-                "heading": "Coordination contract",
-                "quoted": True,
-                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit.",
-                "prev": "## Coordination contract (claim-only; the primitives are #36",
-                "next": "1. **Claim:** exclusivity is the watcher's hard-link claim, ",
-                "pin": "equality"
-        },
-        {
-                "key": "disp:allowance",
-                "anchor": "One allowance can still yield two live task claims",
-                "heading": "Coordination contract",
-                "quoted": True,
-                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.",
-                "prev": "**So the order is mandated: `stat(token)` FIRST, then `stat(",
-                "next": "The schedule that separates",
-                "pin": "equality"
-        },
-        {
-                "key": "disp:clock",
-                "anchor": "This window names three clock sources",
-                "heading": "Coordination contract",
-                "quoted": True,
-                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** \u2014 the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.",
-                "prev": "elapsed \u2014 measured from `probation.since` while the token is",
-                "next": "(a worker that never",
-                "pin": "equality"
-        },
-        {
-                "key": "disp:retire",
-                "anchor": "nor its serialization against a racing admission",
-                "heading": "Coordination contract",
-                "quoted": True,
-                "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The prose below names the seam correctly; what is NOT established is a crash-recoverable protocol across it, nor its serialization against a racing admission. Both write orders were reproduced and neither is safe.",
-                "prev": "which is the property the two-question split depends on.",
-                "next": "**That rename is atomic over the FAMILY, and not over retire",
-                "pin": "equality"
-        },
-        {
-                "key": "stated",
-                "anchor": "The orderings this must hold under",
-                "heading": "Coordination contract",
-                "quoted": False,
-                "block": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
-                "prev": "This is what bounds the risk to one task: reconciliation's `",
-                "next": "``` kick -> sweep -> worker probation held across the sweep;",
-                "pin": "equality"
-        }
-]
+            {
+                    "key": "count:intro",
+                    "anchor": "It does NOT carry proofs for the items below.",
+                    "heading": "The protocol claims NOT established by this document",
+                    "quoted": False,
+                    "block": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
+                    "prev": "## The protocol claims NOT established by this document \u2014 they are open obligations",
+                    "next": "- **The request-or-directory gate is a READ, not a claim fence.** A worker can read \"no request\", pause, let a kick publish, and still commit its ordinary batch. The split model can now express that pause (`worker_read` / `worker_commit`), and the schedule has since been RUN: the gate refuses 4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a published request bounds nothing already in flight. The protocol does NOT survive it. - **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C proof it was described as.** The model stacks owner names rather than holding two simultaneously live claimants, so it cannot express the schedule this obligation is about; the row is STATED, not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect, and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found this bullet still claiming a result the retraction below had already withdrawn. - **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses. - **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings. - **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.",
+                    "pin": "equality"
+            },
+            {
+                    "key": "count:removal",
+                    "anchor": "removal order below is one of them",
+                    "heading": "The reconciliation ticker",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of them: two incompatible normative orders appear and neither is marked primary.",
+                    "prev": "### The reconciliation ticker",
+                    "next": "**It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher",
+                    "pin": "equality"
+            },
+            {
+                    "key": "count:stage",
+                    "anchor": "The green tests here move none of",
+                    "heading": "Staged PRs against main",
+                    "quoted": True,
+                    "block": "### STAGE GATE \u2014 steps 2, 3 and 4 are BLOCKED and must not be opened yet The [open obligations](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations) are not decided, and each one governs a protocol an implementing PR would have to encode. This gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the obligation covering it is open.** A step is unblocked when its obligation names ONE operative rule and the model suite contains a schedule that FAILS under the rejected alternative \u2014 a green suite that passes either way does not lift the gate, because that is the condition the obligations were filed under. **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control showing the same suite passes at head. As written without this, the rule was satisfiable by assertion \u2014 \"the suite discriminates\" is a claim about intent, and intent is what these obligations were filed against. Neither half can be produced by a suite that does not really discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite whose names implied it covered a defect stayed green, exit 0, when that precise bug was reintroduced. **A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent. | blocked step | obligation that blocks it | why that step cannot be written yet | |---|---|---| | 2 \u2014 worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is | | 3 \u2014 core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename \u2014 every site | | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify \u2014 that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates | | 4 \u2014 installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all | Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this document) is not gated \u2014 naming an open obligation is what it is for. **Provenance.** Two reviewers reached these sites independently: `qingyun-wu` at head `1132aad5` (fencing/rollback, removal order, clock) and `keweichen` at head `d2e41ace` (fencing as finding 2, clock as finding 4, each with a reproduced filesystem trace). Independent convergence on the same sites is why this is a gate and not a wording dispute \u2014 and why the gate is preferred here over adjudicating in this PR, which is the alternative `qingyun-wu` offered in the same review. This gate is itself an obligation: delete it in the PR that resolves the last item, not before.",
+                    "prev": "## Staged PRs against main",
+                    "next": "1. this document;",
+                    "pin": "membership",
+                    "unit": "**A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent."
+            },
+            {
+                    "key": "disp:request",
+                    "anchor": "is a READ, not a claim fence",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit.",
+                    "prev": "## Coordination contract (claim-only; the primitives are #3604's)",
+                    "next": "1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the",
+                    "pin": "equality"
+            },
+            {
+                    "key": "disp:allowance",
+                    "anchor": "One allowance can still yield two live task claims",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.",
+                    "prev": "**So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.**",
+                    "next": "The schedule that separates",
+                    "pin": "equality"
+            },
+            {
+                    "key": "disp:clock",
+                    "anchor": "This window names three clock sources",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** \u2014 the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.",
+                    "prev": "elapsed \u2014 measured from `probation.since` while the token is unconsumed",
+                    "next": "(a worker that never",
+                    "pin": "equality"
+            },
+            {
+                    "key": "disp:retire",
+                    "anchor": "nor its serialization against a racing admission",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The prose below names the seam correctly; what is NOT established is a crash-recoverable protocol across it, nor its serialization against a racing admission. Both write orders were reproduced and neither is safe.",
+                    "prev": "which is the property the two-question split depends on.",
+                    "next": "**That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the",
+                    "pin": "equality"
+            },
+            {
+                    "key": "stated",
+                    "anchor": "The orderings this must hold under",
+                    "heading": "Coordination contract",
+                    "quoted": False,
+                    "block": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
+                    "prev": "This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the unbounded event path both route through this gate, there is one token, and every path out of the seam either completes the admission or returns the token.",
+                    "next": "``` kick -> sweep -> worker probation held across the sweep; worker admits 1 (was: wedged, 0, 5) kick -> worker -> sweep worker admits 1, not 4; sweep sees probation, holds (was: eligible, 4, 1) kick -> multi-task backlog one token consumed; 4 stay pending event arrives in probation event path hits the same gate; admit already 0 -> pending crash after publish, before token next sweep re-issues the token; worker admits 1 crash after mkdir, worker gated no token exists to consume; the sweep finishes issuance once worker never reaches its gate window from `since` elapses -> wedged, allowance removed crash between R1 and R2 the tombstone is recognised; R2 replays, nothing is minted retirement races a live worker family moves under it; promotion ENOENTs, no second admission claimed, unfinished past window window from claimed/<task_id> elapses -> wedged ```",
+                    "pin": "equality"
+            }
+    ]
 
     def _doc(self):
         return DOC.read_text()
@@ -1833,8 +1896,13 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     f"{s['key']}: block changed -- an appended count, a reworded "
                     f"caveat or a contradiction inside it all land here")
             else:
+                # Membership over the whole gate accepts a false count appended
+                # to the caveat itself; pin the caveat's own paragraph.
                 self.assertIn(s["anchor"], got,
                     f"{s['key']}: left the quoted gate it must qualify")
+                self.assertEqual(semantic_unit(doc, s["anchor"]), s["unit"],
+                    f"{s['key']}: the caveat paragraph changed -- an appended "
+                    f"count lands here, not in the enclosing gate")
 
     def test_every_site_is_INSIDE_its_declared_section(self):
         doc = self._doc()
@@ -1854,11 +1922,13 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                 continue
             prev, nxt = (line_neighbours(doc, s["anchor"]) if s["quoted"]
                          else neighbours(doc, s["anchor"]))
+            # startswith() on a prefix lets a decoy neighbour opening with the
+            # same words stand in for the real one.
             if s["prev"]:
-                self.assertTrue(prev.startswith(s["prev"]),
+                self.assertEqual(prev, s["prev"],
                     f"{s['key']}: the unit BEFORE it changed or it was relocated")
             if s["next"]:
-                self.assertTrue(nxt.startswith(s["next"]),
+                self.assertEqual(nxt, s["next"],
                     f"{s['key']}: the unit AFTER it changed or it was relocated")
 
 

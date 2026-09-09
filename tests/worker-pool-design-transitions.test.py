@@ -1203,8 +1203,10 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
                                "worker_commit"], ("probation", 4, 1)),
             ("held probation", ["kick", "sweep", "worker_read", "worker", "finish",
                                 "sweep", "worker_commit"], ("eligible", 1, 4)),
-            ("held wedged", ["sweep", "worker_read", "kick", "sweep", "worker",
-                             "finish", "sweep", "worker_commit"], ("eligible", 1, 4)),
+            # A longer schedule lets another worker consume, finish and retire
+            # the allowance before worker_commit uses the held value.
+            ("held wedged", ["sweep", "worker_read", "kick", "sweep",
+                             "worker_commit"], ("probation", 0, 5)),
         ):
             v, claimed, pending, _ = run(sched)
             self.assertEqual((v, claimed, pending), want,
@@ -1237,7 +1239,8 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         # Deleting the surviving live-other claim left 83/83 green with
         # `claims={}`: the state was described, never pinned.
         self.assertEqual(d.claims, {"t1": "p1"},
-            "the other owner's live claim must SURVIVE the crash")
+            "the other owner's live claim must survive the rollback / "
+            "failed promotion")
         self.assertIsNone(d.journal,
             "the journal WAS written at gate step 1b and must not SURVIVE the "
             "live-other rollback / failed promotion -- cleared, not never-written")
