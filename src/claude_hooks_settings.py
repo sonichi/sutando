@@ -11,6 +11,13 @@ Pruning is scoped to the SAME FAMILY as the hook being installed — entries who
 command runs a script with the same basename — and only when that script no
 longer exists. A user's own hooks, dead or alive, are never touched.
 
+Why a bare existence check is enough: the two costs are asymmetric. A false
+prune (the script is merely unreachable at launch) costs ONE launch without that
+hook, because every installer re-adds its own command at the next core launch.
+A missed prune (a dead copy left in place) costs every compaction until a human
+notices — which is how this reached the owner. So the predicate stays broad and
+the blast radius is bounded by family, not by path shape.
+
     python3 src/claude_hooks_settings.py install --settings <path> \\
         --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
         [--matcher compact] [--prepend] [--label "x hook"]
