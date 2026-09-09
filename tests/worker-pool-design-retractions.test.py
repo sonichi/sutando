@@ -1288,5 +1288,51 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
     def test_a_first_writer_only_primitive_is_called_insufficient(self):
         self.assertIn("NOT solved by a first-writer-only primitive", self._flat())
 
+class TheStageGateCarriesThisLayersObligations(unittest.TestCase):
+    """keweichen at 740b171c: the gate repair had no discriminating pin — removing
+    the mappings and the child-obligations paragraph recreated the exact omission
+    while both suites stayed green. These assertions are gate-SCOPED: they read the
+    blockquote, not the document, because the defect was prose present and gate
+    silent."""
+
+    def _gate(self):
+        raw = open(DOC).read()
+        start = raw.index("### STAGE GATE")
+        out = []
+        for line in raw[start:].split("\n"):
+            if line.startswith(">") or (not line.strip() and out):
+                if not line.strip() and out and not out[-1].startswith(">"):
+                    break
+                out.append(line)
+            elif out:
+                break
+        return "\n".join(out)
+
+    def test_untaken_offer_expiry_is_gated_on_steps_2_and_3(self):
+        g = self._gate()
+        row2 = [l for l in g.split("\n") if l.startswith("> | 2 ")]
+        row3 = [l for l in g.split("\n") if l.startswith("> | 3 ")]
+        self.assertTrue(row2 and "untaken-offer expiry" in row2[0],
+            "step 2 consumes offers; its row must gate the expiry")
+        self.assertTrue(row3 and "untaken-offer expiry" in row3[0],
+            "step 3 recovers offers; its row must gate the expiry")
+
+    def test_the_durable_late_result_selector_is_gated_on_step_2(self):
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "durable late-result selector" in row2[0],
+            "step 2 publishes results; the selector that refuses a revoked late "
+            "writer does not exist yet and must gate it")
+
+    def test_the_gate_requires_BOTH_late_writer_orders_pinned(self):
+        self.assertIn("late-writer order", self._gate(),
+            "one order pinned is not the obligation; the gate must say BOTH")
+
+    def test_the_gate_names_these_as_added_by_this_layer(self):
+        """Without this the two could be read as inherited, and a future parent
+        merge would silently drop them the way the first merge did."""
+        g = self._gate()
+        self.assertIn("added by this layer", g)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

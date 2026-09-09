@@ -26,7 +26,7 @@ v1 can express it. Every other decision in that record stands.
 ## The protocol claims NOT established by this document — they are open obligations
 
 This PR carries the design and a model that can express the interleavings the real system has.
-It does NOT carry proofs for the four items below. They were raised as blocking review findings
+It does NOT carry proofs for the items below. They were raised as blocking review findings
 and remain open; a reader must not treat the surrounding prose as having settled them, and the
 implementing PR owes each one a schedule that fails before it passes.
 
@@ -2029,7 +2029,8 @@ production-path tests; the staged list below marks which those are.
 > a clobbering `os.replace` does not refuse a revoked late writer, and the durable selector that
 > would is named here as unresolved, with BOTH late-writer orders owed a pin. Raised by
 > `keweichen`, whose scan of the merged document found each named once in the prose and zero
-> times in the gate — so the gate could have lifted step 2 with both still open.>
+> times in the gate — so the gate could have lifted step 2 with both still open.
+>
 > Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
 > document) is not gated — naming an open obligation is what it is for.
 >
