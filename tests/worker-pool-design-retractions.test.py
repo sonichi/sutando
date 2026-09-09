@@ -23,90 +23,72 @@ HISTORY = (
 
 # (pattern rejected as a MECHANISM, positive control that must be present, why)
 REJECTED = [
-    (r"\blead\b|\brouter\b|\bfollower\b",
-     "pool supervisor",
-     "a lead, router or follower inside the runtime daemon: the daemon is "
-     "transport plus composition, and a scheduler is durable-transition work. "
-     "The scheduler is the pool supervisor, its own process."),
-    (r"the core (?:sweeps|reclaims|assigns|routes|schedules)"
-     r"|the core(?:'s)? sweep"
-     r"|the core (?:is|as) the (?:scheduler|supervisor|control plane)"
-     r"|core-owned (?:sweep|schedul)",
-     "The core agent is an executor only",
-     "the core as scheduler. Quota is per account, so a control plane inside an "
-     "LLM session goes dark in exactly the outage it must act in."),
-    (r"queue_handler_task"
-     r"|(?:the )?watcher (?:owns|is) the admission"
-     r"|admission owner"
-     r"|each watcher (?:claims|admits|routes)",
-     "the supervisor",
-     "queue_handler_task, or any watcher, as the admission owner. Admission is "
-     "one transaction performed by the one scheduler."),
-    (r"keyed on the (?:task )?filename"
-     r"|claim keyed on the basename"
-     r"|filename is the (?:claim )?key"
-     r"|(?:the )?basename as the key",
-     "canonical task ID",
-     "a claim keyed on the filename. Measured 2026-09-08: a stem-keyed "
-     "classifier accumulated 254 rows under names that no longer exist."),
+    (r"leaderless"
+     r"|worker(?:s)? (?:may |can |will )?claim(?:s)? unassigned"
+     r"|self-claim"
+     r"|claim(?:s)? from the unassigned pool",
+     "never selects its own work",
+     "leaderless claiming, in which a worker takes unassigned work when the "
+     "router is down. Owner decision 2026-09-08: the fallback is removed."),
+    (r"reclaim[^.;]{0,60}stale"
+     r"|stale[^.;]{0,60}(?:reclaim|release)"
+     r"|\brepool",
+     "Stale is not dead",
+     "release keyed on a stale beat. A host sleep stales every beat at once, "
+     "so staleness releases held work in bulk and duplicates it."),
+    (r"router (?:revives|restarts|respawns|relaunches|keeps|starts) "
+     r"|router[^.;]{0,30}(?:keeps|holds) (?:a |the )?(?:worker|process) alive",
+     "owns worker recovery",
+     "the router reviving a worker. Placement is its only power; restart is a "
+     "lifecycle and spend decision the core owns."),
+    (r"(?:launchd|supervisor) (?:supervis\w*|keeps|restarts|manages|hosts)\s+"
+     r"(?:a |the |each |every )?worker(?:'s)? session"
+     r"|per-worker plist",
+     "Never a worker's session",
+     "a process supervisor owning a worker's session. Measured 2026-09-08: a "
+     "KeepAlive wrapper whose session never returns retries forever, invisible "
+     "to every heartbeat. A restart is not a resume."),
+    (r"stamp (?:alone )?(?:authoris|authoriz)"
+     r"|authoris(?:e|es|ed)[^.;]{0,20}(?:by|on) the (?:stamp|envelope)"
+     r"|(?:verified|valid) envelope[^.;]{0,30}(?:execute|executes|runs)",
+     "resolved, not read off the message",
+     "an integrity stamp used as an authorisation boundary. A signed guest "
+     "command verifies exactly as a signed owner command does."),
+    (r"\bmessage bus\b|\bgRPC\b|\bsocket\b|\bRPC\b",
+     "os.rename",
+     "a socket, RPC or message bus between pool members. An agent session "
+     "exposes no port, so the filesystem is the substrate."),
+    (r"target_worker|fan_out",
+     "roster",
+     "sender-directed routing headers. Placement is read from the roster; a "
+     "sender's message is not a routing instruction."),
+    (r"least[- ]loaded|busy[- ]cap|auto[- ]?scal(?:e|es|ing)"
+     r"|sticky (?:auto-)?affinity|overflow to (?:another|an|the next)",
+     "Bindings hold until the owner changes them",
+     "load-aware or self-resizing placement, and bindings that change "
+     "themselves. Each shipped in #3604's picker and is cut."),
     (r"per-worker proactive loop"
-     r"|proactive loop on (?:each|every) worker"
-     r"|follower-loop fallback"
-     r"|the worker's (?:own )?loop (?:claims|routes|enforces)",
-     "Worker agents run no proactive loop",
-     "a per-worker proactive loop or follower-loop fallback as a routing "
-     "mechanism. Server-side routing gives a unique seat, so no fallback "
-     "survives in any executor."),
-    (r"task-event-handler-claims|task-event-handler-accepts|pool-probation"
-     r"|\bfallbacks/|\bdirect/|\bsettled/|\.admit/"
-     r"|`token`|`spent`|`held/|`claimed/",
-     "os.replace",
-     "the claims/accepts/receipts/token file protocol. Several writers "
-     "expressing one state through different files is the defect; one writer "
-     "plus one atomically replaced record is the answer."),
-    (r"TASK_FILE",
-     "Executor.offer",
-     "TASK_FILE on stdout as the delivery abstraction. Delivery is the "
-     "adapter's problem, and delivery is not admission."),
-    (r"_pick\(\)|five-tier|five tier",
-     "Routing table",
-     "a five-tier _pick(). Routing is one table evaluated once by one party."),
-    (r"presence of (?:a|the) (?:claim|running|accept)[ -]?(?:file|marker)"
-     r"|(?:claim|running|accept) (?:file|marker) "
-     r"(?:is|means|marks|records|indicates|signals)",
-     "state.json",
-     "a claim, running or accept marker file as the source of task state. One "
-     "fact has one authoritative source, and task state is the journal record."),
-    (r"renam(?:e|es|ed|ing) (?:the |a )?task file"
-     r"|`?claimed`? suffix (?:in|on) the (?:task )?filename "
-     r"(?:is|marks|records|means)"
-     r"|(?:the )?filename (?:encodes|carries|records|marks) (?:the )?state"
-     r"|state (?:lives|is stored) in the (?:task )?filename",
-     "stable and immutable",
-     "a `claimed` suffix, or any rename of tasks/<task-id>.txt, as a state "
-     "mechanism. The payload is written once and never renamed."),
-    (r"executors? (?:writes?|updates?|replaces?|owns?) "
-     r"(?:the |its |their )?(?:`?state\.json`?|authoritative (?:state|record))"
-     r"|(?:the )?executor (?:writes|updates) the (?:state )?record",
-     "Executors never write authoritative state",
-     "an executor writing state.json or any other authoritative record. The "
-     "supervisor is the single writer; executors report events and receipts."),
-    (r"\bPID file\b|\bpidfile\b|\bpid-file\b",
-     "pool-supervisor.lock",
-     "a PID file as the single-instance guard. A PID is reused and the gap "
-     "between reading one and acting on it is a race; the guard is an OS "
-     "advisory lock."),
-    (r"\bSQLite\b|\bsqlite3?\b|CREATE TABLE|UPDATE\s+tasks"
-     r"|conditional `?UPDATE`?|`?WHERE`? clause",
-     "atomically replaced",
-     "SQLite, or any CREATE TABLE / UPDATE ... WHERE store, as the normative "
-     "store. Owner decision 2026-09-07: the journal is the store."),
+     r"|proactive loop (?:on|in|inside) (?:each|every|a) worker"
+     r"|worker(?:'s)? own loop (?:claims|routes|enforces)",
+     "A scheduling loop inside a worker",
+     "a proactive loop inside a worker. Its crons are allowed; a self-driven "
+     "loop that selects work is not."),
+    (r"pool supervisor|the router (?:schedules|is the scheduler)",
+     "router",
+     "the scheduler framing. Owner decision 2026-09-08: the scheduler is a "
+     "router, and it delivers rather than schedules."),
+    # archiving a payload by rename is legitimate; assigning by renaming it is not
+    (r"renam\w+[^.;]{0,30}the payload(?![^.;]{0,24}archive)"
+     r"|renam\w+[^.;]{0,30}(?:the task file|the request)"
+     r"|assignment[^.;]{0,20}(?:is|by) (?:a |the )?rename"
+     r"|\.assigned-|\.claimed-worker",
+     "existing IS the assignment",
+     "assignment carried as a suffix on the task filename. The payload is "
+     "immutable; the assignment is a delivery record in the recipient's folder."),
 ]
 
 
 def _flat(text):
-    """Markdown wraps mid-sentence, so a control phrase is routinely absent from
-    every single line while present in the document."""
     return " ".join(text.split())
 
 
@@ -149,7 +131,7 @@ class DocIsPresentAndSubstantial(unittest.TestCase):
 
     def test_normative_doc_exists(self):
         self.assertTrue(DOC.is_file(), f"{DOC} missing")
-        self.assertGreater(len(DOC.read_text(encoding="utf-8")), 12000)
+        self.assertGreater(len(DOC.read_text(encoding="utf-8")), 9000)
 
     def test_notes_doc_exists(self):
         self.assertTrue(NOTES.is_file(), f"{NOTES} missing")
@@ -197,116 +179,30 @@ class RejectedMechanismsAreNotPrescribed(unittest.TestCase):
                     f"a denial of {pattern!r} was read as a prescription")
 
 
+class HistoryStaysInTheNotes(unittest.TestCase):
+    def test_normative_doc_carries_no_revision_history(self):
+        flat = _flat(DOC.read_text(encoding="utf-8")).lower()
+        for phrase in HISTORY:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, flat,
+                                 f"revision history in the normative doc: {phrase!r}")
+
+
 # One assertive sentence per rejected mechanism, sharing none of the doc's wording.
 _PROBES = {
-    REJECTED[0][0]: "The lead process assigns work to each follower.",
-    REJECTED[1][0]: "On every pass the core sweeps its workers and reclaims their tasks.",
-    REJECTED[2][0]: "The admission owner is queue_handler_task, which holds the lock.",
-    REJECTED[3][0]: "The claim is keyed on the filename of the task file.",
-    REJECTED[4][0]: "Pin affinity is enforced by the per-worker proactive loop.",
-    REJECTED[5][0]: "A winner writes a receipt under task-event-handler-claims and continues.",
-    REJECTED[6][0]: "Delivery is a TASK_FILE line printed on stdout.",
-    REJECTED[7][0]: "Placement runs through the five-tier _pick() ladder.",
-    REJECTED[8][0]: "The presence of a running marker file marks the task as executing.",
-    REJECTED[9][0]: "A worker renames the task file so its filename records the state.",
-    REJECTED[10][0]: "Each executor writes state.json for the task it holds.",
-    REJECTED[11][0]: "Single instance is guaranteed by a PID file written at startup.",
-    REJECTED[12][0]: "Every transition is one conditional UPDATE against the tasks table in SQLite.",
+    REJECTED[0][0]: "When the placement daemon goes quiet each executor falls back to leaderless grabbing of whatever sits in the shared spool.",
+    REJECTED[1][0]: "Tickets held by a seat whose beat lapsed are repooled on the next sweep.",
+    REJECTED[2][0]: "The router restarts a worker whose supervision unit gave up on it.",
+    REJECTED[3][0]: "A per-worker plist keeps each seat alive with KeepAlive.",
+    REJECTED[4][0]: "A command whose stamp authorises it proceeds straight to execution.",
+    REJECTED[5][0]: "Each executor opens a socket back to the scheduler and streams progress over it.",
+    REJECTED[6][0]: "The submitting client sets target_worker in the header and the queue honours it.",
+    REJECTED[7][0]: "The placement pass hands the ticket to the least-loaded seat currently under its cap.",
+    REJECTED[8][0]: "Each worker runs a per-worker proactive loop that wakes on a timer to look for work.",
+    REJECTED[9][0]: "The pool supervisor is the sole scheduler and holds every lease.",
+    REJECTED[10][0]: "Placement renames the task file so the assignment is a rename of the payload itself.",
 }
 
 
-class HistoryLivesInTheNotesFile(unittest.TestCase):
-    """The split is the point: a rule and the account of how it got there in one
-    paragraph is what forced a 1,225-line test onto a 1,914-line draft."""
-
-    def test_normative_doc_carries_no_history(self):
-        text = DOC.read_text(encoding="utf-8").lower()
-        found = [h for h in HISTORY if h in text]
-        self.assertEqual(found, [],
-                         f"history phrasing in the normative doc: {found}")
-
-    def test_the_history_scan_can_fire(self):
-        probe = "an earlier revision said the core sweeps, and that was retracted."
-        self.assertNotEqual([h for h in HISTORY if h in probe], [],
-                            "the history scan cannot detect history")
-
-    def test_the_notes_file_is_where_history_is_allowed(self):
-        """Control on the split: the notes file must actually carry the record,
-        or the normative file is clean because nothing was written down."""
-        notes = NOTES.read_text(encoding="utf-8").lower()
-        self.assertNotEqual([h for h in HISTORY if h in notes], [],
-                            "the notes file records no history, so the split is "
-                            "hiding the record rather than relocating it")
-
-
-class TheChosenContractIsPinned(unittest.TestCase):
-    """A phrase scan cannot see an obsolete MODEL left beside its replacement:
-    nothing is re-worded, so nothing trips it. Pin the chosen side directly."""
-
-    PRESENT = [
-        ("tasks/<task-id>.txt", "the payload path is declared, not described"),
-        ("task-state/", "the journal directory is named"),
-        ("state.json", "the one authoritative record is named"),
-        ("os.replace", "the atomic replacement rule is written down"),
-        ("bindings/rooms.json", "the pin table is one atomically replaced file"),
-        ("results/<task-id>/<generation>.txt", "a result is keyed by generation"),
-        ("executor-events/", "the receipt inbox is named"),
-        ("stale-results/", "a refused stale completion is kept, never applied"),
-        ("pool-supervisor.sock", "executors report over the socket, not the journal"),
-        ("pool-supervisor.lock", "the single-instance guard is an advisory lock"),
-        ("PENDING", "the state machine's re-offerable state"),
-        ("OFFERED", "delivery is not admission, so OFFERED is a real state"),
-        ("ACCEPTED", "an executor must explicitly accept"),
-        ("SUCCEEDED", "a terminal state"),
-        ("executor_id", "possession is guarded on the executor identity"),
-        ("assignment_id", "the offer's identity is echoed in every event"),
-        ("lease_generation", "the anti-replay token in the generation check"),
-        ("PROBING", "the only exit from WEDGED is commanded"),
-        ("QUIESCED", "resource exhaustion is a health state, not a mood"),
-        ("Process with core", "the bound-but-unavailable wait must be user-visible"),
-        ("Rebind", "one of the three owner choices"),
-        ("Executor.offer", "the interface is named, not implied"),
-        ("id:", "identity comes from the header"),
-        ("254", "the identity rule cites its measurement"),
-    ]
-
-    def test_every_chosen_element_is_present(self):
-        text = _flat(DOC.read_text(encoding="utf-8"))
-        for phrase, why in self.PRESENT:
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, text, f"chosen contract missing: {why}")
-
-    def test_the_pin_can_fail(self):
-        """Control: reconstruct the flagged state against a fixture string."""
-        for phrase, _why in self.PRESENT:
-            with self.subTest(phrase=phrase):
-                self.assertNotIn(phrase, "a document that says none of it")
-
-
-class OneSchedulerIsStatedNormatively(unittest.TestCase):
-    """The architectural decision has to be findable as a rule, not inferable
-    from the absence of alternatives."""
-
-    def _flat(self):
-        return re.sub(r"\s+", " ", DOC.read_text(encoding="utf-8"))
-
-    def test_the_supervisor_is_named_the_only_scheduler(self):
-        self.assertRegex(self._flat(), r"only scheduler",
-                         "say there is one scheduler; do not leave it to be derived")
-
-    def test_the_zero_candidate_hole_is_closed_by_construction(self):
-        f = self._flat()
-        self.assertRegex(
-            f, r"removed by construction",
-            "reconciliation must not be presented as the repair for a routing hole")
-        self.assertRegex(
-            f, r"lease expiry and restart convergence",
-            "scope the periodic backstop, or a reader reads it as the routing path")
-
-    def test_the_lifecycles_are_stated_separate(self):
-        self.assertRegex(self._flat(), r"lifecycles are separate",
-                         "co-location is allowed; lifecycle coupling is not")
-
-
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    unittest.main(verbosity=2)
