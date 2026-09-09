@@ -162,6 +162,43 @@ class PerHostRoster(unittest.TestCase):
         self.assertIn("alice@peerbox", via_notify,
                       "the losing peer row was dropped instead of surfaced")
 
+    def test_BOTH_readers_resolve_the_SAME_login_under_EITHER_spelling(self):
+        """Keys agreeing is not the readers agreeing.
+
+        The test above compares merged KEYS, so it passes while the two readers
+        interpret the identity FIELD differently — which they did: one read
+        `gh`, the other `github`, and one live file carries both. A row then
+        resolves for one reader and reads as login-less to the other.
+        """
+        self._write("LOCAL", {"a": {"gh": "john-the-dev"},
+                              "b": {"github": "sonichi"},
+                              "c": {"stand": "@c:x"}})
+
+        spec = importlib.util.spec_from_file_location(
+            "lk", REPO / "skills" / "collaboration-intelligence" / "scripts" / "lookup.py")
+        lk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lk)
+
+        sys.path.insert(0, str(SCRIPT.parent))
+        from roster_union import roster_login
+
+        via_notify = {k: roster_login(r)[0] for k, r in self.nr.load_roster().items()}
+        via_lookup = {r["entity_id"]: r["github"]
+                      for r in lk.load_roster(self.tmp / "data" / "collaboration-intelligence")}
+        self.assertEqual(via_notify, via_lookup,
+                         "the two readers disagree about which field declares the login")
+        self.assertEqual(via_notify, {"a": "john-the-dev", "b": "sonichi", "c": ""},
+                         "a deployed spelling resolved to nothing")
+
+    def test_roster_login_reports_no_login_for_a_row_that_is_not_a_mapping(self):
+        """The shared owner's contract: a malformed row yields no login rather
+        than raising into whichever reader happened to touch it first."""
+        sys.path.insert(0, str(SCRIPT.parent))
+        from roster_union import roster_login
+        self.assertEqual(roster_login("john-the-dev"), ("", ""))
+        self.assertEqual(roster_login(None), ("", ""))
+        self.assertEqual(roster_login({"gh": "x"}), ("x", "gh"))
+
     def test_a_differing_LEGACY_row_is_kept_under_a_suffix_never_a_bare_overwrite(self):
         """john-the-dev's repro: host="" used to collapse the suffix to the bare
         key, so the LEGACY row overwrote local and nothing preserved the loser."""

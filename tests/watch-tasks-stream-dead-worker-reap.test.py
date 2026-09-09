@@ -15,6 +15,10 @@ FAILURES: list[str] = []
 FAILURE_TEXT = "could not safely process"
 
 
+class ReadinessTimeout(RuntimeError):
+    """A readiness wait expired. Never swallowed: a short kill leaves a worker alive."""
+
+
 def check(name: str, cond: bool, detail: str = "") -> None:
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
@@ -113,14 +117,34 @@ class Harness:
         with self.feed.open("a") as fh:
             fh.write(str(p.resolve()) + "\n")
 
-    def kill_workers(self) -> list[int]:
+    def worker_pids(self) -> list[int]:
+        """Receipts that actually carry a pid yet.
+
+        The dispatcher creates `workers/<name>` EMPTY and writes the pid only
+        after spawning, so an unreadable receipt means "not ready", not "no worker".
+        """
         pids = []
-        d = self.dispatch()
-        for r in (d / "workers").iterdir():
+        for r in (self.dispatch() / "workers").iterdir():
             try:
                 pids.append(int(r.read_text().strip()))
             except (ValueError, OSError):
                 pass
+        return pids
+
+    def kill_workers(self, expect: "int | None" = None,
+                     timeout: float = 15.0) -> list[int]:
+        # Derived, not passed: every `running/` marker owes a receipt, and the
+        # marker is written first -- so a call site cannot under-wait by default.
+        if expect is None:
+            expect = max(1, len(names(self.dispatch() / "running")))
+        ready = wait_for(lambda: len(self.worker_pids()) >= expect, timeout)
+        pids = self.worker_pids()
+        if not ready or len(pids) < expect:
+            # Continuing here kills a SHORT set and leaves a worker alive, which
+            # is the failure this helper exists to prevent -- so it must not return.
+            check("kill_workers readiness", False,
+                  f"timed out: {len(pids)} receipt pid(s), expected {expect}")
+            raise ReadinessTimeout(f"{len(pids)} of {expect} receipts after {timeout}s")
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -321,13 +345,59 @@ def scenario_answer_landing_during_the_reap_stays_deliverable() -> None:
 
 
 
+def scenario_readiness_timeout_fails_loudly() -> None:
+    """Two running markers, zero receipt pids, expired wait: the helper must NOT
+    return a short set. Exercises the PRODUCTION helper, not a copy of it."""
+    print("\nscenario: a timed-out readiness wait aborts instead of killing a short set")
+    print("  (the two 'FAIL kill_workers readiness' lines below are DELIBERATE)")
+    d = Path(tempfile.mkdtemp()) / "sutando-task-dispatch.probe"
+    (d / "running").mkdir(parents=True)
+    (d / "workers").mkdir(parents=True)
+    for n in ("task-a.txt", "task-b.txt"):
+        (d / "running" / n).write_text("/nowhere")
+        (d / "workers" / n).write_text("")      # created, pid never written
+
+    class _Stub:
+        dispatch = lambda self: d
+        worker_pids = Harness.worker_pids
+        kill_workers = Harness.kill_workers
+
+    before = len(FAILURES)
+    try:
+        _Stub().kill_workers(timeout=0.5)
+        check("a timed-out readiness wait raises instead of returning", False,
+              "returned normally with a short pid set")
+    except ReadinessTimeout:
+        # check() inside the helper recorded the readiness failure; that entry is
+        # expected here, so it is removed rather than counted against the run.
+        check("a timed-out readiness wait raises instead of returning",
+              len(FAILURES) == before + 1, f"recorded {len(FAILURES) - before} failure(s)")
+        del FAILURES[before]
+
+    (d / "workers" / "task-a.txt").write_text("999999")
+    try:
+        _Stub().kill_workers(timeout=0.5)
+        check("and it still refuses when only SOME receipts are ready", False,
+              "one of two receipts was enough")
+    except ReadinessTimeout:
+        check("and it still refuses when only SOME receipts are ready", True)
+        del FAILURES[-1]
+
+
 def main() -> int:
-    scenario_slot_recovery()
-    scenario_reap_publishes_only_without_an_exact_result()
-    scenario_placeholder_never_settles_the_task_as_success()
-    scenario_whitespace_archived_result_is_not_delivered()
-    scenario_unready_destination_is_left_untouched_and_unsettled()
-    scenario_answer_landing_during_the_reap_stays_deliverable()
+    for sc in (scenario_slot_recovery,
+               scenario_reap_publishes_only_without_an_exact_result,
+               scenario_placeholder_never_settles_the_task_as_success,
+               scenario_whitespace_archived_result_is_not_delivered,
+               scenario_unready_destination_is_left_untouched_and_unsettled,
+               scenario_answer_landing_during_the_reap_stays_deliverable,
+               scenario_readiness_timeout_fails_loudly):
+        try:
+            sc()
+        except ReadinessTimeout as e:
+            # Already recorded by check(); catching keeps one scenario from
+            # hiding the verdicts of the others.
+            print(f"  (scenario {sc.__name__} aborted: {e})")
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1

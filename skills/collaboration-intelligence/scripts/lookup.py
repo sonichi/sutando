@@ -48,15 +48,16 @@ def load(d):
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
-    The roster is keyed by short name with the GitHub login in the `github`
-    FIELD; a key-equality lookup queries the wrong axis and reads a mapped
-    reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
-    `get("john-the-dev")` missed the entry keyed `rui`).
+    The roster is keyed by short name with the GitHub login in a FIELD; a
+    key-equality lookup queries the wrong axis and reads a mapped reviewer as
+    absent (measured twice: 2026-08-27, 2026-08-28 — both times
+    `get("john-the-dev")` missed the entry keyed `rui`). Which field spells that
+    login is roster_union.roster_login's call, shared with the other reader.
     """
     # Same union, same collision semantics as notify_reviewers: both readers of
     # this store delegate to roster_union so they cannot drift apart.
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from roster_union import host_rosters, roster_union
+    from roster_union import host_rosters, roster_login, roster_union
     # The file this reader was pointed at is its LOCAL and goes first: on a
     # legacy host it is the shared file, which host_rosters lists LAST.
     local = d / "reviewer-stands.json"
@@ -69,13 +70,14 @@ def load_roster(d):
     for key, r in merged.items():
         if not isinstance(r, dict):
             continue
+        gh = roster_login(r)[0]
         rows.append({
             "entity_id": key,
             "agent_mxid": r.get("stand") or "",
-            "github": r.get("github") or "",
+            "github": gh,
             "human": r.get("human") or "",
             "allowlisted": r.get("allowlisted"),
-            "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
+            "one_line": f"github={gh} human={r.get('human','')} stand={r.get('stand','')}",
         })
     return rows
 

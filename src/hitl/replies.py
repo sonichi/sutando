@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 from workspace_default import resolve_workspace
 
 from .manager import HitlManager
-from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError
+from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
 
 REPLY_FIELD = "space.ag2.hitl.action"
 EVENT_TYPE = "message.created"
@@ -87,6 +87,9 @@ class HitlReplyHandler:
         # Form task_to_event() last recognised: "click" (hitl_action) or
         # "fallback" (typed label) — a non-owner's fallback is a MESSAGE.
         self.last_branch = None
+        # True after an applied click whose requirement asks for an agent turn
+        # (turn_on_action): the caller keeps the click on the task path.
+        self.last_turn = False
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
@@ -100,6 +103,7 @@ class HitlReplyHandler:
         actor = str(event.get("actor_id") or "")
         self.last_outcome = "ignored"
         self.last_reason = ""
+        self.last_turn = False
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -113,18 +117,40 @@ class HitlReplyHandler:
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
-            self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
-            self.last_outcome = "rejected"
-            self.last_reason = str(e)
+            redo = self._same_click_redelivered(reply)
+            if redo is None:
+                self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
+                self.last_outcome = "rejected"
+                self.last_reason = str(e)
+                return claimed
+            # The click was applied but the turn it asked for was never written (a death in
+            # between): the redelivery is the same click, so the turn is still owed, not stale.
+            self.last_outcome = "applied"
+            self.last_turn = True
+            self._log(f"hitl: {reply.hitl_id} -> {redo.id} redelivered; the turn is still owed")
             return claimed
         self.last_outcome = "applied"
         note = ""
-        if action.kind == TUI_ACTION_KIND and self._workspace is not None:
-            req = self._manager.get(reply.hitl_id)
-            if req is not None:
-                note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
+        req = self._manager.get(reply.hitl_id)
+        if req is not None and getattr(req, "turn_on_action", False):
+            self.last_turn = True
+            note = "; a turn follows"
+        if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
+            note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    def _same_click_redelivered(self, reply: ActionReply):
+        """The Action when `reply` is the click already applied to a turn-requesting requirement
+        (in progress, same action, revision exactly one ahead of the click's), else None."""
+        req = self._manager.get(reply.hitl_id)
+        if req is None or not getattr(req, "turn_on_action", False) or req.status != STATUS_IN_PROGRESS:
+            return None
+        if req.chosen_action != reply.action_id or req.revision != reply.expected_revision + 1:
+            return None
+        if reply.guard != req.guard:
+            return None
+        return next((a for a in req.actions if a.id == reply.action_id), None)
 
     # -- task-relay path ---------------------------------------------------------
 
@@ -161,15 +187,15 @@ class HitlReplyHandler:
         req = self.requirement_for_event(target)
         if req is None:
             return None
-        label = _reply_text(str(task.get("task") or "")).strip().lower()
-        action = next((a for a in req.actions
-                       if a.label.strip().lower() == label or a.id.lower() == label), None)
+        action, note = match_action(req, _reply_text(str(task.get("task") or "")))
         if action is None:
             return None  # a reply to the card that is not a click stays a message
         self.last_branch = "fallback"
-        return {**base, "content": {REPLY_FIELD: {
-            "hitl_id": req.id, "expected_revision": req.revision,
-            "action_id": action.id, "guard": req.guard}}}
+        payload = {"hitl_id": req.id, "expected_revision": req.revision,
+                   "action_id": action.id, "guard": req.guard}
+        if note:
+            payload["answer"] = note
+        return {**base, "content": {REPLY_FIELD: payload}}
 
     def requirement_for_event(self, event_id: str) -> Optional[HumanRequirement]:
         """The active requirement whose card is `event_id` (CREATE projection;
@@ -178,6 +204,50 @@ class HitlReplyHandler:
             if self._manager.projection_target(req.id) == event_id:
                 return req
         return None
+
+
+# The separator is required: without it a label prefix-matches an unrelated
+# sentence that merely starts with it, silently turning prose into a decision.
+NOTE_SEPARATORS = ("\u2014", "\u2013", "-", ":")
+
+
+def match_action(req: HumanRequirement, text: str):
+    """(Action, note) for a reply that is a click, else (None, None).
+
+    Exact label or id is a bare click. `<label> <sep> <note>` is the same click
+    carrying a free-text qualification, which travels on as ActionReply.answer.
+    """
+    t = (text or "").strip()
+    low = t.lower()
+    # Exact match over the WHOLE action set outranks any prefix, or a shorter
+    # sibling label claims the click and eats the rest of the longer one.
+    for action in req.actions:
+        for cand in (action.label or "", action.id or ""):
+            c = cand.strip()
+            if c and low == c.lower():
+                return action, None
+    best = None
+    for action in req.actions:
+        for cand in (action.label or "", action.id or ""):
+            c = cand.strip()
+            if not c or not low.startswith(c.lower()):
+                continue
+            tail = t[len(c):]
+            rest = tail.lstrip()
+            sep = rest[:1]
+            if sep not in NOTE_SEPARATORS:
+                continue
+            # "-" joins words in English, so it separates only where the text
+            # breaks around it; the dashes and ":" never join a word.
+            if sep == "-" and not (tail[:1].isspace() or rest[1:2].isspace()):
+                continue
+            # A separator with nothing after it is still the click; the human
+            # just left the note empty.
+            if best is None or len(c) > len(best[0]):
+                best = (c, action, rest[1:].strip() or None)
+    if best is not None:
+        return best[1], best[2]
+    return None, None
 
 
 REPLY_CONTEXT_END = "[End AG2 Space reply context]"

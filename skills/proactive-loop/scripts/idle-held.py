@@ -17,7 +17,7 @@ So this tool never accepts a list. It reads `held_item_ids` from the state file
 and applies explicit add/remove operations:
 
   idle-held.py --state <ws>/state/idle-streak.json --remove cinny-717 --reason merged
-  idle-held.py --state ... --add ds-pr-13:owner
+  idle-held.py --state ... --add ds-pr-13:owner --note owner/repo#13
   idle-held.py --state ... --remove X --reason "..." --write | idle-surface-hash.py --state ... --commit
 
 A removal REQUIRES a reason, because a silent shrink is the failure that
@@ -31,14 +31,56 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import idle_state  # noqa: E402
+from idle_state import ABORT, REFUSED, locked_update  # noqa: E402
+
 KEY = "held_item_ids"
+
+
+def init_empty(state: Path) -> int:
+    """The one path that may create the key, and only when it is absent.
+    [] asserts nothing held, so this cannot become the invented list."""
+    if not state.is_file():
+        print(f"CANNOT ANSWER: no state file at {state}", file=sys.stderr)
+        return 2
+    try:
+        json.loads(state.read_text())
+    except ValueError as exc:
+        print(f"CANNOT ANSWER: state file is not JSON: {exc}", file=sys.stderr)
+        return 2
+
+    refusal = []
+
+    def seed(doc):
+        # Re-read under the lock: the parse above proves the file is JSON, not
+        # that it still lacks the key when the lock is finally held.
+        if KEY in doc:
+            refusal.append(len(doc[KEY]) if isinstance(doc[KEY], list) else "?")
+            return ABORT
+        doc[KEY] = []
+        doc["held_item_seed"] = {
+            "seeded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "by": "idle-held.py --init-empty",
+            "note": "empty bootstrap; the record is populated by --add, never by a list",
+        }
+        return 0
+
+    outcome = locked_update(state, seed, indent=2)
+    if outcome is REFUSED:
+        return 2
+    if outcome is ABORT:
+        print(f"REFUSED: {state} already has {KEY} ({refusal[0]} entries) "
+              "— --init-empty only bootstraps, it never clears", file=sys.stderr)
+        return 2
+    print(f"seeded {KEY} = [] in {state}  (provenance in held_item_seed)")
+    return 0
 
 
 def load(state: Path):
@@ -49,7 +91,8 @@ def load(state: Path):
     except ValueError as exc:
         return None, f"state file is not JSON: {exc}"
     if KEY not in d:
-        return None, f"state file has no {KEY} — refusing to invent one"
+        return None, (f"state file has no {KEY} — refusing to invent one. "
+                      "Bootstrap it with --init-empty (seeds [], never a list).")
     items = d[KEY]
     if not isinstance(items, list) or any(
         not (isinstance(p, (list, tuple)) and len(p) == 2) for p in items
@@ -80,6 +123,17 @@ def apply_ops(items, adds, removes):
 
 
 BRANCH_SHA = re.compile(r"`?([\w./-]+/[\w./-]+)`?\s*@\s*`?([0-9a-f]{7,40})`?")
+
+
+def refuse_blank(values, flag: str, paired: str) -> "str | None":
+    """A present-but-blank explanation passes a count check and satisfies nothing:
+    the audit sees the key and does not even list it as missing."""
+    for i, v in enumerate(values):
+        if not str(v).strip():
+            return (f"REFUSED: {flag} #{i + 1} is blank. A count check cannot tell a "
+                    f"blank explanation from a real one, so {paired} would record an "
+                    f"unauditable entry with the key present.")
+    return None
 
 
 def audit_notes(doc, repo) -> int:
@@ -225,6 +279,10 @@ def main(argv=None) -> int:
     ap.add_argument("--remove", action="append", default=[], metavar="ID")
     ap.add_argument("--reason", action="append", default=[],
                     help="why an id is being removed; one per --remove")
+    ap.add_argument("--note", action="append", default=[],
+                    help="the held item's note; one per --add. Any string is "
+                         "accepted; an `owner/repo#n` in it is what --audit-prs "
+                         "reads, and a hold with no PR needs a note all the same")
     ap.add_argument("--write", action="store_true",
                     help="persist the new held_item_ids (atomic; other keys untouched)")
     ap.add_argument("--audit-prs", action="store_true",
@@ -233,12 +291,19 @@ def main(argv=None) -> int:
     ap.add_argument("--audit-notes", metavar="REPO",
                     help="resolve every `<branch> @ <sha>` in held_item_notes against that git "
                          "repo and report drift; exit 1 if any note disagrees with git")
+    ap.add_argument("--init-empty", action="store_true",
+                    help="create held_item_ids as [] on a state file that has "
+                         "no such key, so --add works; REFUSES if it exists")
     ap.add_argument("--archive-orphan-notes", action="store_true",
                     help="move every held_item_notes entry whose id is no longer held into "
                          "held_item_notes_archived (never deletes); needs --write to persist")
     a = ap.parse_args(argv)
 
     state = Path(a.state)
+
+    if a.init_empty:
+        return init_empty(state)
+
     doc, err = load(state)
     if err:
         print(f"CANNOT ANSWER: {err}", file=sys.stderr)
@@ -257,14 +322,22 @@ def main(argv=None) -> int:
         print(f"{len(moved)} orphan note(s)"
               + ("" if a.write else "  (not written; pass --write)"), file=sys.stderr)
         if a.write:
-            notes = doc["held_item_notes"]
-            arch = doc.setdefault(ARCHIVE_KEY, {})
             stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            for k in moved:
-                arch[k] = {"note": notes.pop(k), "archived_at": stamp}
-            tmp = state.with_suffix(state.suffix + ".tmp")
-            tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
-            os.replace(tmp, state)
+
+            def archive(fresh):
+                # Re-derive from the doc read under the lock: `moved` above came
+                # from a snapshot and the notes may have changed since.
+                again, err2 = archive_orphan_notes(fresh, stamp)
+                if err2 or not again:
+                    return ABORT
+                notes = fresh["held_item_notes"]
+                arch = fresh.setdefault(ARCHIVE_KEY, {})
+                for k in again:
+                    arch[k] = {"note": notes.pop(k), "archived_at": stamp}
+                return None
+
+            if locked_update(state, archive, indent=2) is REFUSED:
+                return 2
         return 0
 
     if a.audit_prs:
@@ -273,9 +346,22 @@ def main(argv=None) -> int:
     if a.audit_notes:
         return audit_notes(doc, a.audit_notes)
 
+    for _vals, _flag, _paired in ((a.reason, "--reason", "--remove"),
+                                 (a.note, "--note", "--add")):
+        _err = refuse_blank(_vals, _flag, _paired)
+        if _err:
+            print(_err, file=sys.stderr)
+            return 1
+
     if a.remove and len(a.reason) != len(a.remove):
         print(f"REFUSED: {len(a.remove)} --remove but {len(a.reason)} --reason. "
               "A silent shrink is the failure this tool exists to stop.", file=sys.stderr)
+        return 1
+
+    if a.add and len(a.note) != len(a.add):
+        print(f"REFUSED: {len(a.add)} --add but {len(a.note)} --note. A hold with no "
+              "note is invisible to --audit-prs, which is the other half of the "
+              "silent-shrink failure.", file=sys.stderr)
         return 1
 
     adds = []
@@ -304,15 +390,33 @@ def main(argv=None) -> int:
           file=sys.stderr)
     for rid, why in zip(a.remove, a.reason):
         print(f"  removed {rid}: {why}", file=sys.stderr)
+    for (aid, _g), note in zip(adds, a.note):
+        print(f"  added {aid}: {note}", file=sys.stderr)
 
     if a.write:
-        doc[KEY] = after
-        log = doc.setdefault("held_item_removals", [])
-        for rid, why in zip(a.remove, a.reason):
-            log.append({"id": rid, "reason": why})
-        tmp = state.with_suffix(state.suffix + ".tmp")
-        tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
-        os.replace(tmp, state)
+        def apply_under_lock(fresh):
+            # The ops are a DIFF, so re-apply them to the doc read under the
+            # lock rather than writing back the snapshot `after` came from.
+            fresh[KEY], errs2 = apply_ops(fresh.get(KEY) or [], adds, a.remove)
+            if errs2:
+                for e in errs2:
+                    print(f"REFUSED: {e}", file=sys.stderr)
+                return ABORT
+            log = fresh.setdefault("held_item_removals", [])
+            for rid, why in zip(a.remove, a.reason):
+                log.append({"id": rid, "reason": why})
+            # Same lock as the id write: an id that lands without its note is the
+            # unauditable hold this pairing exists to prevent.
+            notes = fresh.setdefault("held_item_notes", {})
+            for (aid, _g), note in zip(adds, a.note):
+                notes[aid] = note
+            return None
+
+        res = locked_update(state, apply_under_lock, indent=2)
+        if res is REFUSED:
+            return 2
+        if res is ABORT:
+            return 1
     return 0
 
 

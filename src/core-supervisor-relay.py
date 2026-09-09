@@ -172,8 +172,16 @@ def compose_message(signal: dict) -> str:
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
     prompt = (signal.get("prompt") or "").strip()
-    # First non-empty prompt line is the most informative single line.
-    excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+    # The first READABLE line: on a login pane the first non-empty line is a box rule or an OAuth
+    # URL fragment. Same filter as the escalation card; a failure here must not drop the notice.
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from prompt_excerpt import first_readable_line
+        excerpt = first_readable_line(prompt)
+    except Exception:  # noqa: BLE001 - the owner's only channel: never crash the escalation
+        excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
     parts = [f"⚠️ Agent needs you — {detail}"]
     if kind and kind not in detail:
         parts.append(f"({kind})")

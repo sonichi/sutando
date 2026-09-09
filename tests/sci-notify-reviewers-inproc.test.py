@@ -498,9 +498,24 @@ class GateCapabilityProbesAGitHubLogin(unittest.TestCase):
         self.assertEqual(login, "plain")
         self.assertNotIn("same_actor_as", why)
 
-    def test_no_login_anywhere_returns_the_key_and_says_so(self):
+    def test_an_unresolvable_same_actor_as_is_KEPT_not_swapped_for_the_key(self):
+        """Premise inverted deliberately: this used to expect the key back.
+
+        `_is_github_user` cannot distinguish "no such user" from "the probe
+        failed", so discarding owner-stated identity on a False routes the gate
+        at whatever the key happens to be — a stranger, if the key collides.
+        An unresolvable login now reaches `gate_capability`, which reports it
+        unverified rather than certifying someone else.
+        """
         login, why = self._resolve("stand-only", set())
-        self.assertEqual(login, "stand-only")
+        self.assertEqual(login, "real-login")
+        self.assertIn("same_actor_as", why)
+
+    def test_a_key_with_NO_roster_identity_still_reports_no_login(self):
+        # The "no login found" branch is still reachable — it just needs a row
+        # that states no identity at all, rather than one that fails to probe.
+        login, why = self._resolve("bare-key", set())
+        self.assertEqual(login, "bare-key")
         self.assertIn("no login found", why)
 
 

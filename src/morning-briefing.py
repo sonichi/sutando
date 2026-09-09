@@ -66,6 +66,16 @@ def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
         return None, ""
 
 
+def weather_location_configured() -> bool:
+    """Are WEATHER_LAT/WEATHER_LON set for this install?
+
+    `config_get` reads the config stanza before os.environ, so an env-only
+    check answers a different question than the one get_weather() asks.
+    """
+    from sutando_config import config_get
+    return bool(config_get("WEATHER_LAT") and config_get("WEATHER_LON"))
+
+
 def get_weather() -> str:
     """Fetch current conditions from Open-Meteo (no key needed)."""
     try:
@@ -77,11 +87,10 @@ def get_weather() -> str:
         )
         # Use lat/lon from config (env legacy fallback) if set
         from sutando_config import config_get
-        _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
-        configured = bool(_lat_cfg and _lon_cfg)
+        configured = weather_location_configured()
         if configured:
-            lat = float(_lat_cfg)
-            lon = float(_lon_cfg)
+            lat = float(config_get("WEATHER_LAT"))
+            lon = float(config_get("WEATHER_LON"))
 
         unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
         if unit not in ("fahrenheit", "celsius"):
@@ -384,7 +393,9 @@ def get_reminders() -> "list[str] | None":
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return _demote_stale_reminders(items)[:5]
+        # No cap here, for the same reason as get_health_issues(): the renderer
+        # is the only place that can still see the total it is omitting from.
+        return _demote_stale_reminders(items)
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -634,6 +645,24 @@ def get_pending_questions() -> list[str]:
 
 
 
+def below_fold_count(total: int) -> int:
+    """How many waiting questions render on no surface the owner reads.
+
+    The notifier sends `questions[:VISIBLE_PREFIX]`, so waiting order IS
+    priority order and everything past it counts as open while reaching
+    nobody. Returns 0 when the prefix cannot be read — an unknown cutoff
+    must not be guessed into a number the briefing then states as fact.
+    """
+    prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
+    if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
+        # Say so: without this, an unreadable prefix and a genuinely unhidden
+        # list both render as no line, which is the silent no-op this fixes.
+        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
+              file=sys.stderr)
+        return 0
+    return max(0, total - prefix)
+
+
 def get_health_issues() -> "list[str] | None":
     """Failed health items, or None when the check could not run.
 
@@ -672,7 +701,9 @@ def get_health_issues() -> "list[str] | None":
         # "unknown", not "clean".
         if r.returncode != 0 and not issues:
             return None
-        return issues[:3]
+        # No cap here: the count is what makes a partial list honest, and a cap
+        # applied before the renderer destroys it. synthesize() bounds the prose.
+        return issues
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -716,25 +747,40 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         parts.append("Your calendar is clear today.")
 
     # Reminders
+    n_rem = 0 if reminders is None else len(reminders)
     if reminders:
-        r_list = ", ".join(reminders[:3])
-        parts.append(f"Reminders due: {r_list}.")
+        shown = reminders[:3]
+        more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
+        parts.append(f"Reminders due: {', '.join(shown)}{more}.")
 
     # Pending questions
     if pending_qs:
         if len(pending_qs) == 1:
             parts.append(f"One pending question waiting: {pending_qs[0]}.")
         else:
-            parts.append(f"{len(pending_qs)} pending questions. Top item: {pending_qs[0]}.")
+            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
+            # yields FILE order, so index 0 is first-listed, not most important.
+            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
+        hidden = below_fold_count(len(pending_qs))
+        if hidden:
+            parts.append(f"{hidden} of them render below the fold.")
 
     # Overnight Discord
     if discord_msgs:
         parts.append(f"Overnight: {len(discord_msgs)} Discord message{'s' if len(discord_msgs) > 1 else ''}.")
 
     # Health issues
+    n_health = 0 if health_issues is None else len(health_issues)
     if health_issues:
-        issues_str = "; ".join(health_issues[:2])
-        parts.append(f"System note: {issues_str}.")
+        shown = health_issues[:2]
+        # Lead with the count and name the remainder, as the health-check
+        # notifiers already do — two of nine must not read as two of two.
+        more = f" (+{n_health - len(shown)} more)" if n_health > len(shown) else ""
+        noun = "failure" if n_health == 1 else "failures"
+        parts.append(
+            f"System note: {n_health} health {noun} — "
+            f"{'; '.join(shown)}{more}."
+        )
 
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
@@ -779,8 +825,7 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
-    import os as _os
-    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+    if weather and not weather_location_configured():
         print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()

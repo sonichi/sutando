@@ -222,6 +222,39 @@ a deployed copy searches upward for `state/authority.json`. Set
 
 Test: `python3 tests/review-authority-guard.test.py`.
 
+## `release-target-guard.py`
+
+DENIES `gh release create|edit` whose `--target` is an abbreviated commit SHA
+(7-39 hex characters). GitHub answers `Release.target_commitish is invalid` and
+creates nothing, so the release reads as cut at the moment it did not happen.
+A full 40-character SHA and a branch/tag name both pass.
+
+It exists because the rule is easy to know and useless to know: the value is not
+chosen, it is pasted from whatever printed last, and every tool prints the
+abbreviated form. Measured twice in fourteen hours on one host, with the
+correction written into the build log between the two occurrences.
+
+### Deploy (per node)
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/release-target-guard.py "$CFG/hooks/"
+```
+
+Register it under the `Bash` PreToolUse matcher exactly as the guards above do
+(same `shlex.quote` recipe — these paths routinely contain a space).
+
+Escape hatch: `SUTANDO_SKIP_RELEASE_TARGET_GUARD=1`. Fail-open on any internal
+error, like every guard here.
+
+Scope: it sees only literal text. `--target "$(git rev-parse --short HEAD)"`
+is allowed, because the value is unknowable before execution — and that is a
+very plausible way to produce this bug. The guard bounds pasted values, not
+computed ones.
+
+Tests: `python3 tests/release-target-guard.test.py`
+
 ## `result-file-marker-guard.py`
 
 Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
@@ -313,3 +346,23 @@ printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.tx
 ```
 
 Tests: `python3 tests/result-file-marker-guard.test.py`
+
+## `comment-signature-guard.py`
+
+Denies a `gh pr comment` / `gh issue comment` / `gh pr create` / `gh issue create`
+whose body carries no agent MXID. Attribution under a shared GitHub login rests on
+the body signature — the login cannot tell two agents apart and the commit email is
+many-to-one — and nothing enforced it.
+
+The check matches the **MXID**, never the surrounding prose: measured across three
+PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the newer
+`— name (@<mxid>)`, so a wording-keyed check sees 2 of 41.
+
+- `SUTANDO_AGENT_MXID` — the identity to require. **No default.** Unset means the
+  guard does not enforce and says so once on stderr, so a node cannot silently
+  inherit another agent's identity and deny every comment it writes.
+- `SUTANDO_ALLOW_UNSIGNED_COMMENT=1` — one-shot override.
+
+**Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
+the same login and is outside the subcommand set, as is a body read from stdin
+(`-F -`). Both are deliberate — the guard reads a body it can see.

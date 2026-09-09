@@ -12,6 +12,26 @@ from pathlib import Path
 
 ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
+# Both spellings are deployed. A row carrying only one must read identically to
+# every consumer, so the choice is made here rather than in each reader.
+IDENTITY_FIELDS = ("gh", "github")
+
+
+def roster_login(row) -> "tuple[str, str]":
+    """(GitHub login this row declares, the field it came from); ("", "") if none.
+
+    Measured on a live roster: 5 rows spell it `gh`, 2 spell it `github`, in one
+    file. A reader that knows one spelling reads the other rows as having no
+    login at all — an absence indistinguishable from a row nobody filled in.
+    """
+    if not isinstance(row, dict):
+        return "", ""
+    for field in IDENTITY_FIELDS:
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), field
+    return "", ""
+
 
 def host_rosters(workspace) -> "list[tuple[str, Path]]":
     """Every peer host's roster under `workspace`, then the shared legacy file.

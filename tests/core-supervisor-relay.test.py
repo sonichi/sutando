@@ -181,6 +181,37 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("Login", m)  # first prompt line
         self.assertIn("resolve", m)
 
+    def test_login_pane_excerpt_is_the_prompt_not_the_chrome(self):
+        # The pane's first non-empty line is a box rule and the next an OAuth URL fragment; the
+        # one-line notice must quote the prompt (same filter as the escalation card).
+        pane = ("╭──────────────── sutando-core ─╮\n"
+                "https://claude.ai/oauth/authorize?code=true&code_challenge=ncifI5jOgzI138TpX&state=uv\n"
+                "Browser didn't open? Use the url below to sign in:\n"
+                "Paste code here if prompted >\n")
+        m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("Use the url below to sign in", m)
+        for noise in ("╭", "───", "https://", "code_challenge"):
+            self.assertNotIn(noise, m)
+
+    def test_the_excerpt_falls_back_to_the_first_line_when_the_filter_cannot_load(self):
+        # The notice is the owner's only channel: a missing filter module must not drop it.
+        pane = "╭─ rule ─╮\nBrowser didn't open? Use the url below to sign in:\n"
+        with patch.dict(sys.modules, {"prompt_excerpt": None}):
+            m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("╭─ rule ─╮", m)  # the old first-non-empty line, degraded but delivered
+
+    def test_the_filter_is_found_from_the_relays_own_directory(self):
+        # Run as a script, sys.path[0] is not src/: the relay must add its own directory.
+        src_dir = os.path.dirname(_SRC)
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(src_dir)]
+            sys.modules.pop("prompt_excerpt", None)
+            m = compose_message(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
+        finally:
+            sys.path[:] = saved
+        self.assertIn("Use the url below to sign in", m)
+
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
         self.assertIn("not authenticated", m)

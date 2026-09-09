@@ -107,5 +107,27 @@ class TestGetPendingQuestions(unittest.TestCase):
         self.assertEqual(len(qs[0]), 60)
 
 
+class SpokenQuestionLineMakesNoRankingClaim(unittest.TestCase):
+    """The one question the briefing speaks is index 0 of an UNRANKED list.
+
+    `get_waiting_questions()` yields file order. Calling that "Top item" states a
+    priority the code never computed, and only this one line is ever spoken — so a
+    high-urgency question below index 0 is both unspoken and implicitly outranked.
+    """
+
+    def test_the_line_does_not_call_index_zero_the_top_item(self) -> None:
+        mod = _load()
+        line = mod.synthesize(None, [], [], [], ["first filed", "urgent but later"], None)
+        self.assertIn("2 pending questions", line)
+        self.assertIn("first filed", line)
+        self.assertNotIn("Top item", line)
+
+    def test_a_single_question_still_reads_naturally(self) -> None:
+        mod = _load()
+        line = mod.synthesize(None, [], [], [], ["only one"], None)
+        self.assertIn("One pending question waiting: only one", line)
+        self.assertNotIn("Top item", line)
+
+
 if __name__ == "__main__":
     unittest.main()

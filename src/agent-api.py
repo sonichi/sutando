@@ -47,7 +47,8 @@ import stat
 import subprocess
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -129,6 +130,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
                                submit_signal_room_task, submission_status)  # noqa: E402
 
@@ -238,6 +240,26 @@ PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
 PQ_FIELD_RE = re.compile(r'\*\*(?:Status|Options|Asked|Question):\*\*')
 PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
+PQ_DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}(?::\d{2})?Z)?')
+
+
+def _parse_asked_date(title: str) -> tuple[Optional[str], Optional[datetime]]:
+    """Leading date on a section's `## ` heading, e.g. '2026-08-22 — ...' or
+    '2026-08-20T02:20Z — ...'. (None, None) when the heading carries no date.
+    """
+    m = PQ_DATE_RE.match(title)
+    if not m:
+        return None, None
+    asked = m.group(0)
+    formats = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ") if m.group(2) else ("%Y-%m-%d",)
+    for fmt in formats:
+        try:
+            # Headings are UTC; a naive parse against a local now() reports a question
+            # asked minutes ago as -1 days, which the age sort then ranks first.
+            return asked, datetime.strptime(asked, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None, None
 
 
 def parse_pending_questions(content: str) -> list[dict]:
@@ -277,10 +299,13 @@ def parse_pending_questions(content: str) -> list[dict]:
             continue
         # Whitespace-normalised so a reflow of the same prose keeps the id.
         qid = "Q" + hashlib.sha1(" ".join(section.split()).encode()).hexdigest()[:12]
+        asked, asked_dt = _parse_asked_date(title)
         q = {
             "id": qid,
             "text": title,
             "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
+            "asked": asked,
+            "age_days": max(0, (datetime.now(timezone.utc) - asked_dt).days) if asked_dt else None,
             "start": start,
             "end": end,
         }
@@ -458,10 +483,14 @@ def _pending_question_rows() -> list[dict]:
     pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
     if not pending_file.exists():
         return []
-    return [
+    rows = [
         {key: value for key, value in question.items() if key not in ("start", "end")}
         for question in parse_pending_questions(pending_file.read_text())
     ]
+    # Oldest first. An undated heading cannot be ranked by age and must sort LAST,
+    # never default to 0 — that would put it ahead of everything genuinely waiting.
+    rows.sort(key=lambda row: (row["age_days"] is None, -(row["age_days"] or 0)))
+    return rows
 
 
 def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
@@ -1484,10 +1513,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # through the voice-only fallback path with incorrect downstream
         # behavior. Strip line terminators; cap to a sane single-line
         # length.
-        from_agent = (
-            from_agent.replace("\r", " ").replace("\n", " ").strip()[:120]
-            or "unknown"
-        )
+        from_agent = header_safe_value(from_agent).strip()[:120] or "unknown"
 
         if not task:
             self.send_json(400, {"error": "task is required"})

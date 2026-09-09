@@ -38,7 +38,7 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,6 +83,34 @@ function resolveChromium() {
 const cmd = process.argv[2];
 const arg = process.argv[3];
 const dryRun = process.argv.includes('--dry-run');
+
+/** `--media <path>`: refuse a missing file HERE, before a browser is launched
+ *  and before any text is typed into a live composer. */
+const MEDIA = (() => {
+  const i = process.argv.indexOf('--media');
+  if (i === -1) return null;
+  const p = process.argv[i + 1];
+  if (!p || p.startsWith('--')) {
+    console.error('--media needs a file path');
+    process.exit(2);
+  }
+  // A readable REGULAR file, not merely something that exists: existsSync is
+  // true for a directory, which then reached the launch that evicts a login.
+  let st;
+  try { st = statSync(p); } catch {
+    console.error(`--media: no such file: ${p}`);
+    process.exit(2);
+  }
+  if (!st.isFile()) {
+    console.error(`--media: not a regular file: ${p}`);
+    process.exit(2);
+  }
+  try { accessSync(p, constants.R_OK); } catch {
+    console.error(`--media: not readable: ${p}`);
+    process.exit(2);
+  }
+  return resolve(p);
+})();
 
 /** Repo root, so the canonical workspace resolver can be invoked from here. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -133,7 +161,8 @@ mkdirSync(PROFILE_DIR, { recursive: true });
 mkdirSync(SHOT_DIR, { recursive: true });
 
 if (!cmd || !['login', 'check', 'post'].includes(cmd)) {
-  console.error('Usage: node x-post-browser.mjs <login|check|post> [text] [--dry-run]');
+  console.error('Usage: node x-post-browser.mjs <login|check|post> [text] '
+                + '[--media <path>] [--dry-run]');
   process.exit(1);
 }
 if (cmd === 'post' && !arg) {
@@ -332,6 +361,16 @@ try {
     await box.click();
     await page.keyboard.type(arg, { delay: 15 });
     await page.waitForTimeout(800);
+    if (MEDIA) {
+      // setInputFiles on the HIDDEN input: clicking the image button opens a
+      // native picker that no automation can drive.
+      const input = await page.waitForSelector('input[type="file"][accept*="image"]',
+                                               { state: 'attached', timeout: 15000 });
+      await input.setInputFiles(MEDIA);
+      // Attached, not merely requested: posting before the upload lands drops the
+      // image silently. `attachments` is measured to appear only once it has.
+      await page.waitForSelector('[data-testid="attachments"]', { timeout: 60000 });
+    }
     const typedDry = await readComposer(page);
     if (!composerMatches(arg, typedDry)) failComposerMismatch(arg, typedDry);
     if (dryRun) {
