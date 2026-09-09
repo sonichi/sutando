@@ -550,8 +550,7 @@ stop suppressing handler-owned work, and shipping the skip change alone would lo
 not there.
 
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** A ticker that counted "claims made this pass" and added that to the directory count would be
-wrong three ways at once, and the first is the one this section had already condemned in
-its own words: a per-pass counter resets, so a receipt-less admission vanishes from the next
+wrong three ways at once. First, a per-pass counter resets, so a receipt-less admission vanishes from the next
 recount and every tick adds another `2 * runners` without any completion — *the per-pass
 allowance wearing a limit*. Second, a queued winner both wrote a `pending/` marker AND
 incremented the counter, so a bound of four admitted two. Third, and fatal to the idea: the
@@ -669,9 +668,8 @@ every pending task every 30 s to a live core. The recoverable failure is the one
 
 **Supervision.** The ticker is owned by the watcher process and shares its lifetime,
 rather than being a detached timer that can outlive it. If the watcher exits the
-ticker goes with it — a separate process would reintroduce exactly the split that put
-the first version of this work on the heartbeat, which had the timer and not the
-capability.
+ticker goes with it — a separate process would reintroduce exactly the split that puts the timer in one
+place and the capability in another.
 
 **Single-flight.** One pass runs at a time. A tick arriving while the previous pass is
 still walking the directory is DROPPED, not queued, because the next pass re-lists
@@ -815,7 +813,7 @@ default above. Once step 3 lands, "fresh" in it means the published verdict; the
 race it demonstrates is unchanged either way, because the claim — not the freshness
 read — is what decides.
 
-Traced for the case the rule used to get wrong — a task with no
+Traced for the hard case — a task with no
 `requested_worker` in a room pinned to worker-2, with worker-2 fresh — and
 scheduled adversarially, with **both non-targets running to completion before the
 target's handler is even entered**:
