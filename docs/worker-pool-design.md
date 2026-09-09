@@ -424,8 +424,7 @@ returns non-zero for a lost claim *and* for an operational failure — so a gene
 publishes in both cases and cannot tell `refused-over-bound` from a genuine error. The typed
 outcome exists precisely so this branch stops guessing.
 
-So the direct lifecycle completes the rule with five obligations, and they are the same five the
-earlier revision listed as unowned: a durable receipt written **before** the emit, a named ownership
+So the direct lifecycle completes the rule with five obligations, and each needs a named owner: a durable receipt written **before** the emit, a named ownership
 handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling for
 THREE crash windows, and they are distinct states rather than one described three ways:
 
@@ -550,9 +549,8 @@ candidate while a canonical-id claim does not — so shipping the canonical key 
 stop suppressing handler-owned work, and shipping the skip change alone would look up a key that is
 not there.
 
-**Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
-revision had the ticker count "claims made this pass" and add that to the directory count. That
-was wrong three ways at once, and the first is the one this section had already condemned in
+**Every admission leaves a receipt, and the ticker keeps NO counter of its own.** A ticker that counted "claims made this pass" and added that to the directory count would be
+wrong three ways at once, and the first is the one this section had already condemned in
 its own words: a per-pass counter resets, so a receipt-less admission vanishes from the next
 recount and every tick adds another `2 * runners` without any completion — *the per-pass
 allowance wearing a limit*. Second, a queued winner both wrote a `pending/` marker AND
@@ -561,9 +559,8 @@ ticker cannot tell a lost claim from a won one, so "do not count a loss" was not
 `queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
 `acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-**What this section replaced, kept short because the falsifications are the useful part.** Earlier
-revisions of this design said three things that are now false, and each was corrected by a reviewer
-rather than by me:
+**Three claims about this design that look reasonable and are false.** The falsifications are the
+useful part, so they are kept and the rest is not:
 
 - **a four-outcome `dispatch_task`** (`queued` / `direct` / `lost` / `suppressed`). The contract is
   five: `refused-over-bound` is a distinct outcome from operational failure, and the `fallback`-mode
@@ -793,8 +790,7 @@ race: a non-target that claimed-and-discarded could win the claim and rename the
 file before the target's session read the path it had been handed. Claim-before-emit
 removes the target/target race: **addressing is not exclusive**, so two instances
 can each correctly believe they are the addressee, and only a claim on a key
-both compute identically decides between them. An earlier version of this section argued that
-racing two discards is safe — true, and insufficient, because neither of the
+both compute identically decides between them. Racing two discards is safe — true, and insufficient, because neither of the
 races that matter is discard-against-discard.
 
 **The claim key is the canonical task id, and that id comes from the shared
@@ -864,8 +860,7 @@ which all instances agree on it:
 | 90.1s | core | worker-2's beat now stale; the room is bound to worker-2 | **does not contend** | no |
 
 Under v1 this is no longer a race, and the reason is worth stating exactly: the core
-does not claim a bound room whatever the beat says, so the second claimant an earlier
-revision arbitrated against does not exist. Either interleaving leaves at most one
+does not claim a bound room whatever the beat says, so the second claimant such arbitration would need does not exist. Either interleaving leaves at most one
 contender. Had worker-2 suppressed instead — its own gate finding a stale beat or a
 `wedged` verdict — the task would stay pending rather than pass to the core.
 
