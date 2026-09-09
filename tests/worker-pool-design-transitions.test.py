@@ -109,13 +109,18 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
-    def as_owner(name, keep_live=True):
-        """(P1.3 seam) Run the next steps AS a named OWNER, optionally leaving the
-        previous one LIVE. restart() replaces `me` and drops the old owner, so a paused
-        owner cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+    def as_owner(name):
+        """(P1.3 seam) Run the next steps AS a named OWNER, leaving the previous one
+        live. restart() replaces `me` and drops the old owner, so a paused owner
+        cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+
+        keweichen at 6268f22e: this took a `keep_live` flag whose False branch did
+        not remove the previous owner, only skip re-adding one already present --
+        a broken advertised input no schedule passed. Dropping it is the honest
+        repair; restart() already IS the replace-the-owner semantics.
         """
         prev = me[0]
-        if keep_live: d.live_owners.add(prev)
+        d.live_owners.add(prev)
         me[0] = name; d.live_owners.add(name)
         return prev
 
@@ -419,7 +424,7 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         is about is TWO SIMULTANEOUS task claims across three resumable actors --
         not three claims -- and the model holds one, so it cannot express it.
         """
-        as_owner(name, keep_live=True)
+        as_owner(name)
 
     def step_third_owner():
         step_second_owner("p-c")
@@ -1201,9 +1206,10 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         defect is in the SCHEDULING seam, which final state cannot see.
 
         His discriminating schedule, verbatim. With the switch, the second owner
-        does the work and the crash lands before any claim record; without it the
-        first owner keeps acting, so a claim record survives and the token is
-        spent."""
+        does the work and the crash lands before the claim is PROMOTED into the
+        admission journal -- the task claim `claims={'t1': 'p1'}` is already there,
+        and `claimed_rec` is what is absent. Without the switch the first owner
+        keeps acting, so the journal record survives and the token is spent."""
         _, claimed, _, d = run(["kick", "sweep", "worker", "second_owner", "worker"],
                                mode="crash_after_claim")
         self.assertEqual(claimed, 0)
@@ -1225,8 +1231,8 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         _, _, _, d = run(["kick", "sweep", "worker", "second_owner", "third_owner"])
         self.assertEqual(d.live_owners, {"p1", "p-b", "p-c"})
         self.assertEqual(d.claims, {"t1": "p1"},
-            "one claim, held by the FIRST owner -- A/B/C needs three and is "
-            "unrepresentable here; do not restate this as three claimants")
+            "one claim, held by the FIRST owner -- A/B/C needs TWO SIMULTANEOUS "
+            "claims across three actors, and one claim cannot express that")
 
     def test_restart_still_drops_the_previous_owner(self):
         """The existing semantics must NOT have changed -- this is a refactor."""

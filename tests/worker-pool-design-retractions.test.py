@@ -9,25 +9,44 @@ import unittest
 DOC = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design.md"
 
 
-def paras_holding(doc, anchor):
-    """EVERY paragraph containing `anchor`. The obligations index repeats each
-    site's wording, so "the paragraph" is ambiguous and picking the first one
-    reads the index instead of the callout."""
-    return [p for p in re.split(r"\n\s*\n", doc) if anchor in p]
+def normalized(doc):
+    """Blockquote markers stripped and whitespace collapsed, so a pinned sentence
+    survives re-wrapping without loosening into a substring match."""
+    return re.sub(r"\s+", " ", re.sub(r"^\s*>+\s?", "", doc, flags=re.M)).strip()
 
 
-def para_holding(doc, anchor):
-    """The maximal run of non-blank lines containing `anchor`.
+def blockquote_blocks(doc):
+    """Every maximal run of consecutive blockquote lines.
 
-    Module-level because two classes assert against it; a second copy would be
-    duplicated policy in the one file whose job is catching claims that drift.
-    keweichen at e2b677cd: the set-size patterns used to run on the ANCHOR
-    CONSTANT, so they could never fail whatever the document said.
+    A site's DISPUTED callout is a blockquote; the obligations index repeats the
+    same wording as a plain bullet. keweichen at 6268f22e moved a marker from the
+    callout INTO the index paragraph and the any()-over-paragraphs form accepted
+    it, because both contain the phrase.
     """
-    for para in re.split(r"\n\s*\n", doc):
-        if anchor in para:
-            return para
-    return ""
+    out, cur = [], []
+    for line in doc.split("\n"):
+        if line.lstrip().startswith(">"):
+            cur.append(line)
+        elif cur:
+            out.append("\n".join(cur)); cur = []
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def sole_para_holding(doc, anchor):
+    """The ONE paragraph containing `anchor`, or a failure.
+
+    keweichen at 6268f22e: the first-match form let a clean DECOY paragraph
+    earlier in the document absorb the check while the operative passage carried
+    the defect. Ambiguity is the bug, so it is raised rather than resolved.
+    """
+    hits = [p for p in re.split(r"\n\s*\n", doc) if anchor in p]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{anchor!r} matches {len(hits)} paragraphs; a locator that picks one "
+            f"of several inspects whichever it happens to reach first")
+    return hits[0]
 
 
 # A line carrying one of these is describing the retraction, not asserting it.
@@ -1276,10 +1295,13 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
             self.assertIn(phrase, d, f"the {site} site lost its local DISPUTED callout")
             # Bind the two in ONE paragraph: a detached marker elsewhere keeps
             # both the phrases and the global count intact.
-            self.assertTrue(
-                any("DISPUTED — see" in p for p in paras_holding(d, phrase)),
-                f"the {site} site keeps its text but no paragraph carries BOTH it and "
-                f"the marker; a marker counted elsewhere does not warn a reader here")
+            blocks = [b for b in blockquote_blocks(d) if phrase in b]
+            self.assertEqual(len(blocks), 1,
+                f"the {site} site should have exactly ONE callout carrying its text; "
+                f"found {len(blocks)}")
+            self.assertIn("DISPUTED — see", blocks[0],
+                f"the {site} site keeps its text but its own CALLOUT lost the marker; "
+                f"a marker moved to the obligations index does not warn a reader here")
         self.assertEqual(self._flat().count("DISPUTED — see"), len(self.DISPUTED_SITES),
             "a site was added or removed without updating DISPUTED_SITES")
 
@@ -1289,19 +1311,18 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         green run from being read as coverage, so it needs its own pin -- and the
         overclaim it must reject needs naming, not just the wording it must keep."""
         d = DOC.read_text()
-        anchor = "it does not pin every one of them"
-        self.assertIn(anchor, d)
-        # The limitation must live in the paragraph it limits; detached
-        # historical prose satisfies a flattened read without limiting anything.
-        para = para_holding(d, anchor)
-        self.assertIn("STATED, not proven", para_holding(d, "STATED, not proven"))
-        self.assertNotIn("PROVEN", para,
-            "the operative passage claims proof while the caveat sits beside it")
-        for overclaim in ("pins every one of them",
-                          "proven, not merely stated",
-                          "rows as PROVEN",
-                          "the model pins every ordering"):
-            self.assertNotIn(overclaim, d, f"the disclosure was inverted into {overclaim!r}")
+        # ONE paragraph, found by a phrase unique to the operative passage: the
+        # previous form asked a SECOND locator whether the caveat existed at all.
+        para = normalized(sole_para_holding(d, "The orderings this must hold under"))
+        for required in ("EXPRESSES", "it does not pin every one of them",
+                         "STATED, not proven"):
+            self.assertIn(required, para,
+                f"{required!r} left the operative paragraph; detached historical "
+                f"prose satisfies a document-wide read without limiting anything")
+        for overclaim in ("ESTABLISHES every row", "rows as PROVEN",
+                          "pins every one of them", "proven, not merely stated"):
+            self.assertNotIn(overclaim, para,
+                f"the operative paragraph was inverted into {overclaim!r}")
 
     def test_the_probation_clock_names_a_NORMATIVE_source(self):
         """[P2] asked which of the three is normative; naming three and picking none
@@ -1385,32 +1406,28 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
         self.assertIn("last-worker removal order", row[0],
             "the row must name the obligation that blocks it")
 
-    # The passages that have each carried a stale count. Scoped, because a
-    # document-wide numeric ban would fight every legitimate figure in it.
-    COUNT_FREE = ("proofs for the items below",
-                  "The last-worker removal order below is one of them:",
-                  "The green tests here move none of")
+    # The exact operative SENTENCE, not an anchor plus a list of forbidden
+    # spellings: keweichen evaded the pattern list with "(5 total)".
+    COUNT_FREE_SENTENCES = (
+        "It does NOT carry proofs for the items below.",
+        "The last-worker removal order below is one of them: two incompatible "
+        "normative orders appear and neither is marked primary.",
+        "The green tests here move none of them: passing at head is silent on "
+        "whether anything fails under the alternative.",
+    )
 
-    def test_the_count_free_passages_reject_ANY_number_not_just_the_old_one(self):
-        """keweichen at 67bc8db7: banning the string 'four' let 'five' through, so
-        the guard tracked one wrong wording instead of the rule. Assert the exact
-        intended forms are PRESENT -- a count of any size displaces them -- and
-        that no digit or number-word survives inside those passages."""
-        d = self._doc()
-        WORDS = ("one", "two", "three", "four", "five", "six", "seven",
-                 "eight", "nine", "ten")
-        num = "|".join(WORDS)
-        # Read the DOCUMENT's paragraph, never the anchor: an addition beside a
-        # preserved anchor is the case a replacement-only control cannot see.
-        for phrase in self.COUNT_FREE:
-            self.assertIn(phrase, d,
-                f"the count-free form {phrase!r} is gone -- a number likely replaced it")
-            para = para_holding(d, phrase).lower()
-            self.assertTrue(para, f"no paragraph holds {phrase!r}")
-            for pat in (rf"\bof (?:the |them )?({num})\b", rf"\ball ({num}|\d+) ",
-                        rf"\b({num}|\d+) (items|tests|obligations|proofs)\b"):
-                self.assertNotRegex(para, pat,
-                    f"the passage holding {phrase!r} states a set size, which re-stales")
+    def test_the_count_free_passages_are_pinned_SENTENCE_EXACT(self):
+        """Enumerating how a count can be spelled is a losing game -- three
+        spellings were banned and a fourth walked through. Pinning the whole
+        sentence inverts it: any inserted count changes the sentence, whatever
+        its wording, and a decoy copy is caught by the uniqueness check."""
+        n = normalized(self._doc())
+        for sentence in self.COUNT_FREE_SENTENCES:
+            self.assertIn(sentence, n,
+                f"the operative sentence changed; a count was probably inserted:\n  {sentence}")
+            self.assertEqual(n.count(sentence), 1,
+                f"{sentence!r} appears more than once, so a guard cannot say which "
+                f"one it read")
 
 
 if __name__ == "__main__":
