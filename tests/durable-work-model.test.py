@@ -11,7 +11,9 @@ ci-covers-every-python-test.test.py: contract drift should fail a test, not
 wait to be noticed.
 """
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,24 +23,28 @@ sys.path.insert(0, str(REPO / "src"))
 import local_task_protocol as ltp  # noqa: E402
 
 
-def _grep_stamped_values(key: str) -> set:
+def _grep_stamped_values(key: str, roots=None) -> set:
     """Every literal value producers stamp for `key:` across live writer
     code, Python AND TypeScript (the TS bridges are live stampers too).
 
     Write signatures only — quoted-key assignment ("access_tier":
-    "ambient"), header-line writes inside string literals ("access_tier:
-    ambient\\n" or backtick-terminated `access_tier: owner`), and unquoted
-    object-literal keys with quoted values (access_tier: 'owner'). Prose in
-    comments, `key: Type` annotations, and `.key === 'x'` comparisons match
-    none of these, which is what keeps this a producer census rather than a
-    word search."""
+    "ambient") and header-line writes inside string literals ("access_tier:
+    ambient\\n" or backtick-terminated `access_tier: owner`). Each carries a
+    syntactic marker that a task RECORD is being written. Prose in comments,
+    `key: Type` annotations, and `.key === 'x'` comparisons match none of
+    these, which is what keeps this a producer census rather than a word
+    search.
+
+    A bare object-literal key (`priority: 'high'`) is deliberately NOT a
+    signature: it matches any option bag in any subsystem, so it cannot tell
+    a task stamp from an unrelated argument that reuses the word."""
     pat = re.compile(
         rf"""["']{key}["']\s*[:=]\s*f?["']([a-z_]+)["']"""
         rf"""|{key}:\s*([a-z_]+)\\n"""
-        rf"""|{key}:\s*([a-z_]+)`"""
-        rf"""|(?<![.\w"'`]){key}\s*:\s*['"]([a-z_]+)['"]""")
+        rf"""|{key}:\s*([a-z_]+)`""")
     found = set()
-    roots = [REPO / "src", REPO / "skills", REPO / "packages"]
+    roots = ([REPO / "src", REPO / "skills", REPO / "packages"]
+             if roots is None else [Path(r) for r in roots])
     for root in roots:
         for suffix in ("*.py", "*.ts", "*.tsx"):
             for f in root.rglob(suffix):
@@ -51,6 +57,31 @@ def _grep_stamped_values(key: str) -> set:
                 for m in pat.finditer(text):
                     found.add(next(g for g in m.groups() if g))
     return found - {None}
+
+
+class TestCensusSignatures(unittest.TestCase):
+    """What counts as a producer stamp, driven by synthetic files."""
+
+    def _scan(self, name, text):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        (Path(d) / name).write_text(text)
+        return _grep_stamped_values("priority", roots=[d])
+
+    def test_record_signatures_are_counted(self):
+        # Positive control: a narrowed pattern that matched nothing would let
+        # every census below pass by being empty rather than by being clean.
+        self.assertEqual(self._scan("w.py", '"priority": "urgent"'), {"urgent"})
+        self.assertEqual(self._scan("w.py", 'f"priority: normal\\n"'), {"normal"})
+        self.assertEqual(self._scan("w.ts", '`priority: low`'), {"low"})
+
+    def test_option_bag_key_is_not_a_task_stamp(self):
+        # notifyBackground(msg, { priority: 'high' }) is a voice-session
+        # option; counting it made the model answer for a plane it does not own.
+        self.assertEqual(
+            self._scan("v.ts",
+                       "session.notifyBackground(msg, { priority: 'high' });"),
+            set())
 
 
 class TestVocabularyCoversLiveProducers(unittest.TestCase):
