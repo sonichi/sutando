@@ -592,11 +592,6 @@ watcher's claim already takes. Naming it as owed is the point. Of the four rows,
 `leave it` is the only one with no exit, and a row with no exit is how the
 previous version of this defect stayed invisible.
 
-**Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
-revision had the ticker count "claims made this pass" and add that to the directory count. That
-was wrong three ways at once, and the first is the one this section had already condemned in
-its own words: a per-pass counter resets, so a receipt-less admission vanishes from the next
-
 The claim record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
 (`:101-109`), so every claim dies with its watcher and a restart retires the lot — the same restart
 hole as the per-watcher `mktemp`, relocated. And `claim_disposition` (`:169-177`) maps `must-handle`
