@@ -591,11 +591,8 @@ it never takes it. No fallthrough to the core exists for a bound room.
 
 > **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
 
-**It is a THIRD periodic mechanism, and it is gated on pool membership.** Two
-passages had to change for that to be true rather than merely intended: "Workers are
-task-only" named the heartbeat and the core's sweep as the only periodic things in a
-pool, and the routing section still called this a per-heartbeat re-list after the
-owner had moved. Both now name the watcher. It also supersedes Decision 5 of
+**It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher
+owns it -- not the heartbeat, and not the core's sweep. It supersedes Decision 5 of
 [`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), which sited the
 unclaimed-work backstop on the LEAD and required followers to stay purely
 event-driven — a placement this design cannot use, because the lead-as-daemon it
