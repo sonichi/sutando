@@ -1624,9 +1624,15 @@ itself to a room whose worker might still come back.
    unbounded event path both route through this gate, there is one token, and every path out of
    the seam either completes the admission or returns the token.
 
-   The four orderings this must hold under, each pinned by
-   `tests/worker-pool-design-transitions.test.py` as a no-write transition model over these exact
-   rules (five pending tasks, two runners):
+   The orderings this must hold under. The model in
+   `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write
+   transition model (five pending tasks, two runners) — but it does not pin every one of them,
+   and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are
+   likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled
+   in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the
+   crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable
+   write separately — which is what the two-claims-per-allowance and retirement obligations
+   already owe. Raised by `keweichen`:
 
    ```
    kick -> sweep -> worker     probation held across the sweep; worker admits 1   (was: wedged, 0, 5)
@@ -1804,6 +1810,7 @@ production-path tests; the staged list below marks which those are.
 > |---|---|---|
 > | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is |
 > | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename — every site |
+> | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify — that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates |
 > | 4 — installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all |
 >
 > Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
