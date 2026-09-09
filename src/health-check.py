@@ -7036,6 +7036,10 @@ _CRON_NOT_A_RUN = re.compile(
     r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
 
 
+#: Shell expansion left in a path — `$VAR`, `${VAR}`, `$(cmd)`, backticks, leading `~`.
+_CRON_UNEXPANDED = re.compile(r"[$`]|^~")
+
+
 def _cron_missing_script(entry: dict) -> Optional[str]:
     """First script path a cron entry invokes that is not on disk, else None.
 
@@ -7063,6 +7067,10 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
         # A `cd` earlier in the command moves the base a relative path resolves
         # against, and REPO_DIR is then the wrong one: doubt must read ok.
         if not ref.startswith("/") and re.search(r"(?:^|\s|&&|;)cd\s", cmd[:m.start()]):
+            continue
+        # Shell expansion cannot be resolved statically: `$JOB_ROOT/live.sh` runs
+        # while its literal spelling never exists. Unknown must read ok, not missing.
+        if _CRON_UNEXPANDED.search(ref):
             continue
         # An absolute path resolves on its own; only a repo-relative one is
         # judged against REPO_DIR, so a valid /tmp script is never "missing".

@@ -153,6 +153,20 @@ check("CONTROL: the same relative path with no cd still warns",
       hc._cron_missing_script({"prompt": "python3 scripts/zacks-check.py"})
       == "scripts/zacks-check.py")
 
+# A path carrying shell expansion cannot be resolved statically (#3672 review):
+# `bash "$JOB_ROOT/live.sh"` exits 0 while that literal spelling never exists, so
+# testing the spelling tells an operator to delete a schedule that runs.
+check("unexpanded $VAR in the path reads as unknown, not missing",
+      hc._cron_missing_script({"prompt": 'bash "$JOB_ROOT/live.sh"'}) is None)
+check("the ${VAR} spelling too",
+      hc._cron_missing_script({"prompt": 'bash "${JOB_ROOT}/live.sh"'}) is None)
+check("a leading ~ is expansion the same way",
+      hc._cron_missing_script({"prompt": "bash ~/bin/nightly.sh"}) is None)
+check("CONTROL: the SAME script named literally, and present, is not missing",
+      hc._cron_missing_script({"prompt": f"bash {_live}"}) is None)
+check("CONTROL: a literal path with no expansion and no file still warns",
+      hc._cron_missing_script({"prompt": f"bash {_gone}"}) == _gone)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
