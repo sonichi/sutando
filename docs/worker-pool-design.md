@@ -309,7 +309,7 @@ Input is the roster and one admitted task; nothing else may be read.
 1. Load `state/roster.json`. **Unreadable or absent → refuse the pass and report.** Never default to the core.
 2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
 3. Validate every target exists in the roster. Unknown → fail the task with a named error.
-4. For each target whose state is `live`: `os.open(deliveries/<target>/<task-id>, O_CREAT|O_EXCL)`. **`EEXIST` is success, not an error** — the delivery already exists and the pass is idempotent.
+4. For each target whose state is `live`: if `deliveries/<target>/<task-id>` **or** `<task-id>.claimed` already exists, the task is delivered — do nothing. Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as success. **Checking only the unclaimed name would recreate a sentinel for work already in flight and deliver it twice.**
 5. For any target not `live`: write nothing, leave the task pending, and record it in `pool-status.json`. Never substitute.
 6. For a set, ids are `<parent-id>-<target>`; persist the resolved member list on the parent so a restart finishes minting.
 

@@ -67,12 +67,34 @@ class Pool:
     def archived(self, task_id):
         return self.root / "tasks" / "archive" / f"{task_id}.json"
 
+    def archive_target(self, task_id):
+        """No-clobber: a colliding name mints .1, .2 rather than replacing."""
+        base = self.archived(task_id)
+        if not base.exists():
+            return base
+        n = 1
+        while base.with_name(f"{base.name}.{n}").exists():
+            n += 1
+        return base.with_name(f"{base.name}.{n}")
+
+    def watcher(self, recipient):
+        return self.root / "state" / "watchers" / f"{recipient}.alive"
+
     def find(self, worker, task_id):
         for p in self.inbox(worker).iterdir():
             got = parse(p.name)
             if got and got[0] == task_id:
                 return p
         return None
+
+    def progressed(self, worker):
+        d = self.root / "state" / "workers" / worker / "done"
+        return d.exists() and any(d.iterdir())
+
+    def ordered(self, tasks):
+        """urgent > normal > low, then oldest created_at first."""
+        rank = {"urgent": 0, "normal": 1, "low": 2}
+        return sorted(tasks, key=lambda t: (rank[t["priority"]], t["created_at"]))
 
     def beat_is_stale(self, worker):
         # A future-dated beat counts as stale: clock skew degrades, never wedges.
@@ -114,7 +136,25 @@ class Core:
                 continue
             if self.pool.beat_is_stale(w):
                 out.append((w, "process-death"))
+            elif any(parse(q.name)[1] == "claimed"
+                     for q in self.pool.inbox(w).iterdir()
+                     if parse(q.name)) and not self.pool.progressed(w):
+                out.append((w, "task-stalled"))
         return out
+
+    def create_worker(self, name):
+        """A worker with no delivery mechanism cannot receive work, so it gets
+        one at creation."""
+        self.pool.states[name] = "live"
+        self.pool.beats[name] = self.pool.now
+        self.pool.watcher(name).parent.mkdir(parents=True, exist_ok=True)
+        self.pool.watcher(name).touch()
+        self.pool.inbox(name)
+
+    def remove_worker(self, name):
+        self.pool.states[name] = "retired"
+        if self.pool.watcher(name).exists():
+            self.pool.watcher(name).unlink()
 
 
 class Router:
@@ -146,7 +186,13 @@ class Router:
             if not pay.exists():
                 pay.write_text(f'{{"id": "{tid}", "body": "{task.get("body","")}"}}')
             dst = self.pool.inbox(t) / tid          # a sentinel: no content needed
-            dst.touch()
+            if self.pool.find(t, tid) is not None:
+                placed.append((t, self.pool.find(t, tid)))
+                continue                             # already delivered, claimed or not
+            try:
+                os.close(os.open(dst, os.O_CREAT | os.O_EXCL, 0o644))
+            except FileExistsError:
+                pass                                 # the pass is idempotent
             placed.append((t, dst))
         return placed
 
@@ -201,7 +247,7 @@ class Worker:
         self.pool.flag(self.name, tid).write_text("")
         path.unlink()                                    # sentinel removed
         if self.pool.payload(tid).exists():
-            os.rename(self.pool.payload(tid), self.pool.archived(tid))
+            os.rename(self.pool.payload(tid), self.pool.archive_target(tid))
         return tid
 
     def residue(self, task_id):
@@ -214,6 +260,8 @@ class Worker:
             return "completed"
         if state == "claimed" and not has_result:
             return "died-mid-work"
+        if held is not None and not self.pool.payload(task_id).is_file():
+            return "stale-sentinel"
         return "clean"
 
 
@@ -425,6 +473,67 @@ class TheFinishGate(PoolCase):
 
     def test_the_correct_echo_completes(self):
         self.assertEqual(self.w1.finish(self.task_a, "task: task-a\nok"), "task-a")
+
+
+class ClaimsTheDocMakesThatNothingElseChecked(PoolCase):
+    """One test per claim the design states and the suite did not yet exercise."""
+
+    def test_a_repeated_router_pass_delivers_once(self):
+        """The pass must be idempotent, or a retry double-assigns."""
+        a = self.admit_and_place("task-1", "worker-1")
+        b = self.router.place({"id": "task-1"}, "worker-1")
+        self.assertEqual(a[0][1], b[0][1])
+        self.assertEqual(len(list(self.pool.inbox("worker-1").iterdir())), 1)
+
+    def test_a_repeated_pass_does_not_resurrect_a_claimed_delivery(self):
+        """A claimed sentinel is renamed, so a pass that only checks the unclaimed
+        name would create a second one and deliver the work twice."""
+        [(_, path)] = self.admit_and_place("task-1", "worker-1")
+        self.w1.claim(path)
+        self.router.place({"id": "task-1"}, "worker-1")
+        names = sorted(q.name for q in self.pool.inbox("worker-1").iterdir())
+        self.assertEqual(names, ["task-1.claimed"])
+
+    def test_archiving_never_clobbers_an_existing_record(self):
+        self.pool.archived("task-1").parent.mkdir(parents=True, exist_ok=True)
+        self.pool.archived("task-1").write_text("an earlier run")
+        [(_, path)] = self.admit_and_place("task-1", "worker-1")
+        self.w1.finish(self.w1.claim(path), "task: task-1\nsecond run")
+        self.assertEqual(self.pool.archived("task-1").read_text(), "an earlier run")
+        self.assertTrue(self.pool.archived("task-1").with_suffix(".json.1").is_file())
+
+    def test_priority_orders_before_age(self):
+        q = [{"priority": "normal", "created_at": 1}, {"priority": "urgent", "created_at": 9},
+             {"priority": "low", "created_at": 0}, {"priority": "normal", "created_at": 0}]
+        self.assertEqual([(t["priority"], t["created_at"]) for t in self.pool.ordered(q)],
+                         [("urgent", 9), ("normal", 0), ("normal", 1), ("low", 0)])
+
+    def test_a_sentinel_whose_payload_is_gone_is_removed(self):
+        [(_, path)] = self.admit_and_place("task-1", "worker-1")
+        self.pool.payload("task-1").unlink()
+        self.assertEqual(self.w1.residue("task-1"), "stale-sentinel")
+
+    def test_a_payload_with_no_sentinel_is_left_for_the_router(self):
+        self.bridge.admit("task-1", "owner")
+        self.pool.payload("task-1").write_text('{"id": "task-1"}')
+        self.assertEqual(self.w1.residue("task-1"), "clean")
+        self.assertTrue(self.pool.payload("task-1").is_file())
+
+    def test_a_stall_is_a_different_signal_from_a_death(self):
+        """Both are anomalies; only one authorises a restart."""
+        [(_, path)] = self.admit_and_place("task-1", "worker-1")
+        self.w1.claim(path)
+        self.pool.beats["worker-1"] = self.pool.now      # beating, but not progressing
+        self.assertIn(("worker-1", "task-stalled"), self.core.inspect())
+        self.assertNotIn(("worker-1", "process-death"), self.core.inspect())
+
+    def test_creating_a_worker_creates_its_delivery_mechanism(self):
+        """The invariant: a worker with no watcher cannot receive work."""
+        self.core.create_worker("worker-9")
+        self.assertTrue(self.pool.watcher("worker-9").is_file())
+        self.assertTrue(self.pool.inbox("worker-9").is_dir())
+        self.core.remove_worker("worker-9")
+        self.assertFalse(self.pool.watcher("worker-9").exists())
 
 
 class TheOneContestedTransition(PoolCase):
