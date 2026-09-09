@@ -16,7 +16,10 @@ prune (the script is merely unreachable at launch) costs ONE launch without that
 hook, because every installer re-adds its own command at the next core launch.
 A missed prune (a dead copy left in place) costs every compaction until a human
 notices — which is how this reached the owner. So the predicate stays broad and
-the blast radius is bounded by family, not by path shape.
+the blast radius is bounded by family, not by path shape — with one exception: a
+path carrying an unexpanded variable is skipped, because the installer would re-add
+its own ABSOLUTE command, never the portable one, so that false prune is permanent
+rather than costing one launch.
 
     python3 src/claude_hooks_settings.py install --settings <path> \\
         --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
@@ -75,6 +78,11 @@ def save(settings_path: Path, settings: dict) -> None:
     os.replace(tmp, settings_path)
 
 
+def _judgeable(path: str) -> bool:
+    """False when the path carries an unexpanded variable, which no existence check can decide."""
+    return "$" not in path
+
+
 def _exists(path: str, project_dir: Optional[Path]) -> bool:
     """A relative script path is relative to the project the settings file belongs to."""
     candidate = Path(path)
@@ -103,7 +111,8 @@ def prune_dead(settings: dict, event: str, family: str,
         for hook in entry.get("hooks", []) or []:
             command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
             path = script_path_of(command)
-            if family_of(command) == family and path and not _exists(path, project_dir):
+            if (family_of(command) == family and path and _judgeable(path)
+                    and not _exists(path, project_dir)):
                 removed.append(command)
                 continue
             kept_hooks.append(hook)

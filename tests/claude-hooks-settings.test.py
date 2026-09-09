@@ -209,5 +209,27 @@ with tempfile.TemporaryDirectory() as tmp:
     check(removed == [dead_cmds[0]] and odd["hooks"]["SessionStart"][0] == "not-a-dict",
           "a non-dict entry is kept in place while the dead one beside it is removed")
 
+
+    # ── an unexpanded variable is not judgeable by existence ──────────────────
+    # Re-added as an absolute path, never the portable one: a false prune is permanent.
+    var_cmd = 'bash "$CLAUDE_PROJECT_DIR/src/personal-claude-compact-hint.sh"'
+    var_settings = {"hooks": {"SessionStart": [entry(var_cmd)]}}
+    var_removed = chs.prune_dead(var_settings, "SessionStart",
+                                 "personal-claude-compact-hint.sh")
+    check(var_removed == [],
+          "a hook whose path carries an unexpanded variable is never pruned",
+          f"removed {var_removed}")
+    check(var_settings["hooks"]["SessionStart"] != [],
+          "that hook survives in the settings it was found in")
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td)
+        (proj / "src").mkdir()
+        (proj / "src" / "personal-claude-compact-hint.sh").write_text("#!/bin/bash\n")
+        kept = {"hooks": {"SessionStart": [entry(var_cmd)]}}
+        check(chs.prune_dead(kept, "SessionStart",
+                             "personal-claude-compact-hint.sh",
+                             project_dir=proj) == [],
+              "nor when a project_dir is supplied and the expansion would resolve")
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
