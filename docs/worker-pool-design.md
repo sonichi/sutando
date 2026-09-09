@@ -413,8 +413,7 @@ Handler fallback (`:255`, `:506`, `:542` — the disposition-1 branch) already e
 writes a `FALLBACKS_DIR` marker and calls `emit_fallback_task_file` / `emit_task_file`. So the task
 was counted when it was first admitted, and moving it to `direct` is a state change on an existing
 receipt rather than a new one. That is what closes the double-admission hole without a second
-counter — the earlier drafts of this section kept looking for a way to *admit* a direct dispatch,
-and the answer is that it was already admitted.
+counter: the dispatch was already admitted.
 
 **The `fallback`-mode publish branch must separate refusal from failure, and today it cannot.**
 That branch is the `queue_handler_task "$task_path" "fallback"` call and the `|| printf` that
@@ -466,7 +465,7 @@ byte of it is identical whether or not anyone ever received the wake.** A name w
 is an ADDRESS; acceptance is an OBSERVATION, and only the receiver can make it. The two crash
 windows below are indistinguishable in the claim, however line 4 is spelled.
 
-The shipped lifecycle makes that concrete, and it refuses two things the earlier revision asserted:
+The shipped lifecycle makes that concrete, and it refuses two claims that look reasonable:
 
 - `claim_is_live()` keys on **line 1, the WATCHER's pid** (`src/watch-tasks-stream.sh:101-109`), so
   a claim goes "dead" when the watcher exits even if an executor is mid-task on it, and
@@ -504,11 +503,11 @@ is — same atomicity, same never-clobber semantics:
 | claim dead (watcher pid), **accept present, executor live** | watcher died after publish; the executor owns the work | **do not retire** — this is the case the shipped sweep gets wrong today |
 | accept present, executor dead | the executor died mid-task | reclaim both records behind the done flag |
 
-The earlier revision could not express row 3 at all, which is why it had to ask the sweep to
+A claim-only model cannot express row 3 at all, which is why it has to ask the sweep to
 "observe acceptance" that nothing wrote.
 
-**Claude's SKIP RULE needs no change; its ACCEPT WRITE does. Those are different halves and an
-earlier revision exempted the whole executor on the strength of the first.** The exemption is real
+**Claude's SKIP RULE needs no change; its ACCEPT WRITE does. Those are different halves, and exempting the whole executor on the strength of the first is the
+error.** The exemption is real
 but narrow: the skip rule is what deadlocks, and Claude has none to fix. **Publishing acceptance is
 NOT part of the skip rule and is required of EVERY executor, Claude included** — the four-row table
 above keys recovery on the accept record, so an executor that never writes one collapses rows 2 and
