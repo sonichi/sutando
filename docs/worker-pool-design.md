@@ -36,9 +36,13 @@ implementing PR owes each one a schedule that fails before it passes.
   4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a
   published request bounds nothing already in flight. The protocol does NOT survive it.
 - **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with
-  no admission record. `as_claimant()` can now hold a paused claimant beside its successor, and the A/B/C schedule has since
-  been RUN: the rollback returns the allowance AND erases the journal while its claimant is still live,
-  so the hold leaves no durable record. The allowance rules do NOT prevent it.
+  no admission record. `as_claimant()` was added to hold a paused claimant beside its successor, and a schedule was run
+  showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C
+  proof it was described as.** The model stacks owner names rather than holding two simultaneously
+  live claimants, so it cannot express the schedule this obligation is about; the row is STATED,
+  not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect,
+  and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found
+  this bullet still claiming a result the retraction below had already withdrawn.
 - **The probation window names three clock sources** — `probation.since`, the journal mtime, and the
   `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` — a FOURTH source, not one of the three — and changing
   it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.**

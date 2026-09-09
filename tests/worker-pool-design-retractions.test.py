@@ -1250,10 +1250,22 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertIn("0 of 4 when it is read before", f)
         self.assertNotIn("nothing here shows the protocol survives it", f)
 
-    def test_the_ABC_schedule_reports_a_RESULT_not_an_intention(self):
+    def test_the_ABC_bullet_does_not_claim_a_proof_the_model_cannot_make(self):
+        """RETARGETED. This pinned "erases the journal while its claimant is still
+        live" to stop the bullet retreating into an intention. keweichen showed the
+        bullet was then claiming MORE than the model supports: it stacks owner names
+        rather than holding two simultaneously live claimants, so the A/B/C schedule
+        is not expressible in it. The old assertion held the overclaim in place.
+
+        The obligation is unchanged and still stated; what must not reappear is the
+        claim that the schedule was RUN and proved it."""
         f = self._flat()
-        self.assertIn("erases the journal while its claimant is still live", f)
-        self.assertNotIn("prevent the double claim is unproven", f)
+        self.assertIn("The allowance rules do NOT prevent the defect", f,
+            "the obligation itself must stay stated, not soften into a maybe")
+        self.assertIn("NOT the A/B/C\n  proof it was described as".replace("\n  ", " "), f,
+            "the bullet must say plainly that the run is not the A/B/C proof")
+        self.assertNotIn("the A/B/C schedule has since been RUN", f,
+            "that phrase is the overclaim the local callout already retracted")
 
     def test_each_open_obligation_is_individually_named(self):
         f = self._flat()
