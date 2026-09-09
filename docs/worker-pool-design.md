@@ -14,9 +14,7 @@ ticker**, which answers its O(N) objection rather than dropping it.
 **It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the
 binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per
 context group*, enforced by the lead refusing to create the second one. This design is
-room-keyed and has no lead, so neither survives: **the refusing party does not exist.** An
-earlier revision of this document claimed that cutting the `exclusions` rule dissolved the
-conflict. It did not, and that claim is retracted here — `exclusions` was one way grouped
+room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped
 rooms ended up on non-coordinating workers, never the reason the binding unit is a room.
 What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by
 the claim, not per group by an assigner.** Two rooms of one former context group may run
@@ -34,13 +32,20 @@ implementing PR owes each one a schedule that fails before it passes.
 
 - **The request-or-directory gate is a READ, not a claim fence.** A worker can read "no request",
   pause, let a kick publish, and still commit its ordinary batch. The split model can now express
-  that pause (`worker_read` / `worker_commit`); nothing here shows the protocol survives it.
+  that pause (`worker_read` / `worker_commit`), and the schedule has since been RUN: the gate refuses
+  4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a
+  published request bounds nothing already in flight. The protocol does NOT survive it.
 - **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with
-  no admission record. `as_claimant()` can now hold a paused claimant beside its successor; whether
-  the allowance rules prevent the double claim is unproven.
+  no admission record. `as_claimant()` can now hold a paused claimant beside its successor, and the A/B/C schedule has since
+  been RUN: the rollback returns the allowance AND erases the journal while its claimant is still live,
+  so the hold leaves no durable record. The allowance rules do NOT prevent it.
 - **The probation window names three clock sources** — `probation.since`, the journal mtime, and the
-  `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at`, and changing it leaves
-  the suite green, so the suite does not choose a contract. Which clock is normative is undecided.
+  `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` — a FOURTH source, not one of the three — and changing
+  it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.**
+  It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime
+  are both written by the subject of the probation, so a slow worker moves the deadline it is judged
+  against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111,
+  then 212 as its worker progresses.
 - **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop,
   against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.
 
@@ -130,9 +135,7 @@ why one reader per decision is load-bearing rather than tidy, is set out under t
 record's contract below; this rule is step 3's, and step 2 routes on beats alone.
 
 **That publisher is a step-3 component, and so is its reader — so across the step-2
-window the wedge feature is ABSENT, not defaulted.** An earlier revision of this
-paragraph called step 2 "a consumer with no producer" and then, eleven lines later,
-said step 2 ships no reader at all. Both cannot hold: a stage with no reader is not
+window the wedge feature is ABSENT, not defaulted.** **step 2 ships no reader at all**; the reader arrives with the step-3 publisher. Both cannot hold: a stage with no reader is not
 a consumer, and the two descriptions imply different failures — a consumer with no
 producer is a latent no-op that could misroute, while an absent feature cannot fire
 at all. The second is the true one and it is the weaker claim, which is why the
@@ -178,12 +181,8 @@ not have to know the publisher's cadence to judge freshness: a bound stated as
 publisher's configuration, and that includes the core, an operator reading the
 file by hand, and any later consumer. The publisher says it outright.
 
-An earlier draft justified this by a **step-2 reader** predating the sweep. That
-reason was wrong and contradicted this document in three other places
-(`:89-100`, `:162-177`, `:929-934`): **step 2 ships no reader at all**, and the
-reader arrives with the step-3 publisher. The conclusion survives its retracted
-premise — self-describing staleness is right because a consumer should not need
-the producer's config, not because of a staging gap that does not exist. `instances` maps an instance name to the enum
+Staleness is self-describing because a consumer should not need the producer's
+config to judge a record it is reading. `instances` maps an instance name to the enum
 `eligible` | `wedged`, and nothing else. **Probation is not a third value of that enum.** A
 probationed instance is published as `wedged` in `instances` — so a reader that implements only
 this matrix fails closed — and its probation state rides a sibling key, `probation`, which the
@@ -253,10 +252,7 @@ no publisher yet — the default stated above (absent record means every fresh-b
 target is eligible) is therefore the *whole* rule in that window, not a fallback
 inside it.
 
-**That does NOT make the zero-candidate schedule go away, and an earlier revision of
-this section claimed it did.** The claim was that beats are observed directly rather
-than raced through a file, so two instances cannot disagree. False, and the trace
-below already says why: each watcher samples an AGING beat independently. The core
+**That does NOT make the zero-candidate schedule go away.** The trace below says why: each watcher samples an AGING beat independently. The core
 reads worker-2 fresh and suppresses; the beat crosses stale; worker-2 reads itself
 stale and suppresses. Nobody claims. The pin swap has the same shape in reverse — a
 worker reads the old pin and suppresses, the pin swaps, the new target reads the new
@@ -265,8 +261,7 @@ belongs to suppress-based routing over independently-sampled state, not to the
 record**, so removing the record does not remove it.
 
 **So suppression is never terminal, and the re-evaluation is owned by the WATCHER,
-on its own 30s reconciliation.** An earlier revision put it on the heartbeat, which has
-no execution path to it: `src/core_heartbeat.py` is a detached liveness sidecar started
+on its own 30s reconciliation.** The heartbeat has no execution path to it: `src/core_heartbeat.py` is a detached liveness sidecar started
 as its own process (`startup.sh:690-697`) and contains ZERO references to
 `dispatch_task`, `acquire_task_claim` or `TASK_FILE` — routing and claiming live in
 `src/watch-tasks-stream.sh:127-147,370-404`. "On its own beat each instance re-runs the
@@ -282,8 +277,7 @@ tick the watcher re-lists the pending task directory and runs each file through
 `dispatch_task` exactly as a Created event would; the ordinary claim arbitrates whoever
 wakes, and a task this instance is not a candidate for suppresses as always.
 
-**No age gate, and that is a decision rather than an omission.** An earlier draft
-admitted only files older than one beat, which buys nothing and costs three things: a
+**No age gate, and that is a decision rather than an omission.** An age gate on file mtime buys nothing and costs three things: a
 suppress/suppress pair can then need TWO ticks rather than one, a 29-second-old urgent
 task waits while an older low-priority one is admitted ahead of it, and a file with a
 future mtime is either never eligible or immediately eligible depending on a comparison
@@ -350,8 +344,7 @@ is the correction that matters, because putting the primitive inside it left the
 bypassing admission entirely.
 
 **A direct receipt is created by TRANSITION or by ADMISSION, and which one is a property of the
-exit, not of the design.** These are two contracts and an earlier draft of this section stated only
-the first, as though it held for every direct dispatch. It does not.
+exit, not of the design.** These are two contracts, not one.
 
 The discriminator is whether a receipt for that task already exists when the exit runs:
 
@@ -399,9 +392,7 @@ returns, and the holder renews `lease_until` on the same beat as its `.alive`.
 | any | expired | **claimed, unfinished** | a worker holds it. **Never re-admit.** The receipt stands until the task reaches a terminal state |
 | any | expired | **terminal** (result written and archived) | the work is done. Release the receipt; its slot returns |
 
-**The discriminator is the task's claim state, NOT the task file's existence.** An earlier revision of
-this table keyed the ambiguous row on *task present* and read that as proof the publish had landed.
-It is not: the task file is written **before** the notification, so it is present on both sides of the
+**The discriminator is the task's claim state, NOT the task file's existence.** Task presence is not proof the publish landed: the task file is written **before** the notification, so it is present on both sides of the
 emit and a crash in between takes the "already emitted" branch — the receipt then consumes a slot
 forever for a task nobody ever received. Measured on the production `dispatch_task` by a reviewer:
 `before emit: task_present=True phase=admitted emitted=0` / `after emit: task_present=True phase=admitted
@@ -422,8 +413,7 @@ Handler fallback (`:255`, `:506`, `:542` — the disposition-1 branch) already e
 writes a `FALLBACKS_DIR` marker and calls `emit_fallback_task_file` / `emit_task_file`. So the task
 was counted when it was first admitted, and moving it to `direct` is a state change on an existing
 receipt rather than a new one. That is what closes the double-admission hole without a second
-counter — the earlier drafts of this section kept looking for a way to *admit* a direct dispatch,
-and the answer is that it was already admitted.
+counter: the dispatch was already admitted.
 
 **The `fallback`-mode publish branch must separate refusal from failure, and today it cannot.**
 That branch is the `queue_handler_task "$task_path" "fallback"` call and the `|| printf` that
@@ -434,8 +424,7 @@ returns non-zero for a lost claim *and* for an operational failure — so a gene
 publishes in both cases and cannot tell `refused-over-bound` from a genuine error. The typed
 outcome exists precisely so this branch stops guessing.
 
-So the direct lifecycle completes the rule with five obligations, and they are the same five the
-earlier revision listed as unowned: a durable receipt written **before** the emit, a named ownership
+So the direct lifecycle completes the rule with five obligations, and each needs a named owner: a durable receipt written **before** the emit, a named ownership
 handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling for
 THREE crash windows, and they are distinct states rather than one described three ways:
 
@@ -470,13 +459,12 @@ event. The task stays durable and unsubmitted — not lost, but never delivered,
 lost because every surface reports it as pending.
 
 **The transition is a SECOND record written by the EXECUTOR, not a field in the watcher's claim.**
-An earlier revision of this section put the accepting executor's name on line 4 of the claim and
-called that the handoff. It is not: **the claim is written by the watcher BEFORE the emit, so every
+The accepting executor's name cannot live on the claim: **the claim is written by the watcher BEFORE the emit, so every
 byte of it is identical whether or not anyone ever received the wake.** A name written by the sender
 is an ADDRESS; acceptance is an OBSERVATION, and only the receiver can make it. The two crash
 windows below are indistinguishable in the claim, however line 4 is spelled.
 
-The shipped lifecycle makes that concrete, and it refuses two things the earlier revision asserted:
+The shipped lifecycle makes that concrete, and it refuses two claims that look reasonable:
 
 - `claim_is_live()` keys on **line 1, the WATCHER's pid** (`src/watch-tasks-stream.sh:101-109`), so
   a claim goes "dead" when the watcher exits even if an executor is mid-task on it, and
@@ -514,11 +502,11 @@ is — same atomicity, same never-clobber semantics:
 | claim dead (watcher pid), **accept present, executor live** | watcher died after publish; the executor owns the work | **do not retire** — this is the case the shipped sweep gets wrong today |
 | accept present, executor dead | the executor died mid-task | reclaim both records behind the done flag |
 
-The earlier revision could not express row 3 at all, which is why it had to ask the sweep to
+A claim-only model cannot express row 3 at all, which is why it has to ask the sweep to
 "observe acceptance" that nothing wrote.
 
-**Claude's SKIP RULE needs no change; its ACCEPT WRITE does. Those are different halves and an
-earlier revision exempted the whole executor on the strength of the first.** The exemption is real
+**Claude's SKIP RULE needs no change; its ACCEPT WRITE does. Those are different halves, and exempting the whole executor on the strength of the first is the
+error.** The exemption is real
 but narrow: the skip rule is what deadlocks, and Claude has none to fix. **Publishing acceptance is
 NOT part of the skip rule and is required of EVERY executor, Claude included** — the four-row table
 above keys recovery on the accept record, so an executor that never writes one collapses rows 2 and
@@ -561,6 +549,15 @@ candidate while a canonical-id claim does not — so shipping the canonical key 
 stop suppressing handler-owned work, and shipping the skip change alone would look up a key that is
 not there.
 
+**Every admission leaves a receipt, and the ticker keeps NO counter of its own.** A ticker that counted "claims made this pass" and added that to the directory count would be
+wrong three ways at once. First, a per-pass counter resets, so a receipt-less admission vanishes from the next
+recount and every tick adds another `2 * runners` without any completion — *the per-pass
+allowance wearing a limit*. Second, a queued winner both wrote a `pending/` marker AND
+incremented the counter, so a bound of four admitted two. Third, and fatal to the idea: the
+ticker cannot tell a lost claim from a won one, so "do not count a loss" was not implementable.
+`queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
+`acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
+
 ### Delivery is not admission, and an unaccepted offer has no clock
 
 The migration above prescribes a fix; the requirement behind it outlives the fix
@@ -599,57 +596,29 @@ previous version of this defect stayed invisible.
 revision had the ticker count "claims made this pass" and add that to the directory count. That
 was wrong three ways at once, and the first is the one this section had already condemned in
 its own words: a per-pass counter resets, so a receipt-less admission vanishes from the next
-recount and every tick adds another `2 * runners` without any completion — *the per-pass
-allowance wearing a limit*. Second, a queued winner both wrote a `pending/` marker AND
-incremented the counter, so a bound of four admitted two. Third, and fatal to the idea: the
-ticker cannot tell a lost claim from a won one, so "do not count a loss" was not implementable.
-`queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
-`acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-**What this section replaced, kept short because the falsifications are the useful part.** Earlier
-revisions of this design said three things that are now false, and each was corrected by a reviewer
-rather than by me:
-
-- **a four-outcome `dispatch_task`** (`queued` / `direct` / `lost` / `suppressed`). The contract is
-  five: `refused-over-bound` is a distinct outcome from operational failure, and the `fallback`-mode
-  publish branch must tell
-  them apart instead of falling through to a generic `|| printf`.
-- **an ownerless `direct/` receipt** that step 2 would have to invent an owner for. For the **handler
-  fallback** exit this is not a new admission — disposition-1 transitions an already-claimed receipt
-  (`:255`, `:506`, `:542`), so it was counted at its first admission. That is the half this summary
-  used to state as though it were universal. It is not: an **initial probe-direct or operational
-  direct** exit has no prior receipt and therefore performs a fresh admission through the shared
-  primitive, per the contract table above. Which of the two applies is a property of the exit.
-- **`queue_handler_task` as the admission owner**, with the count-and-claim primitive placed inside
-  it. That left all four direct exits bypassing admission, and it is why `queue_handler_task` is now
-  a **downstream executor** instead.
-
-One measured correction is worth keeping in full because it kills an obvious-looking fix: the claim
-record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
+The claim record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
 (`:101-109`), so every claim dies with its watcher and a restart retires the lot — the same restart
 hole as the per-watcher `mktemp`, relocated. And `claim_disposition` (`:169-177`) maps `must-handle`
 to 0, `fallback` to 1 and everything else to 2 = unknown, with only the first two reaching the
-live-core branches, so a `direct` value is excluded by default. Both found by keweichen, checking a
-claim I had made without checking it.
+live-core branches, so a `direct` value is excluded by default. Both found by keweichen.
 
-**The startup sweep obeys the same bound**, restated because an earlier revision of this
-section dropped the sentence while rewriting around it: production loops every pre-existing
+**The startup sweep obeys the same bound**: production loops every pre-existing
 `tasks/*.txt` through `dispatch_task` at boot, so without this a restart carrying a backlog
 claims and emits the whole of it before any ticker exists. Startup IS the first
 reconciliation pass, bounded like every other, and its control uses a backlog larger than
 the cap.
 
-`2 *` is a starting point and should be tuned; what is load-bearing is that the bound is on
+`2 *` is a starting point and should be tuned. The bound is on
 CLAIMS, is measured over total outstanding, and belongs to the ticker — because the event path
 has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
 
-**It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
+**It IS a scan.**
 "Only tasks addressed to me" is not enumerable: `requested_worker` and the room id
 live INSIDE flat task files, the pin is mutable, and suppression leaves no receipt —
 so after a repin, no event tells the new target that an existing file now addresses
-it. It can learn that only by looking. The same argument binds the CORE harder, and for a
-different reason than an earlier revision gave: a dead worker emits no further beat, so
+it. It can learn that only by looking. The same argument binds the CORE harder, for a different reason: a dead worker emits no further beat, so
 the core's tick must consider tasks addressed ELSEWHERE — not to claim them, but because
 rule 6's verdict is defined over exactly those tasks (the oldest unclaimed task addressed
 to that instance). The core scans other instances' work to WRITE the eligibility verdict;
@@ -659,17 +628,10 @@ it never takes it. No fallthrough to the core exists for a bound room.
 
 > **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
 
-**It is a THIRD periodic mechanism, and it is gated on pool membership.** Two
-passages had to change for that to be true rather than merely intended: "Workers are
-task-only" named the heartbeat and the core's sweep as the only periodic things in a
-pool, and the routing section still called this a per-heartbeat re-list after the
-owner had moved. Both now name the watcher. It also supersedes Decision 5 of
-[`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), which sited the
-unclaimed-work backstop on the LEAD and required followers to stay purely
-event-driven — a placement this design cannot use, because the lead-as-daemon it
-rests on is itself superseded at the top of this file. Decision 5's *cost* argument
-is not superseded and is answered rather than dropped: it is O(N) wakeups, where N is
-the number of workers deliberately created, and at N=0 there is no ticker at all.
+**It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher
+owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven.
+Its cost is O(N) wakeups, where N is the number of workers deliberately created,
+and at N=0 there is no ticker at all.
 
 **Activation.** The ticker exists only while the instance is a pool member. A default
 install has no pool, so nothing arms it, and `## The starting point is zero workers`
@@ -681,9 +643,7 @@ still-pending file to the live core every 30 s, forever, on the majority
 configuration. Deactivation is that edge in reverse: removing the last worker disarms
 the ticker and the install is again exactly what it was.
 
-**And "pool member" is not a new signal — it is the registry.** An earlier revision made
-membership load-bearing without saying what reads it, which is a gate with no defined
-input and cannot be implemented. The source of truth is the one `## Registry touchpoints`
+**And "pool member" is not a new signal — it is the registry.** Membership is not a gate in its own right: a gate with no defined input cannot be implemented. The source of truth is the one `## Registry touchpoints`
 already names: a worker registers `role: "worker"` and `pool: <name>` in its instance
 manifest, and the core discovers workers *through the registry, never by scanning*. No
 second file, no sentinel, no count cached anywhere — a membership record that can disagree
@@ -738,9 +698,8 @@ every pending task every 30 s to a live core. The recoverable failure is the one
 
 **Supervision.** The ticker is owned by the watcher process and shares its lifetime,
 rather than being a detached timer that can outlive it. If the watcher exits the
-ticker goes with it — a separate process would reintroduce exactly the split that put
-the first version of this work on the heartbeat, which had the timer and not the
-capability.
+ticker goes with it — a separate process would reintroduce exactly the split that puts the timer in one
+place and the capability in another.
 
 **Single-flight.** One pass runs at a time. A tick arriving while the previous pass is
 still walking the directory is DROPPED, not queued, because the next pass re-lists
@@ -764,8 +723,7 @@ not a new capability. It is bounded by the PENDING directory, which is small by
 construction because tasks are consumed and archived promptly (measured on this host
 while writing: 1 pending against 8,442 archived). If that ever stops holding, the
 answer is an index, and the index is what this section would then owe. That IS a step-2 prerequisite, and
-it is written into the step-2 list rather than asserted to be there — an earlier
-revision asserted a listing it never made.
+it is written into the step-2 list rather than asserted to be there.
 
 **Step 3 owns the wedge path, INSIDE THE SWEEP.** That answers the ownership question
 the staging otherwise leaves open, and it is forced by how routing actually runs:
@@ -778,11 +736,8 @@ event handler keeps routing on beats exactly as in step 2 and never consults the
 record. Workers read the record to gate THEMSELVES. One reader per decision, and the
 one party that could disagree with the file is the party that wrote it.
 
-This paragraph is about the STEP-3 residue only, and an earlier revision let it
-deny the step-2 contract as well. To be explicit, because the two sit close enough
-to be read as one rule: **step 2 DOES owe a periodic re-evaluation** — the
-watcher's 30s reconciliation specified above and again in the step-2 prerequisite
-list — and running it on a timer the watcher owns rather than folding it into an
+**Step 2 owes a periodic re-evaluation of its own** — the watcher's 30s
+reconciliation — and running it on a timer the watcher owns rather than folding it into an
 existing beat does not make repeated work non-periodic. What is bounded HERE
 is a different race: a worker that
 suppresses on a `wedged` verdict the core has not yet acted on waits until the
@@ -844,8 +799,7 @@ race: a non-target that claimed-and-discarded could win the claim and rename the
 file before the target's session read the path it had been handed. Claim-before-emit
 removes the target/target race: **addressing is not exclusive**, so two instances
 can each correctly believe they are the addressee, and only a claim on a key
-both compute identically decides between them. An earlier version of this section argued that
-racing two discards is safe — true, and insufficient, because neither of the
+both compute identically decides between them. Racing two discards is safe — true, and insufficient, because neither of the
 races that matter is discard-against-discard.
 
 **The claim key is the canonical task id, and that id comes from the shared
@@ -887,7 +841,7 @@ default above. Once step 3 lands, "fresh" in it means the published verdict; the
 race it demonstrates is unchanged either way, because the claim — not the freshness
 read — is what decides.
 
-Traced for the case the rule used to get wrong — a task with no
+Traced for the hard case — a task with no
 `requested_worker` in a room pinned to worker-2, with worker-2 fresh — and
 scheduled adversarially, with **both non-targets running to completion before the
 target's handler is even entered**:
@@ -914,9 +868,8 @@ which all instances agree on it:
 | 89.9s | worker-2 | my own beat is fresh; `requested_worker` names me | **wins** | yes |
 | 90.1s | core | worker-2's beat now stale; the room is bound to worker-2 | **does not contend** | no |
 
-Under v1 this is no longer a race, and the reason is worth stating exactly: the core
-does not claim a bound room whatever the beat says, so the second claimant an earlier
-revision arbitrated against does not exist. Either interleaving leaves at most one
+Under v1 this is not a race, because the core
+does not claim a bound room whatever the beat says, so the second claimant such arbitration would need does not exist. Either interleaving leaves at most one
 contender. Had worker-2 suppressed instead — its own gate finding a stale beat or a
 `wedged` verdict — the task would stay pending rather than pass to the core.
 
@@ -1067,9 +1020,7 @@ rooms must be kept off the same worker:
   | the worker comes back | it re-reads the binding, finds itself still a member, and resumes. Nothing was reassigned, so nothing has to be revoked |
   | the owner wants a different worker on that room | an explicit re-bind, and the outgoing worker is **stopped by the supervisor that owns it** before the new binding is written — see "What stopping a worker actually takes" below, because `launchctl bootout` alone does NOT stop it. Responsive is not quiescent — an answer says it was alive when it answered, not that it will not claim next tick — so the enforcer is the process boundary, not the worker's cooperation |
 
-  **What stopping a worker actually takes, and what it costs.** An earlier revision named
-  `launchctl bootout` on the plist as the enforcer. Measured against the reference implementation at
-  #3604's pinned `6c0b416e`, that is insufficient in three independent ways, and
+  **What stopping a worker actually takes, and what it costs.** `launchctl bootout` on the plist is not the enforcer. Measured against the reference implementation at #3604's pinned `6c0b416e`, it is insufficient in three independent ways, and
   `scripts/uninstall-core-pool.sh` says so in its own header: *removing a core is three steps, not
   one*. Its `remove_core()` runs `bootout`, then `rm` on the plist, then `tmux kill-session`, then
   removes `state/cores/core-<N>.alive`. Each of the three extra steps closes a distinct hole:
@@ -1162,8 +1113,7 @@ rooms must be kept off the same worker:
   owner's equal-members ruling already admits two members driving two different tasks in one room at
   once. First-pin's window is bounded by that same standing condition rather than being
   narrower than it: **its cardinality is EVERY TASK ALREADY CLAIMED WHEN THE PIN LANDS, not one.**
-  An earlier revision wrote "one task" here and in the trace summary, which is the claim-then-re-read
-  rule's scope (that rule serializes one task) mistaken for the window's scope. The two differ
+  "One task" is the claim-then-re-read rule's scope (that rule serializes one task), not the window's. The two differ
   whenever more than one task is in flight in the room at pin time, which is exactly the case the
   equal-members ruling makes ordinary. What IS bounded: one transition, and self-clearing as soon as
   the claimants in flight at pin time finish — no new task enters the window after the pin lands. So
@@ -1388,8 +1338,7 @@ gap. So removing W runs in this order, and the order is the contract:
    is UNBOUND, and unbound work reaches the core under rule 3 — the ordinary path, not a stand-in.
 4. **Then** the installer records the removal.
 
-**Marking W ineligible is NOT a substitute for step 1, and an earlier revision of this list made
-exactly that mistake.** Eligibility is a value the worker READS before claiming (`:85-91`), so a W
+**Marking W ineligible is NOT a substitute for step 1.** Eligibility is a value the worker READS before claiming (`:85-91`), so a W
 that read `eligible` and then suspended can resume after the verdict flips and claim against its
 stale view. A read-gated flag cannot fence a process that is already past the read; only stopping the
 process can. That ordering also contradicted the re-bind fence above, which has always ended the
@@ -1512,7 +1461,7 @@ itself to a room whose worker might still come back.
    | neither | issuance did not finish | create `token` (`O_EXCL`), then continue at (b) |
 
    Each row is one `stat`, so each is atomic on its own — and **the two together are NOT
-   order-independent, which an earlier draft of this section claimed.** `spent` is created BEFORE the
+   order-independent.** `spent` is created BEFORE the
    token leaves and is not removed until probation ends, so there is no instant at which both are
    absent while an allowance exists. That invariant is true and it is not sufficient: recovery acts on
    the CONJUNCTION of two sequential reads, and a conjunction that holds at no single instant is

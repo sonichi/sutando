@@ -951,9 +951,14 @@ class DecisionsTwoAndThreeAreSupersededExplicitly(unittest.TestCase):
         f = self._flat()
         self.assertRegex(f, r"the refusing party does not exist")
 
-    def test_the_dissolution_claim_is_retracted_in_place(self):
+    def test_the_dissolution_claim_is_NOT_asserted(self):
+        """Was: assert the retraction sentence is present. The retraction narration
+        is gone by owner direction, so the coverage inverts -- pin the ABSENCE of the
+        wrong claim rather than the presence of a paragraph apologising for it."""
         f = self._flat()
-        self.assertRegex(f, r"that claim is retracted here")
+        self.assertNotIn("cutting the `exclusions` rule dissolved", f)
+        self.assertNotIn("exclusions rule dissolved the conflict", f)
+        self.assertIn("`exclusions` is not why the binding unit is a room", f)
 
     def test_the_replacement_semantics_are_stated(self):
         """A supersession that removes a guarantee without naming what replaces it moves
@@ -1232,6 +1237,23 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         carrying the caveat, so a reader landing mid-document never sees it."""
         self.assertGreaterEqual(self._flat().count("DISPUTED — see"), 4,
             "each contested site needs its own inline pointer, not just the index")
+
+    def test_the_probation_clock_names_a_NORMATIVE_source(self):
+        """[P2] asked which of the three is normative; naming three and picking none
+        is what left it open. The model's token_at is a fourth and cannot be it."""
+        f = self._flat()
+        self.assertIn("`probation.since` is normative", f)
+        self.assertIn("a FOURTH source, not one of the three", f)
+
+    def test_the_gate_schedule_reports_a_RESULT_not_an_intention(self):
+        f = self._flat()
+        self.assertIn("0 of 4 when it is read before", f)
+        self.assertNotIn("nothing here shows the protocol survives it", f)
+
+    def test_the_ABC_schedule_reports_a_RESULT_not_an_intention(self):
+        f = self._flat()
+        self.assertIn("erases the journal while its claimant is still live", f)
+        self.assertNotIn("prevent the double claim is unproven", f)
 
     def test_each_open_obligation_is_individually_named(self):
         f = self._flat()
