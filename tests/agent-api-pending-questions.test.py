@@ -435,6 +435,52 @@ class TestAnswer(unittest.TestCase):
         kept = api.answer_pending_question(FREE_FORM, qs[0], "say more", resolve=False)
         self.assertIn("**Status:** open — owner replied", kept)
 
+    def test_the_rewrite_moves_no_structural_marker_and_the_readers_count_moves_by_exactly_what_it_should(self):
+        """The control this seam actually needs (peer measurement, 2026-09-09: one moved
+        `# Resolved` divider took check-pending-questions from 115 waiting to 1 while the
+        file read perfectly). A rewrite may add one Status line inside one section and
+        nothing else: the divider count and its line stay, no heading-like line appears, and
+        BOTH readers' counts move by exactly -1 (answer) or 0 (reply) — asserted on the
+        LAST active section, the one adjacent to the divider."""
+        doc = ("# Pending Questions\n\n## ❓ First?\nBody one.\n\n## ❓ Second?\nBody two.\n\n"
+               "## ❓ Last before the divider?\nBody three.\n\n# Resolved\n\n## ❓ Archived\nDone.\n")
+
+        def divider(text):
+            lines = text.splitlines()
+            idx = [i for i, ln in enumerate(lines) if ln == "# Resolved"]
+            return len(idx), idx[0] if idx else None
+
+        def heading_lines(text):
+            return sum(1 for ln in text.splitlines() if ln.startswith("## "))
+
+        def waiting(text):
+            with tempfile.TemporaryDirectory() as tmp:
+                pq = Path(tmp) / "pending-questions.md"
+                pq.write_text(text)
+                cpq.PQ_FILE = pq
+                return len(cpq.get_waiting_questions())
+
+        qs = api.parse_pending_questions(doc)
+        last = qs[-1]
+        self.assertEqual(last["text"], "❓ Last before the divider?")
+        n_api, n_cpq = len(qs), waiting(doc)
+        self.assertEqual((n_api, n_cpq), (3, 3))
+
+        # A reply that tries to smuggle structure: newlines, a heading, a divider.
+        reply = api.answer_pending_question(doc, last, "hm\n## fake heading\n# Resolved\nwhich two?",
+                                            resolve=False)
+        self.assertEqual(divider(reply)[0], 1, "divider duplicated or lost")
+        self.assertEqual(divider(reply)[1], divider(doc)[1] + 1, "divider moved by other than the one added line")
+        self.assertEqual(heading_lines(reply), heading_lines(doc), "a heading-like line appeared")
+        self.assertEqual(len(api.parse_pending_questions(reply)), n_api, "agent API count changed on a reply")
+        self.assertEqual(waiting(reply), n_cpq, "notifier count changed on a reply")
+
+        answered = api.answer_pending_question(doc, last, "B\n# Resolved")
+        self.assertEqual(divider(answered)[0], 1)
+        self.assertEqual(heading_lines(answered), heading_lines(doc))
+        self.assertEqual(len(api.parse_pending_questions(answered)), n_api - 1, "agent API count on an answer")
+        self.assertEqual(waiting(answered), n_cpq - 1, "notifier count on an answer")
+
     def test_a_question_back_is_recognised(self):
         self.assertTrue(api.is_question_back("decide what?"))
         self.assertTrue(api.is_question_back("  which one ?  "))
