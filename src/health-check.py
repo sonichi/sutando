@@ -3174,6 +3174,41 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def check_skills_driver_code_drift(repo_root: "Path | None" = None) -> dict:
+    """Warn when a long-running skills process is executing code older than disk.
+
+    `live-tree-drift` covers the repo side; nothing covered the skills side, and a
+    skill pulled while its driver is running does not reach that driver -- the
+    process froze its code at launch. Measured 2026-09-10: three pulls in one day
+    left the content driver on superseded code, visible only as the `v=<sha>` stamp
+    in its own log, compared by hand. Absent stamp or absent repo is ok, not warn:
+    a driver that never ran has no drift.
+    """
+    name = "skills-driver-code-drift"
+    import re as _re
+    ws = resolve_workspace()
+    log = Path(ws) / "state" / "content-driver.log"
+    skills = Path(ws) / "skill-repos" / "sutando-skills"
+    if not log.exists() or not (skills / ".git").exists():
+        return {"name": name, "status": "ok",
+                "detail": "no content-driver log or skills checkout — nothing long-running to compare"}
+    try:
+        stamps = _re.findall(r"v=[0-9a-f]+@([0-9a-f]+)", log.read_text(errors="replace"))
+        running = stamps[-1] if stamps else ""
+        head = subprocess.run(["git", "-C", str(skills), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return {"name": name, "status": "ok", "detail": "could not read driver stamp or skills HEAD — not asserting drift"}
+    if not running or not head:
+        return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
+    if running == head:
+        return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
+    return {"name": name, "status": "warn",
+            "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
+                       f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "
+                       f"Re-arm the driver (TaskStop + Monitor) and confirm the stamp moves to {head}.")}
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -11986,6 +12021,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
+    checks.append(check_skills_driver_code_drift())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
