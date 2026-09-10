@@ -8,7 +8,9 @@ Run: python3 tests/create-worker-command.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -105,6 +107,49 @@ class TestItRefusesBeforeCreating(Base):
         self.assertEqual(self.run_cli("--dry-run"), 0)
         self.assertEqual(self.spawned, [])
         self.assertIsNone(pr.load_roster(self.ws))
+
+
+class TestFailuresAreLoud(Base):
+    """The two paths that leave the owner without a usable worker: both must
+    say so on stderr and exit non-zero, never report success quietly."""
+
+    def test_a_missing_repo_refuses(self):
+        self.assertEqual(
+            cw.main(["--workspace", str(self.ws), "--repo",
+                     str(self.ws / "nope")]), cw.REFUSED)
+        self.assertEqual(self.spawned, [])
+
+    def test_a_refused_spawn_exits_refused(self):
+        def boom(*a, **kw):
+            raise sw.SpawnRefused("tmux session already exists")
+        sw.spawn = boom
+        self.assertEqual(self.run_cli(), cw.REFUSED)
+
+    def test_a_worker_created_but_unrostered_fails_loudly(self):
+        # The worst outcome: the worker exists and routing cannot see it. It
+        # must not exit 0, or the caller believes the worker is usable.
+        def bad_roster(*a, **kw):
+            raise pr.RosterError("binding names a worker that does not exist")
+        pr.compile_roster, real = bad_roster, pr.compile_roster
+        self.addCleanup(lambda: setattr(pr, "compile_roster", real))
+        cw.pr = pr
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertIn("was created, but the", err.getvalue())
+        self.assertIn(self.spawned[0], err.getvalue())
+
+
+class TestJsonOutput(Base):
+    def test_json_carries_the_ids_a_script_needs(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--json", "--room", ROOM), 0)
+        got = json.loads(out.getvalue())
+        self.assertEqual(got["worker_id"], self.spawned[0])
+        self.assertEqual(got["room"], ROOM)
+        self.assertEqual(got["roster_version"], pr.load_roster(self.ws)["version"])
 
 
 class TestUnrosteredRecordsAreReportedNotAdopted(Base):
