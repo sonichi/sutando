@@ -2276,8 +2276,24 @@ class TheClaimDecisionCarriesTheTaskAddress(unittest.TestCase):
         row = self._row_named("may this instance claim THIS task")
         self.assertIn("ORDERED", row,
             "rule 1 precedes the pin table; an unordered conjunction loses that")
-        self.assertIn(":778-790", row,
-            "the ordered derivation must cite the rule that orders it")
+        # Pin the WHOLE contract, not a prefix: ":778-790" is also satisfied by the
+        # row's own warning against citing that shorter range, i.e. by its negation.
+        self.assertIn(":778-796", row,
+            "the ordered derivation must cite the whole routing contract, rule 3 included")
+
+    def test_that_row_covers_all_three_routes(self):
+        row = self._row_named("may this instance claim THIS task")
+        for token in ("rule 1", "rule 2", "rule 3", "UNBOUND"):
+            self.assertIn(token, row,
+                f"the claim decision omits {token}; a derivation that stops before rule 3 "
+                "cannot answer the unbound-room case")
+
+    def test_the_address_row_names_BOTH_forms_of_addressing(self):
+        row = self._row_named("what does THIS task address")
+        self.assertIn("requested_worker", row)
+        self.assertIn("bindings.json", row,
+            "the pin table is addressing too (:104-115); naming only the envelope field "
+            "contradicts the routing contract")
 
     def test_the_operational_row_declares_itself_blind_to_the_task(self):
         row = self._row_named("OPERATIONALLY able to claim")
