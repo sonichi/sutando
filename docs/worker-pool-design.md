@@ -95,19 +95,23 @@ namesake.
 | execution attempt | which incarnation claimed it, and its progress | one or more |
 
 ```
-tasks/task-123.json                    the task: immutable, never copied
-deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123           a sentinel — existing IS the assignment
-deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.claimed   the same sentinel, suffix substituted
-(sentinel removed, payload archived)   finish
+tasks/task-123.txt                                              admitted, not yet routed
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        the SAME file, moved here: being here IS the assignment
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.claimed    the same file, suffix substituted
+tasks/archive/task-123.txt                                      finish
 ```
 
-**Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
-the id is its name, the recipient is its folder. Five recipients is one payload and
-five small files, which cannot drift because only one payload exists.
+**One file, moved, is the whole record of ownership.** The router does not write a
+second file that says "addressed to you" — it `os.rename`s the payload into the
+recipient's folder. Where the file is, is who owns it, and there is exactly one file,
+so two records cannot disagree. (An earlier draft used zero-byte sentinels beside an
+immutable payload; that is two encodings of one fact. The rename is also the primitive
+the rescue line already exercises end to end — see *The rescue line*.)
 
-**Creating the delivery assigns; renaming it claims.** The rename moved rather than
-disappeared: `os.rename` is atomic and exclusive, and a record that merely says
-"addressed to you" is not — two live incarnations of one worker would both run it.
+**Moving the delivery assigns; renaming it claims.** Both are `os.rename`: atomic and
+exclusive, so of two live incarnations of one worker exactly one holds the work.
+A set is the one case that copies: one copy per member, then the original is retired,
+and the member list is persisted first so a crash mid-copy finishes rather than repeats.
 
 **A folder per recipient** is not required for correctness (filtering yields the
 same set, and neither layout enforces anything while all workers share one OS
@@ -115,9 +119,8 @@ identity). It is chosen so each watcher wakes only for its own work, pending wor
 is a directory listing, recovery is bounded by one worker, a wrong glob finds an
 empty directory, and a permission boundary becomes possible without a migration.
 
-It adds two failure modes, named not solved: an **orphan delivery** (sentinel whose
-payload was archived) and a **vanishing payload** (payload archived between reading
-the sentinel and reading it).
+Because the payload travels with the assignment there is no orphan delivery and no
+vanishing payload. The residue table below is therefore short.
 
 ## Request, assignment, claim
 
@@ -175,15 +178,25 @@ roster is a refusal, never a default.
 
 | the task declares | the router does |
 |---|---|
-| one target, alive | writes a delivery to that worker |
-| a target set | one delivery to every member; selects no subset |
-| nothing | writes to the core |
-| a named target unavailable | holds and reports; substitutes no one |
-| a target that does not exist | fails with a named error |
+| one target, on the roster | moves the task into that worker's folder |
+| a target set, all on the roster | one copy into every member's folder; selects no subset |
+| nothing | the core's folder |
+| a target not on the roster | the core's folder — a name never created is not a worker |
 
-No `target_worker` or `fan_out` headers — a sender's message is not a routing
-instruction. **Bindings hold until the owner changes them**; nothing is learned or
-decayed, which is why no affinity table exists.
+**The router asks one question — is every target on the roster? — and never asks
+whether a target is up.** A delivery is a file in a folder; a worker that starts
+later finds it. Holding work for a down worker was rejected because a held task
+existed only inside one router pass, recorded nowhere. Liveness is the core's
+health-check, below, and it is a separate mechanism with its own rules.
+
+The addressed worker is never *substituted by another worker*: unknown names go
+to the core, which is a recipient rather than a fallback.
+
+`requested_worker` is honoured when the envelope carries it; the gateway maps the
+broker's `target_worker` onto that name at the boundary, so one field reaches the
+router. A set is declared by a binding, never by a header. **Bindings hold until
+the owner changes them**; nothing is learned or decayed, which is why no affinity
+table exists.
 
 ## Where the router runs
 
@@ -228,12 +241,15 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 
 ## Worker states and recovery
 
-| state | set by | the router may |
+| state | set by | the core does |
 |---|---|---|
-| `live` | the worker's beat | write deliveries to it |
-| `recovering` | the core | hold; write nothing new |
-| `abandoned` | the core | release its claims back to it |
-| `retired` | the core | nothing |
+| `live` | the worker's beat | nothing |
+| `recovering` | the core | restart the runtime; deliveries keep arriving meanwhile |
+| `abandoned` | the core | release its `.claimed` files back to `.txt` for the same worker |
+| `retired` | the core | remove it from the roster; the router then sends its traffic to the core |
+
+The router never reads `state`. These rows are the health-check's, and whatever
+marks a worker `abandoned` is the same process that recovers it.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
@@ -313,8 +329,8 @@ Everything below is normative and meant to be built from directly.
 <workspace>/
   tasks/<task-id>.json                    payload, immutable after admission
   tasks/archive/<task-id>.json            terminal
-  deliveries/<recipient-id>/<task-id>          sentinel, 0 bytes, unclaimed
-  deliveries/<recipient-id>/<task-id>.claimed  sentinel, 0 bytes, claimed
+  deliveries/<recipient-id>/<task-id>.txt      the payload, moved here by the router; unclaimed
+  deliveries/<recipient-id>/<task-id>.claimed  the same file, claimed by one incarnation
   results/<task-id>.txt                   reply body
   state/roster.json                       compiled; router reads only
   state/bindings.json                     owner-authored declarations
@@ -353,32 +369,36 @@ Input is the roster and one admitted task; nothing else may be read.
 
 1. Load `state/roster.json`. **Unreadable or absent → refuse the pass and report.** Never default to the core.
 2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
-3. Validate every target exists in the roster. Unknown → fail the task with a named error.
-4. For each target whose state is `live`: if `deliveries/<target>/<task-id>` **or** `<task-id>.claimed` already exists, the task is delivered — do nothing. Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as success. **Checking only the unclaimed name would recreate a sentinel for work already in flight and deliver it twice.**
-5. For any target not `live`: write nothing, leave the task pending, and record it in `pool-status.json`. Never substitute.
-6. For a set, ids are `<parent-id>-<target>`; persist the resolved member list on the parent so a restart finishes minting.
+3. Any target not in the roster resolves to `core`. State is not read.
+4. One target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.claimed` already exists, it is delivered — do nothing. **Checking only the unclaimed name would re-deliver work already in flight.** Otherwise `os.rename(tasks/<task-id>.txt, deliveries/<target>/<task-id>.txt)`; a rename that fails because the source is gone means another pass delivered it.
+5. A set: persist the member list on the parent first, copy the payload into each member's folder as `<task-id>.txt`, then remove the original. A restart finishes the copies it finds missing.
+
+The name keeps `.txt` because the watcher a worker runs emits for no other extension; claiming substitutes the suffix, so a claimed file stops waking anyone.
 
 Order candidates `urgent > normal > low`, then oldest payload `created_at` first.
 
 ### Worker loop
 
 1. Watch `deliveries/<me>/`, plus one sweep of the same folder at boot. The sweep is not optional: a delivery written while the session was down produces no event.
-2. Candidates are entries with no `.claimed` suffix.
-3. Claim: `os.rename(<task-id>, <task-id>.claimed)`. **`OSError` means somebody won the race — skip the task and continue.** It is the router releasing, or another incarnation of this same worker.
-4. Read `tasks/<task-id>.json`. **Missing → the payload was archived under it; remove the stale sentinel and continue.**
+2. Candidates are entries ending in `.txt`.
+3. Claim: `os.rename(<task-id>.txt, <task-id>.claimed)`. **`OSError` means somebody won the race — skip the task and continue.** It is the core releasing, or another incarnation of this same worker.
+4. Read the `.claimed` file: it is the payload.
 5. Execute, then `finish`.
 
-A worker reads no directory but its own, and writes no sentinel anywhere.
+A worker reads no directory but its own, never lists `tasks/`, and never takes work
+that was not moved to it. This is the rescue line's `acquire_work` with its
+unassigned-pool fallback removed: that fallback let a worker take work nobody
+addressed to it, which is routing by another name.
 
 ### finish — the single completion path
 
-Refuse, writing nothing, unless all three hold: the caller holds `deliveries/<me>/<task-id>.claimed`; the body's first line is exactly `task: <task-id>`; the body after that line is non-empty.
+Refuse, writing nothing, unless all three hold: `deliveries/<me>/<task-id>.claimed` exists and is the caller's; the body's first line is exactly `task: <task-id>`; the body after that line is non-empty.
 
 Then, in this order, each step durable before the next:
 
 1. `results/<task-id>.txt` — write to `results/.tmp-<me>-<task-id>`, `fsync`, `os.rename` into place.
 2. `state/workers/<me>/done/<task-id>.flag` — create, `fsync`.
-3. Remove the sentinel, then `os.rename` the payload into `tasks/archive/`.
+3. `os.rename` the `.claimed` file into `tasks/archive/<task-id>.txt`.
 
 Archiving is no-clobber: on collision mint `<task-id>.json.1`, `.2`, …
 
@@ -387,9 +407,8 @@ Archiving is no-clobber: on collision mint `<task-id>.json.1`, `.2`, …
 | on disk | means | do |
 |---|---|---|
 | result, no flag | completed, flag write was interrupted | write the flag, finish the archive; never re-run |
-| `.claimed`, no result | died mid-work | rename back to `<task-id>`; the same worker retakes it |
-| sentinel, no payload | payload already archived | remove the sentinel |
-| payload, no sentinel, not archived | never routed | leave it; the router will place it |
+| `.claimed`, no result | died mid-work | rename back to `<task-id>.txt`; the same worker retakes it |
+| `.txt` in `tasks/`, not archived | never routed | leave it; the router will place it |
 
 ### Supervision timer
 
@@ -397,7 +416,7 @@ An OS timer, 300 s, independent of any agent session.
 
 1. For each worker in the roster that is not `retired` or owner-paused, collect: beat age, whether a session is running, count of `.claimed` sentinels, and the newest `mtime` among its done-flags and results.
 2. **Process death** — beat older than 90 s *and* no session *and* not paused, on three consecutive ticks → the pre-authorised remedy: restart that worker's process. Deterministic; needs no core.
-3. **Task stalled** — holds `.claimed` sentinels whose age exceeds a threshold while no done-flag or result has appeared → write an anomaly record and route it to the core for diagnosis. **Never authorises a restart.**
+3. **Task stalled** — holds `.claimed` files whose age exceeds a threshold while no done-flag or result has appeared → write an anomaly record and route it to the core for diagnosis. **Never authorises a restart.**
 4. Anomaly records are deduplicated on `(worker-id, signal)` and cleared when work advances.
 5. Verification is that work advanced, not that a process returned.
 
@@ -426,8 +445,8 @@ Scope: roster compiler, router pass, per-recipient folders, worker states, the s
 
 Acceptance:
 - Replay: same roster and task in, same deliveries out, with no pool running.
-- A declared set writes one sentinel per member and exactly one payload.
-- An unavailable target holds and reports; nothing is written to another folder.
+- A declared set writes one copy per member and retires the original; a crash mid-copy finishes on restart.
+- A target not on the roster is delivered to the core; a target on the roster but not live still receives its delivery, and nothing is written to any other folder.
 - A missing roster refuses rather than defaulting to the core.
 - Concurrent claim and release leave exactly one winner, the loser seeing `OSError`.
 - Removing the last worker returns the install to the Stage 1 state, and the same code runs in both directions.
