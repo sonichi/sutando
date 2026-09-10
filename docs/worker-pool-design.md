@@ -44,6 +44,32 @@ is the owner's display name — mutable, one roster field, never in a path or a 
 Renaming is a one-field edit. Labels resolve to ids where intent is captured, never
 at routing.
 
+| field | example | use |
+|---|---|---|
+| `worker_id` | `worker-a3f91c` | routing, directories, binding references; immutable |
+| `label` | `worker-1`, `code reviewer` | shown to the owner; renameable |
+| `incarnation_id` | minted per session | which run of that worker claimed an attempt |
+
+**The id is minted, never chosen.** A sequential `worker-1` cannot satisfy "never
+reused": "next free N" hands a deleted worker's id to its successor, and two hosts
+sharing a synced workspace both compute the same next N. Mint random hex instead —
+`worker-` plus 6 lowercase hex digits, well inside the `[a-z0-9][a-z0-9-]{0,31}`
+bound. **Creation registers the id atomically and a duplicate is refused**, so a
+collision fails loudly at create time rather than silently aliasing two workers.
+
+**Lifecycle, which is what the rule protects:**
+
+- the same worker recovering, restarting, or changing session **keeps its
+  `worker_id`** — a restart is not a new worker;
+- every new session mints a fresh `incarnation_id`, which is what distinguishes
+  attempts by the same worker;
+- deleting a worker and creating another **mints a new id**, even when the owner
+  reuses the label `worker-1`.
+
+That last rule is the point: a surviving sentinel, `.alive` file, done-flag or
+archived header from the deleted worker can never be read as belonging to its
+namesake.
+
 ## Task, delivery, attempt
 
 | level | what it is | cardinality |
@@ -54,8 +80,8 @@ at routing.
 
 ```
 tasks/task-123.json                    the task: immutable, never copied
-deliveries/worker-2/task-123           a sentinel — existing IS the assignment
-deliveries/worker-2/task-123.claimed   the same sentinel, suffix substituted
+deliveries/worker-a3f91c/task-123           a sentinel — existing IS the assignment
+deliveries/worker-a3f91c/task-123.claimed   the same sentinel, suffix substituted
 (sentinel removed, payload archived)   finish
 ```
 
@@ -81,7 +107,7 @@ the sentinel and reading it).
 
 | state | expressed as | owner |
 |---|---|---|
-| request | file content: `requested_worker: worker-2` | producer or bridge |
+| request | file content: `requested_worker: worker-a3f91c` | producer or bridge |
 | assignment | a delivery record in the recipient's folder | the router alone |
 | claim | that record renamed | that worker alone |
 
@@ -290,7 +316,7 @@ a label never appears in a path.
 ```json
 {"id":"task-123","created_at":"<RFC3339>","source":"discord|slack|room|cli|timer",
  "channel_id":"<opaque>","priority":"urgent|normal|low",
- "requested_worker":"worker-2|null","submitter":{"actor":"<id>","tier":"owner|team|…"},
+ "requested_worker":"worker-a3f91c|null","submitter":{"actor":"<id>","tier":"owner|team|…"},
  "authorisation":{"capabilities":["…"],"resolved_by":"task-bridge"},
  "body":"<text>","parent_id":"<task-id>|null"}
 ```
@@ -299,8 +325,8 @@ a label never appears in a path.
 
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
- "workers":{"worker-2":{"label":"support","state":"live","model":"…","scopes":["…"]}},
- "bindings":{"room:!abc:ag2.space":"worker-2","room:!def:ag2.space":["worker-2","worker-3"]}}
+ "workers":{"worker-a3f91c":{"label":"support","state":"live","model":"…","scopes":["…"]}},
+ "bindings":{"room:!abc:ag2.space":"worker-a3f91c","room:!def:ag2.space":["worker-a3f91c","worker-7d02be"]}}
 ```
 
 An assignment records the roster `version` it was made against.
