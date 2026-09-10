@@ -8930,15 +8930,18 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
-            # Two roots process every task twice, so a live parent does not excuse
-            # a duplicate; the split says which to stop first, not which may stay.
+            # A supervised root is a healthy peer; telling an operator to stop it
+            # takes a live instance offline. Only ownerless roots are stoppable here.
+            act = (f"stop the ownerless one(s) first: {', '.join(ownerless)}"
+                   if ownerless else
+                   "do NOT stop any of them — each is supervised; reduce the count "
+                   "through the launcher that owns it")
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID "
-                              f"sentinel (pids {', '.join(roots)}) — draining tasks/ "
-                              "unsupervised; stop them and restart one cleanly. "
-                              f"ownerless, stop these first: {', '.join(ownerless) or 'none'}; "
-                              f"supervised, stopping one needs its launcher: "
-                              f"{', '.join(supervised) or 'none'}"}
+                    "detail": f"{len(roots)} watcher(s) running with no PID sentinel "
+                              f"(pids {', '.join(roots)}) — each drains tasks/, so every "
+                              f"task is processed {len(roots)}x. {act}. "
+                              f"ownerless: {', '.join(ownerless) or 'none'}; "
+                              f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}

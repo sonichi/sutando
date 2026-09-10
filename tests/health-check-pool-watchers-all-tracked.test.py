@@ -585,5 +585,44 @@ class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
 
 
 
+class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
+    """Reported twice by qingyun-wu on #3875 (ad7f1bf7, f91511cc).
+
+    The multiple-root warning called every root orphaned and said "stop them and
+    restart one cleanly", then APPENDED the ownership split without retracting
+    that instruction. An operator following it takes a healthy peer offline.
+    """
+
+    W = "/repo/src/watch-tasks-stream.sh"
+
+    def _detail(self, ps):
+        orig = (hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths)
+        hc._ps_snapshot = lambda: ps
+        hc._proc_argv_vector = lambda pid: None
+        hc.watcher_sentinel_paths = lambda sd: []
+        try:
+            return hc.check_task_watcher().get("detail") or ""
+        finally:
+            hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths = orig
+
+    def test_two_supervised_roots_are_never_told_to_stop(self):
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
+        self.assertNotIn("stop them", d, "blanket stop advice over supervised roots")
+        self.assertIn("do NOT stop any", d)
+        self.assertIn("supervised: 901, 902", d)
+
+    def test_an_ownerless_root_is_still_named_as_stoppable(self):
+        # The control: the fix must not become "never stop anything".
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n")
+        self.assertIn("stop the ownerless one(s) first: 903", d)
+        self.assertNotIn("do NOT stop any", d)
+
+    def test_the_duplicate_processing_cost_is_still_stated(self):
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
+        self.assertIn("processed 2x", d,
+            "the reason a duplicate matters must survive the softened advice")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
