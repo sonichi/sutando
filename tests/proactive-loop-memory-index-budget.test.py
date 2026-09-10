@@ -193,6 +193,49 @@ with tempfile.TemporaryDirectory() as d:
           got is None and "--record" in note, note)
 
 with tempfile.TemporaryDirectory() as d:
+    # An unreadable candidate must not crash the resolver: hashing it is how the
+    # debris filter groups duplicates, and a permission error there is not a
+    # reason to refuse a host its answer.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "live", index_of(LIMIT // 2), age_s=60)
+    locked = _tree(projects, "locked", index_of(LIMIT // 3), age_s=60)
+    os.chmod(locked / "MEMORY.md", 0)
+    try:
+        (locked / "MEMORY.md").read_bytes()
+        unreadable = False          # root, or a filesystem that ignores the mode
+    except OSError:
+        unreadable = True
+    if unreadable:
+        key = mib._content_key(locked / "MEMORY.md")
+        check("unreadable candidate: hashing it yields a marker, not an exception",
+              key.startswith("unreadable:"), key)
+        got, note = mib._live_index(live, REPO, projects.parent.parent)
+        check("unreadable candidate: the resolver still answers or refuses cleanly",
+              got is not None or "CANNOT ANSWER" in note, "got=%s note=%r" % (got, note))
+    os.chmod(locked / "MEMORY.md", 0o644)
+
+with tempfile.TemporaryDirectory() as d:
+    # projects/ exists and is empty, and the cwd-derived default is not a file:
+    # there is nothing to answer ABOUT, which is different from ambiguity.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    projects.mkdir(parents=True)
+    absent = projects / "gone" / "memory"
+    got, note = mib._live_index(absent, REPO, projects.parent.parent)
+    check("no corpus anywhere: refuses naming both the default and the scan root",
+          got is None and "no index at" in note and "none under" in note,
+          "got=%s note=%r" % (got, note))
+
+    # ...but an index OUTSIDE the projects tree is still an answer: an empty scan
+    # establishes no rival, so the caller's own memory dir stands.
+    outside = pathlib.Path(d) / "elsewhere" / "memory"
+    outside.mkdir(parents=True)
+    (outside / "MEMORY.md").write_text(index_of(LIMIT // 2))
+    got, note = mib._live_index(outside, REPO, projects.parent.parent)
+    check("empty projects scan: a default index outside the tree is accepted, not refused",
+          got == outside / "MEMORY.md" and note == "", "got=%s note=%r" % (got, note))
+
+
+with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
