@@ -8,7 +8,9 @@ counts (incl. `empty` = sessions with no assistant message and
 `conversations` = sessions − empty, the number the owner is told), the
 read-only contract (root listing + mtimes identical, --counts-only opens no
 file and is a file count, --dry-run writes nothing, out-dir inside the root
-refused) and the (mtime,size) `new` bookkeeping.
+refused), the (mtime,size) `new` bookkeeping, and the importer's redaction
+policy on every metadata string BEFORE it is cut to length (a `sk-ant-…` key
+in a title or prompt survived the generic scanner: PR #4127 review).
 
 Run: python3 tests/import-claude-context-index.test.py
 """
@@ -39,6 +41,13 @@ A1 = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 A2 = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 B1 = "33333333-cccc-4ccc-8ccc-cccccccccccc"
 A3 = "44444444-dddd-4ddd-8ddd-dddddddddddd"   # never answered (added by one test)
+A4 = "55555555-eeee-4eee-8eee-eeeeeeeeeeee"   # every metadata string carries a key (added by one class)
+
+# Key fixtures: 40 chars after `ghp_`, 35 after `AIza`, the `sk-ant-api03-` shape (20+ after `sk-ant-`).
+GHP = "ghp_" + "A1b2C3d4" * 5
+AIZA = "AIza" + "Sy" * 17 + "Q"
+ANT = "sk-ant-api03-" + "Ab1_" * 23 + "x"
+PLACEHOLDER_ANT = "[STORED-IN-KEYCHAIN-Anthropic API Key]"
 
 
 def _load():
@@ -384,6 +393,73 @@ class TestScanEdges(Base):
         self.assertGreater(r["skipped_since"], 0)
         md = (self.out / "claude-import-index.md").read_text()
         self.assertNotIn("\n## ", md)
+
+
+class TestMetadataRedaction(Base):
+    """A key in a title, prompt, summary or agent name never reaches index.json,
+    index.md or a session record — redacted with the importer's policy (not the
+    generic scanner alone) and before the 120/200-char cut, which could
+    otherwise leave half a key behind."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.root / SLUG_A / f"{A4}.jsonl"
+        _write(self.path, [
+            {"type": "ai-title", "aiTitle": "x" * 100 + " key " + ANT, "sessionId": "s"},
+            _msg("user", f"use {ANT} and {GHP} please", "2026-08-07T10:00:00Z"),
+            _msg("assistant", [{"type": "text", "text": "ok"}], "2026-08-07T10:01:00Z"),
+            {"type": "last-prompt", "lastPrompt": f"rotate {AIZA} too", "sessionId": "s"},
+            {"type": "summary", "summary": f"Rotated {ANT}", "leafUuid": "u"},
+            {"type": "agent-name", "agentName": f"bot {GHP}", "sessionId": "s"},
+        ])
+
+    def test_scan_session_redacts_every_metadata_string_before_the_cut(self):
+        rec = self.m.scan_session(self.path)
+        for field in ("ai_title", "first_prompt", "last_prompt", "summary", "agent_name"):
+            for leak in (ANT, GHP, AIZA, "sk-ant-"):
+                self.assertNotIn(leak, rec[field], field)
+        self.assertEqual(rec["first_prompt"], f"use {PLACEHOLDER_ANT} and [STORED-IN-KEYCHAIN-GitHub Token] please")
+        self.assertEqual(rec["last_prompt"], "rotate [STORED-IN-KEYCHAIN-Google API Key] too")
+        self.assertEqual(rec["summary"], f"Rotated {PLACEHOLDER_ANT}")
+        self.assertEqual(rec["agent_name"], "bot [STORED-IN-KEYCHAIN-GitHub Token]")
+        # the 120-char title cut lands inside the placeholder, never inside the key
+        self.assertEqual(len(rec["ai_title"]), 120)
+        self.assertEqual(rec["ai_title"], "x" * 100 + " key " + PLACEHOLDER_ANT[:15])
+
+    def test_records_json_and_index_md_carry_the_placeholder_not_the_key(self):
+        _write(self.root / SLUG_B / f"{A3}.jsonl", [
+            {"type": "custom-title", "title": f"Deploy with {ANT} now", "sessionId": "s"},
+            _msg("user", "go", "2026-08-08T10:00:00Z", cwd=CWD_B),
+            _msg("assistant", [{"type": "text", "text": "done"}], "2026-08-08T10:01:00Z", cwd=CWD_B),
+        ])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self.m.main(["--root", str(self.root), "--out-dir", str(self.out), "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())["sessions"], 4)
+        written = {name: (self.out / name).read_text() for name in
+                   ("index.json", "claude-import-index.md", "state.json", "status.json")}
+        for name, text in dict(written, stdout=buf.getvalue()).items():
+            for leak in (ANT, GHP, AIZA, "sk-ant-"):
+                self.assertNotIn(leak, text, name)
+        doc = json.loads(written["index.json"])
+        a4 = next(s for s in doc["projects"][SLUG_A]["sessions"] if s["uuid"] == A4)
+        self.assertEqual(a4["title_source"], "ai")
+        self.assertEqual(a4["title"], "x" * 100 + " key " + PLACEHOLDER_ANT[:15])
+        self.assertIn(PLACEHOLDER_ANT, a4["first_prompt"])
+        self.assertIn("[STORED-IN-KEYCHAIN-Google API Key]", a4["last_prompt"])
+        b = next(s for s in doc["projects"][SLUG_B]["sessions"] if s["uuid"] == A3)
+        self.assertEqual(b["title"], f"Deploy with {PLACEHOLDER_ANT} now")       # custom title, same policy
+        self.assertIn("| 55555555 | xxxx", written["claude-import-index.md"])
+        self.assertIn(f"| 44444444 | Deploy with {PLACEHOLDER_ANT} now |", written["claude-import-index.md"])
+        # a first prompt that is the title (no ai/custom title) goes through the same policy
+        _write(self.root / SLUG_B / f"{A4}.jsonl", [
+            _msg("user", f"prompt title {GHP} tail", "2026-08-09T10:00:00Z", cwd=CWD_B),
+            _msg("assistant", [{"type": "text", "text": "done"}], "2026-08-09T10:01:00Z", cwd=CWD_B),
+        ])
+        res = self.m.index(self.root, out_dir=self.out, dry_run=True)
+        rec = self._session(res, SLUG_B, A4)
+        self.assertEqual((rec["title_source"], rec["title"]), ("prompt", "prompt title [STORED-IN-KEYCHAIN-GitHub Token] tail"))
 
 
 if __name__ == "__main__":

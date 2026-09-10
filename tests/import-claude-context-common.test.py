@@ -4,8 +4,9 @@
 Pins: workspace resolution (--workspace wins and never runs the config helper;
 otherwise the helper's stdout, an empty answer refused), the read-only-root
 guard including a cross-drive comparison, private (0600) JSON writes,
-status.json taking counts only, --since parsing, --projects matching and the
-dash-leading slug rewrite (from an explicit argv and from sys.argv).
+status.json taking counts only, --since parsing, --projects matching, the
+dash-leading slug rewrite (from an explicit argv and from sys.argv) and
+`redact_text`, the one redaction policy extract.py and index.py share.
 
 Run: python3 tests/import-claude-context-common.test.py
 """
@@ -132,6 +133,19 @@ class TestCommon(unittest.TestCase):
         self.assertIn("updated_at", again)
         self.assertRegex(self.m.now_iso(), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertRegex(self.m.today(), r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_redact_text_is_the_importers_one_policy(self):
+        ghp = "ghp_" + "A1b2C3d4" * 5
+        aiza = "AIza" + "Sy" * 17 + "Q"
+        ant = "sk-ant-api03-" + "Ab1_" * 23 + "x"
+        n, out = self.m.redact_text(f"token {ghp}, key {aiza}, ANTHROPIC_API_KEY={ant} done")
+        self.assertGreaterEqual(n, 3)
+        for leak in (ghp, aiza, ant, "sk-ant-"):
+            self.assertNotIn(leak, out)
+        self.assertEqual(out, "token [STORED-IN-KEYCHAIN-GitHub Token], key [STORED-IN-KEYCHAIN-Google API Key], "
+                              "ANTHROPIC_API_KEY=[STORED-IN-KEYCHAIN-Anthropic API Key] done")
+        self.assertEqual(self.m.redact_text("nothing secret here"), (0, "nothing secret here"))
+        self.assertEqual(set(self.m.EXTRA_SECRET_PATTERNS), {"Google API Key", "Anthropic API Key"})
 
 
 if __name__ == "__main__":

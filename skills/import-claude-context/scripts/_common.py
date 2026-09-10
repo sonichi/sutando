@@ -26,6 +26,7 @@ REPO = SKILL_DIR.parents[1]  # skills/import-claude-context/scripts -> repo root
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
+from secret_scanner import scan_and_redact  # noqa: E402
 from util_paths import write_private_text  # noqa: E402
 
 DATA_SUBDIR = ("data", "claude-import")
@@ -39,6 +40,26 @@ PROJECTS_DIR = "projects"
 ENTITIES_FILE = "entities.json"
 
 _SINCE_RE = re.compile(r"^(\d+)([hdw])$")
+
+# Key shapes detect-secrets has no plugin for; applied after scan_and_redact with the same placeholder.
+EXTRA_SECRET_PATTERNS = {
+    "Google API Key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    "Anthropic API Key": re.compile(r"sk-ant-[0-9A-Za-z_-]{20,}"),
+}
+
+
+def redact_text(text: str) -> tuple:
+    """The importer's ONE redaction policy — (redaction count, redacted text):
+    secret_scanner first, the local key shapes after. Every string that leaves
+    a transcript goes through here: extract.py's dumps and index.py's titles,
+    prompts, summaries and agent names (the generic scanner alone let an
+    `sk-ant-…` key into the index: PR #4127 review)."""
+    hits, out = scan_and_redact(text)
+    n = len(hits)
+    for name, pat in EXTRA_SECRET_PATTERNS.items():
+        out, k = pat.subn(f"[STORED-IN-KEYCHAIN-{name}]", out)
+        n += k
+    return n, out
 
 
 def now_iso() -> str:

@@ -13,6 +13,12 @@ records per session the cheap metadata Claude Code already wrote:
   user/assistant message counts and the byte volume of the dialog-bearing
   lines; the first prompt through context_resume's message_text/clean_text.
 
+Every metadata string (titles, prompts, summary, agent name) is redacted with
+the importer's policy — `_common.redact_text`, the same object extract.py
+uses on the dumps — BEFORE it is cut to length: the cut first could leave
+half a key in index.json, and the generic scanner alone let an `sk-ant-…`
+key through (PR #4127 review).
+
 One streaming pass per file with a cheap type dispatch per line: JSON is
 parsed only for the short meta lines, the first message line (sidechain flag,
 cwd, timestamp) and the user lines up to the first real prompt; big tool I/O
@@ -50,11 +56,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common  # noqa: E402
 from _common import (  # noqa: E402
-    INDEX_FILE, INDEX_MD, matches_project, now_iso, parse_since, session_key,
+    INDEX_FILE, INDEX_MD, matches_project, now_iso, parse_since, redact_text, session_key,
     split_csv, write_status,
 )
 from context_resume import clean_text, message_text
-from secret_scanner import scan_and_redact
 from util_paths import claude_home_path, write_private_text
 
 SNIPPET_CHARS = 200
@@ -112,6 +117,14 @@ def _snippet(text, limit: int):
     return out[:limit]
 
 
+def _meta(text, limit: int):
+    """A metadata string as the index keeps it: the importer's redaction first,
+    the cut to `limit` after — the other order can leave half a key behind."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return _snippet(redact_text(text)[1], limit)
+
+
 def _take_header(rec: dict, d: dict) -> None:
     if rec["cwd"] is None and isinstance(d.get("cwd"), str) and d["cwd"]:
         rec["cwd"] = d["cwd"]
@@ -146,15 +159,15 @@ def scan_session(path: Path) -> dict:
                 if d is None:
                     continue
                 if t == "ai-title":
-                    rec["ai_title"] = _snippet(d.get("aiTitle"), TITLE_CHARS) or rec["ai_title"]
+                    rec["ai_title"] = _meta(d.get("aiTitle"), TITLE_CHARS) or rec["ai_title"]
                 elif t == "custom-title":
-                    rec["custom_title"] = _snippet(d.get("title"), TITLE_CHARS) or rec["custom_title"]
+                    rec["custom_title"] = _meta(d.get("title"), TITLE_CHARS) or rec["custom_title"]
                 elif t == "last-prompt":
-                    rec["last_prompt"] = _snippet(d.get("lastPrompt"), SNIPPET_CHARS) or rec["last_prompt"]
+                    rec["last_prompt"] = _meta(d.get("lastPrompt"), SNIPPET_CHARS) or rec["last_prompt"]
                 elif t == "agent-name":
-                    rec["agent_name"] = _snippet(d.get("agentName"), TITLE_CHARS) or rec["agent_name"]
+                    rec["agent_name"] = _meta(d.get("agentName"), TITLE_CHARS) or rec["agent_name"]
                 elif t == "summary":
-                    rec["summary"] = _snippet(d.get("summary"), 500) or rec["summary"]
+                    rec["summary"] = _meta(d.get("summary"), 500) or rec["summary"]
                 continue
             if not first_message_seen:
                 first_message_seen = True
@@ -186,7 +199,7 @@ def scan_session(path: Path) -> dict:
                     d = _loads(line)
                     if d is not None:
                         text, _tools = message_text(d.get("message") or {})
-                        rec["first_prompt"] = _snippet(clean_text(text), SNIPPET_CHARS)
+                        rec["first_prompt"] = _meta(clean_text(text), SNIPPET_CHARS)
             else:
                 if _TEXT_BLOCK_RE.search(line):
                     rec["assistant_msgs"] += 1
@@ -204,14 +217,8 @@ def scan_session(path: Path) -> dict:
     return rec
 
 
-def _redact(text):
-    if not text:
-        return text
-    _hits, out = scan_and_redact(text)
-    return out
-
-
 def session_record(slug: str, path: Path, st: os.stat_result, scan: dict) -> dict:
+    """The index row; every string in `scan` already went through `_meta`."""
     title_source = "none"
     title = None
     if scan["custom_title"]:
@@ -226,11 +233,11 @@ def session_record(slug: str, path: Path, st: os.stat_result, scan: dict) -> dic
         "file": path.name,
         "size": st.st_size,
         "mtime_ns": st.st_mtime_ns,
-        "title": _redact(title) or "(untitled)",
+        "title": title or "(untitled)",
         "title_source": title_source,
-        "first_prompt": _redact(scan["first_prompt"]),
-        "last_prompt": _redact(scan["last_prompt"]),
-        "summary": _redact(scan["summary"]),
+        "first_prompt": scan["first_prompt"],
+        "last_prompt": scan["last_prompt"],
+        "summary": scan["summary"],
         "agent_name": scan["agent_name"],
         "first_ts": scan["first_ts"],
         "last_ts": scan["last_ts"],

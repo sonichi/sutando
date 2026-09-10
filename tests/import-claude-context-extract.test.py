@@ -142,6 +142,7 @@ class TestCleaningAndRedaction(Base):
         self.assertIn("carefully.", text)
         raw = (self.root / SLUG / f"{S1}.jsonl").read_text()
         self.assertIn(GHP, raw)  # the source was not touched
+        self.assertIs(self.m.redact, self.m._common.redact_text)   # one policy, shared with index.py
 
     def test_chunks_split_only_at_turn_lines(self):
         self.m.extract(self.root, out_dir=self.out, session=S1[:8], max_chunk_chars=4000)

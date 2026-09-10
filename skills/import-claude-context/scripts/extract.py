@@ -6,7 +6,8 @@ session-recap's extract.py (`dump --root <slug dir> --session <uuid>
 --filter dialog --max-chars 0`: user + assistant text only — tool I/O,
 attachments and thinking never enter), harness noise is stripped with
 context_resume's NOISE_BLOCK_RE / NOISE_LINE_RE, secrets are redacted with
-secret_scanner.scan_and_redact, and the result is written as <=120k-char
+_common.redact_text (secret_scanner plus the importer's own key shapes — the
+one policy index.py applies to its metadata too), and the result is written as <=120k-char
 chunks split only at `[ts] USER:` / `[ts] ASSISTANT:` turn boundaries to
 `<out-dir>/dumps/<slug>/<uuid>.<n>.txt` — 0600 files in 0700 dirs.
 
@@ -48,12 +49,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common  # noqa: E402
 from _common import (  # noqa: E402
-    DUMPS_DIR, INDEX_FILE, REPO, matches_project, now_iso, session_key, split_csv,
+    DUMPS_DIR, INDEX_FILE, REPO, matches_project, now_iso, redact_text, session_key, split_csv,
     write_status,
 )
 import index as index_mod
 from context_resume import NOISE_BLOCK_RE, NOISE_LINE_RE
-from secret_scanner import scan_and_redact
 from util_paths import write_private_text
 
 DEFAULT_MAX_TOTAL = 8_000_000
@@ -65,22 +65,8 @@ TRUNCATED_MARK = " […turn truncated to fit one chunk]"
 TURN_HEADER_RE = re.compile(r"^(\[[^\]\n]*\] (?:USER|ASSISTANT): )(.*)$")
 RECAP_EXTRACT = REPO / "skills" / "session-recap" / "scripts" / "extract.py"
 
-# Key shapes detect-secrets has no plugin for (so secret_scanner leaves them in
-# place); applied after scan_and_redact with the same placeholder format.
-_EXTRA_SECRET_PATTERNS = {
-    "Google API Key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
-    "Anthropic API Key": re.compile(r"sk-ant-[0-9A-Za-z_-]{20,}"),
-}
-
-
-def redact(text: str) -> tuple:
-    """(redaction count, redacted text) — secret_scanner first, local shapes after."""
-    hits, out = scan_and_redact(text)
-    n = len(hits)
-    for name, pat in _EXTRA_SECRET_PATTERNS.items():
-        out, k = pat.subn(f"[STORED-IN-KEYCHAIN-{name}]", out)
-        n += k
-    return n, out
+# The importer's one redaction policy lives in _common; index.py applies the same object.
+redact = redact_text
 
 
 def load_recap_extract():

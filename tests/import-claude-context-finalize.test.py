@@ -5,8 +5,11 @@ Pins: memory file <= 2,000 bytes with one line per project; the MEMORY.md row
 written only when memory-index-budget.py exits 0 (subprocess patched) and
 skipped on exit 1 with the file kept; notes layout (frontmatter + header
 line) and the dated `## Update` section on a changed roll-up; People payload
-cap (25) / shape / >=2-citation floor; --forget removes exactly one project;
---purge-dumps; the vanilla-home memory-dir refusal.
+cap (25) / shape / >=2-citation floor; --forget removes exactly one project
+(its approved snapshot too), takes only a known slug or a unique part of one —
+never a path, a symlink or an unknown value — and shrinks the approved People
+export (`people.json`) to the citations still approved; --purge-dumps; the
+vanilla-home memory-dir refusal.
 
 Run: python3 tests/import-claude-context-finalize.test.py
 """
@@ -294,6 +297,9 @@ class TestForgetAndPurge(Base):
         self.assertIn("[Beta]", overview)
         self.assertEqual((r["note"], r["rollup"], r["summaries"], r["state_sessions"]), (1, 1, 3, 2))
         self.assertEqual(r["entities_dropped"], 2)   # "Only Alpha" and the Alpha-only company
+        self.assertEqual(r["approved"], 1)
+        self.assertFalse((self.data / "approved" / f"{SLUG_A}.json").exists())
+        self.assertTrue((self.data / "approved" / f"{SLUG_B}.json").is_file())
 
         # forgetting the last project retires the memory file and the row
         with patch.object(self.m.subprocess, "run", side_effect=_ok):
@@ -323,6 +329,157 @@ class TestForgetAndPurge(Base):
         self.assertEqual(doc["note"], 1)
         self.assertEqual(doc["purged_files"], 1)   # SLUG_B's dump went with --forget; one left
         self.assertFalse((self.data / "dumps").exists())
+
+
+def _tree(root: Path) -> list:
+    """Every file under `root` with its size — the 'nothing was deleted' witness."""
+    return sorted((str(p.relative_to(root)), p.lstat().st_size) for p in root.rglob("*") if not p.is_dir())
+
+
+class TestForgetGuard(Base):
+    """PR #4127 review: `--forget ../outside` deleted notes/outside.md and the
+    rmtree joins allowed the same. The selector is now a known slug (or a unique
+    part of one) and every target must resolve inside the import's own dirs."""
+
+    def _forget(self, token):
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.m.forget(data_dir=self.data, ws=self.ws, memory_dir=self.mem, slug=token)
+        code = cm.exception.code
+        self.assertTrue(code and isinstance(code, str))      # a message: the process exits 1
+        return code
+
+    def test_path_shaped_unknown_and_ambiguous_values_delete_nothing(self):
+        self._finalize()
+        (self.ws / "notes" / "outside.md").write_text("mine")
+        (self.tmp / "abs.md").write_text("mine")
+        before = _tree(self.tmp)
+        for token in ("../outside", "/abs", "a/b", "..", "", "   ", "~", "~/x", "a\\b", None, 7):
+            self.assertIn("never a path", self._forget(token), repr(token))
+        self.assertIn("no project matches 'zzz'", self._forget("zzz"))
+        self.assertIn("matches 2 projects", self._forget("Projects"))
+        for msg in (self._forget("../outside"), self._forget("zzz"), self._forget("Projects")):
+            self.assertIn("nothing was deleted", msg)
+        self.assertEqual(_tree(self.tmp), before)
+        self.assertTrue((self.ws / "notes" / "outside.md").is_file())
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["projects"].keys(), {SLUG_A, SLUG_B})
+
+    def test_cli_exit_is_nonzero_and_names_the_rule(self):
+        self._finalize()
+        (self.ws / "notes" / "outside.md").write_text("mine")
+        before = _tree(self.tmp)
+        err = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--forget", "../outside", "--json"])
+        self.assertIn("--forget takes a project slug", str(cm.exception.code))
+        self.assertEqual(_tree(self.tmp), before)
+
+    def test_symlinked_note_pointing_outside_is_refused_before_any_deletion(self):
+        self._finalize()
+        secret = self.tmp / "elsewhere" / "secret.md"
+        secret.parent.mkdir()
+        secret.write_text("keep")
+        note = self.ws / "notes" / "claude-import" / f"{SLUG_A}.md"
+        note.unlink()
+        note.symlink_to(secret)
+        before = _tree(self.tmp)
+        msg = self._forget(SLUG_A)
+        self.assertIn("symlink", msg)
+        self.assertIn("nothing was deleted", msg)
+        self.assertEqual(_tree(self.tmp), before)
+        self.assertEqual(secret.read_text(), "keep")
+        self.assertTrue(note.is_symlink())
+        self.assertTrue((self.data / "summaries" / SLUG_A / f"{U1}.json").is_file())
+        self.assertTrue((self.data / "projects" / f"{SLUG_A}.json").is_file())
+        # the roll-up file as a symlink is refused the same way; a cross-drive compare cannot prove "inside"
+        note.unlink()
+        note.write_text("back")
+        rollup = self.data / "projects" / f"{SLUG_A}.json"
+        rollup.rename(self.tmp / "elsewhere" / "rollup.json")
+        rollup.symlink_to(self.tmp / "elsewhere" / "rollup.json")
+        self.assertIn("symlink", self._forget(SLUG_A))
+        rollup.unlink()
+        (self.tmp / "elsewhere" / "rollup.json").rename(rollup)
+        with patch.object(self.m.os.path, "commonpath", side_effect=ValueError("drives")):
+            self.assertIn("outside", self._forget(SLUG_A))
+        self.assertTrue(rollup.is_file())
+
+    def test_a_unique_part_of_a_slug_forgets_exactly_that_project(self):
+        self._finalize()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok):
+            r = self.m.forget(data_dir=self.data, ws=self.ws, memory_dir=self.mem, slug="alpha")
+        self.assertEqual((r["note"], r["rollup"], r["approved"], r["summaries"]), (1, 1, 1, 3))
+        self.assertFalse((self.ws / "notes" / "claude-import" / f"{SLUG_A}.md").exists())
+        self.assertTrue((self.ws / "notes" / "claude-import" / f"{SLUG_B}.md").is_file())
+        self.assertTrue((self.data / "projects" / f"{SLUG_B}.json").is_file())
+        # the slug is known from the index alone (nothing staged or landed), or from the artefacts alone
+        self.assertEqual(self.m.known_slugs(self.data), [SLUG_A, SLUG_B])    # the index row stays until re-indexed
+        (self.data / "index.json").unlink()
+        (self.data / "state.json").unlink()
+        self.assertEqual(self.m.known_slugs(self.data), [SLUG_B])
+        for token in ("-Users-o-Projects-beta", "beta", "BETA"):
+            self.assertEqual(self.m.resolve_forget_slug(self.data, token), SLUG_B)
+        self.assertTrue(self.m.canonical_slug("-Users-o-Projects-gtm"))
+        self.assertFalse(self.m.canonical_slug("."))
+
+
+class TestPeopleExportRevocation(Base):
+    """PR #4127 review: after a commit, people.json (the approved export) was
+    byte-identical after `--forget A` and still cited A. Now every forget/hold
+    shrinks it to the citations still approved; it grows only with a commit."""
+
+    def setUp(self):
+        super().setUp()
+        p = self.data / "entities.json"
+        ents = json.loads(p.read_text())
+        ents["people"].append({"name": "Beta Twice", "relationship": "advisor",
+                               "citations": [_cite(SLUG_B, U3, "one"), _cite(SLUG_B, U3, "two")]})
+        p.write_text(json.dumps(ents))
+
+    def _export(self):
+        path = self.data / "people.json"
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def test_forget_drops_the_projects_citations_and_the_people_under_the_floor(self):
+        self._finalize()
+        names = [p["name"] for p in self._export()]
+        self.assertEqual(len(names), 25)
+        for name in ("Ada Lovelace", "Only Alpha", "Beta Twice"):
+            self.assertIn(name, names)
+        inputs = json.loads((self.data / "approved" / "people-inputs.json").read_text())
+        self.assertEqual((inputs["projects"], inputs["known_people"]), ([SLUG_A, SLUG_B], None))
+        self.assertEqual(oct(os.stat(self.data / "approved" / "people-inputs.json").st_mode & 0o777), "0o600")
+        with patch.object(self.m.subprocess, "run", side_effect=_ok):
+            r = self.m.forget(data_dir=self.data, ws=self.ws, memory_dir=self.mem, slug=SLUG_A)
+        self.assertEqual(r["people_revoked"], 24)
+        export = self._export()
+        self.assertEqual([p["name"] for p in export], ["Beta Twice"])        # Ada and the "Person NN"s fell to one citation
+        text = json.dumps(export)
+        for leak in (SLUG_A, U1[:8], U2[:8], "Only Alpha"):
+            self.assertNotIn(leak, text)
+        self.assertIn('"one" — Claude Code session b3b3b3b3', export[0]["doc"])
+        inputs = json.loads((self.data / "approved" / "people-inputs.json").read_text())
+        self.assertEqual(inputs["projects"], [SLUG_B])
+        self.assertNotIn(SLUG_A, json.dumps(inputs))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--people-json"])
+        self.assertEqual(json.loads(buf.getvalue()), export)                # the approved copy is the revoked one
+        # the last project goes: no export is left at all
+        with patch.object(self.m.subprocess, "run", side_effect=_ok):
+            r2 = self.m.forget(data_dir=self.data, ws=self.ws, memory_dir=self.mem, slug=SLUG_B)
+        self.assertEqual(r2["people_revoked"], 1)
+        self.assertIsNone(self._export())
+        self.assertFalse((self.data / "approved" / "people-inputs.json").exists())
+        self.assertEqual(self.m.refresh_people_export(self.data), 0)
+
+    def test_an_export_without_its_inputs_is_retired_not_recomputed(self):
+        self._finalize()
+        (self.data / "approved" / "people-inputs.json").unlink()
+        self.assertEqual(self.m.refresh_people_export(self.data), 25)
+        self.assertIsNone(self._export())
+        self.assertEqual(self.m._entity_lists("junk"), {k: [] for k in self.m.ENTITY_LISTS})
 
 
 class TestMemoryDirGuard(Base):

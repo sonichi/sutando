@@ -11,7 +11,11 @@ the other staged (people restricted to what landed); --discard --projects drops
 one; a stale staged set, an empty one and an ambiguous selector are refused;
 --forget re-renders a pending review; the deterministic people/company merge
 (shared email, first name -> its unique full name, never two multi-token
-names, companies by name) and its `people_merged` count in the JSON.
+names, companies by name) and its `people_merged` count in the JSON; the
+memory file and overview are rebuilt from the approved snapshots
+(`approved/<slug>.json`) — a landed roll-up that changed on disk is named
+"changed since approval" in the digest and never refreshed by another
+project's commit.
 
 Run: python3 tests/import-claude-context-stage.test.py
 """
@@ -735,6 +739,22 @@ class TestKnownPeople(Base):
         self.assertIsNone(payloads[0]["existing"])
         self.assertIn("doc", payloads[0])
 
+    def test_forget_keeps_the_store_match_in_the_revoked_export(self):
+        self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        self._run("--commit")
+        inputs = json.loads((self.data / "approved" / "people-inputs.json").read_text())
+        self.assertEqual(inputs["known_people"], [KNOWN_ADA])
+        rc, r, _ = self._run("--forget", "beta")
+        self.assertEqual(r["people_revoked"], 24)                              # the "Person NN"s: one citation left
+        export = json.loads((self.data / "people.json").read_text())
+        self.assertEqual([p["name"] for p in export], ["Ada Lovelace", "Only Alpha"])
+        ada = export[0]
+        self.assertEqual((ada["existing"]["id"], ada["existing"]["matched_on"], ada["slug"]), ("k1", "email", "ada-lovelace"))
+        self.assertNotIn("doc", ada)                                           # still an UPDATE, never a fresh dossier
+        self.assertNotIn(U3[:8], ada["doc_append"])
+        self.assertIn(U1[:8], ada["doc_append"])
+        self.assertEqual(ada["identifiers"], {"emails": ["Ada@Example.com", "ada.l@other.example"]})
+
     def test_people_doc_merge_cli_is_idempotent(self):
         existing = self.tmp / "existing.md"
         existing.write_text("# Ada Lovelace\n\n## Contact\n- Email: ada@example.com\n\n"
@@ -752,6 +772,90 @@ class TestKnownPeople(Base):
         self.assertEqual(again, out)
         self.assertIn("needs --existing-doc", self._refused("--people-doc-merge", "--append", str(append)))
         self.assertIn("cannot read --known-people", self._refused("--stage", "--known-people", str(self.tmp / "nope.json")))
+
+
+UNREVIEWED = "Unreviewed"     # every string a changed-but-not-approved roll-up carries starts with this
+
+
+class TestApprovedSnapshots(Base):
+    """PR #4127 review: committing B rebuilt the memory file and overview from
+    A's CURRENT roll-up, so a re-run of A's roll-up that nobody reviewed landed
+    in shared memory. Both are now rebuilt from the approved snapshots."""
+
+    def _rewrite_alpha_unreviewed(self):
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc.update({"what_it_is": f"{UNREVIEWED} widget text", "top_open_thread": f"{UNREVIEWED} thread",
+                    "summary": f"{UNREVIEWED} summary", "note_markdown": f"{UNREVIEWED} body"})
+        p.write_text(json.dumps(doc))
+        return doc
+
+    def _snapshot(self, slug):
+        return json.loads((self.data / "approved" / f"{slug}.json").read_text())
+
+    def test_committing_beta_never_refreshes_alpha_from_an_unreviewed_rollup(self):
+        self._run("--stage", "--projects", "alpha")
+        rc, c, _ = self._run("--commit")
+        snap = self._snapshot(SLUG_A)
+        self.assertEqual(snap["rollup"]["what_it_is"], "A widget builder")
+        self.assertEqual(snap["rollup_hash"], self.m.rollup_hash(json.loads((self.data / "projects" / f"{SLUG_A}.json").read_text())))
+        self.assertEqual(stat.S_IMODE((self.data / "approved").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.data / "approved" / f"{SLUG_A}.json").stat().st_mode), 0o600)
+        self.assertEqual(c["changed_since_approval"], 0)
+        # the coordinator re-runs Alpha's roll-up; nobody has reviewed the new text
+        self._rewrite_alpha_unreviewed()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((rc, c["changed_since_approval"], c["projects"]), (0, 1, 1))
+        self.assertEqual(self._manifest()["changed_since_approval"], [SLUG_A])
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn(UNREVIEWED, review)
+        self.assertIn(f"Changed since approval (1) — kept in memory and the overview as you approved them:\n"
+                      f"- Alpha (`{SLUG_A}`) — changed since approval — bring in {SLUG_A} to refresh\n", review)
+        self.assertIn("covering 2 projects", review)
+        for rel in ("memory/claude_import.md", "notes/claude-import/overview.md"):
+            text = (self.staged / rel).read_text()
+            self.assertNotIn(UNREVIEWED, text, rel)
+            self.assertIn("A widget builder", text, rel)                       # the approved text, previewed
+        rc, c, _ = self._run("--commit")                                       # "bring it in" for Beta
+        self.assertEqual((c["committed"], c["projects"]), (1, 2))
+        mem = (self.mem / "claude_import.md").read_text()
+        overview = (self.ndir / "overview.md").read_text()
+        for text in (mem, overview, (self.ndir / f"{SLUG_A}.md").read_text()):
+            self.assertNotIn(UNREVIEWED, text)
+        self.assertIn("- Alpha — A widget builder; active; open: ship the widget", mem)
+        self.assertIn("- Beta — A launch plan; paused", mem)
+        self.assertIn(f"- [Alpha]({SLUG_A}.md) — A widget builder · active", overview)
+        self.assertEqual(self._snapshot(SLUG_A)["rollup"]["what_it_is"], "A widget builder")
+        # only "bring in alpha" refreshes it: the digest then shows the new text as an update to review
+        rc, c, _ = self._run("--stage", "--projects", "alpha")
+        self.assertEqual(c["changed_since_approval"], 0)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn(f"{UNREVIEWED} summary", review)
+        self.assertIn("note: update to the existing note", review)
+        self.assertNotIn("changed since approval", review)
+        rc, c, _ = self._run("--commit", "--projects", "alpha")
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertIn(f"- Alpha — {UNREVIEWED} widget text; active; open: {UNREVIEWED} thread", mem)
+        self.assertIn(f"{UNREVIEWED} widget text", (self.ndir / "overview.md").read_text())
+        self.assertIn(f"## Update {self.m.today()}\n\n{UNREVIEWED} body", (self.ndir / f"{SLUG_A}.md").read_text())
+        self.assertEqual(self._snapshot(SLUG_A)["rollup"]["what_it_is"], f"{UNREVIEWED} widget text")
+
+    def test_a_landed_project_without_a_readable_snapshot_is_never_rebuilt_from_disk(self):
+        self._run()
+        self._run("--commit")
+        (self.data / "approved" / f"{SLUG_A}.json").write_text("[]")          # not a snapshot any more
+        self._rewrite_alpha_unreviewed()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((c["changed_since_approval"], self._manifest()["changed_since_approval"]), (1, [SLUG_A]))
+        self.assertIn(f"bring in {SLUG_A} to refresh", (self.staged / "review.md").read_text())
+        self.assertIn("covering 1 projects", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertNotIn(UNREVIEWED, mem)
+        self.assertNotIn("- Alpha", mem)
+        self.assertNotIn(UNREVIEWED, (self.ndir / "overview.md").read_text())
+        self.assertEqual(self.m.approved_rollups(self.data, {"projects": {SLUG_A: {}, SLUG_B: {}}}).keys(), {SLUG_B})
+        self.assertEqual(self.m.changed_since_approval(self.data, {}, {"projects": {SLUG_A: {}}}), [])
 
 
 class HeldBase(Base):
@@ -875,7 +979,8 @@ class TestHeld(HeldBase):
         self._run()
         rc, r, _ = self._run("--hold", "2026-08-05")                        # U2, listed in Alpha's roll-up
         self.assertEqual(rc, 0)
-        self.assertEqual(r, {"held": 1, "held_total": 1, "stale_rollups": 1, "staged_remaining": 2})
+        self.assertEqual(r, {"held": 1, "held_total": 1, "stale_rollups": 1, "staged_remaining": 2,
+                             "people_revoked": 0})
         self.assertEqual(json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U2}"],
                          {"personal_override": "hold"})
         review = (self.staged / "review.md").read_text()
@@ -924,7 +1029,11 @@ class TestHeld(HeldBase):
         rc, r, _ = self._run("--forget-session", "2026-08-05")
         self.assertEqual(rc, 0)
         self.assertEqual(r, {"summaries": 2, "dumps": 1, "state_entry": 1, "landed": False,
+                             "entity_citations": 2, "entities_dropped": 0, "people_revoked": 0,
                              "stale_rollups": 1, "staged_remaining": 2})
+        ents = json.loads((self.data / "entities.json").read_text())
+        self.assertNotIn(U2, json.dumps(ents))                        # its citations went with it
+        self.assertEqual(len(next(p for p in ents["people"] if p["name"] == "Only Alpha")["citations"]), 1)
         self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.json").exists())
         self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.1.json").exists())      # the partial too
         self.assertTrue((self.data / "summaries" / SLUG_A / f"{U1}.json").exists())
@@ -936,6 +1045,7 @@ class TestHeld(HeldBase):
         self.assertIn("stale roll-up", self._refused("--commit"))
         rc, r, _ = self._run("--forget-session", U2)                  # again: nothing left, nothing refused
         self.assertEqual((r["summaries"], r["dumps"], r["state_entry"], r["stale_rollups"]), (0, 0, 0, 1))
+        self.assertEqual((r["entity_citations"], r["entities_dropped"]), (0, 0))
         # a session that already landed can be forgotten too; the note stays
         p = self.data / "projects" / f"{SLUG_A}.json"
         doc = json.loads(p.read_text())
@@ -943,9 +1053,15 @@ class TestHeld(HeldBase):
         p.write_text(json.dumps(doc))
         self._run()
         self._run("--commit")
+        self.assertEqual(len(json.loads((self.data / "people.json").read_text())), 25)
         rc, r, _ = self._run("--forget-session", U1)
         self.assertEqual((r["landed"], r["summaries"], r["staged_remaining"]), (True, 1, 0))
         self.assertTrue((self.ndir / f"{SLUG_A}.md").is_file())
+        # the approved People export loses the session's citations: everyone left had one
+        self.assertEqual((r["people_revoked"], r["entities_dropped"]), (25, 2))
+        self.assertEqual(json.loads((self.data / "people.json").read_text()), [])
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, [])
 
     def test_human_output_for_the_session_commands(self):
         self._mark_personal(SLUG_B, U3)

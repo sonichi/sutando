@@ -106,6 +106,23 @@ lands it. A roll-up written with a held session in it, or without an included
 one, is STALE: staged with a placeholder body, refused by --commit until the
 coordinator re-runs that project's roll-up.
 
+The memory file and the overview are single files over every landed project,
+so they are rebuilt from APPROVED SNAPSHOTS — <data-dir>/approved/<slug>.json,
+written by --commit for each project it lands — never from projects/<slug>.json,
+which the coordinator may rewrite between two commits (committing B used to land
+A's unreviewed re-run: PR #4127 review). A landed project whose roll-up changed
+since its approval is named in review.md as "changed since approval — bring in
+<slug> to refresh" and keeps its approved text until it is brought in again.
+The approved People export (<data-dir>/people.json) is written with the inputs
+it came from (approved/people-inputs.json); --forget, --forget-session and
+--hold shrink it to the citations still approved, and only a commit grows it.
+
+`--forget` takes a known slug (or a unique part of one) — never a path: `../x`,
+`/abs`, `a/b`, `..`, `~`, an empty or an unknown value is refused — and every
+path it would delete must resolve inside notes/claude-import/, data/claude-import/
+or the memory dir (symlinks followed, and never a symlink itself), or nothing
+is deleted.
+
 The memory dir is util_paths.memory_dir() (the core's relocated tree); a memory
 dir under the stock Claude home is refused unless passed explicitly — the import
 never writes into Claude Code's own home. `--stage` only resolves it (so a bad
@@ -127,7 +144,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common  # noqa: E402
 from _common import (  # noqa: E402
-    DUMPS_DIR, ENTITIES_FILE, INDEX_FILE, PROJECTS_DIR, REPO, SUMMARIES_DIR,
+    DUMPS_DIR, ENTITIES_FILE, INDEX_FILE, INDEX_MD, PROJECTS_DIR, REPO, SUMMARIES_DIR,
     ensure_private_dir, now_iso, session_key, split_csv, today, write_status,
 )
 from util_paths import claude_home_path, memory_dir as core_memory_dir  # noqa: E402
@@ -150,6 +167,9 @@ STAGED_REVIEW = "review.md"
 STAGED_MANIFEST = "manifest.json"
 STAGED_KNOWN_PEOPLE = "known-people.json"     # the store listing as it was at staging
 APPROVED_PEOPLE = "people.json"               # <data-dir>/people.json: the last commit's payloads
+APPROVED_DIR = "approved"
+APPROVED_PEOPLE_INPUTS = "people-inputs.json"
+CHANGED_SINCE_APPROVAL = "changed since approval"
 IMPORT_SECTION_HEADING = "## Imported from Claude Code"
 PERSONAL_OVERRIDE = "personal_override"       # state.json per session: "include" | "hold"
 HELD_REASON_WORDS = 6
@@ -232,12 +252,17 @@ def load_rollups(data_dir: Path) -> dict:
     return out
 
 
-def load_entities(data_dir: Path) -> dict:
-    doc = _common.load_json(data_dir / ENTITIES_FILE, {}) or {}
+def _entity_lists(doc) -> dict:
+    """An entities document with every list present (junk shapes emptied)."""
+    doc = dict(doc) if isinstance(doc, dict) else {}
     for k in ENTITY_LISTS:
         v = doc.get(k)
         doc[k] = v if isinstance(v, list) else []
     return doc
+
+
+def load_entities(data_dir: Path) -> dict:
+    return _entity_lists(_common.load_json(data_dir / ENTITIES_FILE, {}))
 
 
 def load_inputs(data_dir: Path) -> tuple:
@@ -274,9 +299,58 @@ def inputs_fingerprint(data_dir: Path) -> str:
     return h.hexdigest()
 
 
-def committed_rollups(rollups: dict, state: dict) -> dict:
-    """The roll-ups whose note has landed in the sinks (state.projects records each commit)."""
-    return {s: r for s, r in rollups.items() if s in state["projects"]}
+def rollup_hash(rollup: dict) -> str:
+    return hashlib.sha256(_common.dump_json(rollup).encode("utf-8")).hexdigest()[:16]
+
+
+def approved_dir(data_dir: Path) -> Path:
+    return data_dir / APPROVED_DIR
+
+
+def approved_path(data_dir: Path, slug: str) -> Path:
+    return approved_dir(data_dir) / f"{slug}.json"
+
+
+def save_approved(data_dir: Path, slug: str, rollup: dict) -> str:
+    """Snapshot a roll-up exactly as the owner approved it (what --commit lands).
+    The shared memory file and overview are rebuilt from these snapshots, never
+    from projects/<slug>.json, which the coordinator may rewrite unreviewed."""
+    ensure_private_dir(approved_dir(data_dir))
+    h = rollup_hash(rollup)
+    _common.write_json(approved_path(data_dir, slug),
+                       {"slug": slug, "approved_at": now_iso(), "rollup_hash": h, "rollup": rollup}, private=True)
+    return h
+
+
+def load_approved(data_dir: Path) -> dict:
+    """{slug: snapshot document} for every readable approved roll-up on disk."""
+    out = {}
+    base = approved_dir(data_dir)
+    if not base.is_dir():
+        return out
+    for f in sorted(base.glob("*.json")):
+        if f.name == APPROVED_PEOPLE_INPUTS:
+            continue
+        doc = _common.load_json(f, None)
+        if isinstance(doc, dict) and isinstance(doc.get("rollup"), dict):
+            out[f.stem] = doc
+    return out
+
+
+def approved_rollups(data_dir: Path, state: dict) -> dict:
+    """The roll-ups whose note has landed (state.projects records each commit),
+    each as the owner approved it — the snapshot, not the file under projects/."""
+    snaps = load_approved(data_dir)
+    return {s: snaps[s]["rollup"] for s in state["projects"] if s in snaps}
+
+
+def changed_since_approval(data_dir: Path, rollups: dict, state: dict) -> list:
+    """The landed projects whose roll-up on disk is not the approved one any
+    more (or that have no readable snapshot): the shared files keep the
+    approved text until the owner brings the project in again."""
+    snaps = load_approved(data_dir)
+    return sorted(s for s in state["projects"] if s in rollups
+                  and (snaps.get(s) or {}).get("rollup_hash") != rollup_hash(rollups[s]))
 
 
 def session_meta(index_doc: dict, slug: str, uuid: str) -> dict:
@@ -415,7 +489,7 @@ def header_line(index_doc: dict, slugs, run_kind: str) -> str:
     return f"*[imported, claude-code] — import-claude-context | {first} → {last} | {run_kind}*"
 
 
-def resolve_selectors(available, selectors, what: str) -> list:
+def resolve_selectors(available, selectors, what: str, where: str = "staged/review.md") -> list:
     """`--projects` for the gate: each selector is an exact slug or a unique
     case-insensitive part of one. No match or an ambiguous one refuses — a
     commit never covers more than the owner named. No selectors = everything."""
@@ -427,10 +501,10 @@ def resolve_selectors(available, selectors, what: str) -> list:
         hits = [sel] if sel in available else [s for s in available if sel.lower() in s.lower()]
         if not hits:
             raise SystemExit(f"import-claude-context: no {what} matches {sel!r} "
-                             f"({len(available)} available; the slugs are in staged/review.md)")
+                             f"({len(available)} available; the slugs are in {where})")
         if len(hits) > 1:
             raise SystemExit(f"import-claude-context: {sel!r} matches {len(hits)} {what}s; "
-                             f"name one exactly (the slugs are in staged/review.md)")
+                             f"name one exactly (the slugs are in {where})")
         if hits[0] not in chosen:
             chosen.append(hits[0])
     return chosen
@@ -1104,6 +1178,49 @@ def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
     return payloads
 
 
+def save_people_export(data_dir: Path, people: list, entities: dict, projects, known) -> None:
+    """people.json (the approved payloads) plus the inputs they came from — the
+    entities cut to the approved projects' citations and the store listing — so
+    a later forget/hold can shrink the export without a second review."""
+    _common.write_json(data_dir / APPROVED_PEOPLE, people, private=True)
+    ensure_private_dir(approved_dir(data_dir))
+    cut = strip_citations(entities, lambda c: _citation_project(c) not in projects)[0]
+    _common.write_json(approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS,
+                       {"projects": sorted(projects), "known_people": known, "entities": cut}, private=True)
+
+
+def refresh_people_export(data_dir: Path) -> int:
+    """After --forget / --forget-session / --hold: the approved People export
+    keeps only the citations still approved — a landed project, a summary still
+    on disk, not held — and loses the people that fall under the floor. It only
+    ever shrinks (a re-grown export needs a commit); an export whose inputs are
+    gone is retired. Returns how many payloads went; 0 when nothing was exported."""
+    path = data_dir / APPROVED_PEOPLE
+    if not path.is_file():
+        return 0
+    before = len(_common.load_json(path, []) or [])
+    src = approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS
+    doc = _common.load_json(src, None)
+    index_doc, all_summaries, _r, _e, state = load_inputs(data_dir)
+    approved = set(approved_rollups(data_dir, state))
+    if not isinstance(doc, dict) or not approved:
+        path.unlink()
+        if src.is_file():
+            src.unlink()
+        return before
+    held = held_sessions(all_summaries, state)
+
+    def gone(c):
+        key = (_citation_project(c), _citation_session(c))
+        return key[0] not in approved or key in held or key not in all_summaries
+
+    entities = strip_citations(_entity_lists(doc.get("entities")), gone)[0]
+    known = doc.get("known_people")
+    people = people_payloads(entities, index_doc, projects=approved, known=load_known_people(known))
+    save_people_export(data_dir, people, entities, approved, known)
+    return before - len(people)
+
+
 # ------------------------------------------------------------------------ review
 
 def _dedupe_lines(lines) -> list:
@@ -1213,6 +1330,18 @@ def _people_section(candidates, ambiguous, below_floor: int, merged, known_check
     return text
 
 
+def _changed_section(changed, approved: dict, index_doc: dict) -> str:
+    """The landed projects whose roll-up changed since the owner approved it:
+    named (by their approved name) with the reply that refreshes them."""
+    if not changed:
+        return ""
+    text = f"Changed since approval ({len(changed)}) — kept in memory and the overview as you approved them:\n"
+    for slug in changed:
+        name = display_name(slug, approved.get(slug) or {}, index_doc)
+        text += f"- {name} (`{slug}`) — {CHANGED_SINCE_APPROVAL} — bring in {slug} to refresh\n"
+    return text + "\n"
+
+
 def _held_section(held_rows) -> str:
     """The held sessions by date and reason only — never a title, never a quote."""
     rows = list(held_rows or [])
@@ -1232,7 +1361,7 @@ def _held_section(held_rows) -> str:
 def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, candidates, below_floor: int,
                   outcomes: dict, memory_bytes: int, n_memory_projects: int, n_sessions: int,
                   run_kind: str, merged=None, state=None, held=None, held_rows=None, stale=None,
-                  known_checked: bool = False, ambiguous=None) -> str:
+                  known_checked: bool = False, ambiguous=None, changed=None, approved=None) -> str:
     """The digest the owner reads before anything lands — the one place
     transcript-derived text is shown to them."""
     first, last = date_range(index_doc, slugs)
@@ -1260,6 +1389,7 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
     text += (f"\n## Memory\n\n{memory_bytes:,} B summary (cap {MEMORY_LIMIT:,} B) covering "
              f"{n_memory_projects} projects for the agent's core memory, plus one MEMORY.md row "
              f"if the index budget allows.\n\n")
+    text += _changed_section(changed, approved or {}, index_doc)
     text += _held_section(held_rows)
     text += f"\n---\n{REVIEW_FOOTER}\n"
     return text
@@ -1304,8 +1434,8 @@ def prepare_inputs(data_dir: Path) -> dict:
     entities, merged = merge_entities(drop_held_citations(entities, held))
     return {"index": index_doc, "all_summaries": all_summaries,
             "summaries": {k: v for k, v in all_summaries.items() if k not in held},
-            "rollups": apply_stale(rollups, stale), "entities": entities, "merged": merged,
-            "state": state, "held": held, "stale": stale}
+            "rollups": apply_stale(rollups, stale), "raw_rollups": rollups, "entities": entities,
+            "merged": merged, "state": state, "held": held, "stale": stale}
 
 
 def _ambiguous_rows(triples) -> list:
@@ -1351,10 +1481,12 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
         (sndir / f"{slug}.md").write_text(
             render_note(slug, rollups[slug], index_doc, summaries, run_kind, held), encoding="utf-8")
 
-    # The memory file and the overview are single files over every landed
-    # project: preview them as they will read once the pending set is in too.
-    preview = committed_rollups(rollups, state)
+    # The memory file and the overview are single files over every landed project: preview them from
+    # the approved snapshots plus the pending set; a landed roll-up that changed since its approval is named, not refreshed.
+    approved = approved_rollups(data_dir, state)
+    preview = {s: r for s, r in approved.items() if s not in slugs}
     preview.update({s: rollups[s] for s in slugs})
+    changed = [s for s in changed_since_approval(data_dir, inp["raw_rollups"], state) if s not in slugs]
     n_preview = session_total(index_doc, summaries, preview, rollups, state, held)
     (sndir / OVERVIEW).write_text(render_overview(preview, index_doc, n_preview, run_kind, state, held),
                                   encoding="utf-8")
@@ -1375,7 +1507,7 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
                       memory_bytes=len(memory_text.encode("utf-8")), n_memory_projects=len(preview),
                       n_sessions=n_sessions, run_kind=run_kind, merged=merged, state=state,
                       held=held, held_rows=rows, stale=stale_here, known_checked=known is not None,
-                      ambiguous=amb_rows),
+                      ambiguous=amb_rows, changed=changed, approved=approved),
         encoding="utf-8")
     tally = {k: sum(1 for v in outcomes.values() if v == k) for k in ("created", "updated", "unchanged")}
     n_existing = sum(1 for p in people if p.get("existing"))
@@ -1385,13 +1517,15 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
         "people_new": len(people) - n_existing, "people_ambiguous": len(amb_rows),
         "memory_bytes": len(memory_text.encode("utf-8")),
         "notes_created": tally["created"], "notes_updated": tally["updated"],
-        "notes_unchanged": tally["unchanged"], "held": len(rows), "stale_rollups": len(stale_here), **merged,
+        "notes_unchanged": tally["unchanged"], "held": len(rows), "stale_rollups": len(stale_here),
+        "changed_since_approval": len(changed), **merged,
     }
     _common.write_json(sdir / STAGED_MANIFEST, {
         "staged_at": now_iso(), "run_kind": run_kind, "projects": slugs,
         "fingerprint": inputs_fingerprint(data_dir), "counts": counts,
         "known_people": "checked" if known is not None else "not checked",
         "people_ambiguous": amb_rows, "held": rows, "stale_rollups": stale_here,
+        "changed_since_approval": changed,
     })
     write_status(data_dir, "staged", **counts)
     return counts
@@ -1456,6 +1590,7 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
                                     staged_note=staged_note, held=held)] += 1
         if staged_note.is_file():
             staged_note.unlink()
+        save_approved(data_dir, slug, rollups[slug])
         for (s, u) in summaries:          # the held ones are not in here: they never land
             if s != slug:
                 continue
@@ -1464,7 +1599,7 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
             if rec.get("extracted_at") and rec["summarized_at"] < rec["extracted_at"]:
                 rec["summarized_at"] = stamp
 
-    committed = committed_rollups(rollups, state)
+    committed = approved_rollups(data_dir, state)
     n_sessions = session_total(index_doc, summaries, committed, rollups, state, held)
     (ndir / OVERVIEW).write_text(render_overview(committed, index_doc, n_sessions, run_kind, state, held),
                                  encoding="utf-8")
@@ -1474,13 +1609,14 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
     row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(committed)))
     print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
     people = people_payloads(entities, index_doc, projects=set(committed), known=known)
-    _common.write_json(data_dir / APPROVED_PEOPLE, people, private=True)
+    save_people_export(data_dir, people, entities, set(committed), known)
     _common.save_state(data_dir, state)
 
     remaining = _restage_or_clear(data_dir, ws, run_kind, [s for s in pending if s not in chosen])
     counts = {
         "sessions": int(n_sessions), "summarized": sum(1 for (s, _u) in summaries if s in committed),
         "projects": len(committed), "committed": len(chosen), "staged_remaining": len(remaining),
+        "changed_since_approval": len(changed_since_approval(data_dir, inp["raw_rollups"], state)),
         "notes_created": outcomes["created"], "notes_updated": outcomes["updated"],
         "notes_unchanged": outcomes["unchanged"], "people": len(people),
         "people_existing": sum(1 for p in people if p.get("existing")),
@@ -1517,22 +1653,89 @@ def finalize(*, data_dir: Path, ws: Path, memory_dir: Path, run_kind: str = "use
 
 # ------------------------------------------------------------------------ forget
 
+_SLUG_PATH_MARKS = ("/", "\\", "..")
+
+
+def canonical_slug(token) -> bool:
+    """A slug as Claude Code writes one — a single path component: never a
+    separator, `..`, `.`, a `~` or absolute form, or an empty value."""
+    return (isinstance(token, str) and bool(token) and token == token.strip() and token != "."
+            and not any(m in token for m in _SLUG_PATH_MARKS)
+            and not token.startswith("~") and not os.path.isabs(token))
+
+
+def known_slugs(data_dir: Path) -> list:
+    """Every project slug the import knows: the index, state.json (projects and
+    session keys), a pending manifest, and the roll-up / summary / dump /
+    approved artefacts on disk — never anything derived from an argument."""
+    index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
+    state = _common.load_state(data_dir)
+    slugs = set(index_doc.get("projects") or {}) | set(state["projects"])
+    slugs |= {k.rsplit("/", 1)[0] for k in state["sessions"] if "/" in k}
+    slugs |= set(load_manifest(data_dir).get("projects") or [])
+    slugs |= set(load_rollups(data_dir)) | set(load_approved(data_dir))
+    for sub in (SUMMARIES_DIR, DUMPS_DIR):
+        d = data_dir / sub
+        if d.is_dir():
+            slugs |= {p.name for p in d.iterdir() if p.is_dir()}
+    return sorted(s for s in slugs if canonical_slug(s))
+
+
+def resolve_forget_slug(data_dir: Path, token) -> str:
+    """`--forget <slug>`: an exact known slug or a unique part of one, checked
+    before any path is built from it — `../x`, `/abs`, `a/b`, `..`, `~`, an
+    empty or an unknown value is refused and deletes nothing (PR #4127 review:
+    `--forget ../outside` used to delete notes/outside.md)."""
+    token = token.strip() if isinstance(token, str) else ""
+    if not canonical_slug(token):
+        raise SystemExit("import-claude-context: --forget takes a project slug (or a unique part of one), "
+                         "never a path; nothing was deleted")
+    try:
+        return resolve_selectors(known_slugs(data_dir), [token], "project", where=INDEX_MD)[0]
+    except SystemExit as e:
+        raise SystemExit(f"{e.code}; nothing was deleted")
+
+
+def guard_owned(targets, roots) -> None:
+    """Every path --forget deletes or rewrites must resolve (symlinks followed)
+    inside one of the import's own directories and may not itself be a symlink;
+    one escape refuses the whole command before anything is touched."""
+    real_roots = [os.path.realpath(str(r)) for r in roots]
+    for t in targets:
+        real = os.path.realpath(str(t))
+        inside = False
+        for r in real_roots:
+            try:
+                inside = inside or os.path.commonpath([r, real]) == r
+            except ValueError:
+                continue
+        if os.path.islink(str(t)) or not inside:
+            raise SystemExit(f"import-claude-context: refusing --forget: {Path(t).name} is a symlink or resolves "
+                             "outside notes/claude-import, data/claude-import and the memory dir; nothing was deleted")
+
+
 def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: str = "user") -> dict:
-    removed = {"note": 0, "summaries": 0, "dumps": 0, "rollup": 0, "state_sessions": 0,
-               "entity_citations": 0, "entities_dropped": 0, "memory_row_removed": 0, "staged": 0}
-    note = notes_dir(ws) / f"{slug}.md"
+    slug = resolve_forget_slug(data_dir, slug)
+    ndir = notes_dir(ws)
+    note = ndir / f"{slug}.md"
+    summaries_dir, dumps_dir = data_dir / SUMMARIES_DIR / slug, data_dir / DUMPS_DIR / slug
+    rollup, snapshot = data_dir / PROJECTS_DIR / f"{slug}.json", approved_path(data_dir, slug)
+    guard_owned([note, summaries_dir, dumps_dir, rollup, snapshot, ndir / OVERVIEW, memory_dir / MEMORY_FILE],
+                [ndir, data_dir, memory_dir])
+    removed = {"note": 0, "summaries": 0, "dumps": 0, "rollup": 0, "approved": 0, "state_sessions": 0,
+               "entity_citations": 0, "entities_dropped": 0, "people_revoked": 0, "memory_row_removed": 0,
+               "staged": 0}
     if note.is_file():
         note.unlink()
         removed["note"] = 1
-    for sub, key in ((SUMMARIES_DIR, "summaries"), (DUMPS_DIR, "dumps")):
-        d = data_dir / sub / slug
+    for key, d in (("summaries", summaries_dir), ("dumps", dumps_dir)):
         if d.is_dir():
             removed[key] = sum(1 for _ in d.rglob("*") if _.is_file())
             shutil.rmtree(d)
-    rollup = data_dir / PROJECTS_DIR / f"{slug}.json"
-    if rollup.is_file():
-        rollup.unlink()
-        removed["rollup"] = 1
+    for key, f in (("rollup", rollup), ("approved", snapshot)):
+        if f.is_file():
+            f.unlink()
+            removed[key] = 1
 
     state = _common.load_state(data_dir)
     prefix = slug + "/"
@@ -1547,14 +1750,14 @@ def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: s
         entities, n_cites, n_dropped = strip_citations(load_entities(data_dir), lambda c: _citation_project(c) == slug)
         removed["entity_citations"], removed["entities_dropped"] = n_cites, n_dropped
         _common.write_json(entities_path, entities)
+    removed["people_revoked"] = refresh_people_export(data_dir)
 
     index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
     all_summaries = load_summaries(data_dir)
     held = held_sessions(all_summaries, state)
     summaries = {k: v for k, v in all_summaries.items() if k not in held}
-    rollups = committed_rollups(load_rollups(data_dir), state)
+    rollups = approved_rollups(data_dir, state)
     n_sessions = session_total(index_doc, summaries, rollups, rollups, state, held)
-    ndir = notes_dir(ws)
     if rollups:
         if ndir.is_dir():
             (ndir / OVERVIEW).write_text(render_overview(rollups, index_doc, n_sessions, run_kind, state, held),
@@ -1672,12 +1875,14 @@ def hold_session(*, data_dir: Path, ws: Path, token) -> dict:
     rec[PERSONAL_OVERRIDE] = "hold"
     _common.save_state(data_dir, state)
     return {"held": 1, "held_total": len(held) + 1, "stale_rollups": _stale_after(data_dir, [key]),
+            "people_revoked": refresh_people_export(data_dir),
             "staged_remaining": _rerender_pending(data_dir, ws)}
 
 
 def forget_session(*, data_dir: Path, ws: Path, token) -> dict:
-    """Delete one session's summary (and partials), dumps and state entry —
-    the import keeps nothing of it. A landed project's note is not rewritten
+    """Delete one session's summary (and partials), dumps, state entry and
+    entity citations — the import keeps nothing of it, and the approved People
+    export loses its citations. A landed project's note is not rewritten
     (`--forget <slug>` does that); its roll-up reads as stale until re-run."""
     index_doc, all_summaries, _r, _e, state = load_inputs(data_dir)
     slug, uuid = resolve_session(session_pool(index_doc, all_summaries), token, index_doc, all_summaries)
@@ -1694,6 +1899,15 @@ def forget_session(*, data_dir: Path, ws: Path, token) -> dict:
     removed["state_entry"] = int(rec is not None)
     removed["landed"] = bool(isinstance(rec, dict) and rec.get("summarized_at"))
     _common.save_state(data_dir, state)
+    entities_path = data_dir / ENTITIES_FILE
+    removed["entity_citations"] = removed["entities_dropped"] = 0
+    if entities_path.is_file():
+        entities, n_cites, n_dropped = strip_citations(
+            load_entities(data_dir), lambda c: (_citation_project(c), _citation_session(c)) == (slug, uuid))
+        removed["entity_citations"], removed["entities_dropped"] = n_cites, n_dropped
+        if n_cites:
+            _common.write_json(entities_path, entities)
+    removed["people_revoked"] = refresh_people_export(data_dir)
     removed["stale_rollups"] = _stale_after(data_dir, [(slug, uuid)])
     removed["staged_remaining"] = _rerender_pending(data_dir, ws)
     return removed
