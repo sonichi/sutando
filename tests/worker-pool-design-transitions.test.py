@@ -55,9 +55,22 @@ class _RecSet(set):
 
 class _RecDict(dict):
     """A dict whose every mutation is traced; an add+delete pair cannot cancel."""
-    def __init__(self, owner, name, it=()): super().__init__(it); self._o, self._n = owner, name
+    def __init__(self, owner, name, it=()):
+        super().__init__(it); self._o, self._n = owner, name
+        for k, v in list(self.items()):
+            dict.__setitem__(self, k, self._wrap(k, v))
+
+    def _wrap(self, k, v):
+        # A nested container is durable too: probation["w"]["since"] = x must be
+        # traced, and a plain inner dict makes that write invisible.
+        if isinstance(v, (_RecDict, _RecSet)): return v
+        if isinstance(v, dict): return _RecDict(self._o, f"{self._n}.{k}", v)
+        if isinstance(v, (set, frozenset)): return _RecSet(self._o, f"{self._n}.{k}", v)
+        return v
+
     def _ev(self, op, *a): self._o._op((f"{self._n}.{op}", *a))
-    def __setitem__(self, k, v): self._ev("set", k, v); return super().__setitem__(k, v)
+    def __setitem__(self, k, v):
+        self._ev("set", k, v); return dict.__setitem__(self, k, self._wrap(k, v))
     def __delitem__(self, k): self._ev("del", k); return super().__delitem__(k)
     def pop(self, *a): self._ev("pop", *a[:1]); return super().pop(*a)
     def popitem(self): self._ev("popitem"); return super().popitem()

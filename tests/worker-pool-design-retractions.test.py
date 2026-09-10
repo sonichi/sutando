@@ -1920,7 +1920,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 0
+                    "qdepth": 0,
+                    "ordinal": [
+                            1,
+                            9
+                    ]
             },
             {
                     "key": "count:removal",
@@ -1933,7 +1937,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            1,
+                            65
+                    ]
             },
             {
                     "key": "count:stage",
@@ -1947,7 +1955,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "unit": "**A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent.",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            4,
+                            22
+                    ]
             },
             {
                     "key": "disp:request",
@@ -1960,7 +1972,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            1,
+                            78
+                    ]
             },
             {
                     "key": "disp:allowance",
@@ -1973,7 +1989,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            36,
+                            78
+                    ]
             },
             {
                     "key": "disp:clock",
@@ -1986,7 +2006,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 0,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            59,
+                            78
+                    ]
             },
             {
                     "key": "disp:retire",
@@ -1999,7 +2023,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 3,
-                    "qdepth": 1
+                    "qdepth": 1,
+                    "ordinal": [
+                            62,
+                            78
+                    ]
             },
             {
                     "key": "stated",
@@ -2012,7 +2040,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     "pin": "equality",
                     "kind": "para",
                     "depth": 3,
-                    "qdepth": 0
+                    "qdepth": 0,
+                    "ordinal": [
+                            73,
+                            78
+                    ]
             }
     ]
 
@@ -2060,8 +2092,11 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
             # Quoted rows used physical-line neighbours, so a decoy built from
             # the exact neighbouring LINES stood in for the real unit.
             prev, nxt = unit_neighbours(doc, s["anchor"], s["quoted"])
-            # startswith() on a prefix lets a decoy neighbour opening with the
-            # same words stand in for the real one.
+            # A run of siblings moving together leaves every one-hop check
+            # satisfied, so position is pinned as well.
+            self.assertEqual(list(unit_ordinal(doc, s["anchor"], s["heading"], s["quoted"])),
+                             s["ordinal"],
+                f"{s['key']}: moved within its section, or the section's unit count changed")
             if s["prev"]:
                 self.assertEqual(prev, s["prev"],
                     f"{s['key']}: the unit BEFORE it changed or it was relocated")
