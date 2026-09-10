@@ -92,17 +92,18 @@ class Classifier(unittest.TestCase):
         self.assertEqual(high["confidence"], "high")
         self.assertIn("core-status running", high["reason"])
 
-    def test_clock_only_pane_is_not_case1(self):
-        # Spec: case 1 is pure static, no normalization. A ticking clock is motion.
+    def test_a_clock_ticking_pane_is_not_case1_and_never_warns(self):
+        # Spec: case 1 is pure static, no normalization. A ticking clock is motion
+        # (Chi, 2026-09-10), which is why such a pane is ALIVE and never a warning.
+        # It no longer gets a kind of its own -- `clock-only` existed to suppress the
+        # low-novelty branch, and both are gone; the pane is simply working.
         frames = [idle_with_clock(i) for i in range(6)]
         v = w.classify(frames, True, 900)
         self.assertNotEqual(v["kind"], "static-with-work")
         self.assertFalse(v["raw_static"])
-        self.assertTrue(v["clock_only"])
-        # A clock-only pane is ALIVE (Chi): never a warning, with or without work, however long
         for work in (False, True):
             q = w.classify([idle_with_clock(i) for i in range(12)], work, 900)
-            self.assertEqual((q["kind"], q["warn"]), ("clock-only", False), work)
+            self.assertEqual((q["kind"], q["warn"]), ("working", False), work)
         # ...unless retry text says otherwise: counters-only motion WITH retry text is still case 2
         r = w.classify([retry_frame(i) for i in range(12)], True, 60)
         self.assertEqual(r["kind"], "retry-loop")
@@ -225,11 +226,17 @@ class Classifier(unittest.TestCase):
         self.assertEqual(w.classify([IDLE] * 3, True, 60)["kind"], "static-with-work")
         self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
-    def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
+    def test_repetition_alone_no_longer_warns_retry_is_read_from_the_text(self):
+        # Novelty measured REPETITION; retry is a CAUSE. Measured: a constant-text
+        # retry is already caught by ABNORMAL_PATTERNS, and a retry cycling through
+        # different upstream errors scores novelty 1.00 -- so the statistic reached
+        # neither case. A two-state alternation with no abnormal text is now working.
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
-        v = w.classify(frames, True, 60)
-        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
-        self.assertEqual(w.classify(frames, False, 60)["kind"], "working")
+        self.assertEqual((w.classify(frames, True, 60)["kind"], w.classify(frames, True, 60)["warn"]),
+                         ("working", False))
+        # ...while the retry the TEXT can see still warns, with or without constant text.
+        r = w.classify([retry_frame(i) for i in range(12)], True, 60)
+        self.assertEqual((r["kind"], r["warn"]), ("retry-loop", True))
 
     def test_working_is_not_a_warning(self):
         v = w.classify([working_frame(i) for i in range(20)], True, 60)
@@ -248,11 +255,11 @@ class Classifier(unittest.TestCase):
 
     def test_thresholds_are_reported_and_overridable(self):
         v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
-                       thresholds={"min_samples": 4, "low_novelty_rate": 0.5})
-        self.assertEqual(v["kind"], "low-novelty")
+                       thresholds={"min_samples": 4})
         self.assertEqual(v["thresholds"]["min_samples"], 4)
-        # the same frames under the provisional thresholds read as working (2/6 = 0.33 > 0.25)
-        self.assertEqual(w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60)["kind"], "working")
+        # pattern_min_consecutive still gates: a retry seen once is not yet a loop.
+        one = [retry_frame(0)] + [working_frame(i) for i in range(11)]
+        self.assertEqual(w.classify(one, True, 60, thresholds={"pattern_min_consecutive": 5})["warn"], False)
         self.assertTrue(v["advisory"])
         self.assertIn("not a health guarantee", v["note"])
 
