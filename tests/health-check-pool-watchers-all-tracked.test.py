@@ -655,11 +655,32 @@ class SentinelReconciliationLosesNoRecord(unittest.TestCase):
 
     def test_an_UNPROVABLE_sentinel_is_a_fault_beside_a_live_one(self):
         """A live peer does not clear another instance's unprovable record."""
+        # keweichen: production RETAINS the argv-UNKNOWN tree, and omitting it
+        # here is what let the extras branch bypass the fault aggregation.
         r = run({"watch-tasks-stream-a.pid": "100\n",
-                 "watch-tasks-stream-b.pid": "200\n"}, {"100": {"100"}},
+                 "watch-tasks-stream-b.pid": "200\n"},
+                {"100": {"100"}, "200": {"200"}},
                 verdicts={"100": True, "200": None})
         self.assertEqual(r["status"], "warn", r["detail"])
         self.assertNotIn("streaming watcher alive", r["detail"])
+
+
+    def test_an_UNKNOWN_sentinel_vetoes_advice_about_an_extra_tree(self):
+        """keweichen at 70a8887d: the extras schedules returned BEFORE the fault
+        aggregation, so an unprovable sentinel produced "belongs to a DIFFERENT
+        instance whose sentinel is missing" — and, when both resolved to one
+        target, "ownerless, safe to stop" for a pid whose sentinel exists."""
+        r = run({"watch-tasks-stream-a.pid": "100\n",
+                 "watch-tasks-stream-b.pid": "200\n"},
+                {"100": {"100"}, "200": {"200"}},
+                verdicts={"100": True, "200": None},
+                targets={"100": "watch-tasks-stream-a.pid",
+                         "200": "watch-tasks-stream-a.pid"})
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("unprovable", r["detail"])
+        self.assertIn("no stop or restart is advised", r["detail"])
+        self.assertNotIn("safe to stop", r["detail"])
+        self.assertNotIn("sentinel is missing", r["detail"])
 
 
 class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):

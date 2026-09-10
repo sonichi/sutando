@@ -8867,6 +8867,12 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
     return trees
 
 
+def extras_present(trees, live) -> bool:
+    """Any watcher tree not claimed by a live sentinel."""
+    tracked = {str(x) for x in live}
+    return any(not (members & tracked) for members in trees.values())
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -9069,7 +9075,30 @@ def check_task_watcher() -> dict:
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
 
+    faults = []
+    if dead_pids:
+        faults.append("crashed: " + ", ".join(
+            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
+    if reused:
+        faults.append("PID reuse: " + ", ".join(
+            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
+    if unreadable:
+        faults.append("unreadable: " + ", ".join(
+            f"{sp.name} ({err})" for sp, err in unreadable))
+    if unprovable:
+        faults.append("UNKNOWN: " + ", ".join(
+            f"{sp.name} (pid {spid} unprovable from argv)" for spid, _a, sp in unprovable))
+    if collided:
+        faults.append("one pid, two sentinels: " + ", ".join(
+            f"{a.name} and {b.name} both name pid {spid}" for spid, a, b in collided))
+    # A sentinel fault must not be skipped by an earlier remediation return:
+    # UNKNOWN or conflicting records veto destructive advice about extra trees.
     tracked = {str(p) for p in live}
+    if (unprovable or collided) and extras_present(trees, live):
+        return {"name": name, "status": "warn",
+                "detail": "; ".join(faults) + ". Untracked watcher tree(s) are "
+                          "present too, but no stop or restart is advised while a sentinel record "
+                          "is unprovable or conflicting — resolve the records first"}
     extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
         # A root count is not an identity: only a shared sentinel target makes
@@ -9106,22 +9135,6 @@ def check_task_watcher() -> dict:
     alive = ", ".join(str(p) for p in sorted(live))
     # An anomaly belongs to the instance whose sentinel carries it, so a live
     # PEER is not evidence about a crashed one and must not discard its record.
-    faults = []
-    if dead_pids:
-        faults.append("crashed: " + ", ".join(
-            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
-    if reused:
-        faults.append("PID reuse: " + ", ".join(
-            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
-    if unreadable:
-        faults.append("unreadable: " + ", ".join(
-            f"{sp.name} ({err})" for sp, err in unreadable))
-    if unprovable:
-        faults.append("UNKNOWN: " + ", ".join(
-            f"{sp.name} (pid {spid} unprovable from argv)" for spid, _a, sp in unprovable))
-    if collided:
-        faults.append("one pid, two sentinels: " + ", ".join(
-            f"{a.name} and {b.name} both name pid {spid}" for spid, a, b in collided))
     if faults:
         return {"name": name, "status": "warn",
                 "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
