@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Contract tests for src/pool_delivery.py — a real filesystem, no mocks."""
+import json
 import os
 import subprocess
 import sys
@@ -315,6 +316,113 @@ class TestCLI(Base):
         r = self.run_cli("sweep")
         self.assertIn('"ready"', r.stdout)
         self.assertIn("task-1", r.stdout)
+
+
+class TestEmit(Base):
+    def test_a_dead_consumer_ends_the_reader(self):
+        """A reader that keeps emitting into a closed pipe piles events up
+        unseen; exiting is what makes the failure visible."""
+        from unittest.mock import patch
+        with patch("builtins.print", side_effect=BrokenPipeError):
+            with self.assertRaises(SystemExit) as e:
+                pd._emit("task-1")
+        self.assertEqual(e.exception.code, 0)
+
+
+class TestCliDispatch(Base):
+    def _main(self, *args):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), "--recipient", "core", *args])
+        return rc, buf.getvalue()
+
+    def test_pending_lists_ids(self):
+        self.ws.payload("task-1")
+        self.ws.deliver("core", "task-1")
+        rc, out = self._main("pending")
+        self.assertEqual((rc, out.strip()), (0, "task-1"))
+
+    def test_residue_requires_a_task_id(self):
+        with self.assertRaises(SystemExit):
+            self._main("residue")
+
+    def test_residue_prints_the_state(self):
+        self.ws.payload("task-1")
+        rc, out = self._main("residue", "--task-id", "task-1")
+        self.assertEqual((rc, out.strip()), (0, "undelivered"))
+
+    def test_sweep_emits_json_with_every_bucket(self):
+        self.ws.payload("task-1")
+        self.ws.deliver("core", "task-1")
+        rc, out = self._main("sweep")
+        got = json.loads(out)
+        self.assertEqual(rc, 0)
+        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale"})
+        self.assertEqual(got["ready"], ["task-1"])
+
+
+class TestWatch(Base):
+    def test_watch_emits_the_boot_sweep_then_new_arrivals(self):
+        """The boot sweep is not optional: a delivery written while the reader
+        was down produces no event, so only the sweep finds it."""
+        from unittest.mock import patch
+        self.ws.payload("task-old")
+        self.ws.deliver("core", "task-old")
+        seen = []
+
+        def fake_sleep(_):
+            if len(seen) >= 1:          # after the boot sweep emitted
+                raise KeyboardInterrupt
+            self.ws.payload("task-new")
+            self.ws.deliver("core", "task-new")
+
+        with patch.object(pd, "_emit", side_effect=seen.append), \
+             patch("time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(KeyboardInterrupt):
+                pd.main(["--workspace", str(self.root), "--recipient", "core", "watch"])
+        self.assertIn("task-old", seen)
+
+    def test_watch_announces_a_delivery_that_arrives_while_running(self):
+        """The loop's own job, distinct from the boot sweep."""
+        from unittest.mock import patch
+        seen, ticks = [], []
+
+        def fake_sleep(_):
+            ticks.append(1)
+            if len(ticks) == 1:
+                self.ws.payload("task-live")
+                self.ws.deliver("core", "task-live")
+            else:
+                raise KeyboardInterrupt
+
+        with patch.object(pd, "_emit", side_effect=seen.append), \
+             patch("time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(KeyboardInterrupt):
+                pd.main(["--workspace", str(self.root), "--recipient", "core", "watch"])
+        self.assertIn("task-live", seen)
+
+
+class TestSweepTotality(Base):
+    def test_one_task_under_both_names_is_visited_once(self):
+        """`claimed + pending` can list the same id twice; a second visit would
+        act on a state the first pass already resolved."""
+        self.ws.payload("task-1")
+        pd.claim(self.ws.deliver("core", "task-1"))
+        self.ws.deliver("core", "task-2")
+        self.ws.payload("task-2")
+        out = pd.sweep(self.root, "core")
+        flat = [x for v in out.values() for x in v]
+        self.assertEqual(len(flat), len(set(flat)), out)
+
+    def test_an_unmapped_state_raises_rather_than_falling_through(self):
+        from unittest.mock import patch
+        self.ws.payload("task-1")
+        self.ws.deliver("core", "task-1")
+        with patch.object(pd, "residue", return_value="something-new"):
+            with self.assertRaises(AssertionError):
+                pd.sweep(self.root, "core")
 
 
 if __name__ == "__main__":
