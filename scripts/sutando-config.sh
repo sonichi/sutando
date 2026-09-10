@@ -98,6 +98,15 @@ print(resolve_workspace(), end='')
     fi
     ;;
 
+  transcript-archive-dir)
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_transcript_archive_dir
+print(resolve_transcript_archive_dir(), end='')
+"
+    ;;
+
   vault-enabled)
     py -c "
 import sys

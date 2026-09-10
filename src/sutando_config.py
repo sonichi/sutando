@@ -81,6 +81,17 @@ _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
 
 
+def resolve_transcript_archive_dir(repo_root: Optional[Path] = None) -> str:
+    """Where PreCompact archives conversation transcripts.
+
+    Resolved when the hook FIRES, never baked into settings.json: an absolute
+    path frozen at install time is the defect install-claude-hooks.sh:61-93 records.
+    """
+    hooks = load_config(repo_root).get("hooks") or {}
+    d = (hooks.get("transcript_archive_dir") or "").strip()
+    return d or str(Path.home() / "Desktop" / "sutando-conversations")
+
+
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     """How ``health-check.py --fix`` handles a configured-but-down channel bridge."""
     hc = load_config(repo_root).get("health_check") or {}

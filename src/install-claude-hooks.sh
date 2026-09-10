@@ -9,7 +9,7 @@
 #
 # Hooks installed (4):
 #   PreCompact  → src/archive-transcript.sh
-#                 ${SUTANDO_TRANSCRIPT_ARCHIVE_DIR:-~/Desktop/sutando-conversations/}
+#                 (destination resolved at fire time via sutando-config.sh)
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -94,17 +94,17 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\${SUTANDO_TRANSCRIPT_ARCHIVE_DIR:-\$HOME/Desktop/sutando-conversations/}\""
+  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh")"
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
-# The transcript archiver's destination is $SUTANDO_TRANSCRIPT_ARCHIVE_DIR, expanded
-# when the hook FIRES (not at install), defaulting to ~/Desktop/sutando-conversations/.
-# That default is historical -- a sibling of the old ~/Desktop/sutando clone location --
-# and no rationale for it is recorded; it is kept so an upgrade never relocates existing
-# archives. It is OUTSIDE the vault carrier set.
+# The transcript archiver takes NO destination argument: archive-transcript.sh asks
+# sutando-config.sh for `transcript-archive-dir` when it fires, so the path is never
+# frozen into settings.json. Configure via hooks.transcript_archive_dir; the default
+# (~/Desktop/sutando-conversations) is historical and kept so upgrades never relocate
+# existing archives. It is OUTSIDE the vault carrier set.
 # The location is not what keeps transcripts out of the vault: sync is a whitelist
 # (see .git/info/exclude -- `*` then the include list), so a workspace path is
 # unsynced until vault.sync.include names it. Omitting it
