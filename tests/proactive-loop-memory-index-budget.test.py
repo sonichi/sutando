@@ -141,7 +141,7 @@ def _tree(projects, slug, text, age_s):
     return d
 
 # --- narrowing: each rung is motivated by a real host's population ------------
-STUB = "# Memory index\n"          # the template stub dead worktrees leave behind
+STUB = ("# Sutando memory index\n\nDurable facts about the user, project, and\nreferences. One line per entry: `- [Title](file.md)`.\n")   # the shipped stub
 
 def _mark(memdir):
     (memdir / "NOT-THE-LIVE-CORPUS.txt").write_text("NOT THE LIVE MEMORY CORPUS\n")
@@ -208,7 +208,7 @@ with tempfile.TemporaryDirectory() as d:
         unreadable = True
     if unreadable:
         check("unreadable candidate: treated as UNKNOWN, never as debris",
-              mib._indexes_something(locked / "MEMORY.md") is True, "read succeeded?")
+              mib._is_known_template(locked / "MEMORY.md") is False, "read succeeded?")
         got, note = mib._live_index(live, REPO, projects.parent.parent)
         check("unreadable candidate: the resolver still answers or refuses cleanly",
               got is not None or "CANNOT ANSWER" in note, "got=%s note=%r" % (got, note))
@@ -411,6 +411,35 @@ with tempfile.TemporaryDirectory() as d:
           got != stale / "MEMORY.md", "got=%s note=%r" % (got, note))
     check("false-safe B: with nothing authoritative, it refuses",
           got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
+
+# --- entry FORMAT is not corpus identity either (#3873 review) ----------------
+# A live index using bullets, bare links or numbered rows is unfamiliar, not
+# empty; reading it as debris elects the stale sibling.
+for _shape, _rows in (
+        ("plain bullets", ["- entry %d about a durable fact" % i for i in range(40)]),
+        ("bare links", ["[e%d](e%d.md) — hook" % (i, i) for i in range(40)]),
+        ("numbered links", ["%d. [e%d](e%d.md) — hook" % (i, i, i) for i in range(40)]),
+        ("prefixed rows", ["- Preference: [details %d] matter" % i for i in range(40)]),
+):
+    with tempfile.TemporaryDirectory() as d:
+        projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+        live = _tree(projects, "live", "# Sutando memory index\n\n" + "\n".join(_rows), age_s=60)
+        stale = _tree(projects, "stale", index_of(LIMIT // 3), age_s=86400)
+        _tree(projects, "stub", STUB, age_s=86400)
+        got, note = mib._live_index(live, REPO, projects.parent.parent)
+        check("format: a live index of %s is not debris, so the stale one is not elected" % _shape,
+              got != stale / "MEMORY.md", "got=%s" % got)
+
+with tempfile.TemporaryDirectory() as d:
+    # CONTROL: the filter still fires on the real template, so the four checks
+    # above are not passing because narrowing was simply disabled.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "live", index_of(LIMIT // 2), age_s=60)
+    for i in range(30):
+        _tree(projects, "stub-%d" % i, STUB, age_s=86400)
+    got, note = mib._live_index(live, REPO, projects.parent.parent)
+    check("format CONTROL: 30 shipped stubs are still filtered, leaving the live one",
+          got == live / "MEMORY.md", "got=%s note=%r" % (got, note))
 
 # --- the branches the coverage gate flagged: refusal, fallback, and main()'s default -
 with tempfile.TemporaryDirectory() as d:

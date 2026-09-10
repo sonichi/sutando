@@ -145,9 +145,9 @@ def _narrow(cands: "list[Path]") -> "list[Path]":
     for keep in (
         # An explicit disclaimer beats every inference, including a fresh mtime.
         lambda c: not (c.parent / "NOT-THE-LIVE-CORPUS.txt").exists(),
-        # A template nobody has written in indexes nothing. Copy count cannot say
-        # this: four byte-identical REAL corpora clear any threshold a stub does.
-        lambda c: _indexes_something(c),
+        # Drop only what is positively recognisable as the shipped template.
+        # Neither copy count nor entry formatting can stand in for corpus identity.
+        lambda c: not _is_known_template(c),
     ):
         if len(cands) < 2:
             break
@@ -157,15 +157,28 @@ def _narrow(cands: "list[Path]") -> "list[Path]":
     return cands
 
 
-_ROW = re.compile(r"^\s*[-*]\s*\[", re.M)
+# The shipped stub's prose, whitespace-normalised so wrapping cannot hide it.
+# Recognising the template POSITIVELY is the point: anything unfamiliar stays
+# eligible rather than being read as debris.
+_TEMPLATE_PROSE = "one line per entry"
 
 
-def _indexes_something(index: "Path") -> bool:
-    """True when the file carries at least one `- [Title](file.md)` row."""
+def _is_known_template(index: "Path") -> bool:
+    """True only when the body is nothing but the shipped blurb.
+
+    Deliberately not a test of entry FORMAT: a live index using plain bullets,
+    bare links or numbered rows is unfamiliar, not empty.
+    """
     try:
-        return bool(_ROW.search(index.read_text(encoding="utf-8", errors="replace")))
+        text = index.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return True                 # unreadable is unknown, never "debris"
+        return False                # unreadable is unknown, never debris
+    body = " ".join(l.strip() for l in text.splitlines()
+                    if l.strip() and not l.lstrip().startswith("#"))
+    body = " ".join(body.split()).casefold()
+    if not body:
+        return True                 # headers only: nothing is indexed
+    return body.startswith("durable facts about") and _TEMPLATE_PROSE in body
 
 
 def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
