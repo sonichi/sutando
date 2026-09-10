@@ -4,7 +4,8 @@
 Modes:
   list                    — table of sessions (file, start, end, msgs, first user line)
   dump --session <uuid|last|current> [--filter user|dialog|all] [--max-chars N]
-  Both take --root DIR to read another project dir (e.g. a stock ~/.claude/projects/<slug>).
+  Both take --root DIR to read another project dir (e.g. a <slug> dir under the stock
+  Claude Code projects dir, claude_home_path("projects", vanilla=True)).
 
 "last" = the most recent session file that is NOT the currently-active one
 (active = newest by mtime). Timestamps are per-event ISO from the transcript.

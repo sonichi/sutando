@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""LLM-free index of the owner's stock Claude Code transcripts (~/.claude/projects).
+"""LLM-free index of the owner's stock Claude Code transcripts (the stock projects
+dir, `claude_home_path("projects", vanilla=True)`).
 
 Enumerates `<root>/<slug>/*.jsonl` (top level only — `subagents/**` and every
 other nested transcript is counted and skipped), drops sidechain transcripts
@@ -52,9 +53,9 @@ from _common import (  # noqa: E402
     INDEX_FILE, INDEX_MD, matches_project, now_iso, parse_since, session_key,
     split_csv, write_status,
 )
-from context_resume import clean_text, message_text  # noqa: E402
-from secret_scanner import scan_and_redact  # noqa: E402
-from util_paths import claude_home_path, write_private_text  # noqa: E402
+from context_resume import clean_text, message_text
+from secret_scanner import scan_and_redact
+from util_paths import claude_home_path, write_private_text
 
 SNIPPET_CHARS = 200
 TITLE_CHARS = 120
@@ -62,15 +63,8 @@ TITLE_CHARS = 120
 META_TYPES = frozenset({"ai-title", "custom-title", "last-prompt", "agent-name", "summary"})
 MESSAGE_TYPES = frozenset({"user", "assistant"})
 
-# Record dispatch without decoding the line. Only the record types this index
-# cares about are matched, by their STRUCTURAL form `"type":"user"`: inside a
-# JSON string value every quote is escaped (`\"type\":\"user\"`), so the raw
-# form cannot come from message text, and no nested object (the API message
-# object is `"type":"message"`, content blocks are text/tool_use/...) carries
-# one of these values. Hence the first match is the top-level record type.
-# Verified 2026-09-10 against real transcripts, where assistant lines put the
-# message object BEFORE the top-level `type` — a "first `type` key" rule
-# misread every one of them as `message`.
+# Dispatch without decoding: the raw `"type":"user"` form cannot come from message
+# text (quotes inside JSON strings are escaped) or a nested object, so the first match is the record type.
 _TYPE_RE = re.compile(
     r'"type":\s*"(user|assistant|ai-title|custom-title|last-prompt|agent-name|summary)"')
 _TEXT_BLOCK_RE = re.compile(r'"type":\s*"text"')
@@ -161,8 +155,6 @@ def scan_session(path: Path) -> dict:
                     rec["agent_name"] = _snippet(d.get("agentName"), TITLE_CHARS) or rec["agent_name"]
                 elif t == "summary":
                     rec["summary"] = _snippet(d.get("summary"), 500) or rec["summary"]
-                continue
-            if t not in MESSAGE_TYPES:
                 continue
             if not first_message_seen:
                 first_message_seen = True

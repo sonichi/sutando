@@ -346,6 +346,46 @@ class TestCli(Base):
         self.assertNotIn("Widget", out)
 
 
+
+class TestScanEdges(Base):
+    def test_default_root_is_the_stock_projects_dir(self):
+        with patch.dict(os.environ, {"SOURCE_CLAUDE_CONFIG_DIR": str(self.tmp / "vanilla")}):
+            self.assertEqual(self.m.default_root(), self.tmp / "vanilla" / "projects")
+
+    def test_line_helpers_tolerate_bad_json(self):
+        self.assertIsNone(self.m._loads("{not json"))
+        self.assertIsNone(self.m._loads("[1, 2]"))
+        self.assertEqual(self.m._unescape("a\\qb"), "a\\qb")
+        self.assertEqual(self.m._unescape("a\\nb"), "a\nb")
+        self.assertIsNone(self.m._snippet(None, 10))
+        self.assertIsNone(self.m._snippet("   ", 10))
+        self.assertIsNone(self.m._line_type('{"type": "progress"}'))
+
+    def test_broken_meta_line_and_a_timestamp_only_on_the_last_message(self):
+        p = self.tmp / "odd.jsonl"
+        first = {"type": "user", "cwd": CWD_B, "message": {"role": "user", "content": "hi"}}
+        p.write_text('{"type":"ai-title", broken\n' + json.dumps(first) + "\n"
+                     + json.dumps(_msg("assistant", [{"type": "text", "text": "yo"}], "2026-08-02T10:00:00Z")) + "\n")
+        rec = self.m.scan_session(p)
+        self.assertIsNone(rec["ai_title"])
+        self.assertEqual(rec["cwd"], CWD_B)
+        self.assertEqual((rec["first_ts"], rec["last_ts"]), ("2026-08-02T10:00:00Z", "2026-08-02T10:00:00Z"))
+        self.assertEqual((rec["user_msgs"], rec["assistant_msgs"], rec["first_prompt"]), (1, 1, "hi"))
+
+    def test_only_jsonl_files_are_sessions(self):
+        (self.root / SLUG_A / "notes.txt").write_text("not a transcript")
+        (self.root / SLUG_A / "stray.json").write_text("{}")
+        ent = self.m.enumerate_root(self.root)
+        self.assertEqual(len(ent[SLUG_A]["sessions"]), len(list((self.root / SLUG_A).glob("*.jsonl"))))
+
+    def test_since_in_the_future_leaves_every_project_out_of_the_md(self):
+        r = self.m.index(self.root, out_dir=self.out, since="2999-01-01")
+        self.assertEqual((r["sessions"], r["projects"], r["conversations"]), (0, 0, 0))
+        self.assertGreater(r["skipped_since"], 0)
+        md = (self.out / "claude-import-index.md").read_text()
+        self.assertNotIn("\n## ", md)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     sys.exit(0 if result.wasSuccessful() else 1)

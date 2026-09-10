@@ -479,7 +479,7 @@ class TestMerge(unittest.TestCase):
         chi = merged[1]
         self.assertEqual(chi["role"], "advisor")
         self.assertEqual([c["quote_or_context"] for c in chi["citations"]], ["c2", "c1"])
-        self.assertEqual([c["quote_or_context"] for c in merged[2]["citations"]], ["a2", "a1"])   # unioned, deduped
+        self.assertEqual([c["quote_or_context"] for c in merged[2]["citations"]], ["a2", "a1"])
         self.assertEqual(people, before)                                                        # pure
         self.assertEqual(self.m.merge_people(people), (merged, n))                             # deterministic
 
@@ -568,6 +568,62 @@ class TestMergeInTheFlow(Base):
         rc, payloads, _ = self._run("--people-json")
         self.assertEqual(payloads[0]["name"], "Ada Lovelace")
         self.assertEqual(sum(1 for p in payloads if p["name"].startswith("Ada")), 1)
+
+
+
+class TestCliEdges(Base):
+    def test_string_selectors_and_purge(self):
+        rc, doc, _ = self._run("--stage", "--projects", "alpha", "--purge-dumps")
+        self.assertEqual((rc, doc["projects"], doc["purged_files"]), (0, 1, 2))
+        c = self.m.stage(data_dir=self.data, ws=self.ws, projects="alpha,beta")
+        self.assertEqual(c["projects"], 2)
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stderr(io.StringIO()):
+            c = self.m.commit(data_dir=self.data, ws=self.ws, memory_dir=self.mem, projects=SLUG_A)
+        self.assertEqual((c["committed"], c["staged_remaining"]), (1, 1))
+        r = self.m.discard(data_dir=self.data, ws=self.ws, projects=SLUG_B)
+        self.assertEqual(r, {"discarded": 1, "staged_remaining": 0})
+        self.assertEqual(self._status()["phase"], "discarded")
+
+    def test_human_output_lines(self):
+        out = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--stage"])
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--commit", "--purge-dumps"])
+        text = out.getvalue()
+        self.assertIn("staged 2 projects (3/3 sessions summarised", text)
+        self.assertIn("nothing saved yet", text)
+        self.assertIn("committed 2 projects (0 still staged): 3/3 sessions summarised, 2 projects in", text)
+        self.assertIn("MEMORY.md row written", text)
+        self.assertFalse((self.data / "dumps").exists())
+
+    def test_purge_dumps_alone_from_the_cli(self):
+        rc, doc, _ = self._run("--purge-dumps")
+        self.assertEqual((rc, doc), (0, {"purged_files": 2}))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = self.m.main(["--workspace", str(self.ws), "--purge-dumps"])
+        self.assertEqual((rc, out.getvalue().strip()), (0, "purged 0 dump files"))
+        self.assertSinksUntouched()
+
+    def test_commit_refuses_when_a_rollup_vanished_after_staging(self):
+        self._run("--stage")
+        fp = self._manifest()["fingerprint"]
+        (self.data / "projects" / f"{SLUG_B}.json").unlink()
+        with patch.object(self.m, "inputs_fingerprint", return_value=fp):
+            msg = self._refused("--commit")
+        self.assertIn("no roll-up any more", msg)
+        self.assertSinksUntouched()
+
+    def test_commit_refreshes_a_summarized_at_older_than_the_extraction(self):
+        self._run("--stage")
+        state = {"sessions": {f"{SLUG_A}/{U1}": {"extracted_at": "2026-09-01T00:00:00Z",
+                                                  "summarized_at": "2026-08-01T00:00:00Z"}}, "projects": {}}
+        (self.data / "state.json").write_text(json.dumps(state))
+        rc, _doc, _ = self._run("--commit")
+        self.assertEqual(rc, 0)
+        rec = json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U1}"]
+        self.assertGreater(rec["summarized_at"], rec["extracted_at"])
 
 
 if __name__ == "__main__":

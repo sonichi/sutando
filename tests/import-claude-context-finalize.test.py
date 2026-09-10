@@ -337,6 +337,113 @@ class TestMemoryDirGuard(Base):
             self.assertEqual(self.m.resolve_memory_dir(None), self.mem)
 
 
+
+class TestHelpers(Base):
+    def test_loaders_on_an_empty_data_dir(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertEqual(self.m.load_summaries(empty), {})
+        self.assertEqual(self.m.load_rollups(empty), {})
+        self.assertEqual(self.m.load_entities(empty), {k: [] for k in self.m.ENTITY_LISTS})
+
+    def test_fingerprint_skips_an_unreadable_input(self):
+        full = self.m.inputs_fingerprint(self.data)
+        with patch.object(self.m.Path, "read_bytes", side_effect=OSError("denied")):
+            partial = self.m.inputs_fingerprint(self.data)
+        self.assertNotEqual(full, partial)
+        self.assertRegex(partial, r"^[0-9a-f]{64}$")
+
+    def test_meta_lookups_and_display_name(self):
+        index_doc = json.loads((self.data / "index.json").read_text())
+        self.assertEqual(self.m.session_meta(index_doc, SLUG_A, "nope"), {})
+        self.assertEqual(self.m.session_meta(index_doc, "-no-such", U1), {})
+        self.assertEqual(self.m.display_name(SLUG_A, {"name": " Alpha "}, index_doc), "Alpha")
+        self.assertEqual(self.m.display_name(SLUG_A, {}, index_doc), "alpha")
+        self.assertEqual(self.m.display_name("-Users-o-Projects-gamma", {"name": ""}, index_doc), "gamma")
+        self.assertEqual(self.m.display_name("-", {}, {}), "-")
+        self.assertEqual(self.m.display_name("-Users-o-x", {}, {"projects": {"-Users-o-x": {"cwd": "/"}}}), "x")
+
+    def test_session_total_without_index_counts(self):
+        summaries = {(SLUG_A, U1): {}, (SLUG_B, U3): {}}
+        self.assertEqual(self.m.session_total({}, summaries, [SLUG_A, SLUG_B], [SLUG_A, SLUG_B]), 2)
+        self.assertEqual(self.m.session_total({"counts": {"sessions": 5}}, summaries, [SLUG_A], [SLUG_A, SLUG_B]), 1)
+
+    def test_memory_row_helpers(self):
+        idx = self.mem / "MEMORY.md"
+        idx.write_text("- [Existing lesson](existing.md) — keep me")   # no trailing newline
+        with patch.object(self.m.subprocess, "run", side_effect=_ok):
+            ok, _reason = self.m.guard_memory_row(self.mem, self.m.memory_row(2))
+        self.assertTrue(ok)
+        self.assertEqual(idx.read_text(), "- [Existing lesson](existing.md) — keep me\n" + self.m.memory_row(2) + "\n")
+        self.assertTrue(self.m.remove_memory_row(self.mem))
+        self.assertFalse(self.m.remove_memory_row(self.mem))
+        idx.unlink()
+        self.assertFalse(self.m.remove_memory_row(self.mem))
+
+    def test_memory_dir_guard_survives_a_cross_drive_compare(self):
+        with patch.object(self.m, "core_memory_dir", return_value=self.mem), \
+                patch.object(self.m, "claude_home_path", return_value=self.tmp / ".claude"), \
+                patch.object(self.m.os.path, "commonpath", side_effect=ValueError("drives")):
+            self.assertEqual(self.m.resolve_memory_dir(None), self.mem)
+
+    def test_note_rendering_edges(self):
+        index_doc = json.loads((self.data / "index.json").read_text())
+        summaries = self.m.load_summaries(self.data)
+        rows = self.m._sessions_list(SLUG_A, {"sessions": [U1, 7, None]}, index_doc, summaries)
+        self.assertEqual(rows, f"- 2026-08-01 — Widget build ({U1[:8]})")
+        ndir = self.tmp / "notes"
+        ndir.mkdir()
+        state = {"sessions": {}, "projects": {}}
+        rollup = json.loads((self.data / "projects" / f"{SLUG_A}.json").read_text())
+        self.assertEqual(self.m.write_project_note(ndir, SLUG_A, rollup, index_doc, summaries, state, "user"), "created")
+        self.assertIn("# Alpha\n", (ndir / f"{SLUG_A}.md").read_text())
+        self.assertEqual(self.m.write_project_note(ndir, SLUG_A, rollup, index_doc, summaries, state, "user"), "unchanged")
+
+    def test_review_line_helpers(self):
+        rollup = {"top_open_thread": "ship", "open_threads": [{"thread": "t1"}, {"what": "t2"}, "t3", 5],
+                  "key_decisions": ["plain decision", {"decision": "d2", "why": "w2"}, {"decision": "d3"}]}
+        ents = {"open_threads": [{"project": SLUG_A, "thread": "t4", "owner_action": "call"},
+                                 {"project": SLUG_B, "thread": "x"}, "junk"],
+                "decisions": [{"project": SLUG_A, "decision": "d4"}]}
+        self.assertEqual(self.m._thread_lines(SLUG_A, rollup, ents), ["ship", "t1", "t2", "t3", "t4 (you: call)"])
+        self.assertEqual(self.m._decision_lines(SLUG_A, rollup, ents), ["plain decision", "d2 — because w2", "d3", "d4"])
+        many = [f"item {i}" for i in range(self.m.REVIEW_MAX_ITEMS + 3)]
+        self.assertIn("- …and 3 more\n", self.m._bullets("Threads", many))
+        self.assertEqual(self.m._bullets("Threads", []), "Threads: none recorded.\n")
+        self.assertEqual(self.m._paragraph({"summary": "S"}), "S")
+        self.assertEqual(self.m._paragraph({"note_markdown": "Para one.\n\nPara two."}), "Para one.")
+        self.assertEqual(self.m._paragraph({}), "(no roll-up text)")
+
+    def test_merge_helpers_tolerate_junk_and_union_fields(self):
+        self.assertEqual(self.m._norm_name(None), "")
+        cite = _cite(SLUG_A, U1)
+        self.assertEqual(self.m._union_citations([{"citations": ["junk", cite, dict(cite)]}]), [cite])
+        people = [
+            {"name": "Ada Lovelace", "email": "ada@example.com",
+             "identifiers": {"handles": ["@ada"], "x": "ada"}, "citations": []},
+            {"name": "Ada", "email": "ada@example.com", "company": "Analytical", "relationship": "investor",
+             "identifiers": {"handles": ["@ada", "@lovelace"], "x": ""}, "citations": []},
+        ]
+        merged, n = self.m.merge_people(people)
+        self.assertEqual(n, 1)
+        self.assertEqual((merged[0]["name"], merged[0]["company"], merged[0]["relationship"]),
+                         ("Ada Lovelace", "Analytical", "investor"))
+        self.assertEqual(merged[0]["identifiers"],
+                         {"handles": ["@ada", "@lovelace"], "x": "ada", "emails": ["ada@example.com"]})
+        companies, n = self.m.merge_companies(["junk", {"name": "Acme"}, {"name": "acme", "what": "widgets"}])
+        self.assertEqual((n, len(companies), companies[0]["what"]), (1, 1, "widgets"))
+
+    def test_forget_drops_junk_entity_items(self):
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"].insert(0, "junk")
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        with patch.object(self.m.subprocess, "run", side_effect=_ok):
+            self.m.forget(data_dir=self.data, ws=self.ws, memory_dir=self.mem, slug=SLUG_B)
+        people = json.loads((self.data / "entities.json").read_text())["people"]
+        self.assertTrue(all(isinstance(p, dict) for p in people))
+        self.assertNotIn("junk", people)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     sys.exit(0 if result.wasSuccessful() else 1)

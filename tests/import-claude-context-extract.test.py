@@ -2,8 +2,8 @@
 """Tests for skills/import-claude-context/scripts/extract.py — cleaned, redacted,
 chunked dialog dumps built on session-recap's extract.py --root.
 
-Pins: system-reminder blocks and watcher-ping lines stripped, `ghp_…` and
-`AIza…` redacted before disk, chunks split only at `[ts] USER:/ASSISTANT:`
+Pins: system-reminder blocks and watcher-ping lines stripped, `ghp_…`,
+`AIza…` and `sk-ant-…` redacted before disk, chunks split only at `[ts] USER:/ASSISTANT:`
 turn lines, 0600 files in a 0700 dir, --new bookkeeping on (mtime,size),
 --session prefix, the --max-chars-total soft cap, and the counting rule from
 the 2026-09-10 fresh-install run: a session with no cleaned dialog or under
@@ -25,6 +25,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "import-claude-context" / "scripts"
@@ -35,8 +36,11 @@ S1 = "aaaaaaaa-1111-4111-8111-111111111111"
 S2 = "bbbbbbbb-2222-4222-8222-222222222222"
 S3 = "cccccccc-3333-4333-8333-333333333333"   # aborted: only harness noise, no assistant turn
 S4 = "dddddddd-4444-4444-8444-444444444444"   # answered, but ~60 chars of dialog
-GHP = "ghp_" + "A1b2C3d4" * 5          # 40 chars after the prefix
-AIZA = "AIza" + "Sy" * 17 + "Q"          # 35 chars after the prefix
+
+# Key fixtures: 40 chars after `ghp_`, 35 after `AIza`, the `sk-ant-api03-` shape (20+ after `sk-ant-`).
+GHP = "ghp_" + "A1b2C3d4" * 5
+AIZA = "AIza" + "Sy" * 17 + "Q"
+ANT = "sk-ant-api03-" + "Ab1_" * 23 + "x"
 TURN_RE = re.compile(r"^\[[^\]\n]*\] (USER|ASSISTANT): ", re.M)
 
 
@@ -66,8 +70,8 @@ def make_tree(root: Path) -> None:
     d.mkdir(parents=True)
     recs = [
         {"type": "ai-title", "aiTitle": "Redaction session", "sessionId": "s"},
-        _msg("user", "Hello <system-reminder>SECRET HARNESS BLOCK\nmore</system-reminder> world\nsecond line",
-             _ts(0)),
+        _msg("user", "Hello <system-reminder>SECRET HARNESS BLOCK\nmore</system-reminder> world\nsecond line\n"
+             f"export ANTHROPIC_API_KEY=\"{ANT}\" before you run it", _ts(0)),
         _msg("assistant", [{"type": "text", "text": f"Use token {GHP} and key {AIZA} carefully."}], _ts(1)),
         _msg("user", "[watcher-ping]", _ts(2)),
         _msg("user", [{"type": "tool_result", "tool_use_id": "t", "content": "TOOL OUTPUT MUST NOT APPEAR"}],
@@ -130,8 +134,11 @@ class TestCleaningAndRedaction(Base):
         self.assertNotIn("echo hidden", text)
         self.assertNotIn(GHP, text)
         self.assertNotIn(AIZA, text)
+        self.assertNotIn(ANT, text)
+        self.assertNotIn("sk-ant-", text)
         self.assertIn("[STORED-IN-KEYCHAIN-GitHub Token]", text)
         self.assertIn("[STORED-IN-KEYCHAIN-Google API Key]", text)
+        self.assertIn('ANTHROPIC_API_KEY="[STORED-IN-KEYCHAIN-Anthropic API Key]" before you run it', text)
         self.assertIn("carefully.", text)
         raw = (self.root / SLUG / f"{S1}.jsonl").read_text()
         self.assertIn(GHP, raw)  # the source was not touched
@@ -289,6 +296,32 @@ class TestEmptySessions(Base):
         self.m.extract(self.root, out_dir=self.out, session=S4[:8], min_chars=0)
         self.assertNotIn("skipped_empty", self._rec(S4))
         self.assertEqual(len(self._chunks(S4)), 1)
+
+
+
+class TestSelectionEdges(Base):
+    def test_projects_filter_as_a_csv_string(self):
+        c = self.m.extract(self.root, out_dir=self.out, projects="alpha,zzz")
+        self.assertEqual((c["extracted"], c["skipped_empty"]), (2, 2))
+        c = self.m.extract(self.root, out_dir=self.out, projects="zzz")
+        self.assertEqual((c["extracted"], c["skipped_empty"], c["errors"]), (0, 0, 0))
+
+    def test_a_transcript_gone_since_the_index_is_skipped(self):
+        self.m.extract(self.root, out_dir=self.out, session=S1[:8])   # builds the index over every session
+        (self.root / SLUG / f"{S2}.jsonl").unlink()
+        c = self.m.extract(self.root, out_dir=self.out)
+        self.assertEqual((c["extracted"], c["skipped_empty"], c["errors"]), (1, 2, 0))
+        self.assertEqual(self._chunks(S2), [])
+        with self.assertRaises(SystemExit):
+            self.m.extract(self.root, out_dir=self.out, session=S2[:8])
+
+    def test_a_dump_failure_is_counted_not_fatal(self):
+        with patch.object(self.m, "dump_session", side_effect=SystemExit(2)):
+            c = self.m.extract(self.root, out_dir=self.out)
+        self.assertEqual((c["extracted"], c["errors"], c["skipped_empty"]), (0, 4, 0))
+        self.assertEqual(self._chunks(S1), [])
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["extracted"], status["errors"]), (0, 4))
 
 
 if __name__ == "__main__":

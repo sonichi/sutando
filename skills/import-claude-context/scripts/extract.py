@@ -51,10 +51,10 @@ from _common import (  # noqa: E402
     DUMPS_DIR, INDEX_FILE, REPO, matches_project, now_iso, session_key, split_csv,
     write_status,
 )
-import index as index_mod  # noqa: E402
-from context_resume import NOISE_BLOCK_RE, NOISE_LINE_RE  # noqa: E402
-from secret_scanner import scan_and_redact  # noqa: E402
-from util_paths import write_private_text  # noqa: E402
+import index as index_mod
+from context_resume import NOISE_BLOCK_RE, NOISE_LINE_RE
+from secret_scanner import scan_and_redact
+from util_paths import write_private_text
 
 DEFAULT_MAX_TOTAL = 8_000_000
 DEFAULT_MAX_CHUNK = 120_000
@@ -65,11 +65,11 @@ TRUNCATED_MARK = " […turn truncated to fit one chunk]"
 TURN_HEADER_RE = re.compile(r"^(\[[^\]\n]*\] (?:USER|ASSISTANT): )(.*)$")
 RECAP_EXTRACT = REPO / "skills" / "session-recap" / "scripts" / "extract.py"
 
-# Key shapes detect-secrets has no plugin for, so secret_scanner leaves them in
-# place. Applied after scan_and_redact with the same placeholder format so
-# downstream readers see one convention. Candidates for upstreaming.
+# Key shapes detect-secrets has no plugin for (so secret_scanner leaves them in
+# place); applied after scan_and_redact with the same placeholder format.
 _EXTRA_SECRET_PATTERNS = {
     "Google API Key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    "Anthropic API Key": re.compile(r"sk-ant-[0-9A-Za-z_-]{20,}"),
 }
 
 
@@ -259,9 +259,8 @@ def extract(root=None, *, out_dir, projects=None, session=None, new_only=False,
             "extracted_size": st.st_size, "redactions": n_redactions,
         })
         if not chunks or dialog_chars < min_chars:
-            # Nothing a summariser could work with (an aborted or never-answered
-            # session, or a couple of lines). No dump; remembered in state so
-            # --new does not retry it; never counted as extracted.
+            # No turn or under --min-chars: nothing to summarise. No dump; remembered
+            # in state so --new does not retry it; never counted as extracted.
             _drop_dumps(dumps_root, slug, s["uuid"])
             rec.update({"skipped_empty": True, "chunks": 0, "chars": dialog_chars})
             counts["skipped_empty"] += 1

@@ -530,11 +530,8 @@ def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: s
 
 # ------------------------------------------------------------------ entity merge
 
-#: An email the summariser left inside a display name — "Cyrus (cyrus@x.com)",
-#: "Cyrus <cyrus@x.com>" — is an identifier, not a name. `_norm_name` drops it
-#: and `_emails_of` keeps it, so the email-group merge still unifies the entry
-#: with a bare "Cyrus" that carries the same address. Seen on the owner's real
-#: history 2026-09-10.
+# An email inside a display name ("Cyrus (cyrus@x.com)", "Cyrus <cyrus@x.com>") is an
+# identifier, not a name: `_norm_name` drops it and `_emails_of` keeps it for the email merge.
 _NAME_EMAIL_RE = re.compile(r"\s*[\(<\[]\s*[^\s()<>\[\]]+@[^\s()<>\[\]]+\s*[\)>\]]")
 
 
