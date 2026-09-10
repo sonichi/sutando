@@ -8943,43 +8943,53 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
-            # Same identity policy as the tracked branch: without it, losing the
-            # last sentinel turns distinct instances back into "duplicates".
-            _groups, _unknown = _group_roots_by_target(WORKSPACE_DIR / "state", roots)
+            # ONE identity snapshot for every derivation below: three separate
+            # resolver reads can disagree if a process's identity changes between.
+            _snap = {r: _watcher_sentinel_target(WORKSPACE_DIR / "state", r) for r in roots}
+            _tgt = lambda rs: ({str(_snap[r]) for r in rs if _snap[r] is not None},
+                               [r for r in rs if _snap[r] is None])
+            _all_t, _unknown = _tgt(roots)
+            _sup_t, _su = _tgt(supervised)
+            _own_t, _ou = _tgt(ownerless)
             if _unknown:
                 cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
                         f"(pids {', '.join(roots)}); {len(_unknown)} "
                         f"({', '.join(_unknown)}) have no resolvable (agent, instance), so "
                         f"whether any task is processed twice is UNKNOWN — do not reduce the count")
-            elif len(_groups) == len(roots) and len(roots) > 1:
+            elif len(_all_t) == len(roots) and len(roots) > 1:
                 cost = (f"{len(roots)} watcher(s) with no PID sentinel (pids {', '.join(roots)}) "
-                        f"resolve to {len(_groups)} DISTINCT instances — not duplicates, and no "
+                        f"resolve to {len(_all_t)} DISTINCT instances — not duplicates, and no "
                         f"task is processed twice; do not reduce the count")
             else:
-                _n = max((len(v) for v in _groups.values()), default=len(roots))
+                _n = max((sum(1 for r in roots if _snap[r] is not None
+                              and str(_snap[r]) == x) for x in _all_t), default=len(roots))
                 cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
                         f"(pids {', '.join(roots)}) — {_n} share one instance target, so its "
                         f"tasks are processed {_n}x")
             count = cost
-            # Reduction is advice about the SUPERVISED subset, so it is that
-            # subset's identity that licenses it -- never the whole root count.
-            _sg, _su = _group_roots_by_target(WORKSPACE_DIR / "state", supervised)
-            _sup_dupe = (not _su) and any(len(v) > 1 for v in _sg.values())
+            _sup_dupe = (not _su) and len(_sup_t) < len(supervised)
             _reduce = "; reduce those through the launcher that owns them" if _sup_dupe else ""
-            # Stop advice is scoped to the ownerless subset; parentage gives
-            # supervision, not target identity and not the restart count.
-            _og, _ou = _group_roots_by_target(WORKSPACE_DIR / "state", ownerless)
+            # Per TARGET, not all-or-nothing: covered targets need no restart,
+            # and an unknown SUPERVISED root may alias any of them.
+            _covered = sorted(_own_t & _sup_t)
+            _uncovered = sorted(_own_t - _sup_t)
             if _ou:
                 _stop = (f"Do NOT stop {', '.join(_ou)} — UNKNOWN identity: it may be the only "
                          f"watcher for its instance")
-            elif _og and set(_og) <= set(_sg):
-                # Restarting after the stop is what recreates the duplicate: a
-                # supervised watcher already serves every one of these targets.
+            elif _su:
+                _stop = (f"Do NOT stop {', '.join(ownerless)} — supervised {', '.join(_su)} has "
+                         f"UNKNOWN identity and may serve the same instance: restarting would "
+                         f"duplicate it, and not restarting may leave a gap")
+            elif _uncovered and _covered:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
+                         f"{len(_uncovered)} cleanly — {len(_covered)} of their instance(s) are "
+                         f"already served by a supervised watcher and must NOT be restarted")
+            elif _covered:
                 _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
                          f"a supervised watcher already serves that instance")
-            elif len(_og) > 1:
+            elif len(_uncovered) > 1:
                 _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
-                         f"{len(_og)} cleanly — one per instance, NOT one")
+                         f"{len(_uncovered)} cleanly — one per instance, NOT one")
             else:
                 _stop = f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart one cleanly"
             if ownerless and supervised:

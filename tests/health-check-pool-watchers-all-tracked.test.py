@@ -763,6 +763,27 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertIn("do NOT restart", d)
         self.assertNotIn("and restart one cleanly", d)
 
+    def test_PARTIAL_overlap_restarts_only_the_uncovered_instances(self):
+        """keweichen: supervised 901->A, ownerless 903->A and 904->B. Restarting
+        two recreates A beside 901; only B needs one."""
+        d = self._detail(
+            f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n"
+            f"  904 1 bash {self.W}\n",
+            targets={"901": "/s/A.pid", "903": "/s/A.pid", "904": "/s/B.pid"})
+        self.assertIn("restart 1 cleanly", d)
+        self.assertIn("must NOT be restarted", d)
+        self.assertNotIn("restart 2 cleanly", d)
+
+    def test_an_UNKNOWN_SUPERVISED_root_licenses_no_ownerless_action(self):
+        """If 901 is actually A, restarting duplicates it; if it is not, stopping
+        903 leaves an A gap. Neither is decidable until identity resolves."""
+        d = self._detail(
+            f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n",
+            targets={"903": "/s/A.pid"})
+        self.assertIn("Do NOT stop 903", d)
+        self.assertIn("UNKNOWN identity", d)
+        self.assertNotIn("restart one cleanly", d)
+
     def test_a_lone_ownerless_watcher_is_still_restarted(self):
         """The advice survives where it is correct, or the gate is a mute."""
         d = self._own(f"  901 1 bash {self.W}\n", {"901": "/s/a.pid"})
