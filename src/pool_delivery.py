@@ -5,7 +5,7 @@ Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
 worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
     tasks/<task-id>.json                     the payload; immutable, never copied
-    deliveries/<me>/<task-id>                a sentinel; existing IS the assignment
+    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.claimed        the same sentinel, suffix substituted
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
@@ -31,11 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from workspace_default import resolve_workspace  # noqa: E402
 
+# `.txt` because the watcher that wakes a worker emits for no other extension.
+PENDING_SUFFIX = ".txt"
 CLAIMED_SUFFIX = ".claimed"
 
 # One suffix, substituted never appended: a claimed sentinel must not still read
 # as unclaimed, or a reader re-takes its own in-flight work.
-_SENTINEL = re.compile(r"^(?P<id>task-[A-Za-z0-9_-]+?)(?P<claimed>\.claimed)?$")
+_SENTINEL = re.compile(
+    r"^(?P<id>task-[A-Za-z0-9_-]+?)(?:\.txt|(?P<claimed>\.claimed))$")
 
 RECIPIENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
@@ -108,7 +111,7 @@ def claimed(workspace: Path, recipient: str) -> list[Path]:
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     """The sentinel for `task_id` under either name, or None."""
     d = deliveries_dir(workspace, recipient)
-    for name in (task_id, task_id + CLAIMED_SUFFIX):
+    for name in (task_id + PENDING_SUFFIX, task_id + CLAIMED_SUFFIX):
         p = d / name
         if p.exists():
             return p
@@ -134,7 +137,7 @@ def release(sentinel: Path) -> Path:
     got = parse_sentinel(sentinel.name)
     if got is None or not got[1]:
         raise NotDelivered(f"not a claimed sentinel: {sentinel.name}")
-    dst = sentinel.with_name(got[0])
+    dst = sentinel.with_name(got[0] + PENDING_SUFFIX)
     os.rename(sentinel, dst)
     return dst
 

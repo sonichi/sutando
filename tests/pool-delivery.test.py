@@ -26,8 +26,10 @@ class Workspace:
     def deliver(self, recipient, task_id):
         d = self.root / "deliveries" / recipient
         d.mkdir(parents=True, exist_ok=True)
-        p = d / task_id
-        os.open(p, os.O_CREAT | os.O_EXCL)
+        # Spelled literally, not via pd.PENDING_SUFFIX: a test that reads the
+        # constant cannot catch the constant changing.
+        p = d / f"{task_id}.txt"
+        os.close(os.open(p, os.O_CREAT | os.O_EXCL))
         return p
 
     def result(self, task_id, text="done"):
@@ -52,7 +54,10 @@ class Base(unittest.TestCase):
 
 class TestSentinelNames(Base):
     def test_unclaimed_parses(self):
-        self.assertEqual(pd.parse_sentinel("task-abc"), ("task-abc", False))
+        self.assertEqual(pd.parse_sentinel("task-abc.txt"), ("task-abc", False))
+        # Extensionless is NOT a sentinel: the watcher that wakes a worker
+        # emits for no other extension, so such a file would never be seen.
+        self.assertIsNone(pd.parse_sentinel("task-abc"))
 
     def test_claimed_parses(self):
         self.assertEqual(pd.parse_sentinel("task-abc.claimed"), ("task-abc", True))
@@ -208,7 +213,7 @@ class TestSweep(Base):
         pd.claim(self.ws.deliver("core", "task-1"))
         out = pd.sweep(self.root, "core")
         self.assertEqual(out["released"], ["task-1"])
-        self.assertTrue((self.root / "deliveries/core/task-1").exists())
+        self.assertTrue((self.root / "deliveries/core/task-1.txt").exists())
 
     def test_does_not_release_finished_work(self):
         self.ws.payload("task-1")
