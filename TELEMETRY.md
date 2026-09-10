@@ -13,6 +13,13 @@ Only bucketed / categorical **product events**:
 | `core_started` | `interval_s` | Count active installs (OSS + desktop) |
 | `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `skill:<name>`) | Which features matter |
 | `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
+| `token_usage` | `util_5h_pct`, `util_7d_pct` (Anthropic rate-limit utilization, bucketed to nearest 5%), `status` (`unavailable` when the local quota snapshot cannot be read) | Aggregate quota/token consumption trend and reporting coverage (the accessible usage signal — raw token counts are never read) |
+
+Every event **also** carries two categorical properties so any metric can be
+broken down by them: `surface` (`desktop`/`oss`) and `core_model` (the model id
+powering the core, e.g. `claude-opus-4-8`, or `unknown`). `core_model` is read
+from `$SUTANDO_CORE_MODEL` → `$ANTHROPIC_MODEL` → Claude Code `settings.json` →
+`unknown`; set `SUTANDO_CORE_MODEL` in the launcher for accurate model tracking.
 
 Skill adoption arrives through `feature_used` as `skill:<name>`, emitted by
 `hooks/skill-usage-telemetry.py` for every skill invoked **through the `Skill`

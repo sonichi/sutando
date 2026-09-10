@@ -12,9 +12,8 @@ and that a normal capture DOES reach the sink when enabled.
 
 Run: python3 tests/telemetry.test.py
 """
-# PEP 604 (`X | None`) in annotations is evaluated at def-time on Python < 3.10;
-# defer all annotation evaluation so this file runs on the 3.9 baseline (CR #2088,
-# @qingyun-wu). No runtime annotation introspection here, so this is semantics-safe.
+# PEP 604 (`X | None`) is evaluated at def-time before 3.10, so defer annotation
+# evaluation to keep this file runnable on the 3.9 baseline.
 from __future__ import annotations
 
 import importlib.util
@@ -33,7 +32,8 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 def _load(state_dir: Path, key: str = "", env: dict | None = None):
     """Import a fresh telemetry module with a temp state dir + clean env."""
     for k in ("DO_NOT_TRACK", "SUTANDO_TELEMETRY", "POSTHOG_API_KEY",
-              "SUTANDO_DEBUG_TELEMETRY", "SUTANDO_SURFACE", "SUTANDO_TELEMETRY_ID_FILE"):
+              "SUTANDO_DEBUG_TELEMETRY", "SUTANDO_SURFACE", "SUTANDO_TELEMETRY_ID_FILE",
+              "SUTANDO_CORE_MODEL", "ANTHROPIC_MODEL"):
         os.environ.pop(k, None)
     os.environ["SUTANDO_STATE_DIR"] = str(state_dir)
     # Isolate the durable per-install-id path into the temp tree so tests never
@@ -211,8 +211,8 @@ def run():
         # Beyond the source bucket, the only extra keys are the standard anonymity
         # + surface envelope every event carries (#2071): surface + $set. Still no
         # task content, ids, user, or channel — that's the invariant under test.
-        assert set(tp["properties"]) == {"$ip", "$geoip_disable", "source", "surface", "$set"}, \
-            f"task_processed must ship ONLY the source bucket + surface envelope, got {tp['properties']}"
+        assert set(tp["properties"]) == {"$ip", "$geoip_disable", "source", "surface", "core_model", "$set"}, \
+            f"task_processed must ship ONLY the source bucket + surface/core_model envelope, got {tp['properties']}"
         passed += 1
         print("ok   task_processed/feature_used send correct bucketed events")
 
@@ -471,7 +471,147 @@ def run():
         passed += 1
         print("ok   durable path — macOS / XDG / default / override branches")
 
-    # 14) bandaid_generalize (#2147): the opt-out marker is honored at the
+    # 14) core_model rides on EVERY event (property + $set), from $SUTANDO_CORE_MODEL.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": "claude-opus-4-8"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        _capture_sync(mod, "core_started", {"interval_s": 30})
+        pr = calls[0]["properties"]
+        assert pr["core_model"] == "claude-opus-4-8", pr
+        assert pr["$set"]["core_model"] == "claude-opus-4-8", pr["$set"]
+        passed += 1
+        print("ok   core_model attached to every event (property + $set)")
+
+    # 15) core_model falls back to 'unknown' when unset and no settings model.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"CLAUDE_CONFIG_DIR": str(Path(td) / "no-such")})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        _capture_sync(mod, "feature_used", {"feature": "x"})
+        assert calls[0]["properties"]["core_model"] == "unknown", calls[0]["properties"]
+        passed += 1
+        print("ok   core_model → 'unknown' when unset")
+
+    # 16) core_model resolution chain: $ANTHROPIC_MODEL fallback, and reading the
+    #     `model` from Claude Code's settings.json when no env var is set.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"ANTHROPIC_MODEL": "claude-from-env"})
+        # "-from-env" is not a version, so this asserts BOTH that the env var is
+        # read and that its value is sanitized on the way out.
+        assert mod._core_model() == "claude", "ANTHROPIC_MODEL fallback, coarsened"
+        passed += 1
+        print("ok   core_model reads $ANTHROPIC_MODEL fallback")
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "cfg"
+        cfg.mkdir(parents=True)
+        (cfg / "settings.json").write_text(json.dumps({"model": "claude-from-settings"}))
+        mod = _load(Path(td), key="phc_live", env={"CLAUDE_CONFIG_DIR": str(cfg)})
+        assert mod._core_model() == "claude", "settings.json model, coarsened"
+        passed += 1
+        print("ok   core_model reads model from settings.json")
+
+    # 17) token_usage: bucketed utilization (nearest 5%) + status + model; and the
+    #     _bucket_pct helper clamps/rounds/sentinels.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": "claude-sonnet-5"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.token_usage(41.2, 3.9, status="allowed")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        p = calls[0]
+        assert p["event"] == "token_usage", p["event"]
+        assert p["properties"]["util_5h_pct"] == 40, p["properties"]  # 41.2 → 40
+        assert p["properties"]["util_7d_pct"] == 5, p["properties"]   # 3.9 → 5
+        assert p["properties"]["status"] == "allowed", p["properties"]
+        assert p["properties"]["core_model"] == "claude-sonnet-5", p["properties"]
+        assert mod._bucket_pct(0) == 0 and mod._bucket_pct(100) == 100
+        assert mod._bucket_pct(150) == 100 and mod._bucket_pct(-5) == 0
+        assert mod._bucket_pct(97.5) == 100
+        assert mod._bucket_pct(None) == -1 and mod._bucket_pct("x") == -1
+        passed += 1
+        print("ok   token_usage bucketed (5%) + status + model; _bucket_pct clamps/sentinels")
+
+    # 17b) core_model sources are tenant-controlled, so a custom alias must
+    #      collapse to 'unknown' rather than reach PostHog verbatim.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        # Safe categorical ids pass (lowercased); PII/high-cardinality → unknown.
+        assert mod._coarse_model("claude-opus-4-8") == "claude-opus-4-8"
+        assert mod._coarse_model("  Claude-Sonnet-5 ") == "claude-sonnet-5"
+        assert mod._coarse_model("acme-tenant/prod-model") == "unknown"
+        assert mod._coarse_model("https://ep.acme.com/v1") == "unknown"
+        assert mod._coarse_model("user@acme.com") == "unknown"
+
+        # A tenant alias passes the charset check; the family allow-list is what
+        # stops it reaching the wire verbatim.
+        assert mod._coarse_model("acme-prod") == "unknown"
+        assert mod._coarse_model("customer_foo") == "unknown"
+        assert mod._coarse_model("internal-claude-clone") == "unknown"
+        # A KNOWN FAMILY PREFIX must not license a free-text tail: the regex +
+        # first-token check alone shipped these verbatim to PostHog.
+        assert mod._coarse_model("claude-jane-doe-laptop") == "claude"
+        assert mod._coarse_model("claude-acme-prod") == "claude"
+        assert mod._coarse_model("gpt-customer-foo") == "gpt"
+        assert mod._coarse_model("opus-internal-project-x") == "opus"
+        assert mod._coarse_model("claude-" + "a" * 32) == "claude"
+        # A leading digit is not a version: requiring only the FIRST character to
+        # be one let digits-led free text ship verbatim.
+        assert mod._coarse_model("claude-1janedoe") == "claude"
+        assert mod._coarse_model("claude-1.jane.doe") == "claude"
+        assert mod._coarse_model("gpt-7customer42") == "gpt"
+        # The other half: a grammar that collapsed EVERYTHING would satisfy the
+        # asserts above and destroy the metric, so both directions are pinned.
+        assert mod._coarse_model("claude-3-5-haiku-20241022") == "claude-3-5-haiku-20241022"
+        assert mod._coarse_model("gpt-4") == "gpt-4"
+        assert mod._coarse_model("gpt-5") == "gpt-5"
+        assert mod._coarse_model("gemini-2.5-pro") == "gemini-2.5-pro"
+        assert mod._coarse_model("gpt-4o") == "gpt-4o"
+        assert mod._coarse_model("gpt-4.1") == "gpt-4.1"
+        assert mod._coarse_model("llama-3-70b") == "llama-3-70b"
+        assert mod._coarse_model("model with spaces") == "unknown"
+        assert mod._coarse_model("x" * 60) == "unknown"                       # over length cap
+        assert mod._coarse_model("") == "unknown"
+        # End-to-end: a hostile $SUTANDO_CORE_MODEL never leaves the allowlist.
+        m2 = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": "acme/prod:secret-key"})
+        assert m2._core_model() == "unknown", m2._core_model()
+        passed += 1
+        print("ok   core_model collapses PII/high-cardinality alias to 'unknown'")
+
+    # 17c) token_usage status is constrained to the five documented categories;
+    #      arbitrary quota-script output becomes 'unknown', not telemetry.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        for ok in ("allowed", "allowed_warning", "rejected", "unknown", "unavailable"):
+            assert mod._coarse_status(ok) == ok, ok
+        assert mod._coarse_status("ALLOWED") == "allowed"                     # normalized
+        assert mod._coarse_status("rate limited: 429 for tenant acme") == "unknown"
+        assert mod._coarse_status("") == "unknown"
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.token_usage(10, 10, status="surprise-error-string")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        assert calls[0]["properties"]["status"] == "unknown", calls[0]["properties"]
+        passed += 1
+        print("ok   token_usage status constrained to allowlist ('unknown' otherwise)")
+
+    # 18) token_usage honors opt-out (no path around capture()).
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"DO_NOT_TRACK": "1"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.token_usage(50, 20, status="allowed")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        assert calls == [], f"opt-out MUST silence token_usage, got {calls}"
+        passed += 1
+        print("ok   token_usage honors opt-out (zero sends)")
+    # 19) bandaid_generalize (#2147): the opt-out marker is honored at the
     #     DURABLE data dir too, not just <workspace>/state.
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -484,7 +624,7 @@ def run():
         passed += 1
         print("ok   opt-out honored at the durable data dir (#2147 generalize)")
 
-    # 15) BEFORE/AFTER: an opt-out survives workspace churn ONLY when it lives in
+    # 20) BEFORE/AFTER: an opt-out survives workspace churn ONLY when it lives in
     #     the durable dir. BEFORE (marker in <workspace>/state) → a churn to a
     #     new state dir drops it and telemetry re-enables. AFTER (marker in the
     #     durable dir) → the same churn keeps opted_out True.
@@ -507,6 +647,60 @@ def run():
         assert after is True, "durable opt-out must survive churn"
         passed += 1
         print("ok   BEFORE legacy opt-out lost on churn / AFTER durable opt-out survives (#2147)")
+
+    # 21) Asserted on the SERIALISED payload, not _coarse_model: the raw value
+    #     must be absent from EVERY field. Dot-chunked rows are the same ids re-encoded.
+    for raw, family in (("claude-15551234567", "claude"),
+                        ("gemini-4111111111111111", "gemini"),
+                        ("gpt-123456789012345678901234567890", "gpt"),
+                        ("gpt-12345678", "gpt"),
+                        ("claude-1.555.123.4567", "claude"),
+                        ("claude-4111.1111.1111.1111", "claude"),
+                        ("claude-555.123.4567", "claude"),
+                        ("gemini-4111.1111.1111", "gemini"),
+                        ("gpt-2026.1111.1111", "gpt")):
+        with tempfile.TemporaryDirectory() as td:
+            mod = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": raw})
+            calls = []
+            mod._post = lambda payload: calls.append(payload)  # type: ignore
+            _capture_sync(mod, "core_started", {"interval_s": 30})
+            pr = calls[0]["properties"]
+            digits = raw.split("-", 1)[1]
+            wire = json.dumps(calls[0])
+            assert pr["core_model"] == family, f"{raw}: got {pr['core_model']!r}"
+            assert pr["$set"]["core_model"] == family, pr["$set"]
+            assert digits not in wire, f"{raw}: raw identifier reached the wire in {wire}"
+    passed += 1
+    print("ok   adversarial numeric aliases collapse to family, absent from the payload")
+
+    # 21b) Positive control for the row above: a rule that rejected every dotted
+    #      token would pass all of it. Real versions must still reach the wire.
+    for raw in ("claude-4.5", "claude-2026.08.28", "claude-1.0.0", "gpt-4.1",
+                "gemini-2.5", "claude-20260828", "claude-4.5a", "claude-opus-4-1"):
+        with tempfile.TemporaryDirectory() as td:
+            mod = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": raw})
+            calls = []
+            mod._post = lambda payload: calls.append(payload)  # type: ignore
+            _capture_sync(mod, "core_started", {"interval_s": 30})
+            pr = calls[0]["properties"]
+            assert pr["core_model"] == raw, \
+                f"{raw}: a real version was collapsed to {pr['core_model']!r}"
+    passed += 1
+    print("ok   dot-chunked identifiers collapse; real versions survive verbatim")
+
+    # 22) Control for 21: without this, a guard that collapses EVERYTHING would
+    #     pass 21 and prove nothing.
+    for raw in ("claude-3-5-sonnet-20241022", "claude-sonnet-4-5-20250929",
+                "gpt-4o", "claude-opus-4-1", "gemini-2.5-pro", "llama-70b", "o3-mini"):
+        with tempfile.TemporaryDirectory() as td:
+            mod = _load(Path(td), key="phc_live", env={"SUTANDO_CORE_MODEL": raw})
+            calls = []
+            mod._post = lambda payload: calls.append(payload)  # type: ignore
+            _capture_sync(mod, "core_started", {"interval_s": 30})
+            got = calls[0]["properties"]["core_model"]
+            assert got == raw, f"real model id was collapsed: {raw} -> {got}"
+    passed += 1
+    print("ok   real model ids survive the numeric guard intact (control)")
 
     print(f"\nALL PASS ({passed} checks)")
     return 0

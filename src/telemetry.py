@@ -49,7 +49,9 @@ Config
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -233,6 +235,82 @@ def _install_surface() -> str:
     return "oss"
 
 
+# Model sources are tenant-controlled, so an alias like `acme-prod` satisfies any
+# charset check; only a family allow-list keeps it off the wire.
+_MODEL_FAMILIES = ("claude", "gpt", "o1", "o3", "o4", "gemini", "llama", "mistral",
+                   "qwen", "deepseek", "grok", "codex", "haiku", "sonnet", "opus")
+_MODEL_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
+
+
+# A version is a date stamp (20YYMMDD) or <=3 dot-groups of <=4 digits, and never
+# more digits in total than a date stamp. A chunked identifier is not a version.
+_VERSION_TOKEN = re.compile(r"(?:20\d{6}|\d{1,4})(?:\.\d{1,4}){0,2}[a-z]?")
+_VERSION_MAX_DIGITS = 8
+
+
+def _is_version(tok: str) -> bool:
+    """Shape AND size: the group cap alone still admits 16 digits (2026.1111.1111)."""
+    return (_VERSION_TOKEN.fullmatch(tok) is not None
+            and sum(c.isdigit() for c in tok) <= _VERSION_MAX_DIGITS)
+# Vendor tier words that appear in real model ids. Bounded on purpose — the
+# point is a finite vocabulary, so an unlisted word collapses to the family.
+_MODEL_QUALIFIERS = frozenset({
+    "pro", "mini", "nano", "flash", "turbo", "instant", "preview", "latest",
+    "thinking", "reasoning", "chat", "code", "vision", "lite", "max", "plus",
+})
+
+
+def _coarse_model(raw: str) -> str:
+    """Every token must be a known family or a version; an env-controlled alias
+    must not reach the wire, and a known PREFIX is not enough to trust the tail."""
+    s = (raw or "").strip().lower()
+    if not _MODEL_RE.fullmatch(s):
+        return "unknown"
+    parts = s.split("-")
+    if parts[0] not in _MODEL_FAMILIES:
+        return "unknown"
+    for tok in parts[1:]:
+        if (tok in _MODEL_FAMILIES or tok in _MODEL_QUALIFIERS
+                or _is_version(tok)):
+            continue
+        return parts[0]  # unrecognised tail: keep the family, drop the free text
+    return s
+
+
+def _core_model() -> str:
+    """Categorical name of the model powering the Sutando core (e.g.
+    ``claude-opus-4-8``), or ``"unknown"``.
+
+    Claude Code does not export the active model to the core process, so there
+    is no fully-reliable runtime signal. Resolution order, first hit wins:
+      1. ``$SUTANDO_CORE_MODEL`` — explicit, set by the launcher (startup.sh /
+         desktop app) that DOES know which model it started the core with;
+      2. ``$ANTHROPIC_MODEL`` — honored by some launch paths;
+      3. ``model`` in Claude Code's settings.json (``$CLAUDE_CONFIG_DIR`` or
+         ``~/.claude``) when the user pinned one there;
+      4. ``"unknown"``.
+    Categorical only — every candidate is run through ``_coarse_model`` (bounded
+    charset + length cap → ``unknown``) so a custom alias can never leak PII or
+    inflate cardinality. Fail-safe: any error → ``"unknown"``.
+    """
+    for var in ("SUTANDO_CORE_MODEL", "ANTHROPIC_MODEL"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return _coarse_model(v)
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import claude_home_path  # noqa: E402
+
+        settings = claude_home_path("settings.json")
+        if settings.exists():
+            m = json.loads(settings.read_text()).get("model")
+            if isinstance(m, str) and m.strip():
+                return _coarse_model(m)
+    except Exception:  # pragma: no cover — best-effort read
+        pass
+    return "unknown"
+
+
 def enabled() -> bool:
     """Telemetry fires only when a key is configured AND not opted out."""
     return bool(_KEY) and not opted_out()
@@ -339,6 +417,49 @@ def feature_used(feature: str, *, flush: bool = False) -> None:
     capture("feature_used", {"feature": str(feature)}, flush=flush)
 
 
+def _bucket_pct(x) -> int:
+    """Round a 0-100 utilization percentage to the nearest 5 — coarse enough to
+    stay a bucket (never a fingerprint), fine enough to trend usage."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return -1
+    if not math.isfinite(v):
+        return -1
+    v = max(0.0, min(100.0, v))
+    return int(round(v / 5.0) * 5)
+
+
+# Arrives as free text from the quota script, so anything outside this set
+# becomes ``unknown`` rather than high-cardinality or sensitive telemetry.
+_TOKEN_STATUSES = frozenset(
+    {"allowed", "allowed_warning", "rejected", "unknown", "unavailable"}
+)
+
+
+def _coarse_status(status: str) -> str:
+    s = (status or "").strip().lower()
+    return s if s in _TOKEN_STATUSES else "unknown"
+
+
+def token_usage(util_5h_pct=None, util_7d_pct=None, status: str = "unknown") -> None:
+    """One anonymous event snapshotting quota/token consumption, as the
+    Anthropic rate-limit *utilization* of the 5h and 7d windows (the accessible
+    usage signal — raw token counts aren't exposed to the core). Values are
+    bucketed to the nearest 5% so they stay coarse aggregates, never a
+    fingerprint. ``status`` is the categorical rate-limit status
+    (``allowed`` / ``allowed_warning`` / ``rejected`` / ``unknown`` /
+    ``unavailable``), validated against that allowlist so unexpected script
+    output can't leak. No PII.
+    Emitted best-effort by the heartbeat once per boot; safe to call anywhere.
+    """
+    capture("token_usage", {
+        "util_5h_pct": _bucket_pct(util_5h_pct),
+        "util_7d_pct": _bucket_pct(util_7d_pct),
+        "status": _coarse_status(status),
+    })
+
+
 def _dispatch(event: str, properties: dict | None, *, flush: bool = False) -> None:
     props = {
         "$ip": "",
@@ -351,7 +472,11 @@ def _dispatch(event: str, properties: dict | None, *, flush: bool = False) -> No
     # caller spread + merged into any existing $set so it's always present.
     surface = _install_surface()
     props["surface"] = surface
-    props["$set"] = {**props.get("$set", {}), "surface": surface}
+    # On every event AND as a person property, so any metric can be split by
+    # core model. "unknown" until the launcher sets $SUTANDO_CORE_MODEL.
+    model = _core_model()
+    props["core_model"] = model
+    props["$set"] = {**props.get("$set", {}), "surface": surface, "core_model": model}
     payload = {
         "api_key": _KEY,
         "event": event,

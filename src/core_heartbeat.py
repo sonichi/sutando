@@ -720,6 +720,56 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _emit_token_usage() -> None:  # pragma: no cover — network + optional-skill glue
+    """Best-effort: read the quota-tracker's rate-limit snapshot and emit an
+    anonymous ``token_usage`` telemetry event (bucketed utilization + status).
+
+    Optional-skill safe: if the quota-tracker script isn't installed or the read
+    fails, emit an ``unavailable`` categorical event with sentinel percentages
+    so fleet views can distinguish "cannot report" from "no usage." Never raises
+    to the caller.
+    """
+    try:
+        import subprocess
+        from telemetry import enabled, token_usage
+        from util_paths import claude_home_path
+
+        # Skip BEFORE read-quota.py: that reader writes quota-burn-history.json,
+        # so running it would break the opt-out contract, not just the upload.
+        if not enabled():
+            return
+        script = claude_home_path("skills", "quota-tracker", "scripts", "read-quota.py")
+        if not script.exists():
+            token_usage(status="unavailable")
+            return
+        try:
+            out = subprocess.run(
+                [sys.executable, str(script), "--json"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            token_usage(status="unavailable")
+            return
+        if out.returncode != 0 or not out.stdout.strip():
+            token_usage(status="unavailable")
+            return
+        try:
+            data = json.loads(out.stdout)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            token_usage(status="unavailable")
+            return
+        if not isinstance(data, dict):
+            token_usage(status="unavailable")
+            return
+        rem5 = data.get("remaining_5h_pct")
+        rem7 = data.get("remaining_7d_pct")
+        util5 = (100 - rem5) if isinstance(rem5, (int, float)) else None
+        util7 = (100 - rem7) if isinstance(rem7, (int, float)) else None
+        token_usage(util5, util7, status=str(data.get("status", "unknown")))
+    except Exception:
+        pass  # telemetry must never affect the core
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.mark_stopped:
@@ -738,6 +788,12 @@ def main(argv: list[str] | None = None) -> int:
         from telemetry import capture  # sibling module (src/ already on sys.path)
 
         capture("core_started", {"interval_s": args.interval})
+    except Exception:  # pragma: no cover — telemetry must never break the core
+        pass
+    # Daemon thread: a quota read must never delay the beat loop.
+    try:  # pragma: no cover — fire-and-forget glue
+        import threading
+        threading.Thread(target=_emit_token_usage, daemon=True).start()
     except Exception:  # pragma: no cover — telemetry must never break the core
         pass
     return run_forever(interval=args.interval, status=args.status)
