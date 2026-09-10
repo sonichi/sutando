@@ -120,7 +120,15 @@ check(r["ok"] is False and "network" in r["reason"], "URLError -> network reason
 r, _ = _run("x", raises=ValueError("not json"))
 check(r["ok"] is False and "parse" in r["reason"], "a non-JSON 200 -> parse reason")
 
-print("7. refusals before the network")
+print("7. a declined answer without an `error` key")
+r, _ = _run("x", {"ok": False, "reason": "rate limited"})
+check(r["ok"] is False and r["reason"] == "rate limited" and not rs.is_ambiguous(r),
+      "ok:false + reason -> the reason is relayed, not read as a hit")
+r, _ = _run("x", {"ok": False})
+check(r["ok"] is False and r["reason"] == "gateway declined",
+      "ok:false with nothing else -> 'gateway declined'")
+
+print("8. refusals before the network")
 calls = []
 saved_g, saved_h = rs.gateway, rs.http_json
 try:

@@ -19,6 +19,7 @@ import importlib.util
 import os
 import sys
 import unittest
+import urllib.error
 from unittest import mock
 
 SKILL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -100,6 +101,54 @@ class TestMatchMember(unittest.TestCase):
                   {"user_id": BASSIL_AGENT, "display_name": "Bassil's Sutando", "kind": "agent"}]
         self.assertEqual(self.R.match_member("Bassil's Sutando", roster)["mxid"], BASSIL_AGENT)
         self.assertEqual(self.R.match_member("bassil", roster)["mxid"], "@bassil:ag2.space")
+
+    def test_substring_tiers_below_token_prefix(self):
+        """A fragment that starts no token still resolves when unique: first
+        as a substring of the localpart, then of a display name."""
+        self.assertEqual(self.R.match_member("onichi", [SONICHI, "@chi:ag2.space"])["mxid"],
+                         SONICHI)
+        roster = [{"user_id": "@bassil:ag2.space", "display_name": "Bassil"},
+                  {"user_id": BASSIL_AGENT, "display_name": "Bassil's Sutando"}]
+        self.assertEqual(self.R.match_member("assil's sut", roster)["mxid"], BASSIL_AGENT)
+
+    def test_a_query_that_normalises_to_nothing_is_a_miss(self):
+        for q in ("'s", "@", "  -_-  "):
+            got = self.R.match_member(q, [SONICHI])
+            self.assertFalse(got["ok"], q)
+            self.assertIn("no agent matches", got["reason"], q)
+
+    def test_token_prefix_needs_tokens_on_both_sides(self):
+        self.assertFalse(self.R._token_prefix("", "sutando-sonichi"))
+        self.assertFalse(self.R._token_prefix("sonichi", ""))
+        self.assertTrue(self.R._token_prefix("bassil-sutando", "bassil-s-sutando"))
+
+    def test_a_full_mxid_is_trusted_and_fetches_no_directory(self):
+        got = self.R.match_member("@whoever:ag2.space", [SONICHI])
+        self.assertEqual((got["ok"], got["mxid"]), (True, "@whoever:ag2.space"))
+        self.R.list_agents = lambda: self.fail("a full mxid must not fetch /v1/agents")
+        self.assertEqual(self.R.resolve_user("@whoever:ag2.space")["mxid"], "@whoever:ag2.space")
+
+    def test_directory_entries_without_an_id_are_skipped(self):
+        got = self.R.match_agent("sonichi", [{"label": "Sonichi's Sutando"}, "junk", {"id": SONICHI}])
+        self.assertEqual(got["mxid"], SONICHI)
+
+    def test_resolve_user_reads_the_directory_only_when_no_agents_are_given(self):
+        self.R.list_agents = lambda: {"ok": False, "agents": [], "reason": "no gateway configured"}
+        got = self.R.resolve_user("sonichi")
+        self.assertEqual((got["ok"], got["reason"]), (False, "no gateway configured"))
+        self.R.list_agents = lambda: {"ok": True, "agents": [{"id": SONICHI}], "reason": None}
+        self.assertEqual(self.R.resolve_user("sonichi")["mxid"], SONICHI)
+        self.assertEqual(self.R.resolve_user("sonichi", agents=[])["ok"], False)
+
+    def test_an_unimportable_members_module_leaves_a_tie_a_tie(self):
+        """The agent preference reads `members.classify_member` lazily; when that
+        import fails nobody is known to be an agent, so the tie stays a refusal."""
+        pair = [{"id": "@alex:ag2.space", "display_name": "Alex Sutando"},
+                {"id": "@alex-alex-sutando.agent:ag2.space", "display_name": "Alex Sutando"}]
+        with mock.patch.dict(sys.modules, {"members": None}):
+            got = self.R.match_agent("Alex Sutando", pair, prefer_agents=True)
+        self.assertFalse(got["ok"])
+        self.assertEqual(len(got["candidates"]), 2)
 
 
 class TestMentionFallback(unittest.TestCase):
@@ -251,10 +300,10 @@ class TestMentionFallback(unittest.TestCase):
         self.assertEqual(len(self.broker.asked), 1)   # a missing op is not retried with the slug
 
     def test_broker_miss_on_the_name_but_hit_on_its_slug(self):
-        # The broker normalises nothing, and a display name can be changed
-        # while the localpart keeps the registration slug: "Susan's bot" then
-        # misses, but its platform spelling "susan-s-bot" is a substring of
-        # `@liususan091219-susan-s-bot.agent:ag2.space`.
+        """The broker normalises nothing, and a display name can be changed
+        while the localpart keeps the registration slug: "Susan's bot" then
+        misses, but its platform spelling "susan-s-bot" is a substring of
+        `@liususan091219-susan-s-bot.agent:ag2.space`."""
         susan = "@liususan091219-susan-s-bot.agent:ag2.space"
         self.broker.answers["susan-s-bot"] = _Broker.hit(susan, "Susan's assistant")
         with self._members(["@chi:ag2.space"]):
@@ -283,6 +332,39 @@ class TestMentionFallback(unittest.TestCase):
             got = self._mention("sutando-sonichi")
         self.assertFalse(got["ok"])
         self.assertIn("no agent matches", got["reason"])
+        self.assertEqual(self.posted, [])
+
+    # ----- a resolved mxid that still cannot be posted ----- #
+    def test_client_gate_denial_names_the_resolved_mxid_and_posts_nothing(self):
+        self.M.gate_allows = lambda *a, **k: False
+        got = self._mention("sutando-sonichi", agents=[{"id": SONICHI}])
+        self.assertFalse(got["ok"])
+        self.assertIn("client gate denied", got["reason"])
+        self.assertEqual((got["mxid"], got["resolved_by"]), (SONICHI, "directory"))
+        self.assertEqual(self.posted, [])
+
+    def test_no_gateway_is_named_after_the_resolve(self):
+        self.M.gateway = lambda: ("", {})
+        got = self._mention("sutando-sonichi", agents=[{"id": SONICHI}])
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["reason"], "no gateway configured")
+        self.assertEqual(got["mxid"], SONICHI)
+        self.assertEqual(self.posted, [])
+
+    def test_post_failures_degrade_with_a_reason_and_the_mxid(self):
+        """An HTTP or transport failure on the post itself never raises: the
+        result keeps the resolved mxid so the caller knows WHO was not reached."""
+        for exc, marker in ((urllib.error.HTTPError("https://relay/v1/room", 403, "x", {}, None),
+                             "403"),
+                            (urllib.error.URLError("dns"), "network error"),
+                            (TimeoutError("slow"), "network error")):
+            def _boom(*a, **k):
+                raise exc
+            self.M.http_json = _boom
+            got = self._mention("sutando-sonichi", agents=[{"id": SONICHI}])
+            self.assertFalse(got["ok"], exc)
+            self.assertIn(marker, got["reason"], exc)
+            self.assertEqual((got["mxid"], got["resolved_by"]), (SONICHI, "directory"), exc)
         self.assertEqual(self.posted, [])
 
     def test_roster_tie_between_a_person_and_their_agent_picks_the_agent(self):

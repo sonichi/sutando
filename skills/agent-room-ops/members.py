@@ -16,11 +16,8 @@ from __future__ import annotations
 
 from _gateway import gateway, http_json, degrade_reason, HTTPError, URLError
 
-# An `.agent:` localpart suffix is assigned by the platform when an agent
-# registers. The prefixes are the legacy conventions from before the suffix —
-# this fleet's `sutando-` and the other runtimes' — and MIRROR the web
-# client's list in cinny `src/app/utils/agentMxid.ts:14-22`, so both sides
-# read one mxid the same way; change them together.
+# `.agent:` is the platform's registration suffix; the prefixes are the legacy conventions
+# and MIRROR cinny `src/app/utils/agentMxid.ts:14-22` — change both lists together.
 _AGENT_SUFFIX = ".agent:"
 _AGENT_PREFIXES = ("sutando-", "codex-", "hermes-", "openclaw-", "cline-", "pi-", "kilo-")
 

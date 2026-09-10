@@ -137,12 +137,8 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
 
     body = build_body(mxid, message)
     try:
-        # `mentions` is stamped by the broker into `m.mentions` (since
-        # 2026-07-21), and the leading mxid in `body` is both the routing token
-        # `is_mention` matches as a whole token AND the literal the broker
-        # auto-mentions and renders as a pill for humans. Both stay: structured
-        # routing plus a visible, greppable ask. Never move the mxid out of the
-        # plain body.
+        # `mentions` → m.mentions (broker, 2026-07-21); the mxid LEADING `body` is
+        # the routing token AND the literal pilled for humans. Both stay — never move it.
         cid = os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID")
         worker = os.environ.get("SUTANDO_WORKER_ID") or (f"worker-{cid}" if cid else None)
         _color = (os.environ.get("SUTANDO_WORKER_ACCENT")

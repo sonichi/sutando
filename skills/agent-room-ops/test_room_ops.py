@@ -565,10 +565,8 @@ _AGENTS = [
     {"id": "@qingyun-air.agent:ag2.space", "label": "core"},
 ]
 
-# The shapes one real room holds (2026-09-10): a person, their platform agent
-# (the registration slug keeps the possessive's "s" as its own token), a
-# legacy-prefix agent named "<owner>'s Sutando", and a platform agent with a
-# short label. `display_name` is what `members.room_members` carries.
+# One real room's shapes (2026-09-10): a person, their platform agent (the slug keeps
+# the possessive's "s" as a token), a legacy-prefix agent, a short-labelled platform agent.
 _ROSTER = [
     {"id": "@bassil:ag2.space", "display_name": "Bassil"},
     {"id": "@bassil-bassil-s-sutando.agent:ag2.space", "display_name": "Bassil's Sutando"},
@@ -629,9 +627,9 @@ class ResolveTests(unittest.TestCase):
             self.assertEqual(r["mxid"], BASSIL_AGENT, q)
 
     def test_exact_human_name_beats_agent_preference(self):
-        # "Bassil" is the person's exact localpart AND name; the agent only
-        # token-prefix-matches. A lower tier never competes, so the preference
-        # (which breaks ties INSIDE a tier) has nothing to break.
+        """The query "Bassil" is the person's exact localpart AND name; the agent only
+        token-prefix-matches. A lower tier never competes, so the preference
+        (which breaks ties INSIDE a tier) has nothing to break."""
         r = rs.match_member("Bassil", _ROSTER, prefer_agents=True)
         self.assertEqual(r["mxid"], "@bassil:ag2.space")
 
@@ -652,10 +650,10 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(rs.match_agent("core", _ROSTER)["mxid"], "@qingyun-air.agent:ag2.space")
 
     def test_member_dicts_carry_display_names_bare_ids_do_not(self):
-        # Same roster, two shapes: the {user_id, display_name, kind} dicts
-        # `members.room_members` returns, and the bare mxid list older callers
-        # pass. The name tier is what the dicts add — the localpart alone
-        # cannot answer "Sonichi's Sutando" (its token order differs).
+        """Same roster, two shapes: the {user_id, display_name, kind} dicts
+        `members.room_members` returns, and the bare mxid list older callers
+        pass. The name tier is what the dicts add — the localpart alone
+        cannot answer "Sonichi's Sutando" (its token order differs)."""
         dicts = [{"user_id": m["id"], "display_name": m["display_name"], "kind": "?"}
                  for m in _ROSTER]
         ids = [m["id"] for m in _ROSTER]
@@ -678,15 +676,24 @@ class ResolveTests(unittest.TestCase):
                          "@alex-alex-sutando.agent:ag2.space")
 
 
+# Every apostrophe look-alike `normalize_handle` folds to U+0027. The web client's
+# mention smoke (cinny mentionCandidates) carries the same list — diff the two.
+APOSTROPHE_TWINS = ("\u0027", "\u2019", "\u2018", "\u201b", "\u02bc", "\u2032", "\u0060", "\u00b4")
+
+
 class NormalizeHandleTests(unittest.TestCase):
     def test_possessive_spacing_case_and_at_collapse(self):
         for q in ("Bassil's Sutando", "bassil sutando", "bassil\u2019s sutando",
                   "@Bassil's Sutando", "Bassil_Sutando", "  BASSIL'S  SUTANDO "):
             self.assertEqual(rs.normalize_handle(q), "bassil-sutando", q)
 
-    def test_apostrophe_lookalikes(self):
-        for apo in ("\u2019", "\u2018", "`", "\u00b4"):
-            self.assertEqual(rs.normalize_handle(f"Susan{apo}s bot"), "susan-bot", repr(apo))
+    def test_every_apostrophe_twin_normalises_to_the_same_handle(self):
+        """One row per code point in APOSTROPHE_TWINS, so a look-alike dropped
+        from either copy of the map shows up as one named failing row."""
+        for apo in APOSTROPHE_TWINS:
+            with self.subTest(code_point=f"U+{ord(apo):04X}"):
+                self.assertEqual(rs.normalize_handle(f"Bassil{apo}s Sutando"), "bassil-sutando")
+                self.assertEqual(rs.normalize_handle(f"Susan{apo}s bot"), "susan-bot")
 
     def test_a_localpart_is_its_own_normal_form(self):
         self.assertEqual(rs.normalize_handle("sutando-qingyun-001"), "sutando-qingyun-001")
@@ -771,11 +778,11 @@ class MentionBodyTests(unittest.TestCase):
         self.assertEqual(len(res["candidates"]), 2)
 
     def test_post_payload_leads_with_mxid_and_carries_mentions(self):
-        # A resolved mention posts op:message to /v1/room with the mxid LEADING
-        # the body (the routing token the broker matches as a whole token, and
-        # the literal it pills for humans) AND `mentions:[mxid]` (stamped into
-        # m.mentions). Both pinned so neither regresses; `resolved_by` names the
-        # source so a wrong hit is traceable.
+        """A resolved mention posts op:message to /v1/room with the mxid LEADING
+        the body (the routing token the broker matches as a whole token, and
+        the literal it pills for humans) AND `mentions:[mxid]` (stamped into
+        m.mentions). Both pinned so neither regresses; `resolved_by` names the
+        source so a wrong hit is traceable."""
         cap = {}
 
         def _fake_http_json(method, url, headers, payload):

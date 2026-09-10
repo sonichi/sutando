@@ -45,12 +45,15 @@ import unicodedata
 from _gateway import (gateway, http_request, http_json, degrade_reason, degrade_reason_from,
                       HTTPError, URLError)
 
-# Apostrophe look-alikes a chat client or a keyboard layout substitutes for
-# U+0027: right/left single quotation marks, grave accent, acute accent.
-_APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "`": "'", "´": "'"})
-# A possessive "'s" ending a token: "bassil's sutando" names Bassil's agent, not
-# a person called "bassil's". Anchored to the token end so an "s" inside a word
-# stays ("o'neil").
+# Apostrophe look-alikes folded to U+0027 — the twin of `normalizeMentionText` in the
+# web client (cinny src/app/components/editor/autocomplete/mentionCandidates.ts).
+_APOSTROPHES = str.maketrans({
+    "\u2019": "'", "\u2018": "'", "\u201b": "'",  # right, left, reversed single quotes
+    "\u02bc": "'", "\u2032": "'",                 # modifier-letter apostrophe, prime
+    "`": "'", "\u00b4": "'",
+})
+# A possessive "'s" ending a token ("bassil's sutando" names Bassil's agent), anchored
+# to the token end so an "s" inside a word stays ("o'neil").
 _POSSESSIVE_RE = re.compile(r"'s(?=$|[\s_\-])")
 _SEPARATORS_RE = re.compile(r"[\s_\-]+")
 _NON_SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -74,9 +77,14 @@ def normalize_handle(q: str) -> str:
     apostrophes → runs of whitespace / "_" / "-" become one "-" → strip "-".
     So "Bassil's Sutando", "bassil sutando", "bassil’s sutando" and
     "@Bassil's Sutando" are all "bassil-sutando", and a localpart such as
-    "sutando-qingyun-001" is its own normal form. The apostrophe map runs
-    FIRST because NFKC decomposes U+00B4 (acute accent) into a space plus a
-    combining mark, after which it is no longer one character to map.
+    "sutando-qingyun-001" is its own normal form.
+
+    The look-alikes are U+2019 ’, U+2018 ‘, U+201B ‛, U+02BC ʼ, U+2032 ′,
+    U+0060 ` and U+00B4 ´ — the same set the web client's
+    `normalizeMentionText` folds (cinny `mentionCandidates.ts`), so a handle
+    typed in either place lands on one spelling; extend both together. The map
+    runs FIRST because NFKC decomposes U+00B4 into a space plus a combining
+    mark, after which it is no longer one character to map.
     """
     s = (q or "").translate(_APOSTROPHES)
     s = unicodedata.normalize("NFKC", s).strip().lstrip("@").casefold()
