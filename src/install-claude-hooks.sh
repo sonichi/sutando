@@ -8,7 +8,8 @@
 # context, not in unrelated sessions.
 #
 # Hooks installed (4):
-#   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
+#   PreCompact  → src/archive-transcript.sh
+#                 (destination resolved at fire time via sutando-config.sh)
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -93,13 +94,17 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\""
+  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh")"
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
-# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
+# The transcript archiver takes NO destination argument: archive-transcript.sh asks
+# sutando-config.sh for `transcript-archive-dir` when it fires, so the path is never
+# frozen into settings.json. Configure via hooks.transcript_archive_dir; the default
+# (~/Desktop/sutando-conversations) is historical and kept so upgrades never relocate
+# existing archives. It is OUTSIDE the vault carrier set.
 # The location is not what keeps transcripts out of the vault: sync is a whitelist
 # (see .git/info/exclude -- `*` then the include list), so a workspace path is
 # unsynced until vault.sync.include names it. Omitting it
@@ -157,9 +162,15 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 mkdir -p "$REPO_DIR/.claude"
-# The PreCompact archive hook is a bare `cp`, which cannot create its own
-# destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
+# Create the archive destination only when the archiver is actually being
+# installed, and at the CONFIGURED path -- the unconditional `mkdir -p
+# $HOME/Desktop/sutando-conversations` this replaces ran on every install and
+# left an empty directory on hosts that never registered the hook, so directory
+# existence read as evidence the archiver had run when it had not.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  _ARCHIVE_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" transcript-archive-dir 2>/dev/null || true)"
+  [ -n "$_ARCHIVE_DIR" ] && mkdir -p "$_ARCHIVE_DIR"
+fi
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi

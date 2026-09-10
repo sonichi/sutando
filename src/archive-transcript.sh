@@ -8,9 +8,15 @@
 # replaces expanded empty and wrote nothing on every compaction (#3999).
 set -u
 
+# No argument: resolve from config AT FIRE TIME. The hook registration passes
+# none, so no absolute path is frozen into settings.json (see
+# install-claude-hooks.sh:61-93 for what that costs).
 DEST="${1:-}"
 if [ -z "$DEST" ]; then
-  echo "✗ archive-transcript: no destination directory given" >&2
+  DEST="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" transcript-archive-dir 2>/dev/null || true)"
+fi
+if [ -z "$DEST" ]; then
+  echo "✗ archive-transcript: no destination — config resolution returned empty" >&2
   exit 2
 fi
 
