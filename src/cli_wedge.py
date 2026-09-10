@@ -13,6 +13,23 @@ scores novelty 1.00 and is indistinguishable from healthy work. The statistic
 reached neither case, so it and the `clock-only` exemption that existed only to
 suppress it are both gone.
 
+THE GOAL, in the owner's terms (Chi, 2026-09-10): get all four cases right.
+Four, as a 2x2 -- `idle / moving` x `healthy / abnormal`:
+
+    idle   + healthy    the turn finished.                    No warning.
+    idle   + abnormal   stopped and not coming back.          WARN.
+                        A provider limit or a login prompt: parked,
+                        nothing ticking.
+    moving + healthy    ordinary work.                        No warning.
+                        A ticking clock IS motion (Chi), so a pane
+                        whose only change is a clock lands here.
+    moving + abnormal   output churns, the work does not.     WARN.
+                        Retry loops and compactions are SHAPES of it,
+                        never cases of their own -- `retry-loop` stays a
+                        distinct kind for the trace, and it is this cell.
+
+Every kind folds into one of the four; a fifth kind is a shape, not a case.
+
 This reads the CLI, not the process. A green result here is not evidence the
 core is healthy; it complements `.alive` and the runtime probes, never replaces
 them. Nothing here restarts, kills or fails anything over: it warns.
