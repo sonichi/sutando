@@ -334,14 +334,13 @@ Everything below is normative and meant to be built from directly.
 
 ```
 <workspace>/
-  tasks/<task-id>.json                    payload, immutable after admission
-  tasks/archive/<task-id>.json            terminal
+  tasks/<task-id>.txt                     payload (bridge header format), immutable after admission
+  tasks/archive/<task-id>.txt             terminal
   deliveries/<recipient-id>/<task-id>.txt      sentinel, 0 bytes, unclaimed
   deliveries/<recipient-id>/<task-id>.claimed  sentinel, 0 bytes, claimed by one incarnation
   results/<task-id>.txt                   reply body
   state/roster.json                       compiled; router reads only
   state/bindings.json                     owner-authored declarations
-  state/pool-status.json                  owner-facing, atomically replaced
   state/workers/<id>.alive                worker beat (mtime only)
   state/watchers/<id>.alive               watcher beat (mtime only)
   state/workers/<id>/done/<task-id>.flag  done-flag
@@ -350,25 +349,22 @@ Everything below is normative and meant to be built from directly.
 `<recipient-id>` is `core` or a worker id. Recipient ids match `[a-z0-9][a-z0-9-]{0,31}`;
 a label never appears in a path.
 
-**Payload** — written once by the Task Bridge:
-
-```json
-{"id":"task-123","created_at":"<RFC3339>","source":"discord|slack|room|cli|timer",
- "channel_id":"<opaque>","priority":"urgent|normal|low",
- "requested_worker":"7c54b230a8d94ea9b86f52d70134ac68|null","submitter":{"actor":"<id>","tier":"owner|team|…"},
- "authorisation":{"capabilities":["…"],"resolved_by":"task-bridge"},
- "body":"<text>","parent_id":"<task-id>|null"}
-```
+**Payload** — written once by the bridge as `tasks/<task-id>.txt`, in the header
+format every bridge already uses: `id:`, `priority:`, `requested_worker:` (optional,
+always above `task:` so the strict parse sees it), then `task:` **last**, body below.
+`source:`/`channel_id:` are stamped by the gateway lanes *after* `task:` today, so
+readers take those two leniently. No JSON payload exists; a reader that wants fields
+parses the headers with `local_task_protocol`, never by hand.
 
 **Roster** — compiled by the core on any change to workers, bindings, states or scopes:
 
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
  "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","state":"live","model":"…","scopes":["…"]}},
- "bindings":{"room:!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","room:!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
+ "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
 ```
 
-An assignment records the roster `version` it was made against.
+A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
 
 ### Router pass
 
@@ -407,13 +403,14 @@ Then, in this order, each step durable before the next:
 2. `state/workers/<me>/done/<task-id>.flag` — create, `fsync`.
 3. Remove the sentinel, then `os.rename` the payload into `tasks/archive/<task-id>.txt`.
 
-Archiving is no-clobber: on collision mint `<task-id>.json.1`, `.2`, …
+Archiving is no-clobber: on collision mint `<task-id>.txt.1`, `.2`, …
 
 ### Residue, read at boot
 
 | on disk | means | do |
 |---|---|---|
 | result, no flag | completed, flag write was interrupted | write the flag, finish the archive; never re-run |
+| flag, no result | finished; the bridge already drained the result | archive; never re-run — the flag alone is terminal |
 | `.claimed`, no result | died mid-work | rename back to `<task-id>.txt`; the same worker retakes it |
 | sentinel, no payload | payload already archived | remove the sentinel |
 | payload, no sentinel, not archived | never routed | leave it; the router will place it |
