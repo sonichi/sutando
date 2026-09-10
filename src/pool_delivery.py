@@ -27,6 +27,10 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from workspace_default import resolve_workspace  # noqa: E402
+
 CLAIMED_SUFFIX = ".claimed"
 
 # One suffix, substituted never appended: a claimed sentinel must not still read
@@ -48,26 +52,32 @@ def parse_sentinel(name: str) -> tuple[str, bool] | None:
     return m.group("id"), m.group("claimed") is not None
 
 
-def deliveries_dir(workspace: Path, recipient: str) -> Path:
+def _root(workspace) -> Path:
+    """`None` resolves through the one sanctioned helper — a second resolution
+    path is how a reader and a writer end up in different trees."""
+    return Path(workspace) if workspace is not None else resolve_workspace()
+
+
+def deliveries_dir(workspace, recipient: str) -> Path:
     if not RECIPIENT.match(recipient):
         raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
-    return Path(workspace) / "deliveries" / recipient
+    return _root(workspace) / "deliveries" / recipient
 
 
 def payload_path(workspace: Path, task_id: str) -> Path:
-    return Path(workspace) / "tasks" / f"{task_id}.json"
+    return _root(workspace) / "tasks" / f"{task_id}.json"
 
 
 def archived_payload(workspace: Path, task_id: str) -> Path:
-    return Path(workspace) / "tasks" / "archive" / f"{task_id}.json"
+    return _root(workspace) / "tasks" / "archive" / f"{task_id}.json"
 
 
 def result_path(workspace: Path, task_id: str) -> Path:
-    return Path(workspace) / "results" / f"{task_id}.txt"
+    return _root(workspace) / "results" / f"{task_id}.txt"
 
 
 def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
-    return Path(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
+    return _root(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
 
 
 def pending(workspace: Path, recipient: str) -> list[Path]:
