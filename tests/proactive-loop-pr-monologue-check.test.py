@@ -15,6 +15,7 @@ sys.modules["pr_monologue_check"] = g
 spec.loader.exec_module(g)
 
 ME = "me"
+REPO = "sonichi/sutando"
 
 
 def c(ts, login):
@@ -95,18 +96,18 @@ class TestMain(unittest.TestCase):
 
     def test_refuses_at_the_threshold(self):
         ev = [c(T(1), ME), c(T(2), ME), c(T(3), ME)]
-        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME]), 1)
+        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME, "--repo", REPO]), 1)
 
     def test_allows_below_the_threshold(self):
         ev = [c(T(1), ME), c(T(2), ME)]
-        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME]), 0)
+        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME, "--repo", REPO]), 0)
 
     def test_threshold_is_configurable(self):
         ev = [c(T(1), ME), c(T(2), ME)]
-        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME, "--threshold", "2"]), 1)
+        self.assertEqual(self._with_fetch(ev, [], ["1", "--me", ME, "--threshold", "2", "--repo", REPO]), 1)
 
     def test_empty_thread_is_safe(self):
-        self.assertEqual(self._with_fetch([], [], ["1", "--me", ME]), 0)
+        self.assertEqual(self._with_fetch([], [], ["1", "--me", ME, "--repo", REPO]), 0)
 
     def test_every_verdict_names_the_repo_it_measured(self):
         """A bare `#1` cannot be told apart from the same number in another repo,
@@ -115,7 +116,7 @@ class TestMain(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
         for argv, want in (
-                (["1", "--me", ME], g.DEFAULT_REPO),
+                (["https://github.com/url-form/repo/pull/1", "--me", ME], "url-form/repo"),
                 (["1", "--me", ME, "--repo", "other/repo"], "other/repo"),
         ):
             # All three verdict branches, including REFUSE — the branch the tool
@@ -131,11 +132,11 @@ class TestMain(unittest.TestCase):
         real = g.fetch
         g.fetch = lambda repo, number: (seen.append(repo), ([], []))[1]
         try:
-            g.main(["1", "--me", ME])
+            g.main(["https://github.com/url-form/repo/pull/1", "--me", ME])
             g.main(["1", "--me", ME, "--repo", "other/repo"])
         finally:
             g.fetch = real
-        self.assertEqual(seen, [g.DEFAULT_REPO, "other/repo"])
+        self.assertEqual(seen, ["url-form/repo", "other/repo"])
 
     def test_a_fetch_failure_is_cannot_answer_not_a_green_light(self):
         real = g.fetch
@@ -145,12 +146,12 @@ class TestMain(unittest.TestCase):
 
         g.fetch = boom
         try:
-            self.assertEqual(g.main(["1", "--me", ME]), 2)
+            self.assertEqual(g.main(["1", "--me", ME, "--repo", REPO]), 2)
         finally:
             g.fetch = real
 
     def test_a_nonsense_threshold_refuses_rather_than_guessing(self):
-        self.assertEqual(self._with_fetch([], [], ["1", "--me", ME, "--threshold", "0"]), 2)
+        self.assertEqual(self._with_fetch([], [], ["1", "--me", ME, "--threshold", "0", "--repo", REPO]), 2)
 
 
 class TestFetchLayer(unittest.TestCase):
@@ -211,7 +212,7 @@ class TestFetchLayer(unittest.TestCase):
         real = g.subprocess.run
         g.subprocess.run = run
         try:
-            self.assertEqual(g.main(["1", "--me", ME]), 2)
+            self.assertEqual(g.main(["1", "--me", ME, "--repo", REPO]), 2)
         finally:
             g.subprocess.run = real
 
@@ -270,6 +271,55 @@ class TestPagination(unittest.TestCase):
         full, _ = g.trailing_run(g.merge_events(ev, []), ME)
         truncated, _ = g.trailing_run(g.merge_events(ev[:100], []), ME)
         self.assertEqual((full, truncated), (3, 0))
+
+
+class RepoMustBeNamed(unittest.TestCase):
+    """A bare number plus a defaulted repo is the shape that cannot refuse.
+
+    Naming the assumption in the output was necessary but not sufficient: on
+    2026-09-10 a run omitted --repo, printed a 404 that contained the wrong repo,
+    and the post went out anyway. A reader who has the repo in front of him and
+    posts regardless is not helped by being shown it again, so the default is gone.
+    """
+
+    def test_a_bare_number_without_repo_cannot_answer(self):
+        self.assertEqual(g.main(["1", "--me", ME]), 2)
+
+    def test_the_refusal_says_what_to_pass(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            g.main(["1", "--me", ME])
+        err = buf.getvalue()
+        self.assertIn("--repo", err)
+        self.assertIn("URL", err)
+
+    def test_a_full_url_supplies_the_repo(self):
+        seen = []
+        real = g.fetch
+        g.fetch = lambda repo, number: (seen.append((repo, number)), ([], []))[1]
+        try:
+            g.main(["https://github.com/o/r/pull/42", "--me", ME])
+        finally:
+            g.fetch = real
+        self.assertEqual(seen, [("o/r", 42)])
+
+    def test_a_url_disagreeing_with_repo_refuses_rather_than_picking(self):
+        self.assertEqual(
+            g.main(["https://github.com/o/r/pull/1", "--me", ME, "--repo", "other/repo"]), 2)
+
+    def test_a_url_agreeing_with_repo_is_fine(self):
+        real = g.fetch
+        g.fetch = lambda repo, number: ([], [])
+        try:
+            rc = g.main(["https://github.com/o/r/pull/1", "--me", ME, "--repo", "o/r"])
+        finally:
+            g.fetch = real
+        self.assertEqual(rc, 0)
+
+    def test_a_non_number_non_url_cannot_answer(self):
+        self.assertEqual(g.main(["not-a-pr", "--me", ME, "--repo", REPO]), 2)
 
 
 if __name__ == "__main__":

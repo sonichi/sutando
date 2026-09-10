@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_REPO = "sonichi/sutando"
 DEFAULT_THRESHOLD = 3
+PR_URL_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 
 def parse_ts(value: str) -> datetime:
@@ -82,18 +83,33 @@ def fetch(repo: str, number: int):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("number", type=int)
+    ap.add_argument("number", help="PR number (needs --repo) or a full PR URL")
     ap.add_argument("--repo", default=None)
     ap.add_argument("--me", required=True)
     ap.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     ap.add_argument("--count-bots", action="store_true",
                     help="treat bot comments as engagement (default: ignore them)")
     args = ap.parse_args(argv)
-    # A silently-defaulted repo makes this gate unable to refuse: on a PR in any
-    # other repo it reads the same-numbered thread here, which is usually empty.
-    if args.repo is None:
-        args.repo = DEFAULT_REPO
-        print(f"assuming --repo {DEFAULT_REPO} (not given)", file=sys.stderr)
+    # No default repo: a bare number in another repo reads an unrelated thread,
+    # so the only verdict this gate could reach there is "safe".
+    url = PR_URL_RE.match(args.number.strip())
+    if url:
+        if args.repo and args.repo != url.group(1):
+            print(f"CANNOT ANSWER: --repo {args.repo} disagrees with the URL's "
+                  f"{url.group(1)} — refusing rather than picking one", file=sys.stderr)
+            return 2
+        args.repo, args.number = url.group(1), int(url.group(2))
+    else:
+        if not args.number.isdigit():
+            print(f"CANNOT ANSWER: {args.number!r} is neither a PR number nor a "
+                  "github.com PR URL", file=sys.stderr)
+            return 2
+        args.number = int(args.number)
+        if args.repo is None:
+            print("CANNOT ANSWER: no --repo given, and a bare number could name a PR "
+                  "in any repo. Pass --repo <owner/name>, or the full PR URL.",
+                  file=sys.stderr)
+            return 2
 
     if args.threshold < 1:
         print("threshold must be >= 1", file=sys.stderr)
