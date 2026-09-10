@@ -15,7 +15,11 @@ names, companies by name) and its `people_merged` count in the JSON; the
 memory file and overview are rebuilt from the approved snapshots
 (`approved/<slug>.json`) — a landed roll-up that changed on disk is named
 "changed since approval" in the digest and never refreshed by another
-project's commit.
+project's commit; the approved People export likewise: a commit takes the
+projects it lands from the reviewed entities and every other landed project
+from `approved/people-inputs.json` (its `people_hashes` tell the digest which
+landed project's people changed), so an entities re-run between two commits
+never adds an unreviewed citation to people.json.
 
 Run: python3 tests/import-claude-context-stage.test.py
 """
@@ -856,6 +860,141 @@ class TestApprovedSnapshots(Base):
         self.assertNotIn(UNREVIEWED, (self.ndir / "overview.md").read_text())
         self.assertEqual(self.m.approved_rollups(self.data, {"projects": {SLUG_A: {}, SLUG_B: {}}}).keys(), {SLUG_B})
         self.assertEqual(self.m.changed_since_approval(self.data, {}, {"projects": {SLUG_A: {}}}), [])
+
+
+class TestApprovedPeopleInputs(Base):
+    """PR #4127 review, the same class as the snapshots: --commit recomputed
+    every landed project's people from the live entities.json, so an entities
+    re-run between two commits put citations nobody had reviewed into
+    people.json. Now a landed project outside the commit keeps the citations
+    it was approved with, and the digest names it until it is brought in."""
+
+    def _rerun_entities_for_alpha(self):
+        """What a second entities pass leaves behind: Alpha gains a person and Ada a citation."""
+        p = self.data / "entities.json"
+        ents = json.loads(p.read_text())
+        ents["people"][0]["citations"].append(_cite(SLUG_A, U2, f"{UNREVIEWED} ada citation"))
+        ents["people"].append({"name": f"Aaron {UNREVIEWED}", "relationship": "advisor",
+                               "citations": [_cite(SLUG_A, U1, "one"), _cite(SLUG_A, U2, "two")]})
+        p.write_text(json.dumps(ents))
+
+    def _inputs(self):
+        return json.loads((self.data / "approved" / "people-inputs.json").read_text())
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def test_committing_beta_never_lands_alphas_unreviewed_people(self):
+        self._run("--stage", "--projects", "alpha")
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_changed_since_approval"]), (2, 0))
+        inputs = self._inputs()
+        self.assertEqual(list(inputs["people_hashes"]), [SLUG_A])
+        self.assertEqual(inputs["people_hashes"][SLUG_A], self.m.project_people_hash(inputs["entities"], SLUG_A))
+        # the coordinator re-runs the entities pass; nobody has reviewed what it added to Alpha
+        self._rerun_entities_for_alpha()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((rc, c["people_changed_since_approval"], c["changed_since_approval"]), (0, 1, 0))
+        self.assertEqual(self._manifest()["people_changed_since_approval"], [SLUG_A])
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn(UNREVIEWED, review)
+        self.assertIn(f"Changed since approval (1) — kept in your People export as you approved them:\n"
+                      f"- Alpha (`{SLUG_A}`) — changed since approval — bring in {SLUG_A} to refresh\n\n## Memory\n", review)
+        self.assertNotIn("kept in memory and the overview", review)
+        rc, c, _ = self._run("--commit")                                       # "bring it in" for Beta
+        self.assertEqual((c["committed"], c["projects"], c["people_changed_since_approval"]), (1, 2, 1))
+        export = self._export()
+        self.assertNotIn(UNREVIEWED, json.dumps(export))
+        ada = next(p for p in export if p["name"] == "Ada Lovelace")
+        self.assertEqual(ada["doc"].count("Claude Code session"), 3)         # Alpha's two as approved + Beta's one
+        self.assertIn(U3[:8], ada["doc"])
+        self.assertNotIn(UNREVIEWED, json.dumps(self._inputs()))
+        self.assertEqual(sorted(self._inputs()["people_hashes"]), [SLUG_A, SLUG_B])
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, export)
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")   # a landed project: its approved payloads
+        self.assertEqual([p["name"] for p in payloads], ["Ada Lovelace", "Only Alpha"])
+        self.assertNotIn(UNREVIEWED, json.dumps(payloads))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                                         # nobody has two citations inside Beta
+        # only "bring in alpha" lands the additions: the digest shows them first
+        rc, c, _ = self._run("--stage", "--projects", "alpha")
+        self.assertEqual(c["people_changed_since_approval"], 0)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn(f"- Aaron {UNREVIEWED} — advisor (2 citations)\n", review)
+        self.assertNotIn("changed since approval", review)
+        rc, c, _ = self._run("--commit", "--projects", "alpha")
+        self.assertEqual(c["people_changed_since_approval"], 0)
+        export = self._export()
+        self.assertIn(f"Aaron {UNREVIEWED}", [p["name"] for p in export])
+        ada = next(p for p in export if p["name"] == "Ada Lovelace")
+        self.assertIn(f"{UNREVIEWED} ada citation", ada["doc"])
+        self.assertEqual(ada["doc"].count("Claude Code session"), 4)
+        self.assertIn(UNREVIEWED, json.dumps(self._inputs()))
+
+    def test_a_landed_project_without_approved_inputs_is_flagged_and_lands_nothing(self):
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        (self.data / "approved" / "people-inputs.json").unlink()
+        self._rerun_entities_for_alpha()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((c["people_changed_since_approval"], self._manifest()["people_changed_since_approval"]), (1, [SLUG_A]))
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_changed_since_approval"]), (0, 1))
+        self.assertEqual(self._export(), [])
+        self.assertNotIn(UNREVIEWED, json.dumps(self._inputs()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertEqual(payloads, [])
+        self.assertIsNone(self.m.approved_people_entities(self.data, None))
+        self.assertIsNone(self.m.approved_people_entities(self.data, {"-nope"}))
+
+    def test_union_keeps_the_reviewed_fields_and_adds_the_approved_citations(self):
+        m = self.m
+        live = {"generated_at": "now", "people": [
+            {"name": "Ada L.", "email": "", "role": "CEO", "citations": [_cite(SLUG_B, U3, "b")]},
+            {"name": "Only Alpha", "email": "only@a.example", "citations": [_cite(SLUG_B, U3, "b2")]},
+            {"name": "Grace (grace@h.example)", "citations": [_cite(SLUG_B, U3, "g")]}],
+            "companies": [{"name": "analytical", "what": "", "citations": [_cite(SLUG_B, U3)]}],
+            "deals": [], "open_threads": [],
+            "decisions": [{"decision": "d", "project": SLUG_B, "citations": [_cite(SLUG_B, U3)]}]}
+        prev = {"people": [
+            {"name": "Ada Lovelace", "email": "ada@example.com", "role": "Chief Technology Officer",
+             "citations": [_cite(SLUG_A, U1, "a")]},
+            {"name": "Only Alpha", "email": "other@a.example", "citations": [_cite(SLUG_A, U1, "a2")]},
+            {"name": "ada l.", "role": "Chief Executive Officer", "company": "Analytical",
+             "citations": [_cite(SLUG_A, U2, "a3"), _cite(SLUG_B, U3, "b")]},
+            {"name": "Grace Hopper", "email": "grace@h.example", "role": "Admiral",
+             "identifiers": {"emails": ["g@navy.example"], "x": "@grace"}, "citations": [_cite(SLUG_A, U1, "ga")]},
+            "junk"],
+            "companies": [{"name": "Analytical", "what": "a firm", "citations": [_cite(SLUG_A, U1)]}],
+            "deals": [], "open_threads": [],
+            "decisions": [{"decision": "d", "project": SLUG_B, "citations": [_cite(SLUG_A, U1)]},
+                          {"decision": "e", "project": SLUG_A, "citations": [_cite(SLUG_A, U1)]}]}
+        out = m.union_entities(live, prev)
+        self.assertEqual(out["generated_at"], "now")
+        self.assertEqual([p["name"] for p in out["people"]],
+                         ["Ada L.", "Only Alpha", "Grace", "Ada Lovelace", "Only Alpha"])
+        ada = out["people"][0]                        # "ada l." is the same person by name: fields stay as reviewed
+        self.assertEqual((ada["email"], ada["role"], ada.get("company")), ("", "CEO", None))
+        self.assertEqual([c["quote_or_context"] for c in ada["citations"]], ["b", "a3"])
+        self.assertEqual(out["people"][1]["citations"], [_cite(SLUG_B, U3, "b2")])   # two addresses: not the same
+        grace = out["people"][2]                      # matched on the email inside the name; gains the rest
+        self.assertEqual(grace, {"name": "Grace", "email": "grace@h.example",
+                                 "emails": ["grace@h.example", "g@navy.example"],
+                                 "identifiers": {"emails": ["grace@h.example", "g@navy.example"], "x": "@grace"},
+                                 "citations": [_cite(SLUG_B, U3, "g"), _cite(SLUG_A, U1, "ga")]})
+        self.assertEqual(out["companies"], [{"name": "analytical", "what": "",
+                                             "citations": [_cite(SLUG_B, U3), _cite(SLUG_A, U1)]}])
+        self.assertEqual([len(d["citations"]) for d in out["decisions"]], [2, 1])
+        self.assertFalse(m._same_person({"name": ""}, {"name": ""}))
+        # the fingerprint: this project's citations and the reviewed fields, never an email
+        h = m.project_people_hash(out, SLUG_B)
+        self.assertEqual(h, m.project_people_hash(live, SLUG_B))
+        self.assertNotEqual(h, m.project_people_hash(prev, SLUG_B))
+        self.assertEqual(m.project_people_hash({"people": ["junk", {"name": "x", "citations": [{"project": SLUG_B}]}]}, SLUG_B),
+                         m.project_people_hash({"people": [{"name": "X", "citations": [{"project": SLUG_B, "session": 7}]}]}, SLUG_B))
+        self.assertEqual(m.load_people_inputs(self.data), {})
+        self.assertEqual(m.people_changed_since_approval(self.data, out, {"projects": {SLUG_B: {}}}), [SLUG_B])
 
 
 class HeldBase(Base):

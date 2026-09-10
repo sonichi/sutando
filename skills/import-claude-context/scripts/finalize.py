@@ -115,7 +115,16 @@ since its approval is named in review.md as "changed since approval — bring in
 <slug> to refresh" and keeps its approved text until it is brought in again.
 The approved People export (<data-dir>/people.json) is written with the inputs
 it came from (approved/people-inputs.json); --forget, --forget-session and
---hold shrink it to the citations still approved, and only a commit grows it.
+--hold shrink it to the citations still approved, and only a commit grows it —
+and a commit grows it only with the projects it lands: their citations come
+from the entities the owner just reviewed, every other landed project's from
+the approved inputs, never from a later entities.json (an entities re-run
+between two commits used to add citations nobody had seen: PR #4127 review).
+people-inputs.json carries a per-project fingerprint of the people it approved
+(`people_hashes`); a landed project whose live entities no longer match it is
+named in review.md's People section as "changed since approval — bring in
+<slug> to refresh", and `--people-json --projects <slug>` prints a landed
+project's payloads from the approved inputs.
 
 `--forget` takes a known slug (or a unique part of one) — never a path: `../x`,
 `/abs`, `a/b`, `..`, `~`, an empty or an unknown value is refused — and every
@@ -1178,15 +1187,142 @@ def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
     return payloads
 
 
+def load_people_inputs(data_dir: Path) -> dict:
+    """approved/people-inputs.json — the entities (approved citations only), the
+    store listing and the per-project `people_hashes` the export was computed
+    from; {} when there is none or it is not a document."""
+    doc = _common.load_json(approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS, None)
+    return doc if isinstance(doc, dict) else {}
+
+
+def project_people_hash(entities: dict, slug: str) -> str:
+    """What the digest shows of one project's people, as a fingerprint: every
+    person with a citation in `slug` — name, relationship, role, company — with
+    that project's citations (session and text), sorted. No email (an
+    identifier, not reviewed text) and no other project's citation, so the
+    value survives the approved-inputs union and changes only when the
+    entities pass changed something the owner has not seen for that project."""
+    rows = []
+    for p in entities.get("people") or []:
+        if not isinstance(p, dict):
+            continue
+        cites = sorted((_one_line(_citation_session(c), 80),
+                        _one_line(c.get("quote_or_context") or c.get("context"), 400))
+                       for c in _person_citations(p, {slug}))
+        if cites:
+            rows.append([store_name_key(p.get("name")),
+                         *(_one_line(p.get(k), 200) for k in ("relationship", "role", "company")), cites])
+    rows.sort()
+    return hashlib.sha256(_common.dump_json(rows).encode("utf-8")).hexdigest()[:16]
+
+
+def _same_person(a: dict, b: dict) -> bool:
+    """merge_people's rule across two passes: a shared email is the same person,
+    two addresses that never meet are not, and otherwise the same normalised
+    name is — the whole name this time: both passes describe the same people,
+    so an identical name is the same person, not a coincidence."""
+    ea, eb = {e.lower() for e in _emails_of(a)}, {e.lower() for e in _emails_of(b)}
+    if ea & eb:
+        return True
+    if ea and eb:
+        return False
+    key = store_name_key(a.get("name"))
+    return bool(key) and key == store_name_key(b.get("name"))
+
+
+def _same_entity(kind: str, a: dict, b: dict) -> bool:
+    if kind == "people":
+        return _same_person(a, b)
+    if kind == "companies":
+        key = store_name_key(a.get("name"))
+        return bool(key) and key == store_name_key(b.get("name"))
+    return {k: v for k, v in a.items() if k != "citations"} == {k: v for k, v in b.items() if k != "citations"}
+
+
+def _absorb(base: dict, other: dict) -> dict:
+    """`base` exactly as the owner reviewed it — every field it has, and none it
+    lacks — plus the emails, identifiers and citations `other` carries."""
+    merged = _merge_group([base, other])
+    ids = ("email", "emails", "identifiers", "citations")
+    out = {k: v for k, v in base.items() if k not in ids}
+    out.update({k: merged[k] for k in ids if k in merged})
+    out["name"] = _norm_name(base.get("name"))
+    own = _emails_of(base)
+    if own:
+        out["email"] = own[0]
+    return out
+
+
+def union_entities(primary: dict, secondary: dict) -> dict:
+    """`primary`'s entries as they are, each gaining the citations (a person:
+    the emails and identifiers too) of the `secondary` entry that is the same
+    person (_same_person), company (name) or item (every other field equal);
+    a secondary entry with no counterpart is appended as it is."""
+    out = {k: v for k, v in primary.items() if k not in ENTITY_LISTS}
+    for kind in ENTITY_LISTS:
+        items = [dict(p) for p in primary.get(kind) or [] if isinstance(p, dict)]
+        for s in secondary.get(kind) or []:
+            if not isinstance(s, dict):
+                continue
+            i = next((i for i, p in enumerate(items) if _same_entity(kind, p, s)), None)
+            if i is None:
+                items.append(dict(s))
+            elif kind == "people":
+                items[i] = _absorb(items[i], s)
+            else:
+                items[i] = dict(items[i], citations=_union_citations([items[i], s]))
+        out[kind] = items
+    return out
+
+
+def approved_entities_after(data_dir: Path, entities: dict, chosen, landed) -> dict:
+    """The entities the People export is computed from once `chosen` lands: the
+    citations of the projects being committed now, from the live pass the owner
+    just reviewed, plus — for every other landed project — the citations as
+    they were approved (people-inputs.json), never the live ones: an entities
+    re-run between two commits must not add to an approved project's payload
+    without a digest showing it (PR #4127 review). A person in both keeps the
+    fields reviewed now and gains the approved citations; a landed project whose
+    approved inputs are gone contributes nothing until it is brought in again."""
+    chosen, keep = set(chosen), set(landed) - set(chosen)
+    live = strip_citations(entities, lambda c: _citation_project(c) not in chosen)[0]
+    prev = _entity_lists(load_people_inputs(data_dir).get("entities"))
+    return union_entities(live, strip_citations(prev, lambda c: _citation_project(c) not in keep)[0])
+
+
+def approved_people_entities(data_dir: Path, slugs):
+    """The approved inputs' entities when every slug in `slugs` has landed with
+    them — a landed project's payloads come from what the owner approved, never
+    from a later entities pass — else None (compute from the live inputs)."""
+    inputs = load_people_inputs(data_dir)
+    if not slugs or not set(slugs) <= set(inputs.get("projects") or []):
+        return None
+    return _entity_lists(inputs.get("entities"))
+
+
+def people_changed_since_approval(data_dir: Path, entities: dict, state: dict) -> list:
+    """The landed projects whose people, as the live entities cite them, are not
+    the ones the owner approved — the entities pass added or changed a person or
+    a citation since, or the project's approved inputs are gone. Their approved
+    citations stay in the export; the live ones wait for "bring in <slug>"."""
+    hashes = load_people_inputs(data_dir).get("people_hashes")
+    hashes = hashes if isinstance(hashes, dict) else {}
+    return sorted(s for s in state["projects"] if hashes.get(s) != project_people_hash(entities, s))
+
+
 def save_people_export(data_dir: Path, people: list, entities: dict, projects, known) -> None:
     """people.json (the approved payloads) plus the inputs they came from — the
-    entities cut to the approved projects' citations and the store listing — so
-    a later forget/hold can shrink the export without a second review."""
+    entities cut to the approved projects' citations, the store listing and a
+    people fingerprint per project — so a later forget/hold can shrink the
+    export without a second review and a later stage can tell a project whose
+    people changed since it was approved."""
     _common.write_json(data_dir / APPROVED_PEOPLE, people, private=True)
     ensure_private_dir(approved_dir(data_dir))
     cut = strip_citations(entities, lambda c: _citation_project(c) not in projects)[0]
     _common.write_json(approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS,
-                       {"projects": sorted(projects), "known_people": known, "entities": cut}, private=True)
+                       {"projects": sorted(projects), "known_people": known, "entities": cut,
+                        "people_hashes": {s: project_people_hash(cut, s) for s in sorted(projects)}},
+                       private=True)
 
 
 def refresh_people_export(data_dir: Path) -> int:
@@ -1200,10 +1336,10 @@ def refresh_people_export(data_dir: Path) -> int:
         return 0
     before = len(_common.load_json(path, []) or [])
     src = approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS
-    doc = _common.load_json(src, None)
+    doc = load_people_inputs(data_dir)
     index_doc, all_summaries, _r, _e, state = load_inputs(data_dir)
     approved = set(approved_rollups(data_dir, state))
-    if not isinstance(doc, dict) or not approved:
+    if not doc or not approved:
         path.unlink()
         if src.is_file():
             src.unlink()
@@ -1330,12 +1466,13 @@ def _people_section(candidates, ambiguous, below_floor: int, merged, known_check
     return text
 
 
-def _changed_section(changed, approved: dict, index_doc: dict) -> str:
-    """The landed projects whose roll-up changed since the owner approved it:
-    named (by their approved name) with the reply that refreshes them."""
+def _changed_section(changed, approved: dict, index_doc: dict, kept: str) -> str:
+    """The landed projects whose roll-up (or people) changed since the owner
+    approved it: named (by their approved name) with the reply that refreshes
+    them; `kept` says which shared file keeps the approved version meanwhile."""
     if not changed:
         return ""
-    text = f"Changed since approval ({len(changed)}) — kept in memory and the overview as you approved them:\n"
+    text = f"Changed since approval ({len(changed)}) — kept {kept} as you approved them:\n"
     for slug in changed:
         name = display_name(slug, approved.get(slug) or {}, index_doc)
         text += f"- {name} (`{slug}`) — {CHANGED_SINCE_APPROVAL} — bring in {slug} to refresh\n"
@@ -1361,7 +1498,8 @@ def _held_section(held_rows) -> str:
 def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, candidates, below_floor: int,
                   outcomes: dict, memory_bytes: int, n_memory_projects: int, n_sessions: int,
                   run_kind: str, merged=None, state=None, held=None, held_rows=None, stale=None,
-                  known_checked: bool = False, ambiguous=None, changed=None, approved=None) -> str:
+                  known_checked: bool = False, ambiguous=None, changed=None, approved=None,
+                  people_changed=None) -> str:
     """The digest the owner reads before anything lands — the one place
     transcript-derived text is shown to them."""
     first, last = date_range(index_doc, slugs)
@@ -1386,10 +1524,12 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
         text += _bullets("Open threads", _thread_lines(slug, r, entities))
         text += _bullets("Decisions", _decision_lines(slug, r, entities)) + "\n"
     text += _people_section(candidates, ambiguous, below_floor, merged, known_checked)
+    if people_changed:
+        text += "\n" + _changed_section(people_changed, approved or {}, index_doc, "in your People export").rstrip("\n") + "\n"
     text += (f"\n## Memory\n\n{memory_bytes:,} B summary (cap {MEMORY_LIMIT:,} B) covering "
              f"{n_memory_projects} projects for the agent's core memory, plus one MEMORY.md row "
              f"if the index budget allows.\n\n")
-    text += _changed_section(changed, approved or {}, index_doc)
+    text += _changed_section(changed, approved or {}, index_doc, "in memory and the overview")
     text += _held_section(held_rows)
     text += f"\n---\n{REVIEW_FOOTER}\n"
     return text
@@ -1496,6 +1636,7 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
     candidates, below_floor, ambiguous = people_candidates(entities, projects=set(slugs), known=known)
     people = people_payloads(entities, index_doc, projects=set(slugs), known=known)
     _common.write_json(sdir / STAGED_PEOPLE, people)
+    people_changed = [s for s in people_changed_since_approval(data_dir, entities, state) if s not in slugs]
     n_sessions = session_total(index_doc, summaries, slugs, rollups, state, held)
     rows = held_rows(index_doc, inp["all_summaries"], held,
                      set(slugs) | {s for (s, _u) in held if s not in rollups})
@@ -1507,7 +1648,7 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
                       memory_bytes=len(memory_text.encode("utf-8")), n_memory_projects=len(preview),
                       n_sessions=n_sessions, run_kind=run_kind, merged=merged, state=state,
                       held=held, held_rows=rows, stale=stale_here, known_checked=known is not None,
-                      ambiguous=amb_rows, changed=changed, approved=approved),
+                      ambiguous=amb_rows, changed=changed, approved=approved, people_changed=people_changed),
         encoding="utf-8")
     tally = {k: sum(1 for v in outcomes.values() if v == k) for k in ("created", "updated", "unchanged")}
     n_existing = sum(1 for p in people if p.get("existing"))
@@ -1518,14 +1659,14 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
         "memory_bytes": len(memory_text.encode("utf-8")),
         "notes_created": tally["created"], "notes_updated": tally["updated"],
         "notes_unchanged": tally["unchanged"], "held": len(rows), "stale_rollups": len(stale_here),
-        "changed_since_approval": len(changed), **merged,
+        "changed_since_approval": len(changed), "people_changed_since_approval": len(people_changed), **merged,
     }
     _common.write_json(sdir / STAGED_MANIFEST, {
         "staged_at": now_iso(), "run_kind": run_kind, "projects": slugs,
         "fingerprint": inputs_fingerprint(data_dir), "counts": counts,
         "known_people": "checked" if known is not None else "not checked",
         "people_ambiguous": amb_rows, "held": rows, "stale_rollups": stale_here,
-        "changed_since_approval": changed,
+        "changed_since_approval": changed, "people_changed_since_approval": people_changed,
     })
     write_status(data_dir, "staged", **counts)
     return counts
@@ -1608,8 +1749,11 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
     (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
     row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(committed)))
     print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
-    people = people_payloads(entities, index_doc, projects=set(committed), known=known)
-    save_people_export(data_dir, people, entities, set(committed), known)
+    # The chosen projects' people come from the entities the owner just reviewed; every other
+    # landed project's from its approved inputs — a later entities.json never refreshes those.
+    approved_entities = approved_entities_after(data_dir, entities, chosen, committed)
+    people = people_payloads(approved_entities, index_doc, projects=set(committed), known=known)
+    save_people_export(data_dir, people, approved_entities, set(committed), known)
     _common.save_state(data_dir, state)
 
     remaining = _restage_or_clear(data_dir, ws, run_kind, [s for s in pending if s not in chosen])
@@ -1617,6 +1761,7 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
         "sessions": int(n_sessions), "summarized": sum(1 for (s, _u) in summaries if s in committed),
         "projects": len(committed), "committed": len(chosen), "staged_remaining": len(remaining),
         "changed_since_approval": len(changed_since_approval(data_dir, inp["raw_rollups"], state)),
+        "people_changed_since_approval": len(people_changed_since_approval(data_dir, entities, state)),
         "notes_created": outcomes["created"], "notes_updated": outcomes["updated"],
         "notes_unchanged": outcomes["unchanged"], "people": len(people),
         "people_existing": sum(1 for p in people if p.get("existing")),
@@ -1976,7 +2121,9 @@ def main(argv=None) -> int:
             known = load_known_people(a.known_people) if a.known_people else staged_known_people(data_dir)
             inp = prepare_inputs(data_dir)
             only = set(resolve_selectors(inp["rollups"], projects, "project")) if projects else None
-            payloads = people_payloads(inp["entities"], inp["index"], projects=only, known=known)
+            entities = approved_people_entities(data_dir, only)
+            payloads = people_payloads(inp["entities"] if entities is None else entities, inp["index"],
+                                       projects=only, known=known)
         print(json.dumps(payloads, ensure_ascii=False, indent=2))
         return 0
     if a.purge_dumps and not (a.forget or a.stage or a.commit or a.discard):
