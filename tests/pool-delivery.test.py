@@ -130,6 +130,20 @@ class TestPending(Base):
         self.assertIsNone(pd.find(self.root, "core", "task-1"))
 
 
+class TestLegacyAcceptedSuffix(Base):
+    def test_a_pre_rename_sentinel_is_still_seen(self):
+        """The rename landed mid-flight on a live pool. A `.claimed` sentinel the
+        old code wrote must not become invisible — `find` missing it lets the
+        router deliver already-accepted work a second time. Seen live 2026-09-10."""
+        self.ws.payload("task-1")
+        d = self.root / "deliveries" / "core"; d.mkdir(parents=True, exist_ok=True)
+        legacy = d / "task-1.claimed"; legacy.touch()
+        self.assertEqual(pd.parse_sentinel("task-1.claimed"), ("task-1", True))
+        self.assertEqual(pd.find(self.root, "core", "task-1"), legacy)
+        self.assertEqual([p.name for p in pd.accepted(self.root, "core")], ["task-1.claimed"])
+        self.assertEqual(pd.pending(self.root, "core"), [], "never offered as new work")
+
+
 class TestAccept(Base):
     def test_accept_renames_in_place(self):
         s = self.ws.deliver("core", "task-1")

@@ -35,13 +35,16 @@ from workspace_default import resolve_workspace  # noqa: E402
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
 ACCEPTED_SUFFIX = ".accepted"
+# Sentinels written before the rename. Recognised so work already accepted under
+# the old name is never re-delivered; nothing writes this suffix.
+LEGACY_ACCEPTED_SUFFIX = ".claimed"
 
 # One suffix, substituted never appended: an accepted sentinel must not still
 # read as pending, or a reader re-takes its own in-flight work.
 
 # `~`: the bridge encodes a channel instance into the id (task-<inst>~<id>).
 _SENTINEL = re.compile(
-    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<accepted>\.accepted))$")
+    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<accepted>\.accepted|\.claimed))$")
 
 RECIPIENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
@@ -114,7 +117,8 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     """The sentinel for `task_id` under either name, or None."""
     d = deliveries_dir(workspace, recipient)
-    for name in (task_id + PENDING_SUFFIX, task_id + ACCEPTED_SUFFIX):
+    for name in (task_id + PENDING_SUFFIX, task_id + ACCEPTED_SUFFIX,
+                 task_id + LEGACY_ACCEPTED_SUFFIX):
         p = d / name
         if p.exists():
             return p
