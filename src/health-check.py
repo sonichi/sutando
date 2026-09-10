@@ -8989,11 +8989,21 @@ def check_task_watcher() -> dict:
             elif _uncovered and _covered:
                 # Cardinality alone lets an operator restart the covered one and
                 # leave the uncovered instance absent: name which pid is which.
-                _re = [r for r in ownerless if str(_snap[r]) in _uncovered]
-                _no = [r for r in ownerless if str(_snap[r]) in _covered]
+                _by = {}
+                for r in ownerless:
+                    _by.setdefault(str(_snap[r]), []).append(r)
+                # ONE representative per uncovered target: restarting every root
+                # on a target recreates the duplicate the stop just removed.
+                _re = [_by[x][0] for x in _uncovered if x in _by]
+                _served = [r for r in ownerless if str(_snap[r]) in _covered]
+                _peer = [r for r in ownerless if r not in _re and r not in _served]
+                _why = "; ".join(filter(None, [
+                    f"{', '.join(_served)} — a supervised watcher already serves that instance"
+                    if _served else "",
+                    f"{', '.join(_peer)} — a peer above already covers that instance"
+                    if _peer else ""]))
                 _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}), then restart "
-                         f"{', '.join(_re)} — NOT {', '.join(_no)}, whose instance(s) a "
-                         f"supervised watcher already serves")
+                         f"{', '.join(_re)} and NOT {_why}")
             elif _covered:
                 _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
                          f"a supervised watcher already serves that instance")
@@ -9127,11 +9137,21 @@ def check_task_watcher() -> dict:
                               f"recreates a duplicate for one instance and removes the only "
                               f"watcher for another. Resolve identity first"}
         if distinct and not dupes:
+            _peer = {}
+            for tgt, rs in _groups.items():
+                if tgt not in tracked_targets and len(rs) > 1:
+                    _peer[tgt] = rs
+            if _peer:
+                _act = ("; among themselves " + "; ".join(
+                    f"{', '.join(rs)} share one instance" for rs in _peer.values())
+                    + " — keep ONE of each and stop the rest")
+            else:
+                _act = ". Do NOT stop them"
             return {"name": name, "status": "warn",
                     "detail": f"{len(distinct)} watcher tree(s) ({', '.join(distinct)}) belong to a "
-                              f"DIFFERENT instance than any tracked sentinel — not duplicates; each "
-                              f"is missing its own sentinel record. Do NOT stop them; register "
-                              f"their sentinels"}
+                              f"DIFFERENT instance than any tracked sentinel — not duplicates of a "
+                              f"tracked watcher; each is missing its own sentinel record{_act}; "
+                              f"register their sentinels"}
         keep = ", ".join(str(p) for p in sorted(live))
         own, sup = _split_roots_by_owner(dupes, ps_out)
         extra_note = ("" if not distinct else

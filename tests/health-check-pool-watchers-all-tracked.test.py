@@ -642,6 +642,22 @@ class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
 
 
 
+class ExtraTreesKeepTheirMultiplicity(unittest.TestCase):
+    """keweichen: extras distinct from every TRACKED target can still duplicate
+    EACH OTHER, and calling them "not duplicates" erased that."""
+
+    def test_two_extras_on_one_target_are_duplicates_of_each_other(self):
+        r = run({"watch-tasks-stream-A.pid": "100\n"},
+                {"100": {"100"}, "200": {"200"}, "300": {"300"}},
+                targets={"100": "A.pid", "200": "B.pid", "300": "B.pid"})
+        self.assertIn("share one instance", r["detail"])
+        self.assertIn("keep ONE of each", r["detail"])
+        # the old wording called them "not duplicates" full stop, which erased
+        # that they duplicate EACH OTHER; qualified is fine, unqualified is not.
+        self.assertNotIn("not duplicates; each", r["detail"])
+        self.assertNotIn("Do NOT stop them", r["detail"])
+
+
 class ADeadSentinelDoesNotLicenseStoppingASoleWatcher(unittest.TestCase):
     """keweichen at 70a8887d: with every sentinel dead, an ownerless root is its
     instance's only watcher unless a supervised peer serves the same target."""
@@ -808,6 +824,19 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertIn("restart 904", d)
         self.assertIn("NOT 903", d)
         self.assertNotIn("restart 2", d)
+
+    def test_restart_is_ONE_per_uncovered_target_not_every_root_on_it(self):
+        """keweichen: with 903->A, 904->B, 905->B, restarting both 904 and 905
+        recreates B's duplicate. The one-B fixture could not tell "one per
+        target" from "every root on an uncovered target"."""
+        d = self._detail(
+            f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n"
+            f"  904 1 bash {self.W}\n  905 1 bash {self.W}\n",
+            targets={"901": "/s/A.pid", "903": "/s/A.pid",
+                     "904": "/s/B.pid", "905": "/s/B.pid"})
+        self.assertIn("restart 904 and NOT", d)
+        self.assertNotIn("restart 904, 905", d)
+        self.assertIn("a peer above already covers that instance", d)
 
     def test_an_UNKNOWN_SUPERVISED_root_licenses_no_ownerless_action(self):
         """If 901 is actually A, restarting duplicates it; if it is not, stopping
