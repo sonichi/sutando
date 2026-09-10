@@ -412,9 +412,8 @@ with tempfile.TemporaryDirectory() as d:
     check("false-safe B: with nothing authoritative, it refuses",
           got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
 
-# --- entry FORMAT is not corpus identity either (#3873 review) ----------------
-# A live index using bullets, bare links or numbered rows is unfamiliar, not
-# empty; reading it as debris elects the stale sibling.
+# --- entry FORMAT is not corpus identity either -------------------------------
+# An index of bullets or bare links is unfamiliar, not empty.
 for _shape, _rows in (
         ("plain bullets", ["- entry %d about a durable fact" % i for i in range(40)]),
         ("bare links", ["[e%d](e%d.md) — hook" % (i, i) for i in range(40)]),

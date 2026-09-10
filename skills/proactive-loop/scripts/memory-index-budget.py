@@ -157,9 +157,8 @@ def _narrow(cands: "list[Path]") -> "list[Path]":
     return cands
 
 
-# The shipped stub's prose, whitespace-normalised so wrapping cannot hide it.
-# Recognising the template POSITIVELY is the point: anything unfamiliar stays
-# eligible rather than being read as debris.
+# Recognise the template POSITIVELY: anything unfamiliar stays eligible rather
+# than being read as debris. Normalised, so wrapping cannot hide the blurb.
 _TEMPLATE_PROSE = "one line per entry"
 
 
