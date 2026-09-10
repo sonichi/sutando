@@ -80,8 +80,9 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
    (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
    retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
-   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run with
-   `--write` and `--commit`. Never commit before the send; never build the list from recall.
+   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run the same
+   pipe with `--commit` on `idle-surface-hash.py`. Never commit before the send; never build the list
+   from recall.
    `quiet` + owner active in the last ~30 min → still drop a one-line activity signal.
 6.7. **Failure closure.** Every reported failure ends with the mechanism that prevents its recurrence,
    linked, or the sentence "no mechanism exists, because X". A filed lesson is not a third option.
