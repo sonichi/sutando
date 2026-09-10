@@ -685,6 +685,49 @@ class PinVocabularyDiscriminates(unittest.TestCase):
                 self.assertIn("github_formal_review=hold", r.head,
                               f"live config-value hold archived at keep={keep}")
 
+    def test_a_hold_line_does_not_pin_its_whole_entry(self):
+        """A pin buys the HOLD LINES a place in the head, not the entry carrying them.
+        Entry-granular pinning kept 15 KB of prose live for one 40-byte hold."""
+        pre, _ = fixture(0)
+        big = ("## 2026-09-01T10:00Z — status\n" + ("filler nobody greps\n" * 900)
+               + "HOLD: do not touch PR #123 until the owner says\n\n")
+        E = lambda n: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + ("y" * 900) + "\n\n"
+        corpus = pre + big + "".join(E(i) for i in range(2, 9))
+        r = ct.plan(corpus, 8 * 1024)
+        self.assertIn("HOLD: do not touch PR #123", r.head,
+                      "the hold line must stay greppable in the head")
+        self.assertNotIn("filler nobody greps", r.head,
+                         "the carrier prose must not ride on the hold")
+        self.assertIn("filler nobody greps", r.archived,
+                      "the full entry must be archived, never dropped")
+        self.assertFalse(r.oversized, "condensing must bring the head under budget")
+
+    def test_the_walk_may_spend_the_bytes_condensing_freed(self):
+        """Charging a pin at its stub is what returns the carrier's bytes to the walk.
+        Charge the whole entry and the head stays far under budget with entries archived."""
+        pre, _ = fixture(0)
+        big = ("## 2026-09-01T10:00Z — status\n" + ("filler\n" * 900)
+               + "HOLD: do not touch PR #123\n\n")
+        E = lambda n: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + ("y" * 400) + "\n\n"
+        corpus = pre + big + "".join(E(i) for i in range(2, 30))
+        r = ct.plan(corpus, 8 * 1024)
+        self.assertFalse(r.oversized)
+        used = len(r.head.encode("utf-8"))
+        self.assertGreater(used, int(8 * 1024 * 0.85),
+                           f"head used only {used} B of 8192 — the freed bytes were never spent")
+
+    def test_a_pinned_entry_the_walk_reached_stays_whole(self):
+        """Condensing is for entries kept ONLY by their pin; a recent one is not summarised."""
+        pre, _ = fixture(0)
+        recent = ("## 2026-09-20T10:00Z — recent\n" + "context that matters\n"
+                  + "HOLD: do not merge #9\n\n")
+        corpus = pre + "".join(f"## 2026-09-{i:02d}T00:00Z — old {i}\n" + ("y" * 100) + "\n\n"
+                               for i in range(2, 9)) + recent
+        r = ct.plan(corpus, 8 * 1024)
+        self.assertIn("context that matters", r.head,
+                      "a recent pinned entry was condensed despite fitting")
+
+
 
 if __name__ == "__main__":
     unittest.main()
