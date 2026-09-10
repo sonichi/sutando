@@ -118,7 +118,9 @@ class TestMain(unittest.TestCase):
                 (["1", "--me", ME], g.DEFAULT_REPO),
                 (["1", "--me", ME, "--repo", "other/repo"], "other/repo"),
         ):
-            for events in ([], [c(T(1), ME)]):
+            # All three verdict branches, including REFUSE — the branch the tool
+            # exists for, and the one a wrong repo silently makes unreachable.
+            for events in ([], [c(T(1), ME)], [c(T(1), ME), c(T(2), ME), c(T(3), ME)]):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     self._with_fetch(events, [], argv)
