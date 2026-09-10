@@ -23,6 +23,7 @@ Rules
 - Drop routine operational noise (health checks, quota checks, watcher restarts, memory syncs, idle loop passes) unless it changed the session's course.
 - Short strings: at most 200 characters per item, at most 25 items per list. `summary` is 2–4 sentences.
 - Never write anything that looks like a credential, token or password, even if the dump contains one.
+- `personal`: set it `true` when the session is mainly about the owner's private life rather than their work — family, health, finances, immigration or travel paperwork, career moves, anything a person would not put in a work notebook. When unsure, mark it personal. A personal session is held back from the import: nothing from it reaches memory, notes or people, and the owner sees only its date and `personal_reason`. `personal_reason` is at most 6 words naming the generic category (for example `family matter`, `health`, `personal finances`, `job search`) — never a quote, a name or a detail. Still fill the rest of the schema honestly; the owner may choose to include the session later.
 - Use the exact schema below; unknown things are `""`, `[]` or `null`, not made-up values.
 
 Schema (`summaries/<slug>/<uuid>.json`)
@@ -33,6 +34,8 @@ Schema (`summaries/<slug>/<uuid>.json`)
   "title": "one line — what this session was about",
   "date_range": ["first timestamp seen", "last timestamp seen"],
   "summary": "2–4 sentences: what the owner was doing, what came out of it, where it ended",
+  "personal": false,
+  "personal_reason": "empty, or at most 6 words naming the category when personal is true",
   "timeline": [{"when": "timestamp or empty", "what": "one line"}],
   "tasks": [{"task": "what was attempted", "outcome": "done | partial | abandoned | unknown", "detail": "one line"}],
   "prs_commits": [{"ref": "#123, a sha, or a URL exactly as written", "what": "one line"}],

@@ -237,7 +237,8 @@ class TestPeople(Base):
         self.assertEqual(names[0], "Ada Lovelace")          # most citations first
         self.assertNotIn("One Citation", names)
         for p in payloads:
-            self.assertEqual(set(p) - {"email", "identifiers"}, {"name", "doc", "source", "last_interaction_at"})
+            self.assertEqual(set(p) - {"email", "identifiers"}, {"name", "doc", "source", "last_interaction_at", "existing"})
+            self.assertIsNone(p["existing"])          # no store listing: nobody is matched
             self.assertEqual(p["source"], "claude-import")
             self.assertTrue(p["doc"].startswith(f"# {p['name']}\n"))
             for section in ("## Contact", "## Who they are", "## Your relationship",
@@ -432,6 +433,102 @@ class TestHelpers(Base):
                          {"handles": ["@ada", "@lovelace"], "x": "ada", "emails": ["ada@example.com"]})
         companies, n = self.m.merge_companies(["junk", {"name": "Acme"}, {"name": "acme", "what": "widgets"}])
         self.assertEqual((n, len(companies), companies[0]["what"]), (1, 1, "widgets"))
+
+    def test_store_name_key_and_known_people_loader(self):
+        self.assertEqual(self.m.store_name_key("  Zoë  Ångström (zoe@x.example) "), "zoe angstrom")
+        self.assertEqual(self.m.store_name_key(None), "")
+        self.assertIsNone(self.m.load_known_people(None))
+        self.assertEqual(self.m.load_known_people([{"name": "A"}, "junk", 3]), [{"name": "A"}])
+        self.assertEqual(self.m.load_known_people({"people": [{"name": "B"}]}), [{"name": "B"}])
+        self.assertEqual(self.m.load_known_people({"name": "C"}), [{"name": "C"}])
+        path = self.tmp / "known.json"
+        path.write_text(json.dumps([{"name": "D"}]))
+        self.assertEqual(self.m.load_known_people(path), [{"name": "D"}])
+        path.write_text('"a string"')
+        with self.assertRaises(SystemExit):
+            self.m.load_known_people(str(path))
+        self.assertEqual(self.m.match_known({"name": "D"}, None), (None, []))
+        self.assertEqual(self.m.match_known({"name": "Nobody"}, [{"name": "D"}]), (None, []))
+
+    def test_people_doc_merge_cases(self):
+        merge = self.m.people_doc_merge
+        section = "## Imported from Claude Code (2026-02-02)\n\n- a\n"
+        self.assertEqual(merge("", section), section)
+        self.assertEqual(merge("# Name\n\n## Contact\n- x\n", section), "# Name\n\n## Contact\n- x\n\n" + section)
+        # the same heading in the middle is replaced up to the next heading, at the end without a trailer
+        doc = "# Name\n\n## Imported from Claude Code (2026-02-02)\n\n- old\n\n# Appendix\ntail\n"
+        self.assertEqual(merge(doc, section), "# Name\n\n## Imported from Claude Code (2026-02-02)\n\n- a\n\n# Appendix\ntail\n")
+        doc = "# Name\n\n## Imported from Claude Code (2026-02-02)\n\n- old\n"
+        self.assertEqual(merge(doc, section), "# Name\n\n## Imported from Claude Code (2026-02-02)\n\n- a\n")
+        self.assertEqual(merge(doc, "no heading here\n"), doc.rstrip("\n") + "\n\nno heading here\n")
+        self.assertEqual(merge(merge(doc, section), section), merge(doc, section))
+
+    def test_held_helpers(self):
+        self.assertEqual(self.m.held_reason({"personal_reason": "one two three four five six seven"}), "one two three four five six")
+        self.assertEqual(self.m.held_reason({}), "personal")
+        state = {"sessions": {f"{SLUG_A}/{U1}": {"personal_override": "hold"},
+                              f"{SLUG_A}/{U2}": {"personal_override": "include"}}, "projects": {}}
+        summaries = {(SLUG_A, U1): {}, (SLUG_A, U2): {"personal": True}, (SLUG_B, U3): {"personal": True, "personal_reason": "x"}}
+        held = self.m.held_sessions(summaries, state)
+        self.assertEqual(held, {(SLUG_A, U1): "held by you", (SLUG_B, U3): "x"})
+        self.assertEqual(self.m.excluded_by_slug({"sessions": {f"{SLUG_B}/z": {"skipped_empty": True}}}, held),
+                         {SLUG_A: 1, SLUG_B: 2})
+        self.assertEqual(self.m.session_day({}, {(SLUG_A, U1): {"date_range": ["2026-03-03T10:00:00Z", ""]}}, SLUG_A, U1), "2026-03-03")
+        self.assertEqual(self.m.session_day({}, {}, SLUG_A, U1), "?")
+        self.assertEqual(self.m.drop_held_citations({"people": [1]}, {}), {"people": [1]})
+        ents, n_c, n_d = self.m.strip_citations({"people": ["junk", {"name": "x", "citations": ["junk", _cite(SLUG_A, U1)]},
+                                                            {"name": "y"}]}, lambda c: True)
+        self.assertEqual((n_c, n_d, ents["people"]), (1, 1, [{"name": "y", "citations": []}]))
+        rows = self.m.held_rows({}, summaries, held)
+        self.assertEqual([r["session"] for r in rows], [U1, U3])
+        self.assertEqual(self.m.held_rows({}, summaries, held, {SLUG_B}), [rows[1]])   # filtered to one project
+        section = self.m._held_section([{"session": U1, "date": "2026-03-03", "reason": "a"},
+                                        {"session": U2, "date": "2026-03-03", "reason": "b"}])
+        self.assertIn(f"2026-03-03 · a (`{U1[:8]}`), 2026-03-03 · b (`{U2[:8]}`)", section)
+
+    def test_stale_rollup_rules(self):
+        index_doc = json.loads((self.data / "index.json").read_text())
+        summaries = self.m.load_summaries(self.data)
+        rollups = self.m.load_rollups(self.data)
+        self.assertEqual(self.m.stale_rollups(rollups, summaries, {}, {"sessions": {}}, index_doc), {})
+        # no `sessions` list at all: only an owner-included session makes it stale
+        bare = {SLUG_A: {"name": "Alpha"}}
+        self.assertEqual(self.m.stale_rollups(bare, summaries, {(SLUG_A, U1): "x"}, {"sessions": {}}, index_doc), {})
+        state = {"sessions": {f"{SLUG_A}/{U1}": {"personal_override": "include"}}}
+        self.assertEqual(self.m.stale_rollups(bare, summaries, {}, state, index_doc), {SLUG_A: "written without an included session"})
+        # a listed uuid the index knows but no summary backs: forgotten — unless extract skipped it as empty
+        del summaries[(SLUG_A, U2)]
+        self.assertEqual(self.m.stale_rollups(rollups, summaries, {}, {"sessions": {}}, index_doc)[SLUG_A], "lists a forgotten session")
+        skipped = {"sessions": {f"{SLUG_A}/{U2}": {"skipped_empty": True}}}
+        self.assertNotIn(SLUG_A, self.m.stale_rollups(rollups, summaries, {}, skipped, index_doc))
+        rollups[SLUG_A]["sessions"] = [U1, "not-in-the-index", 7]
+        self.assertEqual(self.m.stale_rollups(rollups, summaries, {}, {"sessions": {}}, index_doc), {})
+        stub = self.m.redact_rollup(rollups[SLUG_A])
+        self.assertEqual((stub["name"], stub["what_it_is"], stub["stale_rollup"]), ("Alpha", "(roll-up pending regeneration)", True))
+        self.assertNotIn("widget", json.dumps(stub).lower())
+        self.assertEqual(self.m._note_body(stub), f"_{self.m.STALE_ROLLUP_TEXT}_")
+        self.assertEqual(self.m._paragraph(stub), self.m.STALE_ROLLUP_TEXT)
+        self.assertIn("(roll-up pending regeneration)", self.m._project_line(SLUG_A, stub, index_doc))
+
+    def test_resolve_session_and_pool(self):
+        index_doc = json.loads((self.data / "index.json").read_text())
+        summaries = self.m.load_summaries(self.data)
+        summaries[(SLUG_B, "ffffffff-0000-4000-8000-000000000009")] = {}       # a summary the index lost
+        pool = self.m.session_pool(index_doc, summaries)
+        self.assertEqual(len(pool), 4)
+        self.assertEqual(self.m.resolve_session(pool, U1, index_doc, summaries), (SLUG_A, U1))
+        self.assertEqual(self.m.resolve_session(pool, "FFFFFFFF", index_doc, summaries)[1], "ffffffff-0000-4000-8000-000000000009")
+        self.assertEqual(self.m.resolve_session(pool, "2026-07-20", index_doc, summaries), (SLUG_B, U3))
+        with self.assertRaises(SystemExit):
+            self.m.resolve_session(pool, "2026-07-21", index_doc, summaries)
+        with self.assertRaises(SystemExit):
+            self.m.resolve_session(pool, None, index_doc, summaries)
+
+    def test_review_people_lines_when_nobody_is_there(self):
+        text = self.m._people_section([], [], 0, {}, True)
+        self.assertIn("Already in your People store — will gain new interactions (0):\n- none\n", text)
+        self.assertIn("New — will be added (0):\n- none\n", text)
+        self.assertEqual(self.m._n(1, "citation"), "1 citation")
 
     def test_forget_drops_junk_entity_items(self):
         ents = json.loads((self.data / "entities.json").read_text())

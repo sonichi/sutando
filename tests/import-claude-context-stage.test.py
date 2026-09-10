@@ -192,7 +192,10 @@ class TestStage(Base):
         self.assertIn(f"### Beta (`{SLUG_B}`)\n", review)
         self.assertIn("A launch plan", review)              # no summary: falls back to what_it_is
         self.assertIn("Open threads: none recorded.\nDecisions: none recorded.", review)
-        people_section = review.split("## People it would add (25)\n", 1)[1]
+        people_section = review.split("## People\n", 1)[1]
+        self.assertIn("_Store not checked (People tool unavailable)", people_section)   # no --known-people
+        self.assertIn("New — will be added (25):\n", people_section)
+        self.assertNotIn("Already in your People store", people_section)
         self.assertIn("- Ada Lovelace — investor; CTO · Analytical (3 citations)\n", people_section)
         self.assertIn("- Only Alpha — colleague (2 citations)\n", people_section)
         self.assertIn("- Person 00 — contact (2 citations)\n", people_section)
@@ -200,8 +203,12 @@ class TestStage(Base):
         self.assertIn("_Left out: 1 with a single mention only (2 citations needed)._", review)
         self.assertIn("## Memory\n\n", review)
         self.assertIn("B summary (cap 2,000 B) covering 2 projects for the agent's core memory, plus one MEMORY.md row if the index budget allows.", review)
+        self.assertIn("## Held back as personal (0)\n\nNone. Say 'hold <date>' to hold a session the classifier missed; "
+                      "held sessions are never quoted.\n", review)
         self.assertTrue(review.rstrip().endswith("---\n" + FOOTER))
         self.assertEqual(review.count(FOOTER), 1)
+        self.assertEqual(self._manifest()["known_people"], "not checked")
+        self.assertEqual(self._manifest()["held"], [])
 
     def test_stage_needs_a_rollup(self):
         for p in (self.data / "projects").glob("*.json"):
@@ -624,6 +631,338 @@ class TestCliEdges(Base):
         self.assertEqual(rc, 0)
         rec = json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U1}"]
         self.assertGreater(rec["summarized_at"], rec["extracted_at"])
+
+
+KNOWN_ADA = {"id": "k1", "slug": "ada-lovelace", "name": "A. Lovelace", "email": "Ada@Example.com",
+             "identifiers": {"emails": ["ada.l@other.example"]}}
+HIDDEN = "Hidden"      # every string a held session carries starts with this; none may surface
+
+
+class TestKnownPeople(Base):
+    """Part 1: a person the store already has is never overwritten or duplicated."""
+
+    def _known(self, entries):
+        path = self.tmp / "known-people.json"
+        path.write_text(json.dumps(entries))
+        return str(path)
+
+    def test_email_match_gives_an_update_payload_without_a_doc(self):
+        rc, c, _ = self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        self.assertEqual(rc, 0)
+        # the cap of 25 applies to NEW people only: Ada rides on top of it
+        self.assertEqual((c["people"], c["people_existing"], c["people_new"], c["people_ambiguous"]), (26, 1, 25, 0))
+        self.assertEqual(self._manifest()["known_people"], "checked")
+        self.assertEqual(self._status()["people_existing"], 1)
+        people = json.loads((self.staged / "people.json").read_text())
+        ada = people[0]
+        self.assertEqual(ada["existing"], {"id": "k1", "slug": "ada-lovelace", "name": "A. Lovelace", "matched_on": "email"})
+        self.assertNotIn("doc", ada)
+        self.assertEqual((ada["id"], ada["slug"], ada["source"]), ("k1", "ada-lovelace", "claude-import"))
+        self.assertEqual(ada["email"], "Ada@Example.com")                                   # the store's spelling stays primary
+        self.assertEqual(ada["identifiers"], {"emails": ["Ada@Example.com", "ada.l@other.example"]})   # merged, case-insensitive
+        self.assertEqual(ada["last_interaction_at"], "2026-08-05T10:00:00Z")
+        self.assertTrue(ada["doc_append"].startswith(f"## Imported from Claude Code ({self.m.today()})\n\n"))
+        self.assertIn("Recent interactions:\n- 2026-08-05 — Widget polish: talked about the raise\n", ada["doc_append"])
+        self.assertIn("Claims and citations:\n", ada["doc_append"])
+        self.assertEqual(ada["doc_append"].count("## "), 1)
+        for p in people[1:]:
+            self.assertIsNone(p["existing"])
+            self.assertIn("doc", p)
+            self.assertNotIn("doc_append", p)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Already in your People store — will gain new interactions (1):\n"
+                      "- Ada Lovelace — matched on email (3 citations)\n", review)
+        self.assertIn("New — will be added (25):\n", review)
+        self.assertNotIn("Store not checked", review)
+        self.assertTrue((self.staged / "known-people.json").is_file())
+        self.assertEqual(stat.S_IMODE((self.staged / "known-people.json").stat().st_mode), 0o600)
+
+    def test_name_match_folds_diacritics_and_two_entries_are_ambiguous(self):
+        known = [{"id": "k2", "slug": "only-alpha", "name": " Ónly  Álpha "},
+                 {"id": "k3", "slug": "person-00", "name": "Person 00"},
+                 {"id": "k4", "slug": "person-00-2", "name": "PERSON 00"}]
+        rc, c, _ = self._run("--stage", "--known-people", self._known(known))
+        self.assertEqual((c["people_existing"], c["people_ambiguous"]), (1, 1))
+        people = json.loads((self.staged / "people.json").read_text())
+        only = next(p for p in people if p["name"] == "Only Alpha")
+        self.assertEqual(only["existing"]["matched_on"], "name")
+        self.assertEqual(only["slug"], "only-alpha")
+        self.assertNotIn("doc", only)
+        self.assertNotIn("email", only)                                    # no address on either side
+        self.assertNotIn("Person 00", [p["name"] for p in people])         # ambiguous: never upserted from here
+        self.assertEqual(self._manifest()["people_ambiguous"], [{
+            "name": "Person 00", "citations": 2,
+            "matches": [{"id": "k3", "slug": "person-00", "name": "Person 00"},
+                        {"id": "k4", "slug": "person-00-2", "name": "PERSON 00"}]}])
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Needs your call (1) — not upserted until you say who they are:\n"
+                      "- Person 00 (2 citations) — your store has 2 entries with this name: "
+                      "Person 00 (person-00), PERSON 00 (person-00-2)\n", review)
+        self.assertIn("- Only Alpha — matched on name (2 citations)\n", review)
+
+    def test_unchecked_store_marks_every_payload_new(self):
+        rc, c, _ = self._run("--stage")
+        self.assertEqual((c["people_existing"], c["people_new"], c["people_ambiguous"]), (0, 25, 0))
+        self.assertEqual(self._manifest()["known_people"], "not checked")
+        self.assertFalse((self.staged / "known-people.json").exists())
+        self.assertTrue(all(p["existing"] is None and "doc" in p
+                            for p in json.loads((self.staged / "people.json").read_text())))
+        self.assertIn("_Store not checked (People tool unavailable)", (self.staged / "review.md").read_text())
+
+    def test_store_listing_survives_restage_commit_and_people_json(self):
+        kp = self._known([KNOWN_ADA])
+        self._run("--stage", "--known-people", kp)
+        rc, c, _ = self._run("--commit", "--projects", "beta")          # Alpha is re-staged without the flag
+        self.assertEqual(self._manifest()["known_people"], "checked")
+        ada = json.loads((self.staged / "people.json").read_text())[0]
+        self.assertEqual(ada["existing"]["matched_on"], "email")
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")     # recomputed from the staged copy
+        self.assertEqual(payloads[0]["existing"]["id"], "k1")
+        self.assertNotIn("doc", payloads[0])
+        self.assertIn("a2a2a2a2", payloads[0]["doc_append"])
+        self.assertNotIn("b3b3b3b3", payloads[0]["doc_append"])
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_existing"]), (26, 1))
+        approved = self.data / "people.json"
+        self.assertEqual(stat.S_IMODE(approved.stat().st_mode), 0o600)
+        rc, payloads, _ = self._run("--people-json")                          # the last commit's approved copy
+        self.assertEqual(payloads, json.loads(approved.read_text()))
+        self.assertEqual(payloads[0]["existing"]["slug"], "ada-lovelace")
+        # a recompute with an explicit listing, and one with none at all
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha", "--known-people", kp)
+        self.assertEqual(payloads[0]["existing"]["id"], "k1")
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertIsNone(payloads[0]["existing"])
+        self.assertIn("doc", payloads[0])
+
+    def test_people_doc_merge_cli_is_idempotent(self):
+        existing = self.tmp / "existing.md"
+        existing.write_text("# Ada Lovelace\n\n## Contact\n- Email: ada@example.com\n\n"
+                            "## Imported from Claude Code (2026-01-01)\n\nold import\n\n## Notes\n- keep me\n")
+        append = self.tmp / "append.md"
+        append.write_text("## Imported from Claude Code (2026-01-01)\n\nRecent interactions:\n- new line\n")
+        rc, out, _ = self._run("--people-doc-merge", "--existing-doc", str(existing), "--append", str(append))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "# Ada Lovelace\n\n## Contact\n- Email: ada@example.com\n\n"
+                              "## Imported from Claude Code (2026-01-01)\n\nRecent interactions:\n- new line\n\n"
+                              "## Notes\n- keep me\n")
+        self.assertNotIn("old import", out)
+        existing.write_text(out)
+        rc, again, _ = self._run("--people-doc-merge", "--existing-doc", str(existing), "--append", str(append))
+        self.assertEqual(again, out)
+        self.assertIn("needs --existing-doc", self._refused("--people-doc-merge", "--append", str(append)))
+        self.assertIn("cannot read --known-people", self._refused("--stage", "--known-people", str(self.tmp / "nope.json")))
+
+
+class HeldBase(Base):
+    def _mark_personal(self, slug, uuid, reason="family matter", drop_from_rollup=True):
+        """What the classifier + coordinator leave behind: a `personal` summary
+        whose every string is a canary, and a roll-up written without it."""
+        p = self.data / "summaries" / slug / f"{uuid}.json"
+        doc = json.loads(p.read_text())
+        doc.update({"personal": True, "personal_reason": reason, "title": f"{HIDDEN} title",
+                    "summary": f"{HIDDEN} summary text", "people": [{"name": f"{HIDDEN} Person"}]})
+        p.write_text(json.dumps(doc))
+        if drop_from_rollup:
+            r = self.data / "projects" / f"{slug}.json"
+            rd = json.loads(r.read_text())
+            rd["sessions"] = [u for u in rd["sessions"] if u != uuid]
+            r.write_text(json.dumps(rd))
+        ents_path = self.data / "entities.json"
+        ents = json.loads(ents_path.read_text())
+        ents["people"].append({"name": f"{HIDDEN} Person", "relationship": "relative",
+                               "citations": [_cite(slug, uuid, f"{HIDDEN} quote"), _cite(slug, uuid, f"{HIDDEN} quote two")]})
+        ents["open_threads"].append({"thread": f"{HIDDEN} thread", "project": slug, "citations": [_cite(slug, uuid)]})
+        ents_path.write_text(json.dumps(ents))
+
+    def _held_section(self):
+        review = (self.staged / "review.md").read_text()
+        return review.split("## Held back as personal", 1)[1]
+
+    def assertNothingHidden(self):
+        for path in list(self.staged.rglob("*")) + list(self.ndir.glob("*.md")) + list(self.mem.glob("*.md")):
+            if path.is_file():
+                self.assertNotIn(HIDDEN, path.read_text(errors="replace"), path.name)
+
+
+class TestHeld(HeldBase):
+    """Part 2: a personal session contributes nothing and is never quoted."""
+
+    def test_held_session_is_absent_from_every_sink_and_the_review_body(self):
+        self._mark_personal(SLUG_B, U3)
+        rc, c, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["held"], c["stale_rollups"]), (2, 2, 1, 0))
+        self.assertEqual(c["people"], 2)                    # the "Person NN"s lost their Beta citation
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("2 sessions across 2 projects", review)
+        self.assertIn(f"### Beta (`{SLUG_B}`)\n\ndir `/Users/o/Projects/beta` · 0 sessions", review)
+        self.assertIn("A launch plan", review)              # the roll-up was written without it: not stale
+        self.assertIn("## Held back as personal (1)\n\n2026-07-20 · family matter\n\n"
+                      "Say 'include <date>' to add one, 'include personal' for all, or 'hold <date>' to hold one "
+                      "the classifier missed; held sessions are never quoted.\n", review)
+        self.assertTrue(review.rstrip().endswith("---\n" + FOOTER))
+        self.assertNothingHidden()
+        self.assertEqual(self._manifest()["held"], [{"project": SLUG_B, "session": U3, "date": "2026-07-20",
+                                                     "reason": "family matter", "held": "personal"}])
+        self.assertNotIn(HIDDEN, (self.staged / "manifest.json").read_text())
+        self.assertNotIn(U3[:8], (self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").read_text())
+        self.assertIn("Imported 2 sessions across 2 projects", (self.staged / "notes" / "claude-import" / "overview.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["held"], c["committed"]), (2, 1, 2))
+        self.assertIn("Imported 2 sessions / 2 projects", (self.mem / "claude_import.md").read_text())
+        state = json.loads((self.data / "state.json").read_text())
+        self.assertNotIn(f"{SLUG_B}/{U3}", state["sessions"])              # never landed
+        for u in (U1, U2):
+            self.assertIn("summarized_at", state["sessions"][f"{SLUG_A}/{u}"])
+        self.assertNothingHidden()
+        rc, payloads, _ = self._run("--people-json")
+        self.assertNotIn(HIDDEN, json.dumps(payloads))
+        rc, rows, _ = self._run("--held-json")
+        self.assertEqual(rows, [{"project": SLUG_B, "session": U3, "date": "2026-07-20",
+                                 "reason": "family matter", "held": "personal"}])
+
+    def test_include_round_trip_marks_the_rollup_stale_until_it_is_rerun(self):
+        self._mark_personal(SLUG_B, U3)
+        self._run()
+        rc, r, _ = self._run("--include", "2026-07-20")
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"included": 1, "held_remaining": 0, "stale_rollups": 1, "staged_remaining": 2})
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_B}/{U3}"],
+                         {"personal_override": "include"})
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("3 sessions across 2 projects", review)
+        self.assertIn("## Held back as personal (0)", review)
+        self.assertIn("roll-up: stale (written without an included session) — re-run before it can land", review)
+        self.assertIn(self.m.STALE_ROLLUP_TEXT, review)
+        self.assertNotIn("A launch plan", review)                     # a stale roll-up shows nothing it wrote
+        self.assertIn(self.m.STALE_ROLLUP_TEXT, (self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").read_text())
+        self.assertEqual(self._manifest()["stale_rollups"], {SLUG_B: "written without an included session"})
+        self.assertEqual(self._status()["stale_rollups"], 1)
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        self.assertIn("stale roll-up", self._refused("--commit", "--projects", "beta"))
+        self.assertSinksUntouched()
+        # the coordinator re-runs Beta's roll-up over its sessions, now including U3
+        p = self.data / "projects" / f"{SLUG_B}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U3]
+        p.write_text(json.dumps(doc))
+        rc, c, _ = self._run()
+        self.assertEqual((c["sessions"], c["held"], c["stale_rollups"]), (3, 0, 0))
+        self.assertIn("A launch plan", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["committed"], c["sessions"]), (2, 3))
+        self.assertIn("summarized_at", json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_B}/{U3}"])
+        # a re-summarisation that flags it again does not override the owner's call
+        self._mark_personal(SLUG_B, U3, drop_from_rollup=False)
+        rc, rows, _ = self._run("--held-json")
+        self.assertEqual(rows, [])
+
+    def test_include_personal_lifts_every_hold(self):
+        self._mark_personal(SLUG_A, U1, reason="health")
+        self._mark_personal(SLUG_B, U3, reason="one two three four five six seven")
+        rc, c, _ = self._run()
+        self.assertEqual((c["sessions"], c["held"]), (1, 2))
+        self.assertIn("2026-07-20 · one two three four five six, 2026-08-01 · health", self._held_section())
+        self.assertIn("no held session matches '2026-01-01'", self._refused("--include", "2026-01-01"))
+        rc, r, _ = self._run("--include-personal")
+        self.assertEqual((r["included"], r["held_remaining"], r["stale_rollups"]), (2, 0, 2))
+        self.assertIn("nothing is held", self._refused("--include-personal"))
+        self.assertIn("## Held back as personal (0)", (self.staged / "review.md").read_text())
+
+    def test_hold_a_session_the_classifier_missed(self):
+        self._run()
+        rc, r, _ = self._run("--hold", "2026-08-05")                        # U2, listed in Alpha's roll-up
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"held": 1, "held_total": 1, "stale_rollups": 1, "staged_remaining": 2})
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U2}"],
+                         {"personal_override": "hold"})
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("2 sessions across 2 projects", review)
+        self.assertIn(f"### Alpha (`{SLUG_A}`)\n\ndir `/Users/o/Projects/alpha` · 1 sessions", review)
+        self.assertIn("roll-up: stale (written with a held session)", review)
+        self.assertNotIn("Alpha is where the owner built", review)
+        self.assertNotIn("Widget polish", (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text())
+        self.assertIn("## Held back as personal (1)\n\n2026-08-05 · held by you\n", review)
+        self.assertIn("no session matches '2026-08-05'", self._refused("--hold", "2026-08-05"))   # already held
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        rc, r, _ = self._run("--include", U2[:8])                              # a uuid prefix works too
+        self.assertEqual((r["included"], r["held_remaining"], r["stale_rollups"]), (1, 0, 0))
+        self.assertIn("Alpha is where the owner built", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(c["committed"], 2)
+        msg = self._refused("--hold", "2026-08-01")                          # landed: the note is on disk
+        self.assertIn("already landed", msg)
+        self.assertIn(f"--forget-session {U1}", msg)
+
+    def test_a_date_shared_by_two_sessions_is_refused_with_the_uuids(self):
+        U4 = "44444444-dddd-4ddd-8ddd-dddddddddddd"
+        p = self.data / "index.json"
+        doc = json.loads(p.read_text())
+        doc["counts"]["sessions"] = 4
+        doc["projects"][SLUG_A]["session_count"] = 3
+        doc["projects"][SLUG_A]["sessions"].append({"uuid": U4, "title": "Widget docs", "first_ts": "2026-08-05T14:00:00Z",
+                                                    "last_ts": "2026-08-05T15:00:00Z"})
+        p.write_text(json.dumps(doc))
+        (self.data / "summaries" / SLUG_A / f"{U4}.json").write_text(json.dumps({"session": U4, "project": SLUG_A}))
+        self._run()
+        msg = self._refused("--hold", "2026-08-05")
+        self.assertIn("'2026-08-05' matches 2 sessions — name one by uuid: ", msg)
+        self.assertIn(U2, msg)
+        self.assertIn(U4, msg)
+        self.assertFalse((self.data / "state.json").exists())
+        rc, r, _ = self._run("--hold", U4)
+        self.assertEqual(r["held"], 1)
+        self.assertIn("no session matches 'a2a2'", self._refused("--forget-session", "a2a2"))   # a prefix needs 8 chars
+
+    def test_forget_session_deletes_summary_dumps_and_state(self):
+        (self.data / "dumps" / SLUG_A / f"{U2}.1.txt").write_text("dump")
+        (self.data / "state.json").write_text(json.dumps({"sessions": {
+            f"{SLUG_A}/{U2}": {"extracted_at": "2026-09-01T00:00:00Z", "chunks": 1, "chars": 500}}, "projects": {}}))
+        self._run()
+        rc, r, _ = self._run("--forget-session", "2026-08-05")
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"summaries": 2, "dumps": 1, "state_entry": 1, "landed": False,
+                             "stale_rollups": 1, "staged_remaining": 2})
+        self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.json").exists())
+        self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.1.json").exists())      # the partial too
+        self.assertTrue((self.data / "summaries" / SLUG_A / f"{U1}.json").exists())
+        self.assertFalse((self.data / "dumps" / SLUG_A / f"{U2}.1.txt").exists())
+        self.assertNotIn(f"{SLUG_A}/{U2}", json.loads((self.data / "state.json").read_text())["sessions"])
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("roll-up: stale (lists a forgotten session)", review)
+        self.assertNotIn("Alpha is where the owner built", review)
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        rc, r, _ = self._run("--forget-session", U2)                  # again: nothing left, nothing refused
+        self.assertEqual((r["summaries"], r["dumps"], r["state_entry"], r["stale_rollups"]), (0, 0, 0, 1))
+        # a session that already landed can be forgotten too; the note stays
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U1]
+        p.write_text(json.dumps(doc))
+        self._run()
+        self._run("--commit")
+        rc, r, _ = self._run("--forget-session", U1)
+        self.assertEqual((r["landed"], r["summaries"], r["staged_remaining"]), (True, 1, 0))
+        self.assertTrue((self.ndir / f"{SLUG_A}.md").is_file())
+
+    def test_human_output_for_the_session_commands(self):
+        self._mark_personal(SLUG_B, U3)
+        self._run()
+        out = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            base = ["--workspace", str(self.ws), "--memory-dir", str(self.mem)]
+            self.m.main(base + ["--stage"])
+            self.m.main(base + ["--include", "2026-07-20"])
+            self.m.main(base + ["--hold", U3])
+            self.m.main(base + ["--forget-session", U3])
+        text = out.getvalue()
+        self.assertIn("2 people (0 already in the store), 1 held as personal", text)
+        self.assertIn("included 1 held session(s), 0 still held; 1 roll-up(s) now stale, 2 projects staged", text)
+        self.assertIn("held 1 session (1 held in all); 0 roll-up(s) now stale, 2 projects staged", text)
+        self.assertIn("forgot 1 session (1 summary files, 0 dumps); 0 roll-up(s) now stale, 2 projects staged", text)
+        self.assertNotIn(HIDDEN, text)
 
 
 if __name__ == "__main__":

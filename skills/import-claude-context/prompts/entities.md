@@ -8,7 +8,7 @@ You are extracting the durable entities from the owner's past Claude Code sessio
 
 Inputs (read every file with the Read tool):
 - `<data-dir>/entities.json` — previous pass, if it exists; merge into it, never drop an existing citation
-- `<data-dir>/summaries/<slug>/<uuid>.json` (… one line per session summary)
+- `<data-dir>/summaries/<slug>/<uuid>.json` (… one line per non-personal session summary — the coordinator leaves out every summary whose `personal` is `true`; if one is listed anyway, cite nothing from it)
 
 Output: write ONE JSON object with the Write tool to `<data-dir>/entities.json`. Reply `done` (or `STOP` if an input was missing). No prose, no code fences.
 
