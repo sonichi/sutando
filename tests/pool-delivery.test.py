@@ -471,5 +471,72 @@ class TestSweepTotality(Base):
                 pd.sweep(self.root, "core")
 
 
+
+class TestBootRecoveryIsAnnounced(Base):
+    """The production `watch` path, not `sweep()` alone: sweep released the
+    interrupted delivery, then `watch` seeded `announced` from it and emitted
+    nothing -- the task sat pending with nobody told."""
+    def watch_once(self):
+        from unittest.mock import patch
+        seen = []
+        def stop(_):
+            raise KeyboardInterrupt
+        with patch.object(pd, "_emit", side_effect=seen.append), patch("time.sleep", side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt):
+                pd.main(["--workspace", str(self.root), "--recipient", "core", "watch"])
+        return seen
+
+    def test_an_accepted_delivery_interrupted_before_boot_is_announced(self):
+        self.ws.payload("task-x")
+        pd.accept(self.ws.deliver("core", "task-x"))
+        self.assertEqual(self.watch_once(), ["task-x"])
+        self.assertTrue((self.root / "deliveries" / "core" / "task-x.txt").exists(), "released")
+
+    def test_a_legacy_claimed_name_is_announced_too(self):
+        self.ws.payload("task-y")
+        (self.root / "deliveries" / "core").mkdir(parents=True)
+        (self.root / "deliveries" / "core" / "task-y.claimed").touch()
+        self.assertEqual(self.watch_once(), ["task-y"])
+
+
+class TestResultReadiness(Base):
+    def accepted(self, tid="task-1"):
+        self.ws.payload(tid)
+        pd.accept(self.ws.deliver("core", tid))
+
+    def test_an_empty_or_whitespace_result_is_not_completion(self):
+        for body in ("", "   \n\t"):
+            self.accepted(f"task-{len(body)}")
+            self.ws.result(f"task-{len(body)}", body)
+            self.assertEqual(pd.residue(self.root, "core", f"task-{len(body)}"), "died-mid-work", repr(body))
+
+    def test_a_substantive_result_is(self):
+        self.accepted()
+        self.ws.result("task-1", "the answer")
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "completed")
+
+
+class TestAcceptIsExclusive(Base):
+    def test_a_second_pending_name_cannot_replace_the_accepted_one(self):
+        """rename() overwrites silently; two accepts of one task were both
+        'successful'. The accepted name is work in flight and must stay."""
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        stray = self.ws.deliver("core", "task-1")
+        with self.assertRaises(pd.NotDelivered):
+            pd.accept(stray)
+        self.assertTrue(stray.exists())
+        self.assertTrue((self.root / "deliveries" / "core" / "task-1.accepted").exists())
+
+    def test_the_lock_file_is_not_a_sentinel(self):
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        self.assertTrue((self.root / "deliveries" / "core" / pd.LOCK_NAME).exists())
+        self.assertEqual([p.name for p in pd.pending(self.root, "core")], [])
+        self.assertEqual([p.name for p in pd.accepted(self.root, "core")], ["task-1.accepted"])
+        pd.sweep(self.root, "core")
+        self.assertTrue((self.root / "deliveries" / "core" / pd.LOCK_NAME).exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

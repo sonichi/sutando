@@ -21,6 +21,8 @@ fswatch, by poll, or not at all.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -32,12 +34,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from workspace_default import resolve_workspace  # noqa: E402
 
+from delivery.readiness import read_ready_result  # noqa: E402
+
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
 ACCEPTED_SUFFIX = ".accepted"
 # Sentinels written before the rename. Recognised so work already accepted under
 # the old name is never re-delivered; nothing writes this suffix.
 LEGACY_ACCEPTED_SUFFIX = ".claimed"
+# Not a sentinel: the regex below never matches it, so listings skip it.
+LOCK_NAME = ".lock"
 
 # One suffix, substituted never appended: an accepted sentinel must not still
 # read as pending, or a reader re-takes its own in-flight work.
@@ -125,6 +131,20 @@ def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     return None
 
 
+@contextlib.contextmanager
+def arbitration(workspace, recipient: str):
+    """One lock per folder around publish, accept and release, so a check of
+    both names and the rename that follows it cannot interleave."""
+    d = deliveries_dir(workspace, recipient)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / LOCK_NAME, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def accept(sentinel: Path) -> Path:
     """Take up work already assigned here. Atomic and exclusive; a loser gets
     OSError.
@@ -137,7 +157,12 @@ def accept(sentinel: Path) -> Path:
     if got is None or got[1]:
         raise NotDelivered(f"not a pending sentinel: {sentinel.name}")
     dst = sentinel.with_name(got[0] + ACCEPTED_SUFFIX)
-    os.rename(sentinel, dst)
+    with arbitration(sentinel.parent.parent.parent, sentinel.parent.name):
+        # A stray pending name beside the accepted one: rename would silently
+        # replace work in flight. (A racing loser's source is gone: OSError.)
+        if dst.exists() and sentinel.exists():
+            raise NotDelivered(f"already accepted: {dst.name}")
+        os.rename(sentinel, dst)
     return dst
 
 
@@ -147,7 +172,8 @@ def release(sentinel: Path) -> Path:
     if got is None or not got[1]:
         raise NotDelivered(f"not an accepted sentinel: {sentinel.name}")
     dst = sentinel.with_name(got[0] + PENDING_SUFFIX)
-    os.rename(sentinel, dst)
+    with arbitration(sentinel.parent.parent.parent, sentinel.parent.name):
+        os.rename(sentinel, dst)
     return dst
 
 
@@ -157,7 +183,9 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     One name per state, each mapped by `sweep` to exactly one action.
     """
     ws = Path(workspace)
-    has_result = result_path(ws, task_id).is_file()
+    # The shared readiness contract, not existence: an empty or whitespace-only
+    # file is a placeholder still being written, and must not suppress recovery.
+    has_result = read_ready_result(result_path(ws, task_id)) is not None
     has_flag = done_flag(ws, recipient, task_id).is_file()
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
@@ -255,7 +283,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(sweep(ws, a.recipient), indent=2))
         return 0
 
-    for task_id in sweep(ws, a.recipient)["ready"]:
+    # A release puts the name back as pending, and pending-at-boot is exactly
+    # what a streaming reader never hears about: announce both.
+    boot = sweep(ws, a.recipient)
+    for task_id in boot["ready"] + boot["released"]:
         _emit(task_id)
     announced = {parse_sentinel(p.name)[0] for p in pending(ws, a.recipient)}
     while True:
