@@ -553,8 +553,11 @@ def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane:
         fcntl.flock(fd, fcntl.LOCK_EX)
         entries = load_window(path)
         # Hashes and pattern names only — no pane text is ever persisted here.
+        # Both families, or classify_window sees no abnormal text and the whole
+        # abnormal column is invisible to its one production caller.
         entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
-                 "patterns": matched_patterns([frame])}
+                 "patterns": matched_patterns([frame]),
+                 "abnormal": matched_abnormal([frame])}
         if pane:
             entry["pane"] = pane
         entries.append(entry)
@@ -622,8 +625,10 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     ids = [e["state"] for e in run]
     raws = [e.get("raw_state") for e in run]
     pats = [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in run]
+    # Absent on rows written before this key existed: [] reads as no abnormal text.
+    abn = [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in run]
     whole_raw_static = len(run) >= 2 and all(raws) and len(set(raws)) == 1
-    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps)
+    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps, abn)
     if whole["kind"] in ("retry-loop", "provider-limit", "low-novelty"):
         return {**whole, **meta}
     last = run[-1].get("raw_state")
@@ -637,7 +642,8 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
         tail_gaps = [b["ts"] - a["ts"] for a, b in zip(tail, tail[1:])]
         trailing = classify_ids([e["state"] for e in tail], True,
                                 [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in tail],
-                                work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps)
+                                work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps,
+                                [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in tail])
         if trailing["kind"] in ("idle", "static-with-work"):
             return {**trailing, **meta, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
                     "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(tail)}

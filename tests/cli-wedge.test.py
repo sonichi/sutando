@@ -857,10 +857,21 @@ class Confidentiality(unittest.TestCase):
     def test_window_entries_carry_hashes_and_patterns_only(self):
         with tempfile.TemporaryDirectory() as d:
             entries = w.append_window(Path(d), retry_frame(1), 1.0)
-            self.assertEqual(sorted(entries[-1]), ["patterns", "raw_state", "state", "ts"])
+            self.assertEqual(sorted(entries[-1]), ["abnormal", "patterns", "raw_state", "state", "ts"])
             text = w.window_path(Path(d)).read_text()
             self.assertNotIn("Retrying", text)
             self.assertNotIn("attempt", text)
+
+    def test_persisted_pattern_fields_hold_NAMES_from_the_known_vocabulary(self):
+        # `abnormal` joined `patterns` in the window; both must stay a closed set of
+        # pattern names, never a snippet of the pane that matched.
+        vocab = {n for n, _ in w.RETRY_PATTERNS} | {n for n, _ in w.ABNORMAL_PATTERNS}
+        with tempfile.TemporaryDirectory() as d:
+            e = w.append_window(Path(d), "❯ \n⏵⏵ please log in to continue · run /login\n", 1.0)
+            self.assertTrue(e[-1]["abnormal"], "the fixture must match, or this proves nothing")
+            for key in ("patterns", "abnormal"):
+                self.assertLessEqual(set(e[-1][key]), vocab, key)
+            self.assertNotIn("/login", w.window_path(Path(d)).read_text())
 
     def test_files_are_owner_only_under_a_permissive_umask(self):
         old = os.umask(0o022)
