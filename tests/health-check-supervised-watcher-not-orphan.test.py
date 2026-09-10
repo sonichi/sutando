@@ -38,8 +38,12 @@ def skip(label, reason=PS_SKIP_REASON):
     print(f"  SKIP {label}  — {reason}")
 
 
-def _verdict(trees, parents):
-    """check_task_watcher() with no sentinel, given tree roots and their ppids."""
+def _verdict(trees, parents, targets=None):
+    """check_task_watcher() with no sentinel, given tree roots and their ppids.
+
+    `targets` maps pid -> resolved sentinel target; absent, identity is
+    unreadable and no duplicate claim may be made from the root count alone.
+    """
     # "" is a scan that RAN and found nothing; None means ps is unavailable,
     # which would contradict this scenario's premise that watchers exist.
     with tempfile.TemporaryDirectory() as ws:
@@ -47,7 +51,9 @@ def _verdict(trees, parents):
              patch.object(hc, "_fresh_local_core_record", return_value={"ts": 1}), \
              patch.object(hc, "_watcher_trees", return_value=trees), \
              patch.object(hc, "_ps_snapshot", return_value=""), \
-             patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))):
+             patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))), \
+             patch.object(hc, "_watcher_sentinel_target",
+                          side_effect=lambda sd, pid: (targets or {}).get(str(pid))):
             return hc.check_task_watcher()
 
 
@@ -72,7 +78,10 @@ check("keeps the orphan verdict", "orphaned" in vU["detail"], vU["detail"])
 check("does not claim a live session", "live session" not in vU["detail"], vU["detail"])
 
 print("TWO supervised watchers (duplicates are still a real problem):")
-v3 = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "99", "200": "98"})
+# Both roots resolve to ONE target, so the duplicate claim below is true.
+# Without that identity the cost cannot be asserted from the count (qingyun-wu).
+v3 = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "99", "200": "98"},
+              targets={"100": "/s/w-a.pid", "200": "/s/w-a.pid"})
 # qingyun-wu, #3875: these pinned the DEFECT — both roots have LIVE parents (99, 98),
 # so 'orphaned' is false and 'stop them' takes two healthy instances offline.
 check("does NOT call supervised roots orphaned", "orphaned" not in v3["detail"], v3["detail"])
@@ -120,3 +129,11 @@ if failures:
     sys.exit(1)
 _note = f" ({len(skipped)} live-OS probe(s) skipped: {skipped})" if skipped else ""
 print(f"\nPASS — supervised watcher is not reported as an orphan{_note}")
+
+print("TWO supervised watchers, DISTINCT instances (not duplicates):")
+v4 = _verdict({"901": {"901"}, "902": {"902"}}, {"901": "99", "902": "98"},
+              targets={"901": "/s/w-a.pid", "902": "/s/w-b.pid"})
+check("says DISTINCT", "DISTINCT" in v4["detail"], v4["detail"])
+check("makes no duplicate claim", "processed 2x" not in v4["detail"], v4["detail"])
+check("does not authorise reduction",
+      "reduce the count through the launcher" not in v4["detail"], v4["detail"])
