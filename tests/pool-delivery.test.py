@@ -219,6 +219,20 @@ class TestResidue(Base):
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "clean")
 
 
+class TestFlagAfterDrain(Base):
+    def test_a_done_flag_with_no_result_is_finished_not_died(self):
+        """The bridge drains results/<id>.txt on delivery. A crash between the
+        flag and the archive, then a drain, leaves .claimed + flag + payload and
+        NO result. Reading that as died-mid-work re-runs finished work."""
+        self.ws.payload("task-1")
+        pd.claim(self.ws.deliver("core", "task-1"))
+        self.ws.flag("core", "task-1")                  # result already drained
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
+        out = pd.sweep(self.root, "core")
+        self.assertEqual(out["released"], [])
+        self.assertIsNone(pd.find(self.root, "core", "task-1"))
+
+
 class TestSweep(Base):
     def test_releases_work_a_crash_left_claimed(self):
         self.ws.payload("task-1")

@@ -155,10 +155,12 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
 
-    # A result outranks everything: the payload is archived last, so between the
-    # flag and the archive it still sits in tasks/ and must not read as new work.
+    # The flag is terminal on its own: the bridge drains the result file on
+    # delivery, so after a drain the flag is the only durable evidence left.
+    if has_flag:
+        return "finished"
     if has_result:
-        return "finished" if has_flag else "completed"
+        return "completed"
     if sentinel is None:
         if payload and not archived_payload(ws, task_id).is_file():
             return "undelivered"
