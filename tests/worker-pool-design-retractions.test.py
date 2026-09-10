@@ -2295,6 +2295,37 @@ class TheClaimDecisionCarriesTheTaskAddress(unittest.TestCase):
             "the pin table is addressing too (:104-115); naming only the envelope field "
             "contradicts the routing contract")
 
+    def test_the_address_row_ORDERS_the_two_forms_field_over_pin(self):
+        """Naming both inputs is not stating which wins.
+
+        Measured: reversing this row's stated precedence left both suites green,
+        so the row was documentation no test could distinguish from its opposite.
+        The direction is the claim -- rule 1 at :778-790 selects on the envelope
+        field first -- so the pin must not be the one described as outranking.
+        """
+        row = self._row_named("what does THIS task address")
+        field_first = row.index("requested_worker") < row.index("bindings.json")
+        self.assertTrue(field_first,
+            "the envelope field must be named before the pin table; order on the page "
+            "is the only cue a reader has to which input wins")
+        self.assertRegex(row, r"requested_worker`?[^|]*\bOUTRANKS\b",
+            "the row names both inputs without saying which wins; a reader hitting "
+            "requested_worker=worker-2 in a room pinned to worker-3 cannot resolve it")
+        self.assertNotRegex(row, r"pin table\*{0,2}\s+OUTRANKS",
+            "reversed precedence: the pin table cannot outrank the envelope field "
+            "while rule 1 at :778-790 selects on the field")
+
+    def test_the_address_row_is_marked_DERIVED_not_a_second_source(self):
+        """bindings.json is the sole source of room MEMBERSHIP one row above.
+
+        Reusing it here as a co-equal answer makes one artifact answer two
+        questions, which the table's own preamble forbids.
+        """
+        row = self._row_named("what does THIS task address")
+        self.assertIn("DERIVED", row,
+            "every other multi-input row says DERIVED, not sourced; unmarked, this row "
+            "reads as a second authority over bindings.json")
+
     def test_the_operational_row_declares_itself_blind_to_the_task(self):
         row = self._row_named("OPERATIONALLY able to claim")
         self.assertIn("BLIND", row,
