@@ -54,6 +54,7 @@ def _verdict(trees, parents, targets=None):
              patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))), \
              patch.object(hc, "_watcher_sentinel_target",
                           side_effect=lambda sd, pid: (targets or {}).get(str(pid))):
+            # always patched: the production resolver would read THIS host
             return hc.check_task_watcher()
 
 
@@ -124,12 +125,6 @@ check("_pid_parent returns None when the pid is absent from the table",
 check("_pid_parent tolerates a malformed row",
       hc._pid_parent("100", "garbage\n  100    99 ok\n") == "99")
 
-if failures:
-    print(f"\nFAILED ({len(failures)}): {failures}")
-    sys.exit(1)
-_note = f" ({len(skipped)} live-OS probe(s) skipped: {skipped})" if skipped else ""
-print(f"\nPASS — supervised watcher is not reported as an orphan{_note}")
-
 print("TWO supervised watchers, DISTINCT instances (not duplicates):")
 v4 = _verdict({"901": {"901"}, "902": {"902"}}, {"901": "99", "902": "98"},
               targets={"901": "/s/w-a.pid", "902": "/s/w-b.pid"})
@@ -137,3 +132,9 @@ check("says DISTINCT", "DISTINCT" in v4["detail"], v4["detail"])
 check("makes no duplicate claim", "processed 2x" not in v4["detail"], v4["detail"])
 check("does not authorise reduction",
       "reduce the count through the launcher" not in v4["detail"], v4["detail"])
+
+if failures:
+    print(f"\nFAILED ({len(failures)}): {failures}")
+    sys.exit(1)
+_note = f" ({len(skipped)} live-OS probe(s) skipped: {skipped})" if skipped else ""
+print(f"\nPASS — supervised watcher is not reported as an orphan{_note}")

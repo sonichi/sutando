@@ -8961,21 +8961,23 @@ def check_task_watcher() -> dict:
                         f"(pids {', '.join(roots)}) — {_n} share one instance target, so its "
                         f"tasks are processed {_n}x")
             count = cost
+            # Reduction is advice about the SUPERVISED subset, so it is that
+            # subset's identity that licenses it -- never the whole root count.
+            _sg, _su = _group_roots_by_target(WORKSPACE_DIR / "state", supervised)
+            _sup_dupe = (not _su) and any(len(v) > 1 for v in _sg.values())
+            _reduce = "; reduce those through the launcher that owns them" if _sup_dupe else ""
             # Stop advice is scoped to the ownerless subset: a root with a live
             # parent is supervised, and stopping it takes a healthy peer offline.
             if ownerless and supervised:
                 lead = (f"{count}. Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
-                        f"one cleanly. Do NOT stop {', '.join(supervised)} — supervised; "
-                        f"reduce those through the launcher that owns them")
+                        f"one cleanly. Do NOT stop {', '.join(supervised)} — supervised{_reduce}")
             elif ownerless:
                 lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
                         f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; "
                         f"stop them and restart one cleanly")
-            elif _unknown or len(_groups) == len(roots):
-                lead = f"{count}. Do NOT stop any of them: each is supervised"
             else:
-                lead = (f"{count}. Do NOT stop any of them: each is supervised; "
-                        f"reduce the count through the launcher that owns it")
+                _r = _reduce.replace("reduce those through", "reduce the count through")
+                lead = f"{count}. Do NOT stop any of them: each is supervised{_r}"
             return {"name": name, "status": "warn",
                     "detail": f"{lead}. ownerless: {', '.join(ownerless) or 'none'}; "
                               f"supervised: {', '.join(supervised) or 'none'}"}

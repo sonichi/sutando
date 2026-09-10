@@ -59,8 +59,8 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             hc._pid_instance_id = lambda pid: pid_instance
             hc._pid_actor_id = lambda pid: pid_actor
             if targets is not None:
-                # Per-pid sentinel TARGET, which is what decides duplicate vs
-                # separate instance. A pid absent from the map is unresolvable.
+                # `{}` states that no pid resolves; None keeps the production
+                # resolver, which reads THIS host — only the restamp cases want that.
                 hc._watcher_sentinel_target = (
                     lambda sd, pid, _m=targets: (
                         (ws / "state" / _m[str(pid)]) if str(pid) in _m else None))
@@ -686,6 +686,49 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertIn("stop them and restart one cleanly", d)
         self.assertNotIn("Do NOT stop", d)
 
+    MIXED = None  # set in the cases below
+
+    def _mixed(self, targets):
+        """Two SUPERVISED roots (901,902 under 900) plus one ownerless (903)."""
+        return self._detail(
+            f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n"
+            f"  903 1 bash {self.W}\n", targets=targets)
+
+    def test_mixed_ownership_DISTINCT_supervised_are_not_reduced(self):
+        """qingyun-wu, #3875: the mixed branch selected its advice before the
+        identity guard, so it said 'do not reduce' and 'reduce those' at once."""
+        d = self._mixed({"901": "/s/a.pid", "902": "/s/b.pid", "903": "/s/c.pid"})
+        self.assertIn("DISTINCT", d)
+        self.assertIn("Stop ONLY the ownerless (903)", d)
+        self.assertNotIn("reduce those through the launcher", d,
+            "distinct supervised instances must not be offered for reduction")
+
+    def test_mixed_ownership_UNKNOWN_identity_is_not_reduced(self):
+        d = self._mixed({})   # stated: no pid resolves
+        self.assertIn("UNKNOWN", d)
+        self.assertIn("Stop ONLY the ownerless (903)", d)
+        self.assertNotIn("reduce those through the launcher", d,
+            "unreadable identity must not authorise reduction in the mixed branch either")
+
+    def test_reduction_reads_the_SUPERVISED_subset_not_every_root(self):
+        """901 and 902 are distinct instances; the OWNERLESS 903 duplicates 901.
+
+        Grouping over all roots finds a duplicate pair and would offer the
+        supervised pair for reduction — but the duplicate is not among them.
+        Reduction is advice about the supervised subset, so only that subset's
+        identity may license it.
+        """
+        d = self._mixed({"901": "/s/a.pid", "902": "/s/b.pid", "903": "/s/a.pid"})
+        self.assertIn("Stop ONLY the ownerless (903)", d)
+        self.assertNotIn("reduce those through the launcher", d,
+            "the duplicate is 903 (ownerless); 901 and 902 are distinct and must not be reduced")
+
+    def test_mixed_ownership_a_PROVEN_duplicate_is_still_reduced(self):
+        """The advice must survive where it is true, or the gate is just a mute."""
+        d = self._mixed({"901": "/s/a.pid", "902": "/s/a.pid", "903": "/s/c.pid"})
+        self.assertIn("processed 2x", d)
+        self.assertIn("reduce those through the launcher", d)
+
     def test_the_duplicate_processing_cost_is_still_stated(self):
         """A PROVEN duplicate — both roots resolve to one target — must still say
         what it costs. The identity is what makes the claim true."""
@@ -707,7 +750,8 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
 
     def test_unreadable_identity_does_not_authorise_reduction(self):
         """No identity, no duplicate claim: it may be one instance twice or two once."""
-        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n",
+                         targets={})   # stated: no pid resolves
         self.assertIn("UNKNOWN", d)
         self.assertNotIn("processed 2x", d)
         self.assertIn("do not reduce the count", d)
