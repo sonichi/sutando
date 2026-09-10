@@ -185,6 +185,9 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that a Team sender is a collaborator. The bridge
     # appends this line directly, bypassing serialize_task_last's key check.
     "collaborator",
+    # The transport SHAPE (ag2space, discord, ...), distinct from `source`,
+    # which names the producing instance so two homeservers stay tellable apart.
+    "channel_kind",
     # Which worker the sender asked for. INTENT, not placement: the pool's
     # own binding table decides, and no claim path consults this header.
     "requested_worker",

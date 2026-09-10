@@ -34,6 +34,7 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_KIND  transport shape for `channel_kind:` (default: PROVIDER)
   REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
                         $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
                         selects which .env fallback and access.json a bridge
@@ -1319,6 +1320,9 @@ _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
+# The transport shape. Defaults to PROVIDER so a lane that has not been given
+# its own instance name keeps emitting exactly what it emitted before.
+CHANNEL_KIND = os.environ.get("REMOTE_TASK_CHANNEL_KIND") or PROVIDER
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
@@ -2718,7 +2722,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
-            "channel": task.get("source") or PROVIDER,
+            "channel": task.get("channel_kind") or CHANNEL_KIND or task.get("source") or PROVIDER,
             "summary": body[:80],
         }
         # Propagate the routable room id so the core-supervisor relay can escalate
@@ -2849,8 +2853,19 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         if f == "session_scope":
             if task.get(f) == "room":
                 lines.append("session_scope: room")
+        elif f == "requested_worker":
+            # The broker's intake stamps `target_worker`; this envelope has
+            # always called it `requested_worker`, so normalise at the boundary.
+            rw = task.get("requested_worker") or task.get("target_worker")
+            if rw:
+                lines.append(f"requested_worker: {_one_line(rw)}")
         elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+            # The transport SHAPE, kept distinct from which instance produced
+            # the task, so two homeservers on one bridge stay tellable apart.
+            kind = task.get("channel_kind") or CHANNEL_KIND
+            if kind:
+                lines.append(f"channel_kind: {_one_line(kind)}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:

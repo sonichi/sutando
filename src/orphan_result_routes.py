@@ -26,6 +26,8 @@ from task_archive import find_task_file  # noqa: E402
 
 # Transports that own their own delivery loop. Their ids can coincidentally
 # satisfy another transport's shape, so exclude by declared source first.
+from channel_kind import is_kind  # noqa: E402
+
 FOREIGN_SOURCES = frozenset({"telegram", "slack", "ag2space", "phone", "voice"})
 
 # A cap, not a target: the scan runs every poll tick and a results/ backlog
@@ -86,7 +88,7 @@ def orphan_result_routes(
             headers = parse_task_headers(task_file.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             continue
-        if (headers.get("source") or "").strip().casefold() in FOREIGN_SOURCES:
+        if is_kind(headers, FOREIGN_SOURCES):
             continue
         channel_id = (headers.get("channel_id") or "").strip()
         if not channel_id or not is_valid_channel_id(channel_id):
