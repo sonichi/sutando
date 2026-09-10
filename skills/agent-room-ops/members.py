@@ -17,9 +17,12 @@ from __future__ import annotations
 from _gateway import gateway, http_json, degrade_reason, HTTPError, URLError
 
 # An `.agent:` localpart suffix is assigned by the platform when an agent
-# registers; the `sutando-` prefix is this fleet's own naming convention.
+# registers. The prefixes are the legacy conventions from before the suffix —
+# this fleet's `sutando-` and the other runtimes' — and MIRROR the web
+# client's list in cinny `src/app/utils/agentMxid.ts:14-22`, so both sides
+# read one mxid the same way; change them together.
 _AGENT_SUFFIX = ".agent:"
-_AGENT_PREFIX = "@sutando-"
+_AGENT_PREFIXES = ("sutando-", "codex-", "hermes-", "openclaw-", "cline-", "pi-", "kilo-")
 
 
 def classify_member(user_id: str) -> str:
@@ -32,7 +35,11 @@ def classify_member(user_id: str) -> str:
     supports. Callers that must not be wrong should ask the platform, not this.
     """
     uid = (user_id or "").strip()
-    if _AGENT_SUFFIX in uid or uid.startswith(_AGENT_PREFIX):
+    if _AGENT_SUFFIX in uid:
+        return "agent"
+    # Anchored at the start of the LOCALPART: a human named for a product
+    # ("@notsutando-x") must not be reclassified.
+    if uid.lstrip("@").split(":", 1)[0].startswith(_AGENT_PREFIXES):
         return "agent"
     return "human"
 
