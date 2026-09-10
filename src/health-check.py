@@ -13474,6 +13474,72 @@ def _default_core_restart() -> bool:
         return False
 
 
+def _recovery_metric(event: str, **properties) -> None:
+    """Flush categorical events before watchdog exit; telemetry cannot break repairs."""
+    try:
+        from telemetry import capture
+        capture(event, properties, flush=True)
+    except Exception:
+        pass
+
+
+def _recovery_duration(seconds: float) -> str:
+    for threshold, bucket in ((60, "<1m"), (300, "1-5m"), (1800, "5-30m")):
+        if seconds < threshold:
+            return bucket
+    return ">=30m"
+
+
+def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
+    """Observe fix health; names are local correlation data, never telemetry properties."""
+    try:
+        if fcntl is None:
+            return
+        state_file = state_file or WORKSPACE_DIR / "state" / "health-fix-metrics.json"
+        now = time.time() if now is None else now
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file.with_name(state_file.name + ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            pending = None
+            if state_file.exists():
+                try:
+                    pending = json.loads(state_file.read_text())
+                    if not (isinstance(pending, dict)
+                            and isinstance(pending.get("started"), (int, float))
+                            and isinstance(pending.get("checks"), list)
+                            and pending["checks"]
+                            and all(isinstance(name, str) for name in pending["checks"])):
+                        raise ValueError("invalid fix observation")
+                except (ValueError, TypeError):
+                    state_file.unlink()
+                    pending = None
+            if start:
+                names = [c["name"] for c in checks if c["status"] != "ok"]
+                if not names or pending is not None:
+                    return
+                tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                                     prefix=".health-fix-", delete=False) as out:
+                        tmp = Path(out.name)
+                        json.dump({"started": now, "checks": names}, out)
+                    os.replace(tmp, state_file)
+                finally:
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+                _recovery_metric("health_fix_started")
+            elif pending is not None:
+                statuses = {c["name"]: c["status"] for c in checks}
+                names = pending["checks"]
+                resolved = sum(statuses.get(name) == "ok" for name in names)
+                outcome = "all_resolved" if resolved == len(names) else "partially_resolved" if resolved else "unresolved"
+                state_file.unlink()
+                _recovery_metric("health_fix_result", outcome=outcome,
+                                 duration_bucket=_recovery_duration(now - pending["started"]))
+    except Exception:
+        pass
+
+
 def recover_core_if_wedged(
     state_file: Optional[Path] = None,
     now: Optional[float] = None,
@@ -13570,6 +13636,20 @@ def recover_core_if_wedged(
                   f"UNKNOWN, not dead; suppressing restart and RESETTING the "
                   f"confirmation window", file=sys.stderr)
             return {"action": "probe-failed", "probe": which}
+        pending = state.get("recovery_metric_pending")
+        if pending and alive and (
+            oldest is None or cur_key != pending["task"] or (
+                isinstance(status_ts, (int, float))
+                and isinstance(pending.get("status_ts"), (int, float))
+                and status_ts > pending["status_ts"]
+            )
+        ):
+            state.pop("recovery_metric_pending", None)
+            _save()
+            _recovery_metric("core_recovery_result", outcome="progress_resumed",
+                             trigger=pending["trigger"],
+                             duration_bucket=_recovery_duration(now - pending["started"]))
+
         wedged = (
             alive
             and oldest is not None
@@ -13620,9 +13700,22 @@ def recover_core_if_wedged(
         if last_restart and now - last_restart < RECOVER_COOLDOWN_SEC:
             return {"action": "cooldown", "oldest_age": oldest_age, "since_restart": int(now - last_restart)}
 
+        pending = state.pop("recovery_metric_pending", None)
+        if pending:
+            _save()
+            _recovery_metric("core_recovery_result", outcome="still_unhealthy",
+                             trigger=pending["trigger"],
+                             duration_bucket=_recovery_duration(now - pending["started"]))
+
         # Give-up cap: prune restart history to the trailing hour.
         history = [t for t in (state.get("restart_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
         if len(history) >= RECOVER_MAX_PER_HOUR:
+            # Independent of notification success: a Slack outage must not
+            # emit a fresh give-up event on every watchdog tick.
+            if not state.get("recovery_metric_gave_up") or now - state["recovery_metric_gave_up"] > 3600:
+                state["recovery_metric_gave_up"] = now
+                _save()
+                _recovery_metric("core_recovery_gave_up")
             # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
             # send so a Slack outage doesn't silence the give-up alert for an hour.
             if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
@@ -13666,11 +13759,23 @@ def recover_core_if_wedged(
         if not dm_ok:
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
-        if not restart_fn():
+        _recovery_metric("core_recovery_attempted", trigger=cur_mode)
+        try:
+            restart_ok = restart_fn()
+        except Exception:
+            _recovery_metric("core_restart_result", outcome="exception", trigger=cur_mode)
+            raise
+        _recovery_metric("core_restart_result", outcome="started" if restart_ok else "failed",
+                         trigger=cur_mode)
+        if not restart_ok:
             # Restart launch failed — don't burn a cooldown/history slot, and
             # keep the observation so we stay confirmed and retry next pass.
             return {"action": "restart_failed", "dm_sent": dm_ok}
 
+        state["recovery_metric_pending"] = {
+            "started": now, "task": cur_key, "status_ts": status_ts, "trigger": cur_mode,
+        }
+        state.pop("recovery_metric_gave_up", None)
         history.append(now)
         state["restart_history"] = history
         state["last_restart"] = now
@@ -14070,6 +14175,9 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    track_health_fix(checks)
+    if do_fix:
+        track_health_fix(checks, start=True)
     issues = [c for c in checks if is_issue(c)]
     codex_notifier = (
         next(
