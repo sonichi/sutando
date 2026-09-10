@@ -93,10 +93,8 @@ class Classifier(unittest.TestCase):
         self.assertIn("core-status running", high["reason"])
 
     def test_a_clock_ticking_pane_is_not_case1_and_never_warns(self):
-        # Spec: case 1 is pure static, no normalization. A ticking clock is motion
-        # (Chi, 2026-09-10), which is why such a pane is ALIVE and never a warning.
-        # It no longer gets a kind of its own -- `clock-only` existed to suppress the
-        # low-novelty branch, and both are gone; the pane is simply working.
+        # A ticking clock is motion, so this pane is alive and never a warning.
+        # It has no kind of its own: `clock-only` only suppressed low-novelty.
         frames = [idle_with_clock(i) for i in range(6)]
         v = w.classify(frames, True, 900)
         self.assertNotEqual(v["kind"], "static-with-work")
@@ -227,10 +225,8 @@ class Classifier(unittest.TestCase):
         self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
     def test_repetition_alone_no_longer_warns_retry_is_read_from_the_text(self):
-        # Novelty measured REPETITION; retry is a CAUSE. Measured: a constant-text
-        # retry is already caught by ABNORMAL_PATTERNS, and a retry cycling through
-        # different upstream errors scores novelty 1.00 -- so the statistic reached
-        # neither case. A two-state alternation with no abnormal text is now working.
+        # Novelty measured repetition; retry is a cause. It reached neither the
+        # constant-text retry (text catches it) nor the varying one (novelty 1.00).
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
         self.assertEqual((w.classify(frames, True, 60)["kind"], w.classify(frames, True, 60)["warn"]),
                          ("working", False))
@@ -982,6 +978,29 @@ class ProseMentioningAStateIsNotThatState(unittest.TestCase):
         v = w.classify(["x"], False, 60)
         self.assertNotIn("_abnormal", v,
                          "the marker duplicates the flattened abnormal_* keys already spread in")
+
+
+class FourCasesFold(unittest.TestCase):
+    """Chi, 2026-09-10: "retry loop is under moving + abnormal". Every kind is a
+    cell of the 2x2, never a fifth case. This pins the FOLD, not the kind names."""
+
+    CELLS = {
+        "idle": ("idle", "healthy"), "static-with-work": ("idle", "abnormal"),
+        "abnormal": ("moving", "abnormal"), "provider-limit": ("idle", "abnormal"),
+        "retry-loop": ("moving", "abnormal"), "working": ("moving", "healthy"),
+    }
+
+    def test_every_warning_kind_sits_in_an_abnormal_cell(self):
+        for kind, (_, health) in self.CELLS.items():
+            warns = kind not in ("idle", "working")
+            self.assertEqual(warns, health == "abnormal", kind)
+
+    def test_retry_is_the_moving_abnormal_cell_not_a_fifth_case(self):
+        r = w.classify([retry_frame(i) for i in range(12)], True, 300)
+        self.assertEqual(r["kind"], "retry-loop")
+        self.assertFalse(r["raw_static"], "moving")
+        self.assertTrue(r["warn"], "abnormal")
+        self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
 
 
 if __name__ == "__main__":
