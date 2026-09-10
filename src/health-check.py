@@ -8954,7 +8954,7 @@ def check_task_watcher() -> dict:
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
-    live, dead_pids, reused, unreadable = {}, [], [], []
+    live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
     for sp in sentinels:
         try:
             spid = int(sp.read_text().strip())
@@ -8964,15 +8964,27 @@ def check_task_watcher() -> dict:
         sargv = _proc_argv(spid)
         if not sargv:
             dead_pids.append((spid, sp))
-        elif "watch-tasks-stream" not in sargv:
-            reused.append((spid, sargv, sp))
         else:
-            live[spid] = sp
+            # The module's own predicate, not a substring: a stranger carrying
+            # the script name as a DATA argument passes `in` and is counted live.
+            verdict = _is_watcher_argv(sargv, spid)
+            if verdict is False:
+                reused.append((spid, sargv, sp))
+            elif verdict is None:
+                unprovable.append((spid, sargv, sp))
+            else:
+                live[spid] = sp
 
     if not live:
         if unreadable and not dead_pids and not reused:
             return {"name": name, "status": "warn",
                     "detail": f"unreadable PID sentinel ({unreadable[0][1]}) — restart the watcher"}
+        if unprovable and not dead_pids and not reused:
+            upid, uargv, _usp = unprovable[0]
+            return {"name": name, "status": "warn",
+                    "detail": f"UNKNOWN: cannot prove pid {upid} is the watcher from its argv "
+                              f"({uargv[:50]}) — not restarting and not stopping it; "
+                              f"re-check when the process vector is readable"}
         if reused and not dead_pids:
             # PID reuse: the sentinel outlived the watcher and the OS handed the
             # number to something else. `kill -0` alone would call this alive.
@@ -8996,12 +9008,40 @@ def check_task_watcher() -> dict:
     tracked = {str(p) for p in live}
     extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
+        # A root count is not an identity: only a shared sentinel target makes
+        # two roots duplicates, and an unresolvable one authorises nothing.
+        state_dir = WORKSPACE_DIR / "state"
+        tracked_targets = {str(sp) for sp in live.values()}
+        dupes, distinct, unknown = [], [], []
+        for r in extras:
+            target = _watcher_sentinel_target(state_dir, r)
+            if target is None:
+                unknown.append(r)
+            elif str(target) in tracked_targets:
+                dupes.append(r)
+            else:
+                distinct.append(r)
+        if unknown:
+            return {"name": name, "status": "warn",
+                    "detail": f"UNKNOWN: {len(unknown)} untracked watcher tree(s) "
+                              f"({', '.join(unknown)}) whose (agent, instance) identity does not "
+                              f"resolve — NOT stopping and NOT reducing: the same instruction "
+                              f"recreates a duplicate for one instance and removes the only "
+                              f"watcher for another. Resolve identity first"}
+        if distinct and not dupes:
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(distinct)} watcher tree(s) ({', '.join(distinct)}) belong to a "
+                              f"DIFFERENT instance than any tracked sentinel — not duplicates; each "
+                              f"is missing its own sentinel record. Do NOT stop them; register "
+                              f"their sentinels"}
         keep = ", ".join(str(p) for p in sorted(live))
-        own, sup = _split_roots_by_owner(extras, ps_out)
+        own, sup = _split_roots_by_owner(dupes, ps_out)
+        extra_note = ("" if not distinct else
+                      f" ({len(distinct)} further tree(s) are a different instance, left alone)")
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by any "
-                          f"sentinel; duplicates process each task more than once. Keep the "
-                          f"tracked one(s) ({keep}). "
+                "detail": f"{len(trees)} watcher trees running — {len(dupes)} share a sentinel "
+                          f"target with a tracked watcher, so those duplicate its work{extra_note}. "
+                          f"Keep the tracked one(s) ({keep}). "
                           f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
                           f"supervised, leave alone (a live parent owns them): "
                           f"{', '.join(sup) or 'none'}"}

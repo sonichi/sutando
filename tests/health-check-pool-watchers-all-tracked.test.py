@@ -33,7 +33,7 @@ WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
 
 def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
-        parent="1", pid_instance=None, pid_actor="") -> dict:
+        parent="1", pid_instance=None, pid_actor="", targets=None) -> dict:
     """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
 
     `pid_instance` is what the WATCHER's own environment yields: a string names
@@ -48,7 +48,7 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             (ws / "state" / fn).write_text(text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
-                 hc._pid_instance_id, hc._pid_actor_id)
+                 hc._pid_instance_id, hc._pid_actor_id, hc._watcher_sentinel_target)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = (argv if callable(argv) else (lambda pid: argv))
@@ -58,11 +58,18 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             hc._fresh_local_core_record = lambda *a, **k: ({} if core_alive else None)
             hc._pid_instance_id = lambda pid: pid_instance
             hc._pid_actor_id = lambda pid: pid_actor
+            if targets is not None:
+                # Per-pid sentinel TARGET, which is what decides duplicate vs
+                # separate instance. A pid absent from the map is unresolvable.
+                hc._watcher_sentinel_target = (
+                    lambda sd, pid, _m=targets: (
+                        (ws / "state" / _m[str(pid)]) if str(pid) in _m else None))
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
-             hc._pid_instance_id, hc._pid_actor_id) = saved
+             hc._pid_instance_id, hc._pid_actor_id,
+             hc._watcher_sentinel_target) = saved
 
 
 class PoolHost(unittest.TestCase):
@@ -90,11 +97,55 @@ class PoolHost(unittest.TestCase):
         self.assertNotIn("stop them and restart one cleanly", r["detail"])
 
     def test_only_the_untracked_root_is_named(self):
+        """888 resolves to the SAME sentinel target as tracked 200, so it really
+        is a duplicate. Without the identity this case pinned the unsafe premise
+        that a second root is a duplicate by arithmetic alone."""
         r = run({"watch-tasks-stream-worker-1.pid": "200\n"},
-                {"200": {"200"}, "888": {"888"}})
+                {"200": {"200"}, "888": {"888"}},
+                targets={"200": "watch-tasks-stream-worker-1.pid",
+                         "888": "watch-tasks-stream-worker-1.pid"})
         self.assertEqual(r["status"], "warn")
         self.assertIn("888", r["detail"])
         self.assertIn("Keep the tracked one(s) (200)", r["detail"])
+
+    def test_a_stranger_carrying_the_script_NAME_is_not_a_live_watcher(self):
+        """The sentinel's pid must be validated by the module's own predicate.
+
+        A substring test on argv accepts any process that merely mentions
+        `watch-tasks-stream.sh` -- e.g. as a data argument -- and reports the
+        watcher healthy while nothing drains tasks/.
+        """
+        impostor = "/usr/bin/python3 -c import time;time.sleep(9) watch-tasks-stream.sh"
+        r = run({"watch-tasks-stream-worker-1.pid": "200\n"}, {}, argv=impostor)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertNotIn("watcher is running", r["detail"])
+        self.assertTrue(
+            "not the watcher" in r["detail"] or "UNKNOWN" in r["detail"],
+            f"a stranger must read as PID reuse or UNKNOWN, got: {r['detail']}")
+
+    def test_a_DISTINCT_target_is_a_separate_instance_not_a_duplicate(self):
+        """worker-b is not worker-a running twice. Telling an operator to reduce
+        the count here removes the only watcher for that instance."""
+        r = run({"watch-tasks-stream-worker-a.pid": "901\n"},
+                {"901": {"901"}, "902": {"902"}},
+                targets={"901": "watch-tasks-stream-worker-a.pid",
+                         "902": "watch-tasks-stream-worker-b.pid"})
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("DIFFERENT instance", r["detail"])
+        self.assertIn("Do NOT stop", r["detail"])
+        self.assertNotIn("duplicate its work", r["detail"])
+
+    def test_an_UNREADABLE_identity_authorises_no_action(self):
+        """Unknown identity must not license stop OR reduce: the same sentence
+        recreates a duplicate for one instance and orphans another."""
+        r = run({"watch-tasks-stream-worker-a.pid": "901\n"},
+                {"901": {"901"}, "903": {"903"}},
+                targets={"901": "watch-tasks-stream-worker-a.pid"})
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("UNKNOWN", r["detail"])
+        self.assertIn("903", r["detail"])
+        self.assertNotIn("safe to stop", r["detail"])
+        self.assertNotIn("reduce the count", r["detail"])
 
     def test_a_dead_sentinel_beside_a_live_one_still_warns(self):
         """A clean exit REMOVES the sentinel (the cleanup trap), so a file that
