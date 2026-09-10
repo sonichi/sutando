@@ -1744,9 +1744,24 @@ _migrate_from_legacy_impl() {
     fi
     if [ -d "$legacy_dir/notes" ]; then
         if [ "$DRY_RUN" = "1" ]; then
-            local n_notes
+            local n_notes excluded_size
             n_notes=$(find "$legacy_dir/notes" -type f -not -path "$legacy_dir/notes/generated/*" -not -path "$legacy_dir/notes/media/*" 2>/dev/null | wc -l | tr -d ' ')
-            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ~2.65 GB media left archived in legacy)" >&2
+            excluded_size=$(
+                {
+                    if [ -d "$legacy_dir/notes/generated" ]; then
+                        du -skL "$legacy_dir/notes/generated" 2>/dev/null || true
+                    fi
+                    if [ -d "$legacy_dir/notes/media" ]; then
+                        du -skL "$legacy_dir/notes/media" 2>/dev/null || true
+                    fi
+                } | awk '{kb += $1} END {
+                    if (kb >= 1048576) printf "%.2f GB", kb / 1048576
+                    else if (kb >= 1024) printf "%.1f MB", kb / 1024
+                    else if (kb > 0) printf "%d KB", kb
+                    else printf "0B"
+                }'
+            )
+            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ${excluded_size} generated/media left archived in legacy)" >&2
         else
             rsync -a --exclude='generated/' --exclude='media/' "$legacy_dir/notes"/ "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
             log "_migrate_from_legacy_impl: rsynced notes/ (excl generated,media) → workspace/notes/"

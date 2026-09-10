@@ -18,6 +18,10 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Extra per-host probes declared in
+    <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
+    check_user_defined). Each entry is {"name", "command"[, "timeout"]};
+    exit 0 reads ok, anything else warn, with the command's output as the detail.
 """
 
 import ast
@@ -28,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import statistics
 import shutil
@@ -6304,6 +6309,102 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
+def _state_in_use_age_h(state_dir: "Path") -> "float | None":
+    """Age of the OLDEST top-level file in state/, or None when unknowable.
+
+    Top level only: state/cores/ is synced across hosts, so a peer's file would
+    date a workspace this host created minutes ago.
+    """
+    try:
+        ages = [time.time() - p.stat().st_mtime
+                for p in state_dir.iterdir() if p.is_file()]
+    except OSError:
+        return None
+    return max(ages) / 3600 if ages else None
+
+
+def _stamper_age_h() -> "float | None":
+    """Hours since the marker-WRITING code was installed here, or None if it is
+    not installed at all.
+
+    A missing marker only indicts the loop once the code that writes it has been
+    present long enough for a pass to close. At merge that code is younger than
+    every existing workspace, so workspace age alone convicts every host.
+    """
+    p = REPO_DIR / "scripts" / "core-status.sh"
+    try:
+        if "last-loop-ok" not in p.read_text(encoding="utf-8", errors="replace"):
+            return None
+        return (time.time() - p.stat().st_mtime) / 3600
+    except OSError:
+        return None
+
+
+def check_cron_schedule() -> dict:
+    """Smoke detector for a session cron schedule that stopped firing.
+
+    CronCreate jobs expire 7 days after registration, and the mechanism that
+    would re-register them (/schedule-crons via /proactive-loop) is itself one of
+    the expiring crons, so nothing self-heals.
+
+    The signal is `state/last-loop-ok`, stamped by scripts/core-status.sh on
+    `idle`. Deliberately NOT core-status.json, which owner turns also refresh and
+    which would therefore stay fresh through any conversation — masking a dead
+    schedule exactly when someone is around to be misled.
+    """
+    name = "cron-schedule"
+    marker = Path(WORKSPACE_DIR) / "state" / "last-loop-ok"
+
+    def _h(env_name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(env_name, str(default)))
+        except ValueError:
+            return default
+
+    warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
+    fail_h = _h("SUTANDO_CRON_STALE_FAIL_H", 26.0)
+
+    try:
+        age_h = (time.time() - marker.stat().st_mtime) / 3600
+    except OSError:
+        # Absence has two opposite meanings: a genuinely fresh workspace, or a loop
+        # that NEVER STARTED — the deadlock above, which writes no marker at all.
+        in_use_h = _state_in_use_age_h(marker.parent)
+        stamper_h = _stamper_age_h()
+        if stamper_h is None:
+            # This build cannot stamp the marker, so its absence says nothing at all.
+            return {"name": name, "status": "ok",
+                    "detail": "no loop marker, and this build does not stamp one"}
+        if stamper_h <= warn_h:
+            # A writer younger than the warn band cannot have had a pass close since
+            # it arrived, so its absence is explained without indicting the loop.
+            return {"name": name, "status": "ok",
+                    "detail": (f"no loop marker yet, but the stamping code is only "
+                               f"{stamper_h:.1f}h old (<{warn_h:.0f}h) — no pass has had "
+                               f"time to close since it was installed")}
+        if in_use_h is not None and in_use_h > warn_h:
+            return {"name": name, "status": "warn",
+                    "detail": (f"no loop marker in the {stamper_h:.1f}h since the stamping code "
+                               f"was installed, and state/ has been written for {in_use_h:.1f}h "
+                               f"(>{warn_h:.0f}h) — a pass should have closed by now, so the loop "
+                               f"may never have STARTED. Check CronList against crons.json")}
+        # Nothing rules out "fresh", and a missing marker must never be louder
+        # than a stale one.
+        return {"name": name, "status": "ok",
+                "detail": "no loop marker yet (fresh install, or no pass closed since restore)"}
+
+    if age_h > fail_h:
+        return {"name": name, "status": "fail",
+                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{fail_h:.0f}h) — the model "
+                           f"cron schedule is almost certainly dead. CronCreate jobs expire after 7d; "
+                           f"re-register from hosts/<host>/crons.json via /schedule-crons")}
+    if age_h > warn_h:
+        return {"name": name, "status": "warn",
+                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{warn_h:.0f}h). "
+                           f"Check CronList against crons.json")}
+    return {"name": name, "status": "ok", "detail": f"last loop pass closed {age_h:.1f}h ago"}
+
+
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     """Detect a stuck core proactive loop via stale core-status.json.
 
@@ -6925,9 +7026,14 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing, unpublished = [], [], []
+    unconsumed, trailing, unpublished, dead = [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
+        # A deleted script still completes — the handler runs and writes a no-op —
+        # so every completion lane reports it on time and lateness is the wrong verdict.
+        if j.get("missing_script"):
+            dead.append((j["name"], j["missing_script"]))
+            continue
         if not j["artifacts"]:
             # `conditional` declares that absence is expected, so it cannot also
             # be the blind spot that pins this probe to warn with no path back.
@@ -6966,7 +7072,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 # send the reader to the wrong layer. Separate bucket, separate cause.
                 bucket = unpublished if j.get("completion_today") else unconsumed
                 bucket.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed and not unpublished:
+    if not late and not missed and not drifted and not unconsumed and not unpublished and not dead:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6995,6 +7101,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
                         f"— no dispatch record retained for this job, so a late "
                         f"schedule and a slow pickup cannot be told apart here")
+    for n, ref in sorted(dead):
+        bits.append(f"{n}: SCHEDULED BUT CANNOT RUN — {ref} does not exist. Its slot "
+                    f"still fires and the handler still writes a result, so every "
+                    f"completion lane reports it finishing on time; the schedule "
+                    f"entry outlived the script and needs removing or restoring")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
@@ -7073,6 +7184,60 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
+
+
+_CRON_NOT_A_RUN = re.compile(
+    r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
+
+
+#: Not a complete literal: shell expansion (`$VAR`, `$(cmd)`, backtick, leading
+#: `~`), a glob, or a brace list — none of which name one path by spelling.
+_CRON_NOT_LITERAL = re.compile(r"[$`*?\[\]{}]|^~")
+
+
+def _cron_missing_script(entry: dict) -> Optional[str]:
+    """First script path a cron entry invokes that is not on disk, else None.
+
+    A job whose script was deleted still leaves a task-cron RESULT — the handler
+    runs, finds nothing, and writes a no-op — so every completion lane reports it
+    as finishing on time. Only the schedule's own command distinguishes "ran and
+    produced nothing" from "cannot run at all", which is why this is read here
+    and not inferred from a result body: `[no-send]` is also what a job writes
+    when it delivered by another route (a DM), so the marker does not separate
+    the two cases and the referenced path does.
+    """
+    cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
+    # Only an INVOKED path counts, and only when the reference is unambiguous:
+    # this verdict makes the operator delete a schedule, so doubt must read ok.
+
+    # `\b` is not a token boundary: `.` is a non-word char, so `\bsh` matched the
+    # extension of any *.sh and captured a shell-expansion fragment (#3672).
+    for m in re.finditer(r"(?:^|\s)(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
+        raw = m.group(1).rstrip(";&|")
+        # `\S+` stops at a space, so a quoted path containing one arrives
+        # truncated; the unbalanced quote is what shows the token was cut.
+        if raw[:1] in "\"'" and not raw.endswith(raw[:1]):
+            continue
+        ref = raw.strip("\"'")
+        if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
+            continue
+        # A negation before the interpreter makes this a mention, not a run.
+        if _CRON_NOT_A_RUN.search(cmd[:m.start()]):
+            continue
+        # A `cd` earlier in the command moves the base a relative path resolves
+        # against, and REPO_DIR is then the wrong one: doubt must read ok.
+        if not ref.startswith("/") and re.search(r"(?:^|\s|&&|;)cd\s", cmd[:m.start()]):
+            continue
+        # Only a complete literal names one path: `$JOB_ROOT/live.sh` and
+        # `nightly-*.sh` both run while that spelling never exists on disk.
+        if _CRON_NOT_LITERAL.search(ref):
+            continue
+        # An absolute path resolves on its own; only a repo-relative one is
+        # judged against REPO_DIR, so a valid /tmp script is never "missing".
+        target = Path(ref) if ref.startswith("/") else REPO_DIR / ref
+        if not target.exists():
+            return ref
+    return None
 
 
 def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
@@ -7185,23 +7350,32 @@ def check_daily_cron_punctuality() -> dict:
         launchd = bool(e.get("launchd"))
         # Each lane is a preference, not a restriction: `launchd` says how a job is
         # SCHEDULED, which does not determine what dated evidence it leaves behind.
-        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
-                else _daily_artifact_minutes(ws / "results", stem))
-        used_artifact_lane = not launchd
-        # Both directions, so neither lane's absence reads as the job's silence:
-        # without the launchd arm a daily artifact reports "no dated artifact" forever.
-        if not arts:
-            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
-                    else _daily_completion_minutes(ws / "state", jname))
-            used_artifact_lane = bool(arts) and launchd
-        # Last resort, and the only lane needing no per-job config: a job that
-        # publishes nothing dated still leaves a task-cron result when it finishes.
-        # Unconditional, not the no-artifact fallback below: a job that published
-        # artifacts then lost its producer keeps history, hiding its completion.
+        # Lanes are a preference, but a lane that is merely STALE must not shadow a
+        # later one holding today: fall through on freshness, not just emptiness.
+        today_str = now.strftime("%Y-%m-%d")
+        lane_thunks = [
+            (lambda: (_daily_completion_minutes(ws / "state", jname) if launchd
+                      else _daily_artifact_minutes(ws / "results", stem)), not launchd),
+            (lambda: (_daily_artifact_minutes(ws / "results", stem) if launchd
+                      else _daily_completion_minutes(ws / "state", jname)), launchd),
+            (lambda: _daily_task_record_minutes(ws / "results", jname), False),
+        ]
+        # Lazy: a lane holding today stops the scan, so the common case still costs
+        # one lane. Only a job with no fresh record anywhere pays for all three.
+        arts, used_artifact_lane, fallback = [], False, None
+        for thunk, flag in lane_thunks:
+            rows = thunk()
+            if any(d == today_str for d, _ in rows):
+                arts, used_artifact_lane = rows, flag
+                break
+            if fallback is None and rows:
+                fallback = (rows, flag)
+        else:
+            if fallback:
+                arts, used_artifact_lane = fallback
+        # Unconditional: `completion_today` below reads it even when a fresher
+        # lane supplied `arts`, so it is not the thunk list's third lane.
         completions = _daily_task_record_minutes(ws / "results", jname)
-        if not arts:
-            arts = completions
-            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
@@ -7215,6 +7389,7 @@ def check_daily_cron_punctuality() -> dict:
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "newest_artifact": newest, "artifact_age_days": age_days,
+            "missing_script": _cron_missing_script(e),
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             # Consumption is a DIFFERENT fact from publication: a task can finish
@@ -9213,7 +9388,31 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
-        if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
+        if c["name"] != "claude-hooks" or not (c.get("_unregistered_hooks") or c.get("_dead_hooks")):
+            continue
+        for rec in c.get("_dead_hooks") or []:
+            owner_script = _HOOK_FAMILY_INSTALLERS.get(str(rec.get("family")))
+            if not owner_script:
+                print(f"  {c['name']}: not repairing dead {rec.get('event')} hook "
+                      f"{rec.get('path')} — not a family a Sutando installer owns", file=out)
+                continue
+        for owner_script in sorted({_HOOK_FAMILY_INSTALLERS[r["family"]]
+                                    for r in c.get("_dead_hooks") or []
+                                    if r.get("family") in _HOOK_FAMILY_INSTALLERS}):
+            print(f"  {c['name']}: pruning dead entries via {Path(owner_script).name}", file=out)
+            try:
+                proc = subprocess.run(["bash", str(REPO_DIR / owner_script)],
+                                      capture_output=True, text=True, timeout=60)
+                emitted = (proc.stdout or "") + (proc.stderr or "")
+                lines = [ln for ln in emitted.splitlines() if ln.strip()]
+                print(f"  {c['name']}: " + (lines[-1].strip() if lines
+                                           else f"installer exited {proc.returncode}"), file=out)
+            except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
+                print(f"  {c['name']}: could not run {Path(owner_script).name} ({exc})", file=out)
+        if not c.get("_unregistered_hooks"):
+            fresh = check_claude_hook_registration()
+            c.clear()
+            c.update(fresh)
             continue
         installer = REPO_DIR / "src" / "install-claude-hooks.sh"
         # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
@@ -11011,6 +11210,39 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_script_path(command: str) -> Optional[str]:
+    """The script a hook command runs; the installer module owns the parse, this is a fallback."""
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from claude_hooks_settings import script_path_of
+        return script_path_of(command)
+    except Exception:  # noqa: BLE001 — an older checkout without the module still gets a probe
+        parts = command.split()
+        for i, tok in enumerate(parts):
+            if tok in ("bash", "sh", "python3", "python", "node"):
+                return parts[i + 1].strip("'\"") if i + 1 < len(parts) else None
+        return parts[0].strip("'\"") if parts else None
+
+
+def _runs_a_script(command: str) -> bool:
+    """True when the command hands a script FILE to an interpreter (bash/sh/python/node).
+
+    `bash -c '…'` runs inline text, not a file, and a command carrying an unexpanded `$VAR`
+    cannot be judged by path existence; both are skipped rather than read as dead.
+    """
+    parts = command.split()
+    if len(parts) < 2 or Path(parts[0]).name not in ("bash", "sh", "zsh", "python", "python3", "node"):
+        return False
+    return not parts[1].startswith("-") and "$" not in command
+
+
+#: Which installer re-adds (and, since it prunes, repairs) each Sutando-owned hook family.
+_HOOK_FAMILY_INSTALLERS = {
+    "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
+    "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+}
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -11140,20 +11372,64 @@ def check_claude_hook_registration(
             # Present, but not actually invoking this checkout's script — either aimed
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
-    if missing or foreign:
+    # Present-but-dead is invisible to the owned-list check above: a registered hook whose
+    # script is gone fails on every fire. Relative paths resolve against the project.
+    dead: list[str] = []
+    dead_records: list[dict] = []
+    project_dir = settings.resolve().parent.parent
+    # Owned families are judged above (present / missing / foreign); the dead scan covers
+    # the rest, and only commands that run a script through an interpreter.
+    owned_families = {Path(marker).name for _e, marker, _c in owned}
+    for event, groups in hooks.items():
+        for g in _as_list(groups):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                cmd = str(h.get("command", ""))
+                if not _runs_a_script(cmd):
+                    continue
+                script = _hook_script_path(cmd)
+                if not script or Path(script).name in owned_families:
+                    continue
+                target = Path(script) if Path(script).is_absolute() else project_dir / script
+                if not target.exists():
+                    family = Path(script).name
+                    dead.append(f"{event}:{family} -> {script}")
+                    dead_records.append({"event": event, "command": cmd,
+                                         "path": script, "family": family})
+    if missing or foreign or dead:
         bits = []
         if missing:
             bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if dead:
+            bits.append(f"{len(dead)} registered but the script no longer exists — every fire "
+                        f"fails 'No such file' ({', '.join(dead)})")
         if foreign:
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
                         f"only an argument ({', '.join(foreign)})")
+        # The bare installer registers the opt-in-only transcript archiver, so the remedy
+        # must not prescribe it when that hook is the only thing missing.
+        only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
+        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
+                  "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
+                  "you intend to enable it"
+                  if only_archive else
+                  "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
+        if dead and not missing and not foreign:
+            remedy = ("re-run the installer that owns each family — it prunes dead copies "
+                      "(`bash scripts/install-personal-claude-hook.sh`, "
+                      "`bash scripts/install-session-start-hook.sh`)")
         result = {"name": name, "status": "warn",
-                  "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+                  "detail": f"{'; '.join(bits)} in {settings} — {remedy}"}
         if missing:
             # Keyed structurally so --fix cannot fire on the warn branches the
             # installer can't repair; `foreign` excluded (displacement unverified).
             result["_unregistered_hooks"] = list(missing)
+        if dead_records:
+            result["_dead_hooks"] = dead_records
         return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
 
@@ -11665,6 +11941,140 @@ def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
     if not is_macos:
         return "not-applicable"
     return "expected-missing" if plist.exists() else "not-applicable"
+
+
+#: Per-host declaration of EXTRA, user-defined probes — same `hosts/<host>/` JSON
+#: convention as skills/proactive-loop/scripts/tool-suites-check.py's extras.
+USER_CHECKS_FILE = "health-checks-extra.json"
+#: Name prefix so an extra row is never mistaken for a built-in probe.
+USER_CHECK_PREFIX = "extra:"
+USER_CHECK_TIMEOUT_S = 30.0
+USER_CHECK_DETAIL_CAP = 300
+#: Only DETAIL_CAP characters survive normalization; reading the whole sink lets an
+#: opt-in command size this process's memory. 200x headroom over what is rendered.
+USER_CHECK_OUTPUT_READ_CAP = 65536
+
+
+def user_checks_path(workspace_dir: Optional[Path] = None,
+                     host: "str | None" = None) -> Path:
+    """Where this host declares its extra checks.
+
+    `hosts/<host>/` and not `state/`: the vault already carries the former, and
+    a `state/` path is re-ignored by the carve-out emitted after the includes.
+    """
+    ws = WORKSPACE_DIR if workspace_dir is None else Path(workspace_dir)
+    return ws / "hosts" / (host or _host_label()) / USER_CHECKS_FILE
+
+
+def load_user_checks(path: Path) -> list:
+    """Declared checks, or `[]` for absent / unreadable / malformed.
+
+    A hand-edited file must never take the health check down with it, so every
+    failure here degrades to "this host declares no extras".
+    """
+    try:
+        decl = json.loads(Path(path).read_text())
+    except Exception:
+        return []
+    entries = decl.get("checks") if isinstance(decl, dict) else None
+    out = []
+    for entry in _as_list(entries):
+        if not isinstance(entry, dict):
+            continue
+        name, command = entry.get("name"), entry.get("command")
+        if not (isinstance(name, str) and name.strip()):
+            continue
+        if not (isinstance(command, str) and command.strip()):
+            continue
+        out.append({
+            "name": name.strip(),
+            "command": command,
+            "timeout": _positive_seconds(entry.get("timeout")) or USER_CHECK_TIMEOUT_S,
+        })
+    return out
+
+
+def _reap_user_command_group(pgid: int) -> None:
+    """A shell can exit 0 while its background children keep running; the group
+    `start_new_session` created must be cleared on that path too, not only on timeout."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _kill_user_command_tree(proc) -> None:
+    """SIGKILL the group `start_new_session` gave this command, not just the shell
+    — killing the shell alone leaves its children running past the timeout."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_user_command(command: str, timeout_s: float, cwd: Path) -> "tuple[int, str]":
+    """Run one declared command bounded in time; return (exit code, output).
+
+    Output lands in a FILE, never a pipe: a command that leaves a background
+    grandchild holding the pipe open would block the drain past the timeout.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as sink:
+        try:
+            proc = subprocess.Popen(command, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                                    stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            return 127, f"{type(exc).__name__}: {exc}"
+        # start_new_session makes the child its own group leader, so the group id is
+        # its pid — captured before the wait reaps it and the attribute is stale.
+        pgid = proc.pid
+        try:
+            code = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_user_command_tree(proc)
+            code = 124
+        else:
+            _reap_user_command_group(pgid)
+        sink.seek(0)
+        return code, sink.read(USER_CHECK_OUTPUT_READ_CAP)
+
+
+def run_user_check(decl: dict, cwd: Optional[Path] = None) -> dict:
+    """One extra probe: exit 0 is `ok`, anything else `warn`, output as the detail.
+
+    `warn` on purpose — an extra check must not change the exit code or wake the
+    notifier surfaces, so a host's own probe can never mask or manufacture an alert.
+    """
+    name = f"{USER_CHECK_PREFIX}{decl['name']}"
+    # Suppression is a property of the CHECK, not of its status: --emit-task,
+    # --notify-on-fail and --notify-slack each read a bare warn as a failure.
+    quiet = {"name": name, "alerting": False}
+    try:
+        code, output = run_user_command(decl["command"], decl["timeout"],
+                                        cwd if cwd is not None else REPO_DIR)
+    except Exception as exc:
+        return {**quiet, "status": "warn",
+                "detail": f"could not run: {type(exc).__name__}: {exc}"[:USER_CHECK_DETAIL_CAP]}
+    detail = " ".join(output.split())[:USER_CHECK_DETAIL_CAP] or "(no output)"
+    if code == 124:
+        return {**quiet, "status": "warn",
+                "detail": f"TIMEOUT after {decl['timeout']:.0f}s (killed): {detail}"}
+    if code == 0:
+        return {**quiet, "status": "ok", "detail": detail}
+    return {**quiet, "status": "warn", "detail": f"exit {code}: {detail}"}
+
+
+def check_user_defined(workspace_dir: Optional[Path] = None,
+                       host: "str | None" = None) -> list:
+    """Every extra probe this host declares — `[]` when it declares none."""
+    try:
+        decls = load_user_checks(user_checks_path(workspace_dir, host))
+    except Exception:
+        return []
+    return [run_user_check(d) for d in decls]
 
 
 def run_all_checks() -> list[dict]:
@@ -12200,6 +12610,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
+    checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
@@ -12218,6 +12629,10 @@ def run_all_checks() -> list[dict]:
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+
+    # Last, and only when this host declares any: a user probe must never
+    # delay or displace a built-in one.
+    checks.extend(check_user_defined())
 
     return checks
 

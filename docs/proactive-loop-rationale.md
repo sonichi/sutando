@@ -434,14 +434,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    # 1. COMPUTE — no --write and no --commit, so nothing is persisted and nothing is
    #    stamped. `idle-held.py` prints the resulting list before it consults --write.
    python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
-       --remove <id> --reason "<why>" --add <id>:<gate> \
+       --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n> \
      | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
          --state "$WORKSPACE/state/idle-streak.json"
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
 
    # 2. Post the message. THEN persist the ops and stamp the set as surfaced:
    python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
-       --remove <id> --reason "<why>" --add <id>:<gate> --write \
+       --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n> --write \
      | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
          --state "$WORKSPACE/state/idle-streak.json" --commit
    ```
