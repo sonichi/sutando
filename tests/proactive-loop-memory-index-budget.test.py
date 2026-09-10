@@ -140,6 +140,58 @@ def _tree(projects, slug, text, age_s):
     os.utime(m, (time.time() - age_s, time.time() - age_s))
     return d
 
+# --- narrowing: each rung is motivated by a real host's population ------------
+STUB = "# Memory index\n"          # the template stub dead worktrees leave behind
+
+def _mark(memdir):
+    (memdir / "NOT-THE-LIVE-CORPUS.txt").write_text("NOT THE LIVE MEMORY CORPUS\n")
+
+def _transcript(projects, slug):
+    (projects / slug / (slug + ".jsonl")).write_text("{}\n")
+
+with tempfile.TemporaryDirectory() as d:
+    # Six corpora, five explicitly disclaimed, and the live one holds NO
+    # transcripts -- so a transcript-first rule picks the wrong tree here.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "app", index_of(LIMIT // 2), age_s=60)
+    for i in range(5):
+        m = _tree(projects, "other-%d" % i, index_of(LIMIT // 3) + "\n<!--%d-->\n" % i, age_s=86400)
+        _mark(m)
+    _transcript(projects, "other-0")
+    got, note = mib._live_index(live, REPO, projects.parent.parent)
+    check("narrowing: an explicit NOT-THE-LIVE-CORPUS disclaimer resolves 6 -> 1",
+          got == live / "MEMORY.md", "got=%s note=%r" % (got, note))
+    check("narrowing: ...and it outranks transcripts, which name the tree a "
+          "session RAN in, not the corpus it writes",
+          got is not None and got.parent.parent.name == "app", "got=%s" % got)
+
+with tempfile.TemporaryDirectory() as d:
+    # Identical template stubs manufacture ambiguity nobody observed; transcripts
+    # then separate the two corpora that are real.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    for i in range(30):
+        _tree(projects, "stub-%d" % i, STUB, age_s=86400)
+    real = _tree(projects, "real", index_of(LIMIT // 2), age_s=600)
+    _tree(projects, "second", index_of(LIMIT // 3), age_s=600)
+    _transcript(projects, "real")
+    got, note = mib._live_index(real, REPO, projects.parent.parent)
+    check("narrowing: identical template stubs are debris, not rival corpora",
+          got == real / "MEMORY.md", "got=%s note=%r" % (got, note))
+
+with tempfile.TemporaryDirectory() as d:
+    # A filter that would empty the set is skipped, so narrowing never costs a
+    # host its answer -- and genuine ambiguity still refuses.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    a = _tree(projects, "a", index_of(LIMIT // 2), age_s=60)
+    b = _tree(projects, "b", index_of(LIMIT // 3), age_s=60)
+    _mark(a); _mark(b)
+    _transcript(projects, "a"); _transcript(projects, "b")
+    got, note = mib._live_index(a, REPO, projects.parent.parent)
+    check("narrowing: all-marked does not narrow to zero -- it refuses, naming both",
+          got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
+    check("narrowing: two real corpora, both with transcripts, still REFUSE",
+          got is None and "--record" in note, note)
+
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)

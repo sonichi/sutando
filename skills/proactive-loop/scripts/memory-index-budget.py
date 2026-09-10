@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import hashlib
 import os
 import re
 import sys
@@ -136,6 +137,46 @@ def _host_stated_index(workspace: Path, repo: Path) -> "tuple[Path | None, str]"
     return Path(raw).expanduser(), f"{ptr}"
 
 
+def _narrow(cands: "list[Path]") -> "list[Path]":
+    """Drop candidates that cannot be this session's corpus, cheapest signal first.
+
+    Each filter is adopted only when it leaves something, so narrowing to zero is
+    never how a host loses its answer.
+    """
+    for keep in (
+        # 1. An explicit disclaimer beats every inference, including a fresh mtime.
+        lambda c: not (c.parent / "NOT-THE-LIVE-CORPUS.txt").exists(),
+        # 2. Debris: dead worktrees and scratch dirs leave byte-identical template
+        #    stubs, which manufacture ambiguity that was never observed.
+        lambda c: _content_key(c) not in _stub_keys(cands),
+        # 3. Transcripts say which tree a session RAN in. That is the corpus it
+        #    writes only where cwd and the memory dir coincide, so it goes last.
+        lambda c: any(c.parent.parent.glob("*.jsonl")),
+    ):
+        if len(cands) < 2:
+            break
+        kept = [c for c in cands if keep(c)]
+        if kept:
+            cands = kept
+    return cands
+
+
+def _content_key(index: "Path") -> str:
+    try:
+        return hashlib.sha256(index.read_bytes()).hexdigest()
+    except OSError:
+        return f"unreadable:{index}"
+
+
+def _stub_keys(cands: "list[Path]") -> "set[str]":
+    """Content hashes shared by 3+ candidates: a template nobody wrote in."""
+    seen: "dict[str, int]" = {}
+    for c in cands:
+        k = _content_key(c)
+        seen[k] = seen.get(k, 0) + 1
+    return {k for k, n in seen.items() if n >= 3}
+
+
 def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
     """(index, note); index None means refuse and the note says why. Freshness is
     not identity -- an mtime cannot say which corpus this session loads."""
@@ -164,6 +205,7 @@ def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | 
         if default.is_file():
             return default, ""
         return None, f"CANNOT ANSWER: no index at {default} and none under {projects}"
+    cands = _narrow(cands)
     if len(cands) == 1:
         return cands[0], ""
     names = ", ".join(c.parent.parent.name for c in cands)
