@@ -28,24 +28,35 @@ import worker_identity as wi  # noqa: E402
 
 
 class FakeTmux:
-    """Records argv; answers has-session from a set of names it knows."""
-    def __init__(self, existing=(), fail_on=None):
+    """Records argv + env; answers has-session from a set of names it knows.
+
+    The core's launcher is faked as well: like the real one, it creates the
+    session named by SUTANDO_TMUX_SESSION and exits non-zero when it cannot."""
+    def __init__(self, existing=(), fail_on=None, runtime="claude"):
         self.calls, self.existing, self.fail_on = [], set(existing), fail_on
+        self.envs, self.runtime = [], runtime
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
+        self.envs.append(dict(kw.get("env") or {}))
+        if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
+            return subprocess.CompletedProcess(argv, 0, self.runtime + "\n", "")
+        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+            if self.fail_on == "launcher":
+                return subprocess.CompletedProcess(argv, 1, "", "did not come up within ~5s")
+            self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
+            return subprocess.CompletedProcess(argv, 0, "Started detached.", "")
         sub = argv[3] if len(argv) > 3 else ""
         if sub == "has-session":
             name = argv[-1].lstrip("=")
             return subprocess.CompletedProcess(argv, 0 if name in self.existing else 1, "", "")
         if self.fail_on and sub == self.fail_on:
             return subprocess.CompletedProcess(argv, 1, "", f"{sub} exploded")
-        if sub == "new-session":
-            self.existing.add(argv[argv.index("-s") + 1])
-            # Real tmux prints the new pane's id under -P -F. Returning "" here
-            # is what let a broken send-keys target pass as correct.
-            return subprocess.CompletedProcess(argv, 0, "%9", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def launches(self):
+        return [e for a, e in zip(self.calls, self.envs)
+                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
 
 
 class Base(unittest.TestCase):
@@ -67,8 +78,8 @@ class TestPlan(Base):
 
     def test_the_watcher_is_pointed_at_the_workers_own_folder(self):
         p = sw.plan(self.ws, REPO)
-        self.assertEqual(p["watcher_argv"][-1], p["delivery_dir"])
-        self.assertIn(p["worker_id"], p["watcher_argv"][-1])
+        self.assertEqual(p["env"]["SUTANDO_TASKS_DIR"], p["delivery_dir"])
+        self.assertIn(p["worker_id"], p["env"]["SUTANDO_TASKS_DIR"])
 
     def test_working_directory_is_separate_from_the_delivery_directory(self):
         p = sw.plan(self.ws, REPO, cwd="/dev/proj")
@@ -105,11 +116,11 @@ class TestRefusals(Base):
         finally:
             _wi.new_worker_id = orig
 
-    def test_a_tmux_failure_surfaces_rather_than_half_creating(self):
+    def test_a_launcher_failure_surfaces_rather_than_half_creating(self):
         with self.assertRaises(sw.SpawnRefused) as e:
-            sw.spawn(self.ws, REPO, runner=FakeTmux(fail_on="new-session"),
+            sw.spawn(self.ws, REPO, runner=FakeTmux(fail_on="launcher"),
                      require_sentinel=False)
-        self.assertIn("new-session", str(e.exception))
+        self.assertIn("did not come up", str(e.exception))
 
 
 class TestSpawn(Base):
@@ -122,14 +133,19 @@ class TestSpawn(Base):
         self.assertEqual(len(wi.incarnations(self.ws, w)), 1, "run history")
         self.assertTrue(sw.session_exists(got["tmux"]["session_name"], runner=t), "tmux")
 
-    def test_the_watcher_is_started_inside_that_session(self):
+    def test_the_runtime_is_the_cores_launcher_under_worker_env(self):
+        """No bare watcher in the pane: the agent starts its own, as the core
+        does, so the session can both receive work and answer it."""
         t = FakeTmux()
         got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
-        keys = [c for c in t.calls if "send-keys" in c]
-        self.assertEqual(len(keys), 1)
-        self.assertEqual(keys[0][keys[0].index("-t") + 1], "%9")
-        self.assertIn("watch-tasks-stream.sh", " ".join(keys[0]))
-        self.assertIn(got["worker_id"], " ".join(keys[0]))
+        envs = t.launches()
+        self.assertEqual(len(envs), 1)
+        env = envs[0]
+        self.assertEqual(env["SUTANDO_TMUX_SESSION"], got["tmux"]["session_name"])
+        self.assertEqual(env["SUTANDO_INSTANCE_ID"], got["worker_id"])
+        self.assertEqual(env["SUTANDO_TASKS_DIR"], got["delivery_dir"])
+        self.assertEqual(env["SUTANDO_CLAUDE_SESSION_ID"], got["runtime_session_id"])
+        self.assertFalse(any("send-keys" in c for c in t.calls))
 
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
@@ -167,14 +183,26 @@ class TestSpawn(Base):
             self.assertNotIn(forbidden, joined)
 
 
-class TestWatcherStartFailure(Base):
-    def test_a_failed_send_keys_surfaces(self):
-        """The session exists but nothing reads the folder — the one state the
-        invariant forbids, so it must raise rather than return."""
+class TestRuntimeStartFailure(Base):
+    def test_a_failed_launch_surfaces(self):
+        """A worker with no runtime is the one state the invariant forbids —
+        a folder nobody reads — so it must raise rather than return."""
         with self.assertRaises(sw.SpawnRefused) as e:
-            sw.spawn(self.ws, REPO, runner=FakeTmux(fail_on="send-keys"),
+            sw.spawn(self.ws, REPO, runner=FakeTmux(fail_on="launcher"),
                      require_sentinel=False)
-        self.assertIn("watcher failed", str(e.exception))
+        self.assertIn("launcher failed", str(e.exception))
+
+    def test_the_recorded_session_id_is_the_one_the_runtime_is_told(self):
+        """Lineage is only truthful if the id in the record IS the CLI session."""
+        t = FakeTmux()
+        got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        sessions = wi.sessions(self.ws, got["worker_id"])
+        self.assertEqual(sessions[0]["session_id"], t.launches()[0]["SUTANDO_CLAUDE_SESSION_ID"])
+
+    def test_the_worker_runs_the_runtime_the_core_is_configured_for(self):
+        t = FakeTmux(runtime="codex")
+        got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        self.assertEqual(got["runtime"], "codex")
 
 
 class TestSentinelProbe(Base):
@@ -216,13 +244,15 @@ class TestSocketResolution(Base):
         t = FakeTmux()
         with patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": "/tmp/other.sock"}):
             sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
-        for call in t.calls:
+        self.assertEqual(t.launches()[0]["SUTANDO_TMUX_SOCKET"], "/tmp/other.sock")
+        for call in (c for c in t.calls if c[0] == "tmux"):
             self.assertEqual(call[2], "/tmp/other.sock", call)
 
     def test_an_explicit_socket_still_wins(self):
         t = FakeTmux()
         sw.spawn(self.ws, REPO, runner=t, require_sentinel=False, socket="/tmp/x.sock")
-        self.assertTrue(all(c[2] == "/tmp/x.sock" for c in t.calls))
+        self.assertEqual(t.launches()[0]["SUTANDO_TMUX_SOCKET"], "/tmp/x.sock")
+        self.assertTrue(all(c[2] == "/tmp/x.sock" for c in t.calls if c[0] == "tmux"))
 
 
 class TestCli(Base):
@@ -247,39 +277,39 @@ class TestCli(Base):
         self.assertIn("refused", buf.getvalue())
 
 
-class TestWatcherAddressing(Base):
-    """Two things a fake tmux cannot fail on unless it is faithful."""
-
-    def test_send_keys_targets_the_pane_id_not_the_session_name(self):
-        """`=name` makes tmux resolve an exact PANE name, so it cannot find a
-        session and the watcher never starts."""
-        t = FakeTmux()
-        sw.spawn(self.ws, str(REPO), runner=t, require_sentinel=False)
-        new = [c for c in t.calls if "new-session" in c][0]
-        send = [c for c in t.calls if "send-keys" in c][0]
-        self.assertIn("-P", new)
-        self.assertIn("#{pane_id}", new)
-        self.assertEqual(send[send.index("-t") + 1], "%9")
+class TestWorkerIsolation(Base):
+    """What keeps N workers apart while they run one launcher."""
 
     def test_the_watcher_declares_its_own_instance(self):
         """Without it the worker resolves the core's (agent, instance) key and
         stamps the core's watcher sentinel, which #3875 alone does not stop."""
-        r = sw.spawn(self.ws, str(REPO), runner=FakeTmux(), require_sentinel=False)
-        argv = r["watcher_argv"]
-        self.assertEqual(argv[0], "env")
-        self.assertEqual(argv[1], f"SUTANDO_INSTANCE_ID={r['worker_id']}")
+        t = FakeTmux()
+        r = sw.spawn(self.ws, str(REPO), runner=t, require_sentinel=False)
+        self.assertEqual(t.launches()[0]["SUTANDO_INSTANCE_ID"], r["worker_id"])
 
-    def test_the_watcher_comes_from_the_repo_not_the_working_directory(self):
-        """WATCHER relative resolves against the session's cwd, so `cwd` would
+    def test_the_launcher_comes_from_the_repo_not_the_working_directory(self):
+        """A relative path resolves against the session's cwd, so `cwd` would
         choose which code the worker runs, not just where it runs."""
         p = sw.plan(self.ws, "/anchor/repo", cwd="/some/other/checkout")
         self.assertEqual(p["cwd"], "/some/other/checkout")
-        self.assertEqual(p["watcher_argv"][3], "/anchor/repo/src/watch-tasks-stream.sh")
+        self.assertEqual(p["launcher_argv"], ["bash", "/anchor/repo/src/agent/start-cli.sh"])
+        self.assertEqual(p["env"]["SUTANDO_CLAUDE_WORKING_DIR"], "/some/other/checkout")
 
-    def test_two_workers_declare_different_instances(self):
-        a = sw.spawn(self.ws, str(REPO), runner=FakeTmux(), require_sentinel=False)
-        b = sw.spawn(self.ws, str(REPO), runner=FakeTmux(), require_sentinel=False)
-        self.assertNotEqual(a["watcher_argv"][1], b["watcher_argv"][1])
+    def test_two_workers_declare_different_instances_and_sessions(self):
+        t = FakeTmux()
+        sw.spawn(self.ws, str(REPO), runner=t, require_sentinel=False)
+        sw.spawn(self.ws, str(REPO), runner=t, require_sentinel=False)
+        a, b = t.launches()
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_TMUX_SESSION",
+                  "SUTANDO_TASKS_DIR", "SUTANDO_CLAUDE_SESSION_ID"):
+            self.assertNotEqual(a[k], b[k], k)
+
+    def test_the_plan_uses_the_id_it_is_given(self):
+        """The identity record is the authority; plan() must not mint a second
+        id that is then thrown away."""
+        p = sw.plan(self.ws, REPO, worker_id="a" * 32)
+        self.assertEqual(p["worker_id"], "a" * 32)
+        self.assertTrue(p["delivery_dir"].endswith("a" * 32))
 
 
 if __name__ == "__main__":

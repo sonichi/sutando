@@ -65,6 +65,10 @@ __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 # into its env). Single resolution path = no divergence.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
+elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+  # A pool worker's session carries its delivery folder in env, so the same
+  # `/startup` that serves the core serves a worker with no argument change.
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
 elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
   __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
   TASKS_DIR="$__WS/tasks"
