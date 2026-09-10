@@ -15,17 +15,68 @@ for _p in (str(_SRC), str(REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from workspace_default import resolve_workspace  # noqa: E402
+from channel_env_resolve import resolve_channel_env  # noqa: E402
 from ag2_sparrow.sparrowd import WorkerSpec, run  # noqa: E402
 
+# The unsuffixed lane. Naming it would rename its whole id namespace
+# (`task-<inst>~...`) and its status file, orphaning work already in flight.
+PRIMARY_CHANNEL = "ag2space"
 
-def worker_specs() -> list:
-    return [
-        WorkerSpec(
-            name="remote-gateway-bridge",
-            argv=[sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
+
+def _channels_dir():
+    return resolve_workspace() / ".claude-sutando" / "channels"
+
+
+def relay_channels(channels_dir=None) -> list:
+    """Channel dirs that resolve to a RELAY env, sorted, primary first.
+
+    Selection is delegated to `channel_env_resolve`, which picks by CONTENT —
+    a usable REMOTE_TASK_TOKEN — so discord/slack/telegram dirs are excluded
+    without this file naming them.
+    """
+    base = channels_dir if channels_dir is not None else _channels_dir()
+    base = Path(base)
+    if not base.is_dir():
+        return []
+    found = []
+    for d in sorted(base.iterdir()):
+        if d.is_dir() and resolve_channel_env(base, d.name) is not None:
+            found.append(d.name)
+    found.sort(key=lambda n: (n != PRIMARY_CHANNEL, n))
+    return found
+
+
+def instance_for(channel: str) -> str:
+    """GATEWAY_INSTANCE for a channel dir — the name ALREADY in use, not the dir.
+
+    Live lanes are `dev` and `local` for `dev-ag2space` and `local-ag2space`;
+    inventing `dev-ag2space` would move that lane's `task-<inst>~...` namespace
+    and status file, orphaning work in flight.
+    """
+    if channel == PRIMARY_CHANNEL:
+        return ""
+    suffix = f"-{PRIMARY_CHANNEL}"
+    return channel[: -len(suffix)] if channel.endswith(suffix) else channel
+
+
+def worker_specs(channels_dir=None) -> list:
+    """One gateway bridge per relay channel.
+
+    A channel with no bridge is a channel that silently receives nothing, which
+    is what made `local-ag2space` inert: the dir and its token existed, but
+    nothing ran against them.
+    """
+    bridge = str(REPO / "src" / "remote-gateway-bridge.py")
+    specs = []
+    for name in relay_channels(channels_dir):
+        instance = instance_for(name)
+        specs.append(WorkerSpec(
+            name=f"gateway-{name}",
+            argv=[sys.executable, bridge],
             cwd=str(REPO),
-        ),
-    ]
+            env={"REMOTE_TASK_CHANNEL_DIR": name, "GATEWAY_INSTANCE": instance},
+        ))
+    return specs
 
 
 def external_supervisor(marker: str) -> "str | None":

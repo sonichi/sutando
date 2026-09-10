@@ -311,11 +311,26 @@ import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location("sparrowd_launcher", REPO / "src" / "sparrowd.py")
 _l = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_l)
-_specs = _l.worker_specs()
-check(len(_specs) == 1 and _specs[0].name == "remote-gateway-bridge",
-      "worker_specs() yields exactly the gateway bridge")
-check(Path(_specs[0].argv[1]).exists(),
-      "the spec's target script exists at the resolved path")
+# A FIXTURE channels dir, not the live workspace: worker_specs() discovers per
+# channel now, so reading the host would make this pass or fail by what happens
+# to be installed (and yield nothing at all on CI).
+_chan = Path(tempfile.mkdtemp()) / "channels"
+for _n in ("ag2space", "dev-ag2space"):
+    (_chan / _n).mkdir(parents=True)
+    (_chan / _n / ".env").write_text(
+        "REMOTE_TASK_URL=https://gw.invalid/relay\nREMOTE_TASK_TOKEN=tok-0123456789\n")
+(_chan / "discord").mkdir(parents=True)
+(_chan / "discord" / ".env").write_text("DISCORD_BOT_TOKEN=nope\n")
+
+_specs = _l.worker_specs(_chan)
+check([s.name for s in _specs] == ["gateway-ag2space", "gateway-dev-ag2space"],
+      "worker_specs() yields one gateway bridge per RELAY channel")
+check(sum(1 for s in _specs if s.env["GATEWAY_INSTANCE"] == "") == 1,
+      "exactly one lane is the unsuffixed primary")
+check([s.env["GATEWAY_INSTANCE"] for s in _specs] == ["", "dev"],
+      "instance is the name already in use, not the channel dir")
+check(all(Path(s.argv[1]).exists() for s in _specs),
+      "every spec's target script exists at the resolved path")
 _calls = []
 _l.run = lambda specs, sd: (_calls.append((specs, sd)), 0)[1]
 _l.external_supervisor = lambda marker: None  # guard has its own tests below
