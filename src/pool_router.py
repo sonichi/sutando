@@ -54,16 +54,18 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
     finished work, and a sentinel would offer it again.
     """
     d = pd.deliveries_dir(workspace, recipient)
-    if pd.find(workspace, recipient, task_id) is not None:
-        return "already"
-    if not pd.payload_path(Path(workspace), task_id).is_file():
-        return "no-payload"
-    d.mkdir(parents=True, exist_ok=True)
-    try:
-        os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
-                         os.O_CREAT | os.O_EXCL))
-    except FileExistsError:
-        return "already"
+    # Under the folder's lock, so the recipient cannot accept (freeing the
+    # pending name) between the check of both names and the create.
+    with pd.arbitration(workspace, recipient):
+        if pd.find(workspace, recipient, task_id) is not None:
+            return "already"
+        if not pd.payload_path(Path(workspace), task_id).is_file():
+            return "no-payload"
+        try:
+            os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
+                             os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            return "already"
     return "delivered"
 
 
@@ -90,6 +92,11 @@ def route(workspace, task: dict, roster=None) -> dict:
     unknown = pr.unknown_targets(r, targets)
     if unknown:
         targets = [pr.CORE]
+
+    # Members would share one payload and one result path, so the first to
+    # finish archives the others' work. Refused until each member has its own.
+    if len(targets) > 1:
+        raise RouterRefused(f"{task_id}: {len(targets)} targets — fan-out is not supported yet")
 
     # Liveness is not consulted: the sentinel is durable, so a worker that
     # starts later finds its work. Holding would record it nowhere.

@@ -7,9 +7,12 @@ only — every routing decision belongs to `pool_router`/`pool_roster`.
 
 The watcher's handler protocol carries the design's recipient rules exactly:
 
-    probe 3   decline    not a roster hit -- unbound, or a name never created.
-                          The core takes it; it is a recipient, not a fallback.
-    probe 0   accept     every target is on the roster; the real run delivers.
+    probe 3   decline      not a roster hit -- unbound, or a name never created.
+                            The core takes it; it is a recipient, not a fallback.
+    probe 4   must-handle  every target is on the roster, OR the roster cannot be
+                            read. The real run delivers; if it fails, the watcher
+                            publishes a failure -- the core never sees the task,
+                            because an addressed task must not change recipient.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -18,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,7 +64,9 @@ def classify(workspace, task: dict) -> tuple[int, list]:
     """(exit code, targets) without delivering anything."""
     roster = pr.load_roster(workspace)
     if roster is None:
-        return DECLINE, []
+        # Refuse, never decline: a decline is the core, and an unreadable file
+        # must not pick a recipient.
+        return MUST_HANDLE, []
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
                              task.get("requested_worker"))
     # One question only: is every target on the roster? Anything else -- no
@@ -68,7 +75,18 @@ def classify(workspace, task: dict) -> tuple[int, list]:
         return DECLINE, targets
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
-    return 0, targets
+    return MUST_HANDLE, targets
+
+
+def _log(workspace, line: str) -> None:
+    """The watcher keeps only the exit code; the reason has to be kept here."""
+    try:
+        d = pr._root(workspace) / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "pool-route-handler.log", "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + line.rstrip() + "\n")
+    except OSError:
+        pass
 
 
 def main(argv=None) -> int:
@@ -81,14 +99,27 @@ def main(argv=None) -> int:
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
-    task = read_task(args.task_file)
+    try:
+        task = read_task(args.task_file)
+    except FileNotFoundError:
+        # Finished and archived between the probe and this run: nothing to route.
+        _log(ws, f"{args.task_file}: gone before the run; nothing to route")
+        return 0
     code, _targets = classify(ws, task)
     if args.probe:
         return code
     if code == DECLINE:
         return DECLINE
 
-    out = rt.route(ws, task, None)
+    try:
+        out = rt.route(ws, task, None)
+    except rt.RouterRefused as e:
+        _log(ws, f"{task.get('id')}: refused: {e}")
+        print(f"pool-route-handler: {e}", file=sys.stderr)
+        return 1
+    except Exception:
+        _log(ws, f"{task.get('id')}: crashed:\n" + traceback.format_exc())
+        raise
     if out.get("failed"):
         # Unreachable via the probe, which declines these; kept so a direct
         # caller cannot turn an unknown name into a delivery.
