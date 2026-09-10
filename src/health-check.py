@@ -8966,15 +8966,28 @@ def check_task_watcher() -> dict:
             _sg, _su = _group_roots_by_target(WORKSPACE_DIR / "state", supervised)
             _sup_dupe = (not _su) and any(len(v) > 1 for v in _sg.values())
             _reduce = "; reduce those through the launcher that owns them" if _sup_dupe else ""
-            # Stop advice is scoped to the ownerless subset: a root with a live
-            # parent is supervised, and stopping it takes a healthy peer offline.
+            # Stop advice is scoped to the ownerless subset; parentage gives
+            # supervision, not target identity and not the restart count.
+            _og, _ou = _group_roots_by_target(WORKSPACE_DIR / "state", ownerless)
+            if _ou:
+                _stop = (f"Do NOT stop {', '.join(_ou)} — UNKNOWN identity: it may be the only "
+                         f"watcher for its instance")
+            elif _og and set(_og) <= set(_sg):
+                # Restarting after the stop is what recreates the duplicate: a
+                # supervised watcher already serves every one of these targets.
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
+                         f"a supervised watcher already serves that instance")
+            elif len(_og) > 1:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
+                         f"{len(_og)} cleanly — one per instance, NOT one")
+            else:
+                _stop = f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart one cleanly"
             if ownerless and supervised:
-                lead = (f"{count}. Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
-                        f"one cleanly. Do NOT stop {', '.join(supervised)} — supervised{_reduce}")
+                lead = (f"{count}. {_stop}. Do NOT stop {', '.join(supervised)} "
+                        f"— supervised{_reduce}")
             elif ownerless:
                 lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
-                        f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; "
-                        f"stop them and restart one cleanly")
+                        f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; {_stop}")
             else:
                 _r = _reduce.replace("reduce those through", "reduce the count through")
                 lead = f"{count}. Do NOT stop any of them: each is supervised{_r}"

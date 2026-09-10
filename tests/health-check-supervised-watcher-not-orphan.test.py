@@ -67,9 +67,15 @@ check("says do NOT stop it", "Do NOT stop it" in v["detail"], v["detail"])
 check("names the live parent", "ppid 12626" in v["detail"], v["detail"])
 
 print("single REPARENTED watcher (a true orphan):")
-v2 = _verdict({"555": {"555"}}, {"555": "1"})
+# Identity resolved, so the stop remedy is licensed; unresolved, it is not (keweichen).
+v2 = _verdict({"555": {"555"}}, {"555": "1"}, targets={"555": "/s/a.pid"})
 check("keeps the orphan verdict", "orphaned" in v2["detail"], v2["detail"])
-check("keeps the stop remedy", "stop them" in v2["detail"], v2["detail"])
+check("keeps the stop remedy", "Stop ONLY the ownerless (555)" in v2["detail"], v2["detail"])
+check("restarts one for a lone instance", "restart one cleanly" in v2["detail"], v2["detail"])
+
+v2u = _verdict({"555": {"555"}}, {"555": "1"}, targets={})
+check("an UNIDENTIFIED orphan is not named stoppable",
+      "Do NOT stop 555" in v2u["detail"], v2u["detail"])
 
 print("single watcher with UNKNOWN parent (must stay an orphan):")
 # An unknown ppid cannot support "runs under a live session" — saying so would

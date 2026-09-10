@@ -669,21 +669,22 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertIn("supervised: 901, 902", d)
 
     def test_mixed_ownership_names_only_the_ownerless_as_stoppable(self):
-        # 901 is supervised (ppid 900 alive), 903 is ownerless (ppid 1). Reported by
-        # qingyun-wu on #3875: the blanket form told an operator to stop 901 too.
-        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n")
+        """With identities resolved, the ownerless root is the only stop target."""
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n",
+                         targets={"901": "/s/a.pid", "903": "/s/c.pid"})
         self.assertIn("Stop ONLY the ownerless (903)", d)
         self.assertIn("Do NOT stop 901", d)
-        self.assertNotIn("stop them and restart one cleanly", d,
-            "the blanket instruction must not survive when a supervised root is present")
-        self.assertIn("ownerless: 903", d)
-        self.assertIn("supervised: 901", d)
 
     def test_an_all_ownerless_set_is_still_stoppable(self):
-        # The control: the fix must not become "never stop anything".
-        d = self._detail(f"  900 1 /bin/zsh -l\n  903 1 bash {self.W}\n  904 1 bash {self.W}\n")
+        """The control: the fix must not become "never stop anything".
+
+        Both roots resolve to ONE target, so they really are duplicates and the
+        stop-and-restart-one advice is correct here.
+        """
+        d = self._detail(f"  900 1 /bin/zsh -l\n  903 1 bash {self.W}\n  904 1 bash {self.W}\n",
+                         targets={"903": "/s/a.pid", "904": "/s/a.pid"})
         self.assertIn("2 orphaned watcher(s)", d)
-        self.assertIn("stop them and restart one cleanly", d)
+        self.assertIn("restart one cleanly", d)
         self.assertNotIn("Do NOT stop", d)
 
     MIXED = None  # set in the cases below
@@ -706,9 +707,40 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
     def test_mixed_ownership_UNKNOWN_identity_is_not_reduced(self):
         d = self._mixed({})   # stated: no pid resolves
         self.assertIn("UNKNOWN", d)
-        self.assertIn("Stop ONLY the ownerless (903)", d)
+        self.assertIn("Do NOT stop 903", d,
+            "an ownerless root whose identity is unreadable is not safe to stop either")
         self.assertNotIn("reduce those through the launcher", d,
             "unreadable identity must not authorise reduction in the mixed branch either")
+
+    def _own(self, ps, targets):
+        return self._detail(ps, targets=targets)
+
+    def test_distinct_all_ownerless_restart_ONE_PER_INSTANCE(self):
+        """keweichen, #3875: 'stop them and restart one' strands an instance when
+        the ownerless roots are distinct. Parentage is not restart cardinality."""
+        d = self._own(f"  901 1 bash {self.W}\n  902 1 bash {self.W}\n",
+                      {"901": "/s/a.pid", "902": "/s/b.pid"})
+        self.assertIn("restart 2 cleanly", d)
+        self.assertIn("one per instance", d)
+
+    def test_an_UNKNOWN_ownerless_root_is_not_named_safe_to_stop(self):
+        d = self._own(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n",
+                      {"901": "/s/a.pid"})
+        self.assertIn("Do NOT stop 903", d)
+        self.assertIn("UNKNOWN identity", d)
+
+    def test_an_ownerless_duplicate_of_a_SUPERVISED_root_is_not_restarted(self):
+        """Stopping 903 then restarting one recreates the duplicate: 901 already
+        serves that instance."""
+        d = self._own(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n",
+                      {"901": "/s/a.pid", "903": "/s/a.pid"})
+        self.assertIn("do NOT restart", d)
+        self.assertNotIn("and restart one cleanly", d)
+
+    def test_a_lone_ownerless_watcher_is_still_restarted(self):
+        """The advice survives where it is correct, or the gate is a mute."""
+        d = self._own(f"  901 1 bash {self.W}\n", {"901": "/s/a.pid"})
+        self.assertIn("restart one cleanly", d)
 
     def test_reduction_reads_the_SUPERVISED_subset_not_every_root(self):
         """901 and 902 are distinct instances; the OWNERLESS 903 duplicates 901.
