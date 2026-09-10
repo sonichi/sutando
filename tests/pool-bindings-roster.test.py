@@ -107,10 +107,14 @@ class TestTargets(Base):
         r = pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": W1})
         self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W1])
 
-    def test_a_set_resolves_to_its_member_list(self):
-        r = pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": [W1, W2]})
-        self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W1, W2])
+    def test_a_set_is_refused_until_members_have_their_own_result(self):
+        with self.assertRaises(pr.RosterError) as e:
+            pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": [W1, W2]})
+        self.assertIn("fan-out", str(e.exception))
 
+    def test_a_one_member_list_is_still_one_target(self):
+        r = pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": [W1]})
+        self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W1])
     def test_requested_worker_outranks_the_binding(self):
         r = pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": W1})
         self.assertEqual(pr.targets_for(r, "room:!x:ag2.space", requested_worker=W2), [W2])
@@ -171,6 +175,40 @@ class TestLabelResolution(unittest.TestCase):
     def test_a_requested_worker_overrides_the_binding(self):
         r = dict(self.ROSTER, bindings={"!room:x": "b" * 32})
         self.assertEqual(pr.targets_for(r, "!room:x", "worker-1"), ["a" * 32])
+
+
+
+class TestCorruptDeclarations(Base):
+    def declare(self, text):
+        p = pr.bindings_path(self.ws); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+
+    def test_a_missing_file_is_a_valid_empty_declaration(self):
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        r = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(pr.targets_for(r, "!x:ag2.space"), [pr.CORE])
+
+    def test_a_valid_empty_declaration_compiles(self):
+        self.declare(json.dumps({"bindings": {}}))
+        self.assertEqual(pr.compile_roster(self.ws, live(W1))["bindings"], {})
+
+    def test_a_corrupt_file_is_refused_and_the_last_roster_survives(self):
+        """Read as empty, a corrupt declaration compiled into a roster that sent
+        every bound task to the core, one version up, with no error anywhere."""
+        self.declare(json.dumps({"bindings": {"!x:ag2.space": W1}}))
+        good = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(pr.targets_for(good, "!x:ag2.space"), [W1])
+        self.declare("{broken")
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W1))
+        kept = pr.load_roster(self.ws)
+        self.assertEqual(kept["version"], good["version"])
+        self.assertEqual(pr.targets_for(kept, "!x:ag2.space"), [W1])
+
+    def test_a_mis_shaped_declaration_is_refused(self):
+        for bad in ("[]", '{"bindings": []}', '"text"'):
+            self.declare(bad)
+            with self.assertRaises(pr.RosterError, msg=bad):
+                pr.load_bindings(self.ws)
 
 
 if __name__ == "__main__":

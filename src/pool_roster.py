@@ -11,8 +11,9 @@ and out of the router is what makes routing testable by replay: same roster,
 same task, same deliveries, with no clock, no directory listing and no liveness
 probe in the decision.
 
-A binding is keyed on the SOURCE of work (`room:!abc:ag2.space`), never on a
-task property, because the owner declares it before any task exists.
+A binding is keyed on the SOURCE of work — the raw channel id the bridge stamps
+(`!abc:ag2.space`) — never on a task property, because the owner declares it
+before any task exists.
 """
 from __future__ import annotations
 
@@ -66,7 +67,20 @@ def _write_atomic(path: Path, payload) -> None:
 
 
 def load_bindings(workspace) -> dict:
-    return _read(bindings_path(workspace), {}).get("bindings", {})
+    """Absent is a valid empty declaration. Unreadable or mis-shaped is refused:
+    read as empty, a corrupt file compiles into a roster that sends every bound
+    task to the core."""
+    p = bindings_path(workspace)
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise RosterError(f"bindings unreadable, keeping the last roster: {p}: {e}")
+    bindings = raw.get("bindings", {}) if isinstance(raw, dict) else None
+    if not isinstance(bindings, dict):
+        raise RosterError(f"bindings must be an object under 'bindings': {p}")
+    return bindings
 
 
 def load_roster(workspace):
@@ -130,6 +144,11 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
         members = list(bound) if isinstance(bound, list) else [bound]
         if not members:
             raise RosterError(f"binding {source!r} names no target")
+        if len(members) > 1:
+            # Members would share one payload and one result path; the first to
+            # finish archives the other's work. Refused until members get their own.
+            raise RosterError(f"binding {source!r} names {len(members)} targets; "
+                              "fan-out is not supported yet")
         missing = [m for m in members if m not in known]
         if missing:
             raise RosterError(
