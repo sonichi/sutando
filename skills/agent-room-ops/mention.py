@@ -29,8 +29,8 @@ from relations import RelationError, relation_fields
 
 def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None,
             resolved_by=None):
-    # `resolved_by` names the source that produced `mxid` — directory | broker |
-    # room — so a wrong hit is traceable to the resolver that made it.
+    # `resolved_by` names the source that produced `mxid` OR refused the handle —
+    # directory | broker | room — so a hit and a refusal are both traceable.
     return {"ok": bool(ok), "room_id": room_id, "mxid": mxid, "event_id": event_id,
             "candidates": candidates or [], "reason": reason, "resolved_by": resolved_by}
 
@@ -74,7 +74,7 @@ def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None) -> "di
     if got.get("ok"):
         return {**got, "resolved_by": "broker"}
     if is_ambiguous(got):
-        return got
+        return {**got, "resolved_by": "broker"}
 
     try:
         from members import room_members
@@ -122,7 +122,8 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
             res, source = room_res, room_res.get("resolved_by")
     if not res.get("ok"):
         return _result(False, room_id=room_id, candidates=res.get("candidates"),
-                       reason=res.get("reason") or "could not resolve handle")
+                       reason=res.get("reason") or "could not resolve handle",
+                       resolved_by=source)
     mxid = res["mxid"]
 
     gate = load_gate() if gate is None else gate

@@ -334,6 +334,38 @@ class TestMentionFallback(unittest.TestCase):
         self.assertIn("no agent matches", got["reason"])
         self.assertEqual(self.posted, [])
 
+    # ----- `resolved_by` on a refusal (PR #4126 review) ----- #
+    def test_a_directory_refusal_is_tagged_directory(self):
+        """A refusal names its resolver the way a hit does, so a caller reading
+        `candidates` knows WHICH source found too many — or nobody at all."""
+        agents = [{"id": "@sutando-a:ag2.space"}, {"id": "@sutando-b:ag2.space"}]
+        got = self._mention("sutando", agents=agents)
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "directory"))
+        self.assertEqual(len(got["candidates"]), 2)
+        # A miss that no later source could answer stays the directory's too.
+        with mock.patch.dict(sys.modules, {"members": None}):
+            got = self._mention("sutando-sonichi")
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "directory"))
+        self.assertEqual(self.posted, [])
+
+    def test_a_broker_ambiguity_is_tagged_broker(self):
+        self.broker.default = _Broker.ambiguous(BASSIL_AGENT, SONICHI)
+        with self._members([SONICHI]):
+            got = self._mention("sutando")
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "broker"))
+        self.assertEqual(sorted(got["candidates"]), sorted([BASSIL_AGENT, SONICHI]))
+        self.assertEqual(self.posted, [])
+        # The tag is put on by `_resolve_from_room` itself, not by `mention`.
+        got = self.M._resolve_from_room("sutando", ROOM, "@me:ag2.space")
+        self.assertEqual(got["resolved_by"], "broker")
+        self.assertEqual(self.member_reads, [])
+
+    def test_a_roster_ambiguity_is_tagged_room(self):
+        with self._members(["@sutando-rui:ag2.space", SONICHI]):
+            got = self._mention("sutando")
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "room"))
+        self.assertEqual(len(got["candidates"]), 2)
+
     # ----- a resolved mxid that still cannot be posted ----- #
     def test_client_gate_denial_names_the_resolved_mxid_and_posts_nothing(self):
         self.M.gate_allows = lambda *a, **k: False

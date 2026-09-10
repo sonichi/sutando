@@ -54,7 +54,8 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
 #   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|broker|room",...}
 #   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->
-#   {"ok":false,"candidates":[...]} and NOTHING is posted: pick one from `members` and retry
+#   {"ok":false,"candidates":[...],"resolved_by":"<the source that found too many>"} and
+#   NOTHING is posted: pick one from `members` and retry
 #   with its mxid — never guess one.
 python3 skills/agent-room-ops/room_ops.py members '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$evt' --agent '@a:hs'
