@@ -2183,5 +2183,62 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
                     f"{s['key']}: the unit AFTER it changed or it was relocated")
 
 
+
+class AuthoritativeSourceRowsSeparateFactFromDerivation(unittest.TestCase):
+    """A `sole source` table must not assign a DERIVED decision to one partial input.
+
+    Two rows did. The claim row named the hard link as the sole source for "may this
+    task be executed", contradicting the unfenced-first-pin contract that requires a
+    post-claim bindings re-read; the result row named the file's presence as proof of
+    completion, contradicting `read_ready_result`. Deleting either row left every other
+    test green, which is why these exist.
+    """
+
+    def _rows(self):
+        text = DOC.read_text(encoding="utf-8")
+        return [l for l in text.split("\n") if l.startswith("| ") and l.count("|") >= 3]
+
+    def test_no_row_makes_the_claim_the_sole_source_of_execution(self):
+        for row in self._rows():
+            head = row.split("|")[1].strip().lower()
+            if "execute" in head and "hold" not in head:
+                self.assertIn("DERIVED", row,
+                    "an execution-authorization row must be marked DERIVED, not sourced: " + row[:120])
+                self.assertIn("bindings", row,
+                    "an execution row must name the post-claim bindings re-read: " + row[:120])
+
+    def test_the_execution_row_EXISTS(self):
+        """Presence assertion. Without it the suite constrains only rows that happen to
+        exist, so DELETING the derived-execution row passes — measured: mutation M4
+        returned rc=0 against the first version of this class."""
+        rows = self._rows()
+        exec_rows = [r for r in rows if "EXECUTE" in r.split("|")[1]]
+        self.assertEqual(len(exec_rows), 1,
+            "exactly one derived-execution row must exist; deleting it would otherwise "
+            "silently restore the claim-proves-execution error")
+
+    def test_the_claim_row_claims_only_ownership(self):
+        claim = [r for r in self._rows() if "hard-link claim" in r]
+        self.assertTrue(claim, "the hard-link claim row vanished")
+        for row in claim:
+            head = row.split("|")[1].strip().lower()
+            self.assertNotIn("execute", head,
+                "the hard link proves exclusive ownership, never execution authorization: " + row[:120])
+
+    def test_completion_is_the_ready_predicate_not_file_presence(self):
+        finish = [r for r in self._rows() if r.split("|")[1].strip().lower().startswith("did the work finish")]
+        self.assertTrue(finish, "the completion row vanished")
+        for row in finish:
+            self.assertIn("read_ready_result", row,
+                "completion must name the ready-result predicate: " + row[:120])
+            self.assertNotIn("| the result file under", row,
+                "file presence is not completion: " + row[:120])
+
+    def test_the_crash_predicate_does_not_say_mere_presence(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertNotIn("a result's presence", text,
+            "the crash-predicate list still treats presence as completion")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

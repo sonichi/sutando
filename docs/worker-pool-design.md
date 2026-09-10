@@ -1711,14 +1711,15 @@ remembers is the one a sweep reads.
 
 | question | sole source |
 |---|---|
-| may this task be executed, and by which instance | the hard-link claim `state/task-event-handler-claims/<canonical task id>` |
+| who exclusively holds this task's claim | the hard-link claim `state/task-event-handler-claims/<canonical task id>` |
+| may that holder EXECUTE for this room | DERIVED, not sourced: the claim AND the post-claim `bindings.json` re-read (`:1094-1139`). The claim proves exclusive ownership, never execution authorization — first-pin is unfenced, so a claim can still name an instance the room no longer binds. |
 | was the offer TAKEN, and by which executor | the accept record `state/task-event-handler-accepts/<canonical task id>` |
 | which instances serve this room | `state/pool/bindings.json` |
-| may that instance claim right now | the `eligibility` key of `state/pool-status.json`, and — before every read of it — the directory `state/pool-probation/<instance>.admit/` |
+| may that instance claim right now | DERIVED, not sourced: a conjunction over separately owned inputs — `eligibility` in `state/pool-status.json`, the probation directory `state/pool/probation/`, the room's `bindings.json`, the instance's `.alive`, and the quiesce exclusion at `:1899`. No single one of these answers it. |
 | is that instance's process up | its own `.alive` |
 | has that instance run out of credit | `state/pool/quiesced/<instance>.json` |
 | may a reclaim repeat this task's external side effect | the done flag `state/cores/<name>/done/task-X.flag` |
-| did the work finish | the result file under `results/` |
+| did the work finish | the READY-RESULT predicate (`src/delivery/readiness.py` `read_ready_result`): a non-empty, decodable body. NEVER the file's presence — a result path exists before it holds an answer, so presence-as-completion strands the real answer and archives the task as done. |
 | how many admissions are outstanding | a listing of `DISPATCH_DIR`, never a counter |
 | how long the task waited | `data/pool-metrics.jsonl` |
 
@@ -1773,7 +1774,7 @@ file plus `os.replace`, the temp in the DESTINATION directory, so no consumer ca
 read a partial one. The receipt under `direct/` is unlinked in the same step that
 publishes the result, so a released slot never outlives the work it was counting.
 Every crash between two of those writes is decided by a predicate that already
-exists — a claim's owner and its liveness, a result's presence, a name a recovery
+exists — a claim's owner and its liveness, a result's READINESS (non-empty and decodable, never its mere presence), a name a recovery
 can `stat` — and never by a timestamp, because an mtime cannot say which of two
 writes had landed.
 
@@ -1946,7 +1947,7 @@ exists for, which is why the pane capture and not the session is the input.
 | adapter | delivery | accept | health |
 |---|---|---|---|
 | **Claude** | the watcher's `TASK_FILE:` line, read by the session's `Monitor` | the session publishes the accept record. Its skip rule needs no change because it has none; the write is owed all the same | its `.alive`, plus the wrapper's pane capture for the quota class |
-| **Codex** | `task-notifier.sh` re-scans the queue on the wake, so `next_pending_task` must consult the accept record before skipping AND must key on the canonical id, in one change — see the migration table under the routing rule | the CLI loop, once `next_pending_task` has selected a candidate | the wrapper's `tmux pipe-pane` capture; with no in-session watcher the claim-latency bound is the sweep interval |
+| **Codex** | `task-notifier.sh` re-scans the queue on the wake, so `next_pending_task` must consult the accept record before skipping AND must key on the canonical id, in one change, and `has_result` must be replaced with the ready-result predicate — it uses a raw `[ -f ]` (`task-notifier.sh:102-107,187`), so a zero-byte or whitespace result suppresses the task permanently — see the migration table under the routing rule | the CLI loop, once `next_pending_task` has selected a candidate | the wrapper's `tmux pipe-pane` capture; with no in-session watcher the claim-latency bound is the sweep interval |
 
 **The boundary does not by itself make a runtime without an in-session watcher a
 first-class worker, and v1 does not claim that it does.** The interface says what
