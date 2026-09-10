@@ -122,12 +122,14 @@ def probe_watcher_sentinels(state_dir: Path, pid_alive
     # Two sentinel FILES naming one pid is one watcher and a stale record, not
     # two watchers; listing the pid twice reports a pool that does not exist.
     seen = {}
-    for n, _s, d in rows:
-        seen.setdefault(d, []).append(n)
+    for n, s, d in rows:
+        if s == "running":
+            seen.setdefault(d, []).append(n)
     dup = {d: ns for d, ns in seen.items() if len(ns) > 1}
+    dup_note = ("; ".join(f"{' and '.join(ns)} both name {d}" for d, ns in dup.items())
+                if dup else "")
     if dup and len(running) == len(rows):
-        detail = "; ".join(f"{' and '.join(ns)} both name {d}" for d, ns in dup.items())
-        return ("degraded", f"one pid, two sentinels: {detail}", None)
+        return ("degraded", f"one pid, two sentinels: {dup_note}", None)
     if len(running) == len(rows):
         pids = ", ".join(d for _, _, d in rows)
         return ("running", pids if len(rows) == 1 else
@@ -138,8 +140,12 @@ def probe_watcher_sentinels(state_dir: Path, pid_alive
         # sentinel is a question, and answering it "offline" overstates.
         worst = "unknown" if any(s == "unknown" for _, s, _ in rows) else "offline"
         return (worst, rest, None)
-    ok = ", ".join(d for _, s, d in rows if s == "running")
-    return ("degraded", f"{len(running)} of {len(rows)} up ({ok}); {rest}", None)
+    # De-duplicate: two sentinels naming one live pid is one process, and
+    # counting it twice reports a pool that is not there.
+    ok = ", ".join(dict.fromkeys(d for _, s, d in rows if s == "running"))
+    live_n = len(set(d for _, s, d in rows if s == "running"))
+    tail = f"; one pid, two sentinels: {dup_note}" if dup_note else ""
+    return ("degraded", f"{live_n} of {len(rows)} up ({ok}); {rest}{tail}", None)
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:

@@ -642,6 +642,18 @@ class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
 
 
 
+class ADeadSentinelDoesNotLicenseStoppingASoleWatcher(unittest.TestCase):
+    """keweichen at 70a8887d: with every sentinel dead, an ownerless root is its
+    instance's only watcher unless a supervised peer serves the same target."""
+
+    def test_the_sole_live_ownerless_watcher_is_not_safe_to_stop(self):
+        r = run({"watch-tasks-stream-A.pid": "111\n"}, {"903": {"903"}},
+                argv=lambda pid: None if str(pid) == "111" else WATCHER_ARGV,
+                targets={"903": "B.pid"})
+        self.assertIn("do NOT stop 903", r["detail"])
+        self.assertIn("safe to stop: none", r["detail"])
+
+
 class SentinelReconciliationLosesNoRecord(unittest.TestCase):
     """keweichen at e3fbc2cf: `live[spid] = sp` is keyed by pid, so a second
     sentinel naming that pid vanished and the check reported a false green."""
@@ -791,9 +803,11 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
             f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n"
             f"  904 1 bash {self.W}\n",
             targets={"901": "/s/A.pid", "903": "/s/A.pid", "904": "/s/B.pid"})
-        self.assertIn("restart 1 cleanly", d)
-        self.assertIn("must NOT be restarted", d)
-        self.assertNotIn("restart 2 cleanly", d)
+        # keweichen: cardinality alone lets an operator restart the covered pid
+        # and leave the uncovered instance absent. Name which is which.
+        self.assertIn("restart 904", d)
+        self.assertIn("NOT 903", d)
+        self.assertNotIn("restart 2", d)
 
     def test_an_UNKNOWN_SUPERVISED_root_licenses_no_ownerless_action(self):
         """If 901 is actually A, restarting duplicates it; if it is not, stopping

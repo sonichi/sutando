@@ -8987,9 +8987,13 @@ def check_task_watcher() -> dict:
                          f"UNKNOWN identity and may serve the same instance: restarting would "
                          f"duplicate it, and not restarting may leave a gap")
             elif _uncovered and _covered:
-                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
-                         f"{len(_uncovered)} cleanly — {len(_covered)} of their instance(s) are "
-                         f"already served by a supervised watcher and must NOT be restarted")
+                # Cardinality alone lets an operator restart the covered one and
+                # leave the uncovered instance absent: name which pid is which.
+                _re = [r for r in ownerless if str(_snap[r]) in _uncovered]
+                _no = [r for r in ownerless if str(_snap[r]) in _covered]
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}), then restart "
+                         f"{', '.join(_re)} — NOT {', '.join(_no)}, whose instance(s) a "
+                         f"supervised watcher already serves")
             elif _covered:
                 _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
                          f"a supervised watcher already serves that instance")
@@ -9063,9 +9067,16 @@ def check_task_watcher() -> dict:
             # here is what makes the duplicates.
             own, sup = _split_roots_by_owner(roots, ps_out)
             _dg, _du = _group_roots_by_target(WORKSPACE_DIR / "state", own)
-            if _du:
-                own = [o for o in own if o not in _du]
-            _blind = (f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "")
+            _sg2, _ = _group_roots_by_target(WORKSPACE_DIR / "state", sup)
+            # Every sentinel here is dead, so an ownerless root is its instance's
+            # ONLY watcher unless a supervised peer serves the same target.
+            _sole = [o for tgt, rs in _dg.items() if tgt not in _sg2 for o in rs]
+            if _du or _sole:
+                own = [o for o in own if o not in _du and o not in _sole]
+            _blind = "".join([
+                f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "",
+                (f"; do NOT stop {', '.join(_sole)} — the only watcher for that instance, "
+                 f"and its sentinel is already dead") if _sole else ""])
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still "
                               f"run; tasks/ IS being drained{_blind}. "

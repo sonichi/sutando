@@ -161,3 +161,23 @@ def _dup_pid_sentinels_are_not_two_watchers():
 
 
 _dup_pid_sentinels_are_not_two_watchers()
+
+def _collision_survives_a_partly_down_pool():
+    """keweichen: A/B -> live 100 plus C -> dead 999 reported
+    '2 of 3 up (pid 100, pid 100)' — the collision vanished and one process
+    was counted twice."""
+    import tempfile
+    import pathlib as _pl
+    from services_status import probe_watcher_sentinels
+    td = _pl.Path(tempfile.mkdtemp())
+    (td / "watch-tasks-stream-A.pid").write_text("100")
+    (td / "watch-tasks-stream-B.pid").write_text("100")
+    (td / "watch-tasks-stream-C.pid").write_text("999")
+    status, detail, _ = probe_watcher_sentinels(td, lambda p: int(p) == 100)
+    assert "1 of 3 up" in detail, detail
+    assert "pid 100, pid 100" not in detail, detail
+    assert "one pid, two sentinels" in detail, detail
+    print("  ok   a collision survives a partly-down pool")
+
+
+_collision_survives_a_partly_down_pool()
