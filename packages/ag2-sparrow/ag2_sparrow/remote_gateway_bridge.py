@@ -500,11 +500,8 @@ _ALLOWDIV_STATE = {"mtime": None, "warned_hash": None, "unsupported_until": 0.0,
 
 
 def allowlist_divergence(local_allow, broker_allow, agent_id):
-    """Owner-warning body when LOCAL allowFrom names senders the BROKER
-    registry lacks (their room messages silently never become tasks); None when
-    aligned. Pure — no I/O. Only the local-minus-broker direction warns: that
-    is the silent-drop case; broker-extra senders still get tasks and are
-    tier-clamped locally by _tier_for."""
+    """Only local-minus-broker warns: that is the silent-drop direction.
+    Broker-extra senders still get tasks, tier-clamped locally by _tier_for."""
     local = {str(x).strip() for x in (local_allow or []) if str(x).strip()}
     broker = {str(x).strip() for x in (broker_allow or []) if str(x).strip()}
     missing = sorted(m for m in local - broker if m != str(agent_id).strip())

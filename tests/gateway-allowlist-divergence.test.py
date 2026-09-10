@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
-"""Allowlist-divergence warning in the ag2-sparrow gateway bridge.
-
-The broker registry decides whose room messages become tasks; local access.json
-only re-tiers ones that arrived. A local-only add therefore drops silently at
-the broker, and the bridge detects that divergence and warns the owner.
-
-Hermetic — no network: _req is monkeypatched; config/state under temp roots
-(CLAUDE_CONFIG_DIR seeded BEFORE import per the #2429 isolation rule).
-
-Covers:
-  1. pure divergence body: missing sender named + exact fix command; None when aligned
-  2. own agent-id / blank entries never count as divergence
-  3. hook end-to-end: local access.json + fake broker → ONE [dm-only] proactive file
-  4. dedup: unchanged divergence never warns twice; a NEW divergence re-warns
-  5. broker read failure → no warning, no mtime consumption (retries next loop)
-  6. realignment clears the warned-hash (future divergence warns again)
-  7. a persistently failing broker keeps retrying but logs once per cooldown
-
-Run: python3 tests/gateway-allowlist-divergence.test.py   (exit 0 / 1)
-"""
+"""Hermetic: `_req` is monkeypatched and CLAUDE_CONFIG_DIR must be seeded BEFORE
+import — the module reads it at import time, so a later setenv is too late."""
 from __future__ import annotations
 
 import json
