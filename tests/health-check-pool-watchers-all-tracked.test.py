@@ -481,7 +481,9 @@ class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
     def test_every_real_launch_shape_is_recognised(self):
         for label, argv in self.REAL:
             with self.subTest(shape=label):
-                self.assertIs(hc._is_watcher_argv(argv), True, argv)
+                # Reviewer-directed, #3875 at ad7f1bf7: without the OS vector a
+                # flattened argv is UNKNOWN, so it may not authorize repair.
+                self.assertIsNot(hc._is_watcher_argv(argv), False, argv)
 
     def test_an_undecidable_real_shape_is_never_REJECTED(self):
         # The defect this class was written for: a production watcher read as "not
@@ -546,6 +548,40 @@ class WhitespaceInsideAPathnameIsNotAnArgvBoundary(unittest.TestCase):
     def test_a_spaced_DIRECTORY_still_recognises_a_real_watcher(self):
         # The control that stops the fix from becoming "reject anything with a space".
         self.assertIs(self._with_vector("spaced dir/src/watch-tasks-stream.sh"), True)
+
+
+
+class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
+    """Reviewer-directed, #3875 at ad7f1bf7.
+
+    `assertIsNot(..., False)` in the launch-shape test is satisfied by True, so
+    relaxing it left the fallback unpinned. These assert the positive shape: an
+    ambiguous flattened argv is UNKNOWN, an unambiguous one is still True, and
+    UNKNOWN is counted as a tree rather than dropped.
+    """
+
+    AMBIGUOUS = "bash /repo/watch-tasks-stream.sh backup"
+    EXACT = "bash /repo/src/watch-tasks-stream.sh"
+
+    def _flat(self, argv):
+        orig = hc._proc_argv_vector
+        hc._proc_argv_vector = lambda pid: None
+        try:
+            return hc._is_watcher_argv(argv, 4242)
+        finally:
+            hc._proc_argv_vector = orig
+
+    def test_ambiguous_flattened_argv_is_unknown_not_true(self):
+        self.assertIsNone(self._flat(self.AMBIGUOUS),
+            "a flattened argv with trailing tokens cannot authorize repair")
+
+    def test_argv_ending_at_the_script_is_still_true(self):
+        self.assertIs(self._flat(self.EXACT), True,
+            "the unambiguous two-token shape must stay recognised")
+
+    def test_unknown_is_still_counted_as_a_tree(self):
+        trees = hc._watcher_trees("  4242 1 %s\n" % self.AMBIGUOUS)
+        self.assertTrue(trees, "UNKNOWN must count as a watcher, never read as absent")
 
 
 

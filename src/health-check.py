@@ -8701,10 +8701,10 @@ def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
         return False
     if parts[1].startswith("-"):
         return False
-    # The script always begins with parts[1] and any continuation is space-led,
-    # which the pattern's lookahead accepts -- so a hit here holds under any split.
+    # Authoritative only when argv ends at parts[1]: with more tokens the real
+    # pathname may continue past a space and end in a different name.
     if _WATCHER_SCRIPT.search(parts[1]) is not None:
-        return True
+        return True if len(parts) == 2 else None
     if len(parts) == 2:
         return False
     # Only a later token matches, and a spaced script path is the same string as a
