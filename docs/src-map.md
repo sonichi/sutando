@@ -124,6 +124,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`pool_delivery.py`** — Delivery-side half of the worker pool: read one recipient's own folder.
+- **`pool_route_handler.py`** — The router, as the core watcher's task-event handler.
+- **`pool_router.py`** — The router pass: resolve one admitted task against the roster, write deliveries.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
