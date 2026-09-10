@@ -25,11 +25,14 @@ Four, as a 2x2 -- `idle / moving` x `healthy / abnormal`:
                           awaiting-input (a prompt      -> abnormal
                             waiting on a human)
                           compacting, if it froze       -> abnormal
-                          NO abnormal text, but work is outstanding
-                            and the RAW pane never moved
-                                                       -> static-with-work
-                        The last is case 1 and the only one with no text
-                        to read; without outstanding work it is `idle`.
+                          parked ON an error (APIError,
+                            network error) -- not a retry,
+                            nothing is being attempted    -> abnormal
+                        Every subcase is named by TEXT ON THE PANE. This
+                        module reads the CLI, so a verdict may not rest on
+                        the work queue (Chi): the `static-with-work` kind
+                        did, and is gone. A static pane with no abnormal
+                        text is `idle`, whatever is queued elsewhere.
     moving + healthy    ordinary work.                        No warning.
                         A ticking clock IS motion (Chi), so a pane
                         whose only change is a clock lands here.
@@ -120,6 +123,9 @@ ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
         ("compacting", r"compact(ing|ion)\b"),
         ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
+        # Parked ON an error, which is not a retry: nothing is being attempted.
+        ("api-error", r"\bAPI ?Error\b|\b(internal server error|bad gateway|service unavailable)\b|\bHTTP [45]\d\d\b"),
+        ("network-error", r"\bnetwork error\b|\bfetch failed\b|\bcould not reach\b|\bE(CONNREFUSED|NOTFOUND|HOSTUNREACH)\b|\bdns (lookup )?failed\b"),
     )
 )
 
@@ -246,7 +252,7 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    static-with-work | retry-loop | abnormal | provider-limit |
+    idle | working | retry-loop | abnormal | provider-limit |
     unknown (or, from the window, cadence-too-sparse); the four before unknown are warnings. `raw_static` is case 1's
     input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
@@ -325,10 +331,6 @@ def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict,
         return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
     if raw_static:
-        if work_outstanding:
-            high = duration_s >= th["static_high_conf_s"] and nov.sample_count >= th["static_high_conf_samples"]
-            return {**base, "kind": "static-with-work", "confidence": "high" if high else "low", "warn": True,
-                    "reason": f"pane unchanged across {nov.sample_count} samples over {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
         return {**base, "kind": "idle", "confidence": "high", "warn": False,
                 "reason": "pane unchanged and nothing outstanding"}
     return {**base, "kind": "working", "confidence": "medium" if nov.novelty_rate < 0.6 else "high", "warn": False,
@@ -665,7 +667,7 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
                                 [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in tail],
                                 work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps,
                                 [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in tail])
-        if trailing["kind"] in ("idle", "static-with-work"):
+        if trailing["kind"] == "idle":
             return {**trailing, **meta, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
                     "novelty_rate": whole["novelty_rate"], "trailing_static_samples": len(tail)}
     return {**whole, **meta}
