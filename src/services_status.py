@@ -119,6 +119,15 @@ def probe_watcher_sentinels(state_dir: Path, pid_alive
         return probe_pidfile(watcher_sentinel_path(state_dir), pid_alive)
     rows = [(sp.name, *probe_pidfile(sp, pid_alive)[:2]) for sp in found]
     running = [r for r in rows if r[1] == "running"]
+    # Two sentinel FILES naming one pid is one watcher and a stale record, not
+    # two watchers; listing the pid twice reports a pool that does not exist.
+    seen = {}
+    for n, _s, d in rows:
+        seen.setdefault(d, []).append(n)
+    dup = {d: ns for d, ns in seen.items() if len(ns) > 1}
+    if dup and len(running) == len(rows):
+        detail = "; ".join(f"{' and '.join(ns)} both name {d}" for d, ns in dup.items())
+        return ("degraded", f"one pid, two sentinels: {detail}", None)
     if len(running) == len(rows):
         pids = ", ".join(d for _, _, d in rows)
         return ("running", pids if len(rows) == 1 else
