@@ -332,6 +332,42 @@ end tell
     _osascript(osa)
 
 
+_STATUS_IDS_JS = (
+    "(function(){var ids=[];"
+    "document.querySelectorAll('article[data-testid=\\\"tweet\\\"]').forEach(function(a){"
+    "var l=a.querySelector('a[href*=\\\"/status/\\\"]');if(!l)return;"
+    "var m=(l.getAttribute('href')||'').match(/\\/status\\/(\\d+)/);"
+    "if(m)ids.push(m[1]);});"
+    "return JSON.stringify(ids);})()"
+)
+
+
+def _rendered_status_ids() -> list:
+    """Status ids on the page right now. The pre-submit call is the baseline that
+    makes 'a tweet matching the text' mean 'a tweet this submit created'."""
+    try:
+        ids = json.loads(run_js(_STATUS_IDS_JS))
+    except (ValueError, BrowserError):
+        return []
+    return [str(i) for i in ids] if isinstance(ids, list) else []
+
+
+def _reply_verify_js(text: str, before) -> str:
+    """Confirm a NEW article carrying the WHOLE text. A prefix match over every
+    rendered tweet also matches the tweet being replied to, and an older reply."""
+    return (
+        "(function(){var seen=" + json.dumps(list(before)) + ";"
+        "var want=" + json.dumps(text) + ";var found=false;"
+        "document.querySelectorAll('article[data-testid=\\\"tweet\\\"]').forEach(function(a){"
+        "var l=a.querySelector('a[href*=\\\"/status/\\\"]');if(!l)return;"
+        "var m=(l.getAttribute('href')||'').match(/\\/status\\/(\\d+)/);if(!m)return;"
+        "if(seen.indexOf(m[1])>-1)return;"
+        "var tx=a.querySelector('[data-testid=\\\"tweetText\\\"]');"
+        "if(tx&&tx.innerText.indexOf(want)>-1)found=true;});"
+        "return JSON.stringify({posted:found});})()"
+    )
+
+
 def cmd_reply(ref: str, text: str) -> int:
     ensure_tab(_status_url(ref), settle=5.0)
     run_js(
@@ -351,16 +387,10 @@ def cmd_reply(ref: str, text: str) -> int:
     if run_js(fill) == "noeditor":
         raise BrowserError("reply composer did not open")
     time.sleep(0.5)
+    before = _rendered_status_ids()
     _os_submit_via_keystroke()
     time.sleep(4.0)
-    needle = json.dumps(text[:20])
-    ver = (
-        "(function(){var arts=document.querySelectorAll('article[data-testid=\\\"tweet\\\"]');"
-        "var found=false;arts.forEach(function(a){var tx=a.querySelector('[data-testid=\\\"tweetText\\\"]');"
-        "if(tx&&tx.innerText.indexOf(" + needle + ")>-1)found=true;});"
-        "return JSON.stringify({posted:found});})()"
-    )
-    if json.loads(run_js(ver)).get("posted"):
+    if json.loads(run_js(_reply_verify_js(text, before))).get("posted"):
         print("reply posted"); return 0
     print("reply submitted but not confirmed (check the tweet)"); return 1
 

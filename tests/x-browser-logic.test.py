@@ -408,17 +408,88 @@ def test_cmd_reply_raises_when_the_composer_never_opens():
 def test_cmd_reply_confirms_the_post_before_claiming_it():
     mod = load()
     mod._os_submit_via_keystroke = lambda: None
-    _seq(mod, "ok", "hi", '{"posted":true}')
+    # 3rd return is the pre-submit baseline; the 4th is the verifier.
+    _seq(mod, "ok", "hi", '["1"]', '{"posted":true}')
     rc, out = _out(mod.cmd_reply, "1", "hi")
     check(rc == 0 and "reply posted" in out, f"confirmed -> 0 ({out!r})")
 
     mod2 = load()
     mod2._os_submit_via_keystroke = lambda: None
-    _seq(mod2, "ok", "hi", '{"posted":false}')
+    _seq(mod2, "ok", "hi", '["1"]', '{"posted":false}')
     rc2, out2 = _out(mod2.cmd_reply, "1", "hi")
     check(rc2 == 1 and "not confirmed" in out2,
           f"an unconfirmed reply admits it rather than reporting success "
           f"(rc={rc2}, {out2!r})")
+
+
+def _eval_verify_js(js, articles):
+    """Run the generated verifier in node against a DOM shim. Stubbing the JS
+    result instead is what let a prefix match over every tweet pass as proof."""
+    import json as _json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        return None
+    shim = (
+        "const ARTS = " + _json.dumps(articles) + ".map(function(a){return {"
+        "querySelector:function(sel){"
+        "if(sel.indexOf('/status/')>-1)return {getAttribute:function(){return '/u/status/'+a.id;}};"
+        "if(sel.indexOf('tweetText')>-1)return {innerText:a.text};"
+        "return null;}};});"
+        "global.document={querySelectorAll:function(){return ARTS;}};"
+        "process.stdout.write(String(" + js + "));"
+    )
+    out = subprocess.run([node, "-e", shim], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise AssertionError("node shim failed: " + out.stderr.strip()[:300])
+    return _json.loads(out.stdout)
+
+
+def test_reply_verification_needs_a_tweet_this_submit_created():
+    mod = load()
+    text = "thanks for the detailed writeup, the second half is the useful part"
+    # The reviewer's repro: an article ALREADY on the page opens with the text,
+    # and the keystroke submit does nothing. Nothing new must count as posted.
+    already_there = [{"id": "1", "text": text}]
+    before = ["1"]
+    r = _eval_verify_js(mod._reply_verify_js(text, before), already_there)
+    if r is None:
+        check(False, "node is unavailable, so the verifier was never exercised")
+        return
+    check(r == {"posted": False},
+          f"a pre-existing tweet carrying the text is not proof of a post ({r})")
+
+    # A genuinely new article carrying the whole text is what proof looks like.
+    posted = already_there + [{"id": "999", "text": text}]
+    r2 = _eval_verify_js(mod._reply_verify_js(text, before), posted)
+    check(r2 == {"posted": True}, f"a new tweet with the full text confirms ({r2})")
+
+    # A new tweet sharing only the first 20 characters must not confirm either.
+    near = already_there + [{"id": "998", "text": text[:20] + " something else"}]
+    r3 = _eval_verify_js(mod._reply_verify_js(text, before), near)
+    check(r3 == {"posted": False},
+          f"a 20-char prefix on a new tweet is not the reply ({r3})")
+
+
+def test_reply_baseline_is_taken_before_the_keystroke():
+    """Order is the whole mechanism: a baseline read after the submit already
+    contains the new tweet, so nothing could ever look new."""
+    mod = load()
+    events = []
+    mod.ensure_tab = lambda *a, **k: None
+    mod.time.sleep = lambda *_a, **_k: None
+    mod._os_submit_via_keystroke = lambda: events.append("submit")
+    def rj(js, *a, **k):
+        if "ids.push" in js:
+            events.append("baseline"); return "[]"
+        if "seen" in js:
+            events.append("verify"); return '{"posted":false}'
+        return "ok"
+    mod.run_js = rj
+    _out(mod.cmd_reply, "1", "hi")
+    check(events == ["baseline", "submit", "verify"],
+          f"baseline must precede the submit keystroke (got {events})")
 
 
 def test_cmd_reply_embeds_the_text_as_json():
@@ -427,7 +498,7 @@ def test_cmd_reply_embeds_the_text_as_json():
     seen = []
     mod.ensure_tab = lambda *a, **k: None
     mod.time.sleep = lambda *_a, **_k: None
-    seq = ["ok", "quote\"y", '{"posted":true}']
+    seq = ["ok", "quote\"y", '[]', '{"posted":true}']
     def cap(js, *a, **k):
         seen.append(js)
         return seq.pop(0)
