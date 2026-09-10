@@ -53,24 +53,24 @@ class Base(unittest.TestCase):
 
 
 class TestSentinelNames(Base):
-    def test_unclaimed_parses(self):
+    def test_pending_parses(self):
         self.assertEqual(pd.parse_sentinel("task-abc.txt"), ("task-abc", False))
         # Extensionless is NOT a sentinel: the watcher that wakes a worker
         # emits for no other extension, so such a file would never be seen.
         self.assertIsNone(pd.parse_sentinel("task-abc"))
 
-    def test_claimed_parses(self):
-        self.assertEqual(pd.parse_sentinel("task-abc.claimed"), ("task-abc", True))
+    def test_accepted_parses(self):
+        self.assertEqual(pd.parse_sentinel("task-abc.accepted"), ("task-abc", True))
 
     def test_non_sentinel_rejected(self):
         for name in ("roster.json", "task-abc.json", ".DS_Store", "notes.txt"):
             self.assertIsNone(pd.parse_sentinel(name), name)
 
     def test_suffix_substitutes_never_appends(self):
-        """A claimed sentinel must not still read as unclaimed."""
-        claimed = pd.parse_sentinel("task-abc.claimed")
-        self.assertTrue(claimed[1])
-        self.assertNotIn(".claimed", claimed[0])
+        """A accepted sentinel must not still read as pending."""
+        accepted = pd.parse_sentinel("task-abc.accepted")
+        self.assertTrue(accepted[1])
+        self.assertNotIn(".accepted", accepted[0])
 
     def test_recipient_id_is_validated(self):
         for bad in ("../core", "core/../x", "Core", "", "a" * 40):
@@ -97,9 +97,9 @@ class TestPending(Base):
     def test_absent_folder_is_not_an_error(self):
         self.assertEqual(pd.pending(self.root, "worker-nope"), [])
 
-    def test_claimed_is_not_pending(self):
+    def test_accepted_is_not_pending(self):
         s = self.ws.deliver("core", "task-1")
-        pd.claim(s)
+        pd.accept(s)
         self.assertEqual(pd.pending(self.root, "core"), [])
 
     def test_ordered_by_delivery_time(self):
@@ -122,48 +122,48 @@ class TestPending(Base):
         got = [pd.parse_sentinel(p.name)[0] for p in pd.pending(self.root, "worker-1")]
         self.assertEqual(got, ["task-for-worker"])
 
-    def test_claim_by_a_worker_lands_in_the_workers_folder(self):
+    def test_accept_by_a_worker_lands_in_the_workers_folder(self):
         self.ws.payload("task-1")
         s = self.ws.deliver("worker-1", "task-1")
-        c = pd.claim(s)
+        c = pd.accept(s)
         self.assertEqual(c.parent.name, "worker-1")
         self.assertIsNone(pd.find(self.root, "core", "task-1"))
 
 
-class TestClaim(Base):
-    def test_claim_renames_in_place(self):
+class TestAccept(Base):
+    def test_accept_renames_in_place(self):
         s = self.ws.deliver("core", "task-1")
-        c = pd.claim(s)
+        c = pd.accept(s)
         self.assertFalse(s.exists())
         self.assertTrue(c.exists())
-        self.assertEqual(c.name, "task-1.claimed")
+        self.assertEqual(c.name, "task-1.accepted")
 
-    def test_claim_is_exclusive(self):
+    def test_accept_is_exclusive(self):
         s = self.ws.deliver("core", "task-1")
-        pd.claim(s)
+        pd.accept(s)
         with self.assertRaises(OSError):
-            pd.claim(s)
+            pd.accept(s)
 
-    def test_claiming_a_claimed_sentinel_is_refused(self):
+    def test_accepting_an_accepted_sentinel_is_refused(self):
         s = self.ws.deliver("core", "task-1")
-        c = pd.claim(s)
+        c = pd.accept(s)
         with self.assertRaises(pd.NotDelivered):
-            pd.claim(c)
+            pd.accept(c)
 
-    def test_claim_does_not_touch_the_payload(self):
+    def test_accept_does_not_touch_the_payload(self):
         p = self.ws.payload("task-1")
         before = p.read_text()
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.assertTrue(p.exists())
         self.assertEqual(p.read_text(), before)
 
     def test_release_returns_it_to_pending(self):
         s = self.ws.deliver("core", "task-1")
-        pd.release(pd.claim(s))
+        pd.release(pd.accept(s))
         got = [pd.parse_sentinel(p.name)[0] for p in pd.pending(self.root, "core")]
         self.assertEqual(got, ["task-1"])
 
-    def test_release_refuses_an_unclaimed_sentinel(self):
+    def test_release_refuses_a_pending_sentinel(self):
         s = self.ws.deliver("core", "task-1")
         with self.assertRaises(pd.NotDelivered):
             pd.release(s)
@@ -171,7 +171,7 @@ class TestClaim(Base):
     def test_find_locates_under_either_name(self):
         s = self.ws.deliver("core", "task-1")
         self.assertEqual(pd.find(self.root, "core", "task-1"), s)
-        c = pd.claim(s)
+        c = pd.accept(s)
         self.assertEqual(pd.find(self.root, "core", "task-1"), c)
 
     def test_find_returns_none_when_undelivered(self):
@@ -181,7 +181,7 @@ class TestClaim(Base):
 class TestResidue(Base):
     def test_result_without_flag_is_completed(self):
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.result("task-1")
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "completed")
 
@@ -191,18 +191,18 @@ class TestResidue(Base):
         self.ws.flag("core", "task-1")
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
 
-    def test_delivered_unclaimed_work_is_named_not_a_fallback(self):
+    def test_delivered_pending_work_is_named_not_a_fallback(self):
         """It is work waiting, so it must not share a name with 'nothing here'."""
         self.ws.payload("task-1")
         self.ws.deliver("core", "task-1")
-        self.assertEqual(pd.residue(self.root, "core", "task-1"), "unclaimed")
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "pending")
 
     def test_nothing_anywhere_is_clean(self):
         self.assertEqual(pd.residue(self.root, "core", "task-absent"), "clean")
 
-    def test_claimed_without_result_died_mid_work(self):
+    def test_accepted_without_result_died_mid_work(self):
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "died-mid-work")
 
     def test_sentinel_without_payload_is_stale(self):
@@ -222,10 +222,10 @@ class TestResidue(Base):
 class TestFlagAfterDrain(Base):
     def test_a_done_flag_with_no_result_is_finished_not_died(self):
         """The bridge drains results/<id>.txt on delivery. A crash between the
-        flag and the archive, then a drain, leaves .claimed + flag + payload and
+        flag and the archive, then a drain, leaves .accepted + flag + payload and
         NO result. Reading that as died-mid-work re-runs finished work."""
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.flag("core", "task-1")                  # result already drained
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
         out = pd.sweep(self.root, "core")
@@ -234,21 +234,21 @@ class TestFlagAfterDrain(Base):
 
 
 class TestSweep(Base):
-    def test_releases_work_a_crash_left_claimed(self):
+    def test_releases_work_a_crash_left_accepted(self):
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         out = pd.sweep(self.root, "core")
         self.assertEqual(out["released"], ["task-1"])
         self.assertTrue((self.root / "deliveries/core/task-1.txt").exists())
 
     def test_does_not_release_finished_work(self):
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.result("task-1")
         out = pd.sweep(self.root, "core")
         self.assertEqual(out["completed"], ["task-1"])
         self.assertEqual(out["released"], [])
-        self.assertTrue((self.root / "deliveries/core/task-1.claimed").exists())
+        self.assertTrue((self.root / "deliveries/core/task-1.accepted").exists())
 
     def test_removes_a_sentinel_whose_payload_is_gone(self):
         self.ws.deliver("core", "task-1")
@@ -263,7 +263,7 @@ class TestSweep(Base):
 
     def test_is_idempotent(self):
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         pd.sweep(self.root, "core")
         second = pd.sweep(self.root, "core")
         self.assertEqual(second["released"], [])
@@ -272,7 +272,7 @@ class TestSweep(Base):
     def test_finished_work_is_retired_not_handed_back(self):
         """Result + flag + a lingering sentinel must never re-enter the queue."""
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.result("task-1")
         self.ws.flag("core", "task-1")
         out = pd.sweep(self.root, "core")
@@ -282,14 +282,14 @@ class TestSweep(Base):
 
     def test_every_residue_state_has_a_sweep_branch(self):
         """A state with no branch must fail loudly, not fall through to ready."""
-        states = ("unclaimed", "died-mid-work", "completed", "finished",
+        states = ("pending", "died-mid-work", "completed", "finished",
                   "stale-sentinel", "undelivered", "clean")
         seen = set()
         for name, build in (
-            ("unclaimed", lambda: (self.ws.payload("task-1"), self.ws.deliver("core", "task-1"))),
-            ("died-mid-work", lambda: (self.ws.payload("task-1"), pd.claim(self.ws.deliver("core", "task-1")))),
-            ("completed", lambda: (self.ws.payload("task-1"), pd.claim(self.ws.deliver("core", "task-1")), self.ws.result("task-1"))),
-            ("finished", lambda: (self.ws.payload("task-1"), pd.claim(self.ws.deliver("core", "task-1")), self.ws.result("task-1"), self.ws.flag("core", "task-1"))),
+            ("pending", lambda: (self.ws.payload("task-1"), self.ws.deliver("core", "task-1"))),
+            ("died-mid-work", lambda: (self.ws.payload("task-1"), pd.accept(self.ws.deliver("core", "task-1")))),
+            ("completed", lambda: (self.ws.payload("task-1"), pd.accept(self.ws.deliver("core", "task-1")), self.ws.result("task-1"))),
+            ("finished", lambda: (self.ws.payload("task-1"), pd.accept(self.ws.deliver("core", "task-1")), self.ws.result("task-1"), self.ws.flag("core", "task-1"))),
             ("stale-sentinel", lambda: (self.ws.deliver("core", "task-1"),)),
         ):
             with tempfile.TemporaryDirectory() as d:
@@ -304,9 +304,9 @@ class TestSweep(Base):
     def test_sweep_never_touches_a_sibling(self):
         self.ws.payload("task-2")
         other = self.ws.deliver("worker-1", "task-2")
-        claimed = pd.claim(other)
+        accepted = pd.accept(other)
         pd.sweep(self.root, "core")
-        self.assertTrue(claimed.exists())
+        self.assertTrue(accepted.exists())
 
 
 class TestPayload(Base):
@@ -438,10 +438,10 @@ class TestWatch(Base):
 
 class TestSweepTotality(Base):
     def test_one_task_under_both_names_is_visited_once(self):
-        """`claimed + pending` can list the same id twice; a second visit would
+        """`accepted + pending` can list the same id twice; a second visit would
         act on a state the first pass already resolved."""
         self.ws.payload("task-1")
-        pd.claim(self.ws.deliver("core", "task-1"))
+        pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.deliver("core", "task-2")
         self.ws.payload("task-2")
         out = pd.sweep(self.root, "core")

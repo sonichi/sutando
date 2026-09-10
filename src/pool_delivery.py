@@ -6,11 +6,12 @@ worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
     tasks/<task-id>.txt                      the payload; immutable, never copied
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
-    deliveries/<me>/<task-id>.claimed        the same sentinel, suffix substituted
+    deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
-claims, which is atomic and exclusive, so a losing racer sees OSError and walks
-away. Nothing here writes a sentinel, reads another recipient's folder, or
+records that the ASSIGNED recipient accepted the work — a worker never selects
+its own, so nothing is claimed here. The rename is atomic and exclusive, so a
+losing racer sees OSError and walks away. Nothing here writes a sentinel, reads another recipient's folder, or
 selects work that was not delivered.
 
 This module is intentionally free of any watcher, session or transport concern:
@@ -33,14 +34,14 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
-CLAIMED_SUFFIX = ".claimed"
+ACCEPTED_SUFFIX = ".accepted"
 
-# One suffix, substituted never appended: a claimed sentinel must not still read
-# as unclaimed, or a reader re-takes its own in-flight work.
+# One suffix, substituted never appended: an accepted sentinel must not still
+# read as pending, or a reader re-takes its own in-flight work.
 
 # `~`: the bridge encodes a channel instance into the id (task-<inst>~<id>).
 _SENTINEL = re.compile(
-    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<claimed>\.claimed))$")
+    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<accepted>\.accepted))$")
 
 RECIPIENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
@@ -50,11 +51,11 @@ class NotDelivered(Exception):
 
 
 def parse_sentinel(name: str) -> tuple[str, bool] | None:
-    """(task_id, claimed) for a sentinel filename, or None if it is not one."""
+    """(task_id, accepted) for a sentinel filename, or None if it is not one."""
     m = _SENTINEL.match(name)
     if not m:
         return None
-    return m.group("id"), m.group("claimed") is not None
+    return m.group("id"), m.group("accepted") is not None
 
 
 def _root(workspace) -> Path:
@@ -86,7 +87,7 @@ def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
 
 
 def pending(workspace: Path, recipient: str) -> list[Path]:
-    """Unclaimed sentinels in this recipient's folder, oldest first.
+    """Pending sentinels in this recipient's folder, oldest first.
 
     Ordering is by the sentinel's own mtime, so a reader drains in delivery
     order without reading any payload.
@@ -102,7 +103,7 @@ def pending(workspace: Path, recipient: str) -> list[Path]:
     return sorted(out, key=lambda q: (q.stat().st_mtime, q.name))
 
 
-def claimed(workspace: Path, recipient: str) -> list[Path]:
+def accepted(workspace: Path, recipient: str) -> list[Path]:
     d = deliveries_dir(workspace, recipient)
     if not d.is_dir():
         return []
@@ -113,32 +114,34 @@ def claimed(workspace: Path, recipient: str) -> list[Path]:
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     """The sentinel for `task_id` under either name, or None."""
     d = deliveries_dir(workspace, recipient)
-    for name in (task_id + PENDING_SUFFIX, task_id + CLAIMED_SUFFIX):
+    for name in (task_id + PENDING_SUFFIX, task_id + ACCEPTED_SUFFIX):
         p = d / name
         if p.exists():
             return p
     return None
 
 
-def claim(sentinel: Path) -> Path:
-    """Take a delivery. Atomic and exclusive; a loser gets OSError.
+def accept(sentinel: Path) -> Path:
+    """Take up work already assigned here. Atomic and exclusive; a loser gets
+    OSError.
 
-    The loser is the router releasing, or another incarnation of this same
-    recipient — never a sibling, which cannot see this folder.
+    Nothing is selected: the folder decided the recipient. This only excludes a
+    second incarnation of the SAME recipient — never a sibling, which cannot see
+    this folder.
     """
     got = parse_sentinel(sentinel.name)
     if got is None or got[1]:
-        raise NotDelivered(f"not an unclaimed sentinel: {sentinel.name}")
-    dst = sentinel.with_name(got[0] + CLAIMED_SUFFIX)
+        raise NotDelivered(f"not a pending sentinel: {sentinel.name}")
+    dst = sentinel.with_name(got[0] + ACCEPTED_SUFFIX)
     os.rename(sentinel, dst)
     return dst
 
 
 def release(sentinel: Path) -> Path:
-    """Hand a claimed delivery back to the SAME recipient for its next run."""
+    """Hand an accepted delivery back to the SAME recipient for its next run."""
     got = parse_sentinel(sentinel.name)
     if got is None or not got[1]:
-        raise NotDelivered(f"not a claimed sentinel: {sentinel.name}")
+        raise NotDelivered(f"not an accepted sentinel: {sentinel.name}")
     dst = sentinel.with_name(got[0] + PENDING_SUFFIX)
     os.rename(sentinel, dst)
     return dst
@@ -167,7 +170,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
         return "clean"
     if not payload:
         return "stale-sentinel"
-    return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "unclaimed"
+    return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
 
 
 def sweep(workspace: Path, recipient: str) -> dict:
@@ -176,13 +179,13 @@ def sweep(workspace: Path, recipient: str) -> dict:
     ws = Path(workspace)
     seen = set()
     actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": []}
-    for p in claimed(ws, recipient) + pending(ws, recipient):
+    for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
             continue
         seen.add(task_id)
         state = residue(ws, recipient, task_id)
-        if state == "unclaimed":
+        if state == "pending":
             actions["ready"].append(task_id)
         elif state == "died-mid-work":
             release(p)
