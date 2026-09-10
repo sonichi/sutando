@@ -48,28 +48,48 @@ def load(d):
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
-    The roster is keyed by short name with the GitHub login in the `github`
-    FIELD; a key-equality lookup queries the wrong axis and reads a mapped
-    reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
-    `get("john-the-dev")` missed the entry keyed `rui`).
+    The roster is keyed by short name with the GitHub login in a FIELD; a
+    key-equality lookup queries the wrong axis and reads a mapped reviewer as
+    absent (measured twice: 2026-08-27, 2026-08-28 — both times
+    `get("john-the-dev")` missed the entry keyed `rui`). Which field spells that
+    login is roster_union.roster_login's call, shared with the other reader.
     """
-    import json
-    p = d / "reviewer-stands.json"
-    if not p.exists():
+    # Same union, same collision semantics as notify_reviewers: both readers of
+    # this store delegate to roster_union so they cannot drift apart.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from roster_union import host_rosters, roster_login, roster_union
+    # The file this reader was pointed at is its LOCAL and goes first: on a
+    # legacy host it is the shared file, which host_rosters lists LAST.
+    local = d / "reviewer-stands.json"
+    paths = [("local", local)] if local.is_file() else []
+    paths += [(h, p) for h, p in host_rosters(d.parent.parent) if p != local]
+    merged = roster_union(paths)
+    if not merged:
         return []
     rows = []
-    for key, r in json.loads(p.read_text()).items():
+    for key, r in merged.items():
         if not isinstance(r, dict):
             continue
+        gh = roster_login(r)[0]
         rows.append({
             "entity_id": key,
             "agent_mxid": r.get("stand") or "",
-            "github": r.get("github") or "",
+            "github": gh,
             "human": r.get("human") or "",
             "allowlisted": r.get("allowlisted"),
-            "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
+            "one_line": f"github={gh} human={r.get('human','')} stand={r.get('stand','')}",
         })
     return rows
+
+def _name_of(r):
+    """quick-lookup.yaml keys people as `id`/`who`, the roster as `entity_id`/
+    `one_line`; match() reads both, so every render site must too."""
+    return r.get("entity_id") or r.get("id") or ""
+
+
+def _role_of(r):
+    return str(r.get("one_line") or r.get("who") or "")
+
 
 def _identity_id(i):
     # schema.md names this field `user_id`; this reader only ever read
@@ -134,7 +154,7 @@ def main():
         print(f"KNOWN ENTITIES ({len(rows)})\n{stale}")
         for r in rows:
             st = r.get("agent_mxid") or "-- no Stand recorded --"
-            print(f"  {r.get('entity_id',''):<28} {r.get('kind',''):<6} {st}")
+            print(f"  {_name_of(r):<28} {r.get('kind',''):<6} {st}")
         return 0
 
     hits = match(rows, a.query, ents)
@@ -145,14 +165,14 @@ def main():
         return 0
 
     for r in hits:
-        eid = r.get("entity_id", "")
+        eid = _name_of(r)
         stand = r.get("agent_mxid")
         print(f"\n  {eid}  [{r.get('kind','?')}]")
-        print(f"    role: {str(r.get('one_line',''))[:150]}")
+        print(f"    role: {_role_of(r)[:150]}")
         if stand:
             print(f"    ADDRESS THIS -> {stand}")
         else:
-            loose = re.findall(r"@[\w.\-]+", str(r.get("one_line", "")))
+            loose = re.findall(r"@[\w.\-]+", _role_of(r))
             if loose:
                 print(f"    ⚠ NO STRUCTURED Stand, but the role text names: {', '.join(loose)}")
                 print("      UNVERIFIED -- prose is not a resolved id. Use it, and say it is unconfirmed.")

@@ -256,8 +256,8 @@ class WriteTaskSharedPredicate(_Base):
         d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
         d.mkdir(parents=True)
         (d / f"{TID}.txt").write_text("the reply")
-        tid = gw._write_task({"id": TID, "task": "hi", "source": "ag2space"})
-        self.assertEqual(tid, TID)
+        written = gw._write_task({"id": TID, "task": "hi", "source": "ag2space"})
+        self.assertEqual(written, (TID, True))
         self.assertFalse((gw.TASKS_DIR / f"{TID}.txt").exists(),
                          "already-handled redelivery must not re-queue")
         self.assertIn("[no-send]", (gw.RESULTS_DIR / f"{TID}.txt").read_text())

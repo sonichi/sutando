@@ -204,6 +204,53 @@ class StoreShapes(unittest.TestCase):
             d = store(t, roster=ROSTER)
             self.assertEqual(lk.match(lk.load_roster(d), "no-such-login"), [])
 
+    def test_listing_names_an_id_who_row_instead_of_a_blank_column(self):
+        """--all must not render a row that match() can find as nameless.
+
+        The renderer read only `entity_id`; a real host's quick-lookup.yaml
+        keys people as `id`, so four rows listed as blank names against a
+        populated Stand column.
+        """
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n  - id: 'gh:qingyun-wu'\n"
+                         "    who: 'reviewer on the server-PR stack'\n")
+            orig_store, orig_argv = lk.store, sys.argv
+            lk.store, sys.argv = (lambda: d), ["lookup.py", "--all"]
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+        body = [l for l in buf.getvalue().splitlines()
+                if l.startswith("  ") and "updated_at" not in l]
+        self.assertEqual(len(body), 1, buf.getvalue())
+        self.assertIn("gh:qingyun-wu", body[0])
+
+    def test_a_query_renders_the_name_and_role_of_an_id_who_row(self):
+        """The per-query detail path had the same blind spot as --all: it read
+        entity_id/one_line, so a matched quick-lookup row printed a blank name
+        above a blank role — on the one surface used to decide who to address.
+        """
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n  - id: 'gh:qingyun-wu'\n"
+                         "    who: 'reviewer on the server-PR stack'\n")
+            orig_store, orig_argv = lk.store, sys.argv
+            lk.store, sys.argv = (lambda: d), ["lookup.py", "gh:qingyun-wu"]
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+        out = buf.getvalue()
+        self.assertIn("gh:qingyun-wu", out, out)
+        self.assertIn("reviewer on the server-PR stack", out, out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

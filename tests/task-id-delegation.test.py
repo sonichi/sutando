@@ -33,9 +33,7 @@ OWNERS = ("src/task_archive.py", "packages/ag2-sparrow/ag2_sparrow/task_archive.
 
 # Known instances, each tracked by a named PR, so this guard covers the unbounded
 # future set now. DELETE a row when its fix lands; section 6 fails on a stale one.
-KNOWN = {
-    "src/runtime-api/tasks_view.py:240": "sonichi/sutando#3656",
-}
+KNOWN = {}
 
 fails = []
 known_hit = []
@@ -73,7 +71,7 @@ for name in ("task_id_from_filename", "find_task_file"):
 
 src_txt = (REPO / OWNERS[0]).read_text()
 vend_txt = (REPO / OWNERS[1]).read_text()
-for pat in ("_ID_STATE", "_ID_PLAIN"):
+for pat in ("_STATE_SUFFIX", "_NOT_A_RECORD"):
     a = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", src_txt, re.M)
     b = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", vend_txt, re.M)
     check(f"{pat} is byte-identical in both copies of the owner",

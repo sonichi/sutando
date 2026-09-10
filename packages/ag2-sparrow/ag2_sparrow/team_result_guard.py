@@ -31,10 +31,12 @@ from typing import NamedTuple
 
 # A marker is a control only where the shared parser EXECUTES it, so the guard
 # derives its classification from parse_markers rather than a parallel grammar.
-try:
+try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
+    from .local_task_protocol import canonical_access_tier
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
+    from local_task_protocol import canonical_access_tier
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -102,12 +104,10 @@ def resolve_access_tier(task_file) -> str:
     if not candidates:
         return "owner"
     # Conflicting explicit tiers can only come from injection — fail closed.
-    normed = {"guest" if t == "other" else t for t in candidates}
+    normed = {canonical_access_tier(t) for t in candidates}
     if len(normed) > 1:
         return "guest"
-    tier = candidates[-1]
-    if tier == "other":
-        tier = "guest"
+    tier = normed.pop()
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
@@ -160,18 +160,50 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
+def attach_markers_confined(body: str, attach_roots) -> bool:
+    """True iff the body carries at least one attach marker and EVERY one names an
+    ABSOLUTE path whose realpath sits under one of `attach_roots`.
+
+    The task-scoped output allowance (Signal Room, design 5G ⑤a-cap): a Team
+    result may carry `[file:]` markers for files the task itself produced under
+    its own output directory -- and nothing else. Realpath on both sides, so a
+    symlink planted inside the root that points out of it is caught the way
+    send_allowlist catches it. A relative or `~`-prefixed path is not confined:
+    it would resolve against a cwd or a home directory this policy cannot
+    vouch for. An empty `attach_roots` confines nothing.
+    """
+    roots = [os.path.realpath(str(r)) for r in (attach_roots or ()) if str(r).strip()]
+    if not roots:
+        return False
+    values = [a.value for a in parse_markers(body or "").actions if a.kind == "attach"]
+    if not values:
+        return False
+    for raw in values:
+        candidate = (raw or "").strip()
+        if not candidate or not os.path.isabs(candidate):
+            return False
+        real = os.path.realpath(candidate)
+        if not any(real == root or real.startswith(root + os.sep) for root in roots):
+            return False
+    return True
+
+
 def scan_team_result(body: str, repo: Path, secret_filter=None,
                      scan_sensitive_data: bool = True,
-                     allow_attach: bool = False) -> str:
+                     allow_attach: bool = False,
+                     attach_roots=()) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
     # redirect it suppressed never executes -- neither is a control here.
     if kinds & {"redirect"}:
         raise TeamResultLeakError("result delivery control marker")
-    if "attach" in kinds and not allow_attach:
+    if ("attach" in kinds and not allow_attach
+            and not attach_markers_confined(body, attach_roots)):
         # Verdict-only exemption: the adapter says whether THIS channel+sender
         # may attach; path authorization stays with the transport allowlist.
+        # The task-scoped allowance is narrower than allow_attach: only files
+        # under the task's own output root (attach_markers_confined) pass.
         raise TeamResultLeakError("result delivery control marker")
     # Suppression is deliberately absent: redirect and attach move data
     # somewhere the sender should not reach, a skip marker moves nothing.
@@ -202,6 +234,9 @@ def is_suppression_only(body: str) -> bool:
 VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
+# Machine-detectable prefix of the fail-closed scanner-outage reason, so a
+# consumer that owns its own transport can map outage (not content) to an error.
+SCANNER_UNAVAILABLE = "scanner unavailable"
 WITHHELD_RESULT_DIR = "withheld-team-results"
 SUPPRESSED_RESULT_DIR = "suppressed-team-results"
 
@@ -382,21 +417,23 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
 def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True,
-                             allow_attach: bool = False) -> TeamResultVerdict:
+                             allow_attach: bool = False,
+                             honor_suppressions: bool = True,
+                             attach_roots=()) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
     if not is_guarded_tier(tier):
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
-    if is_suppression_only(body):
-        # Above the scan on purpose: an undelivered body has nothing to leak,
-        # and a LEAK here would put a notice back in the channel.
+    if honor_suppressions and is_suppression_only(body):
+        # Above the scan on purpose: an undelivered body has nothing to leak —
+        # marker-honouring adapters only (publishers pass honor_suppressions=False).
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
     try:
         return TeamResultVerdict(
             VERDICT_DELIVER,
             scan_team_result(body, repo, secret_filter, scan_sensitive_data,
-                         allow_attach=allow_attach),
+                         allow_attach=allow_attach, attach_roots=attach_roots),
             None)
     except TeamResultLeakError as exc:
         if str(exc) == "result delivery control marker":
@@ -406,12 +443,13 @@ def classify_result_for_tier(body: str, tier, repo: Path,
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
         # withheld, never delivered on the assumption that it was probably fine.
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT,
-                                 f"scanner unavailable: {exc}")
+                                 f"{SCANNER_UNAVAILABLE}: {exc}")
 
 
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
-                          suppress_journal=None, allow_attach: bool = False):
+                          suppress_journal=None, allow_attach: bool = False,
+                          honor_suppressions: bool = True, attach_roots=()):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -424,7 +462,8 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data,
-        allow_attach=allow_attach)
+        allow_attach=allow_attach, honor_suppressions=honor_suppressions,
+        attach_roots=attach_roots)
     if (suppress_journal is not None and is_guarded_tier(tier)
             and is_suppression_only(body)):
         state_dir, task_id = suppress_journal

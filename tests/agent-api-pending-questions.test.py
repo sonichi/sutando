@@ -21,11 +21,18 @@ Exit: 0 = all pass, 1 = failure
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -41,6 +48,48 @@ def _load(name: str, path: Path):
 
 api = _load("agent_api", REPO / "src" / "agent-api.py")
 cpq = _load("check_pending_questions", REPO / "src" / "check-pending-questions.py")
+
+
+class _FrozenClock:
+    """Stands in for agent-api's `datetime`, pinned to one aware UTC instant."""
+
+    def __init__(self, instant):
+        self._instant = instant
+
+    def now(self, tz=None):
+        if tz is None:
+            return self._instant.astimezone().replace(tzinfo=None)
+        return self._instant.astimezone(tz)
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
+
+
+@contextlib.contextmanager
+def _frozen_utc_clock():
+    """Pin the module's clock to one aware UTC instant and yield it.
+
+    `age_days` floors, so a test that reads a *different* instant than production
+    disagrees by a whole day whenever the two straddle a UTC calendar boundary.
+    """
+    instant = datetime.now(timezone.utc)
+    with mock.patch.object(api, "datetime", _FrozenClock(instant)):
+        yield instant
+
+
+def _floor_interpreter():
+    """This host's 3.9 floor interpreter, or None if it has none.
+
+    Resolved by name or explicit configuration, never a literal path: the stock
+    macOS 3.9 sits behind an Xcode-CLT stub REVIEW.md criterion 7 forbids naming.
+    """
+    cand = os.environ.get("SUTANDO_PY39") or shutil.which("python3.9")
+    if not cand or not Path(cand).exists():
+        return None
+    ver = subprocess.run([cand, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                         capture_output=True, text=True).stdout.strip()
+    return Path(cand) if ver == "3.9" else None
+
 
 # The format the agent actually writes today: prose under a `## ` heading, no
 # metadata fields, resolved items parked below a `# Resolved` divider.
@@ -180,6 +229,145 @@ class TestParse(unittest.TestCase):
         self.assertEqual(api.parse_pending_questions(answered), [])
 
 
+    def test_dated_heading_parses_asked_and_age_days(self):
+        """`## YYYY-MM-DD — ...` gives a bare-date `asked` and a non-negative age."""
+        dated = "# Q\n\n## 2020-01-01 — sutando-life CI: something old\nBody.\n"
+        with _frozen_utc_clock() as now_utc:
+            q = api.parse_pending_questions(dated)[0]
+        self.assertEqual(q["asked"], "2020-01-01")
+        expected_age = (now_utc - datetime(2020, 1, 1, tzinfo=timezone.utc)).days
+        self.assertEqual(q["age_days"], expected_age)
+
+    def test_datetime_heading_t_z_form_parses_asked_and_age_days(self):
+        """`## YYYY-MM-DDTHH:MMZ — ...` is the other heading shape in the wild."""
+        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
+        with _frozen_utc_clock() as now_utc:
+            q = api.parse_pending_questions(dated)[0]
+        self.assertEqual(q["asked"], "2020-01-01T02:20Z")
+        expected_age = (now_utc - datetime(2020, 1, 1, 2, 20, tzinfo=timezone.utc)).days
+        self.assertEqual(q["age_days"], expected_age)
+
+    def test_undated_heading_gives_null_asked_and_age(self):
+        """No leading date on the heading — must not fabricate an age."""
+        q = api.parse_pending_questions(FREE_FORM)[0]
+        self.assertIsNone(q["asked"])
+        self.assertIsNone(q["age_days"])
+
+
+class TestPython39AndTimezones(unittest.TestCase):
+    """agent-api.py has no `from __future__ import annotations`, so annotations are
+    evaluated at def time — a PEP 604 union breaks import on the supported 3.9."""
+
+    def test_the_module_carries_no_39_breaking_annotations(self):
+        """The always-on arm: delegates to the repo-wide gate for this one file so
+        the floor stays checked on hosts that have no 3.9 to run the arm below."""
+        lint = _load("py39_union_lint", REPO / "tests" / "python39-union-annotations.test.py")
+        self.assertIsNone(lint.check_file(Path(api.__file__)))
+
+    def test_the_real_module_imports_on_the_floor_interpreter(self):
+        """Import the actual module under 3.9. A source-text fragment can only show
+        that a copied helper compiles, never that the real import succeeds."""
+        py39 = _floor_interpreter()
+        if py39 is None:
+            self.skipTest("no python3.9 on PATH and $SUTANDO_PY39 unset")
+        prog = ("import importlib.util, sys\n"
+                f"sys.path.insert(0, {str(REPO / 'src')!r})\n"
+                f"spec = importlib.util.spec_from_file_location('agent_api_39', {str(REPO / 'src' / 'agent-api.py')!r})\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(m)\n"
+                "print(m._parse_asked_date('2020-01-01T02:20Z x')[0])\n")
+        r = subprocess.run([str(py39), "-c", prog], capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, f"3.9 rejected the module: {r.stderr[-300:]}")
+        self.assertEqual("2020-01-01T02:20Z", r.stdout.strip())
+
+    def test_a_shaped_but_impossible_date_is_not_an_age(self):
+        """`2026-13-45` matches the heading regex and no strptime format — the branch
+        must fall through to (None, None) rather than raise or invent an age."""
+        asked, dt = api._parse_asked_date("2026-13-45 — not a real date")
+        self.assertIsNone(asked)
+        self.assertIsNone(dt)
+        q = api.parse_pending_questions("# Q\n\n## 2026-13-45 — not a real date\nBody.\n")[0]
+        self.assertIsNone(q["asked"])
+        self.assertIsNone(q["age_days"])
+
+    def test_a_Z_heading_is_utc_not_local(self):
+        """Parsed naive and compared to a local now(), a just-asked question reports -1."""
+        _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
+        self.assertIsNotNone(dt.tzinfo, "a Z heading must parse as aware UTC")
+        self.assertEqual(0, dt.utcoffset().total_seconds())
+
+    def test_age_is_identical_across_host_timezones(self):
+        """The age must be a property of the heading, not of the host's $TZ. Pins the
+        production side: a naive local now() there diverges by a day away from UTC."""
+        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
+        saved = os.environ.get("TZ")
+        ages = {}
+        try:
+            for zone in ("UTC", "Etc/GMT+12", "Etc/GMT-14"):
+                os.environ["TZ"] = zone
+                time.tzset()
+                with _frozen_utc_clock():
+                    ages[zone] = api.parse_pending_questions(dated)[0]["age_days"]
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+        self.assertEqual(1, len(set(ages.values())), f"age varies with host timezone: {ages}")
+
+    def test_a_future_dated_heading_does_not_sort_first(self):
+        """Clock skew or a typo gives a negative age, which -(age) would rank ahead of all."""
+        ahead = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%MZ")
+        q = api.parse_pending_questions(f"# Q\n\n## {ahead} — from the future\nBody.\n")[0]
+        self.assertEqual(0, q["age_days"], "a future heading must clamp to 0, never go negative")
+
+
+class TestPendingQuestionRows(unittest.TestCase):
+    """`_pending_question_rows()` orders by age — oldest first — with undated
+    questions sorted last (never defaulted to age 0, which would put them
+    first instead)."""
+
+    def _rows(self, content: str) -> list[dict]:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "pending-questions.md"
+            pending.write_text(content)
+            with mock.patch.object(api, "personal_path", return_value=pending):
+                return api._pending_question_rows()
+
+    def test_rows_are_oldest_first_undated_sorts_last(self):
+        with _frozen_utc_clock() as today:
+            self._assert_oldest_first(today)
+
+    def _assert_oldest_first(self, today):
+        just_now = today.strftime("%Y-%m-%d")  # age_days == 0
+        mid = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+        old = (today - timedelta(days=40)).strftime("%Y-%m-%d")
+        # Undated BEFORE the age-0 heading: the one order in which defaulting
+        # undated to 0 would survive a stable sort and pass anyway.
+        mixed = (
+            "# Pending Questions\n\n"
+            "## Undated question\nBody.\n\n"
+            f"## {just_now} — asked just now\nBody.\n\n"
+            f"## {old} — asked weeks ago\nBody.\n\n"
+            f"## {mid} — asked a while ago\nBody.\n"
+        )
+        texts = [row["text"] for row in self._rows(mixed)]
+        self.assertEqual(texts, [
+            f"{old} — asked weeks ago",
+            f"{mid} — asked a while ago",
+            f"{just_now} — asked just now",
+            "Undated question",
+        ])
+
+    def test_rows_carry_asked_and_age_days_after_stripping_offsets(self):
+        rows = self._rows("# Q\n\n## 2020-01-01 — old one\nBody.\n")
+        self.assertNotIn("start", rows[0])
+        self.assertNotIn("end", rows[0])
+        self.assertEqual(rows[0]["asked"], "2020-01-01")
+        self.assertIsInstance(rows[0]["age_days"], int)
+
+
 class TestAnswer(unittest.TestCase):
     def test_free_form_question_is_answerable(self):
         """The regression: listed by GET /status, then 404 on POST /answer."""
@@ -232,6 +420,8 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TestParse),
+        loader.loadTestsFromTestCase(TestPython39AndTimezones),
+        loader.loadTestsFromTestCase(TestPendingQuestionRows),
         loader.loadTestsFromTestCase(TestAnswer),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)

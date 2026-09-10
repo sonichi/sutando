@@ -43,12 +43,14 @@ def _windows(start, cap):
     return out
 
 
-def _result(ok, messages=None, reason=None, room_id=None, complete=None):
+def _result(ok, messages=None, reason=None, room_id=None, complete=None, order="newest_first"):
     # `complete` is False when the raw-event window was still growing when we stopped, so a
     # caller can tell "this room is quiet" from "I did not look far enough". None on error
     # paths, where the question does not arise.
+    # `order` is in-band because the default is newest-first, so `tail` returns the OLDEST
+    # rows and a caller reads a prefix of history as the present.
     return {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or [],
-            "complete": complete}
+            "complete": complete, "order": order}
 
 
 _REDACTOR = None
@@ -131,7 +133,8 @@ def _normalize(items):
     return out
 
 
-def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None):
+def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None,
+              oldest_first=False):
     """Pull up to `limit` recent messages from `room_id` via the gateway verb."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
@@ -207,5 +210,10 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     # nothing more, because from here those two cases are indistinguishable. A caller that
     # sees complete=False knows only "do not treat this as the whole story", which is the
     # safe direction for a function whose failure mode is a confident empty.
-    return _result(True, messages[:limit], room_id=room_id,
-                   complete=len(messages) >= limit)
+    # Still the NEWEST `limit` messages either way — `oldest_first` reverses only the
+    # rendering, so `| tail` shows the latest instead of the oldest.
+    kept = messages[:limit]
+    if oldest_first:
+        kept = list(reversed(kept))
+    return _result(True, kept, room_id=room_id, complete=len(messages) >= limit,
+                   order="oldest_first" if oldest_first else "newest_first")

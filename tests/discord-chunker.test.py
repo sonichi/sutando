@@ -178,10 +178,47 @@ def _run_delivery_budget_cases():
     print("[discord delivery budget] all 3 cases OK")
 
 
+def _run_gate_message_cases():
+    """The gate line must not state an inequality its own predicate can falsify.
+
+    It fires on the CHUNK COUNT, so a structure that splits at exactly max_len
+    printed "N chars > N" — false, and it sends a reader hunting an off-by-one.
+    """
+    import contextlib
+    import io
+    import re
+
+    body = ("ab\n" * 200)[:40]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        chunks = list(bridge._chunk_for_discord(body, max_len=40, max_chunks=4))
+    out = buf.getvalue()
+
+    assert len(chunks) > 1, (
+        "gate-message: fixture no longer splits at exactly max_len, so this "
+        "case cannot exercise the gate — pick another structure")
+    assert "[delivery-gate]" in out, f"gate-message: gate did not fire: {out!r}"
+    assert f"{len(chunks)} chunk(s)" in out, (
+        f"gate-message: chunk count missing from {out!r}")
+    for lhs, rhs in re.findall(r"(\d+) chars > (\d+)", out):
+        assert int(lhs) > int(rhs), (
+            f"gate-message: printed a FALSE inequality {lhs} > {rhs} in {out!r}")
+
+    plain = ("word " * 200)[:40]
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        assert len(list(bridge._chunk_for_discord(plain, max_len=40, max_chunks=4))) == 1
+    assert "[delivery-gate]" not in buf2.getvalue(), (
+        "gate-message: fired on a single-chunk body")
+
+    print("[delivery gate message] all 2 cases OK")
+
+
 def main():
     _run_against(bridge, "discord-bridge.py")
     _run_against(dm, "dm-result.py")
     _run_delivery_budget_cases()
+    _run_gate_message_cases()
     print("All chunker tests passed.")
 
 

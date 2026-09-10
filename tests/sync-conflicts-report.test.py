@@ -201,6 +201,21 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("wrap2.md", r.stdout)
         self.assertNotIn("indent2.md", r.stdout)
 
+    def test_unique_lines_against_a_large_single_section_haystack_finish_fast(self):
+        """The runaway: a 2 MB one-section live file and thousands of saved lines
+        absent from it cost 18 ms each through a per-line regex — 30+ CPU-minutes
+        over the real corpus. A bounded find is 0.13 ms; the bar below is 30x
+        slack over that and 40x under the regex."""
+        import time
+        live = "\n".join(f'{{"ts": {i}, "k": "v{i}"}}' for i in range(40000))
+        saved = "\n".join(f'{{"ts": {i}, "k": "w{i}"}}' for i in range(3000))
+        t = time.time()
+        out = MOD._new_content(saved, live)
+        dt = time.time() - t
+        self.assertEqual(len(out), 3000, "every saved line is genuinely absent")
+        self.assertLess(dt, 4.0, f"_new_content took {dt:.1f}s for 3000 lines against a "
+                                 f"{len(live)//1024} KB haystack — the per-line regex is back")
+
     def test_mixed_batch_reports_only_the_lossy_file(self):
         """The discrimination, exercised in one run rather than three."""
         self._pair("lost.md", "# a\n", "# a\n" + "\n".join(f"n{i}" for i in range(9)) + "\n")

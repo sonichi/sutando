@@ -53,13 +53,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
+# AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
+RELAY_TOKEN_VARS: tuple[str, ...] = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
 
 def _clean(value: object) -> str:
     """Strip whitespace and one layer of matching quotes; '' if not usable.
 
     `.env` conventions allow `VAR="abc"`, and the literal quotes reaching an API
     URL is a real bug this repo has already hit (telegram 404s on
-    `.../bot"abc"/getUpdates`).
+    `.../bot"abc"/getUpdates`). Exactly ONE layer: a token may legitimately
+    contain quote characters, so peeling further would corrupt it.
     """
     if not isinstance(value, str):
         return ""
@@ -67,6 +72,35 @@ def _clean(value: object) -> str:
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
         v = v[1:-1].strip()
     return v
+
+
+def clean_relay_token(value: object) -> str:
+    """`_clean` plus repair for a re-rendered `<url>|<secret>` relay token.
+
+    A writer that quoted an already-quoted value leaves stacked layers and
+    shell escapes, and the polluted secret 401s on every relay. Safe to peel
+    here and nowhere else: this shape is url|hex, so a quote or backslash at
+    either edge is never content (unlike a bot token — see
+    tests/discord-token-delegation.test.py's one-layer contract).
+
+    The gate is `|`-SHAPED, not provenance-based: any future value containing a
+    pipe inherits this peel, so check that before adding one to RELAY_TOKEN_VARS.
+    """
+    v = _clean(value)
+    if "|" not in v:
+        return v
+    while True:
+        prev = v
+        v = v.strip().strip("\\'\"").strip()
+        if v == prev:
+            return v
+
+
+def _clean_for(var: str, value: object) -> str:
+    """Apply the contract that `var` requires: relay vars peel, everything else
+    keeps the one-matching-layer rule. Keyed here so the three readers below
+    cannot disagree and a new one inherits it without remembering."""
+    return clean_relay_token(value) if var in RELAY_TOKEN_VARS else _clean(value)
 
 
 def token_from_env_file(var: str, env_file: Path) -> str:
@@ -81,7 +115,7 @@ def token_from_env_file(var: str, env_file: Path) -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip() == var:
-            return _clean(value)
+            return _clean_for(var, value)
     return ""
 
 
@@ -99,7 +133,7 @@ def token_from_vault(var: str, vault_get=None) -> str:
         except Exception:
             return ""
     try:
-        return _clean(vault_get(var))
+        return _clean_for(var, vault_get(var))
     except Exception:
         return ""
 
@@ -113,7 +147,7 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
     conventional sources have nothing usable.
     """
     environ = os.environ if environ is None else environ
-    found = _clean(environ.get(var, ""))
+    found = _clean_for(var, environ.get(var, ""))
     if found:
         return found
     if env_file is not None:

@@ -18,6 +18,7 @@ from task_workstreams import (  # noqa: E402
     apply_inference,
     build_classifier_snapshot,
     build_workstream_context,
+    resolve_context_request,
 )
 
 
@@ -39,8 +40,9 @@ def main(argv=None) -> int:
         print(json.dumps(build_classifier_snapshot(workspace), ensure_ascii=False, indent=2))
         return 0
     if args.command == "context":
-        task_id = Path(args.task).stem
-        context = build_workstream_context(workspace, task_id, limit=args.limit)
+        task_id, task_path = resolve_context_request(workspace, args.task)
+        context = None if task_id is None else build_workstream_context(
+            workspace, task_id, limit=args.limit, task_path=task_path)
         if context is not None:
             sys.stdout.write(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
         return 0

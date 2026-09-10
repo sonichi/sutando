@@ -19,6 +19,7 @@ import urllib.error
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+_guard = importlib.import_module("ag2_sparrow.team_result_guard")
 
 fail = 0
 
@@ -154,12 +155,16 @@ with tempfile.TemporaryDirectory() as td:
     write_task(tasks, "task-notice-one", "team", **notice_fields)
     first_notice, first_reason = m._guarded_result_body(
         "task-notice-one", BODY_WITH_MARKERS)
+    # task-team1 above was withheld too, so two records exist here; glob order
+    # is the filesystem's, so the record must be addressed by its own id.
     review_files = list((m._STATE / "withheld-team-results").glob("wr_*.json"))
+    review_file = (m._STATE / "withheld-team-results"
+                   / f"{_guard.withheld_review_id('task-notice-one')}.json")
     check(first_reason is not None
           and any(a.kind == "skip" for a in m.parse_markers(first_notice).actions),
           "first withhold closes the lease without posting into the shared room")
-    check(bool(review_files), "first withhold persists an owner-review artifact")
-    review_record = json.loads(review_files[0].read_text(encoding="utf-8"))
+    check(review_file.is_file(), "first withhold persists an owner-review artifact")
+    review_record = json.loads(review_file.read_text(encoding="utf-8"))
     check(review_record.get("context", {}).get("room_name") == "Design Room",
           "the bridge retains the human-readable room name for private review")
 

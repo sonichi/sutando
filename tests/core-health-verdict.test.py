@@ -236,12 +236,17 @@ try:
 finally:
     rh.subprocess.run = _orig_run
 
-# A probe that RAN and genuinely found nothing still reads False (a real miss is
-# not the same as an unavailable probe).
+# A definitive miss is injected at the shared tri-state seam, never via the host's
+# tmux: a `tmux` -> /usr/bin/false on PATH must not be able to satisfy this.
 _orig_run2 = rh._run
+_orig_hs = rh._tmux_has_session
 try:
-    rh._run = lambda cmd: (1, "")
+    rh._tmux_has_session = lambda sock, sess, timeout=None: False
     check("_core_running -> False when has-session ran and missed", rh._core_running() is False)
+    rh._tmux_has_session = lambda sock, sess, timeout=None: None
+    check("_core_running -> None when the probe observed nothing", rh._core_running() is None)
+    rh._tmux_has_session = _orig_hs
+    rh._run = lambda cmd: (1, "")
     check("_gateway_running -> False when probes ran but found nothing", rh._gateway_running() is False)
     rh._run = lambda cmd: (0, "") if cmd and cmd[0] == "pgrep" else (1, "")
     check("_gateway_running -> True via pgrep", rh._gateway_running() is True)
@@ -249,6 +254,7 @@ try:
     check("_gateway_running -> True via tmux window fallback", rh._gateway_running() is True)
 finally:
     rh._run = _orig_run2
+    rh._tmux_has_session = _orig_hs
     rh._gateway_configured = _orig_gwc
 
 

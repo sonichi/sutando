@@ -6,6 +6,7 @@ import shutil
 import signal
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -70,6 +71,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
+            "src/task_archive.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
             "src/watch-tasks-stream.sh",
@@ -132,9 +134,12 @@ exit 0
         # Stub the heartbeat writer: the launcher must start it (it is the sole
         # writer of state/cores/<host>.alive that cron-runner gates fires on).
         # Record that it ran; exit immediately so no daemon lingers in the test.
+        # `--stop` is the restart handoff: the real CLI ends other writers and exits; the stub just exits.
         (self.root / "src/core_heartbeat.py").write_text(
-            "import os\n"
+            "import os, sys\n"
             "from pathlib import Path\n"
+            "if '--stop' in sys.argv:\n"
+            "    sys.exit(0)\n"
             "Path(os.environ['HEARTBEAT_PID']).write_text(str(os.getpid()))\n"
             "with open(os.environ['HEARTBEAT_LOG'], 'w') as f:\n"
             "    f.write('heartbeat-started')\n"
@@ -162,7 +167,19 @@ exit 0
 ''')
 
     def tearDown(self):
-        self.tmp.cleanup()
+        # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
+        pid_file = Path(self.tmp.name) / "heartbeat.pid"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(int(pid_file.read_text()), 0)
+            except (FileNotFoundError, ValueError, ProcessLookupError):
+                break
+            time.sleep(0.01)
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _write_exe(self, name, body):
         path = self.bin / name
@@ -406,6 +423,25 @@ exit 0
             "launcher did not start the core heartbeat writer",
         )
         self.assertEqual(marker_text, "heartbeat-started")
+
+    def test_restart_resolves_the_heartbeat_interpreter_once_for_stop_and_start(self):
+        # The resolver records who called it. The launcher (any $(...) depth keeps $0 and $$) must
+        # resolve exactly once and hand that one interpreter to both the --stop and the start.
+        calls = Path(self.tmp.name) / "resolve-calls"
+        with open(self.root / "scripts/python-binary.sh", "a") as f:
+            f.write(
+                "\nresolve_python() {\n"
+                f"  printf '%s:%s\\n' \"$$\" \"$0\" >> '{calls}'\n"
+                f"  printf '%s' '{sys.executable}'\n"
+                "}\n"
+            )
+        marker = Path(self.tmp.name) / "heartbeat.log"
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        started = _read_when_nonempty(marker, time.monotonic() + 5)
+        mine = [l for l in calls.read_text().splitlines() if l.endswith("start-cli.sh")]
+        self.assertEqual(len(mine), 1, f"the launcher must resolve once, in its own shell: {mine}")
+        self.assertEqual(started, "heartbeat-started", "no replacement writer started after --stop")
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")

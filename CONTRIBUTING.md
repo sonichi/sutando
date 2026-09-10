@@ -69,6 +69,23 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
 4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
 
+5. **Run the repo's own scanner before you push**, not after CI tells you:
+
+   ```bash
+   git commit ...                                              # it reads COMMITS, not your worktree
+   bash scripts/review-checks.sh --diff <(git diff origin/main...HEAD)
+   ```
+
+   It runs the machine-readable `checks:` block in [`REVIEW.md`](REVIEW.md) — the same one CI runs — so a red result here is a red result there.
+
+   Three things that make it report something other than what you expect, each measured:
+
+   - **Commit first.** Against an uncommitted or merely staged worktree the three-dot range is empty and you get `ERROR — empty diff; nothing was scanned, so this is NOT a pass`. It fails loudly rather than passing, but it is easy to read as "clean".
+   - **Three dots, not two.** `origin/main..HEAD` renders `main`'s own newer commits as your removals.
+   - **`PARTIAL` is not `PASS`.** With no `.py` in the diff it prints `prose-cap had no in-scope files`; from a `gh pr diff` file with no tree to read it prints `prose-cap SKIPPED`. Neither one scanned any prose.
+
+   Worth the second it costs because these findings are mechanical and invisible while writing. `prose-cap` counts **consecutive added comment lines**, so a trailing comment on a code line folds into the block beneath it — `return None  # why` above a 2-line block is a 3-line run, and the fix is a blank line between them, not a rewrite. On 2026-09-01 one file cost four separate CI round-trips across two authors for that class alone.
+
 ## The PR body should answer
 
 In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so the reviewer doesn't wonder whether you forgot it.

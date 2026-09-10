@@ -73,6 +73,17 @@ def match_agent(query: str, agents: list) -> dict:
     return {"ok": False, "mxid": None, "candidates": [], "reason": f"no agent matches {query!r}"}
 
 
+def match_member(query: str, member_mxids: list) -> dict:
+    """Resolve `query` against a room's MEMBER mxids, same ranking as match_agent.
+
+    Members carry no label, so only the localpart tiers apply. Scoping to one
+    room is what makes this safe to fall back to: a handle can only resolve to
+    someone already in the room being posted to.
+    """
+    agents = [{"id": m} for m in (member_mxids or []) if m]
+    return match_agent(query, agents)
+
+
 def list_agents() -> dict:
     """GET /v1/agents → {"ok", "agents": [...], "reason"}. Graceful on any failure."""
     base, headers = gateway()

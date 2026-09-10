@@ -54,17 +54,16 @@ class HumanActionTests(unittest.TestCase):
 
     def test_request_mirrors_card_with_act_and_outcome_options(self):
         rid = self._request()
-        card = self.ha.store.get(self.d._ha_of[rid])
-        q = card["questions"][0]
-        self.assertIn("Sign the agreement", q["question"])
-        self.assertIn("Review section 4", q["question"])
-        self.assertEqual([o["label"] for o in q["options"]], ["Done", "Decline"])
+        req = self.ha.manager.get(self.d._ha_of[rid])
+        self.assertIn("Sign the agreement", req.message)
+        self.assertIn("Review section 4", req.message)
+        self.assertEqual([a.label for a in req.actions], ["Done", "Decline"])
 
     def test_card_done_completes_and_decline_declines(self):
         for answer, expected in ((1, "completed"), (2, "declined")):
             rid = self._request()
             aid = self.d._ha_of[rid]
-            self.ha.store.resolve(aid, {"1": [answer]}, "@owner:x")
+            self.ha.resolve(aid, {"1": [answer]}, "@owner:x")
             self.d._settle(rid)
             rec = self.store.get(rid)
             self.assertEqual(rec["status"], expected)
@@ -76,8 +75,7 @@ class HumanActionTests(unittest.TestCase):
                                               {"requestId": rid, "note": "signed"}))
         self.assertEqual(out["status"], "completed")
         self.assertEqual(self.store.get(rid)["result"], {"note": "signed"})
-        card = self.ha.store.get(self.d._ha_of[rid])
-        self.assertEqual(card["status"], "resolved")  # no dangling card
+        self.assertEqual(self.ha.manager.get(self.d._ha_of[rid]).status, "resolved")  # no dangling card
 
     def test_api_decline_and_terminal_is_idempotent_safe(self):
         rid = self._request()
@@ -106,7 +104,7 @@ class HumanActionTests(unittest.TestCase):
                                       {"requestId": rid}))
         self.assertEqual(cm.exception.code, -32601)
         self.assertEqual(self.store.get(rid)["status"], "pending")
-        self.assertEqual(self.ha.store.get(self.d._ha_of[rid])["status"],
+        self.assertEqual(self.ha.manager.get(self.d._ha_of[rid]).status,
                          "pending")
         with self.assertRaises(ProtocolError):
             asyncio.run(self.d.handle("human_action.decline", {"requestId": rid}))
@@ -117,6 +115,62 @@ class HumanActionTests(unittest.TestCase):
         st = asyncio.run(self.d.handle("human_action.status", {"requestId": rid}))
         self.assertEqual(st["status"], "pending")
         self.assertEqual(st["requestId"], rid)
+
+
+class AdapterEdgeTests(unittest.TestCase):
+    """The adapter's own branches, driven without a dispatcher: the free-text
+    decision both ways, expiry, malformed answers, the stale duplicate, and the
+    answer-shape helper's fallbacks (the coverage gate's 12 lines on #3753)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ha = HumanActionAdapter(str(Path(self.tmp.name) / "ha"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _req(self, rid, **params):
+        return {"requestId": rid, "params": params}
+
+    def test_free_text_decision_round_trips_the_typed_answer(self):
+        aid = self.ha.open_elicitation(self._req("r-ft", type="text", question="Your name?"))
+        req = self.ha.manager.get(aid)
+        self.assertEqual([(a.id, a.kind, a.label) for a in req.actions], [("answer", "free_text", "Answer")])
+        self.assertIn("expires_at", req.to_wire())
+        self.ha.resolve(aid, {"1": "Alice"}, "@owner:x")
+        self.assertEqual(self.ha.poll_resolution(aid), ("resolved", {"1": "Alice"}, "@owner:x"))
+
+    def test_an_expired_requirement_reports_expired_on_every_poll(self):
+        r = self._req("r-exp", action="x"); r["expiresAt"] = 1.0
+        aid = self.ha.open_approval(r)
+        self.assertEqual(self.ha.poll_resolution(aid), ("expired", None, None))
+        status, answers, _by = self.ha.poll_resolution(aid)
+        self.assertEqual((status, answers), ("expired", None))
+
+    def test_resolve_refuses_an_unknown_requirement_and_a_bad_index(self):
+        from hitl.schema import MalformedActionError
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve("ha-nope", {"1": [1]}, "@owner:x")
+        aid = self.ha.open_approval(self._req("r-idx", action="x"))
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve(aid, {"1": [9]}, "@owner:x")
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve(aid, {"1": "Maybe"}, "@owner:x")
+
+    def test_a_duplicate_answer_is_swallowed_not_raised(self):
+        aid = self.ha.open_approval(self._req("r-dup", action="x"))
+        self.ha.resolve(aid, {"1": [1]}, "@owner:x")
+        self.assertIsNone(self.ha.resolve(aid, {"1": [2]}, "@owner:x"))
+        self.assertEqual(self.ha.poll_resolution(aid)[0], "resolved")
+        self.assertEqual(self.ha.manager.get(aid).chosen_action, "approve")
+
+    def test_answer_shape_fallbacks(self):
+        aid = self.ha.open_approval(self._req("r-shape", action="x"))
+        req = self.ha.manager.get(aid)
+        req.chosen_action = "ghost"; req.answer = None
+        self.assertEqual(self.ha._answers(req), {})
+        req.chosen_action = "approve"; req.subject["options"] = []
+        self.assertEqual(self.ha._answers(req), {"1": "Approve"})
 
 
 class ProductionComposedSettleTests(unittest.TestCase):
@@ -149,7 +203,7 @@ class ProductionComposedSettleTests(unittest.TestCase):
         rec = self.srv.store.get(rid)
         self.assertEqual(rec["status"], "pending")
         self.assertIsNone(rec.get("resolvedBy"))
-        self.assertEqual(self.srv.ha.store.get(self.d._ha_of[rid])["status"],
+        self.assertEqual(self.srv.ha.manager.get(self.d._ha_of[rid]).status,
                          "pending")
 
 
