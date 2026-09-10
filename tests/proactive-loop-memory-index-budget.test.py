@@ -161,8 +161,7 @@ with tempfile.TemporaryDirectory() as d:
     got, note = mib._live_index(live, REPO, projects.parent.parent)
     check("narrowing: an explicit NOT-THE-LIVE-CORPUS disclaimer resolves 6 -> 1",
           got == live / "MEMORY.md", "got=%s note=%r" % (got, note))
-    check("narrowing: ...and it outranks transcripts, which name the tree a "
-          "session RAN in, not the corpus it writes",
+    check("narrowing: ...and a transcript beside a DISCLAIMED corpus changes nothing",
           got is not None and got.parent.parent.name == "app", "got=%s" % got)
 
 with tempfile.TemporaryDirectory() as d:
@@ -175,8 +174,11 @@ with tempfile.TemporaryDirectory() as d:
     _tree(projects, "second", index_of(LIMIT // 3), age_s=600)
     _transcript(projects, "real")
     got, note = mib._live_index(real, REPO, projects.parent.parent)
-    check("narrowing: identical template stubs are debris, not rival corpora",
-          got == real / "MEMORY.md", "got=%s note=%r" % (got, note))
+    # The stubs are gone -- the refusal names 2 candidates, not 32. Separating the
+    # two REAL ones is not something this tool can do without an authority.
+    check("narrowing: template stubs are debris, so the refusal names only the real ones",
+          got is None and "2 candidate indexes" in note and "stub-0" not in note,
+          "got=%s note=%r" % (got, note))
 
 with tempfile.TemporaryDirectory() as d:
     # A filter that would empty the set is skipped, so narrowing never costs a
@@ -205,9 +207,8 @@ with tempfile.TemporaryDirectory() as d:
     except OSError:
         unreadable = True
     if unreadable:
-        key = mib._content_key(locked / "MEMORY.md")
-        check("unreadable candidate: hashing it yields a marker, not an exception",
-              key.startswith("unreadable:"), key)
+        check("unreadable candidate: treated as UNKNOWN, never as debris",
+              mib._indexes_something(locked / "MEMORY.md") is True, "read succeeded?")
         got, note = mib._live_index(live, REPO, projects.parent.parent)
         check("unreadable candidate: the resolver still answers or refuses cleanly",
               got is not None or "CANNOT ANSWER" in note, "got=%s note=%r" % (got, note))
@@ -384,6 +385,33 @@ with tempfile.TemporaryDirectory() as d:
             os.environ.pop("SUTANDO_MEMORY_DIR", None)
         else:
             os.environ["SUTANDO_MEMORY_DIR"] = _prev
+
+# --- the two false-safe paths @qingyun-wu reproduced on #3873 -----------------
+# Selecting a STALE corpus is strictly worse than refusing: it green-lights an
+# addition that will not load, which is what this guard exists to prevent.
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    same = index_of(LIMIT // 2)
+    live = _tree(projects, "live", same, age_s=60)
+    for n in ("copy-a", "copy-b"):
+        _tree(projects, n, same, age_s=60)
+    stale = _tree(projects, "stale", index_of(LIMIT // 3), age_s=86400)
+    got, note = mib._live_index(live, REPO, projects.parent.parent)
+    check("false-safe A: three identical REAL corpora are not debris, so it refuses",
+          got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
+    check("false-safe A: and it never selects the stale index",
+          got != stale / "MEMORY.md", "got=%s" % got)
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    live = _tree(projects, "live", index_of(LIMIT // 2), age_s=60)
+    stale = _tree(projects, "stale", index_of(LIMIT // 3), age_s=86400)
+    (projects / "stale" / "stale.jsonl").write_text("{}\n")
+    got, note = mib._live_index(live, REPO, projects.parent.parent)
+    check("false-safe B: a transcript beside the STALE corpus does not elect it",
+          got != stale / "MEMORY.md", "got=%s note=%r" % (got, note))
+    check("false-safe B: with nothing authoritative, it refuses",
+          got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
 
 # --- the branches the coverage gate flagged: refusal, fallback, and main()'s default -
 with tempfile.TemporaryDirectory() as d:

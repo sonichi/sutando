@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import hashlib
 import os
 import re
 import sys
@@ -138,20 +137,17 @@ def _host_stated_index(workspace: Path, repo: Path) -> "tuple[Path | None, str]"
 
 
 def _narrow(cands: "list[Path]") -> "list[Path]":
-    """Drop candidates that cannot be this session's corpus, cheapest signal first.
+    """Drop candidates that cannot be this session's corpus.
 
     Each filter is adopted only when it leaves something, so narrowing to zero is
     never how a host loses its answer.
     """
     for keep in (
-        # 1. An explicit disclaimer beats every inference, including a fresh mtime.
+        # An explicit disclaimer beats every inference, including a fresh mtime.
         lambda c: not (c.parent / "NOT-THE-LIVE-CORPUS.txt").exists(),
-        # 2. Debris: dead worktrees and scratch dirs leave byte-identical template
-        #    stubs, which manufacture ambiguity that was never observed.
-        lambda c: _content_key(c) not in _stub_keys(cands),
-        # 3. Transcripts say which tree a session RAN in. That is the corpus it
-        #    writes only where cwd and the memory dir coincide, so it goes last.
-        lambda c: any(c.parent.parent.glob("*.jsonl")),
+        # A template nobody has written in indexes nothing. Copy count cannot say
+        # this: four byte-identical REAL corpora clear any threshold a stub does.
+        lambda c: _indexes_something(c),
     ):
         if len(cands) < 2:
             break
@@ -161,20 +157,15 @@ def _narrow(cands: "list[Path]") -> "list[Path]":
     return cands
 
 
-def _content_key(index: "Path") -> str:
+_ROW = re.compile(r"^\s*[-*]\s*\[", re.M)
+
+
+def _indexes_something(index: "Path") -> bool:
+    """True when the file carries at least one `- [Title](file.md)` row."""
     try:
-        return hashlib.sha256(index.read_bytes()).hexdigest()
+        return bool(_ROW.search(index.read_text(encoding="utf-8", errors="replace")))
     except OSError:
-        return f"unreadable:{index}"
-
-
-def _stub_keys(cands: "list[Path]") -> "set[str]":
-    """Content hashes shared by 3+ candidates: a template nobody wrote in."""
-    seen: "dict[str, int]" = {}
-    for c in cands:
-        k = _content_key(c)
-        seen[k] = seen.get(k, 0) + 1
-    return {k for k, n in seen.items() if n >= 3}
+        return True                 # unreadable is unknown, never "debris"
 
 
 def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
