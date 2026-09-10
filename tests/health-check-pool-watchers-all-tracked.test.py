@@ -642,6 +642,57 @@ class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
 
 
 
+class MultiplicitySurvivesToTheDiagnosis(unittest.TestCase):
+    """keweichen's invariant, #3875: every case tonight was one shape — a
+    multi-map reduced to a set before the multiplicity decision was finished.
+
+    So assert the property across the matrix rather than one regression row at a
+    time: wherever N roots share a target, the diagnosis must still be able to
+    say N, and must never advise an action that assumes one.
+    """
+
+    W = "/repo/src/watch-tasks-stream.sh"
+
+    def _d(self, ps, targets):
+        return StopAdviceNeverTargetsASupervisedWatcher._detail(self, ps, targets=targets)
+
+    def test_every_shared_target_is_still_countable_in_the_verdict(self):
+        cases = [
+            # (label, supervised, ownerless, targets, must_appear)
+            ("two ownerless on one uncovered target",
+             ["901"], ["903", "904", "905"],
+             {"901": "/s/A.pid", "903": "/s/A.pid", "904": "/s/B.pid", "905": "/s/B.pid"},
+             ["restart 904 and NOT", "peer above already covers"]),
+            ("three ownerless, three distinct targets",
+             ["901"], ["903", "904", "905"],
+             {"901": "/s/A.pid", "903": "/s/B.pid", "904": "/s/C.pid", "905": "/s/D.pid"},
+             ["restart"]),
+            ("all ownerless share one target",
+             [], ["903", "904"],
+             {"903": "/s/B.pid", "904": "/s/B.pid"},
+             ["restart one cleanly"]),
+        ]
+        for label, sup, own, targets, must in cases:
+            with self.subTest(label):
+                ps = "  900 1 /bin/zsh -l\n"
+                ps += "".join(f"  {p} 900 bash {self.W}\n" for p in sup)
+                ps += "".join(f"  {p} 1 bash {self.W}\n" for p in own)
+                d = self._d(ps, targets)
+                for m in must:
+                    self.assertIn(m, d, f"{label}: {d}")
+                # the invariant: never advise restarting more watchers than there
+                # are distinct uncovered targets
+                sup_t = {targets[p] for p in sup if p in targets}
+                own_t = {targets[p] for p in own if p in targets}
+                uncovered = len(own_t - sup_t)
+                import re as _re
+                named = _re.search(r"then restart ([0-9, ]+?) and NOT", d)
+                if named:
+                    self.assertLessEqual(
+                        len([x for x in named.group(1).split(",") if x.strip()]), uncovered,
+                        f"{label}: restarts more than the {uncovered} uncovered target(s): {d}")
+
+
 class ExtraTreesKeepTheirMultiplicity(unittest.TestCase):
     """keweichen: extras distinct from every TRACKED target can still duplicate
     EACH OTHER, and calling them "not duplicates" erased that."""
