@@ -123,6 +123,44 @@ class TestOnlyTheRealSourceCounts(unittest.TestCase):
         self.assertIsNone(wpc.parse(hdr(), "Do something clever with the pool"))
 
 
+class TestAStampedCommandWinsOverProse(unittest.TestCase):
+    """Prose is the fallback for a broker that stamps nothing; a stamped
+    command is read instead, and never from below `task:`."""
+
+    def test_a_stamped_add_needs_no_sentence(self):
+        got = wpc.parse(hdr(picker_command="add",
+                            picker_args='{"label": "reviewer"}'), "")
+        self.assertEqual(got, {"action": "add", "label": "reviewer"})
+
+    def test_a_stamped_pin_carries_its_set_and_flag(self):
+        got = wpc.parse(hdr(picker_command="pin",
+                            picker_args='{"workers": ["%s", "%s"], "dedicated": true}' % (W1, W2)), "")
+        self.assertEqual(got["workers"], [W1, W2])
+        self.assertTrue(got["dedicated"])
+
+    def test_the_stamp_beats_a_contradicting_sentence(self):
+        got = wpc.parse(hdr(picker_command="unpin"),
+                        f"Pin room {ROOM} to {W1} (worker picker)")
+        self.assertEqual(got["action"], "unpin")
+
+    def test_an_unknown_command_is_named_not_guessed_from_prose(self):
+        # A broker naming a verb we do not implement must not be answered by
+        # reading a sentence written for a different one.
+        got = wpc.parse(hdr(picker_command="retire"), ADD)
+        self.assertEqual(got, {"action": "unsupported", "command": "retire"})
+
+    def test_unparseable_args_refuse_rather_than_fall_back(self):
+        # The sentence may describe the same intent, but nothing proves it, so
+        # a corrupt stamp refuses instead of trusting prose beside it.
+        got = wpc.parse(hdr(picker_command="add", picker_args="{not json"), ADD)
+        self.assertEqual(got, {"action": "malformed", "command": "add"})
+
+    def test_the_room_still_comes_from_the_header(self):
+        got = wpc.parse(hdr(picker_command="pin",
+                            picker_args='{"worker": "%s", "room": "!evil:x"}' % W1), "")
+        self.assertEqual(got["room"], ROOM)
+
+
 class TestTaskFile(unittest.TestCase):
     def test_it_reads_a_real_task_file(self):
         with tempfile.TemporaryDirectory() as d:
