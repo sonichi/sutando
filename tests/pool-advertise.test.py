@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""The picker shows what we advertise, so the two bodies must agree.
+
+Status comes from the snapshot, the name from the profile patch. A worker in
+one and not the other renders wrong rather than absent, which is why both are
+built from a single roster read.
+
+Run: python3 tests/pool-advertise.test.py
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+import pool_advertise as pa  # noqa: E402
+
+import pool_roster as pr  # noqa: E402
+
+W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
+W2 = "b4e02d3c5f6a7b8c9d0e1f2a3b4c5d6e"
+W3 = "c5f13e4d6a7b8c9d0e1f2a3b4c5d6e7f"
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name)
+
+    def roster(self, workers):
+        return pr.compile_roster(self.ws, workers, {})
+
+
+class TestStatusComesFromState(Base):
+    def test_live_is_active_and_abandoned_is_dead(self):
+        r = self.roster({W1: {"state": "live"}, W2: {"state": "abandoned"}})
+        snap = pa.snapshot(r, now=1000)
+        self.assertEqual(snap["live_cores"], [W1])
+        self.assertEqual(snap["dead_cores"], [W2])
+        self.assertEqual(snap["ts"], 1000)
+
+    def test_recovering_is_neither_so_the_broker_reads_it_available(self):
+        r = self.roster({W1: {"state": "recovering"}})
+        snap = pa.snapshot(r, now=1)
+        self.assertEqual(snap["live_cores"], [])
+        self.assertEqual(snap["dead_cores"], [])
+
+    def test_the_roster_version_rides_along(self):
+        r = self.roster({W1: {"state": "live"}})
+        self.assertEqual(pa.snapshot(r, now=1)["roster_version"], r["version"])
+
+
+class TestNamesComeFromTheProfilePatch(Base):
+    def test_a_label_is_carried(self):
+        r = self.roster({W1: {"state": "live", "label": "reviewer"}})
+        self.assertEqual(pa.profile_workers(r)[W1]["label"], "reviewer")
+
+    def test_an_unlabelled_worker_falls_back_to_its_id(self):
+        r = self.roster({W1: {"state": "live"}})
+        self.assertEqual(pa.profile_workers(r)[W1]["label"], W1)
+
+    def test_a_declared_runtime_is_carried_so_a_codex_worker_reads_right(self):
+        r = self.roster({W1: {"state": "live", "runtime": "codex"}})
+        self.assertEqual(pa.profile_workers(r)[W1]["runtime"], "codex")
+
+    def test_no_runtime_is_omitted_rather_than_guessed(self):
+        # The broker defaults an absent runtime to claude; sending one we did
+        # not declare would make a guess look like a declaration.
+        r = self.roster({W1: {"state": "live"}})
+        self.assertNotIn("runtime", pa.profile_workers(r)[W1])
+
+    def test_a_retired_worker_is_advertised_nowhere(self):
+        # The broker renders any id it has metadata for, so leaving a retired
+        # worker here would pin a deleted worker to the picker permanently.
+        r = self.roster({W1: {"state": "live"}, W2: {"state": "retired"}})
+        self.assertNotIn(W2, pa.profile_workers(r))
+        snap = pa.snapshot(r, now=1)
+        self.assertNotIn(W2, snap["live_cores"] + snap["dead_cores"])
+
+
+class TestTheTwoBodiesAgree(Base):
+    def test_every_advertised_status_has_a_name(self):
+        r = self.roster({W1: {"state": "live", "label": "one"},
+                         W2: {"state": "abandoned"},
+                         W3: {"state": "recovering", "label": "three"}})
+        ad = pa.advertisement(self.ws, now=1)
+        named = set(ad["profile_patch"]["workers"])
+        snap = ad["workers_snapshot"]
+        self.assertTrue(set(snap["live_cores"] + snap["dead_cores"]) <= named)
+
+    def test_both_bodies_come_from_one_roster_read(self):
+        self.roster({W1: {"state": "live", "label": "one"}})
+        ad = pa.advertisement(self.ws, now=7)
+        self.assertEqual(ad["workers_snapshot"]["live_cores"], [W1])
+        self.assertEqual(ad["profile_patch"]["workers"][W1]["label"], "one")
+
+    def test_no_roster_refuses_rather_than_advertising_an_empty_pool(self):
+        # An empty advertisement would retire every worker the picker shows.
+        with self.assertRaises(FileNotFoundError):
+            pa.advertisement(self.ws)
+
+
+class TestCli(Base):
+    def test_it_prints_both_bodies_as_json(self):
+        self.roster({W1: {"state": "live", "label": "one"}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pa.main(["--workspace", str(self.ws)]), 0)
+        got = json.loads(out.getvalue())
+        self.assertEqual(got["workers_snapshot"]["live_cores"], [W1])
+        self.assertEqual(got["profile_patch"]["workers"][W1]["label"], "one")
+
+    def test_no_roster_exits_two_and_says_so(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pa.main(["--workspace", str(self.ws)]), 2)
+        self.assertIn("no roster", err.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
