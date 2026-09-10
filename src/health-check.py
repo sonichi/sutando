@@ -9116,6 +9116,7 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
 
 # The one owned hook whose effect leaves the workspace; excluded from unattended repair.
 _TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
 
 
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
@@ -11171,15 +11172,22 @@ def check_claude_hook_registration(
         # The omit flag gates DEPRECATED_HOOKS, so prescribing it skips the very pruning a
         # foreign entry needs and reports `removed=0`, which reads as a successful run.
         if foreign:
-            remedy = ("do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 here — that flag gates "
-                      "the deprecated-hook pruning, so it reports `removed=0` and clears nothing. "
-                      "Run `bash src/install-claude-hooks.sh` plain: it prunes the legacy forms it "
-                      f"knows ({', '.join(foreign)}) and installs their successors. NOTE: one flag "
-                      "controls both, so a plain run ALSO registers the ~/Desktop transcript "
-                      "archiver — if this host does not want it, delete that one PreCompact entry "
-                      "afterwards (re-running with the flag would un-prune, not un-install). If an "
-                      "entry is genuinely foreign (another program or checkout) the installer cannot "
-                      "own it — remove that one by hand")
+            # The flag gates ONE deprecated entry (the legacy archive `cp`), not pruning
+            # at large — every other DEPRECATED_HOOKS entry is pruned with it set.
+            archive_foreign = [f for f in foreign if _TRANSCRIPT_ARCHIVE_FAMILY in f]
+            if archive_foreign:
+                remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
+                          "— that flag is what adds the legacy archive form to the prune list, so with "
+                          f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
+                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
+                          "archiver: if this host does not want it, delete that one PreCompact entry "
+                          "afterwards")
+            else:
+                remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
+                          "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
+                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
+                          "installed. If an entry is genuinely foreign (another program or checkout) "
+                          "the installer cannot own it — remove that one by hand")
         if dead and not missing and not foreign:
             remedy = ("re-run the installer that owns each family — it prunes dead copies "
                       "(`bash scripts/install-personal-claude-hook.sh`, "
