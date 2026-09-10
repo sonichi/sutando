@@ -391,9 +391,8 @@ with tempfile.TemporaryDirectory() as td:
 
 print("\ncase: no vault repo at all is SILENT, not a permanent untracked warning")
 with tempfile.TemporaryDirectory() as td:
-    # No `git init`: git exits 128 "not a git repository" WITHOUT raising, so the
-    # probe cannot distinguish it from a tracked-but-absent file. Warning here is
-    # unactionable and fires on every pass forever.
+    # No `git init`: git exits 128 WITHOUT raising, so the probe cannot tell
+    # "no repo" from "untracked" and warns on every pass forever.
     ws = Path(td) / "ws"
     (ws / "state").mkdir(parents=True)
     f = ws / "state" / tsc.EXTRAS
