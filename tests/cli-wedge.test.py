@@ -980,6 +980,30 @@ class ProseMentioningAStateIsNotThatState(unittest.TestCase):
                          "the marker duplicates the flattened abnormal_* keys already spread in")
 
 
+class IdleAbnormalSubcases(unittest.TestCase):
+    """Chi, 2026-09-10: "in idle + abnormal, there are more subcases not mentioned".
+    All five, measured -- four named by text, one by the absence of it."""
+
+    def test_every_idle_abnormal_subcase_is_idle_and_warns(self):
+        for name, frame, work in (
+            ("quota-limit", "❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n", True),
+            ("out-of-credits", "❯ \n⏵⏵ you are out of usage credits\n", True),
+            ("needs-login", "❯ \n⏵⏵ please log in to continue · run /login\n", True),
+            ("awaiting-input", "❯ \n⏵⏵ waiting for your approval to run a command\n", True),
+            ("compacting-frozen", "Compacting conversation…\n", True),
+            ("static-with-work", "❯ \n⏵⏵ bypass permissions on · 1 monitor\n", True),
+        ):
+            v = w.classify([frame] * 6, work, 900, "core-status running")
+            self.assertTrue(v["raw_static"], f"{name} must be idle")
+            self.assertTrue(v["warn"], f"{name} must warn, got {v['kind']}")
+
+    def test_the_same_static_pane_without_work_is_healthy_idle(self):
+        # static-with-work is the one subcase with no text to read, so outstanding
+        # work is the whole discriminator between the abnormal and healthy cells.
+        v = w.classify(["❯ \n⏵⏵ bypass permissions on · 1 monitor\n"] * 6, False, 900)
+        self.assertEqual((v["kind"], v["warn"]), ("idle", False))
+
+
 class FourCasesFold(unittest.TestCase):
     """Chi, 2026-09-10: "retry loop is under moving + abnormal". Every kind is a
     cell of the 2x2, never a fifth case. This pins the FOLD, not the kind names."""

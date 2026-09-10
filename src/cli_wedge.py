@@ -18,8 +18,18 @@ Four, as a 2x2 -- `idle / moving` x `healthy / abnormal`:
 
     idle   + healthy    the turn finished.                    No warning.
     idle   + abnormal   stopped and not coming back.          WARN.
-                        A provider limit or a login prompt: parked,
-                        nothing ticking.
+                        Parked, nothing ticking. Five subcases, four
+                        named by their text and one by its absence:
+                          quota-limit / out-of-credits -> provider-limit
+                          needs-login                  -> abnormal
+                          awaiting-input (a prompt      -> abnormal
+                            waiting on a human)
+                          compacting, if it froze       -> abnormal
+                          NO abnormal text, but work is outstanding
+                            and the RAW pane never moved
+                                                       -> static-with-work
+                        The last is case 1 and the only one with no text
+                        to read; without outstanding work it is `idle`.
     moving + healthy    ordinary work.                        No warning.
                         A ticking clock IS motion (Chi), so a pane
                         whose only change is a clock lands here.
