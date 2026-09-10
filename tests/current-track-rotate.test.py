@@ -716,16 +716,36 @@ class PinVocabularyDiscriminates(unittest.TestCase):
         self.assertGreater(used, int(8 * 1024 * 0.85),
                            f"head used only {used} B of 8192 — the freed bytes were never spent")
 
+    # A corpus UNDER the cap makes plan() return it unchanged, so every "stayed
+    # whole" assertion passes without rotating. Each case below asserts it rotated.
+    def _pinned_walk_corpus(self):
+        pre, _ = fixture(0)
+        old_pin = ("## 2026-09-02T00:00Z — old\n" + ("y" * 1200) + "\n"
+                   + "HOLD: do not merge #1\n\n")
+        filler = "".join(f"## 2026-09-{i:02d}T00:00Z — mid {i}\n" + ("y" * 900) + "\n\n"
+                         for i in range(3, 12))
+        recent = ("## 2026-09-20T10:00Z — recent\n" + ("context that matters\n" * 8)
+                  + "HOLD: do not merge #9\n\n")
+        return pre + old_pin + filler + recent
+
     def test_a_pinned_entry_the_walk_reached_stays_whole(self):
         """Condensing is for entries kept ONLY by their pin; a recent one is not summarised."""
-        pre, _ = fixture(0)
-        recent = ("## 2026-09-20T10:00Z — recent\n" + "context that matters\n"
-                  + "HOLD: do not merge #9\n\n")
-        corpus = pre + "".join(f"## 2026-09-{i:02d}T00:00Z — old {i}\n" + ("y" * 100) + "\n\n"
-                               for i in range(2, 9)) + recent
-        r = ct.plan(corpus, 8 * 1024)
+        corpus = self._pinned_walk_corpus()
+        cap = 8 * 1024
+        self.assertGreater(len(corpus.encode("utf-8")), cap,
+                           "corpus is under the cap, so plan() returns it unrotated")
+        r = ct.plan(corpus, cap)
+        self.assertTrue(r.archived, "nothing was archived — the walk never ran")
         self.assertIn("context that matters", r.head,
                       "a recent pinned entry was condensed despite fitting")
+
+    def test_an_old_pin_the_walk_never_reached_is_still_condensed(self):
+        """Discriminating control: the fix must not make every pin whole."""
+        r = ct.plan(self._pinned_walk_corpus(), 8 * 1024)
+        self.assertIn("HOLD: do not merge #1", r.head, "the old hold LINE must survive")
+        self.assertIn(ct.CONDENSED_NOTE.strip(), r.head, "no entry was condensed at all")
+        self.assertNotIn("y" * 1200, r.head, "the old pin kept its whole body")
+
 
 
 

@@ -201,6 +201,14 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     used, started = 0, order[0] in keep
     walked = set()
     for i in order:
+        if i in pinned and i not in ends:
+            # The stub is already charged, so reaching a pin buys back only the rest.
+            # The newest entry is exempt from the cap, or rotation hides the live anchor.
+            upgrade = _size(entries[i]) - _size(stub[i])
+            if i == order[0] or used + upgrade <= budget:
+                used += upgrade
+                walked.add(i)
+            continue
         if i in keep:
             continue
         if started and used + _size(entries[i]) > budget:
