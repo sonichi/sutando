@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import subprocess
+import threading
 import unittest
 from pathlib import Path
 
@@ -245,6 +247,86 @@ class TestDurability(Base):
         json.loads(p.read_text(encoding="utf-8"))
         self.assertEqual(list(p.parent.glob(".*tmp")), [])
 
+class TestConcurrentWriters(Base):
+    """A shared mutable record has ONE writer contract, and concurrency tests
+    call the production writer. `_write` is atomic for the READER; it does not
+    serialise two writers, and a lost lineage row is unrecoverable — the module
+    records it at start or never. Found in review of this PR."""
+
+    def _spawn_processes(self, wid, n=24):
+        prog = (f"import sys; sys.path.insert(0, {str(REPO / 'src')!r})\n"
+                "import worker_identity as wi\n"
+                f"wi.record_session({str(self.ws)!r}, {wid!r}, 'p-' + sys.argv[1],"
+                " runtime='claude', relation='new')\n")
+        script = self.ws / "writer.py"
+        script.write_text(prog, encoding="utf-8")
+        procs = [subprocess.Popen([sys.executable, str(script), str(i)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                 for i in range(n)]
+        return [p.wait() for p in procs]
+
+    def test_no_session_row_is_lost_across_processes(self):
+        wid = wi.new_worker_id()
+        wi.record_session(self.ws, wid, "s-initial", runtime="claude", relation="new")
+        codes = self._spawn_processes(wid)
+        self.assertEqual([c for c in codes if c != 0], [], "a writer failed")
+        self.assertEqual(len(wi.sessions(self.ws, wid)), 25)
+
+    def test_no_session_row_is_lost_across_threads(self):
+        """Threads share a pid, so this also pins the temp-name collision: a
+        per-pid suffix makes the loser of the race raise FileNotFoundError."""
+        wid = wi.new_worker_id()
+        wi.record_session(self.ws, wid, "s-initial", runtime="claude", relation="new")
+        errors = []
+
+        def write(i):
+            try:
+                wi.record_session(self.ws, wid, f"t-{i}", runtime="claude", relation="new")
+            except Exception as exc:  # noqa: BLE001 — the defect surfaced as an exception
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(wi.sessions(self.ws, wid)), 25)
+
+    def test_no_incarnation_row_is_lost(self):
+        wid = wi.new_worker_id()
+        wi.record_session(self.ws, wid, "s-1", runtime="claude", relation="new")
+        errors = []
+
+        def start(_i):
+            try:
+                wi.start_incarnation(self.ws, wid, "s-1")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=start, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(wi.incarnations(self.ws, wid)), 16)
+
+    def test_the_idempotence_check_holds_under_concurrency(self):
+        """Two writers racing on the SAME session id must yield one row, not two
+        — which is only true if the check and the append share a lock."""
+        wid = wi.new_worker_id()
+
+        def same(_i):
+            wi.record_session(self.ws, wid, "s-same", runtime="claude", relation="new")
+
+        threads = [threading.Thread(target=same, args=(i,)) for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(wi.sessions(self.ws, wid)), 1)
+
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=0)
