@@ -108,6 +108,33 @@ class TestMain(unittest.TestCase):
     def test_empty_thread_is_safe(self):
         self.assertEqual(self._with_fetch([], [], ["1", "--me", ME]), 0)
 
+    def test_every_verdict_names_the_repo_it_measured(self):
+        """A bare `#1` cannot be told apart from the same number in another repo,
+        so a cross-repo run reads an unrelated (usually empty) thread and can only
+        ever say "safe" — a gate that cannot refuse."""
+        import io
+        from contextlib import redirect_stdout
+        for argv, want in (
+                (["1", "--me", ME], g.DEFAULT_REPO),
+                (["1", "--me", ME, "--repo", "other/repo"], "other/repo"),
+        ):
+            for events in ([], [c(T(1), ME)]):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    self._with_fetch(events, [], argv)
+                self.assertIn(f"{want}#1", buf.getvalue())
+
+    def test_the_repo_reaches_fetch(self):
+        seen = []
+        real = g.fetch
+        g.fetch = lambda repo, number: (seen.append(repo), ([], []))[1]
+        try:
+            g.main(["1", "--me", ME])
+            g.main(["1", "--me", ME, "--repo", "other/repo"])
+        finally:
+            g.fetch = real
+        self.assertEqual(seen, [g.DEFAULT_REPO, "other/repo"])
+
     def test_a_fetch_failure_is_cannot_answer_not_a_green_light(self):
         real = g.fetch
 

@@ -16,6 +16,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+DEFAULT_REPO = "sonichi/sutando"
 DEFAULT_THRESHOLD = 3
 
 
@@ -82,12 +83,17 @@ def fetch(repo: str, number: int):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("number", type=int)
-    ap.add_argument("--repo", default="sonichi/sutando")
+    ap.add_argument("--repo", default=None)
     ap.add_argument("--me", required=True)
     ap.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     ap.add_argument("--count-bots", action="store_true",
                     help="treat bot comments as engagement (default: ignore them)")
     args = ap.parse_args(argv)
+    # A silently-defaulted repo makes this gate unable to refuse: on a PR in any
+    # other repo it reads the same-numbered thread here, which is usually empty.
+    if args.repo is None:
+        args.repo = DEFAULT_REPO
+        print(f"assuming --repo {DEFAULT_REPO} (not given)", file=sys.stderr)
 
     if args.threshold < 1:
         print("threshold must be >= 1", file=sys.stderr)
@@ -101,16 +107,17 @@ def main(argv=None) -> int:
     events = merge_events(comments, reviews, keep_bots=args.count_bots)
     run, span = trailing_run(events, args.me)
     if not events:
-        print(f"#{args.number}: no comment/review activity yet — safe to post")
+        print(f"{args.repo}#{args.number}: no comment/review activity yet — safe to post")
         return 0
     if run >= args.threshold:
         print(
-            f"REFUSE #{args.number}: your last {run} events on this thread are ALL yours, "
+            f"REFUSE {args.repo}#{args.number}: your last {run} events on this thread are ALL yours, "
             f"spanning {span:.1f}d, with no reply from anyone else.\n"
             f"  Posting again talks into silence. Re-solicit a human/stand, or leave it."
         )
         return 1
-    print(f"#{args.number}: trailing run of yours = {run} (threshold {args.threshold}) — safe to post")
+    print(f"{args.repo}#{args.number}: trailing run of yours = {run} "
+          f"(threshold {args.threshold}) — safe to post")
     return 0
 
 
