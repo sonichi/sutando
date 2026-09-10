@@ -611,13 +611,23 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertIn("Do NOT stop any of them", d)
         self.assertIn("supervised: 901, 902", d)
 
-    def test_an_ownerless_root_is_still_named_as_stoppable(self):
-        # The control: the fix must not become "never stop anything".
+    def test_mixed_ownership_names_only_the_ownerless_as_stoppable(self):
+        # 901 is supervised (ppid 900 alive), 903 is ownerless (ppid 1). Reported by
+        # qingyun-wu on #3875: the blanket form told an operator to stop 901 too.
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n")
-        self.assertIn("orphaned watcher(s)", d)
-        self.assertIn("stop them and restart one cleanly", d)
+        self.assertIn("Stop ONLY the ownerless (903)", d)
+        self.assertIn("Do NOT stop 901", d)
+        self.assertNotIn("stop them and restart one cleanly", d,
+            "the blanket instruction must not survive when a supervised root is present")
         self.assertIn("ownerless: 903", d)
-        self.assertNotIn("Do NOT stop any of them", d)
+        self.assertIn("supervised: 901", d)
+
+    def test_an_all_ownerless_set_is_still_stoppable(self):
+        # The control: the fix must not become "never stop anything".
+        d = self._detail(f"  900 1 /bin/zsh -l\n  903 1 bash {self.W}\n  904 1 bash {self.W}\n")
+        self.assertIn("2 orphaned watcher(s)", d)
+        self.assertIn("stop them and restart one cleanly", d)
+        self.assertNotIn("Do NOT stop", d)
 
     def test_the_duplicate_processing_cost_is_still_stated(self):
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")

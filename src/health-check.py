@@ -8930,17 +8930,22 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
-            # A root with a live parent is not orphaned and stopping it takes a
-            # healthy instance offline; only ownerless roots keep the stop remedy.
-            if ownerless:
-                lead = (f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                        f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
+            # Stop advice is scoped to the ownerless subset: a root with a live
+            # parent is supervised, and stopping it takes a healthy peer offline.
+            count = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                     f"(pids {', '.join(roots)}) — each drains tasks/, so every task "
+                     f"is processed {len(roots)}x")
+            if ownerless and supervised:
+                lead = (f"{count}. Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
+                        f"one cleanly. Do NOT stop {', '.join(supervised)} — supervised; "
+                        f"reduce those through the launcher that owns them")
+            elif ownerless:
+                lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; "
                         f"stop them and restart one cleanly")
             else:
-                lead = (f"{len(roots)} watcher(s) running with no PID sentinel "
-                        f"(pids {', '.join(roots)}) — each drains tasks/, so every task "
-                        f"is processed {len(roots)}x. Do NOT stop any of them: each is "
-                        f"supervised; reduce the count through the launcher that owns it")
+                lead = (f"{count}. Do NOT stop any of them: each is supervised; "
+                        f"reduce the count through the launcher that owns it")
             return {"name": name, "status": "warn",
                     "detail": f"{lead}. ownerless: {', '.join(ownerless) or 'none'}; "
                               f"supervised: {', '.join(supervised) or 'none'}"}
