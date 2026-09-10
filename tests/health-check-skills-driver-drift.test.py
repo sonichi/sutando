@@ -18,6 +18,8 @@ Covers:
   f) log present, no stamp in it     -> ok (driver logged before stamping)
   g) unreadable skills HEAD          -> ok (degrade; never invent an alarm)
   i) git not runnable (OSError)     -> ok (degrade, never a false alarm)
+  j) real-Git control: the probe's git argv is never a bare "git"
+  j2) absent-CLT control: no runnable git -> ok degrade
   h) POSITIVE CONTROL + MUTATION: the equality test is exercised, not just
      read. Inverting `running == head` in the source must break arm (a) —
      without this, deleting the comparison passes every other arm.
@@ -153,6 +155,45 @@ def main() -> int:
             hc.subprocess.run = real_run
         check(r["status"] == "ok" and "not asserting drift" in r["detail"],
               f"i) git unrunnable -> ok degrade, not a false alarm, got {r}")
+
+    # The macOS /usr/bin/git stub raises an install dialog no timeout can suppress.
+    # Assert the ARGV built, not the verdict: a decision test cannot see the invoke.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text("[v=e1e1f151715f@" + head + "] x\n")
+        real_run = hc.subprocess.run
+        seen = []
+
+        def _spy(argv, *a, **k):
+            seen.append(argv)
+            return real_run(argv, *a, **k)
+
+        hc.subprocess.run = _spy
+        try:
+            hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.subprocess.run = real_run
+        gitcalls = [c for c in seen if c and "rev-parse" in list(c)]
+        check(bool(gitcalls), "j) the probe invokes git at all (guards the arm below)")
+        check(all(list(c)[0] != "git" for c in gitcalls),
+              "j) NO call is a bare 'git' - it goes through the resolver, got " + repr(gitcalls))
+
+    # j2) resolver reports no runnable git -> ok degrade, naming that cause.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text("[v=e1e1f151715f@" + head + "] x\n")
+        real_argv = hc.git_argv
+
+        def _no_git(*a):
+            raise hc.GitUnavailable("no runnable git on this host")
+
+        hc.git_argv = _no_git
+        try:
+            r = hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.git_argv = real_argv
+        check(r["status"] == "ok" and "no runnable git" in r["detail"],
+              "j2) absent CLT -> ok degrade naming the cause, got " + repr(r))
 
     # h) POSITIVE CONTROL + MUTATION. Arm (a) must depend on the equality test.
     #    Invert it in the source, load THAT, and prove the healthy case breaks.

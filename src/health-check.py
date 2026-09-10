@@ -3195,8 +3195,12 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     try:
         stamps = _re.findall(r"v=[0-9a-f]+@([0-9a-f]+)", log.read_text(errors="replace"))
         running = stamps[-1] if stamps else ""
-        head = subprocess.run(["git", "-C", str(skills), "rev-parse", "--short", "HEAD"],
+        # git_argv, never a bare "git": the stock macOS /usr/bin/git is a CLT stub
+        # that raises an install dialog no timeout or except can suppress.
+        head = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--short", "HEAD"),
                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except GitUnavailable:
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host — not asserting drift"}
     except Exception:
         return {"name": name, "status": "ok", "detail": "could not read driver stamp or skills HEAD — not asserting drift"}
     if not running:
