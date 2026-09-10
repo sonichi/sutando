@@ -48,7 +48,7 @@ at routing.
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | shown to the owner; renameable |
-| `incarnation_id` | minted per session | which run of that worker claimed an attempt |
+| `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
 `[a-z0-9][a-z0-9-]{0,31}` ceiling. 122 random bits is what makes independent
@@ -92,12 +92,12 @@ namesake.
 |---|---|---|
 | task | the immutable payload | one |
 | delivery | one task, one intended recipient | one per recipient |
-| execution attempt | which incarnation claimed it, and its progress | one or more |
+| execution attempt | which incarnation accepted it, and its progress | one or more |
 
 ```
 tasks/task-123.txt                                              the payload: immutable, never copied, never moved until finish
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
-deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.claimed    the same sentinel, suffix substituted
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
 tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
 ```
 
@@ -114,7 +114,9 @@ set is N empty files and one payload, and that machinery does not exist. The pri
 two extra residue rows below — a sentinel whose payload was archived, and a payload
 archived between noticing the sentinel and reading it — both bounded and cheap.
 
-**Creating the sentinel assigns; renaming it claims.** The rename is `os.rename`,
+**Creating the sentinel assigns; renaming it records acceptance.** A worker never
+selects its own work, so nothing is *accepted* — the folder already decided the
+recipient, and the rename says the assigned recipient took it up. `os.rename` is
 atomic and exclusive, so of two live incarnations of one worker exactly one holds the
 work. It is the same primitive the rescue line's `acquire_work` uses; only the
 directory differs.
@@ -129,7 +131,7 @@ It adds two failure modes, named and handled in the residue table: an **orphan
 sentinel** (its payload already archived) and a **vanishing payload** (archived
 between reading the sentinel and reading it).
 
-## Request, assignment, claim
+## Request, assignment, acceptance
 
 | state | expressed as | owner |
 |---|---|---|
@@ -230,7 +232,7 @@ acceptance**.
 
 **The core never switches intake protocols** — it reads `deliveries/core/` always,
 and the worker count changes only what the handler decides. And "untouched" must be
-claimed honestly: moving supervision and moving delivery from a pipe to a file *are*
+accepted honestly: moving supervision and moving delivery from a pipe to a file *are*
 changes to the single-core path, so if today's behaviour must be preserved for the
 first pool release, they stay out of its default path.
 
@@ -242,7 +244,7 @@ died mid-work, released to the same worker.
 
 `finish` is the single completion path and refuses unless the caller holds the
 claim, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
-writes nothing. The echo exists because a worker holding two claims once wrote each
+writes nothing. The echo exists because a worker holding two acceptances once wrote each
 reply into the other's result file, and an owner's answer reached the wrong room.
 Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 
@@ -252,7 +254,7 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 |---|---|---|
 | `live` | the worker's beat | nothing |
 | `recovering` | the core | restart the runtime; deliveries keep arriving meanwhile |
-| `abandoned` | the core | release its `.claimed` sentinels back to `.txt` for the same worker |
+| `abandoned` | the core | release its `.accepted` sentinels back to `.txt` for the same worker |
 | `retired` | the core | remove it from the roster; the router then sends its traffic to the core |
 
 The router never reads `state`. These rows are the health-check's, and whatever
@@ -266,7 +268,7 @@ is why a release is not authorised by staleness: it keys on `abandoned`.
 claim with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the
 core is work belonging to a worker that will not return, which ends in a question to
-the owner, and reporting so a long-claimed delivery is visible.
+the owner, and reporting so a long-accepted delivery is visible.
 
 ## Supervision
 
@@ -336,8 +338,8 @@ Everything below is normative and meant to be built from directly.
 <workspace>/
   tasks/<task-id>.txt                     payload (bridge header format), immutable after admission
   tasks/archive/<task-id>.txt             terminal
-  deliveries/<recipient-id>/<task-id>.txt      sentinel, 0 bytes, unclaimed
-  deliveries/<recipient-id>/<task-id>.claimed  sentinel, 0 bytes, claimed by one incarnation
+  deliveries/<recipient-id>/<task-id>.txt      sentinel, 0 bytes, pending
+  deliveries/<recipient-id>/<task-id>.accepted sentinel, 0 bytes, accepted by one incarnation
   results/<task-id>.txt                   reply body
   state/roster.json                       compiled; router reads only
   state/bindings.json                     owner-authored declarations
@@ -373,10 +375,10 @@ Input is the roster and one admitted task; nothing else may be read.
 1. Load `state/roster.json`. **Unreadable or absent → refuse the pass and report.** Never default to the core.
 2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
 3. Any target not in the roster resolves to `core`. State is not read.
-4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.claimed` already exists, it is delivered — do nothing. **Checking only the unclaimed name would recreate a sentinel for work in flight and deliver it twice.** Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
+4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do nothing. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
 5. A set is step 4 once per member; the payload is never copied.
 
-The name keeps `.txt` because the watcher a worker runs emits for no other extension; claiming substitutes the suffix, so a claimed file stops waking anyone.
+The name keeps `.txt` because the watcher a worker runs emits for no other extension; claiming substitutes the suffix, so a accepted file stops waking anyone.
 
 Order candidates `urgent > normal > low`, then oldest payload `created_at` first.
 
@@ -384,7 +386,7 @@ Order candidates `urgent > normal > low`, then oldest payload `created_at` first
 
 1. Watch `deliveries/<me>/`, plus one sweep of the same folder at boot. The sweep is not optional: a delivery written while the session was down produces no event.
 2. Candidates are entries ending in `.txt`.
-3. Claim: `os.rename(<task-id>.txt, <task-id>.claimed)`. **`OSError` means somebody won the race — skip the task and continue.** It is the core releasing, or another incarnation of this same worker.
+3. Accept: `os.rename(<task-id>.txt, <task-id>.accepted)`. **`OSError` means somebody won the race — skip the task and continue.** It is the core releasing, or another incarnation of this same worker.
 4. Read `tasks/<task-id>.txt`. **Missing → the payload was archived under it; remove the stale sentinel and continue.**
 5. Execute, then `finish`.
 
@@ -395,7 +397,7 @@ addressed to it, which is routing by another name.
 
 ### finish — the single completion path
 
-Refuse, writing nothing, unless all three hold: the caller holds `deliveries/<me>/<task-id>.claimed`; the body's first line is exactly `task: <task-id>`; the body after that line is non-empty.
+Refuse, writing nothing, unless all three hold: the caller holds `deliveries/<me>/<task-id>.accepted`; the body's first line is exactly `task: <task-id>`; the body after that line is non-empty.
 
 Then, in this order, each step durable before the next:
 
@@ -411,7 +413,7 @@ Archiving is no-clobber: on collision mint `<task-id>.txt.1`, `.2`, …
 |---|---|---|
 | result, no flag | completed, flag write was interrupted | write the flag, finish the archive; never re-run |
 | flag, no result | finished; the bridge already drained the result | archive; never re-run — the flag alone is terminal |
-| `.claimed`, no result | died mid-work | rename back to `<task-id>.txt`; the same worker retakes it |
+| `.accepted`, no result | died mid-work | rename back to `<task-id>.txt`; the same worker retakes it |
 | sentinel, no payload | payload already archived | remove the sentinel |
 | payload, no sentinel, not archived | never routed | leave it; the router will place it |
 
@@ -419,9 +421,9 @@ Archiving is no-clobber: on collision mint `<task-id>.txt.1`, `.2`, …
 
 An OS timer, 300 s, independent of any agent session.
 
-1. For each worker in the roster that is not `retired` or owner-paused, collect: beat age, whether a session is running, count of `.claimed` files, and the newest `mtime` among its done-flags and results.
+1. For each worker in the roster that is not `retired` or owner-paused, collect: beat age, whether a session is running, count of `.accepted` files, and the newest `mtime` among its done-flags and results.
 2. **Process death** — beat older than 90 s *and* no session *and* not paused, on three consecutive ticks → the pre-authorised remedy: restart that worker's process. Deterministic; needs no core.
-3. **Task stalled** — holds `.claimed` files whose age exceeds a threshold while no done-flag or result has appeared → write an anomaly record and route it to the core for diagnosis. **Never authorises a restart.**
+3. **Task stalled** — holds `.accepted` files whose age exceeds a threshold while no done-flag or result has appeared → write an anomaly record and route it to the core for diagnosis. **Never authorises a restart.**
 4. Anomaly records are deduplicated on `(worker-id, signal)` and cleared when work advances.
 5. Verification is that work advanced, not that a process returned.
 
