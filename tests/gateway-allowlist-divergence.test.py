@@ -37,9 +37,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 AGENT = "@sutando-test:ag2.space"
 
-# ---------------------------------------------------------------------------
 # 1–2. pure body
-# ---------------------------------------------------------------------------
 body = rgb.allowlist_divergence(["@rui:hs", "@mark:hs"], ["@rui:hs"], AGENT)
 check("divergence names the missing sender", body is not None and "@mark:hs" in body, repr(body)[:80])
 check("divergence carries the exact fix command",
@@ -51,9 +49,7 @@ check("broker superset → None (only silent-drop direction warns)",
 check("own id/blank entries ignored",
       rgb.allowlist_divergence([AGENT, "  ", "@rui:hs"], ["@rui:hs"], AGENT) is None)
 
-# ---------------------------------------------------------------------------
 # hook end-to-end with fake broker + temp dirs
-# ---------------------------------------------------------------------------
 def fresh():
     tmp = Path(tempfile.mkdtemp(prefix="allowdiv-ws-"))
     set_dirs(task_dir=tmp / "tasks", result_dir=tmp / "results", state_dir=tmp / "state")
@@ -137,9 +133,8 @@ try:
     check("access.json was never touched across the three passes",
           os.path.getmtime(rgb._ag2space_access_path()) == mtime_before)
 
-    # 4c. a NEW divergence (another sender) → one more warning. Counted relative
-    # to the prior state: an absolute count silently breaks when a case is inserted
-    # above, which is a stale assertion rather than a real regression.
+    # 4c. Counted relative to the prior state: an absolute count silently breaks
+    # when a case is inserted above, reading as a regression rather than staleness.
     n_before = len(proactive_files(tmp))
     write_access(["@rui:hs", "@mark:hs", "@sam:hs"])
     rgb._maybe_warn_allowlist_divergence()
@@ -177,11 +172,8 @@ try:
 finally:
     rgb._req = _orig_req
 
-# 7. unsupported endpoint (404/405 = pre-registry gateway): mirror the /ack
-# cooldown (qingyun CR 2026-07-30). Two consecutive loops must make exactly ONE
-# /v1/agents attempt and ONE log line; after the cooldown expires the request
-# is retried (self-healing, no worker restart needed). mtime stays unmarked so
-# a gateway that gains the endpoint still gets the real divergence check.
+# 7. 404/405 means a pre-registry gateway: cooldown, then retry. mtime stays
+# unmarked so a gateway that later gains the endpoint still gets checked.
 import io
 import urllib.error
 
@@ -228,9 +220,8 @@ finally:
     rgb._log = _orig_log
     rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
 
-# 7b. a non-404/405 HTTP error (e.g. 500) stays TRANSIENT: no cooldown is
-# entered, so the very next loop retries — only the unsupported-endpoint
-# shape gets the time gate.
+# 7b. A non-404/405 error stays TRANSIENT: no cooldown, so the next loop
+# retries — only the unsupported-endpoint shape gets the time gate.
 tmp = fresh()
 rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
 write_access(["@rui:hs", "@mark:hs"])

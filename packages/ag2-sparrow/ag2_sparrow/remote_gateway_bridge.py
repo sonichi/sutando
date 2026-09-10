@@ -485,7 +485,6 @@ def _tier_for(user_id):
     return LOCAL_TIER
 
 
-# ── allowlist divergence warning (local access.json vs broker registry) ──────
 # The BROKER registry decides whose messages become tasks; local access.json only
 # re-tiers ones that arrived, so a local-only add drops silently at the broker.
 
