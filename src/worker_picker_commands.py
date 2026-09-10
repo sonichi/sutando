@@ -37,6 +37,12 @@ import local_task_protocol as ltp  # noqa: E402
 
 SOURCE = "worker-picker"
 
+# A header the broker may stamp instead of relying on the sentence. Read from
+# ABOVE `task:` only, like `requested_worker`, so a body cannot forge one.
+COMMAND_HEADER = "picker_command"
+COMMAND_ARGS_HEADER = "picker_args"
+COMMANDS = ("add", "pin", "unpin")
+
 _ADD = re.compile(r"^Add a new worker to the pool\b", re.I)
 _LABEL = re.compile(r"Preferred label for the new worker:\s*(.+?)\.?\s*$", re.I)
 _UNPIN = re.compile(r"^Unpin room\s+(\S+)", re.I)
@@ -56,19 +62,58 @@ def _refuse_no_room(action: str) -> None:
           file=sys.stderr)
 
 
+def _structured(headers: dict, room: str) -> "dict | None":
+    """The intent from a stamped command, or None when there is no usable one.
+
+    An UNKNOWN command returns None rather than falling through to the prose:
+    a broker that names a verb we do not implement must not be answered by
+    guessing from a sentence written for a different one.
+    """
+    name = (headers.get(COMMAND_HEADER) or "").strip()
+    if not name:
+        return None
+    if name not in COMMANDS:
+        return {"action": "unsupported", "command": name}
+    args = {}
+    raw = (headers.get(COMMAND_ARGS_HEADER) or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            args = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            # A stamped command we cannot read is a refusal, not a reason to
+            # trust the sentence: nothing proves the two say the same thing.
+            return {"action": "malformed", "command": name}
+    if name == "add":
+        label = args.get("label")
+        return {"action": "add", "label": str(label) if label else None}
+    workers = args.get("workers") or ([args["worker"]] if args.get("worker") else [])
+    at = room or str(args.get("room") or "")
+    if name == "unpin":
+        return {"action": "unpin", "room": at}
+    return {"action": "pin", "room": at,
+            "workers": [str(w) for w in workers],
+            "dedicated": bool(args.get("dedicated"))}
+
+
 def parse(headers: dict, body: str) -> "dict | None":
     """The intent behind one task, or None when it is not the picker's.
 
     `headers` must come from the strict parser (see module docstring): every
     key read below is an authorization field, and a lenient scan would let the
-    body supply one. An unrecognised sentence from a genuine picker task
-    returns None rather than a guess: a wrong intent creates or re-routes a
-    worker. So does a room-scoped sentence with no stamped room.
+    body supply one. A stamped command wins over the sentence; the sentence is
+    the fallback for a broker that stamps none. An unrecognised sentence
+    returns None rather than a guess, and so does a room-scoped sentence with
+    no stamped room: a wrong intent creates or re-routes a worker.
     """
     if (headers.get("source") or "").strip() != SOURCE:
         return None
     text = " ".join((body or "").split())
     room = (headers.get("channel_id") or "").strip()
+
+    structured = _structured(headers, room)
+    if structured is not None:
+        return structured
 
     if _ADD.search(text):
         m = _LABEL.search(text)
