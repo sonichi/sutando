@@ -200,7 +200,7 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    clock-only | static-with-work | retry-loop | blocked | provider-limit | low-novelty |
+    clock-only | static-with-work | retry-loop | abnormal | provider-limit | low-novelty |
     unknown (or, from the window, cadence-too-sparse); the four before unknown are warnings. `raw_static` is case 1's
     input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
@@ -263,20 +263,23 @@ def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_on
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
     bs = ps.get("_blocked") or {"blocked_current": False, "current_blocked": [],
                                 "consecutive_blocked_samples": 0}
-    if bs["blocked_current"]:
-        conf = "high" if bs["consecutive_blocked_samples"] >= 3 else "medium"
-        why = (f"blocked text on the last {bs['consecutive_blocked_samples']} "
-               f"sample(s) ({', '.join(bs['current_blocked'])})")
+    low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
+    # Retry is a SHAPE of the abnormal axis, not a sibling (owner): a retrying
+    # pane is `moving + abnormal` — it moves while the work does not proceed.
+    if bs["blocked_current"] or ps["retry_current"]:
+        names = list(bs["current_blocked"]) + list(ps["current_patterns"])
+        n = max(bs["consecutive_blocked_samples"], ps["consecutive_pattern_samples"])
+        # BOTH conditions: enough samples observed AND the text is recurrent.
+        # n>=3 alone called a short window high-confidence; `enough` alone ignored recurrence.
+        conf = "high" if (n >= 3 and enough) else "medium"
+        why = f"blocked text on the last {n} sample(s) ({', '.join(names)})"
         # Kinds stay STRING LITERALS: the availability fold's totality test derives
         # the emittable set by scanning this source, and a variable hides them.
         if any(p in bs["current_blocked"] for p in PROVIDER_LIMIT_PATTERNS):
             return {**base, "kind": "provider-limit", "confidence": conf, "warn": True, "reason": why}
-        return {**base, "kind": "blocked", "confidence": conf, "warn": True, "reason": why}
-    low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
-    # Retry loop = low novelty AND retry text that is current and recurrent (not a stale residue).
-    if ps["retry_current"] and (raw_static or nov.static or low_novelty):
-        return {**base, "kind": "retry-loop", "confidence": "high" if enough else "medium", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct state(s) over {nov.sample_count} samples; retry text on the last {ps['consecutive_pattern_samples']} ({', '.join(ps['current_patterns'])})"}
+        if ps["retry_current"] and not bs["blocked_current"]:
+            return {**base, "kind": "retry-loop", "confidence": conf, "warn": True, "reason": why}
+        return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
     if raw_static:
         if work_outstanding:

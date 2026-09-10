@@ -152,8 +152,8 @@ class Classifier(unittest.TestCase):
             return [f"{msg}\n  idle · 5:{17 + i // 3:02d} PM · nothing running\n> "
                     for i in range(12)]
         for msg, want in (("You are out of usage credits", "provider-limit"),
-                          ("Please log in to continue", "blocked"),
-                          ("Compacting conversation", "blocked")):
+                          ("Please log in to continue", "abnormal"),
+                          ("Compacting conversation", "abnormal")):
             v = w.classify(moving(msg), False, 4200)
             self.assertEqual(v["kind"], want, msg)
             self.assertTrue(v["warn"], msg)
@@ -164,7 +164,7 @@ class Classifier(unittest.TestCase):
         v = w.classify(["Please log in to continue"] * 8, True, 600)
         self.assertEqual(v["matched_patterns"], [])
         self.assertIn("needs-login", v["matched_blocked"])
-        self.assertEqual(v["kind"], "blocked")
+        self.assertEqual(v["kind"], "abnormal")
 
     def test_the_two_families_are_disjoint(self):
         self.assertFalse({n for n, _ in w.RETRY_PATTERNS} & {n for n, _ in w.BLOCKED_PATTERNS})
