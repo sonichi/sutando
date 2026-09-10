@@ -107,6 +107,44 @@ class Base(unittest.TestCase):
 
 
 class TestStage(Base):
+    def test_skipped_empty_session_is_neither_counted_nor_pending(self):
+        # extract.py skipped an aborted session (no dump, no summary): the
+        # digest and the sinks count what was summarised, and --commit is not blocked
+        U4 = "44444444-dddd-4ddd-8ddd-dddddddddddd"
+        p = self.data / "index.json"
+        doc = json.loads(p.read_text())
+        doc["counts"]["sessions"] = 4
+        doc["projects"][SLUG_A]["session_count"] = 3
+        doc["projects"][SLUG_A]["sessions"].append(
+            {"uuid": U4, "title": "aborted session", "first_ts": "2026-08-06T09:00:00Z",
+             "last_ts": "2026-08-06T09:00:00Z", "user_msgs": 1, "assistant_msgs": 0})
+        p.write_text(json.dumps(doc))
+        (self.data / "state.json").write_text(json.dumps({"sessions": {
+            f"{SLUG_A}/{U4}": {"extracted_at": "2026-09-10T00:00:00Z", "chunks": 0, "chars": 0,
+                               "skipped_empty": True}}, "projects": {}}))
+        rc, c, _err = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["projects"]), (3, 3, 2))
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("3 sessions across 2 projects", review)
+        self.assertIn("2 sessions (2026-08-01 → 2026-08-05)", review)      # Alpha: 3 indexed, 1 skipped
+        self.assertNotIn("aborted", review)
+        self.assertNotIn(U4[:8], (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text())
+        overview = (self.staged / "notes" / "claude-import" / "overview.md").read_text()
+        self.assertIn("Imported 3 sessions across 2 projects", overview)
+        self.assertIn("2 sessions (2026-08-01", overview)
+        rc, c, _err = self._run("--commit")
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["committed"]), (3, 3, 2))
+        self.assertIn("Imported 3 sessions / 2 projects on ", (self.mem / "claude_import.md").read_text())
+        state = json.loads((self.data / "state.json").read_text())
+        rec = state["sessions"][f"{SLUG_A}/{U4}"]
+        self.assertTrue(rec["skipped_empty"])
+        self.assertNotIn("summarized_at", rec)
+        for u in (U1, U2):
+            self.assertIn("summarized_at", state["sessions"][f"{SLUG_A}/{u}"])
+        self.assertEqual(self._status()["phase"], "done")
+
     def test_default_run_stages_and_touches_no_sink(self):
         rc, c, _err = self._run()
         self.assertEqual(rc, 0)

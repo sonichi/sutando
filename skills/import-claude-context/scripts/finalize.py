@@ -41,6 +41,10 @@ finalize runs in two steps:
                                                 changed roll-up appends `## Update <date>`
       <workspace>/notes/claude-import/overview.md regenerated
       <data-dir>/state.json                     `summarized_at` per session, note hashes
+                                                (a session extract.py marked
+                                                `skipped_empty` has no dump and no
+                                                summary: it is left out of every
+                                                session count and never pending)
       <data-dir>/status.json                    phase `done` + counts (`staged` while a
                                                 --projects remainder is still pending)
     Refused (exit 1) when nothing is staged, or when the summaries, roll-ups or
@@ -243,16 +247,39 @@ def project_meta(index_doc: dict, slug: str) -> dict:
     return (index_doc.get("projects") or {}).get(slug) or {}
 
 
-def session_total(index_doc: dict, summaries: dict, slugs, all_slugs) -> int:
+def skipped_empty_by_slug(state: dict) -> dict:
+    """{slug: n} of the sessions extract.py skipped as empty (no dump, no summary)."""
+    out = {}
+    for key, rec in (state.get("sessions") or {}).items():
+        if isinstance(rec, dict) and rec.get("skipped_empty"):
+            slug = key.rsplit("/", 1)[0]
+            out[slug] = out.get(slug, 0) + 1
+    return out
+
+
+def session_total(index_doc: dict, summaries: dict, slugs, all_slugs, state=None) -> int:
     """Sessions behind `slugs`: the index total once every project is in, else the
-    per-project counts (falling back to the summaries on disk)."""
+    per-project counts (falling back to the summaries on disk) — minus the
+    sessions extract.py skipped as empty, which the owner was never promised."""
+    skipped = skipped_empty_by_slug(state or {})
     if set(all_slugs) <= set(slugs):
-        return int(index_doc.get("counts", {}).get("sessions") or len(summaries))
+        indexed = int(index_doc.get("counts", {}).get("sessions") or 0)
+        if indexed:
+            return max(len(summaries), indexed - sum(skipped.values()))
+        return len(summaries)
     total = 0
     for slug in slugs:
-        total += int(project_meta(index_doc, slug).get("session_count")
-                     or sum(1 for (s, _u) in summaries if s == slug))
+        n_sum = sum(1 for (s, _u) in summaries if s == slug)
+        indexed = int(project_meta(index_doc, slug).get("session_count") or 0)
+        total += max(n_sum, indexed - skipped.get(slug, 0)) if indexed else n_sum
     return total
+
+
+def project_sessions(index_doc: dict, slug: str, state=None) -> int:
+    """One project's session count as the owner should read it: the index count
+    minus the sessions extract.py skipped as empty."""
+    n = int(project_meta(index_doc, slug).get("session_count") or 0)
+    return max(0, n - skipped_empty_by_slug(state or {}).get(slug, 0))
 
 
 def display_name(slug: str, rollup: dict, index_doc: dict) -> str:
@@ -477,8 +504,8 @@ def write_project_note(ndir: Path, slug: str, rollup: dict, index_doc: dict, sum
     return result
 
 
-def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: str) -> str:
-    slugs = sorted(rollups, key=lambda s: (-(project_meta(index_doc, s).get("session_count") or 0), s))
+def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: str, state=None) -> str:
+    slugs = sorted(rollups, key=lambda s: (-project_sessions(index_doc, s, state), s))
     text = _frontmatter("Claude Code history import — overview")
     text += header_line(index_doc, slugs, run_kind) + "\n\n"
     text += (f"# Claude Code history import\n\n"
@@ -494,7 +521,7 @@ def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: s
         status = _one_line(r.get("status"), 20) or "unknown"
         thread = _one_line(r.get("top_open_thread"), 140)
         line = f"- [{name}]({slug}.md) — {what or '(no roll-up)'} · {status}"
-        line += f" · {p.get('session_count') or 0} sessions ({_day(p.get('first_ts'))} → {_day(p.get('last_ts'))})"
+        line += f" · {project_sessions(index_doc, slug, state)} sessions ({_day(p.get('first_ts'))} → {_day(p.get('last_ts'))})"
         if thread:
             line += f" · open: {thread}"
         text += line + "\n"
@@ -859,7 +886,7 @@ def _person_why(p: dict) -> str:
 
 def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, candidates, below_floor: int,
                   outcomes: dict, memory_bytes: int, n_memory_projects: int, n_sessions: int,
-                  run_kind: str, merged=None) -> str:
+                  run_kind: str, merged=None, state=None) -> str:
     """The digest the owner reads before anything lands — the one place
     transcript-derived text is shown to them."""
     first, last = date_range(index_doc, slugs)
@@ -873,7 +900,7 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
         r = rollups[slug]
         p = project_meta(index_doc, slug)
         text += f"### {display_name(slug, r, index_doc)} (`{slug}`)\n\n"
-        meta = [f"{p.get('session_count') or 0} sessions ({_day(p.get('first_ts'))} → {_day(p.get('last_ts'))})",
+        meta = [f"{project_sessions(index_doc, slug, state)} sessions ({_day(p.get('first_ts'))} → {_day(p.get('last_ts'))})",
                 f"status: {_one_line(r.get('status'), 20) or 'unknown'}",
                 note_words.get(outcomes.get(slug), "note: new")]
         if p.get("cwd"):
@@ -945,20 +972,20 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
     # project: preview them as they will read once the pending set is in too.
     preview = committed_rollups(rollups, state)
     preview.update({s: rollups[s] for s in slugs})
-    n_preview = session_total(index_doc, summaries, preview, rollups)
-    (sndir / OVERVIEW).write_text(render_overview(preview, index_doc, n_preview, run_kind), encoding="utf-8")
+    n_preview = session_total(index_doc, summaries, preview, rollups, state)
+    (sndir / OVERVIEW).write_text(render_overview(preview, index_doc, n_preview, run_kind, state), encoding="utf-8")
     memory_text = render_memory_file(preview, index_doc, n_preview)
     (smem / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
 
     candidates, below_floor = people_candidates(entities, projects=set(slugs))
     people = people_payloads(entities, index_doc, projects=set(slugs))
     _common.write_json(sdir / STAGED_PEOPLE, people)
-    n_sessions = session_total(index_doc, summaries, slugs, rollups)
+    n_sessions = session_total(index_doc, summaries, slugs, rollups, state)
     (sdir / STAGED_REVIEW).write_text(
         render_review(slugs=slugs, rollups=rollups, index_doc=index_doc, entities=entities,
                       candidates=candidates, below_floor=below_floor, outcomes=outcomes,
                       memory_bytes=len(memory_text.encode("utf-8")), n_memory_projects=len(preview),
-                      n_sessions=n_sessions, run_kind=run_kind, merged=merged),
+                      n_sessions=n_sessions, run_kind=run_kind, merged=merged, state=state),
         encoding="utf-8")
     tally = {k: sum(1 for v in outcomes.values() if v == k) for k in ("created", "updated", "unchanged")}
     counts = {
@@ -1033,8 +1060,8 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
                 rec["summarized_at"] = stamp
 
     committed = committed_rollups(rollups, state)
-    n_sessions = session_total(index_doc, summaries, committed, rollups)
-    (ndir / OVERVIEW).write_text(render_overview(committed, index_doc, n_sessions, run_kind), encoding="utf-8")
+    n_sessions = session_total(index_doc, summaries, committed, rollups, state)
+    (ndir / OVERVIEW).write_text(render_overview(committed, index_doc, n_sessions, run_kind, state), encoding="utf-8")
     memory_dir.mkdir(parents=True, exist_ok=True)
     memory_text = render_memory_file(committed, index_doc, n_sessions)
     (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
@@ -1128,11 +1155,11 @@ def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: s
     index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
     summaries = load_summaries(data_dir)
     rollups = committed_rollups(load_rollups(data_dir), state)
-    n_sessions = session_total(index_doc, summaries, rollups, rollups)
+    n_sessions = session_total(index_doc, summaries, rollups, rollups, state)
     ndir = notes_dir(ws)
     if rollups:
         if ndir.is_dir():
-            (ndir / OVERVIEW).write_text(render_overview(rollups, index_doc, n_sessions, run_kind),
+            (ndir / OVERVIEW).write_text(render_overview(rollups, index_doc, n_sessions, run_kind, state),
                                          encoding="utf-8")
         if memory_dir.is_dir():
             (memory_dir / MEMORY_FILE).write_text(

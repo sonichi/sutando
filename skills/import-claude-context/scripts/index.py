@@ -21,12 +21,19 @@ Modes:
   (default)      full pass; writes index.json + claude-import-index.md into
                  --out-dir and records each session's (mtime,size) in state.json
   --counts-only  readdir + stat only: opens no transcript, writes nothing —
-                 the number the "found N conversations" message needs, in ms
+                 a FILE count, in ms (sidechains and sessions nobody answered
+                 cannot be told apart without a read: `empty`/`conversations`
+                 are null here; the full pass has them)
   --dry-run      full pass, writes nothing, prints counts
   --new          also list only the sessions whose (mtime,size) changed since
                  the last index run (the `new` count is always reported)
   --json         print the counts as JSON — counts only, never titles, prompts
                  or paths (the onboarding card reads this)
+
+Counts: `sessions` is every non-sidechain transcript; `empty` the ones with no
+assistant message at all (aborted / never-answered — extract.py skips them,
+nothing is summarised); `conversations` = sessions − empty, the number the
+owner is told ("N conversations across M projects").
 
 The source tree is opened read-only and --out-dir may not lie inside it.
 """
@@ -318,6 +325,7 @@ def build_projects(scanned: dict) -> dict:
             "dialog_bytes": sum(r["dialog_bytes"] for r in sessions),
             "user_msgs": sum(r["user_msgs"] for r in sessions),
             "assistant_msgs": sum(r["assistant_msgs"] for r in sessions),
+            "empty": sum(1 for r in sessions if r["assistant_msgs"] == 0),
             "sessions": sessions,
         }
     return projects
@@ -329,10 +337,12 @@ def render_index_md(index: dict) -> str:
         "# Claude Code history — import index",
         "",
         f"Generated {index['generated_at']} from `{index['root']}` — "
-        f"{c['sessions']} sessions across {c['projects']} projects "
+        f"{c['sessions']} sessions across {c['projects']} projects — "
+        f"{c['conversations']} conversations, {c['empty']} with no assistant reply "
         f"({c['sidechains']} sidechain and {c['subagent_files']} subagent transcripts skipped).",
         "",
-        "Tick `[x]` when a session's summary has landed in `summaries/<slug>/<uuid>.json`.",
+        "A session's summary lands in `summaries/<slug>/<uuid>.json`; `progress.py` counts them. "
+        "A `0` assistant count is a session nobody answered: extract.py skips it, nothing is summarised.",
         "",
     ]
     projects = sorted(index["projects"].values(),
@@ -362,7 +372,7 @@ def render_index_md(index: dict) -> str:
 # --------------------------------------------------------------------------- index
 
 COUNT_KEYS = (
-    "projects", "project_dirs", "sessions", "sidechains", "subagent_files",
+    "projects", "project_dirs", "sessions", "empty", "conversations", "sidechains", "subagent_files",
     "skipped_since", "user_msgs", "assistant_msgs", "tool_lines", "dialog_bytes",
     "bytes_on_disk", "earliest", "latest", "new", "counts_only", "dry_run",
 )
@@ -394,6 +404,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
             "projects": sum(1 for e in listing.values() if e["sessions"]),
             "project_dirs": project_dirs,
             "sessions": sessions,
+            "empty": None, "conversations": None,   # a file count cannot know
             "sidechains": None,
             "subagent_files": sum(e["subagent_files"] for e in listing.values()),
             "skipped_since": sum(e["skipped_since"] for e in listing.values()),
@@ -438,6 +449,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
         "projects": sum(1 for p in fresh.values() if p["session_count"]),
         "project_dirs": project_dirs,
         "sessions": sum(p["session_count"] for p in fresh.values()),
+        "empty": sum(p["empty"] for p in fresh.values()),
         "sidechains": sum(p["sidechains"] for p in fresh.values()),
         "subagent_files": sum(p["subagent_files"] for p in fresh.values()),
         "skipped_since": sum(p["skipped_since"] for p in fresh.values()),
@@ -452,6 +464,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
         "counts_only": False,
         "dry_run": bool(dry_run),
     }
+    counts["conversations"] = counts["sessions"] - counts["empty"]
 
     # A filtered run (--projects/--since) must not forget the projects it did
     # not look at: merge over the previous index.json.
@@ -476,6 +489,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
                 rec.update({"mtime_ns": s["mtime_ns"], "size": s["size"], "indexed_at": stamp})
         _common.save_state(out_dir, state)
         write_status(out_dir, "indexed", sessions=counts["sessions"], projects=counts["projects"],
+                     conversations=counts["conversations"], empty=counts["empty"],
                      new=counts["new"], sidechains=counts["sidechains"],
                      subagent_files=counts["subagent_files"])
 
@@ -490,9 +504,10 @@ def counts_line(r: dict) -> str:
     if r.get("counts_only"):
         return (f"{r['sessions']} transcripts across {r['projects']} projects "
                 f"({r['subagent_files']} subagent transcripts skipped; "
-                f"{r['bytes_on_disk'] / 1e6:.1f} MB on disk) — stat only")
+                f"{r['bytes_on_disk'] / 1e6:.1f} MB on disk) — stat only, a file count")
     return (f"{r['sessions']} sessions across {r['projects']} projects "
-            f"({r['sidechains']} sidechain + {r['subagent_files']} subagent transcripts skipped); "
+            f"({r['conversations']} conversations, {r['empty']} empty; "
+            f"{r['sidechains']} sidechain + {r['subagent_files']} subagent transcripts skipped); "
             f"{r['new']} new since the last index; dialog ≈ {r['dialog_bytes'] / 1e6:.1f} MB; "
             f"{_day(r['earliest'])} → {_day(r['latest'])}"
             + ("; dry run — nothing written" if r["dry_run"] else ""))

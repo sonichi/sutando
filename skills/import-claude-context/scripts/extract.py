@@ -18,10 +18,20 @@ Flags:
   --max-chars-total N  soft cap for the run, default 8,000,000 chars — newest
                        sessions first; the run stops once the cap is reached
   --max-chunk-chars N  default 120,000
+  --min-chars N        a session whose cleaned dialog is shorter than this
+                       (default 400 chars) — or yields no turn at all — is not
+                       extracted: no dump, counted as `skipped_empty`
   --json               print the counts as JSON (counts only)
 
 Records per-session extraction in state.json (extracted_at, mtime, size,
-chunks, chars) and writes status.json (phase + counts).
+chunks, chars; `skipped_empty: true` for the sessions that had nothing worth
+summarising, so a `--new` re-run leaves them alone until the file changes) and
+writes status.json (phase + counts). `extracted` counts only the sessions
+that wrote at least one chunk — the fresh-install run of 2026-09-10 reported
+47 extracted while 43 dump files existed: four aborted sessions (no assistant
+turn) went through the loop with an empty chunk list and were counted anyway,
+and a fifth survived at 178 bytes, enough to pass an emptiness test and
+produce a useless summary.
 """
 from __future__ import annotations
 
@@ -48,6 +58,7 @@ from util_paths import write_private_text  # noqa: E402
 
 DEFAULT_MAX_TOTAL = 8_000_000
 DEFAULT_MAX_CHUNK = 120_000
+DEFAULT_MIN_CHARS = 400
 _HEADER_ALLOWANCE = 200
 TRUNCATED_MARK = " […turn truncated to fit one chunk]"
 
@@ -201,8 +212,16 @@ def _select_sessions(index_doc: dict, projects, session, new_only, state, root: 
     return wanted, unchanged
 
 
+def _drop_dumps(dumps_root: Path, slug: str, uuid: str) -> None:
+    """Remove a session's chunk files (a session that turned out empty on a
+    re-extraction must not keep the dumps of an earlier version)."""
+    for old in (dumps_root / slug).glob(f"{uuid}.*.txt"):
+        old.unlink()
+
+
 def extract(root=None, *, out_dir, projects=None, session=None, new_only=False,
-            max_chars_total=DEFAULT_MAX_TOTAL, max_chunk_chars=DEFAULT_MAX_CHUNK) -> dict:
+            max_chars_total=DEFAULT_MAX_TOTAL, max_chunk_chars=DEFAULT_MAX_CHUNK,
+            min_chars=DEFAULT_MIN_CHARS) -> dict:
     root = Path(root) if root else index_mod.default_root()
     out_dir = Path(out_dir)
     _common.refuse_inside(root, out_dir)
@@ -217,8 +236,8 @@ def extract(root=None, *, out_dir, projects=None, session=None, new_only=False,
 
     recap = load_recap_extract()
     dumps_root = _common.ensure_private_dir(out_dir / DUMPS_DIR)
-    counts = {"extracted": 0, "chunks": 0, "chars": 0, "redactions": 0, "errors": 0,
-              "skipped_unchanged": unchanged, "budget_exhausted": False, "remaining": 0}
+    counts = {"extracted": 0, "skipped_empty": 0, "chunks": 0, "chars": 0, "redactions": 0,
+              "errors": 0, "skipped_unchanged": unchanged, "budget_exhausted": False, "remaining": 0}
     for i, (slug, s, st) in enumerate(wanted):
         if counts["chars"] >= max_chars_total:
             counts["budget_exhausted"] = True
@@ -232,15 +251,25 @@ def extract(root=None, *, out_dir, projects=None, session=None, new_only=False,
         cleaned = clean_dump(raw)
         n_redactions, redacted = redact(cleaned)
         chunks = chunk_turns(redacted, max_chunk_chars)
-        paths = write_chunks(dumps_root, slug, s["uuid"], chunks)
-        chars = sum(len(c) for c in chunks)
+        dialog_chars = len(redacted.strip())
         rec = state["sessions"].setdefault(session_key(slug, s["uuid"]), {})
         rec.update({
             "mtime_ns": st.st_mtime_ns, "size": st.st_size,
             "extracted_at": now_iso(), "extracted_mtime_ns": st.st_mtime_ns,
-            "extracted_size": st.st_size, "chunks": len(paths), "chars": chars,
-            "redactions": n_redactions,
+            "extracted_size": st.st_size, "redactions": n_redactions,
         })
+        if not chunks or dialog_chars < min_chars:
+            # Nothing a summariser could work with (an aborted or never-answered
+            # session, or a couple of lines). No dump; remembered in state so
+            # --new does not retry it; never counted as extracted.
+            _drop_dumps(dumps_root, slug, s["uuid"])
+            rec.update({"skipped_empty": True, "chunks": 0, "chars": dialog_chars})
+            counts["skipped_empty"] += 1
+            continue
+        rec.pop("skipped_empty", None)
+        paths = write_chunks(dumps_root, slug, s["uuid"], chunks)
+        chars = sum(len(c) for c in chunks)
+        rec.update({"chunks": len(paths), "chars": chars})
         counts["extracted"] += 1
         counts["chunks"] += len(paths)
         counts["chars"] += chars
@@ -262,19 +291,22 @@ def main(argv=None) -> int:
     ap.add_argument("--new", action="store_true")
     ap.add_argument("--max-chars-total", type=int, default=DEFAULT_MAX_TOTAL)
     ap.add_argument("--max-chunk-chars", type=int, default=DEFAULT_MAX_CHUNK)
+    ap.add_argument("--min-chars", type=int, default=DEFAULT_MIN_CHARS,
+                    help="sessions with less cleaned dialog than this are skipped, not extracted")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(_common.absorb_dash_values(argv, ("--projects", "--session")))
 
     out_dir = _common.data_dir(a.workspace, a.out_dir)
     c = extract(a.root, out_dir=out_dir, projects=split_csv(a.projects), session=a.session,
                 new_only=a.new, max_chars_total=a.max_chars_total,
-                max_chunk_chars=a.max_chunk_chars)
+                max_chunk_chars=a.max_chunk_chars, min_chars=a.min_chars)
     if a.json:
         print(json.dumps(c, sort_keys=True))
     else:
         print(f"extracted {c['extracted']} sessions into {c['chunks']} chunks "
               f"({c['chars'] / 1e6:.1f}M chars, {c['redactions']} redactions); "
-              f"{c['skipped_unchanged']} unchanged skipped, {c['errors']} errors"
+              f"{c['skipped_unchanged']} unchanged skipped, {c['skipped_empty']} empty skipped, "
+              f"{c['errors']} errors"
               + (f"; budget reached, {c['remaining']} sessions left" if c["budget_exhausted"] else ""))
     return 0
 

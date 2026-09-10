@@ -5,7 +5,10 @@ chunked dialog dumps built on session-recap's extract.py --root.
 Pins: system-reminder blocks and watcher-ping lines stripped, `ghp_…` and
 `AIza…` redacted before disk, chunks split only at `[ts] USER:/ASSISTANT:`
 turn lines, 0600 files in a 0700 dir, --new bookkeeping on (mtime,size),
---session prefix, the --max-chars-total soft cap.
+--session prefix, the --max-chars-total soft cap, and the counting rule from
+the 2026-09-10 fresh-install run: a session with no cleaned dialog or under
+--min-chars of it writes no dump, is `skipped_empty` (remembered in
+state.json so --new leaves it alone) and is never counted as extracted.
 
 Run: python3 tests/import-claude-context-extract.test.py
 """
@@ -30,6 +33,8 @@ os.environ.setdefault("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER", "1")
 SLUG = "-Users-o-Projects-alpha"
 S1 = "aaaaaaaa-1111-4111-8111-111111111111"
 S2 = "bbbbbbbb-2222-4222-8222-222222222222"
+S3 = "cccccccc-3333-4333-8333-333333333333"   # aborted: only harness noise, no assistant turn
+S4 = "dddddddd-4444-4444-8444-444444444444"   # answered, but ~60 chars of dialog
 GHP = "ghp_" + "A1b2C3d4" * 5          # 40 chars after the prefix
 AIZA = "AIza" + "Sy" * 17 + "Q"          # 35 chars after the prefix
 TURN_RE = re.compile(r"^\[[^\]\n]*\] (USER|ASSISTANT): ", re.M)
@@ -78,8 +83,16 @@ def make_tree(root: Path) -> None:
         recs.append(_msg(role, text if role == "user" else [{"type": "text", "text": text}], _ts(i)))
     _write(d / f"{S1}.jsonl", recs)
     _write(d / f"{S2}.jsonl", [
-        _msg("user", "short second session", "2026-07-01T09:00:00Z"),
+        _msg("user", "second session: " + "y" * 420, "2026-07-01T09:00:00Z"),
         _msg("assistant", [{"type": "text", "text": "ok"}], "2026-07-01T09:01:00Z"),
+    ])
+    _write(d / f"{S3}.jsonl", [
+        _msg("user", "<system-reminder>only noise</system-reminder>", "2026-06-02T09:00:00Z"),
+        _msg("user", "[watcher-ping]", "2026-06-02T09:01:00Z"),
+    ])
+    _write(d / f"{S4}.jsonl", [
+        _msg("user", "hi", "2026-06-01T09:00:00Z"),
+        _msg("assistant", [{"type": "text", "text": "short answer"}], "2026-06-01T09:01:00Z"),
     ])
 
 
@@ -162,20 +175,21 @@ class TestCleaningAndRedaction(Base):
 class TestStateAndSelection(Base):
     def test_new_skips_unchanged_and_picks_up_a_touched_file(self):
         c = self.m.extract(self.root, out_dir=self.out)
-        self.assertEqual((c["extracted"], c["skipped_unchanged"]), (2, 0))
+        self.assertEqual((c["extracted"], c["skipped_unchanged"], c["skipped_empty"]), (2, 0, 2))
         state = json.loads((self.out / "state.json").read_text())
         rec = state["sessions"][f"{SLUG}/{S1}"]
         for k in ("extracted_at", "extracted_mtime_ns", "extracted_size", "chunks", "chars"):
             self.assertIn(k, rec)
         c = self.m.extract(self.root, out_dir=self.out, new_only=True)
-        self.assertEqual((c["extracted"], c["skipped_unchanged"]), (0, 2))
+        self.assertEqual((c["extracted"], c["skipped_unchanged"], c["skipped_empty"]), (0, 4, 0))
         p = self.root / SLUG / f"{S2}.jsonl"
         t = time.time() + 100
         os.utime(p, (t, t))
         c = self.m.extract(self.root, out_dir=self.out, new_only=True)
-        self.assertEqual((c["extracted"], c["skipped_unchanged"]), (1, 1))
+        self.assertEqual((c["extracted"], c["skipped_unchanged"], c["skipped_empty"]), (1, 3, 0))
         status = json.loads((self.out / "status.json").read_text())
         self.assertEqual(status["phase"], "extracted")
+        self.assertEqual((status["extracted"], status["skipped_empty"]), (1, 0))
 
     def test_session_prefix_and_unknown(self):
         c = self.m.extract(self.root, out_dir=self.out, session="bbbbbbbb")
@@ -189,7 +203,7 @@ class TestStateAndSelection(Base):
         c = self.m.extract(self.root, out_dir=self.out, max_chars_total=10)
         self.assertEqual(c["extracted"], 1)
         self.assertTrue(c["budget_exhausted"])
-        self.assertEqual(c["remaining"], 1)
+        self.assertEqual(c["remaining"], 3)
         self.assertTrue(self._chunks(S1))      # newest (2026-08) first
         self.assertEqual(self._chunks(S2), [])
 
@@ -203,9 +217,78 @@ class TestStateAndSelection(Base):
             rc = self.m.main(["--root", str(self.root), "--out-dir", str(self.out), "--json"])
         self.assertEqual(rc, 0)
         doc = json.loads(buf.getvalue())
-        self.assertEqual(doc["extracted"], 2)
+        self.assertEqual((doc["extracted"], doc["skipped_empty"]), (2, 2))
         self.assertNotIn("Redaction session", buf.getvalue())
         self.assertNotIn(str(self.root), buf.getvalue())
+
+
+class TestEmptySessions(Base):
+    """The 2026-09-10 bug: `extracted 47` printed while 43 dump files existed —
+    four never-answered sessions produced no chunk yet were counted, and one
+    178-byte dialog got a useless summary."""
+
+    def _rec(self, uuid):
+        return json.loads((self.out / "state.json").read_text())["sessions"][f"{SLUG}/{uuid}"]
+
+    def test_empty_and_tiny_sessions_are_skipped_not_extracted(self):
+        c = self.m.extract(self.root, out_dir=self.out)
+        self.assertEqual((c["extracted"], c["skipped_empty"], c["errors"]), (2, 2, 0))
+        self.assertTrue(self._chunks(S1) and self._chunks(S2))
+        self.assertEqual(self._chunks(S3), [])          # no assistant turn: no chunk at all
+        self.assertEqual(self._chunks(S4), [])          # ~60 chars of dialog: under --min-chars
+        for u in (S3, S4):
+            rec = self._rec(u)
+            self.assertTrue(rec["skipped_empty"])
+            self.assertEqual(rec["chunks"], 0)
+            for k in ("extracted_at", "extracted_mtime_ns", "extracted_size"):
+                self.assertIn(k, rec)
+        self.assertNotIn("skipped_empty", self._rec(S1))
+        self.assertGreater(self._rec(S4)["chars"], 0)   # the tiny one had dialog, just not enough
+        # extracted == dump files written; status.json says the same
+        written = {p.name.split(".")[0] for p in (self.out / "dumps" / SLUG).glob("*.txt")}
+        self.assertEqual(written, {S1, S2})
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["extracted"], status["skipped_empty"]), (2, 2))
+
+    def test_human_summary_names_the_skipped_count(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.m.main(["--root", str(self.root), "--out-dir", str(self.out)])
+        self.assertIn("extracted 2 sessions", buf.getvalue())
+        self.assertIn("2 empty skipped", buf.getvalue())
+
+    def test_min_chars_zero_keeps_the_tiny_session(self):
+        c = self.m.extract(self.root, out_dir=self.out, min_chars=0)
+        self.assertEqual((c["extracted"], c["skipped_empty"]), (3, 1))
+        self.assertEqual(len(self._chunks(S4)), 1)
+        self.assertEqual(self._chunks(S3), [])          # still nothing to write
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.m.main(["--root", str(self.root), "--out-dir", str(self.out), "--min-chars", "0", "--json"])
+        self.assertEqual(json.loads(buf.getvalue())["extracted"], 3)
+
+    def test_new_rerun_leaves_skipped_sessions_alone_until_the_file_changes(self):
+        self.m.extract(self.root, out_dir=self.out)
+        c = self.m.extract(self.root, out_dir=self.out, new_only=True)
+        self.assertEqual((c["extracted"], c["skipped_empty"], c["skipped_unchanged"]), (0, 0, 4))
+        p = self.root / SLUG / f"{S4}.jsonl"
+        t = time.time() + 100
+        os.utime(p, (t, t))
+        c = self.m.extract(self.root, out_dir=self.out, new_only=True)
+        self.assertEqual((c["extracted"], c["skipped_empty"], c["skipped_unchanged"]), (0, 1, 3))
+        self.assertEqual(self._chunks(S4), [])
+
+    def test_a_session_that_turns_out_empty_loses_its_old_dumps(self):
+        self.m.extract(self.root, out_dir=self.out, session=S4[:8], min_chars=0)
+        self.assertEqual(len(self._chunks(S4)), 1)
+        c = self.m.extract(self.root, out_dir=self.out, session=S4[:8])
+        self.assertEqual((c["extracted"], c["skipped_empty"]), (0, 1))
+        self.assertEqual(self._chunks(S4), [])
+        self.assertTrue(self._rec(S4)["skipped_empty"])
+        # and back again once it qualifies: the flag goes away with the dump written
+        self.m.extract(self.root, out_dir=self.out, session=S4[:8], min_chars=0)
+        self.assertNotIn("skipped_empty", self._rec(S4))
+        self.assertEqual(len(self._chunks(S4)), 1)
 
 
 if __name__ == "__main__":

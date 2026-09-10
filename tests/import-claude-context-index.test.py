@@ -4,9 +4,11 @@
 Fixture: two project slugs, three top-level sessions (one a sidechain), one
 nested subagents/x/y.jsonl, repeated `ai-title` lines (the LAST wins), `cwd`
 on message lines (recovered), a `summary` record, a `custom-title`. Pins the
-counts, the read-only contract (root listing + mtimes identical, --counts-only
-opens no file, --dry-run writes nothing, out-dir inside the root refused) and
-the (mtime,size) `new` bookkeeping.
+counts (incl. `empty` = sessions with no assistant message and
+`conversations` = sessions − empty, the number the owner is told), the
+read-only contract (root listing + mtimes identical, --counts-only opens no
+file and is a file count, --dry-run writes nothing, out-dir inside the root
+refused) and the (mtime,size) `new` bookkeeping.
 
 Run: python3 tests/import-claude-context-index.test.py
 """
@@ -36,6 +38,7 @@ CWD_B = "/Users/o/Projects/beta"
 A1 = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 A2 = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 B1 = "33333333-cccc-4ccc-8ccc-cccccccccccc"
+A3 = "44444444-dddd-4ddd-8ddd-dddddddddddd"   # never answered (added by one test)
 
 
 def _load():
@@ -144,6 +147,7 @@ class TestFullPass(Base):
         self.assertEqual(res["sidechains"], 1)
         self.assertEqual(res["subagent_files"], 1)
         self.assertEqual(res["new"], 2)
+        self.assertEqual((res["empty"], res["conversations"]), (0, 2))
         self.assertEqual(res["earliest"], "2026-07-20T08:00:00Z")
         self.assertEqual(res["latest"], "2026-08-02T09:00:00Z")
 
@@ -181,7 +185,31 @@ class TestFullPass(Base):
         self.assertEqual(status["phase"], "indexed")
         self.assertEqual(status["sessions"], 2)
         self.assertEqual(set(status) - {"phase", "updated_at"},
-                         {"sessions", "projects", "new", "sidechains", "subagent_files"})
+                         {"sessions", "projects", "conversations", "empty", "new", "sidechains",
+                          "subagent_files"})
+        self.assertEqual((status["conversations"], status["empty"]), (2, 0))
+
+    def test_empty_sessions_are_counted_and_left_out_of_conversations(self):
+        # an aborted session: the owner typed, nothing ever answered (assistant_msgs 0)
+        _write(self.root / SLUG_A / f"{A3}.jsonl", [
+            _msg("user", "are you there?", "2026-08-07T10:00:00Z"),
+            _msg("user", "<system-reminder>noise</system-reminder>", "2026-08-07T10:01:00Z"),
+        ])
+        res = self.m.index(self.root, out_dir=self.out)
+        self.assertEqual((res["sessions"], res["empty"], res["conversations"]), (3, 1, 2))
+        self.assertEqual(self._session(res, SLUG_A, A3)["assistant_msgs"], 0)
+        self.assertEqual(res["index"]["projects"][SLUG_A]["empty"], 1)
+        self.assertEqual(res["index"]["projects"][SLUG_B]["empty"], 0)
+        self.assertEqual(res["index"]["counts"]["conversations"], 2)
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["sessions"], status["conversations"], status["empty"]), (3, 2, 1))
+        md = (self.out / "claude-import-index.md").read_text()
+        self.assertIn("3 sessions across 2 projects — 2 conversations, 1 with no assistant reply", md)
+        # --counts-only is a file count: it cannot know
+        res = self.m.index(self.root, out_dir=self.out, counts_only=True)
+        self.assertEqual(res["sessions"], 4)
+        self.assertIsNone(res["empty"])
+        self.assertIsNone(res["conversations"])
 
     def test_real_key_order_message_object_before_type(self):
         # Claude Code writes assistant lines with the API message object (which
@@ -251,6 +279,7 @@ class TestReadOnlyContract(Base):
         self.assertIsNone(res["sidechains"])
         self.assertIsNone(res["new"])
         self.assertIsNone(res["dialog_bytes"])
+        self.assertIsNone(res["conversations"])
         self.assertGreater(res["bytes_on_disk"], 0)
         self.assertFalse(self.out.exists())
 
@@ -308,8 +337,12 @@ class TestCli(Base):
         doc = json.loads(out)
         self.assertEqual((doc["sessions"], doc["projects"], doc["subagent_files"]), (3, 2, 1))
         self.assertTrue(doc["counts_only"])
+        rc, out = self._run(["--root", str(self.root), "--out-dir", str(self.out), "--counts-only"])
+        self.assertIn("3 transcripts across 2 projects", out)
+        self.assertIn("a file count", out)
+        _write(self.root / SLUG_A / f"{A3}.jsonl", [_msg("user", "hello?", "2026-08-07T10:00:00Z")])
         rc, out = self._run(["--root", str(self.root), "--out-dir", str(self.out)])
-        self.assertIn("2 sessions across 2 projects", out)
+        self.assertIn("3 sessions across 2 projects (2 conversations, 1 empty;", out)
         self.assertNotIn("Widget", out)
 
 
