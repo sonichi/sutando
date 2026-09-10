@@ -73,8 +73,13 @@ check("does not claim a live session", "live session" not in vU["detail"], vU["d
 
 print("TWO supervised watchers (duplicates are still a real problem):")
 v3 = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "99", "200": "98"})
-check("keeps the orphan/stop verdict for 2 trees", "stop them" in v3["detail"], v3["detail"])
-check("counts both", "2 orphaned" in v3["detail"], v3["detail"])
+# qingyun-wu, #3875: these pinned the DEFECT — both roots have LIVE parents (99, 98),
+# so 'orphaned' is false and 'stop them' takes two healthy instances offline.
+check("does NOT call supervised roots orphaned", "orphaned" not in v3["detail"], v3["detail"])
+check("does NOT tell you to stop them", "stop them" not in v3["detail"], v3["detail"])
+check("still counts both", "2 watcher(s)" in v3["detail"], v3["detail"])
+check("still states the duplicate cost", "processed 2x" in v3["detail"], v3["detail"])
+check("names them as supervised", "supervised: 100, 200" in v3["detail"], v3["detail"])
 
 print("no watchers at all (unchanged):")
 v4 = _verdict({}, {})

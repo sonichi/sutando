@@ -608,14 +608,16 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
     def test_two_supervised_roots_are_never_told_to_stop(self):
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
         self.assertNotIn("stop them", d, "blanket stop advice over supervised roots")
-        self.assertIn("do NOT stop any", d)
+        self.assertIn("Do NOT stop any of them", d)
         self.assertIn("supervised: 901, 902", d)
 
     def test_an_ownerless_root_is_still_named_as_stoppable(self):
         # The control: the fix must not become "never stop anything".
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  903 1 bash {self.W}\n")
-        self.assertIn("stop the ownerless one(s) first: 903", d)
-        self.assertNotIn("do NOT stop any", d)
+        self.assertIn("orphaned watcher(s)", d)
+        self.assertIn("stop them and restart one cleanly", d)
+        self.assertIn("ownerless: 903", d)
+        self.assertNotIn("Do NOT stop any of them", d)
 
     def test_the_duplicate_processing_cost_is_still_stated(self):
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
