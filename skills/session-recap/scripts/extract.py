@@ -4,6 +4,7 @@
 Modes:
   list                    — table of sessions (file, start, end, msgs, first user line)
   dump --session <uuid|last|current> [--filter user|dialog|all] [--max-chars N]
+  Both take --root DIR to read another project dir (e.g. a stock ~/.claude/projects/<slug>).
 
 "last" = the most recent session file that is NOT the currently-active one
 (active = newest by mtime). Timestamps are per-event ISO from the transcript.
@@ -25,7 +26,16 @@ sys.path.insert(0, str(REPO / "src"))
 from util_paths import claude_project_slug  # noqa: E402
 
 
-def transcripts_dir() -> Path:
+def transcripts_dir(root=None) -> Path:
+    """The dir whose top-level *.jsonl are the sessions to read.
+
+    Default: Sutando's own relocated tree for this checkout. `root` (the
+    `--root` flag) names any other project dir — the import-claude-context
+    skill points it at a stock `~/.claude/projects/<slug>/` so this one parser
+    serves both trees.
+    """
+    if root:
+        return Path(root)
     ws = subprocess.run(
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, check=True).stdout.strip()
@@ -128,9 +138,12 @@ def main() -> None:
                          "dialog: user + assistant text; "
                          "all: dialog + tool-call names + system lines")
     ap.add_argument("--max-chars", type=int, default=200_000)
+    ap.add_argument("--root", default=None,
+                    help="project dir holding the *.jsonl sessions "
+                         "(default: this checkout's Sutando transcript dir)")
     args = ap.parse_args()
 
-    sessions = sorted(transcripts_dir().glob("*.jsonl"),
+    sessions = sorted(transcripts_dir(args.root).glob("*.jsonl"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     if not sessions:
         sys.exit("no transcripts found")

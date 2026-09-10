@@ -50,6 +50,12 @@ _NOISE_LINE_RE = re.compile(
 )
 _PER_MESSAGE_CHAR_CAP = 1500  # one runaway message must not eat the budget
 
+# Public names for the noise rules, so other transcript readers (the
+# import-claude-context skill) strip the same harness tags instead of keeping a
+# private copy that drifts. Same objects; the underscored names stay canonical.
+NOISE_BLOCK_RE = _NOISE_BLOCK_RE
+NOISE_LINE_RE = _NOISE_LINE_RE
+
 
 def _clean(text: str) -> str:
     text = _NOISE_BLOCK_RE.sub("", text)
@@ -77,6 +83,13 @@ def _message_text(message: dict) -> tuple[str, list[str]]:
             tools.append(block.get("name", "?"))
         # thinking / tool_result / images: skipped — noise for resume purposes
     return "\n".join(texts), tools
+
+
+# Public aliases (import-claude-context reuses them). `clean_text` keeps the
+# per-message cap above — it is a resume/snippet cleaner, not a bulk one; bulk
+# readers apply NOISE_BLOCK_RE / NOISE_LINE_RE directly.
+message_text = _message_text
+clean_text = _clean
 
 
 def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int = 6000) -> str:

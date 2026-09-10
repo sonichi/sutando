@@ -214,6 +214,8 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
+**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk, nothing leaves the Mac without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` to undo one project.
+
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
 **Trusted capability catalog** — discover, inspect, install, and update skills
