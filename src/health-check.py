@@ -11168,14 +11168,15 @@ def check_claude_hook_registration(
                   "you intend to enable it"
                   if only_archive else
                   "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
-        # The installer only writes hooks it owns, so it cannot remove a foreign entry:
-        # prescribing it there reports `added=0 skipped=N removed=0` and reads as success.
+        # The omit flag gates DEPRECATED_HOOKS, so prescribing it skips the very pruning a
+        # foreign entry needs and reports `removed=0`, which reads as a successful run.
         if foreign:
-            remedy = ("the installer cannot clear this — it only writes hooks it owns, so it leaves "
-                      "a foreign entry in place and reports `removed=0`; delete the offending "
-                      f"entry from the settings file by hand ({', '.join(foreign)}), then re-run "
-                      "`SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh` "
-                      "if anything it owns is also missing")
+            remedy = ("do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 here — that flag gates "
+                      "the deprecated-hook pruning, so it reports `removed=0` and clears nothing. "
+                      "Run `bash src/install-claude-hooks.sh` plain: it prunes the legacy forms it "
+                      f"knows ({', '.join(foreign)}) and installs their successors. If an entry is "
+                      "genuinely foreign (another program or checkout) the installer cannot own it "
+                      "— remove that one by hand")
         if dead and not missing and not foreign:
             remedy = ("re-run the installer that owns each family — it prunes dead copies "
                       "(`bash scripts/install-personal-claude-hook.sh`, "
