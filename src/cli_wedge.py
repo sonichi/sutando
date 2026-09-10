@@ -3,11 +3,45 @@
 
 Two cases a heartbeat and a liveness probe both miss: (1) the RAW pane is
 static while work is outstanding — pure static, no normalization, per the
-spec; (2) the pane moves but revisits the same states (a retry loop), measured
-as novelty over NORMALIZED frames — clocks, durations, counters, spinners and
-token counts would fake novelty. A pane whose only motion is a clock is
-ALIVE (Chi, from running these panes daily): reported as `clock-only`, never a
-warning, and kept in every trace so the observation can be re-checked.
+spec; (2) the pane moves while the work does not, identified by the TEXT on it
+(ABNORMAL_PATTERNS) — retry, provider limits, a login prompt, a compaction.
+
+Retry is read from the text, never from novelty. Measured (Chi, 2026-09-10): a
+retry whose message is constant collapses to one normalized state and the text
+detector has already fired; a retry cycling through different upstream errors
+scores novelty 1.00 and is indistinguishable from healthy work. The statistic
+reached neither case, so it and the `clock-only` exemption that existed only to
+suppress it are both gone.
+
+THE GOAL, in the owner's terms (Chi, 2026-09-10): get all four cases right.
+Four, as a 2x2 -- `idle / moving` x `healthy / abnormal`:
+
+    idle   + healthy    the turn finished.                    No warning.
+    idle   + abnormal   stopped and not coming back.          WARN.
+                        Parked, nothing ticking. Five subcases, four
+                        named by their text and one by its absence:
+                          quota-limit / out-of-credits -> provider-limit
+                          needs-login                  -> abnormal
+                          awaiting-input (a prompt      -> abnormal
+                            waiting on a human)
+                          compacting, if it froze       -> abnormal
+                          parked ON an error (APIError,
+                            network error) -- not a retry,
+                            nothing is being attempted    -> abnormal
+                        Every subcase is named by TEXT ON THE PANE. This
+                        module reads the CLI, so a verdict may not rest on
+                        the work queue (Chi): the `static-with-work` kind
+                        did, and is gone. A static pane with no abnormal
+                        text is `idle`, whatever is queued elsewhere.
+    moving + healthy    ordinary work.                        No warning.
+                        A ticking clock IS motion (Chi), so a pane
+                        whose only change is a clock lands here.
+    moving + abnormal   output churns, the work does not.     WARN.
+                        Retry loops and compactions are SHAPES of it,
+                        never cases of their own -- `retry-loop` stays a
+                        distinct kind for the trace, and it is this cell.
+
+Every kind folds into one of the four; a fifth kind is a shape, not a case.
 
 This reads the CLI, not the process. A green result here is not evidence the
 core is healthy; it complements `.alive` and the runtime probes, never replaces
@@ -73,7 +107,6 @@ _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
 # verdict. status_ttl_s mirrors graceful-restart.sh busy() (GR_STATUS_TTL_S).
 PROVISIONAL_THRESHOLDS = {
     "min_samples": 10,
-    "low_novelty_rate": 0.25,
     "static_high_conf_s": 300,
     "static_high_conf_samples": 3,
     "pattern_min_consecutive": 2,
@@ -90,6 +123,9 @@ ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
         ("compacting", r"compact(ing|ion)\b"),
         ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
+        # Parked ON an error, which is not a retry: nothing is being attempted.
+        ("api-error", r"\bAPI ?Error\b|\b(internal server error|bad gateway|service unavailable)\b|\bHTTP [45]\d\d\b"),
+        ("network-error", r"\bnetwork error\b|\bfetch failed\b|\bcould not reach\b|\bE(CONNREFUSED|NOTFOUND|HOSTUNREACH)\b|\bdns (lookup )?failed\b"),
     )
 )
 
@@ -216,7 +252,7 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    clock-only | static-with-work | retry-loop | abnormal | provider-limit | low-novelty |
+    idle | working | retry-loop | abnormal | provider-limit |
     unknown (or, from the window, cadence-too-sparse); the four before unknown are warnings. `raw_static` is case 1's
     input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
@@ -238,7 +274,6 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
         pats = [list(pats) for _ in state_ids]
     ps = pattern_stats(list(pats or []), th)
     abn = abnormal_stats(list(abnormal or []), th)
-    clock_only = (not raw_static) and nov.static
     spacing = {}
     if gaps:
         g = sorted(gaps)
@@ -258,13 +293,12 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
         "work_outstanding": work_outstanding,
         "work_detail": work_detail,
         "raw_static": bool(raw_static),
-        "clock_only": clock_only,
         "thresholds": th,
     }
     if nov.sample_count < 2:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
                 "reason": "fewer than 2 samples in the current observation run — nothing to compare"}
-    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th, abn)
+    verdict = _classify_run(base, nov, raw_static, ps, work_outstanding, duration_s, work_detail, th, abn)
     # Two frames a second apart cannot establish a wedge: a WARNING needs the run to have lasted.
     if verdict["warn"] and duration_s < th["min_duration_s"]:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
@@ -272,14 +306,13 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     return verdict
 
 
-def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_only: bool,
+def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict,
                   work_outstanding: bool, duration_s: float, work_detail: str, th: dict,
                   abn: dict) -> dict:
     enough = nov.sample_count >= th["min_samples"]
     # A provider told the CLI to stop: not a retry loop, a abnormal state of its own.
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
     bs = abn
-    low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
     # Retry is a SHAPE of the abnormal axis, not a sibling (owner): a retrying
     # pane is `moving + abnormal` — it moves while the work does not proceed.
     if bs["abnormal_current"] or ps["retry_current"]:
@@ -298,18 +331,8 @@ def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_on
         return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
     if raw_static:
-        if work_outstanding:
-            high = duration_s >= th["static_high_conf_s"] and nov.sample_count >= th["static_high_conf_samples"]
-            return {**base, "kind": "static-with-work", "confidence": "high" if high else "low", "warn": True,
-                    "reason": f"pane unchanged across {nov.sample_count} samples over {duration_s:.0f}s while work is outstanding ({work_detail or 'unspecified'})"}
         return {**base, "kind": "idle", "confidence": "high", "warn": False,
                 "reason": "pane unchanged and nothing outstanding"}
-    if clock_only:
-        return {**base, "kind": "clock-only", "confidence": "medium", "warn": False,
-                "reason": "only volatile fields (clock/counters) change — a live CLI, not a wedge (operator observation); recorded for the harness"}
-    if work_outstanding and low_novelty:
-        return {**base, "kind": "low-novelty", "confidence": "low", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples with work outstanding, no current retry text — repetitive, cause unknown"}
     return {**base, "kind": "working", "confidence": "medium" if nov.novelty_rate < 0.6 else "high", "warn": False,
             "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples"}
 
@@ -629,7 +652,7 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     abn = [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in run]
     whole_raw_static = len(run) >= 2 and all(raws) and len(set(raws)) == 1
     whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps, abn)
-    if whole["kind"] in ("retry-loop", "provider-limit", "low-novelty"):
+    if whole["kind"] in ("retry-loop", "provider-limit"):
         return {**whole, **meta}
     last = run[-1].get("raw_state")
     tail = []
@@ -644,9 +667,9 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
                                 [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in tail],
                                 work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps,
                                 [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in tail])
-        if trailing["kind"] in ("idle", "static-with-work"):
+        if trailing["kind"] == "idle":
             return {**trailing, **meta, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
-                    "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(tail)}
+                    "novelty_rate": whole["novelty_rate"], "trailing_static_samples": len(tail)}
     return {**whole, **meta}
 
 # ---- CLI: record real traces / replay / one-shot probe ----------------------

@@ -85,24 +85,30 @@ class Classifier(unittest.TestCase):
         v = w.classify([IDLE] * 6, False, 30)
         self.assertEqual((v["kind"], v["warn"], v["raw_static"]), ("idle", False, True))
 
-    def test_case1_is_pure_raw_static_with_work(self):
-        low = w.classify([IDLE] * 6, True, 60, "core-status running")
-        high = w.classify([IDLE] * 6, True, 900, "core-status running")
-        self.assertEqual((low["kind"], low["warn"], low["confidence"]), ("static-with-work", True, "low"))
-        self.assertEqual(high["confidence"], "high")
-        self.assertIn("core-status running", high["reason"])
+    def test_the_work_queue_does_not_decide_a_verdict(self):
+        # This module reads the CLI (Chi). A static pane is idle whatever is queued
+        # elsewhere; `static-with-work` rested on the queue and is gone.
+        for work in (False, True):
+            v = w.classify([IDLE] * 6, work, 900, "core-status running")
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
 
-    def test_clock_only_pane_is_not_case1(self):
-        # Spec: case 1 is pure static, no normalization. A ticking clock is motion.
+    def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
+        for frame in ("❯ \n⏵⏵ APIError: 500 Internal Server Error\n",
+                      "❯ \n⏵⏵ Network error: could not reach the API\n",
+                      "❯ \n⏵⏵ fetch failed\n"):
+            v = w.classify([frame] * 6, False, 300)
+            self.assertEqual((v["kind"], v["warn"]), ("abnormal", True), frame)
+
+    def test_a_clock_ticking_pane_is_not_case1_and_never_warns(self):
+        # A ticking clock is motion, so this pane is alive and never a warning.
+        # It has no kind of its own: `clock-only` only suppressed low-novelty.
         frames = [idle_with_clock(i) for i in range(6)]
         v = w.classify(frames, True, 900)
         self.assertNotEqual(v["kind"], "static-with-work")
         self.assertFalse(v["raw_static"])
-        self.assertTrue(v["clock_only"])
-        # A clock-only pane is ALIVE (Chi): never a warning, with or without work, however long
         for work in (False, True):
             q = w.classify([idle_with_clock(i) for i in range(12)], work, 900)
-            self.assertEqual((q["kind"], q["warn"]), ("clock-only", False), work)
+            self.assertEqual((q["kind"], q["warn"]), ("working", False), work)
         # ...unless retry text says otherwise: counters-only motion WITH retry text is still case 2
         r = w.classify([retry_frame(i) for i in range(12)], True, 60)
         self.assertEqual(r["kind"], "retry-loop")
@@ -221,15 +227,19 @@ class Classifier(unittest.TestCase):
         v = w.classify([retry_frame(0), retry_frame(0)], True, 1)
         self.assertEqual((v["kind"], v["warn"]), ("unknown", False))
         self.assertIn("too short", v["reason"])
-        self.assertEqual(w.classify([IDLE] * 3, True, 30)["kind"], "unknown")          # would warn → too short
-        self.assertEqual(w.classify([IDLE] * 3, True, 60)["kind"], "static-with-work")
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 30)["kind"], "unknown")  # would warn → too short
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 60)["kind"], "retry-loop")
         self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
-    def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
+    def test_repetition_alone_no_longer_warns_retry_is_read_from_the_text(self):
+        # Novelty measured repetition; retry is a cause. It reached neither the
+        # constant-text retry (text catches it) nor the varying one (novelty 1.00).
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
-        v = w.classify(frames, True, 60)
-        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
-        self.assertEqual(w.classify(frames, False, 60)["kind"], "working")
+        self.assertEqual((w.classify(frames, True, 60)["kind"], w.classify(frames, True, 60)["warn"]),
+                         ("working", False))
+        # ...while the retry the TEXT can see still warns, with or without constant text.
+        r = w.classify([retry_frame(i) for i in range(12)], True, 60)
+        self.assertEqual((r["kind"], r["warn"]), ("retry-loop", True))
 
     def test_working_is_not_a_warning(self):
         v = w.classify([working_frame(i) for i in range(20)], True, 60)
@@ -248,11 +258,11 @@ class Classifier(unittest.TestCase):
 
     def test_thresholds_are_reported_and_overridable(self):
         v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
-                       thresholds={"min_samples": 4, "low_novelty_rate": 0.5})
-        self.assertEqual(v["kind"], "low-novelty")
+                       thresholds={"min_samples": 4})
         self.assertEqual(v["thresholds"]["min_samples"], 4)
-        # the same frames under the provisional thresholds read as working (2/6 = 0.33 > 0.25)
-        self.assertEqual(w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60)["kind"], "working")
+        # pattern_min_consecutive still gates: a retry seen once is not yet a loop.
+        one = [retry_frame(0)] + [working_frame(i) for i in range(11)]
+        self.assertEqual(w.classify(one, True, 60, thresholds={"pattern_min_consecutive": 5})["warn"], False)
         self.assertTrue(v["advisory"])
         self.assertIn("not a health guarantee", v["note"])
 
@@ -298,10 +308,9 @@ class IoEdge(unittest.TestCase):
             v = w.classify_window(entries, w.work_outstanding(ws, now=1500.0), 1500.0)
             # the static run started at 1100 (the working frame before it does not count)
             self.assertEqual(v["duration"], 400.0)
-            self.assertEqual(v["kind"], "static-with-work")
+            self.assertEqual(v["kind"], "idle")
             self.assertEqual(v["trailing_static_samples"], 2)
             self.assertEqual(v["sample_count"], 3)  # the run is still reported whole
-            self.assertEqual(v["confidence"], "low")  # 2 samples: one gap, however long (TustinOC)
             self.assertEqual((v["observation_runs"], v["median_gap_s"]), (1, 300.0))
             # a clock-only trailing run is NOT a static run (raw ids differ)
             for i in range(3):
@@ -325,7 +334,7 @@ class IoEdge(unittest.TestCase):
         # three samples within the continuity limit ARE a run, and the duration is the run's
         entries = [e(0.0), e(600.0), e(1200.0)]
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1230.0)
-        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("static-with-work", "high", 1230.0, 1))
+        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("idle", "high", 1230.0, 1))
         # a window whose newest sample is itself older than the limit has no current observation
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1200.0 + 5000)
         self.assertEqual(v["kind"], "unknown")
@@ -342,7 +351,7 @@ class IoEdge(unittest.TestCase):
         self.assertIn("cannot be observed at this rate", v["reason"])
         # the same pane sampled inside the limit is a plain case-1 warning
         dense = [e(1800.0 * i) for i in range(6)]
-        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "static-with-work")
+        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "idle")
 
     def test_a_cadence_change_is_judged_on_the_recent_gaps_not_the_window_median(self):
         # Codex on 8ada45a: 15 half-hourly samples then 5 hourly ones kept the window median
@@ -975,6 +984,55 @@ class ProseMentioningAStateIsNotThatState(unittest.TestCase):
         v = w.classify(["x"], False, 60)
         self.assertNotIn("_abnormal", v,
                          "the marker duplicates the flattened abnormal_* keys already spread in")
+
+
+class IdleAbnormalSubcases(unittest.TestCase):
+    """Chi, 2026-09-10: "in idle + abnormal, there are more subcases not mentioned".
+    All five, measured -- four named by text, one by the absence of it."""
+
+    def test_every_idle_abnormal_subcase_is_idle_and_warns(self):
+        for name, frame, work in (
+            ("quota-limit", "❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n", True),
+            ("out-of-credits", "❯ \n⏵⏵ you are out of usage credits\n", True),
+            ("needs-login", "❯ \n⏵⏵ please log in to continue · run /login\n", True),
+            ("awaiting-input", "❯ \n⏵⏵ waiting for your approval to run a command\n", True),
+            ("compacting-frozen", "Compacting conversation…\n", True),
+            ("api-error", "❯ \n⏵⏵ APIError: 500 Internal Server Error\n", True),
+            ("network-error", "❯ \n⏵⏵ Network error: could not reach the API\n", True),
+        ):
+            v = w.classify([frame] * 6, work, 900, "core-status running")
+            self.assertTrue(v["raw_static"], f"{name} must be idle")
+            self.assertTrue(v["warn"], f"{name} must warn, got {v['kind']}")
+
+    def test_a_static_pane_with_no_abnormal_text_is_healthy_idle(self):
+        # Every subcase is named by text now, so a pane with none is idle -- and
+        # stays idle whether or not work is queued elsewhere.
+        for work in (False, True):
+            v = w.classify(["❯ \n⏵⏵ bypass permissions on · 1 monitor\n"] * 6, work, 900)
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
+
+
+class FourCasesFold(unittest.TestCase):
+    """Chi, 2026-09-10: "retry loop is under moving + abnormal". Every kind is a
+    cell of the 2x2, never a fifth case. This pins the FOLD, not the kind names."""
+
+    CELLS = {
+        "idle": ("idle", "healthy"), "static-with-work": ("idle", "abnormal"),
+        "abnormal": ("moving", "abnormal"), "provider-limit": ("idle", "abnormal"),
+        "retry-loop": ("moving", "abnormal"), "working": ("moving", "healthy"),
+    }
+
+    def test_every_warning_kind_sits_in_an_abnormal_cell(self):
+        for kind, (_, health) in self.CELLS.items():
+            warns = kind not in ("idle", "working")
+            self.assertEqual(warns, health == "abnormal", kind)
+
+    def test_retry_is_the_moving_abnormal_cell_not_a_fifth_case(self):
+        r = w.classify([retry_frame(i) for i in range(12)], True, 300)
+        self.assertEqual(r["kind"], "retry-loop")
+        self.assertFalse(r["raw_static"], "moving")
+        self.assertTrue(r["warn"], "abnormal")
+        self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
 
 
 if __name__ == "__main__":
