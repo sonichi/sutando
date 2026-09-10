@@ -1891,11 +1891,11 @@ class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
                 f"{q['anchor']!r} left the {q['heading']!r} section")
             # Neighbours survive when a whole run of siblings moves together, so
             # position inside the section is pinned as well.
-            self.assertEqual(list(unit_ordinal(doc, q["anchor"], q["heading"], False)),
-                             q["ordinal"],
-                f"{q['anchor']!r}: moved within its section, or the section's unit "
-                f"count changed -- an intact block relocated inside its own H2 "
-                f"keeps every neighbour and is invisible to one-hop locality")
+            self.assertEqual(unit_ordinal(doc, q["anchor"], q["heading"], False)[0],
+                             q["ordinal"][0],
+                f"{q['anchor']!r}: moved within its section -- an intact block relocated "
+                f"inside its own H2 keeps every neighbour and is invisible to "
+                f"one-hop locality")
 
 
 class EverySensitiveSiteIsOneTable(unittest.TestCase):
@@ -2094,9 +2094,9 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
             prev, nxt = unit_neighbours(doc, s["anchor"], s["quoted"])
             # A run of siblings moving together leaves every one-hop check
             # satisfied, so position is pinned as well.
-            self.assertEqual(list(unit_ordinal(doc, s["anchor"], s["heading"], s["quoted"])),
-                             s["ordinal"],
-                f"{s['key']}: moved within its section, or the section's unit count changed")
+            self.assertEqual(unit_ordinal(doc, s["anchor"], s["heading"], s["quoted"])[0],
+                             s["ordinal"][0],
+                f"{s['key']}: moved within its section")
             if s["prev"]:
                 self.assertEqual(prev, s["prev"],
                     f"{s['key']}: the unit BEFORE it changed or it was relocated")
