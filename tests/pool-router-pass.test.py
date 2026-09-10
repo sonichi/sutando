@@ -91,13 +91,11 @@ class TestResolution(Base):
         got = rt.route(self.ws, self.task(requested_worker=W2), r)
         self.assertEqual(got["delivered"], [W2])
 
-    def test_a_set_delivers_one_sentinel_per_member(self):
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}}, {SRC: [W1, W2]})
-        got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
-        for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
-
+    def test_a_set_is_refused_at_compile(self):
+        """Members would share one payload and one result path: the first to
+        finish archives the other's work. Refused until members have their own."""
+        with self.assertRaises(pr.RosterError):
+            self.roster({W1: {"state": "live"}, W2: {"state": "live"}}, {SRC: [W1, W2]})
 
 class TestNeverSubstitutes(Base):
     def test_an_unknown_target_goes_to_the_core_not_another_worker(self):
@@ -118,14 +116,13 @@ class TestNeverSubstitutes(Base):
         self.assertEqual(got["delivered"], [W1])
         self.assertFalse((self.ws / "deliveries" / "core").exists())
 
-    def test_every_member_of_a_set_is_delivered_to(self):
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "abandoned"}},
-                        {SRC: [W1, W2]})
-        got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
+    def test_a_set_on_an_older_roster_refuses_the_pass_before_any_delivery(self):
+        r = {"version": 1, "workers": {W1: {"state": "live"}, W2: {"state": "live"}},
+             "bindings": {SRC: [W1, W2]}}
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, self.task(), r)
         for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
-
+            self.assertFalse((self.ws / "deliveries" / w / "task-1.txt").exists())
 
 class TestDoubleDelivery(Base):
     def test_a_second_pass_does_not_re_deliver(self):
@@ -235,21 +232,35 @@ class TestPayloadGuard(Base):
         self.assertEqual(out["skipped"], [W1])
         self.assertIsNone(pd.find(self.ws, W1, "task-done"))
 
-    def test_a_set_skips_only_the_missing_payload_not_the_members(self):
-        # One payload serves every member, so the guard is per-task: either all
-        # members are skipped or none are.
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}},
-                        {SRC: [W1, W2]})
-        out = rt.route(self.ws, self.task("task-ghost", payload=False), r)
-        self.assertEqual(sorted(out["skipped"]), sorted([W1, W2]))
-        self.assertEqual(out["delivered"], [])
-
     def test_the_ordinary_path_still_delivers(self):
         r = self.roster()
         out = rt.route(self.ws, self.task("task-real"), r)
         self.assertEqual(out["delivered"], [W1])
         self.assertEqual(out["skipped"], [])
         self.assertIsNotNone(pd.find(self.ws, W1, "task-real"))
+
+
+
+class TestArbitration(Base):
+    def test_publish_waits_for_the_folder_lock_and_then_sees_the_acceptance(self):
+        """The reported race: A checks both names, B publishes and the recipient
+        accepts (freeing the pending name), A's exclusive create succeeds. Under
+        the lock A cannot look until the accept is complete, and then sees it."""
+        import threading
+        import time
+        self.task()
+        out = {}
+        with pd.arbitration(self.ws, W1):
+            th = threading.Thread(target=lambda: out.setdefault("r", rt.deliver_one(self.ws, W1, "task-1")))
+            th.start(); time.sleep(0.3)
+            self.assertTrue(th.is_alive(), "deliver_one must block while the folder is locked")
+            d = self.ws / "deliveries" / W1
+            (d / "task-1.txt").touch()
+            os.rename(d / "task-1.txt", d / "task-1.accepted")
+        th.join(5)
+        self.assertEqual(out["r"], "already")
+        names = sorted(p.name for p in (self.ws / "deliveries" / W1).iterdir() if p.name.startswith("task-"))
+        self.assertEqual(names, ["task-1.accepted"])
 
 
 if __name__ == "__main__":
