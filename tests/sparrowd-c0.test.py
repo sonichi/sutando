@@ -312,8 +312,7 @@ _spec = _ilu.spec_from_file_location("sparrowd_launcher", REPO / "src" / "sparro
 _l = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_l)
 # A FIXTURE channels dir, not the live workspace: worker_specs() discovers per
-# channel now, so reading the host would make this pass or fail by what happens
-# to be installed (and yield nothing at all on CI).
+# channel, so reading the host would decide this by what happens to be installed.
 _chan = Path(tempfile.mkdtemp()) / "channels"
 for _n in ("ag2space", "dev-ag2space"):
     (_chan / _n).mkdir(parents=True)
