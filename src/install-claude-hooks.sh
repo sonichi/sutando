@@ -162,9 +162,15 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 mkdir -p "$REPO_DIR/.claude"
-# The PreCompact archive hook is a bare `cp`, which cannot create its own
-# destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
+# Create the archive destination only when the archiver is actually being
+# installed, and at the CONFIGURED path -- the unconditional `mkdir -p
+# $HOME/Desktop/sutando-conversations` this replaces ran on every install and
+# left an empty directory on hosts that never registered the hook, so directory
+# existence read as evidence the archiver had run when it had not.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  _ARCHIVE_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" transcript-archive-dir 2>/dev/null || true)"
+  [ -n "$_ARCHIVE_DIR" ] && mkdir -p "$_ARCHIVE_DIR"
+fi
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi

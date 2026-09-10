@@ -89,7 +89,12 @@ def resolve_transcript_archive_dir(repo_root: Optional[Path] = None) -> str:
     """
     hooks = load_config(repo_root).get("hooks") or {}
     d = (hooks.get("transcript_archive_dir") or "").strip()
-    return d or str(Path.home() / "Desktop" / "sutando-conversations")
+    if d:
+        return d
+    # The carrier set is a whitelist, so an unlisted workspace path is unsynced:
+    # local-only without leaving the system's bookkeeping.
+    from .workspace_default import resolve_workspace
+    return str(Path(resolve_workspace()) / "transcripts")
 
 
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
