@@ -436,7 +436,17 @@ actually has: `watch-tasks-stream.sh`, the Task Bridge, and the core. The rescue
 is consulted the way a reference is — for the failures it already paid for, named in
 the notes — and nothing is carried across.
 
-Scope: keep one recipient, `core`. Move its intake to `deliveries/core/`, give the watcher a supervision unit, add the boot sweep and residue rules.
+Scope: keep one recipient, `core`. Give the watcher a supervision unit, add the boot sweep and residue rules.
+
+**Moving the core's intake to `deliveries/core/` is DEFERRED, not cancelled** (owner, 2026-09-10, relayed:
+*"let's keep the current version, in the short term, we want to prioritize stability"*). Until then the core
+keeps today's shape — the router's handler declines a task it does not place, and the watcher hands it to the
+core exactly as it did before any pool existed. That is the bypass this section otherwise permits, chosen
+deliberately rather than by omission.
+
+**Revisit trigger:** a second worker exists, or the first feature that must cover both the core and a worker is
+specified — whichever comes first. The cost being accepted meanwhile is two intake protocols, so every such
+feature is written twice, and the router's accounting stays incomplete for tasks it declined.
 
 Acceptance, all four required:
 - **Session exit** — kill the session mid-task; on restart, pending deliveries are announced and the in-flight one is retaken.
