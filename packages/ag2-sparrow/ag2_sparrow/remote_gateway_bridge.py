@@ -593,7 +593,7 @@ def _maybe_warn_allowlist_divergence():
     try:
         mt = os.path.getmtime(_ag2space_access_path())
     except OSError:
-        return  # no local access.json → nothing to diverge
+        return
     # The remedy this warning prints changes the BROKER registry, which touches no
     # local mtime — so an mtime-only trigger can never clear or re-arm the warning.
     now = time.time()
