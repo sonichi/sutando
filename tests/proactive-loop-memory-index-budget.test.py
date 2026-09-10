@@ -141,7 +141,9 @@ def _tree(projects, slug, text, age_s):
     return d
 
 # --- narrowing: each rung is motivated by a real host's population ------------
-STUB = ("# Sutando memory index\n\nDurable facts about the user, project, and\nreferences. One line per entry: `- [Title](file.md)`.\n")   # the shipped stub
+STUB = ("# Sutando memory index\n\nDurable facts about the user, project, and references. "
+        "One line per entry: `- [Title](file.md) — one-line hook`. "
+        "See CLAUDE.md `## Memory` for the schema.\n")   # the shipped stub, verbatim
 
 def _mark(memdir):
     (memdir / "NOT-THE-LIVE-CORPUS.txt").write_text("NOT THE LIVE MEMORY CORPUS\n")
@@ -193,6 +195,21 @@ with tempfile.TemporaryDirectory() as d:
           got is None and "AMBIGUOUS CORPUS" in note, "got=%s note=%r" % (got, note))
     check("narrowing: two real corpora, both with transcripts, still REFUSE",
           got is None and "--record" in note, note)
+
+with tempfile.TemporaryDirectory() as d:
+    # A real index KEEPS the shipped blurb and grows rows beneath it, so only an
+    # "and nothing else" test separates it from an untouched stub.
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    grown = _tree(projects, "grown", STUB + index_of(LIMIT // 2), age_s=60)
+    stub = _tree(projects, "stub", STUB, age_s=86400)
+    check("a grown index that KEPT the template blurb is NOT debris",
+          mib._is_known_template(grown / "MEMORY.md") is False,
+          "prefix test would discard the live corpus")
+    check("an untouched stub IS debris",
+          mib._is_known_template(stub / "MEMORY.md") is True, "stub not recognised")
+    got, note = mib._live_index(grown, REPO, projects.parent.parent)
+    check("so narrowing keeps the grown corpus and drops the stub",
+          got == grown / "MEMORY.md", "got=%s note=%r" % (got, note))
 
 with tempfile.TemporaryDirectory() as d:
     # Hashing is only how the debris filter groups duplicates, so a permission

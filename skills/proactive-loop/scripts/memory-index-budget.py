@@ -159,14 +159,17 @@ def _narrow(cands: "list[Path]") -> "list[Path]":
 
 # Recognise the template POSITIVELY: anything unfamiliar stays eligible rather
 # than being read as debris. Normalised, so wrapping cannot hide the blurb.
-_TEMPLATE_PROSE = "one line per entry"
+_TEMPLATE_BODY = (
+    "durable facts about the user, project, and references. one line per entry: "
+    "`- [title](file.md) — one-line hook`. see claude.md `## memory` for the schema."
+)
 
 
 def _is_known_template(index: "Path") -> bool:
-    """True only when the body is nothing but the shipped blurb.
+    """True only when the body IS the shipped blurb and nothing else.
 
-    Deliberately not a test of entry FORMAT: a live index using plain bullets,
-    bare links or numbered rows is unfamiliar, not empty.
+    Equality, not a prefix: a grown index keeps the same header and blurb, so
+    `startswith` reads every real corpus as debris.
     """
     try:
         text = index.read_text(encoding="utf-8", errors="replace")
@@ -175,9 +178,7 @@ def _is_known_template(index: "Path") -> bool:
     body = " ".join(l.strip() for l in text.splitlines()
                     if l.strip() and not l.lstrip().startswith("#"))
     body = " ".join(body.split()).casefold()
-    if not body:
-        return True                 # headers only: nothing is indexed
-    return body.startswith("durable facts about") and _TEMPLATE_PROSE in body
+    return body == "" or body == _TEMPLATE_BODY
 
 
 def _live_index(memory_dir: Path, repo: Path, workspace: Path) -> "tuple[Path | None, str]":
