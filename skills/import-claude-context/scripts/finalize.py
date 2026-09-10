@@ -79,6 +79,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -502,8 +503,22 @@ def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: s
 
 # ------------------------------------------------------------------ entity merge
 
+#: An email the summariser left inside a display name — "Cyrus (cyrus@x.com)",
+#: "Cyrus <cyrus@x.com>" — is an identifier, not a name. `_norm_name` drops it
+#: and `_emails_of` keeps it, so the email-group merge still unifies the entry
+#: with a bare "Cyrus" that carries the same address. Seen on the owner's real
+#: history 2026-09-10.
+_NAME_EMAIL_RE = re.compile(r"\s*[\(<\[]\s*[^\s()<>\[\]]+@[^\s()<>\[\]]+\s*[\)>\]]")
+
+
+def _name_embedded_emails(value) -> list:
+    return [m.strip("()<>[] ") for m in _NAME_EMAIL_RE.findall(value)] if isinstance(value, str) else []
+
+
 def _norm_name(value) -> str:
-    return " ".join(value.split()) if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(_NAME_EMAIL_RE.sub("", value).split())
 
 
 def _emails_of(p: dict) -> list:
@@ -513,6 +528,7 @@ def _emails_of(p: dict) -> list:
     raw = [p.get("email")]
     raw += list(p.get("emails") or []) if isinstance(p.get("emails"), list) else []
     raw += list(ids.get("emails") or []) if isinstance(ids.get("emails"), list) else []
+    raw += _name_embedded_emails(p.get("name"))
     out, seen = [], set()
     for v in raw:
         if isinstance(v, str) and "@" in v and v.strip() and v.strip().lower() not in seen:
@@ -531,6 +547,21 @@ def _union_citations(entries) -> list:
             if key not in seen:
                 seen.add(key)
                 out.append(c)
+    return out
+
+
+def _clean_entry(p: dict) -> dict:
+    """A copy of a singleton entry with the display name cleaned and any email
+    the name carried moved into `emails`, so the People payload never shows
+    "Cyrus (cyrus@x.com)" as a name and the address is not lost."""
+    out = dict(p)
+    found = _name_embedded_emails(p.get("name"))
+    if found:
+        out["name"] = _norm_name(p.get("name"))
+        have = {e.lower() for e in _emails_of(p)}
+        extra = [e for e in found if e.lower() in have]  # already known via _emails_of
+        existing = list(p.get("emails") or []) if isinstance(p.get("emails"), list) else []
+        out["emails"] = existing + [e for e in extra if e.lower() not in {x.lower() for x in existing}]
     return out
 
 
@@ -620,7 +651,7 @@ def merge_people(people) -> tuple:
        matches ("John" vs "John Smith" + "John Doe") leave everything untouched.
     3. Two multi-token names are never merged by name."""
     entries = [p for p in people or [] if isinstance(p, dict)]
-    step1 = [_merge_group([entries[i] for i in g]) if len(g) > 1 else dict(entries[g[0]])
+    step1 = [_merge_group([entries[i] for i in g]) if len(g) > 1 else _clean_entry(entries[g[0]])
              for g in _email_groups(entries)]
     names = [_norm_name(p.get("name")) for p in step1]
     result = list(step1)

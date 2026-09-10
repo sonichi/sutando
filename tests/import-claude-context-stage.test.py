@@ -472,6 +472,20 @@ class TestMerge(unittest.TestCase):
         # junk entries are dropped, not merged
         self.assertEqual(self.m.merge_people([None, "x", {"name": "Solo"}])[0], [{"name": "Solo"}])
 
+    def test_email_inside_a_name_is_an_identifier_not_a_name(self):
+        # Seen on the owner's real history: the summariser wrote "Cyrus (cyrus@x.com)".
+        people = [{"name": "Cyrus (cyrus@onspark.com)", "citations": [_cite(SLUG_A, U1)]},
+                  {"name": "Cyrus", "email": "cyrus@onspark.com", "citations": [_cite(SLUG_A, U2)]},
+                  {"name": "Rui <rui@ag2.ai>", "citations": [_cite(SLUG_B, U3)]}]
+        merged, n = self.m.merge_people(people)
+        names = sorted(p["name"] for p in merged)
+        self.assertEqual((n, names), (1, ["Cyrus", "Rui"]))
+        cyrus = next(p for p in merged if p["name"] == "Cyrus")
+        self.assertEqual(len(cyrus["citations"]), 2)
+        self.assertIn("cyrus@onspark.com", [e.lower() for e in self.m._emails_of(cyrus)])
+        rui = next(p for p in merged if p["name"] == "Rui")
+        self.assertIn("rui@ag2.ai", [e.lower() for e in self.m._emails_of(rui)])
+
     def test_companies_merge_by_name(self):
         companies = [{"name": "Analytical", "citations": [_cite(SLUG_A, U1, "x")]},
                      {"name": "analytical ", "what": "engines", "relationship": "customer",
