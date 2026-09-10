@@ -121,7 +121,7 @@ class Classifier(unittest.TestCase):
         v = w.classify([frame(i) for i in range(12)], True, 300)
         # A provider-blocked CLI is its own kind (owner review), not forced into "retry loop".
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("provider-limit", True, "high"))
-        self.assertIn("quota-limit", v["current_patterns"])
+        self.assertIn("quota-limit", v["current_blocked"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
 
     def test_codex_idle_banner_is_not_a_provider_limit(self):
@@ -135,7 +135,7 @@ class Classifier(unittest.TestCase):
                 "› \n"
             )
         v = w.classify([frame(i) for i in range(20)], False, 60)
-        self.assertNotIn("quota-limit", v["matched_patterns"], v)
+        self.assertNotIn("quota-limit", v["matched_patterns"] + v.get("matched_blocked", []), v)
         self.assertNotEqual(v["kind"], "provider-limit", v)
         # Positive controls: the phrasings that DO mean a limit was hit still match.
         for line in ("You've hit your usage limit · resets 6pm",
@@ -143,7 +143,35 @@ class Classifier(unittest.TestCase):
                      "Session limit reached. Try again at 6pm",
                      "usage limit exceeded for this plan",
                      "/usage-credits to finish what you're working on."):
-            self.assertIn("quota-limit", w.matched_patterns([line]), line)
+            self.assertIn("quota-limit", w.matched_blocked([line]), line)
+
+    def test_a_blocked_pane_whose_clock_moves_is_not_clock_only(self):
+        """The clock-only exemption ("a live CLI, not a wedge") swallowed every
+        blocked state whose pane ticked: #4015 sat 70 min refusing each turn."""
+        def moving(msg):
+            return [f"{msg}\n  idle · 5:{17 + i // 3:02d} PM · nothing running\n> "
+                    for i in range(12)]
+        for msg, want in (("You are out of usage credits", "provider-limit"),
+                          ("Please log in to continue", "blocked"),
+                          ("Compacting conversation", "blocked")):
+            v = w.classify(moving(msg), False, 4200)
+            self.assertEqual(v["kind"], want, msg)
+            self.assertTrue(v["warn"], msg)
+
+    def test_blocked_is_reached_without_any_retry_text(self):
+        """Every blocked verdict used to be gated on retry text, which is why
+        quota-limit had to live in RETRY_PATTERNS to work at all."""
+        v = w.classify(["Please log in to continue"] * 8, True, 600)
+        self.assertEqual(v["matched_patterns"], [])
+        self.assertIn("needs-login", v["matched_blocked"])
+        self.assertEqual(v["kind"], "blocked")
+
+    def test_the_two_families_are_disjoint(self):
+        self.assertFalse({n for n, _ in w.RETRY_PATTERNS} & {n for n, _ in w.BLOCKED_PATTERNS})
+
+    def test_ordinary_work_still_does_not_warn(self):
+        v = w.classify([f"Thinking... step {i}" for i in range(8)], True, 600)
+        self.assertEqual((v["kind"], v["warn"]), ("working", False))
 
     def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
         # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
