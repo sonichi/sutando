@@ -143,6 +143,9 @@ ALLOWLIST = {
     # tasks_view: flagged tokens are RPC status fields ("state": "pending"),
     # not filesystem paths; tasks/results dirs are injected by server.py.
     "src/runtime-api/tasks_view.py",
+    # pool_advertise: the flagged token is the ROSTER's own "state" field, not
+    # a path; the roster arrives via pool_roster, which owns resolution.
+    "src/pool_advertise.py",
     # runtime-cli talks to the daemon over the socket only — it renders the
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",

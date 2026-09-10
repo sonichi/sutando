@@ -123,6 +123,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`pool_advertise.py`** — What the pool tells the broker, so the worker picker can show it.
 - **`pool_delivery.py`** — Delivery-side half of the worker pool: read one recipient's own folder.
 - **`pool_roster.py`** — Bindings the owner writes; a roster the core compiles; the router only reads.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
