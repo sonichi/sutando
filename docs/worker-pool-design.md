@@ -147,6 +147,26 @@ the `id:` header.
 
 A row is a boundary, not a process; several share one.
 
+### One fact, one record
+
+Every question below has exactly one authoritative record. A second place that also
+answers it is a defect even while the two agree, because the copy nobody remembers is
+the one that drifts. Reviews on the rescue line found this class three times.
+
+| question | the one record | never inferred from |
+|---|---|---|
+| which task is this | the `id:` header | the filename |
+| who owns this task | the folder the file is in | any header, any table |
+| is it claimed, and by whom | the `.claimed` suffix; the folder names the worker | a claims table |
+| is it finished | `state/workers/<w>/done/<task-id>.flag` | the result file's existence |
+| what was the reply | `results/<task-id>.txt` | the archive |
+| which workers exist | `state/roster.json` (compiled) | folder listings, tmux |
+| which room goes where | `state/bindings.json`, compiled into the roster | envelope headers |
+| which worker a sender asked for | `requested_worker` on the envelope | prose in the body |
+| is a worker alive | its beat, read by the core's health-check only | the router, any header |
+| a worker's canonical identity | `worker_id` in its identity record | its label, its tmux name |
+| a worker's runtime session | its session lineage record | the tmux pane, the transcript |
+
 ### The nevers
 
 A worker never selects its own work, writes or alters a delivery, or reads another
@@ -250,6 +270,25 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 
 The router never reads `state`. These rows are the health-check's, and whatever
 marks a worker `abandoned` is the same process that recovers it.
+
+**Retirement is a sweep, not a step.** Retiring a worker touches two records — the
+roster and the worker's folder — and no two file writes are atomic together, so the
+protocol is ordered and every step is idempotent:
+
+1. Write the roster with the worker `retired`. This is the only decision; everything
+   after it is consequence. From the next pass the router names the core instead.
+2. On every health-check tick, sweep `deliveries/<worker>/`: each `.txt` is moved back
+   to `tasks/` for re-routing (a rename, so a crash mid-sweep loses nothing); each
+   `.claimed` is left until its result appears or the `abandoned` rule releases it.
+3. Remove the folder only when it is empty. **Nothing under `deliveries/` is ever
+   deleted unread.**
+
+A router pass that loaded the roster before step 1 and renames into the folder after
+step 2 strands nothing: the next tick sweeps it. The states keweichen reproduced
+against the rescue line — an active token beside completed custody, a directory
+gating a worker whose owner is gone, `ENOTEMPTY` when admission races retirement —
+cannot arise here because there is no token, no gate directory and no second record:
+the folder's contents *are* the state, and the sweep converges on empty.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
@@ -414,7 +453,7 @@ Archiving is no-clobber: on collision mint `<task-id>.json.1`, `.2`, …
 
 An OS timer, 300 s, independent of any agent session.
 
-1. For each worker in the roster that is not `retired` or owner-paused, collect: beat age, whether a session is running, count of `.claimed` sentinels, and the newest `mtime` among its done-flags and results.
+1. For each worker in the roster that is not `retired` or owner-paused, collect: beat age, whether a session is running, count of `.claimed` files, and the newest `mtime` among its done-flags and results.
 2. **Process death** — beat older than 90 s *and* no session *and* not paused, on three consecutive ticks → the pre-authorised remedy: restart that worker's process. Deterministic; needs no core.
 3. **Task stalled** — holds `.claimed` files whose age exceeds a threshold while no done-flag or result has appeared → write an anomaly record and route it to the core for diagnosis. **Never authorises a restart.**
 4. Anomaly records are deduplicated on `(worker-id, signal)` and cleared when work advances.
