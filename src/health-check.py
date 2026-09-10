@@ -8782,6 +8782,19 @@ def _watcher_sentinel_target(state_dir, pid):
         return None
 
 
+def _group_roots_by_target(state_dir, roots):
+    """(target -> [pids], unresolvable pids). The ONE identity policy both the
+    sentinel-present and no-sentinel branches classify with."""
+    groups, unknown = {}, []
+    for r in roots:
+        target = _watcher_sentinel_target(state_dir, r)
+        if target is None:
+            unknown.append(r)
+        else:
+            groups.setdefault(str(target), []).append(r)
+    return groups, unknown
+
+
 def _ps_watcher_index(ps_output: str) -> tuple:
     """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
 
@@ -8930,11 +8943,26 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            # Same identity policy as the tracked branch: without it, losing the
+            # last sentinel turns distinct instances back into "duplicates".
+            _groups, _unknown = _group_roots_by_target(WORKSPACE_DIR / "state", roots)
+            if _unknown:
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}); {len(_unknown)} "
+                        f"({', '.join(_unknown)}) have no resolvable (agent, instance), so "
+                        f"whether any task is processed twice is UNKNOWN — do not reduce the count")
+            elif len(_groups) == len(roots) and len(roots) > 1:
+                cost = (f"{len(roots)} watcher(s) with no PID sentinel (pids {', '.join(roots)}) "
+                        f"resolve to {len(_groups)} DISTINCT instances — not duplicates, and no "
+                        f"task is processed twice; do not reduce the count")
+            else:
+                _n = max((len(v) for v in _groups.values()), default=len(roots))
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}) — {_n} share one instance target, so its "
+                        f"tasks are processed {_n}x")
+            count = cost
             # Stop advice is scoped to the ownerless subset: a root with a live
             # parent is supervised, and stopping it takes a healthy peer offline.
-            count = (f"{len(roots)} watcher(s) running with no PID sentinel "
-                     f"(pids {', '.join(roots)}) — each drains tasks/, so every task "
-                     f"is processed {len(roots)}x")
             if ownerless and supervised:
                 lead = (f"{count}. Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
                         f"one cleanly. Do NOT stop {', '.join(supervised)} — supervised; "
@@ -8943,6 +8971,8 @@ def check_task_watcher() -> dict:
                 lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
                         f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; "
                         f"stop them and restart one cleanly")
+            elif _unknown or len(_groups) == len(roots):
+                lead = f"{count}. Do NOT stop any of them: each is supervised"
             else:
                 lead = (f"{count}. Do NOT stop any of them: each is supervised; "
                         f"reduce the count through the launcher that owns it")
@@ -9012,15 +9042,9 @@ def check_task_watcher() -> dict:
         # two roots duplicates, and an unresolvable one authorises nothing.
         state_dir = WORKSPACE_DIR / "state"
         tracked_targets = {str(sp) for sp in live.values()}
-        dupes, distinct, unknown = [], [], []
-        for r in extras:
-            target = _watcher_sentinel_target(state_dir, r)
-            if target is None:
-                unknown.append(r)
-            elif str(target) in tracked_targets:
-                dupes.append(r)
-            else:
-                distinct.append(r)
+        _groups, unknown = _group_roots_by_target(state_dir, extras)
+        dupes = [r for tgt, rs in _groups.items() if tgt in tracked_targets for r in rs]
+        distinct = [r for tgt, rs in _groups.items() if tgt not in tracked_targets for r in rs]
         if unknown:
             return {"name": name, "status": "warn",
                     "detail": f"UNKNOWN: {len(unknown)} untracked watcher tree(s) "

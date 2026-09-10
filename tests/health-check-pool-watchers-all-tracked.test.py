@@ -646,15 +646,21 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
 
     W = "/repo/src/watch-tasks-stream.sh"
 
-    def _detail(self, ps):
-        orig = (hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths)
+    def _detail(self, ps, targets=None):
+        """`targets` maps pid -> sentinel target. Absent, identity is unreadable,
+        which is itself a case: the duplicate claim must not be made from a count."""
+        orig = (hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths,
+                hc._watcher_sentinel_target)
         hc._ps_snapshot = lambda: ps
         hc._proc_argv_vector = lambda pid: None
         hc.watcher_sentinel_paths = lambda sd: []
+        if targets is not None:
+            hc._watcher_sentinel_target = lambda sd, pid, _m=targets: _m.get(str(pid))
         try:
             return hc.check_task_watcher().get("detail") or ""
         finally:
-            hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths = orig
+            (hc._ps_snapshot, hc._proc_argv_vector, hc.watcher_sentinel_paths,
+             hc._watcher_sentinel_target) = orig
 
     def test_two_supervised_roots_are_never_told_to_stop(self):
         d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
@@ -681,9 +687,32 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
         self.assertNotIn("Do NOT stop", d)
 
     def test_the_duplicate_processing_cost_is_still_stated(self):
-        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
+        """A PROVEN duplicate — both roots resolve to one target — must still say
+        what it costs. The identity is what makes the claim true."""
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n",
+                         targets={"901": "/s/w-a.pid", "902": "/s/w-a.pid"})
         self.assertIn("processed 2x", d,
             "the reason a duplicate matters must survive the softened advice")
+
+    def test_two_DISTINCT_instances_are_not_called_duplicates(self):
+        """qingyun-wu, #3875: losing the last sentinel must not turn two instances
+        into duplicate workers, and must not authorise reducing the count."""
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n",
+                         targets={"901": "/s/w-a.pid", "902": "/s/w-b.pid"})
+        self.assertIn("DISTINCT", d)
+        self.assertNotIn("processed 2x", d)
+        self.assertIn("do not reduce the count", d)
+        self.assertNotIn("reduce the count through the launcher", d,
+            "the affirmative reduce instruction must not survive a distinct-instance verdict")
+
+    def test_unreadable_identity_does_not_authorise_reduction(self):
+        """No identity, no duplicate claim: it may be one instance twice or two once."""
+        d = self._detail(f"  900 1 /bin/zsh -l\n  901 900 bash {self.W}\n  902 900 bash {self.W}\n")
+        self.assertIn("UNKNOWN", d)
+        self.assertNotIn("processed 2x", d)
+        self.assertIn("do not reduce the count", d)
+        self.assertNotIn("reduce the count through the launcher", d,
+            "unreadable identity must not authorise reduction")
 
 
 
