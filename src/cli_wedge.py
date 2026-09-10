@@ -82,7 +82,7 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
     "min_duration_s": 60,
 }
-BLOCKED_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
+ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     (name, re.compile(rx, re.IGNORECASE))
     for name, rx in (
         ("quota-limit", r"\b(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|\b(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
@@ -120,10 +120,10 @@ def raw_state_id(frame: str) -> str:
     return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
 
 
-def matched_blocked(frames: list) -> list:
-    """BLOCKED-family names in `frames` — credits, login, compaction, waiting."""
+def matched_abnormal(frames: list) -> list:
+    """abnormal-family names in `frames` — credits, login, compaction, waiting."""
     text = "\n".join(frames)
-    return [name for name, rx in BLOCKED_PATTERNS if rx.search(text)]
+    return [name for name, rx in ABNORMAL_PATTERNS if rx.search(text)]
 
 
 def matched_patterns(frames: list) -> list:
@@ -187,13 +187,13 @@ def pattern_stats(pattern_samples: list, th: dict) -> dict:
             "retry_current": recurrent}
 
 
-def blocked_stats(blocked_samples: list, th: dict) -> dict:
-    """The same recurrence test over the BLOCKED family, kept separate so a
-    blocked state no longer has to look like a retry to reach a verdict."""
-    st = pattern_stats(blocked_samples, th)
-    return {"current_blocked": st["current_patterns"],
-            "consecutive_blocked_samples": st["consecutive_pattern_samples"],
-            "blocked_current": st["retry_current"]}
+def abnormal_stats(abnormal_samples: list, th: dict) -> dict:
+    """The same recurrence test over the abnormal family, kept separate so a
+    abnormal state no longer has to look like a retry to reach a verdict."""
+    st = pattern_stats(abnormal_samples, th)
+    return {"current_abnormal": st["current_patterns"],
+            "consecutive_abnormal_samples": st["consecutive_pattern_samples"],
+            "abnormal_current": st["retry_current"]}
 
 
 def classify(frames: list, work_outstanding: bool, duration_s: float,
@@ -207,12 +207,12 @@ def classify(frames: list, work_outstanding: bool, duration_s: float,
         raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
     return classify_ids([state_id(f) for f in frames], raw_static, [matched_patterns([f]) for f in frames],
                         work_outstanding, duration_s, work_detail, thresholds,
-                        blocked=[matched_blocked([f]) for f in frames])
+                        abnormal=[matched_abnormal([f]) for f in frames])
 
 
 def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool,
                  duration_s: float, work_detail: str = "", thresholds: Optional[dict] = None,
-                 gaps: Optional[list] = None, blocked: Optional[list] = None) -> dict:
+                 gaps: Optional[list] = None, abnormal: Optional[list] = None) -> dict:
     """The verdict from hashes and pattern names alone — what the persisted
     window carries, so no pane text is needed (or stored) to classify. `pats`
     is one list of pattern names per sample (a flat list means every sample)."""
@@ -221,7 +221,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if pats and all(isinstance(x, str) for x in pats):
         pats = [list(pats) for _ in state_ids]
     ps = pattern_stats(list(pats or []), th)
-    ps["_blocked"] = blocked_stats(list(blocked or []), th)
+    ps["_abnormal"] = abnormal_stats(list(abnormal or []), th)
     clock_only = (not raw_static) and nov.static
     spacing = {}
     if gaps:
@@ -235,8 +235,8 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
         "novel_state_count": nov.novel_state_count,
         "novelty_rate": round(nov.novelty_rate, 3),
         "matched_patterns": sorted({p for s in (pats or []) for p in s}),
-        "matched_blocked": sorted({p for s in (blocked or []) for p in s}),
-        **{k: v for k, v in blocked_stats(list(blocked or []), {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}).items()},
+        "matched_abnormal": sorted({p for s in (abnormal or []) for p in s}),
+        **{k: v for k, v in abnormal_stats(list(abnormal or []), {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}).items()},
         **ps,
         **spacing,
         "work_outstanding": work_outstanding,
@@ -259,25 +259,25 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
 def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_only: bool,
                   work_outstanding: bool, duration_s: float, work_detail: str, th: dict) -> dict:
     enough = nov.sample_count >= th["min_samples"]
-    # A provider told the CLI to stop: not a retry loop, a blocked state of its own.
+    # A provider told the CLI to stop: not a retry loop, a abnormal state of its own.
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
-    bs = ps.get("_blocked") or {"blocked_current": False, "current_blocked": [],
-                                "consecutive_blocked_samples": 0}
+    bs = ps.get("_abnormal") or {"abnormal_current": False, "current_abnormal": [],
+                                "consecutive_abnormal_samples": 0}
     low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
     # Retry is a SHAPE of the abnormal axis, not a sibling (owner): a retrying
     # pane is `moving + abnormal` — it moves while the work does not proceed.
-    if bs["blocked_current"] or ps["retry_current"]:
-        names = list(bs["current_blocked"]) + list(ps["current_patterns"])
-        n = max(bs["consecutive_blocked_samples"], ps["consecutive_pattern_samples"])
+    if bs["abnormal_current"] or ps["retry_current"]:
+        names = list(bs["current_abnormal"]) + list(ps["current_patterns"])
+        n = max(bs["consecutive_abnormal_samples"], ps["consecutive_pattern_samples"])
         # BOTH conditions: enough samples observed AND the text is recurrent.
         # n>=3 alone called a short window high-confidence; `enough` alone ignored recurrence.
         conf = "high" if (n >= 3 and enough) else "medium"
-        why = f"blocked text on the last {n} sample(s) ({', '.join(names)})"
+        why = f"abnormal text on the last {n} sample(s) ({', '.join(names)})"
         # Kinds stay STRING LITERALS: the availability fold's totality test derives
         # the emittable set by scanning this source, and a variable hides them.
-        if any(p in bs["current_blocked"] for p in PROVIDER_LIMIT_PATTERNS):
+        if any(p in bs["current_abnormal"] for p in PROVIDER_LIMIT_PATTERNS):
             return {**base, "kind": "provider-limit", "confidence": conf, "warn": True, "reason": why}
-        if ps["retry_current"] and not bs["blocked_current"]:
+        if ps["retry_current"] and not bs["abnormal_current"]:
             return {**base, "kind": "retry-loop", "confidence": conf, "warn": True, "reason": why}
         return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
