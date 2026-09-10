@@ -8669,6 +8669,7 @@ _WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
 
 # The script named as a whole final path component, so `x-watch-tasks-stream.sh`
 # and a mention inside a longer word cannot match.
+_WATCHER_SCRIPT_NAME = "watch-tasks-stream.sh"
 _WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
 
 
@@ -8692,7 +8693,7 @@ def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
             return False
         if vec[1].startswith("-"):
             return False
-        return _WATCHER_SCRIPT.search(vec[1]) is not None
+        return os.path.basename(vec[1]) == _WATCHER_SCRIPT_NAME
     parts = argv.split()
     if len(parts) < 2:
         return False

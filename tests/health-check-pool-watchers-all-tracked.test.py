@@ -510,5 +510,44 @@ class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
         self.assertEqual(len(hc._watcher_trees(ps)), 2)
 
 
+class WhitespaceInsideAPathnameIsNotAnArgvBoundary(unittest.TestCase):
+    """Reported by qingyun-wu on #3875 at 631e7fea, with real launched processes.
+
+    The vector branch matched the script NAME anywhere in vec[1] via a regex whose
+    `[\\s/]` alternative treats a space as a component boundary. Inside one
+    authoritative pathname it is not: `backup/copy watch-tasks-stream.sh` is a file
+    named `copy watch-tasks-stream.sh`, and publishing its pid points cleanup at an
+    unrelated process. Compare the exact final component instead.
+    """
+
+    TABLE = [("plain/src/watch-tasks-stream.sh", True),
+             ("spaced dir/src/watch-tasks-stream.sh", True),
+             ("backup/watch-tasks-stream.sh backup", False),
+             ("backup/copy watch-tasks-stream.sh", False),
+             ("backup/watch-tasks-stream.sh.bak", False)]
+
+    def _with_vector(self, path):
+        orig = hc._proc_argv_vector
+        hc._proc_argv_vector = lambda pid: ["/bin/bash", path]
+        try:
+            return hc._is_watcher_argv("bash " + path, 4242)
+        finally:
+            hc._proc_argv_vector = orig
+
+    def test_the_reported_table_holds(self):
+        for path, want in self.TABLE:
+            self.assertIs(self._with_vector(path), want, path)
+
+    def test_a_name_that_is_not_the_final_component_is_refused(self):
+        # The two rows that published a wrong pid; each fails if the regex returns.
+        for path in ("backup/watch-tasks-stream.sh backup", "backup/copy watch-tasks-stream.sh"):
+            self.assertIs(self._with_vector(path), False, path)
+
+    def test_a_spaced_DIRECTORY_still_recognises_a_real_watcher(self):
+        # The control that stops the fix from becoming "reject anything with a space".
+        self.assertIs(self._with_vector("spaced dir/src/watch-tasks-stream.sh"), True)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
