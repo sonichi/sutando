@@ -19,6 +19,7 @@ Rules
 - `name` is the short human name of the project (from the working dir or how the owner refers to it), not the slug.
 - `what_it_is` is one line (≤ 90 characters) a stranger can read; `top_open_thread` is the single most important unfinished thing (≤ 90 characters).
 - `status` is one of `active`, `paused`, `done`, `unknown` — active if the last session's work was still in flight.
+- Lists: at most 20 items each, 200 characters per item, most important first — a roll-up condenses; it does not re-list every session's items.
 - `note_markdown` is a readable note for a human, 200–600 words, in this order: what the project is, what was accomplished (with PR/commit refs as written), key decisions and why, open threads, people and companies involved. Plain markdown, no top-level `#` heading (finalize adds it), no secrets.
 
 Schema (`projects/<slug>.json`)

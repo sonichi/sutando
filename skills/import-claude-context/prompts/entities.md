@@ -18,6 +18,7 @@ Rules
 - People are real humans the owner dealt with or discussed (investors, colleagues, customers, collaborators) — not the assistant, not the owner, not authors of libraries. `relationship` is from the owner's point of view.
 - `email` only when it is written in the summaries; never construct one.
 - Companies, deals and decisions likewise only as stated; `open_threads` are unfinished items across projects, most important first, at most 30.
+- Keep to what is durable: `decisions` are the ones that shaped a project (at most 40, most important first), `companies` only those the owner dealt with or discussed as a counterparty — not every product, library or vendor named in passing.
 - Nothing that looks like a credential.
 
 Schema (`entities.json`)
