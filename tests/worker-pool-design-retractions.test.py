@@ -924,7 +924,9 @@ class OneComponentBelongsToOneStage(unittest.TestCase):
     def test_the_two_components_are_told_apart_by_question_and_file(self):
         f = self._flat()
         self.assertIn("which instance is this room pinned to", f)
-        self.assertIn("may that instance claim right now", f)
+        # Was "may that instance claim right now" until keweichen showed that
+        # phrasing claimed the per-task decision it cannot make (#4041).
+        self.assertIn("is that instance operationally able to claim", f)
 
     def test_only_step_three_owns_the_eligibility_reader(self):
         """Exactly one surviving 'eligibility reader' mention, and it is step 3's."""
@@ -2238,6 +2240,67 @@ class AuthoritativeSourceRowsSeparateFactFromDerivation(unittest.TestCase):
         text = DOC.read_text(encoding="utf-8")
         self.assertNotIn("a result's presence", text,
             "the crash-predicate list still treats presence as completion")
+
+
+class TheClaimDecisionCarriesTheTaskAddress(unittest.TestCase):
+    """Reported by keweichen on #4041 at head 1625feca.
+
+    The single `may that instance claim right now` row derived the decision from
+    instance state alone. Rule 1 (`:778-790`) reads `requested_worker` FIRST, so
+    two tasks differing only in that field decide differently on identical
+    instance state -- the listed conjunction cannot answer what it claimed to.
+    Their control: deleting the whole row left ran=133 failures=0, so nothing
+    here could see it. Each test below fails when its own sentence is removed.
+    """
+
+    def _rows(self):
+        text = DOC.read_text(encoding="utf-8")
+        return [ln for ln in text.splitlines() if ln.startswith("| ")]
+
+    def _row_named(self, needle):
+        hits = [r for r in self._rows() if needle in r]
+        self.assertEqual(len(hits), 1,
+            f"expected exactly one authoritative-source row matching {needle!r}, got {len(hits)}")
+        return hits[0]
+
+    def test_a_row_answers_the_per_task_claim_decision(self):
+        # keweichen's delete-the-row mutation is exactly this assertion failing.
+        self._row_named("may this instance claim THIS task")
+
+    def test_that_row_names_requested_worker_as_an_input(self):
+        row = self._row_named("may this instance claim THIS task")
+        self.assertIn("requested_worker", row,
+            "the per-task claim decision omits the task address rule 1 reads first")
+
+    def test_that_row_is_ordered_not_a_bare_conjunction(self):
+        row = self._row_named("may this instance claim THIS task")
+        self.assertIn("ORDERED", row,
+            "rule 1 precedes the pin table; an unordered conjunction loses that")
+        self.assertIn(":778-790", row,
+            "the ordered derivation must cite the rule that orders it")
+
+    def test_the_operational_row_declares_itself_blind_to_the_task(self):
+        row = self._row_named("OPERATIONALLY able to claim")
+        self.assertIn("BLIND", row,
+            "the instance-state conjunction must say it cannot see the task, "
+            "or it reads as answering the per-task question again")
+        self.assertNotIn("`bindings.json`", row,
+            "room membership is its own fact; folding it into the operational "
+            "conjunction is what made one row look sufficient")
+
+    def test_the_eligibility_reader_no_longer_claims_the_per_task_question(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertNotIn("the eligibility reader asks *may that instance claim right now*", text,
+            "two decompositions of one question stood at once (:2128-2137 vs the table)")
+
+    def test_the_two_questions_are_not_the_same_string(self):
+        rows = self._rows()
+        op = [r for r in rows if "OPERATIONALLY able to claim" in r]
+        per = [r for r in rows if "may this instance claim THIS task" in r]
+        self.assertTrue(op and per)
+        self.assertNotEqual(op[0].split("|")[1].strip(), per[0].split("|")[1].strip(),
+            "the operational gate and the per-task decision must not share a question")
+
 
 
 if __name__ == "__main__":

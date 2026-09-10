@@ -1715,7 +1715,9 @@ remembers is the one a sweep reads.
 | may that holder EXECUTE for this room | DERIVED, not sourced: the claim AND the post-claim `bindings.json` re-read (`:1094-1139`). The claim proves exclusive ownership, never execution authorization — first-pin is unfenced, so a claim can still name an instance the room no longer binds. |
 | was the offer TAKEN, and by which executor | the accept record `state/task-event-handler-accepts/<canonical task id>` |
 | which instances serve this room | `state/pool/bindings.json` |
-| may that instance claim right now | DERIVED, not sourced: a conjunction over separately owned inputs — `eligibility` in `state/pool-status.json`, the probation directory `state/pool/probation/`, the room's `bindings.json`, the instance's `.alive`, and the quiesce exclusion at `:1899`. No single one of these answers it. |
+| is that instance OPERATIONALLY able to claim, ignoring what the task addresses | DERIVED, not sourced: a conjunction over separately owned inputs — `eligibility` in `state/pool-status.json`, the probation directory `state/pool/probation/`, the instance's `.alive`, and the quiesce exclusion at `:1899`. No single one answers it, and this conjunction is deliberately BLIND to the task — it is the same for two tasks addressed differently. |
+| what does THIS task address | the authoritative `requested_worker` on the task envelope — a task-level fact, owned by no instance record |
+| may this instance claim THIS task | DERIVED, not sourced, and ORDERED: rule 1 at `:778-790` reads `requested_worker` FIRST and can suppress an operationally-able instance; only with no such field does the pin table in `bindings.json` decide (rule 2). The operational conjunction above is a GATE on the winner, never the chooser. Two tasks differing only in `requested_worker` decide differently on identical instance state, so any derivation omitting the address cannot answer this. |
 | is that instance's process up | its own `.alive` |
 | has that instance run out of credit | `state/pool/quiesced/<instance>.json` |
 | may a reclaim repeat this task's external side effect | the done flag `state/cores/<name>/done/task-X.flag` |
@@ -2131,8 +2133,10 @@ production-path tests; the staged list below marks which those are.
    were one phrase here until two reviewers found the contradiction at one head.**
    They answer different questions against different files: the binding lookup asks
    *which instance is this room pinned to*, off the pin table, and step 2 owns it;
-   the eligibility reader asks *may that instance claim right now*, off the
-   pool-status record, and step 3 owns it with its publisher. Naming both "the
+   the eligibility reader asks *is that instance operationally able to claim*, off
+   the pool-status record, and step 3 owns it with its publisher. Neither answers
+   *may this instance claim THIS task* — that is the ordered derivation at `:1718-1720`,
+   which reads the task's own `requested_worker` before either of them. Naming both "the
    eligibility reader" put one component in two stages and contradicted **Step 2
    routes on BEATS ALONE** three hundred lines above — which is the same document
    requiring a step-2 record reader and forbidding one. No binding lookup on
