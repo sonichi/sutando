@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Turn the haiku summaries into Sutando's sinks — and undo them per project.
+"""Turn the haiku summaries into Sutando's sinks — once the owner has reviewed
+them — and undo them per project.
 
 Reads, all under <data-dir> (= <workspace>/data/claude-import/):
   index.json                      session metadata (titles, dates, cwd) from index.py
@@ -8,29 +9,69 @@ Reads, all under <data-dir> (= <workspace>/data/claude-import/):
   projects/<slug>.json            per-project roll-up incl. `note_markdown`
   entities.json                   people / companies / deals / decisions / open threads
 
-Writes:
-  <memory-dir>/claude_import.md               <= 2,000 bytes: "Imported N sessions /
-                                              M projects on <date>", one line per
-                                              project (name, what it is, status, top
-                                              open thread), pointer to notes/claude-import/
-  <memory-dir>/MEMORY.md                      ONE row, only when
-                                              memory-index-budget.py --adding <row> exits 0
-                                              (refused -> row skipped, logged, file kept)
-  <workspace>/notes/claude-import/<slug>.md   one note per project; a re-run with a
-                                              changed roll-up appends `## Update <date>`
-  <workspace>/notes/claude-import/overview.md regenerated each run
-  <data-dir>/status.json                      phase + counts only
-  <data-dir>/state.json                       `summarized_at` per session
+Nothing may land in the agent's memory, notes or People store until the owner
+has seen a digest of what was learned and said yes (owner, 2026-09-10), so the
+finalize runs in two steps:
 
-  --people-json     print <=25 People upsert payloads (people with >=2 citations)
-                    for the station's people__upsert_person tool; writes nothing
+  --stage  (the default: an unguarded run cannot write into a sink)
+    renders everything under <data-dir>/staged/ and touches no sink:
+      staged/memory/claude_import.md            the <= 2,000-byte memory summary
+      staged/notes/claude-import/<slug>.md      one note per project, + overview.md
+      staged/people.json                        the <= 25 People upsert payloads
+      staged/review.md                          the digest the owner reads: one
+                                                paragraph per project, its open
+                                                threads and decisions, the people
+                                                it would add (name, why, citation
+                                                counts), the memory size, and how
+                                                to answer
+      staged/manifest.json                      staged_at, run kind, pending slugs,
+                                                a fingerprint of the inputs
+      status.json                               phase `staged`, counts only
+
+  --commit [--projects a,b]  (only on the owner's explicit yes)
+    moves the staged set into the real sinks with the same guards as before:
+      <memory-dir>/claude_import.md             <= 2,000 bytes: "Imported N sessions /
+                                                M projects on <date>", one line per
+                                                project (name, what it is, status, top
+                                                open thread), pointer to notes/claude-import/
+      <memory-dir>/MEMORY.md                    ONE row, only when
+                                                memory-index-budget.py --adding <row> exits 0
+                                                (refused -> row skipped, logged, file kept)
+      <workspace>/notes/claude-import/<slug>.md one note per project; a re-run with a
+                                                changed roll-up appends `## Update <date>`
+      <workspace>/notes/claude-import/overview.md regenerated
+      <data-dir>/state.json                     `summarized_at` per session, note hashes
+      <data-dir>/status.json                    phase `done` + counts (`staged` while a
+                                                --projects remainder is still pending)
+    Refused (exit 1) when nothing is staged, or when the summaries, roll-ups or
+    entities changed since staging (stale: stage and review again). `--projects`
+    takes an exact slug or a unique part of one, commits that subset and
+    re-stages the rest.
+
+  --discard [--projects a,b]
+                    drop the staged set (or a subset); the sinks are untouched
+  --people-json [--projects a,b]
+                    print the <= 25 People upsert payloads (people with >= 2
+                    citations) for the station's people__upsert_person tool;
+                    writes nothing. Prints the staged copy while one is pending.
+                    A payload is APPROVED only by --commit: the caller upserts
+                    after the commit, and after `--commit --projects a` asks for
+                    `--people-json --projects a` so only people cited in the
+                    approved projects land.
   --forget <slug>   remove exactly that project's note, summaries, dumps, roll-up,
-                    memory line, state and entity citations
-  --purge-dumps     delete <data-dir>/dumps/ (run after a successful finalize)
+                    memory line, state, entity citations and staged copy
+  --purge-dumps     delete <data-dir>/dumps/ (alone, or after --stage / --forget)
+
+People and companies are de-duplicated in memory first (merge_people /
+merge_companies: shared email -> one person; a bare first name folds into its
+unique fuller match; same company name case-insensitively), before the >= 2
+citations / <= 25 selection and before review.md; the counts land in the JSON as
+`people_merged` / `companies_merged`. entities.json itself is never rewritten here.
 
 The memory dir is util_paths.memory_dir() (the core's relocated tree); a memory
 dir under the stock ~/.claude is refused unless passed explicitly — the import
-never writes into Claude Code's own home.
+never writes into Claude Code's own home. `--stage` only resolves it (so a bad
+install fails before the owner is asked); nothing is written there until --commit.
 """
 from __future__ import annotations
 
@@ -47,7 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common  # noqa: E402
 from _common import (  # noqa: E402
     DUMPS_DIR, ENTITIES_FILE, INDEX_FILE, PROJECTS_DIR, REPO, SUMMARIES_DIR,
-    now_iso, session_key, today, write_status,
+    ensure_private_dir, now_iso, session_key, split_csv, today, write_status,
 )
 from util_paths import claude_home_path, memory_dir as core_memory_dir  # noqa: E402
 
@@ -61,6 +102,15 @@ PEOPLE_CAP = 25
 PEOPLE_MIN_CITATIONS = 2
 BUDGET_SCRIPT = REPO / "skills" / "proactive-loop" / "scripts" / "memory-index-budget.py"
 ENTITY_LISTS = ("people", "companies", "deals", "decisions", "open_threads")
+
+STAGED_DIR = "staged"
+STAGED_MEMORY_SUBDIR = "memory"
+STAGED_PEOPLE = "people.json"
+STAGED_REVIEW = "review.md"
+STAGED_MANIFEST = "manifest.json"
+REVIEW_MAX_ITEMS = 12
+REVIEW_FOOTER = ("Reply 'bring it in' to save this to your Sutando, 'bring in <slug>' "
+                 "for one project, or 'forget <slug>' to drop one.")
 
 
 def memory_row(n_projects: int) -> str:
@@ -90,6 +140,18 @@ def resolve_memory_dir(explicit=None) -> Path:
 
 def notes_dir(ws: Path) -> Path:
     return ws.joinpath(*NOTES_SUBDIR)
+
+
+def staged_dir(data_dir: Path) -> Path:
+    return data_dir / STAGED_DIR
+
+
+def staged_notes_dir(data_dir: Path) -> Path:
+    return staged_dir(data_dir).joinpath(*NOTES_SUBDIR)
+
+
+def staged_memory_dir(data_dir: Path) -> Path:
+    return staged_dir(data_dir) / STAGED_MEMORY_SUBDIR
 
 
 # ----------------------------------------------------------------------- inputs
@@ -130,6 +192,45 @@ def load_entities(data_dir: Path) -> dict:
     return doc
 
 
+def load_inputs(data_dir: Path) -> tuple:
+    """(index_doc, summaries, rollups, entities, state) — everything finalize reads."""
+    index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
+    return (index_doc, load_summaries(data_dir), load_rollups(data_dir),
+            load_entities(data_dir), _common.load_state(data_dir))
+
+
+def input_files(data_dir: Path) -> list:
+    files = [data_dir / INDEX_FILE, data_dir / ENTITIES_FILE]
+    base = data_dir / SUMMARIES_DIR
+    if base.is_dir():
+        for slug_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            files += [f for f in sorted(slug_dir.glob("*.json")) if f.name.count(".") == 1]
+    pdir = data_dir / PROJECTS_DIR
+    if pdir.is_dir():
+        files += sorted(pdir.glob("*.json"))
+    return files
+
+
+def inputs_fingerprint(data_dir: Path) -> str:
+    """sha256 over the inputs finalize reads (index, merged summaries, roll-ups,
+    entities). A staged set whose fingerprint no longer matches was reviewed
+    against summaries that have since changed: it is stale, whatever the clocks say."""
+    h = hashlib.sha256()
+    for f in input_files(data_dir):
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        h.update(str(f.relative_to(data_dir)).encode("utf-8") + b"\0")
+        h.update(hashlib.sha256(data).digest())
+    return h.hexdigest()
+
+
+def committed_rollups(rollups: dict, state: dict) -> dict:
+    """The roll-ups whose note has landed in the sinks (state.projects records each commit)."""
+    return {s: r for s, r in rollups.items() if s in state["projects"]}
+
+
 def session_meta(index_doc: dict, slug: str, uuid: str) -> dict:
     for s in ((index_doc.get("projects") or {}).get(slug) or {}).get("sessions") or []:
         if s.get("uuid") == uuid:
@@ -139,6 +240,18 @@ def session_meta(index_doc: dict, slug: str, uuid: str) -> dict:
 
 def project_meta(index_doc: dict, slug: str) -> dict:
     return (index_doc.get("projects") or {}).get(slug) or {}
+
+
+def session_total(index_doc: dict, summaries: dict, slugs, all_slugs) -> int:
+    """Sessions behind `slugs`: the index total once every project is in, else the
+    per-project counts (falling back to the summaries on disk)."""
+    if set(all_slugs) <= set(slugs):
+        return int(index_doc.get("counts", {}).get("sessions") or len(summaries))
+    total = 0
+    for slug in slugs:
+        total += int(project_meta(index_doc, slug).get("session_count")
+                     or sum(1 for (s, _u) in summaries if s == slug))
+    return total
 
 
 def display_name(slug: str, rollup: dict, index_doc: dict) -> str:
@@ -176,6 +289,27 @@ def date_range(index_doc: dict, slugs) -> tuple:
 def header_line(index_doc: dict, slugs, run_kind: str) -> str:
     first, last = date_range(index_doc, slugs)
     return f"*[imported, claude-code] — import-claude-context | {first} → {last} | {run_kind}*"
+
+
+def resolve_selectors(available, selectors, what: str) -> list:
+    """`--projects` for the gate: each selector is an exact slug or a unique
+    case-insensitive part of one. No match or an ambiguous one refuses — a
+    commit never covers more than the owner named. No selectors = everything."""
+    available = list(available)
+    if not selectors:
+        return available
+    chosen = []
+    for sel in selectors:
+        hits = [sel] if sel in available else [s for s in available if sel.lower() in s.lower()]
+        if not hits:
+            raise SystemExit(f"import-claude-context: no {what} matches {sel!r} "
+                             f"({len(available)} available; the slugs are in staged/review.md)")
+        if len(hits) > 1:
+            raise SystemExit(f"import-claude-context: {sel!r} matches {len(hits)} {what}s; "
+                             f"name one exactly (the slugs are in staged/review.md)")
+        if hits[0] not in chosen:
+            chosen.append(hits[0])
+    return chosen
 
 
 # ------------------------------------------------------------------- memory file
@@ -286,38 +420,59 @@ def _note_hash(rollup: dict) -> str:
     return hashlib.sha256((rollup.get("note_markdown") or "").encode("utf-8")).hexdigest()[:16]
 
 
-def write_project_note(ndir: Path, slug: str, rollup: dict, index_doc: dict, summaries: dict,
-                       state: dict, run_kind: str) -> str:
-    """Returns 'created' | 'updated' | 'unchanged'."""
-    path = ndir / f"{slug}.md"
-    note = (rollup.get("note_markdown") or "").strip() or "_(no roll-up text)_"
+def _note_body(rollup: dict) -> str:
+    return (rollup.get("note_markdown") or "").strip() or "_(no roll-up text)_"
+
+
+def render_note(slug: str, rollup: dict, index_doc: dict, summaries: dict, run_kind: str) -> str:
+    """The full text of a NEW notes/claude-import/<slug>.md."""
+    name = display_name(slug, rollup, index_doc)
+    cwd = project_meta(index_doc, slug).get("cwd")
+    text = _frontmatter(f"Claude Code history — {name}")
+    text += header_line(index_doc, [slug], run_kind) + "\n\n"
+    text += f"# {name}\n\n"
+    if cwd:
+        text += f"Project dir: `{cwd}` (Claude Code slug `{slug}`)\n\n"
+    text += _note_body(rollup) + "\n"
     sessions = _sessions_list(slug, rollup, index_doc, summaries)
-    digest = _note_hash(rollup)
+    if sessions:
+        text += f"\n## Sessions\n{sessions}\n"
+    return text
+
+
+def render_update_block(slug: str, rollup: dict, index_doc: dict, summaries: dict) -> str:
+    """What a re-run with a changed roll-up appends to an existing note."""
+    block = f"\n\n## Update {today()}\n\n{_note_body(rollup)}\n"
+    sessions = _sessions_list(slug, rollup, index_doc, summaries)
+    if sessions:
+        block += f"\n### Sessions\n{sessions}\n"
+    return block
+
+
+def note_outcome(ndir: Path, slug: str, rollup: dict, state: dict) -> str:
+    """What a commit does to notes/claude-import/<slug>.md: created | updated | unchanged."""
+    if not (ndir / f"{slug}.md").is_file():
+        return "created"
     prev = state["projects"].get(slug) or {}
-    if path.is_file():
-        if prev.get("note_hash") == digest:
-            return "unchanged"
-        block = f"\n\n## Update {today()}\n\n{note}\n"
-        if sessions:
-            block += f"\n### Sessions\n{sessions}\n"
+    return "unchanged" if prev.get("note_hash") == _note_hash(rollup) else "updated"
+
+
+def write_project_note(ndir: Path, slug: str, rollup: dict, index_doc: dict, summaries: dict,
+                       state: dict, run_kind: str, staged_note=None) -> str:
+    """Returns 'created' | 'updated' | 'unchanged'. A new note is the staged file
+    moved into place when one is given (what the owner reviewed lands verbatim)."""
+    path = ndir / f"{slug}.md"
+    result = note_outcome(ndir, slug, rollup, state)
+    if result == "unchanged":
+        return result
+    if result == "updated":
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(block)
-        result = "updated"
+            fh.write(render_update_block(slug, rollup, index_doc, summaries))
+    elif staged_note is not None and Path(staged_note).is_file():
+        shutil.move(str(staged_note), str(path))
     else:
-        name = display_name(slug, rollup, index_doc)
-        cwd = project_meta(index_doc, slug).get("cwd")
-        text = _frontmatter(f"Claude Code history — {name}")
-        text += header_line(index_doc, [slug], run_kind) + "\n\n"
-        text += f"# {name}\n\n"
-        if cwd:
-            text += f"Project dir: `{cwd}` (Claude Code slug `{slug}`)\n\n"
-        text += note + "\n"
-        if sessions:
-            text += f"\n## Sessions\n{sessions}\n"
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        result = "created"
-    state["projects"][slug] = {"note_hash": digest, "note_written_at": now_iso()}
+        path.write_text(render_note(slug, rollup, index_doc, summaries, run_kind), encoding="utf-8")
+    state["projects"][slug] = {"note_hash": _note_hash(rollup), "note_written_at": now_iso()}
     return result
 
 
@@ -345,6 +500,188 @@ def render_overview(rollups: dict, index_doc: dict, n_sessions: int, run_kind: s
     return text
 
 
+# ------------------------------------------------------------------ entity merge
+
+def _norm_name(value) -> str:
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _emails_of(p: dict) -> list:
+    """Every email an entry carries (`email`, `emails`, `identifiers.emails`),
+    first-seen casing, case-insensitively unique, in order."""
+    ids = p.get("identifiers") if isinstance(p.get("identifiers"), dict) else {}
+    raw = [p.get("email")]
+    raw += list(p.get("emails") or []) if isinstance(p.get("emails"), list) else []
+    raw += list(ids.get("emails") or []) if isinstance(ids.get("emails"), list) else []
+    out, seen = [], set()
+    for v in raw:
+        if isinstance(v, str) and "@" in v and v.strip() and v.strip().lower() not in seen:
+            seen.add(v.strip().lower())
+            out.append(v.strip())
+    return out
+
+
+def _union_citations(entries) -> list:
+    out, seen = [], set()
+    for e in entries:
+        for c in e.get("citations") or []:
+            if not isinstance(c, dict):
+                continue
+            key = (c.get("project"), c.get("session"), c.get("quote_or_context") or c.get("context"))
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
+
+
+def _merge_group(entries) -> dict:
+    """One person out of several entries: the longest name (first on a tie),
+    the most specific (longest) role, the base's other fields or the first
+    non-empty one, emails / identifiers / citations unioned in input order."""
+    base = max(entries, key=lambda p: len(_norm_name(p.get("name"))))
+    out = dict(base)
+    out["name"] = _norm_name(base.get("name"))
+    roles = [p["role"].strip() for p in entries if isinstance(p.get("role"), str) and p["role"].strip()]
+    if roles:
+        out["role"] = max(roles, key=len)
+    for key in ("company", "relationship"):
+        if not (isinstance(out.get(key), str) and out[key].strip()):
+            for p in entries:
+                if isinstance(p.get(key), str) and p[key].strip():
+                    out[key] = p[key]
+                    break
+    emails, seen = [], set()
+    for p in entries:
+        for e in _emails_of(p):
+            if e.lower() not in seen:
+                seen.add(e.lower())
+                emails.append(e)
+    if emails:
+        own = _emails_of(base)
+        out["email"] = own[0] if own else emails[0]
+        if len(emails) > 1 or any(isinstance(p.get("emails"), list) for p in entries):
+            out["emails"] = emails
+    ids = {}
+    for p in entries:
+        d = p.get("identifiers")
+        if not isinstance(d, dict):
+            continue
+        for k, v in d.items():
+            if isinstance(v, list):
+                merged = list(ids.get(k) or [])
+                merged += [x for x in v if x not in merged]
+                ids[k] = merged
+            elif v not in (None, "") and ids.get(k) in (None, ""):
+                ids[k] = v
+    if ids:
+        if emails:
+            ids["emails"] = emails
+        out["identifiers"] = ids
+    out["citations"] = _union_citations(entries)
+    return out
+
+
+def _email_groups(entries) -> list:
+    """Indices grouped by shared email (transitively), each group in input order,
+    groups in order of their first member."""
+    parent = list(range(len(entries)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first = {}
+    for i, p in enumerate(entries):
+        for e in _emails_of(p):
+            k = e.lower()
+            if k in first:
+                ri, rj = find(first[k]), find(i)
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+            else:
+                first[k] = i
+    groups = {}
+    for i in range(len(entries)):
+        groups.setdefault(find(i), []).append(i)
+    return [groups[r] for r in sorted(groups)]
+
+
+def merge_people(people) -> tuple:
+    """Deterministic de-duplication of the entities pass (people[]) — returns
+    (merged list, number of entries absorbed). Pure: the input is not modified.
+
+    1. Entries sharing a non-empty email are one person: longest name, union of
+       emails / identifiers / citations, the more specific role.
+    2. A single-token name ("Chi") merges into the UNIQUE other entry whose name
+       starts with that token and a space ("Chi Wang") when their emails do not
+       conflict: the fuller name is kept, citations unioned. Two or more fuller
+       matches ("John" vs "John Smith" + "John Doe") leave everything untouched.
+    3. Two multi-token names are never merged by name."""
+    entries = [p for p in people or [] if isinstance(p, dict)]
+    step1 = [_merge_group([entries[i] for i in g]) if len(g) > 1 else dict(entries[g[0]])
+             for g in _email_groups(entries)]
+    names = [_norm_name(p.get("name")) for p in step1]
+    result = list(step1)
+    absorbed = set()
+    for i, p in enumerate(step1):
+        name = names[i]
+        if not name or " " in name:
+            continue
+        token = name.lower() + " "
+        hits = [j for j, other in enumerate(names) if j != i and other.lower().startswith(token)]
+        if len(hits) != 1:
+            continue
+        j = hits[0]
+        mine = {e.lower() for e in _emails_of(p)}
+        theirs = {e.lower() for e in _emails_of(result[j])}
+        if mine and theirs and mine.isdisjoint(theirs):
+            continue  # two different addresses: not provably the same person
+        result[j] = _merge_group([result[j], p])
+        absorbed.add(i)
+    merged = [p for i, p in enumerate(result) if i not in absorbed]
+    return merged, len(entries) - len(merged)
+
+
+def merge_companies(companies) -> tuple:
+    """Companies with the same name (case-insensitive) are one: first spelling
+    kept, first non-empty `what` / `relationship`, citations unioned."""
+    out, index = [], {}
+    n_in = 0
+    for c in companies or []:
+        if not isinstance(c, dict):
+            continue
+        n_in += 1
+        key = _norm_name(c.get("name")).lower()
+        if key and key in index:
+            base = out[index[key]]
+            merged = dict(base)
+            for k in ("what", "relationship"):
+                if not (isinstance(merged.get(k), str) and merged[k].strip()) \
+                        and isinstance(c.get(k), str) and c[k].strip():
+                    merged[k] = c[k]
+            merged["citations"] = _union_citations([base, c])
+            out[index[key]] = merged
+            continue
+        if key:
+            index[key] = len(out)
+        out.append(dict(c))
+    return out, n_in - len(out)
+
+
+def merge_entities(entities: dict) -> tuple:
+    """(a copy of entities with people and companies de-duplicated, merge counts).
+    Applied in memory before the People selection and the review digest — never
+    written back, so entities.json (and the staged fingerprint) stay as the
+    entities pass left them."""
+    people, n_people = merge_people(entities.get("people"))
+    companies, n_companies = merge_companies(entities.get("companies"))
+    out = dict(entities)
+    out["people"], out["companies"] = people, companies
+    return out, {"people_merged": n_people, "companies_merged": n_companies}
+
+
 # ------------------------------------------------------------------------ people
 
 def _citation_project(c) -> str:
@@ -355,21 +692,38 @@ def _citation_session(c) -> str:
     return c.get("session") if isinstance(c, dict) else ""
 
 
-def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
-                    min_citations: int = PEOPLE_MIN_CITATIONS) -> list:
+def _person_citations(p: dict, projects=None) -> list:
+    cites = [c for c in p.get("citations") or [] if isinstance(c, dict)]
+    if projects is not None:
+        cites = [c for c in cites if _citation_project(c) in projects]
+    return cites
+
+
+def people_candidates(entities: dict, cap: int = PEOPLE_CAP, min_citations: int = PEOPLE_MIN_CITATIONS,
+                      projects=None) -> tuple:
+    """([(person, citations)] — the <= cap named people with >= min_citations
+    citations, most-cited first — and how many named people fell under the floor).
+    `projects` restricts the citations that count, and that a payload may quote,
+    to those slugs: people are approved only through the projects they were seen in."""
     people = [p for p in entities.get("people") or [] if isinstance(p, dict) and p.get("name")]
-    people = [p for p in people if len([c for c in p.get("citations") or [] if isinstance(c, dict)]) >= min_citations]
-    people.sort(key=lambda p: (-len(p.get("citations") or []), str(p.get("name"))))
+    scored = [(p, _person_citations(p, projects)) for p in people]
+    kept = [(p, c) for p, c in scored if len(c) >= min_citations]
+    kept.sort(key=lambda t: (-len(t[1]), str(t[0].get("name"))))
+    return kept[:cap], len(scored) - len(kept)
+
+
+def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
+                    min_citations: int = PEOPLE_MIN_CITATIONS, projects=None) -> list:
     payloads = []
-    for p in people[:cap]:
-        cites = [c for c in p.get("citations") or [] if isinstance(c, dict)]
+    for p, cites in people_candidates(entities, cap, min_citations, projects)[0]:
         dated = []
         for c in cites:
             meta = session_meta(index_doc, _citation_project(c) or "", _citation_session(c) or "")
             dated.append((meta.get("last_ts") or "", meta.get("title") or "", c))
         dated.sort(key=lambda t: t[0], reverse=True)
         name = _one_line(p["name"], 80)
-        email = p.get("email") if isinstance(p.get("email"), str) and "@" in p.get("email", "") else None
+        emails = _emails_of(p)
+        email = emails[0] if emails else None
         company = _one_line(p.get("company"), 80)
         role = _one_line(p.get("role"), 80)
         relationship = _one_line(p.get("relationship"), 200)
@@ -397,58 +751,308 @@ def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
         }
         if email:
             payload["email"] = email
-            payload["identifiers"] = {"emails": [email]}
+            payload["identifiers"] = {"emails": emails}
         payloads.append(payload)
     return payloads
 
 
-# ---------------------------------------------------------------------- finalize
+# ------------------------------------------------------------------------ review
 
-def finalize(*, data_dir: Path, ws: Path, memory_dir: Path, run_kind: str = "user") -> dict:
-    index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
-    summaries = load_summaries(data_dir)
-    rollups = load_rollups(data_dir)
-    entities = load_entities(data_dir)
-    state = _common.load_state(data_dir)
+def _dedupe_lines(lines) -> list:
+    seen, out = set(), []
+    for ln in lines:
+        key = " ".join(ln.lower().split())
+        if key and key not in seen:
+            seen.add(key)
+            out.append(ln)
+    return out
 
-    n_sessions = index_doc.get("counts", {}).get("sessions") or len(summaries)
-    stamp = now_iso()
-    for (slug, uuid) in summaries:
-        rec = state["sessions"].setdefault(session_key(slug, uuid), {})
-        rec.setdefault("summarized_at", stamp)
-        if rec.get("extracted_at") and rec["summarized_at"] < rec["extracted_at"]:
-            rec["summarized_at"] = stamp
+
+def _thread_lines(slug: str, rollup: dict, entities: dict) -> list:
+    lines = [_one_line(rollup.get("top_open_thread"), 160)]
+    for t in rollup.get("open_threads") or []:
+        if isinstance(t, dict):
+            t = t.get("thread") or t.get("what")
+        lines.append(_one_line(t, 160))
+    for t in entities.get("open_threads") or []:
+        if not isinstance(t, dict) or t.get("project") != slug:
+            continue
+        line = _one_line(t.get("thread"), 160)
+        action = _one_line(t.get("owner_action"), 120)
+        if line and action:
+            line += f" (you: {action})"
+        lines.append(line)
+    return _dedupe_lines(lines)
+
+
+def _decision_lines(slug: str, rollup: dict, entities: dict) -> list:
+    lines = []
+    source = list(rollup.get("key_decisions") or [])
+    source += [d for d in entities.get("decisions") or [] if isinstance(d, dict) and d.get("project") == slug]
+    for d in source:
+        if isinstance(d, dict):
+            line = _one_line(d.get("decision"), 160)
+            why = _one_line(d.get("why"), 120)
+            if line and why:
+                line += f" — because {why}"
+        else:
+            line = _one_line(d, 160)
+        lines.append(line)
+    return _dedupe_lines(lines)
+
+
+def _bullets(title: str, lines) -> str:
+    if not lines:
+        return f"{title}: none recorded.\n"
+    shown = lines[:REVIEW_MAX_ITEMS]
+    text = f"{title}:\n" + "".join(f"- {ln}\n" for ln in shown)
+    if len(lines) > len(shown):
+        text += f"- …and {len(lines) - len(shown)} more\n"
+    return text
+
+
+def _paragraph(rollup: dict) -> str:
+    for key in ("summary", "what_it_is"):
+        text = _one_line(rollup.get(key), 900)
+        if text:
+            return text
+    body = (rollup.get("note_markdown") or "").strip()
+    return _one_line(body.split("\n\n", 1)[0] if body else "", 900) or "(no roll-up text)"
+
+
+def _person_why(p: dict) -> str:
+    role_company = " · ".join(x for x in (_one_line(p.get("role"), 60), _one_line(p.get("company"), 60)) if x)
+    return "; ".join(x for x in (_one_line(p.get("relationship"), 120), role_company) if x) \
+        or "mentioned in your sessions"
+
+
+def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, candidates, below_floor: int,
+                  outcomes: dict, memory_bytes: int, n_memory_projects: int, n_sessions: int,
+                  run_kind: str, merged=None) -> str:
+    """The digest the owner reads before anything lands — the one place
+    transcript-derived text is shown to them."""
+    first, last = date_range(index_doc, slugs)
+    text = ("# Claude Code import — review before it lands\n\n"
+            f"Staged {today()} ({run_kind} run): {n_sessions} sessions across {len(slugs)} "
+            f"projects, {first} → {last}. Nothing below has been written to your memory, "
+            f"notes or People store yet.\n\n## Projects\n\n")
+    note_words = {"created": "note: new", "updated": "note: update to the existing note",
+                  "unchanged": "note: unchanged (nothing new)"}
+    for slug in slugs:
+        r = rollups[slug]
+        p = project_meta(index_doc, slug)
+        text += f"### {display_name(slug, r, index_doc)} (`{slug}`)\n\n"
+        meta = [f"{p.get('session_count') or 0} sessions ({_day(p.get('first_ts'))} → {_day(p.get('last_ts'))})",
+                f"status: {_one_line(r.get('status'), 20) or 'unknown'}",
+                note_words.get(outcomes.get(slug), "note: new")]
+        if p.get("cwd"):
+            meta.insert(0, f"dir `{p['cwd']}`")
+        text += " · ".join(meta) + "\n\n" + _paragraph(r) + "\n\n"
+        text += _bullets("Open threads", _thread_lines(slug, r, entities))
+        text += _bullets("Decisions", _decision_lines(slug, r, entities)) + "\n"
+    text += f"## People it would add ({len(candidates)})\n\n"
+    for p, cites in candidates:
+        n = len(cites)
+        text += f"- {_one_line(p['name'], 80)} — {_person_why(p)} ({n} citation{'s' if n != 1 else ''})\n"
+    if not candidates:
+        text += "- none\n"
+    if below_floor:
+        text += (f"\n_Left out: {below_floor} with a single mention only "
+                 f"({PEOPLE_MIN_CITATIONS} citations needed)._\n")
+    n_merged = (merged or {}).get("people_merged") or 0
+    if n_merged:
+        text += f"\n_{n_merged} duplicate people entries were merged first (same email, or a first name and its full name)._\n"
+    text += (f"\n## Memory\n\n{memory_bytes:,} B summary (cap {MEMORY_LIMIT:,} B) covering "
+             f"{n_memory_projects} projects for the agent's core memory, plus one MEMORY.md row "
+             f"if the index budget allows.\n\n---\n{REVIEW_FOOTER}\n")
+    return text
+
+
+# ------------------------------------------------------------------------- stage
+
+def load_manifest(data_dir: Path) -> dict:
+    doc = _common.load_json(staged_dir(data_dir) / STAGED_MANIFEST, None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("projects"), list):
+        return {}
+    doc["projects"] = [s for s in doc["projects"] if isinstance(s, str)]
+    return doc
+
+
+def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, exact: bool = False) -> dict:
+    """Render the review set under <data-dir>/staged/. Touches no sink (the
+    workspace notes are only looked at to say new / update / unchanged); a fresh
+    stage replaces whatever was pending."""
+    index_doc, summaries, rollups, entities, state = load_inputs(data_dir)
+    entities, merged = merge_entities(entities)
+    if isinstance(projects, str):
+        projects = split_csv(projects)
+    if projects and exact:
+        slugs = [s for s in rollups if s in set(projects)]
+    else:
+        slugs = [s for s in rollups if _common.matches_project(s, projects)]
+    if not slugs:
+        raise SystemExit("import-claude-context: nothing to stage — no project roll-up "
+                         + ("matches --projects" if projects else "under projects/ yet"))
+
+    sdir = staged_dir(data_dir)
+    if sdir.exists():
+        shutil.rmtree(sdir)
+    ensure_private_dir(sdir)
+    sndir = staged_notes_dir(data_dir)
+    sndir.mkdir(parents=True, exist_ok=True)
+    smem = staged_memory_dir(data_dir)
+    smem.mkdir(parents=True, exist_ok=True)
 
     ndir = notes_dir(ws)
-    ndir.mkdir(parents=True, exist_ok=True)
-    outcomes = {"created": 0, "updated": 0, "unchanged": 0}
-    for slug, rollup in rollups.items():
-        outcomes[write_project_note(ndir, slug, rollup, index_doc, summaries, state, run_kind)] += 1
-    if rollups:
-        (ndir / OVERVIEW).write_text(render_overview(rollups, index_doc, n_sessions, run_kind),
-                                     encoding="utf-8")
+    outcomes = {}
+    for slug in slugs:
+        outcomes[slug] = note_outcome(ndir, slug, rollups[slug], state)
+        (sndir / f"{slug}.md").write_text(render_note(slug, rollups[slug], index_doc, summaries, run_kind),
+                                          encoding="utf-8")
 
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    memory_text = render_memory_file(rollups, index_doc, n_sessions)
-    (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
-    row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(rollups)))
-    print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
+    # The memory file and the overview are single files over every landed
+    # project: preview them as they will read once the pending set is in too.
+    preview = committed_rollups(rollups, state)
+    preview.update({s: rollups[s] for s in slugs})
+    n_preview = session_total(index_doc, summaries, preview, rollups)
+    (sndir / OVERVIEW).write_text(render_overview(preview, index_doc, n_preview, run_kind), encoding="utf-8")
+    memory_text = render_memory_file(preview, index_doc, n_preview)
+    (smem / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
 
-    people = people_payloads(entities, index_doc)
-    _common.save_state(data_dir, state)
+    candidates, below_floor = people_candidates(entities, projects=set(slugs))
+    people = people_payloads(entities, index_doc, projects=set(slugs))
+    _common.write_json(sdir / STAGED_PEOPLE, people)
+    n_sessions = session_total(index_doc, summaries, slugs, rollups)
+    (sdir / STAGED_REVIEW).write_text(
+        render_review(slugs=slugs, rollups=rollups, index_doc=index_doc, entities=entities,
+                      candidates=candidates, below_floor=below_floor, outcomes=outcomes,
+                      memory_bytes=len(memory_text.encode("utf-8")), n_memory_projects=len(preview),
+                      n_sessions=n_sessions, run_kind=run_kind, merged=merged),
+        encoding="utf-8")
+    tally = {k: sum(1 for v in outcomes.values() if v == k) for k in ("created", "updated", "unchanged")}
     counts = {
-        "sessions": int(n_sessions), "summarized": len(summaries), "projects": len(rollups),
-        "notes_created": outcomes["created"], "notes_updated": outcomes["updated"],
-        "notes_unchanged": outcomes["unchanged"], "people": len(people),
-        "memory_bytes": len(memory_text.encode("utf-8")), "memory_row": bool(row_written),
+        "sessions": int(n_sessions), "summarized": sum(1 for (s, _u) in summaries if s in set(slugs)),
+        "projects": len(slugs), "people": len(people),
+        "memory_bytes": len(memory_text.encode("utf-8")),
+        "notes_created": tally["created"], "notes_updated": tally["updated"],
+        "notes_unchanged": tally["unchanged"], **merged,
     }
-    write_status(data_dir, "done", **counts)
+    _common.write_json(sdir / STAGED_MANIFEST, {
+        "staged_at": now_iso(), "run_kind": run_kind, "projects": slugs,
+        "fingerprint": inputs_fingerprint(data_dir), "counts": counts,
+    })
+    write_status(data_dir, "staged", **counts)
     return counts
 
 
+def _restage_or_clear(data_dir: Path, ws: Path, run_kind: str, remaining) -> list:
+    """Keep exactly `remaining` pending (re-rendered against the current inputs)
+    or clear the staging area when nothing is left."""
+    remaining = [s for s in remaining if (data_dir / PROJECTS_DIR / f"{s}.json").is_file()]
+    if remaining:
+        stage(data_dir=data_dir, ws=ws, run_kind=run_kind, projects=remaining, exact=True)
+    else:
+        shutil.rmtree(staged_dir(data_dir), ignore_errors=True)
+    return remaining
+
+
+# ------------------------------------------------------------------------ commit
+
+def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict:
+    """Move the staged set (or a --projects subset) into the real sinks. Only
+    after the owner's explicit yes; refuses when nothing is staged or the staged
+    set no longer matches the summaries it was rendered from."""
+    manifest = load_manifest(data_dir)
+    pending = manifest.get("projects") or []
+    if not pending:
+        raise SystemExit("import-claude-context: nothing is staged — run finalize.py --stage, show the "
+                         "owner staged/review.md, and --commit only on their yes")
+    if manifest.get("fingerprint") != inputs_fingerprint(data_dir):
+        raise SystemExit(f"import-claude-context: the staged set (staged {manifest.get('staged_at') or '?'}) "
+                         "is stale — the summaries, roll-ups or entities changed since it was rendered; "
+                         "run finalize.py --stage again and have the owner review the new digest")
+    if isinstance(projects, str):
+        projects = split_csv(projects)
+    chosen = resolve_selectors(pending, projects, "staged project")
+    run_kind = manifest.get("run_kind") or "user"
+
+    index_doc, summaries, rollups, entities, state = load_inputs(data_dir)
+    entities, merged = merge_entities(entities)
+    missing = [s for s in chosen if s not in rollups]
+    if missing:
+        raise SystemExit(f"import-claude-context: {len(missing)} staged project(s) have no roll-up any more; "
+                         "run finalize.py --stage again")
+    sndir = staged_notes_dir(data_dir)
+    ndir = notes_dir(ws)
+    ndir.mkdir(parents=True, exist_ok=True)
+    outcomes = {"created": 0, "updated": 0, "unchanged": 0}
+    stamp = now_iso()
+    for slug in chosen:
+        staged_note = sndir / f"{slug}.md"
+        outcomes[write_project_note(ndir, slug, rollups[slug], index_doc, summaries, state, run_kind,
+                                    staged_note=staged_note)] += 1
+        if staged_note.is_file():
+            staged_note.unlink()
+        for (s, u) in summaries:
+            if s != slug:
+                continue
+            rec = state["sessions"].setdefault(session_key(s, u), {})
+            rec.setdefault("summarized_at", stamp)
+            if rec.get("extracted_at") and rec["summarized_at"] < rec["extracted_at"]:
+                rec["summarized_at"] = stamp
+
+    committed = committed_rollups(rollups, state)
+    n_sessions = session_total(index_doc, summaries, committed, rollups)
+    (ndir / OVERVIEW).write_text(render_overview(committed, index_doc, n_sessions, run_kind), encoding="utf-8")
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    memory_text = render_memory_file(committed, index_doc, n_sessions)
+    (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
+    row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(committed)))
+    print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
+    people = people_payloads(entities, index_doc, projects=set(committed))
+    _common.save_state(data_dir, state)
+
+    remaining = _restage_or_clear(data_dir, ws, run_kind, [s for s in pending if s not in chosen])
+    counts = {
+        "sessions": int(n_sessions), "summarized": sum(1 for (s, _u) in summaries if s in committed),
+        "projects": len(committed), "committed": len(chosen), "staged_remaining": len(remaining),
+        "notes_created": outcomes["created"], "notes_updated": outcomes["updated"],
+        "notes_unchanged": outcomes["unchanged"], "people": len(people), **merged,
+        "memory_bytes": len(memory_text.encode("utf-8")), "memory_row": bool(row_written),
+    }
+    write_status(data_dir, "staged" if remaining else "done", **counts)
+    return counts
+
+
+def discard(*, data_dir: Path, ws: Path, projects=None) -> dict:
+    """Drop the staged set (or a --projects subset). The sinks are untouched."""
+    manifest = load_manifest(data_dir)
+    pending = manifest.get("projects") or []
+    if not pending:
+        raise SystemExit("import-claude-context: nothing is staged — nothing to discard")
+    if isinstance(projects, str):
+        projects = split_csv(projects)
+    chosen = resolve_selectors(pending, projects, "staged project")
+    remaining = _restage_or_clear(data_dir, ws, manifest.get("run_kind") or "user",
+                                  [s for s in pending if s not in chosen])
+    if not remaining:
+        write_status(data_dir, "discarded", discarded=len(chosen), staged_remaining=0)
+    return {"discarded": len(chosen), "staged_remaining": len(remaining)}
+
+
+def finalize(*, data_dir: Path, ws: Path, memory_dir: Path, run_kind: str = "user") -> dict:
+    """Stage and commit in one go — for in-process callers that already hold the
+    owner's yes (tests). The CLI never does this: it stages by default and
+    commits only on --commit."""
+    stage(data_dir=data_dir, ws=ws, run_kind=run_kind)
+    return commit(data_dir=data_dir, ws=ws, memory_dir=memory_dir)
+
+
+# ------------------------------------------------------------------------ forget
+
 def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: str = "user") -> dict:
     removed = {"note": 0, "summaries": 0, "dumps": 0, "rollup": 0, "state_sessions": 0,
-               "entity_citations": 0, "entities_dropped": 0, "memory_row_removed": 0}
+               "entity_citations": 0, "entities_dropped": 0, "memory_row_removed": 0, "staged": 0}
     note = notes_dir(ws) / f"{slug}.md"
     if note.is_file():
         note.unlink()
@@ -491,9 +1095,9 @@ def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: s
         _common.write_json(entities_path, entities)
 
     index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
-    rollups = load_rollups(data_dir)
     summaries = load_summaries(data_dir)
-    n_sessions = index_doc.get("counts", {}).get("sessions") or len(summaries)
+    rollups = committed_rollups(load_rollups(data_dir), state)
+    n_sessions = session_total(index_doc, summaries, rollups, rollups)
     ndir = notes_dir(ws)
     if rollups:
         if ndir.is_dir():
@@ -507,7 +1111,18 @@ def forget(*, data_dir: Path, ws: Path, memory_dir: Path, slug: str, run_kind: s
             if p.is_file():
                 p.unlink()
         removed["memory_row_removed"] = int(remove_memory_row(memory_dir))
-    write_status(data_dir, "forgot", projects=len(rollups), summarized=len(summaries))
+
+    # A pending review is re-rendered without this project (its citations are
+    # gone from the entities too), so a later "bring it in" is not stale.
+    manifest = load_manifest(data_dir)
+    pending = manifest.get("projects") or []
+    staged_left = 0
+    if pending:
+        removed["staged"] = int(slug in pending)
+        staged_left = len(_restage_or_clear(data_dir, ws, manifest.get("run_kind") or run_kind,
+                                            [s for s in pending if s != slug]))
+    write_status(data_dir, "forgot", projects=len(rollups), summarized=len(summaries),
+                 staged_remaining=staged_left)
     return removed
 
 
@@ -520,6 +1135,8 @@ def purge_dumps(data_dir: Path) -> int:
     return n
 
 
+# --------------------------------------------------------------------------- cli
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -527,24 +1144,44 @@ def main(argv=None) -> int:
     ap.add_argument("--data-dir", default=None, help="default <workspace>/data/claude-import")
     ap.add_argument("--memory-dir", default=None, help="default util_paths.memory_dir()")
     ap.add_argument("--run-kind", default="user", choices=["onboarding", "user"])
-    ap.add_argument("--people-json", action="store_true")
-    ap.add_argument("--forget", default=None, metavar="SLUG")
+    ap.add_argument("--projects", default=None, metavar="A,B",
+                    help="slugs for --stage (any substring), --commit / --discard / --people-json "
+                         "(exact slug or a unique part of one)")
+    action = ap.add_mutually_exclusive_group()
+    action.add_argument("--stage", action="store_true",
+                        help="render the review set under <data-dir>/staged/ (the default)")
+    action.add_argument("--commit", action="store_true",
+                        help="move the staged set into the sinks — only on the owner's explicit yes")
+    action.add_argument("--discard", action="store_true", help="drop the staged set (or the --projects subset)")
+    action.add_argument("--people-json", action="store_true")
+    action.add_argument("--forget", default=None, metavar="SLUG")
     ap.add_argument("--purge-dumps", action="store_true")
     ap.add_argument("--json", action="store_true")
-    a = ap.parse_args(_common.absorb_dash_values(argv, ("--forget",)))
+    a = ap.parse_args(_common.absorb_dash_values(argv, ("--forget", "--projects")))
 
     data_dir = _common.data_dir(a.workspace, a.data_dir)
+    projects = split_csv(a.projects)
     if a.people_json:
-        index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
-        print(json.dumps(people_payloads(load_entities(data_dir), index_doc),
-                         ensure_ascii=False, indent=2))
+        staged_people = staged_dir(data_dir) / STAGED_PEOPLE
+        if not projects and staged_people.is_file():
+            payloads = _common.load_json(staged_people, [])
+        else:
+            index_doc = _common.load_json(data_dir / INDEX_FILE, {}) or {}
+            only = set(resolve_selectors(load_rollups(data_dir), projects, "project")) if projects else None
+            payloads = people_payloads(merge_entities(load_entities(data_dir))[0], index_doc, projects=only)
+        print(json.dumps(payloads, ensure_ascii=False, indent=2))
         return 0
-    if a.purge_dumps and not a.forget:
+    if a.purge_dumps and not (a.forget or a.stage or a.commit or a.discard):
         n = purge_dumps(data_dir)
         print(json.dumps({"purged_files": n}) if a.json else f"purged {n} dump files")
         return 0
 
     ws = _common.workspace_root(a.workspace)
+    if a.discard:
+        r = discard(data_dir=data_dir, ws=ws, projects=projects)
+        print(json.dumps(r, sort_keys=True) if a.json else
+              f"discarded {r['discarded']} staged projects, {r['staged_remaining']} still staged")
+        return 0
     memory_dir = resolve_memory_dir(a.memory_dir)
     if a.forget:
         r = forget(data_dir=data_dir, ws=ws, memory_dir=memory_dir, slug=a.forget, run_kind=a.run_kind)
@@ -553,13 +1190,29 @@ def main(argv=None) -> int:
         print(json.dumps(r, sort_keys=True) if a.json else
               f"forgot {a.forget}: " + ", ".join(f"{k}={v}" for k, v in r.items()))
         return 0
-    c = finalize(data_dir=data_dir, ws=ws, memory_dir=memory_dir, run_kind=a.run_kind)
+    if a.commit:
+        c = commit(data_dir=data_dir, ws=ws, memory_dir=memory_dir, projects=projects)
+        if a.purge_dumps:
+            c["purged_files"] = purge_dumps(data_dir)
+        if a.json:
+            print(json.dumps(c, sort_keys=True))
+        else:
+            print(f"committed {c['committed']} projects ({c['staged_remaining']} still staged): "
+                  f"{c['summarized']}/{c['sessions']} sessions summarised, {c['projects']} projects in, "
+                  f"notes +{c['notes_created']}/~{c['notes_updated']}, {c['people']} people payloads, "
+                  f"memory {c['memory_bytes']} B, MEMORY.md row {'written' if c['memory_row'] else 'skipped'}")
+        return 0
+    # default: --stage. Nothing is written to a sink; the memory dir was only
+    # resolved so a bad install fails here rather than after the owner said yes.
+    c = stage(data_dir=data_dir, ws=ws, run_kind=a.run_kind, projects=projects)
+    if a.purge_dumps:
+        c["purged_files"] = purge_dumps(data_dir)
     if a.json:
         print(json.dumps(c, sort_keys=True))
     else:
-        print(f"finalized: {c['summarized']}/{c['sessions']} sessions summarised, {c['projects']} projects, "
-              f"notes +{c['notes_created']}/~{c['notes_updated']}, {c['people']} people payloads, "
-              f"memory {c['memory_bytes']} B, MEMORY.md row {'written' if c['memory_row'] else 'skipped'}")
+        print(f"staged {c['projects']} projects ({c['summarized']}/{c['sessions']} sessions summarised, "
+              f"{c['people']} people, memory {c['memory_bytes']} B) — nothing saved yet; show the owner "
+              f"staged/review.md and run --commit only on their yes")
     return 0
 
 

@@ -11,7 +11,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
-- import-claude-context: new in-box, user-invocable skill that brings the owner's Claude Code history into Sutando — an LLM-free index of the stock `~/.claude/projects` transcripts, noise-stripped + secret-redacted 0600 dialog dumps, haiku summaries per session/project/entities, and sinks in core memory (≤2 KB file + budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads; read-only on `~/.claude`, `--new` incremental, `--forget <slug>` undo. `session-recap/scripts/extract.py` gains `--root`; `context_resume` exports `message_text`/`clean_text`/`NOISE_*_RE`.
+- import-claude-context: new in-box, user-invocable skill that brings the owner's Claude Code history into Sutando — an LLM-free index of the stock `~/.claude/projects` transcripts, noise-stripped + secret-redacted 0600 dialog dumps, haiku summaries per session/project/entities, and sinks in core memory (≤2 KB file + budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads; read-only on `~/.claude`, `--new` incremental, `--forget <slug>` undo. Review gate: `finalize.py` stages by default under `data/claude-import/staged/` (with a `review.md` digest and duplicate people/companies merged first) and writes the sinks only on the owner's "bring it in" (`--commit`, `--projects` for one project, `--discard` to drop). `session-recap/scripts/extract.py` gains `--root`; `context_resume` exports `message_text`/`clean_text`/`NOISE_*_RE`.
 - report-feedback: `--auto` mode for agent-initiated bug reports — honors the owner's `state/feedback-prefs.json` toggles (auto-report + send-logs, both default on), dedupes identical titles (24h), and caps volume (5/day).
 
 ## Fixed
