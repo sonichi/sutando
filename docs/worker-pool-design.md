@@ -46,16 +46,32 @@ at routing.
 
 | field | example | use |
 |---|---|---|
-| `worker_id` | `worker-a3f91c` | routing, directories, binding references; immutable |
+| `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | shown to the owner; renameable |
 | `incarnation_id` | minted per session | which run of that worker claimed an attempt |
 
-**The id is minted, never chosen.** A sequential `worker-1` cannot satisfy "never
-reused": "next free N" hands a deleted worker's id to its successor, and two hosts
-sharing a synced workspace both compute the same next N. Mint random hex instead —
-`worker-` plus 6 lowercase hex digits, well inside the `[a-z0-9][a-z0-9-]{0,31}`
-bound. **Creation registers the id atomically and a duplicate is refused**, so a
-collision fails loudly at create time rather than silently aliasing two workers.
+**The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
+`[a-z0-9][a-z0-9-]{0,31}` ceiling. 122 random bits is what makes independent
+generation safe without a coordinator; a short suffix is not. Six hex digits is 24
+bits, and 1,000 independently minted ids collide with probability **2.9%** — 95% by
+10,000. A `worker-` prefix adds readability, not entropy, and the label is where
+readability belongs.
+
+**Opaque is not the same as unguessable.** Opacity is a demand on the *reader*: treat
+the id as one value, never parse role, order or meaning out of it. Uniqueness and
+non-reuse are separate requirements, met by the generator rather than by secrecy.
+The id being unguessable is a consequence here, not the goal.
+
+**A counter is rejected for coordination, not memory.** Persisting the highest
+allocated value would stop numbers being recycled without remembering every id ever
+issued. The defect is allocation across hosts: two machines on a synced workspace
+both compute the same next value, and neither is wrong locally.
+
+**Registration is atomic, and a conflict is an error.** Creation registers the id
+atomically, so a duplicate is refused loudly at create time. That solves *local*
+concurrency only — when a cross-host sync surfaces two workers claiming one id, it
+must **fail and report**. Never overwrite, never silently merge: both behaviours
+destroy exactly the identity this rule exists to protect.
 
 **Lifecycle, which is what the rule protects:**
 
@@ -80,8 +96,8 @@ namesake.
 
 ```
 tasks/task-123.json                    the task: immutable, never copied
-deliveries/worker-a3f91c/task-123           a sentinel — existing IS the assignment
-deliveries/worker-a3f91c/task-123.claimed   the same sentinel, suffix substituted
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123           a sentinel — existing IS the assignment
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.claimed   the same sentinel, suffix substituted
 (sentinel removed, payload archived)   finish
 ```
 
@@ -107,7 +123,7 @@ the sentinel and reading it).
 
 | state | expressed as | owner |
 |---|---|---|
-| request | file content: `requested_worker: worker-a3f91c` | producer or bridge |
+| request | file content: `requested_worker: 7c54b230a8d94ea9b86f52d70134ac68` | producer or bridge |
 | assignment | a delivery record in the recipient's folder | the router alone |
 | claim | that record renamed | that worker alone |
 
@@ -316,7 +332,7 @@ a label never appears in a path.
 ```json
 {"id":"task-123","created_at":"<RFC3339>","source":"discord|slack|room|cli|timer",
  "channel_id":"<opaque>","priority":"urgent|normal|low",
- "requested_worker":"worker-a3f91c|null","submitter":{"actor":"<id>","tier":"owner|team|…"},
+ "requested_worker":"7c54b230a8d94ea9b86f52d70134ac68|null","submitter":{"actor":"<id>","tier":"owner|team|…"},
  "authorisation":{"capabilities":["…"],"resolved_by":"task-bridge"},
  "body":"<text>","parent_id":"<task-id>|null"}
 ```
@@ -325,8 +341,8 @@ a label never appears in a path.
 
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
- "workers":{"worker-a3f91c":{"label":"support","state":"live","model":"…","scopes":["…"]}},
- "bindings":{"room:!abc:ag2.space":"worker-a3f91c","room:!def:ag2.space":["worker-a3f91c","worker-7d02be"]}}
+ "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","state":"live","model":"…","scopes":["…"]}},
+ "bindings":{"room:!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","room:!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
 ```
 
 An assignment records the roster `version` it was made against.
