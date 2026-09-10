@@ -137,7 +137,7 @@ between reading the sentinel and reading it).
 |---|---|---|
 | request | file content: `requested_worker: 7c54b230a8d94ea9b86f52d70134ac68` | producer or bridge |
 | assignment | a delivery record in the recipient's folder | the router alone |
-| claim | that record renamed | that worker alone |
+| acceptance | that record renamed | that worker alone |
 
 The canonical id never changes; suffixes substitute, never append; consumers key on
 the `id:` header.
@@ -150,7 +150,7 @@ the `id:` header.
 | core | everything it does with no pool. Plus: default target, pool lifecycle, model choice, all spend, compiles the roster, **owns worker recovery** | its own session |
 | Task Bridge | admits every new task: attests the submitter, validates authorisation | ahead of the queue |
 | router | resolve one task against the roster, write one delivery per declared recipient, report status | the task watcher — **no daemon of its own** |
-| worker | claim and execute deliveries in its own folder; submit requests in scope; run crons of its own | its own session |
+| worker | accept and execute deliveries in its own folder; submit requests in scope; run crons of its own | its own session |
 | recipient's watcher | the receiving half of a worker or the core — part of it, separate from its session | `watch-tasks-stream.sh`, one per recipient |
 | process supervisor | starts and restarts the core and every watcher. **Never a worker's session** | `launchd` on macOS |
 
@@ -239,11 +239,11 @@ first pool release, they stay out of its default path.
 ## Completion
 
 Fixed order: result, then done-flag, then archive. Residue is then unambiguous —
-**result with no flag** means completed, never re-run; **claim with no result** means
+**result with no flag** means completed, never re-run; **an accepted sentinel with no result** means
 died mid-work, released to the same worker.
 
 `finish` is the single completion path and refuses unless the caller holds the
-claim, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
+the acceptance, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
 writes nothing. The echo exists because a worker holding two acceptances once wrote each
 reply into the other's result file, and an owner's answer reached the wrong room.
 Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
@@ -265,7 +265,7 @@ future-dated beat counts as stale too. A host sleep expires every beat at once. 
 is why a release is not authorised by staleness: it keys on `abandoned`.
 
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
-claim with no result releases to that same worker — the only party allowed to take
+an accepted sentinel with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the
 core is work belonging to a worker that will not return, which ends in a question to
 the owner, and reporting so a long-accepted delivery is visible.
@@ -378,7 +378,7 @@ Input is the roster and one admitted task; nothing else may be read.
 4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do nothing. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
 5. A set is step 4 once per member; the payload is never copied.
 
-The name keeps `.txt` because the watcher a worker runs emits for no other extension; claiming substitutes the suffix, so a accepted file stops waking anyone.
+The name keeps `.txt` because the watcher a worker runs emits for no other extension; accepting substitutes the suffix, so a accepted file stops waking anyone.
 
 Order candidates `urgent > normal > low`, then oldest payload `created_at` first.
 
@@ -455,7 +455,7 @@ Acceptance:
 - A declared set writes one sentinel per member and exactly one payload.
 - A target not on the roster is delivered to the core; a target on the roster but not live still receives its delivery, and nothing is written to any other folder.
 - A missing roster refuses rather than defaulting to the core.
-- Concurrent claim and release leave exactly one winner, the loser seeing `OSError`.
+- Concurrent accept and release leave exactly one winner, the loser seeing `OSError`.
 - Removing the last worker returns the install to the Stage 1 state, and the same code runs in both directions.
 
 ### The rescue line
@@ -490,7 +490,7 @@ Each of these is out of scope for v1, and none is an oversight.
 1. Migrating in-flight work when the layout moves to per-recipient folders.
 2. Delegation's depth and volume budgets, and the authorisation record behind them.
 3. The parent contract for a set: completion, cancellation, downstream idempotency.
-4. How a remote worker carries request, assignment and claim without a shared inode.
+4. How a remote worker carries request, assignment and acceptance without a shared inode.
 5. Identity persistence versus context restoration — resuming is not remembering.
 6. How a steering message reaches the in-flight task it steers.
 7. Per-worker schedule durability, and suppression on pause.
