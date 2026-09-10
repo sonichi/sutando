@@ -33,7 +33,7 @@ WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
 
 def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
-        parent="1", pid_instance=None, pid_actor="", targets=None) -> dict:
+        parent="1", pid_instance=None, pid_actor="", targets=None, verdicts=None) -> dict:
     """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
 
     `pid_instance` is what the WATCHER's own environment yields: a string names
@@ -48,10 +48,16 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             (ws / "state" / fn).write_text(text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
-                 hc._pid_instance_id, hc._pid_actor_id, hc._watcher_sentinel_target)
+                 hc._pid_instance_id, hc._pid_actor_id, hc._watcher_sentinel_target,
+                 hc._is_watcher_argv)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = (argv if callable(argv) else (lambda pid: argv))
+            if verdicts is not None:
+                # None is the tri-state "cannot prove", which no argv string
+                # reliably produces; force it so that branch is reachable.
+                hc._is_watcher_argv = (
+                    lambda a, pid=None, _v=verdicts: _v.get(str(pid), True))
             hc._watcher_trees = lambda *a, **k: trees
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: parent
@@ -69,7 +75,7 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
              hc._pid_instance_id, hc._pid_actor_id,
-             hc._watcher_sentinel_target) = saved
+             hc._watcher_sentinel_target, hc._is_watcher_argv) = saved
 
 
 class PoolHost(unittest.TestCase):
@@ -634,6 +640,26 @@ class AnUnreadableVectorSaysUnknownNeverTrue(unittest.TestCase):
         trees = hc._watcher_trees("  4242 1 %s\n" % self.AMBIGUOUS)
         self.assertTrue(trees, "UNKNOWN must count as a watcher, never read as absent")
 
+
+
+class SentinelReconciliationLosesNoRecord(unittest.TestCase):
+    """keweichen at e3fbc2cf: `live[spid] = sp` is keyed by pid, so a second
+    sentinel naming that pid vanished and the check reported a false green."""
+
+    def test_two_sentinels_naming_ONE_pid_are_not_collapsed(self):
+        r = run({"watch-tasks-stream-a.pid": "4242\n",
+                 "watch-tasks-stream-b.pid": "4242\n"}, {"4242": {"4242"}})
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("one pid, two sentinels", r["detail"])
+        self.assertIn("4242", r["detail"])
+
+    def test_an_UNPROVABLE_sentinel_is_a_fault_beside_a_live_one(self):
+        """A live peer does not clear another instance's unprovable record."""
+        r = run({"watch-tasks-stream-a.pid": "100\n",
+                 "watch-tasks-stream-b.pid": "200\n"}, {"100": {"100"}},
+                verdicts={"100": True, "200": None})
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertNotIn("streaming watcher alive", r["detail"])
 
 
 class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):

@@ -9000,6 +9000,7 @@ def check_task_watcher() -> dict:
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
+    collided = []
     for sp in sentinels:
         try:
             spid = int(sp.read_text().strip())
@@ -9018,6 +9019,10 @@ def check_task_watcher() -> dict:
             elif verdict is None:
                 unprovable.append((spid, sargv, sp))
             else:
+                # A dict keyed by pid DROPS the second file naming one pid, and
+                # two sentinels for one process is a real anomaly, not a tie.
+                if spid in live:
+                    collided.append((spid, live[spid], sp))
                 live[spid] = sp
 
     if not live:
@@ -9041,9 +9046,13 @@ def check_task_watcher() -> dict:
             # A dead sentinel does NOT mean nothing drains tasks/ — restarting
             # here is what makes the duplicates.
             own, sup = _split_roots_by_owner(roots, ps_out)
+            _dg, _du = _group_roots_by_target(WORKSPACE_DIR / "state", own)
+            if _du:
+                own = [o for o in own if o not in _du]
+            _blind = (f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "")
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still "
-                              f"run; tasks/ IS being drained. "
+                              f"run; tasks/ IS being drained{_blind}. "
                               f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
                               f"supervised, leave alone (a live parent owns them): "
                               f"{', '.join(sup) or 'none'}"}
@@ -9097,11 +9106,18 @@ def check_task_watcher() -> dict:
     if unreadable:
         faults.append("unreadable: " + ", ".join(
             f"{sp.name} ({err})" for sp, err in unreadable))
+    if unprovable:
+        faults.append("UNKNOWN: " + ", ".join(
+            f"{sp.name} (pid {spid} unprovable from argv)" for spid, _a, sp in unprovable))
+    if collided:
+        faults.append("one pid, two sentinels: " + ", ".join(
+            f"{a.name} and {b.name} both name pid {spid}" for spid, a, b in collided))
     if faults:
         return {"name": name, "status": "warn",
                 "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
-                          f"{len(dead_pids) + len(reused) + len(unreadable)} sentinel(s) name no "
-                          f"live watcher — {'; '.join(faults)}. Each is a separate instance's "
+                          f"{len(dead_pids) + len(reused) + len(unreadable) + len(unprovable) + len(collided)} "
+                          f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
+                          f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
     if len(live) == 1:
         return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
