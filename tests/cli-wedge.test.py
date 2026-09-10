@@ -909,5 +909,62 @@ class FailureBoundary(unittest.TestCase):
                 w.append_window(ws, IDLE, 1.0)
 
 
+
+class ProseMentioningAStateIsNotThatState(unittest.TestCase):
+    """One negative control per abnormal pattern.
+
+    These panes are agent CLIs whose transcripts are English prose about their
+    own work, so an unanchored substring search is SELF-HITTING: a session
+    discussing compaction classified itself `abnormal` at high confidence
+    (measured on 12 prose-only frames of an idle pane). The matcher anchors to
+    the start of a line after stripping banner decoration — a banner leads its
+    line, prose buries the phrase mid-sentence.
+    """
+
+    PROSE = [
+        ("compacting", "I am compacting the summary of what we discussed"),
+        ("compacting", "reviewing the compacting patterns in cli_wedge"),
+        ("needs-login", "we fixed the bug where it says please log in to continue"),
+        ("needs-login", "a session expired bug we already fixed"),
+        ("awaiting-input", "the draft is waiting for your input before it sends"),
+        ("out-of-credits", "the ticket says the user was out of usage credits last week"),
+        ("quota-limit", "the docs explain what happens when you hit your weekly limit"),
+    ]
+    BANNERS = [
+        ("compacting", "Compacting conversation"),
+        ("compacting", "\u273b Compacting conversation"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired"),
+        ("awaiting-input", "Waiting for your input"),
+        ("out-of-credits", "You are out of usage credits"),
+    ]
+
+    def test_prose_mentioning_a_state_does_not_match(self):
+        for name, line in self.PROSE:
+            self.assertEqual(w.matched_abnormal([line]), [],
+                             f"{name}: prose matched as a banner -> {line!r}")
+
+    def test_real_banners_still_match(self):
+        """The other half. Anchoring alone would drop a true positive --
+        'You are out of usage credits' does not START with the pattern -- so each
+        pattern also carries the banner's leading form. Without this test the
+        anchor could be tightened until nothing fires and every prose case passes."""
+        for name, line in self.BANNERS:
+            self.assertIn(name, w.matched_abnormal([line]),
+                          f"{name}: real banner stopped matching -> {line!r}")
+
+    def test_a_prose_only_idle_pane_does_not_warn(self):
+        frames = [f"I am reviewing the compacting patterns\n  \u00b7 5:{17 + i // 3:02d} PM\n> "
+                  for i in range(12)]
+        v = w.classify(frames, False, 600)
+        self.assertFalse(v["warn"], f"a prose-only idle pane warned: {v}")
+        self.assertNotEqual(v["kind"], "abnormal", v)
+
+    def test_the_internal_marker_does_not_ride_in_the_verdict(self):
+        v = w.classify(["x"], False, 60)
+        self.assertNotIn("_abnormal", v,
+                         "the marker duplicates the flattened abnormal_* keys already spread in")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

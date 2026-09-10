@@ -85,11 +85,11 @@ PROVISIONAL_THRESHOLDS = {
 ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     (name, re.compile(rx, re.IGNORECASE))
     for name, rx in (
-        ("quota-limit", r"\b(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|\b(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
-        ("out-of-credits", r"\bout of (usage )?credits?\b|\bcredit balance (is )?(too )?low\b|\binsufficient credits?\b"),
-        ("needs-login", r"\b(please )?(log ?in|sign ?in) to continue\b|\bsession expired\b|\bauthentication (required|failed)\b|\brun /login\b"),
-        ("compacting", r"\bcompact(ing|ion)\b"),
-        ("awaiting-input", r"\b(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
+        ("quota-limit", r"(you('ve| have)? )?(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|(you('ve| have)? )?hit your\b.{0,24}\blimit\b|/?usage-credits\b"),
+        ("out-of-credits", r"(you('re| are)? )?out of (usage )?credits?\b|credit balance (is )?(too )?low\b|insufficient credits?\b"),
+        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
+        ("compacting", r"compact(ing|ion)\b"),
+        ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
     )
 )
 
@@ -120,10 +120,26 @@ def raw_state_id(frame: str) -> str:
     return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
 
 
+# Leading decoration a CLI puts before a banner: indent, quote/prompt glyphs,
+# spinner frames, box rules. Stripped so the anchor sees the banner's first word.
+_BANNER_DECOR = re.compile(r"^[\s>\u00b7*\u2022\-\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u28c0-\u28ff]+")
+
+
 def matched_abnormal(frames: list) -> list:
-    """abnormal-family names in `frames` — credits, login, compaction, waiting."""
-    text = "\n".join(frames)
-    return [name for name, rx in ABNORMAL_PATTERNS if rx.search(text)]
+    """abnormal-family names in `frames` — credits, login, compaction, waiting.
+
+    ANCHORED to the start of a line, not searched anywhere in the text. These
+    panes are agent CLIs whose transcripts are English prose about their own
+    work, so an unanchored search is self-hitting: a session discussing
+    compaction classified itself `abnormal` at high confidence. A banner leads
+    its line; prose buries the phrase mid-sentence.
+    """
+    hits = []
+    lines = [_BANNER_DECOR.sub("", ln) for f in frames for ln in f.splitlines()]
+    for name, rx in ABNORMAL_PATTERNS:
+        if any(rx.match(ln) for ln in lines):
+            hits.append(name)
+    return hits
 
 
 def matched_patterns(frames: list) -> list:
@@ -221,7 +237,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if pats and all(isinstance(x, str) for x in pats):
         pats = [list(pats) for _ in state_ids]
     ps = pattern_stats(list(pats or []), th)
-    ps["_abnormal"] = abnormal_stats(list(abnormal or []), th)
+    abn = abnormal_stats(list(abnormal or []), th)
     clock_only = (not raw_static) and nov.static
     spacing = {}
     if gaps:
@@ -236,7 +252,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
         "novelty_rate": round(nov.novelty_rate, 3),
         "matched_patterns": sorted({p for s in (pats or []) for p in s}),
         "matched_abnormal": sorted({p for s in (abnormal or []) for p in s}),
-        **{k: v for k, v in abnormal_stats(list(abnormal or []), {**PROVISIONAL_THRESHOLDS, **(thresholds or {})}).items()},
+        **abn,
         **ps,
         **spacing,
         "work_outstanding": work_outstanding,
@@ -248,7 +264,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if nov.sample_count < 2:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
                 "reason": "fewer than 2 samples in the current observation run — nothing to compare"}
-    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th)
+    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th, abn)
     # Two frames a second apart cannot establish a wedge: a WARNING needs the run to have lasted.
     if verdict["warn"] and duration_s < th["min_duration_s"]:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
@@ -257,12 +273,12 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
 
 
 def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_only: bool,
-                  work_outstanding: bool, duration_s: float, work_detail: str, th: dict) -> dict:
+                  work_outstanding: bool, duration_s: float, work_detail: str, th: dict,
+                  abn: dict) -> dict:
     enough = nov.sample_count >= th["min_samples"]
     # A provider told the CLI to stop: not a retry loop, a abnormal state of its own.
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
-    bs = ps.get("_abnormal") or {"abnormal_current": False, "current_abnormal": [],
-                                "consecutive_abnormal_samples": 0}
+    bs = abn
     low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
     # Retry is a SHAPE of the abnormal axis, not a sibling (owner): a retrying
     # pane is `moving + abnormal` — it moves while the work does not proceed.
