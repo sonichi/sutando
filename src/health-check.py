@@ -3174,7 +3174,7 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
-def check_skills_driver_code_drift(repo_root: "Path | None" = None) -> dict:
+def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     """Warn when a long-running skills process is executing code older than disk.
 
     `live-tree-drift` covers the repo side; nothing covered the skills side, and a
@@ -3186,7 +3186,7 @@ def check_skills_driver_code_drift(repo_root: "Path | None" = None) -> dict:
     """
     name = "skills-driver-code-drift"
     import re as _re
-    ws = resolve_workspace()
+    ws = workspace or resolve_workspace()
     log = Path(ws) / "state" / "content-driver.log"
     skills = Path(ws) / "skill-repos" / "sutando-skills"
     if not log.exists() or not (skills / ".git").exists():
@@ -3199,8 +3199,10 @@ def check_skills_driver_code_drift(repo_root: "Path | None" = None) -> dict:
                               capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         return {"name": name, "status": "ok", "detail": "could not read driver stamp or skills HEAD — not asserting drift"}
-    if not running or not head:
+    if not running:
         return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
+    if not head:
+        return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
     if running == head:
         return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
     return {"name": name, "status": "warn",
