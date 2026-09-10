@@ -18,6 +18,7 @@ import os
 import shlex
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent
@@ -34,6 +35,9 @@ def default_socket() -> str:
     that sets the env afterwards would silently target the wrong tmux server."""
     return os.environ.get("SUTANDO_TMUX_SOCKET") or DEFAULT_SOCKET
 WATCHER = "src/watch-tasks-stream.sh"
+# The core's own launcher, run under per-worker env: one argv, one set of
+# hooks, one runtime for every session in the pool.
+LAUNCHER = "src/agent/start-cli.sh"
 
 
 class SpawnRefused(Exception):
@@ -67,77 +71,71 @@ def session_exists(name: str, socket=None, runner=_run) -> bool:
     return runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"]).returncode == 0
 
 
+def core_runtime(repo, runner=_run) -> str:
+    """The runtime the core is configured for; a worker runs the same one."""
+    r = runner(["bash", str(Path(repo) / "scripts" / "sutando-config.sh"), "core-runtime"])
+    return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
-         socket=None, label: str = "") -> dict:
+         socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
     before anything exists and testable without tmux."""
     socket = socket or default_socket()
-    worker_id = wi.new_worker_id()
+    worker_id = worker_id or wi.new_worker_id()
+    delivery_dir = str(Path(workspace) / "deliveries" / worker_id)
     return {
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
         "cwd": str(cwd or repo),
-        "delivery_dir": str(Path(workspace) / "deliveries" / worker_id),
+        "delivery_dir": delivery_dir,
         "tmux": {"socket": socket, "session_name": wi.tmux_session_name(worker_id)},
-        # Absolute, from `repo`: WATCHER relative would resolve against the
+        # Absolute, from `repo`: a relative path would resolve against the
         # session's cwd, so `cwd` would silently pick which code the worker runs.
-        "watcher_argv": ["env", f"SUTANDO_INSTANCE_ID={worker_id}",
-                         "bash", str(Path(repo) / WATCHER),
-                         str(Path(workspace) / "deliveries" / worker_id)],
+        "launcher_argv": ["bash", str(Path(repo) / LAUNCHER)],
+        "env": {"SUTANDO_TMUX_SOCKET": socket,
+                "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
+                "SUTANDO_INSTANCE_ID": worker_id,
+                "SUTANDO_TASKS_DIR": delivery_dir,
+                "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo)},
     }
 
 
-def spawn(workspace, repo, *, runtime: str = "claude", cwd: str = "",
+def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
           require_sentinel: bool = True) -> dict:
     """Create the four parts, in an order where a failure leaves less behind.
 
     Identity first (a record with no process is inert), then the delivery folder,
-    then the tmux session, then the watcher inside it. The watcher is last
-    because it is the only part that starts reading.
+    then the runtime session via the core's launcher, which starts the watcher
+    from inside the agent exactly as the core does. It is last because it is
+    the only part that starts reading.
     """
     socket = socket or default_socket()
+    runtime = runtime or core_runtime(repo, runner)
     if require_sentinel and not per_instance_sentinel_supported(repo):
         raise SpawnRefused(
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")
 
-    p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket, label=label)
+    session_id = str(uuid.uuid4())   # the CLI wants a dashed UUID
+    rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
+                           host=os.uname().nodename, session_id=session_id,
+                           tmux_socket=socket)
+    p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket,
+             label=label, worker_id=rec["worker_id"])
     name = p["tmux"]["session_name"]
     if session_exists(name, socket, runner):
         raise SpawnRefused(f"tmux session {name!r} already exists")
-
     Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
 
-    rec = wi.create_worker(workspace, runtime=runtime, cwd=p["cwd"],
-                           host=os.uname().nodename, tmux_socket=socket)
-    # plan() minted a candidate id; the identity record is the authority.
-    worker_id = rec["worker_id"]
-    if worker_id != p["worker_id"]:
-        Path(p["delivery_dir"]).rmdir()
-        p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket, label=label)
-        p["worker_id"] = worker_id
-        p["delivery_dir"] = str(Path(workspace) / "deliveries" / worker_id)
-        p["tmux"]["session_name"] = name = rec["tmux_session"]
-        p["watcher_argv"] = ["env", f"SUTANDO_INSTANCE_ID={worker_id}",
-                             "bash", str(Path(repo) / WATCHER), p["delivery_dir"]]
-        Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
-
-    r = runner(["tmux", "-S", socket, "new-session", "-d", "-P", "-F",
-                "#{pane_id}", "-s", name, "-c", p["cwd"]])
+    env = {**os.environ, **p["env"], "SUTANDO_CLAUDE_SESSION_ID": session_id}
+    r = runner(p["launcher_argv"], env=env)
     if r.returncode != 0:
-        raise SpawnRefused(f"tmux new-session failed: {(r.stderr or '').strip()}")
+        raise SpawnRefused(f"the runtime launcher failed: {(r.stderr or '').strip()}")
 
-    # `=name` targets an exact PANE name, not a session, so send-keys cannot
-    # find it; -P -F prints the new pane's id, which addresses it directly.
-    pane = (r.stdout or "").strip() or f"={name}"
-    watcher = " ".join(shlex.quote(a) for a in p["watcher_argv"])
-    r = runner(["tmux", "-S", socket, "send-keys", "-t", pane, watcher, "Enter"])
-    if r.returncode != 0:
-        raise SpawnRefused(f"starting the watcher failed: {(r.stderr or '').strip()}")
-
-    return {**p, **rec, "started": True}
+    return {**p, **rec, "runtime_session_id": session_id, "started": True}
 
 
 def main(argv=None) -> int:
@@ -146,14 +144,14 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_SRC.parent))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
-    ap.add_argument("--runtime", default="claude")
+    ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     try:
         fn = plan if a.dry_run else spawn
-        print(json.dumps(fn(a.workspace, a.repo, runtime=a.runtime, cwd=a.folder,
+        print(json.dumps(fn(a.workspace, a.repo, runtime=a.runtime or None, cwd=a.folder,
                             socket=a.socket or None, label=a.label), indent=2))
     except SpawnRefused as e:
         print(f"spawn-worker refused: {e}", file=sys.stderr)

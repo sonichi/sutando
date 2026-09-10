@@ -56,6 +56,17 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# A pool worker runs THIS launcher under its own session/instance env; the
+# owner-facing surfaces (remote control, Chrome) stay with the canonical core.
+WORKER_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
+SURFACE_ARGS=(--remote-control "Sutando" --chrome)
+[ -n "$WORKER_INSTANCE" ] && SURFACE_ARGS=()
+SESSION_ARGS=()
+if [ -n "${SUTANDO_CLAUDE_RESUME:-}" ]; then
+  SESSION_ARGS=(--resume "$SUTANDO_CLAUDE_RESUME")
+elif [ -n "${SUTANDO_CLAUDE_SESSION_ID:-}" ]; then
+  SESSION_ARGS=(--session-id "$SUTANDO_CLAUDE_SESSION_ID")
+fi
 
 # Marker identifying THIS process as the long-lived sutando-core session (as
 # opposed to an ad-hoc `claude` in the same checkout — PR review, codex, etc.).
@@ -73,6 +84,7 @@ export SUTANDO_CORE_SESSION=1
 # Called ONLY from paths that create or heal a core. Attaching to a live one
 # must not clear: that would cancel a `--stop-only` still waiting to be observed.
 clear_shutdown_sentinel() {
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   if [ -n "$PY" ]; then
     "$PY" "$REPO/src/shutdown.py" clear >/dev/null \
       || echo "start-cli.sh: shutdown.py clear failed — the intake gate may hold tasks" >&2
@@ -88,6 +100,7 @@ _SENTINEL_STASH=""
 # restore-after-exec below unreachable dead code.
 shopt -s execfail
 stash_shutdown_sentinel() {
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   _SENTINEL_STASH=""
   [ -n "$PY" ] || return 0
   _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
@@ -97,6 +110,7 @@ stash_shutdown_sentinel() {
 }
 # Only reachable when exec FAILED: exec never returns on success.
 restore_shutdown_sentinel() {
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   [ -n "$_SENTINEL_STASH" ] && [ -f "$_SENTINEL_STASH" ] || return 0
   _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
   if [ -n "$_sp" ]; then
@@ -111,6 +125,8 @@ export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
+[ -n "$WORKER_INSTANCE" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$WORKER_INSTANCE")
+[ -n "${SUTANDO_TASKS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -722,8 +738,8 @@ if tmux_session_exists; then
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
-  CORE_CMD=(claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/startup")
+  CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "/startup")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
@@ -788,8 +804,8 @@ if ! command -v tmux > /dev/null 2>&1; then
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e
-  exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+  exec claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "/startup"
   _exec_rc=$?
   set -e
@@ -824,8 +840,8 @@ apply_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "/startup" || true
   # Create-then-attach rather than `new-session -A`, so the sentinel clears only
   # once a session demonstrably exists; the poll below is the single verdict.
@@ -843,8 +859,8 @@ if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
+    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "/startup"
   # Verify the core actually came up before reporting success. Without this a
   # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
