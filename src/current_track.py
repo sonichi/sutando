@@ -50,8 +50,10 @@ DEFAULT_KEEP = 32 * 1024
 
 #: Entries other tools read as LIVE STATE, kept at any age: an aged-out hold
 #: reads as "not held" to every consumer that greps this file.
+#: `HOLD` is case-SENSITIVE: the lowercase verb and a denial of a hold are not state.
+#: A config-value hold keeps its own alternative — that spelling is lowercase by nature.
 PIN_DEFAULT = re.compile(
-    r"\bHOLD\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
+    r"(?-i:\bHOLD\b)|\b\w+=hold\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
     r"|\bin force until\b|\bawait(?:ing)? (?:the )?owner\b|⛔",
     re.I,
 )
