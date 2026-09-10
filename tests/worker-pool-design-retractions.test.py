@@ -8,6 +8,84 @@ import unittest
 
 DOC = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design.md"
 
+
+def normalized(doc):
+    """Blockquote markers stripped and whitespace collapsed, so a pinned sentence
+    survives re-wrapping without loosening into a substring match."""
+    return re.sub(r"\s+", " ", re.sub(r"^\s*>+\s?", "", doc, flags=re.M)).strip()
+
+
+def section_of(doc, heading_fragment):
+    """The ONE section whose heading contains `heading_fragment`, to the next
+    heading of the same or higher level.
+
+    keweichen at e50715ee: every locator here was document-GLOBAL, so it checked
+    that a passage EXISTS and is UNIQUE, never that it is where it belongs.
+    Moving a complete valid callout to EOF passed 110/110 three separate ways.
+    """
+    lines = doc.split("\n")
+    starts = [(i, len(m.group(1)))
+              for i, l in enumerate(lines)
+              for m in [re.match(r"^(#{1,6}) ", l)] if m and heading_fragment in l]
+    if len(starts) != 1:
+        raise AssertionError(
+            f"{heading_fragment!r} names {len(starts)} headings; a section-bound "
+            f"check cannot pick one of several")
+    start, level = starts[0]
+    for j in range(start + 1, len(lines)):
+        m = re.match(r"^(#{1,6}) ", lines[j])
+        if m and len(m.group(1)) <= level:
+            return "\n".join(lines[start:j])
+    return "\n".join(lines[start:])
+
+
+def sole_para_normalized(text, needle):
+    """The ONE paragraph whose NORMALIZED form holds `needle`.
+
+    Blockquote nesting means a raw paragraph never contains the collapsed
+    sentence, so matching must happen after normalization, per paragraph.
+    """
+    hits = [p for p in re.split(r"\n\s*\n", text) if needle in normalized(p)]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{needle!r} matches {len(hits)} paragraphs in this scope")
+    return hits[0]
+
+
+def blockquote_blocks(doc):
+    """Every maximal run of consecutive blockquote lines.
+
+    A site's DISPUTED callout is a blockquote; the obligations index repeats the
+    same wording as a plain bullet. keweichen at 6268f22e moved a marker from the
+    callout INTO the index paragraph and the any()-over-paragraphs form accepted
+    it, because both contain the phrase.
+    """
+    out, cur = [], []
+    for line in doc.split("\n"):
+        if line.lstrip().startswith(">"):
+            cur.append(line)
+        elif cur:
+            out.append("\n".join(cur)); cur = []
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def sole_para_holding(doc, anchor):
+    """The ONE paragraph containing `anchor`, or a failure.
+
+    keweichen at 6268f22e: the first-match form let a clean DECOY paragraph
+    earlier in the document absorb the check while the operative passage carried
+    the defect. Ambiguity is the bug, so it is raised rather than resolved.
+    """
+    hits = [p for p in re.split(r"\n\s*\n", doc) if anchor in p]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{anchor!r} matches {len(hits)} paragraphs; a locator that picks one "
+            f"of several inspects whichever it happens to reach first")
+    return hits[0]
+
+
 # A line carrying one of these is describing the retraction, not asserting it.
 HISTORICAL = (
     "an earlier revision", "an earlier draft", "used to", "no longer",
@@ -83,6 +161,196 @@ RETRACTED = [
      "entirely -- on death the CORE stands in (:999), so there is no second live "
      "claimant to fence."),
 ]
+
+
+def operative_block(doc, anchor, quoted=False):
+    """The ONE complete unit holding `anchor` -- a quote block if `quoted`, else a
+    paragraph. Returned NORMALIZED so it can be compared for equality."""
+    if quoted:
+        units, cur = [], []
+        for line in doc.split("\n"):
+            if line.lstrip().startswith(">"):
+                cur.append(line)
+            elif cur:
+                units.append("\n".join(cur)); cur = []
+        if cur:
+            units.append("\n".join(cur))
+    else:
+        units = re.split(r"\n\s*\n", doc)
+    # Match on the NORMALIZED unit: a formatting-only line wrap inside an anchor
+    # otherwise fails a block whose normalized text is unchanged (keweichen).
+    hits = [u for u in units if anchor in normalized(u)]
+    if len(hits) != 1:
+        raise AssertionError(f"{anchor!r} is in {len(hits)} units, not 1")
+    return normalized(hits[0])
+
+
+def neighbours(doc, anchor, quoted=False):
+    """(previous, next) paragraphs, normalized -- relocation changes these even
+    when the block itself and its section are untouched.
+
+    `quoted` selects the blockquote occurrence: this anchor also appears in the
+    obligations list, and taking the first match read THAT -- the same first-match
+    defect these pins exist to close, reintroduced in the helper closing it.
+    """
+    paras = re.split(r"\n\s*\n", doc)
+    hits = [k for k, p in enumerate(paras) if anchor in normalized(p)
+            and (p.lstrip().startswith(">") if quoted else True)]
+    if len(hits) != 1:
+        raise AssertionError(f"{anchor!r} matches {len(hits)} units (quoted={quoted})")
+    i = hits[0]
+    prev = normalized(paras[i - 1]) if i else ""
+    nxt = normalized(paras[i + 1]) if i + 1 < len(paras) else ""
+    return prev, nxt
+
+
+
+def _line_kind(line):
+    """(kind, depth, qdepth) from the line's real Markdown container.
+
+    CommonMark allows a block marker 0-3 leading spaces; four opens an indented
+    code block, and quote depth is a COUNT, so `>>` is not `>` at another depth.
+    """
+    m = re.match(r"( *)((?:> ?)*)(.*)$", line)
+    lead, marks, body = m.group(1), m.group(2), m.group(3)
+    if len(lead) >= 4:
+        return "code", len(lead), 0
+    qdepth = marks.count(">")
+    # Spaces BEFORE the marker are the list's nesting depth; eating them into
+    # `lead` reported a two-space-nested item as top level.
+    inner = len(lead) + (len(body) - len(body.lstrip()))
+    if inner >= 4 and qdepth == 0:
+        return "code", inner, 0
+    st = body.lstrip()
+    if st.startswith("|"):
+        return "table", inner, qdepth
+    if re.match(r"(?:[-*+]\s|\d+[.)]\s)", st):
+        return "list", inner, qdepth
+    if st.startswith("#"):
+        return "heading", inner, qdepth
+    return "para", inner, qdepth
+
+
+def _is_delim_row(line):
+    """A GFM delimiter row: every cell has >=1 hyphen and only -,: around it."""
+    kind, _, _ = _line_kind(line)
+    if kind != "table":
+        return False
+    body = re.sub(r"^ *(?:> ?)*", "", line).strip()
+    cells = [c.strip() for c in body.strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-+:?", c) for c in cells)
+
+
+def semantic_units(doc):
+    """The document as whole SEMANTIC units, each carrying its CONTAINER.
+
+    A unit absorbs its own wrapped continuation lines, so re-wrapping is
+    invisible; `kind`/`depth` carry the container that normalized text cannot,
+    and a `|` line is a table row only inside a contiguous run of them.
+    """
+    lines = doc.split("\n")
+    # A blank line ends a GFM table, so a pipe line is a table row only inside
+    # a contiguous run that carries a separator (|---|), however many adjoin it.
+    _sep = _is_delim_row
+    table_ok = [False] * len(lines)
+    k = 0
+    while k < len(lines):
+        if _line_kind(lines[k])[0] != "table":
+            k += 1; continue
+        j, q0 = k, _line_kind(lines[k])[2]
+        while (j < len(lines) and _line_kind(lines[j])[0] == "table"
+               and _line_kind(lines[j])[2] == q0):
+            j += 1
+        # GFM: the delimiter must FOLLOW the header immediately and match its
+        # cell count; any-delimiter-anywhere accepted a one-cell row and a swap.
+        def _cells(l):
+            b = re.sub(r"^ *(?:> ?)*", "", l).strip().strip("|")
+            return len(b.split("|"))
+        if (j - k >= 2 and _sep(lines[k + 1]) and not _sep(lines[k])
+                and _cells(lines[k]) == _cells(lines[k + 1])):
+            for i in range(k, j):
+                table_ok[i] = True
+        k = j
+    units, cur, meta, fence = [], [], None, False
+    def flush():
+        if cur:
+            units.append({"text": "\n".join(cur), **meta}); cur.clear()
+    for k, line in enumerate(lines):
+        st = line.strip()
+        if st.startswith("```"):
+            if fence: cur.append(line); flush(); fence = False; continue
+            flush(); fence = True
+            meta = {"kind": "fence", "depth": 0,
+                    "quoted": _line_kind(line)[2] > 0, "qdepth": _line_kind(line)[2]}
+            cur.append(line); continue
+        if fence:
+            cur.append(line); continue
+        if not st or st == ">":
+            flush(); continue
+        kind, depth, qdepth = _line_kind(line)
+        quoted = qdepth > 0
+        if kind == "table" and not table_ok[k]:
+            kind = "para"
+        # Only a plain line CONTINUES a paragraph or list item. A heading or
+        # table row always opens its own unit, and never absorbs the prose under it.
+        cont = (meta is not None and qdepth == meta["qdepth"]
+                and kind == "para" and meta["kind"] in ("para", "list"))
+        if not cont:
+            flush(); meta = {"kind": kind, "depth": depth, "quoted": quoted, "qdepth": qdepth}
+        cur.append(line)
+    flush()
+    return units
+
+
+def _holders(doc, anchor, quoted=None):
+    """Units whose normalized text holds `anchor`, optionally one quote-state.
+
+    An anchor can name both an obligation list item and the quoted callout that
+    disputes it; `quoted` is the discriminator the site table already carries.
+    """
+    return [(k, u) for k, u in enumerate(semantic_units(doc))
+            if anchor in normalized(u["text"])
+            and (quoted is None or u["quoted"] == quoted)]
+
+
+def unit_ordinal(doc, anchor, heading, quoted=None):
+    """The unit's INDEX among the units of its own section.
+
+    Neighbours are preserved when a whole run of siblings moves together, so
+    one-hop locality cannot see a block relocated intact inside its own section.
+    """
+    sec = section_of(doc, heading)
+    units = [u for u in semantic_units(sec)]
+    hits = [k for k, u in enumerate(units)
+            if anchor in normalized(u["text"])
+            and (quoted is None or u["quoted"] == quoted)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} units in {heading!r}, not 1"
+    return hits[0], len(units)
+
+
+def semantic_unit(doc, anchor, quoted=None):
+    """The ONE unit whose normalized text holds `anchor`, with its container."""
+    hits = [u for _, u in _holders(doc, anchor, quoted)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} semantic units hold it, not 1"
+    u = hits[0]
+    return {"text": normalized(u["text"]), "kind": u["kind"],
+            "depth": u["depth"], "quoted": u["quoted"], "qdepth": u.get("qdepth", 0)}
+
+
+def unit_neighbours(doc, anchor, quoted=None):
+    """The FULL normalized units either side of the one holding `anchor`.
+
+    Blockquote-aware: a quoted callout's neighbours are the surrounding units,
+    not the nearest physical lines, so a decoy built from the exact neighbouring
+    LINES no longer stands in for the real unit and a reflow no longer false-reds.
+    """
+    units = semantic_units(doc)
+    hits = [k for k, _ in _holders(doc, anchor, quoted)]
+    assert len(hits) == 1, f"{anchor!r}: {len(hits)} semantic units hold it, not 1"
+    k = hits[0]
+    prev = normalized(units[k - 1]["text"]) if k else ""
+    nxt = normalized(units[k + 1]["text"]) if k + 1 < len(units) else ""
+    return prev, nxt
 
 
 def live_hits(text, phrase):
@@ -361,11 +629,15 @@ class RemovalUnbindsBeforeTheInstaller(unittest.TestCase):
         PINNED an unsafe order: a suspended worker resumes and claims on a stale
         eligibility read. Stopping the process is the only fence."""
         t = self._text()
-        i_fence = t.find("FENCE W FIRST")
-        i_drain = t.find("Drain what it holds")
-        i_rewrite = t.find("REWRITE THE BINDINGS")
-        for name, i in (("fence", i_fence), ("drain", i_drain), ("rewrite", i_rewrite)):
-            self.assertNotEqual(i, -1, "no %s step is described" % name)
+        anchors = {"fence": "FENCE W FIRST", "drain": "Drain what it holds",
+                   "rewrite": "REWRITE THE BINDINGS"}
+        for name, a in anchors.items():
+            # find() takes the FIRST match, so a second copy anywhere silently
+            # decides this ordering. Unique today; assert it stays that way.
+            self.assertEqual(t.count(a), 1,
+                f"the {name} anchor appears {t.count(a)} times; positions would be "
+                f"compared against whichever copy comes first")
+        i_fence, i_drain, i_rewrite = (t.find(anchors[k]) for k in ("fence", "drain", "rewrite"))
         self.assertLess(i_fence, i_drain, "reclaiming before the worker is stopped lets "
                                           "the reclaimed path and W run the same task")
         self.assertLess(i_fence, i_rewrite, "publishing a new binding before W is stopped "
@@ -1226,20 +1498,24 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
     def test_an_unbound_worker_is_what_is_refused_not_a_bound_peer(self):
         self.assertIn("no UNBOUND worker stands in", self._flat())
 
-    def test_the_four_contested_claims_are_named_as_OPEN_not_settled(self):
+    def test_the_contested_claims_are_named_as_OPEN_not_settled(self):
         """The re-cut's whole point: prose near these topics must not read as proof."""
         f = self._flat()
         self.assertIn("open obligations", f)
         self.assertIn("NOT established by this document", f)
 
-    # Each contested site, keyed by a phrase only ITS callout carries. A count
-    # cannot name which one went missing, and four of the five share a heading.
+    # site -> (enclosing section, phrase only ITS callout carries); a global
+    # count cannot name which one went missing.
     DISPUTED_SITES = {
-        "removal order":  "two incompatible normative orders appear and neither is marked primary",
-        "request gate":   "is a READ, not a claim fence",
-        "one allowance":  "One allowance can still yield two live task claims",
-        "probation clock":"This window names three clock sources and the model returns a fourth",
-        "retirement seam":"nor its serialization against a racing admission",
+        "removal order":   ("The reconciliation ticker",
+                            "two incompatible normative orders appear and neither is marked primary"),
+        "request gate":    ("Coordination contract", "is a READ, not a claim fence"),
+        "one allowance":   ("Coordination contract",
+                            "One allowance can still yield two live task claims"),
+        "probation clock": ("Coordination contract",
+                            "This window names three clock sources and the model returns a fourth"),
+        "retirement seam": ("Coordination contract",
+                            "nor its serialization against a racing admission"),
     }
 
     def test_every_contested_SITE_carries_a_local_disputed_marker(self):
@@ -1249,10 +1525,22 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         keweichen at 67bc8db7: a `>= 4` count let the FIFTH callout be deleted
         with 109/109 still green -- the assertion could see that markers exist
         and never which site lost one. Pin each site by its own text."""
-        f = self._flat()
-        for site, phrase in self.DISPUTED_SITES.items():
-            self.assertIn(phrase, f, f"the {site} site lost its local DISPUTED callout")
-        self.assertEqual(f.count("DISPUTED — see"), len(self.DISPUTED_SITES),
+        d = DOC.read_text()
+        for site, (heading, phrase) in self.DISPUTED_SITES.items():
+            sec = section_of(d, heading)
+            # Normalize BOTH sides: this consumer still read raw text, so a
+            # formatting-only rewrap failed a callout that had not changed.
+            self.assertIn(phrase, normalized(sec),
+                f"the {site} site left the {heading!r} section -- moving a valid "
+                f"callout elsewhere leaves the passage it qualifies uncaveated")
+            blocks = [b for b in blockquote_blocks(sec) if phrase in normalized(b)]
+            self.assertEqual(len(blocks), 1,
+                f"the {site} site needs exactly ONE callout in its own section; "
+                f"found {len(blocks)}")
+            self.assertIn("DISPUTED — see", normalized(blocks[0]),
+                f"the {site} callout lost its marker; one counted elsewhere in the "
+                f"document does not warn a reader here")
+        self.assertEqual(self._flat().count("DISPUTED — see"), len(self.DISPUTED_SITES),
             "a site was added or removed without updating DISPUTED_SITES")
 
     def test_the_model_is_described_as_STATED_not_proven(self):
@@ -1260,13 +1548,23 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         pins every ordering also passed 109/109. It is the disclosure that keeps a
         green run from being read as coverage, so it needs its own pin -- and the
         overclaim it must reject needs naming, not just the wording it must keep."""
-        f = self._flat()
-        self.assertIn("it does not pin every one of them", f)
-        self.assertIn("STATED, not proven", f)
-        for overclaim in ("pins every one of them",
-                          "proven, not merely stated",
-                          "the model pins every ordering"):
-            self.assertNotIn(overclaim, f, f"the disclosure was inverted into {overclaim!r}")
+        d = DOC.read_text()
+        # ONE paragraph, found by a phrase unique to the operative passage: the
+        # previous form asked a SECOND locator whether the caveat existed at all.
+        para = normalized(sole_para_normalized(
+            section_of(d, "Coordination contract"), "The orderings this must hold under"))
+        for required in ("EXPRESSES", "it does not pin every one of them",
+                         "STATED, not proven"):
+            self.assertIn(required, para,
+                f"{required!r} left the operative paragraph; detached historical "
+                f"prose satisfies a document-wide read without limiting anything")
+        # Pin the claim SENTENCE, do not enumerate its inversions. My own control
+        # showed "it CERTIFIES all orderings" evading the list while the caveat stood.
+        self.assertIn(
+            "EXPRESSES the rows below as a no-write transition model (five pending "
+            "tasks, two runners) — but it does not pin every one of them", para,
+            "the model's claim sentence changed; a stronger verb was probably "
+            "inserted beside the caveat rather than replacing it")
 
     def test_the_probation_clock_names_a_NORMATIVE_source(self):
         """[P2] asked which of the three is normative; naming three and picking none
@@ -1428,30 +1726,461 @@ class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
         self.assertIn("last-worker removal order", row[0],
             "the row must name the obligation that blocks it")
 
-    # The passages that have each carried a stale count. Scoped, because a
-    # document-wide numeric ban would fight every legitimate figure in it.
-    COUNT_FREE = ("proofs for the items below",
-                  "The last-worker removal order below is one of them:",
-                  "The green tests here move none of")
+    # The exact operative SENTENCE with the section that must contain it; a
+    # list of forbidden spellings was evaded by "(5 total)".
+    COUNT_FREE_SENTENCES = (
+        ("The protocol claims NOT established by this document",
+         "It does NOT carry proofs for the items below."),
+        ("The reconciliation ticker",
+         "The last-worker removal order below is one of them: two incompatible "
+         "normative orders appear and neither is marked primary."),
+        ("Staged PRs against main",
+         "The green tests here move none of them: passing at head is silent on "
+         "whether anything fails under the alternative."),
+    )
 
-    def test_the_count_free_passages_reject_ANY_number_not_just_the_old_one(self):
-        """keweichen at 67bc8db7: banning the string 'four' let 'five' through, so
-        the guard tracked one wrong wording instead of the rule. Assert the exact
-        intended forms are PRESENT -- a count of any size displaces them -- and
-        that no digit or number-word survives inside those passages."""
-        d = self._doc()
+    def test_the_count_free_passages_are_pinned_SENTENCE_EXACT(self):
+        """Enumerating how a count can be spelled is a losing game -- three
+        spellings were banned and a fourth walked through. Pinning the whole
+        sentence inverts it: any inserted count changes the sentence, whatever
+        its wording, and a decoy copy is caught by the uniqueness check."""
+        doc = self._doc()
         WORDS = ("one", "two", "three", "four", "five", "six", "seven",
                  "eight", "nine", "ten")
-        for phrase in self.COUNT_FREE:
-            self.assertIn(phrase, d,
-                f"the count-free form {phrase!r} is gone -- a number likely replaced it")
-            self.assertNotRegex(phrase, r"\d", f"{phrase!r} carries a digit")
-            # Ban the SET-SIZE count, not the number-words: "one of them" is
-            # durable, "one of the four" is what went stale twice.
-            num = "|".join(WORDS)
-            for pat in (rf"\bof the ({num})\b", rf"\b({num}) (items|tests|obligations|proofs)\b"):
-                self.assertNotRegex(phrase.lower(), pat,
-                    f"{phrase!r} states the set size, which re-stales on every change")
+        num = "|".join(WORDS)
+        for heading, sentence in self.COUNT_FREE_SENTENCES:
+            sec = section_of(doc, heading)
+            self.assertIn(sentence, normalized(sec),
+                f"the operative sentence left the {heading!r} section")
+            self.assertEqual(normalized(doc).count(sentence), 1,
+                f"{sentence!r} also appears elsewhere -- a relocated decoy copy "
+                f"satisfies a global pin while the operative passage rots")
+            # The count sits BESIDE the sentence, so the paragraph is the unit.
+            para = normalized(sole_para_normalized(sec, sentence[:34])).lower()
+            for pat in (rf"\bof (?:the |them )?({num})\b", rf"\ball ({num}|\d+) ",
+                        rf"\b({num}|\d+) (items|tests|obligations|proofs)\b"):
+                self.assertNotRegex(para, pat,
+                    f"the paragraph holding {sentence[:30]!r} states a set size")
+
+
+
+class OperativeBlocksAreEqualityPinnedAndLocal(unittest.TestCase):
+    """keweichen at a7d5d637: section_of() narrowed a document-global locator to a
+    SECTION-global one, and several sections are broad H2s. Same-section
+    relocation stayed green, and an added contradiction inside a valid block
+    stayed green, because every pin still asked about a PHRASE.
+
+    His prescription, stated twice: full normalized block equality. Any insertion,
+    reword or contradiction changes the block; neighbours catch relocation that
+    leaves the block itself intact.
+    """
+
+    # Captured from the document, so a legitimate edit updates them deliberately.
+    BLOCKS = {
+        "intro_caveat": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
+        "stated": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
+        "disputed_request_gate": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit."
+}
+
+    ANCHORS = {
+        "intro_caveat": ("It does NOT carry proofs for the items below.", False),
+        "stated": ("The orderings this must hold under", False),
+        "disputed_request_gate": ("is a READ, not a claim fence", True),
+    }
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_each_operative_block_is_EQUAL_not_merely_containing(self):
+        doc = self._doc()
+        for name, (anchor, quoted) in self.ANCHORS.items():
+            self.assertEqual(operative_block(doc, anchor, quoted), self.BLOCKS[name],
+                f"the {name} block changed. Equality is the pin BECAUSE a phrase "
+                f"check accepts a sentence added beside it -- an appended count, "
+                f"or a contradiction inside the same block")
+
+    def test_the_intro_caveat_still_precedes_the_list_it_calls_BELOW(self):
+        """It says "the items below"; moved after them the sentence is false while
+        its own text is untouched."""
+        prev, nxt = neighbours(self._doc(), "It does NOT carry proofs for the items below.")
+        self.assertIn("The protocol claims NOT established by this document", prev)
+        self.assertIn("The request-or-directory gate is a READ", nxt)
+
+    def test_each_DISPUTED_callout_sits_ON_what_it_qualifies(self):
+        """Equality cannot see relocation: the block is byte-identical wherever it
+        lands. keweichen at a7d5d637 moved a valid callout within its own H2 and
+        every check stayed green, because sharing a section is not site locality."""
+        doc = self._doc()
+        for anchor, heading, follows in (
+            ("is a READ, not a claim fence",
+             "Coordination contract", "**Claim:** exclusivity is the watcher's hard-link claim"),
+        ):
+            prev, nxt = neighbours(doc, anchor, quoted=True)
+            self.assertIn(heading, prev,
+                f"the {anchor[:24]!r} callout no longer opens its section")
+            self.assertIn(follows, nxt,
+                f"the {anchor[:24]!r} callout is no longer ON the rule it disputes")
+
+    def test_the_stage_caveat_stays_INSIDE_the_quoted_stage_gate(self):
+        """Moving it out of the quote leaves it under the same H2 and stops it
+        qualifying the gate -- which is the whole reason it is written there."""
+        doc = self._doc()
+        gates = [b for b in [operative_block(doc, "### STAGE GATE", True)] if b]
+        self.assertTrue(gates, "no quoted STAGE GATE block")
+        self.assertIn("The green tests here move none of them", gates[0],
+            "the stage caveat left the quoted gate")
+
+    def test_a_located_block_carries_no_CONTRADICTION_of_its_own_claim(self):
+        """Equality already rejects an addition; this names the specific inversions
+        so a failure reads as what it is rather than as a diff."""
+        doc = self._doc()
+        stated = operative_block(doc, "The orderings this must hold under", False)
+        gate = operative_block(doc, "is a READ, not a claim fence", True)
+        for bad in ("CERTIFIES all orderings", "are all PROVEN", "rows as PROVEN"):
+            self.assertNotIn(bad, stated)
+        for bad in ("SETTLED", "proven correct"):
+            self.assertNotIn(bad, gate)
+
+
+
+class AnalogousQualifiersAreUnitExactAndContainerBound(unittest.TestCase):
+    """The four blocks pinned by equality were the ones a reviewer had named. I
+    audited the rest for the same property and SIX more relocate to EOF with the
+    suite green -- keweichen then confirmed independently that "analogous blocks
+    remain unpinned".
+
+    These are list ITEMS, a TABLE ROW and inline qualifiers rather than callouts.
+    The unit is the whole semantic item: equality kills mutation, the container
+    kills nesting, and both full neighbours kill relocation and decoys.
+    """
+
+    QUALIFIERS = [
+            {
+                    "anchor": "Retirement is not crash-complete",
+                    "heading": "The protocol claims NOT established by this document",
+                    "unit": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings.",
+                    "kind": "list",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
+                    "next": "- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop, against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.",
+                    "ordinal": [
+                            5,
+                            9
+                    ]
+            },
+            {
+                    "anchor": "a FOURTH source, not one of the three",
+                    "heading": "The protocol claims NOT established by this document",
+                    "unit": "- **The probation window names three clock sources** \u2014 `probation.since`, the journal mtime, and the `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at` \u2014 a FOURTH source, not one of the three \u2014 and changing it leaves the suite green, so the suite does not choose a contract. **`probation.since` is normative.** It is the only one of the three the worker does not author: journal mtime and `claimed/<task_id>` mtime are both written by the subject of the probation, so a slow worker moves the deadline it is judged against. Measured on the model: one allowance minted at t=10 reports probation start 10, then 111, then 212 as its worker progresses.",
+                    "kind": "list",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "- **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with no admission record. `as_owner()` was added to hold a paused owner name beside its successor, and a schedule was run showing the rollback returns the allowance AND erases the journal. **That run is NOT the A/B/C proof it was described as.** The model stacks owner names rather than holding two simultaneously live claimants, so it cannot express the schedule this obligation is about; the row is STATED, not proven, exactly as the local callout now says. The allowance rules do NOT prevent the defect, and nothing here demonstrates the interleaving that produces it. Raised by `keweichen`, who found this bullet still claiming a result the retraction below had already withdrawn.",
+                    "next": "- **Retirement is not crash-complete, and not serialized against admission.** The root rename and the pool-status/probation write are separate durable operations, so a crash between them leaves either an active token beside completed custody in the tombstone, or a directory still gating a worker whose probation owner is gone. Admission racing retirement is worse: a worker past token observation recreates `held/claimed`, hits `ENOENT` moving the now-tombstoned token, and the active gate is back \u2014 after which a later retirement over the non-empty tombstone fails `ENOTEMPTY`. Both write orders were REPRODUCED against the specified filesystem operations. What is owed is a serialized, crash-recoverable cross-record retirement protocol with generation-safe tombstones, and a model that exposes each durable write plus the worker interleavings.",
+                    "ordinal": [
+                            4,
+                            9
+                    ]
+            },
+            {
+                    "anchor": "One owner, not \"sidecar or wrapper\"",
+                    "heading": "What the core and the operator read to judge a worker",
+                    "unit": "| the report transport, named \u2014 and the producer must be BUILT | **the WRAPPER that owns the tmux session, via `tmux pipe-pane` to a per-instance capture file.** One owner, not \"sidecar or wrapper\". **`src/core_heartbeat.py` does NOT do this today and the earlier revision was wrong to say it \"already tails\" anything** \u2014 it probes process/tmux metadata through `tmux_probe.classify` and writes `.alive`; it never captures pane output, and the `/tmp/core-heartbeat.log` the launchers create is the heartbeat's OWN stdout, not provider output. So this is a component to write, and it owes: the `pipe-pane` capture, provider-error attribution (which lines are an out-of-credits error rather than ordinary output), the parse that extracts the provider's reported reset time, and the atomic temp-plus-`os.replace` write. Nothing the failing session has to successfully DO \u2014 the pane already carries its output. A runtime with no pane to pipe has no quiesce detection, and the design says that rather than assuming one |",
+                    "kind": "table",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "| the core's role | reads it, and nothing more. It does not take the room: a quiesced instance's bound rooms stay pending. (An earlier revision justified this row with \"a worker too broken to write its own record is simply never eligible\" \u2014 a leftover from when the WORKER was the writer. It is no longer a reason for anything and is removed rather than reworded) |",
+                    "next": "| routing exclusion | a quiesced instance is skipped at claim time (not \"in `instances` order\" \u2014 the set is unordered). A room whose every binding is quiesced stays pending. This is deliberately NOT the unreadable-bindings fall-through: an unreadable file leaves the room unbound, so rule 3 sends it to the core; a quiesced binding is still a binding |",
+                    "ordinal": [
+                            17,
+                            23
+                    ]
+            },
+            {
+                    "anchor": "`exclusions` is not why the binding unit is a room",
+                    "heading": "Worker pool \u2014 design (v1)",
+                    "unit": "**It also supersedes Decisions 2 and 3 of that record, explicitly.** Decision 2 makes the binding unit a CONTEXT GROUP; Decision 3 promises *at most one outstanding assignment per context group*, enforced by the lead refusing to create the second one. This design is room-keyed and has no lead, so neither survives: **the refusing party does not exist.** `exclusions` is not why the binding unit is a room: `exclusions` was one way grouped rooms ended up on non-coordinating workers, never the reason the binding unit is a room. What replaces them: **the binding unit is the ROOM, and concurrency is bounded per TASK by the claim, not per group by an assigner.** Two rooms of one former context group may run turns at the same time, and so may two members bound to one room. Group identity, group admission and group release are named as out of scope for v1 in the routing section and remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in v1 can express it. Every other decision in that record stands.",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "**Status:** design, owner-decided 2026-09-03 (PR-triage room). This is step 1 of staging #3604 into PRs against `main`; #3604 stays open as the reference implementation and is not merged as one piece. It supersedes the \"lead = the runtime daemon\" and \"lead-managed sizing\" placements in #3604's `docs/lead-follower-pool.md` and Decision 4 of [`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), and Decision 5 of that record (the unclaimed-work backstop belongs to the lead; followers stay purely event-driven) \u2014 superseded because it sites the backstop on a lead this design no longer has, not because its reasoning was wrong; see **The reconciliation ticker**, which answers its O(N) objection rather than dropping it.",
+                    "next": "## The protocol claims NOT established by this document \u2014 they are open obligations",
+                    "ordinal": [
+                            2,
+                            448
+                    ]
+            },
+            {
+                    "anchor": "work stays PENDING only when EVERY bound member is ineligible",
+                    "heading": "Coordination contract",
+                    "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
+                    "kind": "list",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant.",
+                    "ordinal": [
+                            13,
+                            78
+                    ]
+            },
+            {
+                    "anchor": "no UNBOUND worker stands in",
+                    "heading": "Coordination contract",
+                    "unit": "5. **No stand-in:** the rule is quantified over the room's binding SET, never over one member. An ineligible member \u2014 beat stale, or wedged under rule 6 \u2014 suppresses ITSELF; eligible bound peers stay candidates and keep claiming. New work stays PENDING only when EVERY bound member is ineligible. The core does not claim it, and no UNBOUND worker stands in. Work an ineligible worker had ALREADY CLAIMED may be reclaimed behind the done flag, so nothing in flight is lost; what is refused is ADMITTING NEW work to a set with no eligible member. A fresh beat alone does not restore eligibility; rule 6 is what says whether beating counts. The pin is not changed; nothing is loaned or re-bound.",
+                    "kind": "list",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "prev": "**This does NOT weaken no-stand-in.** The core still never takes a BOUND room's work. Unbinding is an explicit owner-commanded transition with a recorded rewrite; what rule 5 forbids is the core helping itself to a room whose worker might still come back.",
+                    "next": "A room whose every bound member is ineligible is therefore unserved until one returns or the owner explicitly redirects or cancels the work. That availability gap is deliberate: there is no second claimant to fence because an unbound worker is never a claimant.",
+                    "ordinal": [
+                            13,
+                            78
+                    ]
+            }
+    ]
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_each_qualifier_is_exact_unique_container_bound_and_local(self):
+        """Whole semantic unit by equality, its CONTAINER, and both neighbours.
+
+        Normalized text alone cannot see the Markdown parent: nesting a list
+        item two spaces deeper, or ending a table with a blank line so a row
+        falls outside it, leaves text/neighbours/section identical while the
+        asserted membership is false.
+        """
+        doc = self._doc()
+        for q in self.QUALIFIERS:
+            u = semantic_unit(doc, q["anchor"], False)
+            self.assertEqual(u["text"], q["unit"],
+                f"{q['anchor']!r}: its unit changed")
+            self.assertEqual((u["kind"], u["depth"], u["qdepth"]),
+                             (q["kind"], q["depth"], q["qdepth"]),
+                f"{q['anchor']!r}: container changed -- nesting it deeper or "
+                f"breaking its table leaves the text identical and the parent false")
+            prev, nxt = unit_neighbours(doc, q["anchor"], False)
+            self.assertEqual(prev, q["prev"], f"{q['anchor']!r}: unit BEFORE changed")
+            self.assertEqual(nxt, q["next"], f"{q['anchor']!r}: unit AFTER changed")
+            sec = normalized(section_of(doc, q["heading"]))
+            self.assertIn(u["text"], sec,
+                f"{q['anchor']!r} left the {q['heading']!r} section")
+            # Neighbours survive when a whole run of siblings moves together, so
+            # position inside the section is pinned as well.
+            self.assertEqual(unit_ordinal(doc, q["anchor"], q["heading"], False)[0],
+                             q["ordinal"][0],
+                f"{q['anchor']!r}: moved within its section -- an intact block relocated "
+                f"inside its own H2 keeps every neighbour and is invisible to "
+                f"one-hop locality")
+
+
+class EverySensitiveSiteIsOneTable(unittest.TestCase):
+    """ONE table over every count-free passage and every DISPUTED site.
+
+    keweichen at a5022979: equality covered 3 representative units while
+    COUNT_FREE had 3 passages and DISPUTED had 5, and "the current parallel
+    tables already drifted" -- two of them named the SAME callout, which is what
+    a second table costs. Each row carries its block, its section, and its exact
+    neighbouring units, so mutation, relocation and contradiction are one check.
+    """
+
+    SITES = [
+            {
+                    "key": "count:intro",
+                    "anchor": "It does NOT carry proofs for the items below.",
+                    "heading": "The protocol claims NOT established by this document",
+                    "quoted": False,
+                    "block": "This PR carries the design and a model that can express the interleavings the real system has. It does NOT carry proofs for the items below. They were raised as blocking review findings and remain open; a reader must not treat the surrounding prose as having settled them, and the implementing PR owes each one a schedule that fails before it passes.",
+                    "prev": "## The protocol claims NOT established by this document \u2014 they are open obligations",
+                    "next": "- **The request-or-directory gate is a READ, not a claim fence.** A worker can read \"no request\", pause, let a kick publish, and still commit its ordinary batch. The split model can now express that pause (`worker_read` / `worker_commit`), and the schedule has since been RUN: the gate refuses 4 of 4 admissions when the verdict is read after the kick and **0 of 4 when it is read before**, so a published request bounds nothing already in flight. The protocol does NOT survive it.",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 0,
+                    "ordinal": [
+                            1,
+                            9
+                    ]
+            },
+            {
+                    "key": "count:removal",
+                    "anchor": "removal order below is one of them",
+                    "heading": "The reconciliation ticker",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of them: two incompatible normative orders appear and neither is marked primary.",
+                    "prev": "### The reconciliation ticker",
+                    "next": "**It is a THIRD periodic mechanism, and it is gated on pool membership.** The watcher owns it -- not the heartbeat, and not the core's sweep. The backstop is NOT sited on a lead, and followers are not purely event-driven. Its cost is O(N) wakeups, where N is the number of workers deliberately created, and at N=0 there is no ticker at all.",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 1,
+                    "ordinal": [
+                            1,
+                            65
+                    ]
+            },
+            {
+                    "key": "count:stage",
+                    "anchor": "The green tests here move none of",
+                    "heading": "Staged PRs against main",
+                    "quoted": True,
+                    "block": "### STAGE GATE \u2014 steps 2, 3 and 4 are BLOCKED and must not be opened yet The [open obligations](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations) are not decided, and each one governs a protocol an implementing PR would have to encode. This gate is the operative rule: **no PR implementing steps 2, 3 or 4 may be opened while the obligation covering it is open.** A step is unblocked when its obligation names ONE operative rule and the model suite contains a schedule that FAILS under the rejected alternative \u2014 a green suite that passes either way does not lift the gate, because that is the condition the obligations were filed under. **That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control showing the same suite passes at head. As written without this, the rule was satisfiable by assertion \u2014 \"the suite discriminates\" is a claim about intent, and intent is what these obligations were filed against. Neither half can be produced by a suite that does not really discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite whose names implied it covered a defect stayed green, exit 0, when that precise bug was reintroduced. **A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent. | blocked step | obligation that blocks it | why that step cannot be written yet | |---|---|---| | 2 \u2014 worker event handler | gate-is-a-read; two-claims-per-allowance | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is | | 3 \u2014 core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename \u2014 every site | | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify \u2014 that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates | | 4 \u2014 installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all | Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this document) is not gated \u2014 naming an open obligation is what it is for. **Provenance.** Two reviewers reached these sites independently: `qingyun-wu` at head `1132aad5` (fencing/rollback, removal order, clock) and `keweichen` at head `d2e41ace` (fencing as finding 2, clock as finding 4, each with a reproduced filesystem trace). Independent convergence on the same sites is why this is a gate and not a wording dispute \u2014 and why the gate is preferred here over adjudicating in this PR, which is the alternative `qingyun-wu` offered in the same review. This gate is itself an obligation: delete it in the PR that resolves the last item, not before.",
+                    "prev": "**That failure must be EXHIBITED, as a pair, not described.** The lifting evidence is (a) the actual failing run under the rejected alternative, pasted, at the actual head, and (b) a control showing the same suite passes at head. As written without this, the rule was satisfiable by assertion \u2014 \"the suite discriminates\" is a claim about intent, and intent is what these obligations were filed against. Neither half can be produced by a suite that does not really discriminate, and both are cheap. Raised by `qingyun-wu`'s worker-2 off a live case where a suite whose names implied it covered a defect stayed green, exit 0, when that precise bug was reintroduced.",
+                    "next": "| blocked step | obligation that blocks it | why that step cannot be written yet |",
+                    "pin": "membership",
+                    "unit": "**A pass at head is not progress against any obligation.** The green tests here move none of them: passing at head is silent on whether anything fails under the alternative. The two are orthogonal, and reading a green run as movement is the specific mistake this paragraph exists to prevent.",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 1,
+                    "ordinal": [
+                            4,
+                            22
+                    ]
+            },
+            {
+                    "key": "disp:request",
+                    "anchor": "is a READ, not a claim fence",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence \u2014 a worker can read \"no request\", pause, and still commit.",
+                    "prev": "## Coordination contract (claim-only; the primitives are #3604's)",
+                    "next": "1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the CANONICAL task id \u2014 `state/task-event-handler-claims/<task-id>`, resolved by `task_archive.task_id_for(path, accept=...)` (first link wins, a dead owner's claim retired by pid); the claimant then renames `tasks/task-X.txt` to `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads. Keying on the raw basename would hand the renamed file a key nobody holds. There is no assignment step; eligibility is `requested_worker` and the pin table.",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 1,
+                    "ordinal": [
+                            1,
+                            78
+                    ]
+            },
+            {
+                    "key": "disp:allowance",
+                    "anchor": "One allowance can still yield two live task claims",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.",
+                    "prev": "**So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.**",
+                    "next": "The schedule that separates the orders is a worker consuming between the two reads:",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 1,
+                    "ordinal": [
+                            36,
+                            78
+                    ]
+            },
+            {
+                    "key": "disp:clock",
+                    "anchor": "This window names three clock sources",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth. **`probation.since` is normative** \u2014 the obligations section picks it and gives the reason. What is still open is not the choice but its ENFORCEMENT: no model schedule fails when that choice is swapped, so the suite does not hold the algorithm below to it, and the algorithm here still reads journal and `claimed/<task_id>` mtimes. Step 3 is gated on a schedule that discriminates them.",
+                    "prev": "**Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep ends probation by exactly one of: the admitted task's result exists (verdict \u2192 `eligible`, computed afresh; the allowance retired by the single rename below); or the window `stand_in_after_s` has elapsed \u2014 measured from `probation.since` while the token is unconsumed",
+                    "next": "(a worker that never reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from the `claimed/<task_id>` record's mtime once the promotion has landed \u2014 in which case the verdict \u2192 `wedged`, the allowance is retired by the same single rename, and the request is NOT re-armed; a second kick needs a second command. `probation` is never the last word.",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 0,
+                    "qdepth": 1,
+                    "ordinal": [
+                            59,
+                            78
+                    ]
+            },
+            {
+                    "key": "disp:retire",
+                    "anchor": "nor its serialization against a racing admission",
+                    "heading": "Coordination contract",
+                    "quoted": True,
+                    "block": "**DISPUTED \u2014 see [the protocol claims NOT established by this document](#the-protocol-claims-not-established-by-this-document--they-are-open-obligations).** The prose below names the seam correctly; what is NOT established is a crash-recoverable protocol across it, nor its serialization against a racing admission. Both write orders were reproduced and neither is safe.",
+                    "prev": "**Retirement is ONE rename, because the allowance is a FAMILY of names and `rmtree` is not one act.** The sweep ends probation with `rename(<instance>.admit, <instance>.admit.retired.<verdict>)`. Removing children first is what must not happen: unlinking `spent` and the phase records leaves the root standing holding no name, and that is precisely the state recovery is required to read as unfinished issuance \u2014 so the next sweep finishes it, minting a fresh allowance beside a task that has already completed. The single rename flips the worker's gate (does the directory exist?) and both of recovery's names (`token`, `spent`) at the same instant, which is the property the two-question split depends on.",
+                    "next": "**That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the verdict scalar live in the pool-status record \u2014 a different object, with its own write \u2014 so retirement is TWO durable writes and has a seam whichever order they take. Neither order is safe on its own, and the two fail in opposite directions:",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 3,
+                    "qdepth": 1,
+                    "ordinal": [
+                            62,
+                            78
+                    ]
+            },
+            {
+                    "key": "stated",
+                    "anchor": "The orderings this must hold under",
+                    "heading": "Coordination contract",
+                    "quoted": False,
+                    "block": "The orderings this must hold under. The model in `tests/worker-pool-design-transitions.test.py` EXPRESSES the rows below as a no-write transition model (five pending tasks, two runners) \u2014 but it does not pin every one of them, and the difference matters. `gate_step1b` fuses `mkdir` with the `rename`, and R2/R3 are likewise fused, so any row needing a crash BETWEEN those durable writes cannot be scheduled in it; the A/B/C row stacks owner names rather than holding two live claimants. Treat the crash-window and A/B/C rows as STATED, not proven, until the model exposes each durable write separately \u2014 which is what the two-claims-per-allowance and retirement obligations already owe. Raised by `keweichen`:",
+                    "prev": "This is what bounds the risk to one task: reconciliation's `2 * runners` throttle and the unbounded event path both route through this gate, there is one token, and every path out of the seam either completes the admission or returns the token.",
+                    "next": "``` kick -> sweep -> worker probation held across the sweep; worker admits 1 (was: wedged, 0, 5) kick -> worker -> sweep worker admits 1, not 4; sweep sees probation, holds (was: eligible, 4, 1) kick -> multi-task backlog one token consumed; 4 stay pending event arrives in probation event path hits the same gate; admit already 0 -> pending crash after publish, before token next sweep re-issues the token; worker admits 1 crash after mkdir, worker gated no token exists to consume; the sweep finishes issuance once worker never reaches its gate window from `since` elapses -> wedged, allowance removed crash between R1 and R2 the tombstone is recognised; R2 replays, nothing is minted retirement races a live worker family moves under it; promotion ENOENTs, no second admission claimed, unfinished past window window from claimed/<task_id> elapses -> wedged ```",
+                    "pin": "equality",
+                    "kind": "para",
+                    "depth": 3,
+                    "qdepth": 0,
+                    "ordinal": [
+                            73,
+                            78
+                    ]
+            }
+    ]
+
+    def _doc(self):
+        return DOC.read_text()
+
+    def test_every_site_block_is_EQUAL_or_a_member_of_its_quoted_gate(self):
+        doc = self._doc()
+        for s in self.SITES:
+            got = operative_block(doc, s["anchor"], s["quoted"])
+            u = semantic_unit(doc, s["anchor"], s["quoted"])
+            self.assertEqual((u["kind"], u["depth"], u["qdepth"]),
+                             (s["kind"], s["depth"], s["qdepth"]),
+                f"{s['key']}: container changed -- nesting or a broken table "
+                f"leaves the normalized text identical and the parent false")
+            if s["pin"] == "equality":
+                self.assertEqual(got, s["block"],
+                    f"{s['key']}: block changed -- an appended count, a reworded "
+                    f"caveat or a contradiction inside it all land here")
+            else:
+                # Membership over the whole gate accepts a false count appended
+                # to the caveat itself; pin the caveat's own paragraph.
+                self.assertIn(s["anchor"], got,
+                    f"{s['key']}: left the quoted gate it must qualify")
+                self.assertEqual(u["text"], s["unit"],
+                    f"{s['key']}: the caveat paragraph changed -- an appended "
+                    f"count lands here, not in the enclosing gate")
+
+    def test_every_site_is_INSIDE_its_declared_section(self):
+        doc = self._doc()
+        for s in self.SITES:
+            sec = normalized(section_of(doc, s["heading"]))
+            self.assertIn(s["anchor"], sec,
+                f"{s['key']} left the {s['heading']!r} section -- equality pins its "
+                f"bytes and cannot see where they moved to")
+
+    def test_every_site_keeps_its_EXACT_neighbouring_units(self):
+        """Neighbours compared as whole normalized units, not substrings:
+        relocating a callout between two decoys that merely CONTAIN the expected
+        substrings passed the assertIn form (keweichen)."""
+        doc = self._doc()
+        for s in self.SITES:
+            if not (s["prev"] or s["next"]):
+                continue
+            # Quoted rows used physical-line neighbours, so a decoy built from
+            # the exact neighbouring LINES stood in for the real unit.
+            prev, nxt = unit_neighbours(doc, s["anchor"], s["quoted"])
+            # A run of siblings moving together leaves every one-hop check
+            # satisfied, so position is pinned as well.
+            self.assertEqual(unit_ordinal(doc, s["anchor"], s["heading"], s["quoted"])[0],
+                             s["ordinal"][0],
+                f"{s['key']}: moved within its section")
+            if s["prev"]:
+                self.assertEqual(prev, s["prev"],
+                    f"{s['key']}: the unit BEFORE it changed or it was relocated")
+            if s["next"]:
+                self.assertEqual(nxt, s["next"],
+                    f"{s['key']}: the unit AFTER it changed or it was relocated")
 
 
 if __name__ == "__main__":

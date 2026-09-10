@@ -37,10 +37,77 @@ def legacy_artifact_path(instance, phase, task):
     return f"{instance}.admit.{task}" + (".claimed" if phase == "claimed" else "")
 
 
+class _RecSet(set):
+    """A set whose every mutation is traced, including bulk and replacement."""
+    def __init__(self, owner, name, it=()): super().__init__(it); self._o, self._n = owner, name
+    def _ev(self, op, *a): self._o._op((f"{self._n}.{op}", *a))
+    def add(self, v): self._ev("add", v); return super().add(v)
+    def discard(self, v): self._ev("discard", v); return super().discard(v)
+    def remove(self, v): self._ev("remove", v); return super().remove(v)
+    def pop(self): self._ev("pop"); return super().pop()
+    def clear(self): self._ev("clear"); return super().clear()
+    def update(self, *a): self._ev("update", *[sorted(x) for x in a]); return super().update(*a)
+    def difference_update(self, *a):
+        self._ev("difference_update", *[sorted(x) for x in a]); return super().difference_update(*a)
+    def intersection_update(self, *a):
+        self._ev("intersection_update", *[sorted(x) for x in a]); return super().intersection_update(*a)
+
+
+class _RecDict(dict):
+    """A dict whose every mutation is traced; an add+delete pair cannot cancel."""
+    def __init__(self, owner, name, it=()):
+        super().__init__(it); self._o, self._n = owner, name
+        for k, v in list(self.items()):
+            dict.__setitem__(self, k, self._wrap(k, v))
+
+    def _wrap(self, k, v):
+        # A nested container is durable too: probation["w"]["since"] = x must be
+        # traced, and a plain inner dict makes that write invisible.
+        if isinstance(v, (_RecDict, _RecSet)): return v
+        if isinstance(v, dict): return _RecDict(self._o, f"{self._n}.{k}", v)
+        if isinstance(v, (set, frozenset)): return _RecSet(self._o, f"{self._n}.{k}", v)
+        return v
+
+    def _ev(self, op, *a): self._o._op((f"{self._n}.{op}", *a))
+    def __setitem__(self, k, v):
+        self._ev("set", k, v); return dict.__setitem__(self, k, self._wrap(k, v))
+    def __delitem__(self, k): self._ev("del", k); return super().__delitem__(k)
+    def pop(self, *a): self._ev("pop", *a[:1]); return super().pop(*a)
+    def popitem(self): self._ev("popitem"); return super().popitem()
+    def setdefault(self, k, d=None): self._ev("setdefault", k, d); return super().setdefault(k, d)
+    def update(self, *a, **kw): self._ev("update", sorted(dict(*a, **kw).items())); return super().update(*a, **kw)
+    def clear(self): self._ev("clear"); return super().clear()
+
+
 class Disk:
+    # EVERY modeled durable field, scalar or container. Nothing removes a trace
+    # entry, so an add+delete pair cannot cancel the way terminal state does.
+    DURABLE = ("spent", "token", "journal", "journal_at", "claimed_rec",
+               "claimed_at", "admit_dir", "tombstone", "token_at", "request",
+               "claims", "record", "probation", "results", "writers",
+               "live_owners", "phase_dirs", "computed_at", "torn")
+    _SETS = ("phase_dirs", "results", "writers", "live_owners")
+    _DICTS = ("claims", "record", "probation")
+
+    def _op(self, ev):
+        object.__getattribute__(self, "ops").append(ev)
+
+    def __setattr__(self, k, v):
+        # Wholesale replacement of a container is itself a durable write, and the
+        # replacement must keep recording or later mutations go untraced.
+        if k in Disk._SETS and not isinstance(v, _RecSet):
+            v = _RecSet(self, k, v or ())
+        elif k in Disk._DICTS and not isinstance(v, _RecDict):
+            v = _RecDict(self, k, v or {})
+        if k in Disk.DURABLE and "ops" in self.__dict__:
+            self._op((k, sorted(v) if isinstance(v, (set, frozenset))
+                      else sorted(v.items()) if isinstance(v, dict) else v))
+        object.__setattr__(self, k, v)
+
     def __init__(self):
         # record: sweep-only. token/journal/claimed: sweep creates, worker renames, sweep removes.
         # request: kick-pool. results: the worker finishing an admitted task.
+        object.__setattr__(self, 'ops', [])
         self.record, self.probation, self.request = {}, {}, False
         self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
         self.spent = False            # created BEFORE the token leaves; never moves
@@ -109,13 +176,18 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
-    def as_owner(name, keep_live=True):
-        """(P1.3 seam) Run the next steps AS a named claimant, optionally leaving the
-        previous one LIVE. restart() replaces `me` and drops the old owner, so a paused
-        claimant cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+    def as_owner(name):
+        """(P1.3 seam) Run the next steps AS a named OWNER, leaving the previous one
+        live. restart() replaces `me` and drops the old owner, so a paused owner
+        cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+
+        keweichen at 6268f22e: this took a `keep_live` flag whose False branch did
+        not remove the previous owner, only skip re-adding one already present --
+        a broken advertised input no schedule passed. Dropping it is the honest
+        repair; restart() already IS the replace-the-owner semantics.
         """
         prev = me[0]
-        if keep_live: d.live_owners.add(prev)
+        d.live_owners.add(prev)
         me[0] = name; d.live_owners.add(name)
         return prev
 
@@ -374,8 +446,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if verdict() == "probation" and d.journal is None and d.claimed_rec is None: gate_step1(f"t{claimed+1}")
 
     def restart():
-        # The old owner STOPS being live: a restart is not a second claimant.
-        # Use as_owner() when the schedule needs both alive at once.
+        # The old owner STOPS being live: a restart is not a second owner.
+        # Use as_owner() when the schedule needs both owner names alive at once.
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
     def contender_rename():
@@ -415,11 +487,11 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             claims      = {'t1': 'p1'}          <- ONE claim, held by the FIRST
             live_owners = {'p1', 'p-b', 'p-c'}
 
-        so stacking three adds three owner names and no second claim. A/B/C needs
-        three live CLAIMS and stays unrepresentable here; test_three_OWNERS_...
-        pins both states exactly so that limitation cannot be silently lifted.
+        so stacking three adds three owner names and no second claim. The obligation A/B/C
+        is about is TWO SIMULTANEOUS task claims across three resumable actors --
+        not three claims -- and the model holds one, so it cannot express it.
         """
-        as_owner(name, keep_live=True)
+        as_owner(name)
 
     def step_third_owner():
         step_second_owner("p-c")
@@ -1174,10 +1246,11 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         self.assertEqual(fused[:3], split[:3],
             "read-then-commit with no pause must equal the fused worker()")
         fd, sd = fused[3], split[3]
-        for field in ("record", "claims", "live_owners", "results", "journal",
-                      "claimed_rec", "token", "spent", "request", "probation"):
-            self.assertEqual(getattr(fd, field), getattr(sd, field),
-                f"disk field {field} diverges, so the composition is not equal")
+        # An enumerated field list exempted admit_dir, phase_dirs, tombstone,
+        # timestamps and writers; vars() cannot be outgrown by a new field.
+        self.assertEqual(vars(fd), vars(sd),
+            "the fused and split compositions must leave IDENTICAL disk state; "
+            "an enumerated field list silently exempts every field added later")
 
     def test_an_action_can_land_BETWEEN_the_read_and_the_commit(self):
         """The interleaving P1.2 describes: read, something happens, then commit."""
@@ -1185,30 +1258,92 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         self.assertIsNotNone(v, "the schedule must run at all -- it could not be written before")
         self.assertTrue(d.request, "the kick landed between the read and the commit")
 
+    def test_the_commit_USES_THE_HELD_VERDICT_and_never_rereads(self):
+        """keweichen at a5022979: replacing `worker_commit(held[0])` with
+        `worker_commit(worker_read())` RE-FUSES the seam and all 83 tests passed --
+        the class claiming the split is expressible stayed green with it removed.
+
+        Parameterized over ALL THREE verdict inputs: a mutant re-reading only when
+        the held verdict is probation/wedged passed the eligible case alone."""
+        for label, sched, want in (
+            ("held eligible", ["sweep", "drift", "worker_read", "kick",
+                               "worker_commit"], ("probation", 4, 1)),
+            ("held probation", ["kick", "sweep", "worker_read", "worker", "finish",
+                                "sweep", "worker_commit"], ("eligible", 1, 4)),
+            # A longer schedule lets another worker consume, finish and retire
+            # the allowance before worker_commit uses the held value.
+            ("held wedged", ["sweep", "worker_read", "kick", "sweep",
+                             "worker_commit"], ("probation", 0, 5)),
+        ):
+            v, claimed, pending, d = run(sched)
+            self.assertEqual((v, claimed, pending), want,
+                f"{label}: the commit re-read instead of using the held verdict")
+            if label == "held wedged":
+                # The tuple alone let a wedged commit run the FIRST durable half
+                # of an admission: same (verdict, claimed, pending), different disk.
+                _, _, _, noop = run([x for x in sched if x != "worker_commit"])
+                self.assertEqual(vars(d), vars(noop),
+                    "held wedged: the commit must be a NO-OP on durable state -- "
+                    "token, spent, journal and phase_dirs must be untouched")
+
     def test_a_second_OWNER_coexists_with_the_first(self):
-        """P1.3: restart() REPLACES the claimant; as_owner() adds one."""
+        """P1.3: restart() REPLACES the owner; as_owner() adds an owner name."""
         _, _, _, restarted = run(["kick", "sweep", "worker", "restart"])
         _, _, _, second = run(["kick", "sweep", "worker", "second_owner"])
         self.assertEqual(len(restarted.live_owners), len(second.live_owners) - 1,
-            "a restart drops the old owner; a second claimant keeps it live")
+            "a restart drops the old owner; a second owner keeps it live")
         self.assertIn("p-b", second.live_owners)
         self.assertIn("p1", second.live_owners)
 
-    def test_three_OWNERS_coexist_but_only_ONE_CLAIM_ever_exists(self):
-        """The old name said "THREE claimants can coexist"; the run produces three
+    def test_as_owner_SWITCHES_the_active_actor_not_only_the_owner_set(self):
+        """keweichen at e2b677cd: deleting `me[0] = name` -- so as_owner records a
+        name without making it act -- left the terminal owner set intact and the
+        whole suite GREEN at 82/82. The previous pins read final state, and the
+        defect is in the SCHEDULING seam, which final state cannot see.
+
+        His discriminating schedule, verbatim. With the switch, the second owner
+        does the work and the crash lands before the HELD ADMISSION JOURNAL is
+        promoted to `claimed_rec`. Order matters and I had it backwards twice:
+        the token becomes the held journal FIRST, step 2 then acquires the task
+        claim, and `claimed_rec` is the PROMOTED ADMISSION RECORD -- not a "claim
+        record", and a claim is never "promoted into the journal"."""
+        _, claimed, _, d = run(["kick", "sweep", "worker", "second_owner", "worker"],
+                               mode="crash_after_claim")
+        self.assertEqual(claimed, 0)
+        # Deleting the surviving live-other claim left 83/83 green with
+        # `claims={}`: the state was described, never pinned.
+        self.assertEqual(d.claims, {"t1": "p1"},
+            "the other owner's live claim must survive the rollback / "
+            "failed promotion")
+        self.assertIsNone(d.journal,
+            "the journal WAS written at gate step 1b and must not SURVIVE the "
+            "live-other rollback / failed promotion -- cleared, not never-written")
+        self.assertEqual(d.live_owners, {"p1", "p-b"},
+            "the rollback must RETAIN the other live owner: dropping p1 left 84/84 "
+            "green while this test called its claim live")
+        self.assertIsNone(d.claimed_rec,
+            "a promoted admission record here means the FIRST owner was still acting")
+        self.assertTrue(d.token,
+            "the token is RETURNED BY the live-other rollback -- it is spent at the "
+            "switch and true only afterwards, so this reads the end state")
+
+    def test_three_OWNERS_coexist_and_the_run_ENDS_with_one_claim(self):
+        """TERMINAL state only -- the name says so now. The old name said "THREE
+        claimants can coexist"; the run produces three
         OWNER names and a single claim, so the name asserted the very thing P1.3
         needs and the model cannot do.
 
-        Both states are pinned EXACTLY, not by membership: keweichen measured that
-        adding real shadow claims left all 82 tests green, so a model that grew the
-        ability to hold three claims would have silently satisfied a suite still
-        describing itself as unable to. Whichever way this changes -- the limitation
-        lifted, or a claim leaking in -- it now fails here and gets decided."""
+        SCOPE, stated because the previous docstring over-promised: this observes
+        PERSISTENT TERMINAL state only. A persistent second claim fails here; a
+        transient add/delete second claim passes, correctly, and is the narrower
+        assertion below. A/B/C needs TWO SIMULTANEOUS claims across three actors --
+        not three claims, which is what the old wording said."""
         _, _, _, d = run(["kick", "sweep", "worker", "second_owner", "third_owner"])
         self.assertEqual(d.live_owners, {"p1", "p-b", "p-c"})
         self.assertEqual(d.claims, {"t1": "p1"},
-            "one claim, held by the FIRST owner -- A/B/C needs three and is "
-            "unrepresentable here; do not restate this as three claimants")
+            "one PERSISTENT terminal claim, held by the FIRST owner -- A/B/C needs "
+            "TWO SIMULTANEOUS claims across three actors. A transient add/delete "
+            "claim is correctly outside this terminal assertion.")
 
     def test_restart_still_drops_the_previous_owner(self):
         """The existing semantics must NOT have changed -- this is a refactor."""
