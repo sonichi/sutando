@@ -11174,9 +11174,12 @@ def check_claude_hook_registration(
             remedy = ("do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 here — that flag gates "
                       "the deprecated-hook pruning, so it reports `removed=0` and clears nothing. "
                       "Run `bash src/install-claude-hooks.sh` plain: it prunes the legacy forms it "
-                      f"knows ({', '.join(foreign)}) and installs their successors. If an entry is "
-                      "genuinely foreign (another program or checkout) the installer cannot own it "
-                      "— remove that one by hand")
+                      f"knows ({', '.join(foreign)}) and installs their successors. NOTE: one flag "
+                      "controls both, so a plain run ALSO registers the ~/Desktop transcript "
+                      "archiver — if this host does not want it, delete that one PreCompact entry "
+                      "afterwards (re-running with the flag would un-prune, not un-install). If an "
+                      "entry is genuinely foreign (another program or checkout) the installer cannot "
+                      "own it — remove that one by hand")
         if dead and not missing and not foreign:
             remedy = ("re-run the installer that owns each family — it prunes dead copies "
                       "(`bash scripts/install-personal-claude-hook.sh`, "
