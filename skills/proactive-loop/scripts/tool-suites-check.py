@@ -149,20 +149,28 @@ def _warn_if_uncarried(decl: Path) -> None:
 
     Advisory only — a backup concern must never fail a test run.
     """
-    ws = decl.parent.parent
+    # hosts/<host>/X is two deep, state/X one: parent.parent lands inside the
+    # workspace for the carried path and would probe the wrong tree.
+    ws = decl.parent.parent.parent if decl.parent.parent.name == "hosts" else decl.parent.parent
     try:
         r = subprocess.run(["git", "-C", str(ws), "ls-files", "--error-unmatch",
                             str(decl.relative_to(ws))],
                            capture_output=True, text=True, timeout=10)
     except Exception:
         return                      # no git, no repo, or a path outside it: not our business
+    # git exits 128 for "not a git repository" WITHOUT raising, so the guard above
+    # never saw it: a workspace with no vault repo reported every file untracked.
+    if r.returncode == 128 or "not a git repository" in r.stderr:
+        return
     if r.returncode != 0:
+        move = ("" if decl.parent.parent.name == "hosts" else
+                f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no "
+                f"config edit. Do NOT add a state/ path to vault.sync.include: the vault emits "
+                f"carve-outs after includes so a `state/` exclude re-ignores it, and `include` "
+                f"REPLACES the carrier set rather than extending it (see sync-workspace.sh:36-45).")
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
-              f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no config "
-              f"edit. Do NOT add a state/ path to vault.sync.include: the vault emits carve-outs "
-              f"after includes so a `state/` exclude re-ignores it, and `include` REPLACES the "
-              f"carrier set rather than extending it (see sync-workspace.sh:36-45).",
+              f"If it is lost, the suites it registers stop running SILENTLY (absent = no "
+              f"extras). {move}".rstrip(),
               file=sys.stderr)
 
 

@@ -371,6 +371,9 @@ print("\ncase: the uncarried warning names a remedy that can actually work")
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td) / "ws"
     (ws / "state").mkdir(parents=True)
+    # A REAL repo: an untracked file exits 1 here. Without one git exits 128,
+    # which is "I cannot tell", not "untracked" — see the no-repo case below.
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
     f = ws / "state" / tsc.EXTRAS
     f.write_text(json.dumps({"suites": []}))
     buf = io.StringIO()
@@ -385,6 +388,36 @@ with tempfile.TemporaryDirectory() as td:
           "Add its path to vault.sync.include." in msg, False)
     check("it names the carve-out ordering", "after includes" in msg, True)
     check("it warns that include REPLACES the carrier set", "REPLACES" in msg, True)
+
+print("\ncase: no vault repo at all is SILENT, not a permanent untracked warning")
+with tempfile.TemporaryDirectory() as td:
+    # No `git init`: git exits 128 "not a git repository" WITHOUT raising, so the
+    # probe cannot distinguish it from a tracked-but-absent file. Warning here is
+    # unactionable and fires on every pass forever.
+    ws = Path(td) / "ws"
+    (ws / "state").mkdir(parents=True)
+    f = ws / "state" / tsc.EXTRAS
+    f.write_text(json.dumps({"suites": []}))
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        tsc.extra_suites(f, Path(td))
+    check("no repo => no warning", "NOT tracked" in buf.getvalue(), False)
+
+print("\ncase: the carried hosts/<host>/ path is probed against the WORKSPACE")
+with tempfile.TemporaryDirectory() as td:
+    # hosts/<host>/X is two levels deep; parent.parent is <workspace>/hosts, so the
+    # probe ran against the wrong tree and the remedy told it to move where it is.
+    ws = Path(td) / "ws"
+    (ws / "hosts" / "H").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    f = ws / "hosts" / "H" / tsc.EXTRAS
+    f.write_text(json.dumps({"suites": []}))
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        tsc.extra_suites(f, Path(td))
+    msg = buf.getvalue()
+    check("an untracked carried file still warns", "NOT tracked" in msg, True)
+    check("it does NOT tell it to move where it already is", "hosts/<host>/" in msg, False)
 
 print("\ncase: a state DIRECTORY still resolves (the pre-move call shape)")
 with tempfile.TemporaryDirectory() as td:
