@@ -19,8 +19,8 @@ class Workspace:
             (self.root / d).mkdir(parents=True, exist_ok=True)
 
     def payload(self, task_id, body="do a thing"):
-        p = self.root / "tasks" / f"{task_id}.json"
-        p.write_text(f'{{"id": "{task_id}", "task": "{body}"}}', encoding="utf-8")
+        p = self.root / "tasks" / f"{task_id}.txt"
+        p.write_text(f"id: {task_id}\nsource: test\ntask: {body}\n", encoding="utf-8")
         return p
 
     def deliver(self, recipient, task_id):
@@ -284,15 +284,16 @@ class TestSweep(Base):
 
 
 class TestPayload(Base):
-    def test_reads_delivered_payload(self):
+    def test_reads_the_bridges_task_file_as_text(self):
         self.ws.payload("task-1", "write the docs")
-        self.assertEqual(pd.read_payload(self.root, "task-1")["task"], "write the docs")
+        self.assertIn("task: write the docs", pd.read_payload(self.root, "task-1"))
 
     def test_missing_payload_is_none(self):
         self.assertIsNone(pd.read_payload(self.root, "task-absent"))
 
-    def test_corrupt_payload_is_none_not_a_crash(self):
-        (self.root / "tasks" / "task-1.json").write_text("{not json", encoding="utf-8")
+    def test_an_archived_payload_is_none(self):
+        """finish moved it; a lingering sentinel must not resurrect it."""
+        pd.archived_payload(self.root, "task-1").write_text("id: task-1\n", encoding="utf-8")
         self.assertIsNone(pd.read_payload(self.root, "task-1"))
 
 

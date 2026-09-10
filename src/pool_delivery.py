@@ -4,7 +4,7 @@
 Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
 worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
-    tasks/<task-id>.json                     the payload; immutable, never copied
+    tasks/<task-id>.txt                      the payload; immutable, never copied
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.claimed        the same sentinel, suffix substituted
 
@@ -68,11 +68,11 @@ def deliveries_dir(workspace, recipient: str) -> Path:
 
 
 def payload_path(workspace: Path, task_id: str) -> Path:
-    return _root(workspace) / "tasks" / f"{task_id}.json"
+    return _root(workspace) / "tasks" / f"{task_id}{PENDING_SUFFIX}"
 
 
 def archived_payload(workspace: Path, task_id: str) -> Path:
-    return _root(workspace) / "tasks" / "archive" / f"{task_id}.json"
+    return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
 
 
 def result_path(workspace: Path, task_id: str) -> Path:
@@ -198,13 +198,18 @@ def sweep(workspace: Path, recipient: str) -> dict:
     return actions
 
 
-def read_payload(workspace: Path, task_id: str) -> dict | None:
+def read_payload(workspace: Path, task_id: str) -> str | None:
+    """The task text from `tasks/`, which a sentinel only points at.
+
+    The bridges write header-format text, never JSON; a reader that wants
+    fields parses it with local_task_protocol, not here.
+    """
     p = payload_path(Path(workspace), task_id)
     if not p.is_file():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
         return None
 
 
