@@ -386,9 +386,8 @@ with tempfile.TemporaryDirectory() as d:
         else:
             os.environ["SUTANDO_MEMORY_DIR"] = _prev
 
-# --- the two false-safe paths @qingyun-wu reproduced on #3873 -----------------
-# Selecting a STALE corpus is strictly worse than refusing: it green-lights an
-# addition that will not load, which is what this guard exists to prevent.
+# --- the two false-safe paths reproduced on #3873 ----------------------------
+# Electing a STALE corpus green-lights an addition that will not load.
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     same = index_of(LIMIT // 2)
