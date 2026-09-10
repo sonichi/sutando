@@ -264,10 +264,14 @@ def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_on
     bs = ps.get("_blocked") or {"blocked_current": False, "current_blocked": [],
                                 "consecutive_blocked_samples": 0}
     if bs["blocked_current"]:
-        prov = [p for p in bs["current_blocked"] if p in PROVIDER_LIMIT_PATTERNS]
-        kind = "provider-limit" if prov else "blocked"
-        return {**base, "kind": kind, "confidence": "high" if bs["consecutive_blocked_samples"] >= 3 else "medium",
-                "warn": True, "reason": f"blocked text on the last {bs['consecutive_blocked_samples']} sample(s) ({', '.join(bs['current_blocked'])})"}
+        conf = "high" if bs["consecutive_blocked_samples"] >= 3 else "medium"
+        why = (f"blocked text on the last {bs['consecutive_blocked_samples']} "
+               f"sample(s) ({', '.join(bs['current_blocked'])})")
+        # Kinds stay STRING LITERALS: the availability fold's totality test derives
+        # the emittable set by scanning this source, and a variable hides them.
+        if any(p in bs["current_blocked"] for p in PROVIDER_LIMIT_PATTERNS):
+            return {**base, "kind": "provider-limit", "confidence": conf, "warn": True, "reason": why}
+        return {**base, "kind": "blocked", "confidence": conf, "warn": True, "reason": why}
     low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
     # Retry loop = low novelty AND retry text that is current and recurrent (not a stale residue).
     if ps["retry_current"] and (raw_static or nov.static or low_novelty):
