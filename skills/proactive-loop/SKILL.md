@@ -101,8 +101,8 @@ caps this file and refuses date stamps in it).
    owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
    Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
    is UNKNOWN, not dead; never hand-roll a process check.
-9.5. **PR thread gate**, before posting to a PR thread:
-   `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login>`
+9.5. **PR thread gate**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
 10. **Discord.** Check the channels in `reference_discord_channels.md`; forward actionable public items to
     the dev channel. #bot2bot tags: `claim:` `blocked:` `done:` `ping:` `nack:` `opinion-requested:`.
