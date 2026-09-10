@@ -33,7 +33,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `fetch <ref>` | inbound media → local path | discord inbound `att.save`→inbox |
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
 | `say <room> <text>` | post plain text, pinging **nobody** by design — status lines, an answer to the room; never a hand-off | discord plain channel message |
-| `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → room), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
+| `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → directory narrowed by the room → broker → roster), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
 | `members <room>` | who is present (mxid, display name, kind) — the roster to pick from when `mention` finds no match | discord member list |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
@@ -52,7 +52,7 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
-#   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|broker|room",...}
+#   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
 #   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->
 #   {"ok":false,"candidates":[...],"resolved_by":"<the source that found too many>"} and
 #   NOTHING is posted: pick one from `members` and retry
@@ -113,8 +113,11 @@ layer (its CLAUDE.md equivalent) at connect time.
 - **A hand-off that does not carry the peer's mxid is silently dropped.** In a
   shared room an agent ignores agent-authored messages unless they mention it
   or reply to it. Use `mention <handle> <text> <room>`: it resolves a handle,
-  label or display name ("Bassil's Sutando") to the one mxid (directory →
-  room), refuses on ambiguity, and posts `<mxid> — <text>` with `mentions`.
+  label or display name ("Bassil's Sutando") to the one mxid — the directory,
+  narrowed to the room's members when it over-matches (an owner with several
+  agent identities), then the broker's room-scoped resolver, then the roster
+  with its display names — refuses on ambiguity, and posts `<mxid> — <text>`
+  with `mentions`.
   `say` pings nobody by design — never use it to hand off. If `mention`
   reports no match, run `members <room>` and pick from the roster; never guess
   an mxid.

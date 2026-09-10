@@ -30,7 +30,9 @@ Three sources, one answer shape `{ok, mxid, candidates, reason}`:
   - `resolve_in_room` — the broker's own `op: resolve_user`, scoped to a room
     (exact mxid / localpart / display name, then substring; it normalises
     nothing, hence `slug_handle` for a second try with the platform's
-    localpart spelling of a name).
+    localpart spelling of a name). It says "nobody" with an HTTP 404 that
+    carries a JSON error (measured live 2026-09-11), which `op_unsupported`
+    tells apart from a gateway that has no such op.
   - `resolve_user` — the `/v1/agents` directory, the unchanged entry point.
 
 Pure matching and response parsing are separated from the network so both are
@@ -42,7 +44,7 @@ import json
 import re
 import unicodedata
 
-from _gateway import (gateway, http_request, http_json, degrade_reason, degrade_reason_from,
+from _gateway import (gateway, http_request, http_json, degrade_reason, degrade_reason_parsed,
                       HTTPError, URLError)
 
 # Apostrophe look-alikes folded to U+0027 — the twin of `normalizeMentionText` in the
@@ -308,14 +310,50 @@ def is_ambiguous(res: dict) -> bool:
     return bool(res.get("candidates")) or str(res.get("reason") or "").lower().startswith("ambiguous")
 
 
+_UNKNOWN_OP_RE = re.compile(r"unknown\s+op", re.IGNORECASE)
+
+
+def _error_body(err):
+    """The JSON an HTTPError's body carries; None when it is empty or not JSON.
+
+    The body is single-shot, so it is read here once and the parsed value
+    feeds both the reason and `op_unsupported` — an empty body must stay
+    distinguishable from a JSON `{}`, which is why "" is None and not `{}`.
+    """
+    try:
+        raw = err.read().decode("utf-8").strip()
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def op_unsupported(code: int, parsed, reason: str) -> bool:
+    """True only when the gateway has no `resolve_user` op at all.
+
+    Measured live 2026-09-11: the broker answers a MISS with HTTP 404 and a
+    JSON body — `{"error": "no member matching 'x' in this room — not found"}`
+    — so a 404 is not "no such verb" by status alone. Every 404 used to read
+    as unsupported, which skipped the caller's `slug_handle` retry on every
+    real miss and misreported the broker. The op is missing when a 404/405
+    carries no JSON body at all (a router with no route answers bare), or
+    when the server names it: an "unknown op" error at 400, 404 or 405. Any
+    other 404/405 with a JSON body is the op answering, and reads as a miss.
+    """
+    if code in (400, 404, 405) and _UNKNOWN_OP_RE.search(reason or ""):
+        return True
+    return code in (404, 405) and parsed is None
+
+
 def resolve_in_room(query: str, room_id: str) -> dict:
     """POST /v1/room {op: resolve_user} → {ok, mxid, display_name, candidates, reason, unsupported}.
 
     The broker resolves within the room's own roster, display names included,
     so this is the first thing to ask when the directory does not know a
-    handle. `unsupported` is True when the gateway has no such op — a 404, or
-    the broker's HTTP 400 "unknown op" — which tells the caller to fall back to
-    the member list rather than to report a miss nobody measured.
+    handle. `unsupported` is True when the gateway has no such op — a bare
+    404/405, or an "unknown op" error (see `op_unsupported`) — which tells the
+    caller to fall back to the member list rather than to report a miss nobody
+    measured. A 404 that carries the broker's JSON is its own miss (or its
+    "ambiguous"), read exactly like a 200 answer so the candidates still carry.
     Network/HTTP failures are `ok: False` with a reason and never raise.
     """
     out = {"ok": False, "mxid": None, "display_name": "", "candidates": [], "reason": None,
@@ -332,11 +370,17 @@ def resolve_in_room(query: str, room_id: str) -> dict:
         _status, parsed = http_json("POST", f"{base}/v1/room", headers,
                                     {"op": "resolve_user", "room_id": room_id, "query": q})
     except HTTPError as e:
-        # degrade_reason_from consumes the body: the server's own text is what
-        # tells a missing op ("unknown op …") apart from a rejected query.
-        reason = degrade_reason_from(e)
-        unsupported = e.code == 404 or (e.code == 400 and "unknown op" in reason.lower())
-        return {**out, "reason": reason, "unsupported": unsupported}
+        parsed = _error_body(e)
+        reason = degrade_reason_parsed(e.code, parsed)
+        if op_unsupported(e.code, parsed, reason):
+            return {**out, "reason": reason, "unsupported": True}
+        if e.code in (404, 405) and parsed is not None:
+            answer = parse_resolve_user_response(parsed)
+            if answer["ok"]:
+                # An mxid under an error status is a contradiction, never a resolve.
+                return {**out, "reason": f"malformed gateway response (HTTP {e.code} with an mxid)"}
+            return {**out, **answer}
+        return {**out, "reason": reason}
     except (URLError, TimeoutError) as e:
         return {**out, "reason": f"network error: {e}"}
     except ValueError as e:

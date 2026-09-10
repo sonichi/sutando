@@ -761,7 +761,9 @@ class ResolveUserResponseTests(unittest.TestCase):
         self.assertTrue(rs.is_ambiguous(r))
 
 
-class MentionBodyTests(unittest.TestCase):
+class MentionBodyTests(EnvCase):
+    # EnvCase: an ambiguous directory answer now reads the roster (a gateway
+    # call), so the env must be cleared and the channel .env shadowed here too.
     def test_leads_with_mxid(self):
         b = mn.build_body("@sutando-qingyun-001:ag2.space", "review #149")
         self.assertTrue(b.startswith("@sutando-qingyun-001:ag2.space"))
@@ -773,9 +775,12 @@ class MentionBodyTests(unittest.TestCase):
     def test_ambiguous_handle_does_not_post(self):
         # mention() must refuse to post on an ambiguous handle (never mention the
         # wrong agent) — returns ok:false + candidates, no network touched.
-        res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
+        with mock.patch.object(_gateway, "http_request",
+                               side_effect=AssertionError("network touched")):
+            res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
         self.assertFalse(res["ok"])
         self.assertEqual(len(res["candidates"]), 2)
+        self.assertEqual(res["resolved_by"], "directory")
 
     def test_post_payload_leads_with_mxid_and_carries_mentions(self):
         """A resolved mention posts op:message to /v1/room with the mxid LEADING

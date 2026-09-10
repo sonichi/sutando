@@ -14,6 +14,15 @@ Sutando", the way the room shows the peer, resolves too. The ORDER is the
 contract: directory, then broker (the handle, then its platform slug), then
 roster — and an ambiguous answer from any of them is a refusal that no later
 source widens into a guess.
+
+2026-09-11 (live dry-run against an owner with 13 stale agent identities): the
+directory over-matched "Owner's Sutando" against all 13 and `mention` refused
+even in a room holding exactly one of them, where the broker and the roster
+both resolved it. An ambiguous DIRECTORY answer is now narrowed to the room's
+members first — one present resolves (`directory+room`), two present stay a
+refusal, none present hands over to the room-scoped sources — with the roster
+read once. Narrowing by membership is not widening: a unique directory hit is
+still never second-guessed, and a broker ambiguity still consults nobody else.
 """
 import importlib.util
 import os
@@ -212,18 +221,19 @@ class TestMentionFallback(unittest.TestCase):
         self.assertEqual(self.broker.asked, [])
         self.assertEqual(self.member_reads, [])
 
-    def test_an_ambiguous_directory_answer_is_not_widened(self):
-        """Ambiguity means too many, so consulting a second source can only turn
-        a refusal into a guess. It must stay a refusal."""
+    def test_an_ambiguous_directory_answer_is_narrowed_by_the_room_never_widened(self):
+        """Ambiguity means too many; the room's membership is the one thing that
+        can NARROW it. The broker is not asked: were it, its answer (a third
+        agent here) could only widen the directory's pair into a guess."""
         agents = [{"id": "@sutando-a:ag2.space"}, {"id": "@sutando-b:ag2.space"}]
-        self.broker.default = _Broker.hit("@sutando-a:ag2.space")
+        self.broker.default = _Broker.hit("@sutando-c:ag2.space")
         with self._members(["@sutando-a:ag2.space"]):
             got = self._mention("sutando", agents=agents)
-        self.assertFalse(got["ok"])
-        self.assertEqual(len(got["candidates"]), 2)
-        self.assertEqual(self.posted, [])
+        self.assertEqual((got["ok"], got["mxid"], got["resolved_by"]),
+                         (True, "@sutando-a:ag2.space", "directory+room"))
+        self.assertEqual(self.posted[0]["mentions"], ["@sutando-a:ag2.space"])
         self.assertEqual(self.broker.asked, [])
-        self.assertEqual(self.member_reads, [])
+        self.assertEqual(self.member_reads, [ROOM])
 
     def test_an_unreadable_member_list_keeps_the_directory_reason(self):
         """A membership read that failed is not evidence of non-membership; the
@@ -339,7 +349,8 @@ class TestMentionFallback(unittest.TestCase):
         """A refusal names its resolver the way a hit does, so a caller reading
         `candidates` knows WHICH source found too many — or nobody at all."""
         agents = [{"id": "@sutando-a:ag2.space"}, {"id": "@sutando-b:ag2.space"}]
-        got = self._mention("sutando", agents=agents)
+        with self._members(["@chi:ag2.space"]):   # neither candidate is in the room
+            got = self._mention("sutando", agents=agents)
         self.assertEqual((got["ok"], got["resolved_by"]), (False, "directory"))
         self.assertEqual(len(got["candidates"]), 2)
         # A miss that no later source could answer stays the directory's too.
@@ -365,6 +376,107 @@ class TestMentionFallback(unittest.TestCase):
             got = self._mention("sutando")
         self.assertEqual((got["ok"], got["resolved_by"]), (False, "room"))
         self.assertEqual(len(got["candidates"]), 2)
+
+    # ----- an ambiguous directory, narrowed by the room (2026-09-11) ----- #
+    # One owner's 13 stale directory ids all token-prefix-match "Owner's Sutando".
+    STALE = [f"@owner-sutando-{i:02d}.agent:ag2.space" for i in range(12)]
+    IMPORTING = "@owner-sutando-importing.agent:ag2.space"
+    DIRECTORY = [{"id": m} for m in STALE + [IMPORTING]]
+    HUMAN = {"user_id": "@owner:ag2.space", "display_name": "Owner", "kind": "human"}
+
+    def test_the_directory_alone_over_matches_the_owners_thirteen(self):
+        got = self.M.resolve_user("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertFalse(got["ok"])
+        self.assertEqual(len(got["candidates"]), 13)
+
+    def test_thirteen_directory_matches_narrow_to_the_one_in_the_room(self):
+        roster = [self.HUMAN,
+                  {"user_id": self.IMPORTING, "display_name": "Owner's Sutando importing",
+                   "kind": "agent"},
+                  {"user_id": "@me:ag2.space", "display_name": "Me", "kind": "agent"}]
+        with self._members(roster):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertTrue(got["ok"], got)
+        self.assertEqual((got["mxid"], got["resolved_by"]), (self.IMPORTING, "directory+room"))
+        self.assertEqual(got["candidates"], [])
+        self.assertEqual(self.posted[0]["mentions"], [self.IMPORTING])
+        self.assertTrue(self.posted[0]["body"].startswith(self.IMPORTING))
+        self.assertEqual(self.broker.asked, [])        # membership alone decided it
+        self.assertEqual(self.member_reads, [ROOM])    # one read, not one per source
+
+    def test_two_directory_matches_in_the_room_still_refuse_and_post_nothing(self):
+        roster = [self.HUMAN,
+                  {"user_id": self.STALE[0], "display_name": "Owner's Sutando (old)",
+                   "kind": "agent"},
+                  {"user_id": self.IMPORTING, "display_name": "Owner's Sutando importing",
+                   "kind": "agent"}]
+        with self._members(roster):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertFalse(got["ok"])
+        self.assertEqual(sorted(got["candidates"]), sorted([self.STALE[0], self.IMPORTING]))
+        self.assertEqual(self.posted, [])
+        # The room-scoped sources were still tried before refusing — the broker
+        # with the name, then its slug — and the roster in hand was reused.
+        self.assertEqual([q for q, _ in self.broker.asked], ["Owner's Sutando", "owner-s-sutando"])
+        self.assertEqual(self.member_reads, [ROOM])
+        self.assertEqual(got["resolved_by"], "room")
+
+    def test_directory_ambiguity_with_nobody_in_the_room_falls_to_the_broker(self):
+        self.broker.answers["Owner's Sutando"] = _Broker.hit(SONICHI, "Owner's Sutando")
+        with self._members([self.HUMAN, {"user_id": "@me:ag2.space", "display_name": "Me"}]):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertTrue(got["ok"], got)
+        self.assertEqual((got["mxid"], got["resolved_by"]), (SONICHI, "broker"))
+        self.assertEqual(self.posted[0]["mentions"], [SONICHI])
+        self.assertEqual(self.member_reads, [ROOM])
+
+    def test_the_roster_display_name_breaks_a_tie_the_directory_narrowed_to_two(self):
+        roster = [self.HUMAN,
+                  {"user_id": self.STALE[0], "display_name": "Owner's Sutando", "kind": "agent"},
+                  {"user_id": self.IMPORTING, "display_name": "Owner's Sutando importing",
+                   "kind": "agent"}]
+        with self._members(roster):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertEqual((got["ok"], got["mxid"], got["resolved_by"]),
+                         (True, self.STALE[0], "room"))
+        self.assertEqual(self.member_reads, [ROOM])
+
+    def test_a_narrowed_refusal_is_kept_when_the_room_sources_cannot_answer(self):
+        """Directory labels the room does not show: three agents labelled
+        "Helper", two of them in the room under localparts the roster cannot
+        match. The refusal carries the two present, not all three."""
+        agents = [{"id": "@h1:ag2.space", "label": "Helper"},
+                  {"id": "@h2:ag2.space", "label": "Helper"},
+                  {"id": "@h3:ag2.space", "label": "Helper"}]
+        with self._members(["@h1:ag2.space", "@h2:ag2.space", "@chi:ag2.space"]):
+            got = self._mention("Helper", agents=agents)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["candidates"], ["@h1:ag2.space", "@h2:ag2.space"])
+        self.assertEqual(got["resolved_by"], "directory+room")
+        self.assertIn("in this room", got["reason"])
+        self.assertEqual(self.posted, [])
+
+    def test_an_unreadable_roster_cannot_narrow_but_the_broker_is_still_asked(self):
+        self.broker.answers["Owner's Sutando"] = _Broker.hit(self.IMPORTING)
+        with self._members([self.IMPORTING], ok=False):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertEqual((got["ok"], got["resolved_by"]), (True, "broker"))
+        self.assertEqual(self.member_reads, [ROOM])    # the failed read is not retried
+
+    def test_an_unreadable_roster_and_a_broker_miss_keep_all_thirteen(self):
+        with self._members([self.IMPORTING], ok=False):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "directory"))
+        self.assertEqual(len(got["candidates"]), 13)
+        self.assertEqual(self.member_reads, [ROOM])
+        self.assertEqual(self.posted, [])
+
+    def test_an_unimportable_members_module_keeps_the_directory_ambiguity(self):
+        with mock.patch.dict(sys.modules, {"members": None}):
+            got = self._mention("Owner's Sutando", agents=self.DIRECTORY)
+        self.assertEqual((got["ok"], got["resolved_by"]), (False, "directory"))
+        self.assertEqual(len(got["candidates"]), 13)
+        self.assertEqual(self.posted, [])
 
     # ----- a resolved mxid that still cannot be posted ----- #
     def test_client_gate_denial_names_the_resolved_mxid_and_posts_nothing(self):
