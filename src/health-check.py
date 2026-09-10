@@ -13183,30 +13183,58 @@ def _recovery_metric(event: str, **properties) -> None:
 
 
 def _recovery_duration(seconds: float) -> str:
-    return "<1m" if seconds < 60 else "1-5m" if seconds < 300 else "5-30m" if seconds < 1800 else ">=30m"
+    for threshold, bucket in ((60, "<1m"), (300, "1-5m"), (1800, "5-30m")):
+        if seconds < threshold:
+            return bucket
+    return ">=30m"
 
 
 def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
-    """Observe non-OK checks after a fix pass; check names stay local."""
+    """Observe fix health; names are local correlation data, never telemetry properties."""
     try:
+        if fcntl is None:
+            return
         state_file = state_file or WORKSPACE_DIR / "state" / "health-fix-metrics.json"
         now = time.time() if now is None else now
-        if start:
-            names = [c["name"] for c in checks if c["status"] != "ok"]
-            if not names:
-                return
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps({"started": now, "checks": names}))
-            _recovery_metric("health_fix_started")
-        elif state_file.exists():
-            pending = json.loads(state_file.read_text())
-            statuses = {c["name"]: c["status"] for c in checks}
-            names = pending["checks"]
-            resolved = sum(statuses.get(name) == "ok" for name in names)
-            outcome = "all_resolved" if resolved == len(names) else "partially_resolved" if resolved else "unresolved"
-            state_file.unlink()
-            _recovery_metric("health_fix_result", outcome=outcome,
-                             duration_bucket=_recovery_duration(now - pending["started"]))
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file.with_name(state_file.name + ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            pending = None
+            if state_file.exists():
+                try:
+                    pending = json.loads(state_file.read_text())
+                    if not (isinstance(pending, dict)
+                            and isinstance(pending.get("started"), (int, float))
+                            and isinstance(pending.get("checks"), list)
+                            and pending["checks"]
+                            and all(isinstance(name, str) for name in pending["checks"])):
+                        raise ValueError("invalid fix observation")
+                except (ValueError, TypeError):
+                    state_file.unlink()
+                    pending = None
+            if start:
+                names = [c["name"] for c in checks if c["status"] != "ok"]
+                if not names or pending is not None:
+                    return
+                tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                                     prefix=".health-fix-", delete=False) as out:
+                        tmp = Path(out.name)
+                        json.dump({"started": now, "checks": names}, out)
+                    os.replace(tmp, state_file)
+                finally:
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+                _recovery_metric("health_fix_started")
+            elif pending is not None:
+                statuses = {c["name"]: c["status"] for c in checks}
+                names = pending["checks"]
+                resolved = sum(statuses.get(name) == "ok" for name in names)
+                outcome = "all_resolved" if resolved == len(names) else "partially_resolved" if resolved else "unresolved"
+                state_file.unlink()
+                _recovery_metric("health_fix_result", outcome=outcome,
+                                 duration_bucket=_recovery_duration(now - pending["started"]))
     except Exception:
         pass
 
@@ -13431,15 +13459,13 @@ def recover_core_if_wedged(
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
         _recovery_metric("core_recovery_attempted", trigger=cur_mode)
-        restart_started = time.monotonic()
         try:
             restart_ok = restart_fn()
         except Exception:
-            _recovery_metric("core_restart_result", outcome="exception", trigger=cur_mode,
-                             duration_bucket=_recovery_duration(time.monotonic() - restart_started))
+            _recovery_metric("core_restart_result", outcome="exception", trigger=cur_mode)
             raise
         _recovery_metric("core_restart_result", outcome="started" if restart_ok else "failed",
-                         trigger=cur_mode, duration_bucket=_recovery_duration(time.monotonic() - restart_started))
+                         trigger=cur_mode)
         if not restart_ok:
             # Restart launch failed — don't burn a cooldown/history slot, and
             # keep the observation so we stay confirmed and retry next pass.

@@ -96,6 +96,64 @@ class RecoveryMetrics(unittest.TestCase):
         self.assertNotIn('private-plugin-name', json.dumps(self.events))
         self.assertNotIn('secret', json.dumps(self.events))
 
+    def test_restart_exception_is_reported_and_propagated(self):
+        self.run_core(10000)
+        with self.assertRaisesRegex(RuntimeError, 'restart exploded'):
+            hc.recover_core_if_wedged(
+                state_file=self.state, now=10121, alive_fn=lambda: True,
+                oldest_task_fn=lambda: ('private-task-path', 900),
+                status_ts_fn=lambda: 10, just_booted_fn=lambda: False,
+                stopped_fn=lambda: False, sender=lambda _: True,
+                restart_fn=lambda: (_ for _ in ()).throw(RuntimeError('restart exploded')))
+        self.assertEqual(self.events[-1], ('core_restart_result', {
+            'outcome': 'exception', 'trigger': 'wedged'}))
+        self.assertNotIn('recovery_metric_pending', json.loads(self.state.read_text()))
+
+    def test_corrupt_fix_record_is_discarded_and_tracking_resumes(self):
+        checks = [{'name': 'private-name', 'status': 'down'}]
+        for corrupt in ('{not json', 'null', '{"started": 1, "checks": []}',
+                        '{"started": 1, "checks": [42]}'):
+            with self.subTest(corrupt=corrupt):
+                self.state.write_text(corrupt)
+                hc.track_health_fix(checks, state_file=self.state, now=1)
+                self.assertFalse(self.state.exists())
+                hc.track_health_fix(checks, start=True, state_file=self.state, now=10)
+                hc.track_health_fix([], state_file=self.state, now=2000)
+                self.assertEqual(self.events[-1][1], {
+                    'outcome': 'unresolved', 'duration_bucket': '>=30m'})
+
+    def test_atomic_failure_does_not_publish_partial_state(self):
+        checks = [{'name': 'private-name', 'status': 'down'}]
+        with patch.object(hc.os, 'replace', side_effect=OSError('disk error')):
+            hc.track_health_fix(checks, start=True, state_file=self.state, now=1)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(list(self.state.parent.glob('.health-fix-*')), [])
+        self.assertEqual(self.events, [])
+        hc.track_health_fix(checks, start=True, state_file=self.state, now=2)
+        self.assertTrue(self.state.exists())
+
+    def test_concurrent_starts_and_observers_emit_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        checks = [{'name': 'private-name', 'status': 'down'}]
+        def start(_):
+            hc.track_health_fix(checks, start=True, state_file=self.state, now=1)
+        def observe(_):
+            hc.track_health_fix([{'name': 'private-name', 'status': 'ok'}],
+                                state_file=self.state, now=400)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(start, range(16)))
+            list(pool.map(observe, range(16)))
+        self.assertEqual(self.events, [('health_fix_started', {}), ('health_fix_result', {
+            'outcome': 'all_resolved', 'duration_bucket': '5-30m'})])
+
+    def test_fix_tracking_skips_healthy_or_unsupported_hosts(self):
+        hc.track_health_fix([], start=True, state_file=self.state)
+        with patch.object(hc, 'fcntl', None):
+            hc.track_health_fix([{'name': 'a', 'status': 'down'}], start=True,
+                                state_file=self.state)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.events, [])
+
     def test_telemetry_failure_cannot_break_recovery(self):
         self.mock.stop()
         import telemetry

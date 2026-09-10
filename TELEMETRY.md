@@ -14,7 +14,7 @@ Only bucketed / categorical **product events**:
 | `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `skill:<name>`) | Which features matter |
 | `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
 | `core_recovery_attempted` | `trigger` (`wedged` / `dead`) | Confirmed wedge or dead-core restart attempts |
-| `core_restart_result` | `trigger`, `outcome` (`started` / `failed` / `exception`), `duration_bucket` | Whether the restart command succeeded |
+| `core_restart_result` | `trigger`, `outcome` (`started` / `failed` / `exception`) | Whether the restart command succeeded |
 | `core_recovery_result` | `trigger`, `outcome` (`progress_resumed` / `still_unhealthy`), `duration_bucket` | Evidence of progress after a successful restart |
 | `core_recovery_gave_up` | none | Restart cap reached; deduplicated for one hour even if owner notification fails |
 | `health_fix_started` | none | Health-check `--fix` passes with non-OK checks |
@@ -121,6 +121,10 @@ latencies, not exact downtime. Progress means the core is alive and its oldest
 queued task changes/disappears or its status timestamp advances. A successful
 restart command alone is never counted as recovered. Attempts without a later
 observation remain pending and are excluded from the observed recovery rate.
+That rate is conditional on an observation existing: it can look healthier than
+reality when severe failures prevent later observations. Show attempted restarts
+and observed results alongside the rate. `core_restart_result` reports only the
+command outcome; it has no duration field.
 
 Fix results describe the original non-OK checks (including warnings), some of
 which require manual repair. Missing checks count as unresolved. This is a
@@ -132,5 +136,15 @@ Recovery sends use the existing bounded synchronous path (one-second network
 timeout per event), so short-lived watchdog processes can deliver their events.
 Failures are swallowed and opt-out is checked for every event. Delivery is best
 effort, with no durable event queue or exactly-once guarantee. A PostHog outage
-can cause missing events; overlapping health-check invocations can race on the
-fix-pass observation file. Core recovery retains its existing exclusive lock.
+can cause missing events. The synchronous attempt event can delay a restart by
+about one network-timeout interval when the endpoint is unreachable; additional
+events add their own send latency. This trades watchdog latency for delivery
+before a short-lived process exits; the network timeout is not an end-to-end
+deadline (for example, DNS resolution can take longer).
+
+Fix-pass state uses a nonblocking exclusive lock and atomic replacement. A
+competing writer skips tracking rather than overwriting an outstanding pass;
+a corrupt record is discarded so the next pass can be tracked. Platforms without
+file locking skip fix-pass metrics. Concurrent watchdogs can still observe a
+pass before all its repairs finish, so this remains a health snapshot, not a
+serialized repair transaction. Core recovery retains its existing exclusive lock.
