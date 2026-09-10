@@ -15,7 +15,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, type ProxyDeps, type CredentialState } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { createProxyServer, type CredentialState } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 type Cred = { accessToken: string; refreshToken?: string; expiresAt?: number };
 type Stored = { service: string; oauth: Cred } | null;
