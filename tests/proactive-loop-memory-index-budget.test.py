@@ -193,9 +193,8 @@ with tempfile.TemporaryDirectory() as d:
           got is None and "--record" in note, note)
 
 with tempfile.TemporaryDirectory() as d:
-    # An unreadable candidate must not crash the resolver: hashing it is how the
-    # debris filter groups duplicates, and a permission error there is not a
-    # reason to refuse a host its answer.
+    # Hashing is only how the debris filter groups duplicates, so a permission
+    # error there must not cost a host its answer.
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     live = _tree(projects, "live", index_of(LIMIT // 2), age_s=60)
     locked = _tree(projects, "locked", index_of(LIMIT // 3), age_s=60)
