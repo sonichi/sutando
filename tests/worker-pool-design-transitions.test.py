@@ -47,6 +47,14 @@ class _RecSet(set):
     def pop(self): self._ev("pop"); return super().pop()
     def clear(self): self._ev("clear"); return super().clear()
     def update(self, *a): self._ev("update", *[sorted(x) for x in a]); return super().update(*a)
+    def symmetric_difference_update(self, *a):
+        self._ev("symdiff_update", *[sorted(x) for x in a]); return super().symmetric_difference_update(*a)
+    # The in-place OPERATORS are a second mutation surface: overriding the named
+    # methods alone left |= &= -= ^= inherited straight from the builtin.
+    def __ior__(self, o): self.update(o); return self
+    def __iand__(self, o): self.intersection_update(o); return self
+    def __isub__(self, o): self.difference_update(o); return self
+    def __ixor__(self, o): self.symmetric_difference_update(o); return self
     def difference_update(self, *a):
         self._ev("difference_update", *[sorted(x) for x in a]); return super().difference_update(*a)
     def intersection_update(self, *a):
@@ -77,6 +85,7 @@ class _RecDict(dict):
     def setdefault(self, k, d=None): self._ev("setdefault", k, d); return super().setdefault(k, d)
     def update(self, *a, **kw): self._ev("update", sorted(dict(*a, **kw).items())); return super().update(*a, **kw)
     def clear(self): self._ev("clear"); return super().clear()
+    def __ior__(self, o): self.update(o); return self
 
 
 class Disk:
