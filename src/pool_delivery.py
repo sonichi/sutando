@@ -37,8 +37,10 @@ CLAIMED_SUFFIX = ".claimed"
 
 # One suffix, substituted never appended: a claimed sentinel must not still read
 # as unclaimed, or a reader re-takes its own in-flight work.
+
+# `~`: the bridge encodes a channel instance into the id (task-<inst>~<id>).
 _SENTINEL = re.compile(
-    r"^(?P<id>task-[A-Za-z0-9_-]+?)(?:\.txt|(?P<claimed>\.claimed))$")
+    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<claimed>\.claimed))$")
 
 RECIPIENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 

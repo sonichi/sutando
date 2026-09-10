@@ -78,6 +78,18 @@ class TestSentinelNames(Base):
                 pd.deliveries_dir(self.root, bad)
 
 
+class TestLaneEncodedIds(Base):
+    def test_a_lane_encoded_id_parses_and_is_pending(self):
+        """local-hs ids look like task-local-hs~task-<hex>: the `~` is the
+        bridge's instance separator. Seen live: a worker's pending() was empty
+        while its sentinel sat in the folder."""
+        got = pd.parse_sentinel("task-local-hs~task-4384e6c562dee80eba.txt")
+        self.assertEqual(got, ("task-local-hs~task-4384e6c562dee80eba", False))
+        self.ws.deliver("core", "task-local-hs~task-1")
+        self.assertEqual([pd.parse_sentinel(p.name)[0] for p in pd.pending(self.root, "core")],
+                         ["task-local-hs~task-1"])
+
+
 class TestPending(Base):
     def test_empty_folder_is_not_an_error(self):
         self.assertEqual(pd.pending(self.root, "core"), [])
