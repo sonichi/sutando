@@ -64,6 +64,29 @@ def _finish(args) -> str:
     return str(pool_delivery.mark_done(Path(ws), worker, task_id, published=True))
 
 
+def _witness(result: Path, ws: Path, tid: str, seen: dict, also=None) -> threading.Thread:
+    """The drain's answer, recorded the instant `result` appears. It looks before
+    it honours `stop`: the main thread's own sighting never closes its window."""
+    def observe() -> None:
+        try:
+            while True:
+                if result.exists():
+                    seen["claimant"] = result_claimant.resolve_claimant(ws / "state", tid)
+                    if also is not None:
+                        seen.update(also())
+                    return
+                if seen.get("stop"):
+                    return
+                time.sleep(0.001)
+        except Exception as exc:  # noqa: BLE001 — a dead witness must say why
+            seen["error"] = repr(exc)
+    return threading.Thread(target=observe, name="observe", daemon=True)
+
+
+def _witnessed(seen: dict) -> bool:
+    return "claimant" in seen or "error" in seen
+
+
 def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
     """A worker's watcher publishes a result; an observer polling `results/` as
     fast as it can must find the attribution already there, every time."""
@@ -73,17 +96,7 @@ def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
     tid = "task-ordering"
     result = h.ws / "results" / f"{tid}.txt"
     seen: dict = {}
-
-    def observe() -> None:
-        # The drain's own question, asked the instant the result becomes visible.
-        while not seen.get("stop"):
-            if result.exists():
-                seen["claimant"] = result_claimant.resolve_claimant(h.ws / "state", tid)
-                seen["size"] = result.stat().st_size
-                return
-            time.sleep(0.001)
-
-    watcher = threading.Thread(target=observe, daemon=True)
+    watcher = _witness(result, h.ws, tid, seen, lambda: {"size": result.stat().st_size})
     try:
         h.task(f"{tid}.txt")
         h.start()
@@ -93,12 +106,14 @@ def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
         watcher.start()
         h.kill_workers()
         h.deliver("task-nudge.txt")  # arrival is what drives the reap
-        published = wait_for(lambda: result.is_file() and result.stat().st_size > 0)
+        # The witness is what the test waits on; the file alone decides nothing.
+        wait_for(lambda: _witnessed(seen))
+        published = result.is_file() and result.stat().st_size > 0
         check("the worker's watcher published a result", published)
         seen["stop"] = True
         watcher.join(10.0)
         check("the observer caught the result appearing", "claimant" in seen,
-              f"never observed {result}")
+              seen.get("error") or f"never observed {result}")
         check("and its flag was ALREADY there when it did",
               seen.get("claimant") == WORKER,
               f"result was visible with claimant={seen.get('claimant')!r}")
@@ -135,28 +150,23 @@ def scenario_a_successful_handler_is_attributed_before_its_result_is_visible() -
     tid = "task-success"
     result = h.ws / "results" / f"{tid}.txt"
     seen: dict = {}
-
-    def observe() -> None:
-        while not seen.get("stop"):
-            if result.exists():
-                seen["claimant"] = result_claimant.resolve_claimant(h.ws / "state", tid)
-                seen["stage"] = pool_delivery.flag_stage(h.ws, WORKER, tid)
-                return
-            time.sleep(0.001)
-
-    watcher = threading.Thread(target=observe, daemon=True)
+    watcher = _witness(result, h.ws, tid, seen,
+                       lambda: {"stage": pool_delivery.flag_stage(h.ws, WORKER, tid)})
     try:
         h.deliver(f"{tid}.txt")
         h.start()
         watcher.start()
-        published = wait_for(lambda: result.is_file() and result.stat().st_size > 0)
+        # The witness is what the test waits on; the file alone decides nothing.
+        wait_for(lambda: _witnessed(seen))
+        published = result.is_file() and result.stat().st_size > 0
         check("the handler published a result", published)
         seen["stop"] = True
         watcher.join(10.0)
         # The reviewer's probe, printed so a control run shows what it measured.
         print(f"  probe: result_ready={published} stage_at_visibility={seen.get('stage')!r} "
               f"claimant={seen.get('claimant')!r}")
-        check("the observer caught the result appearing", "claimant" in seen, str(result))
+        check("the observer caught the result appearing", "claimant" in seen,
+              seen.get("error") or str(result))
         check("and this worker's name was ALREADY on it when it did",
               seen.get("claimant") == WORKER,
               f"result was visible with claimant={seen.get('claimant')!r}")
