@@ -478,6 +478,31 @@ class TestRunAndDeferral(Base):
         self.assertFalse(h.parked(self.ws, "task-1"))
 
 
+    def test_a_pass_reads_the_stores_it_can_while_one_is_unreadable(self):
+        """A blind store must not end the pass: the markers in the readable one
+        are still delivered."""
+        import os
+        blind = h.retry_dir(self.ws)
+        blind.mkdir(parents=True)
+        os.chmod(blind, 0o000)
+        self.addCleanup(os.chmod, blind, 0o755)
+        if os.access(blind, os.R_OK):
+            self.skipTest("the mode did not take effect (running as root?)")
+        self.roster()
+        self.task_file("task-1", channel_id="!room:x")
+        d = h.retry_dirs(self.ws)[1]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "task-1").write_text("refused: earlier\n")
+        self.assertEqual(h.retry_pass(str(self.ws))["delivered"], ["task-1"])
+        self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_a_run_with_no_task_file_and_no_verb_is_a_usage_error(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            h.main(["--workspace", str(self.ws)])
+
+
 class TestParkedQuestion(Base):
     """The Stop hook's exemption question. It must never read "I could not
     tell" as "nobody parked it" — that is what tells the core to answer a
