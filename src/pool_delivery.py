@@ -7,6 +7,12 @@ worker — receives work as *sentinels* in `deliveries/<recipient>/`:
     tasks/<task-id>.txt                      the payload; immutable, never copied
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
+    state/workers/<me>/done/<task-id>.flag   completion evidence; ONE writer,
+                                            `mark_done`, run BEFORE the result
+
+That flag has two readers — `residue` here, and `src/result_claimant.py`, which
+the gateway consults to stamp an outbound reply with the worker that produced
+it. Hence the ordering: flag, then result.
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
 records that the ASSIGNED recipient accepted the work — a worker never selects
@@ -26,7 +32,9 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -99,6 +107,48 @@ def result_path(workspace: Path, task_id: str) -> Path:
 
 def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
     return _root(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
+
+
+def is_done_flag(path) -> bool:
+    """Completion evidence is a REGULAR file and nothing else: a directory at
+    the name is malformed state, and reading it as a finish invents a claimant.
+
+    Only absence answers False quietly. Any other stat error propagates — a
+    tree that cannot be read is not an empty tree, and a reader deciding that
+    for itself is how one claimant hides and another gets stamped.
+    """
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
+def mark_done(workspace, recipient: str, task_id: str) -> Path:
+    """Record that `recipient` finished `task_id`. The ONLY writer of the flag.
+
+    Ordering is flag THEN result: the gateway reads attribution off this file
+    when it drains `results/`, so a result published first is delivered with no
+    worker on it. The reverse — a flag with no result — is recoverable, and
+    `residue` maps it to `finished`.
+
+    Write is temp-file + rename inside the same directory, so a concurrent
+    reader sees the name either absent or complete, never half-written.
+    """
+    if not RECIPIENT.match(recipient):
+        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    dst = done_flag(workspace, recipient, task_id)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(tmp)
+        raise
+    return dst
 
 
 def pending(workspace: Path, recipient: str) -> list[Path]:
@@ -216,7 +266,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # The shared readiness contract, not existence: an empty or whitespace-only
     # file is a placeholder still being written, and must not suppress recovery.
     has_result = read_ready_result(result_path(ws, task_id)) is not None
-    has_flag = done_flag(ws, recipient, task_id).is_file()
+    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
 
@@ -295,7 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
     ap.add_argument("command", nargs="?",
-                    choices=("sweep", "pending", "watch", "residue", "payload"))
+                    choices=("sweep", "pending", "watch", "residue", "payload",
+                             "mark-done"))
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel", help="a sentinel filename, for `payload`")
     ap.add_argument("--held", metavar="TASK_ID",
@@ -337,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"pool_delivery: no payload for {task_id} at {p}", file=sys.stderr)
             return 1
         print(p)
+        return 0
+    if a.command == "mark-done":
+        if not a.task_id:
+            ap.error("--task-id is required for mark-done")
+        print(mark_done(ws, a.recipient, a.task_id))
         return 0
     if a.command == "residue":
         if not a.task_id:

@@ -198,12 +198,28 @@ claim_disposition() {
 
 # 0 = the task is settled (failure published, or a real answer already exists).
 # 1 = NOT settled: another writer may own the destination, so nothing was touched.
+record_worker_done() {
+  # Attribution BEFORE the result: the gateway reads the finisher off this flag
+  # when it drains results/, so a result seen first is delivered with no worker.
+  local filename="$1" task_id="${filename%.txt}"
+  # The core is not a pool recipient and claims nothing; only a worker flags.
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
+  [ -n "$SUTANDO_PY_BIN" ] || return 1
+  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
+    --workspace "$WORKSPACE_DIR" --recipient "$SUTANDO_INSTANCE_ID" \
+    mark-done --task-id "$task_id" >/dev/null || return 1
+}
+
 publish_terminal_failure() {
   local filename="$1" reason="$2" result temporary rc
   result="$RESULTS_DIR/$filename"
   # The shared readiness contract, not -f/-s: an empty OR whitespace-only body
   # is the undeliverable placeholder state and must not suppress this failure.
   handler_result_exists "$filename" && return 0
+  if ! record_worker_done "$filename"; then
+    echo "watch-tasks-stream: could not record the done flag for $filename; leaving the claim unsettled rather than publishing a result no worker can be attributed for" >&2
+    return 1
+  fi
   mkdir -p "$RESULTS_DIR"
   temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
   chmod 600 "$temporary" 2>/dev/null || true

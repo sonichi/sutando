@@ -194,6 +194,9 @@ ALLOWLIST = {
     # mention_gate.py: every path is composed FROM a caller-injected workspace
     # (bridge/CLI resolve it) — task_archive.py's caller-supplies-the-path rationale.
     "src/mention_gate.py",
+    # result_claimant.py reads under a state dir the gateway adapter injects;
+    # resolving one here is the second resolution path this test prevents.
+    "src/result_claimant.py",
 }
 
 

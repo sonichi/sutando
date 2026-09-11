@@ -76,6 +76,9 @@ class Harness:
         self.handler.write_text(
             '#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && exit 4; done\nexec sleep 100000\n')
         self.handler.chmod(0o755)
+        # A caller that needs the watcher to run as somebody (a pool worker, say)
+        # sets it here; copying start() to add one variable is how harnesses drift.
+        self.extra_env: dict[str, str] = {}
         self.proc: subprocess.Popen | None = None
 
     @classmethod
@@ -87,7 +90,7 @@ class Harness:
         h.feed.write_text("")
         (tmp / "bin" / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {h.feed}\n")
         (tmp / "bin" / "fswatch").chmod(0o755)
-        h.handler, h.proc = tmp / "handler.sh", None
+        h.handler, h.proc, h.extra_env = tmp / "handler.sh", None, {}
         return h
 
     def task(self, name: str) -> Path:
@@ -101,6 +104,7 @@ class Harness:
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
         env["SUTANDO_TASK_EVENT_HANDLER"] = str(self.handler)
+        env.update(self.extra_env)
         # The watched dir is $1, NOT an env var — passing it as one would fall
         # through to the resolver and watch the REAL workspace.
         self.proc = subprocess.Popen(

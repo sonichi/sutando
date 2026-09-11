@@ -3791,14 +3791,30 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
+_CLAIMANT_RESOLVER = None
+
+
+def set_claimant_resolver(fn) -> None:
+    """Host-injected `(state_dir, result_stem) -> worker id`, "" when nothing
+    claims the task, raising when the host's state cannot answer definitely.
+    Sparrow never names a host's state layout; the adapter edge does."""
+    global _CLAIMANT_RESOLVER
+    _CLAIMANT_RESOLVER = fn
+
+
 def _worker_of(task_id: str) -> str:
-    """Which pool worker finished this task, read from the per-core done-flag.
+    """Which worker finished this task, per the host-injected resolver.
     `task_id` is the result stem, which already carries the `task-` prefix."""
-    try:
-        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
-    except OSError:
+    if _CLAIMANT_RESOLVER is None:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    try:
+        got = _CLAIMANT_RESOLVER(_STATE, task_id)
+    except Exception as exc:
+        # Abstain, never guess: a wrong id draws another worker's name and
+        # colour on the reply, with the same confidence as a right one.
+        _log(f"result {task_id}: {exc} — not stamping a worker")
+        return ""
+    return got if isinstance(got, str) else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
