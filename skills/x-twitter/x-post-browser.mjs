@@ -225,9 +225,10 @@ function pidsForProfile() {
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
+  const signalled = [];
   try {
     for (const pid of pidsForProfile().pids) {
-      try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
+      try { process.kill(parseInt(pid, 10), 'SIGTERM'); signalled.push(pid); } catch {}
     }
   } catch {}
   // WAIT for the SIGTERM to be honoured instead of killing on a fixed 1s. Chrome
@@ -235,10 +236,18 @@ function releaseProfileLock() {
   // that flush drops every cookie set since the last write — which is exactly the
   // auth cookies from a sign-in that just happened.
   const graceMs = Number(process.env.X_PROFILE_GRACE_MS || 10000);
-  const { remaining } = waitForProfileExit(
+  const { remaining, waitedMs } = waitForProfileExit(
     pidsForProfile,
     graceMs,
     (ms) => { try { execFileSync('sleep', [String(ms / 1000)]); } catch {} },
+  );
+  // Say what happened, so a surviving session is evidence the grace ENGAGED rather
+  // than an absence anyone can read either way: which pids were signalled, whether
+  // they exited on their own, and how long it took.
+  console.error(
+    `profile-lock: SIGTERM->[${signalled.join(',') || 'none'}] ` +
+    `exited_cleanly=${remaining.length === 0} waited_ms=${waitedMs} ` +
+    `sigkilled=[${remaining.join(',') || 'none'}]`,
   );
   try {
     for (const pid of remaining) {
