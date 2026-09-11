@@ -31,14 +31,34 @@ except SystemExit:
 
 WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
+# Every pid below is fabricated, so the argv reader must be fabricated too: left
+# at production `_is_watcher_argv` reads THIS host, where pid 300 may be anything.
+_HOST_ARGV_VECTOR = hc._proc_argv_vector
+
+
+def _fabricated_argv_vector(vectors=None):
+    """`_proc_argv_vector` over a pid -> argv-list map; any other pid is unreadable,
+    which is what the injected flat `argv` is then decided from."""
+    table = {str(pid): vec for pid, vec in (vectors or {}).items()}
+    return lambda pid, _t=table: _t.get(str(pid))
+
+
+def setUpModule():
+    hc._proc_argv_vector = _fabricated_argv_vector()
+
+
+def tearDownModule():
+    hc._proc_argv_vector = _HOST_ARGV_VECTOR
+
 
 def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
         parent="1", pid_instance=None, pid_actor="", targets=None, verdicts=None,
-        ps="") -> dict:
+        ps="", argv_vectors=None) -> dict:
     """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
 
     `pid_instance` is what the WATCHER's own environment yields: a string names
-    its instance, "" is the default, and None means unreadable.
+    its instance, "" is the default, and None means unreadable. `argv_vectors`
+    maps pid -> argv list, the OS-authoritative half of the same fabrication.
     """
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -50,10 +70,11 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
                  hc._pid_instance_id, hc._pid_actor_id, hc._watcher_sentinel_target,
-                 hc._is_watcher_argv)
+                 hc._is_watcher_argv, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = (argv if callable(argv) else (lambda pid: argv))
+            hc._proc_argv_vector = _fabricated_argv_vector(argv_vectors)
             if verdicts is not None:
                 # None is the tri-state "cannot prove", which no argv string
                 # reliably produces; force it so that branch is reachable.
@@ -77,7 +98,8 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._fresh_local_core_record,
              hc._pid_instance_id, hc._pid_actor_id,
-             hc._watcher_sentinel_target, hc._is_watcher_argv) = saved
+             hc._watcher_sentinel_target, hc._is_watcher_argv,
+             hc._proc_argv_vector) = saved
 
 
 class PoolHost(unittest.TestCase):
@@ -94,6 +116,15 @@ class PoolHost(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r["detail"])
         for pid in ("100", "200", "300"):
             self.assertIn(pid, r["detail"])
+
+    def test_an_OS_vector_that_denies_the_script_is_PID_reuse(self):
+        """The same host shape CI kept hitting by accident, now stated: the pid in
+        the sentinel is authoritatively some other program, so it is not a watcher."""
+        r = run({"watch-tasks-stream-worker-2.pid": "300\n"}, {},
+                argv_vectors={300: ["/usr/bin/python3", "-u", "/opt/app/worker.py"]})
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("300", r["detail"])
+        self.assertIn("PID reuse", r["detail"])
 
     def test_a_genuinely_untracked_watcher_is_still_reported(self):
         """The union must not swallow the defect the probe exists to find."""
@@ -521,7 +552,8 @@ class TheDarwinArgvParseIsExercisedOnAnyPlatform(unittest.TestCase):
                 + b"\0".join(argv) + b"\0")
         with patch.object(Path, "read_bytes", side_effect=OSError("not linux")), \
              patch.object(ctypes, "CDLL", return_value=self._fake_libc(blob)):
-            return hc._proc_argv_vector(4242)
+            # The real reader is the subject here, not the module-wide fabrication.
+            return _HOST_ARGV_VECTOR(4242)
 
     def test_the_exec_path_is_skipped_and_argv_returned(self):
         self.assertEqual(
@@ -556,7 +588,7 @@ class TheDarwinArgvParseIsExercisedOnAnyPlatform(unittest.TestCase):
 
         with patch.object(Path, "read_bytes", side_effect=OSError("not linux")), \
              patch.object(ctypes, "CDLL", return_value=_Fail()):
-            self.assertIsNone(hc._proc_argv_vector(4242))
+            self.assertIsNone(_HOST_ARGV_VECTOR(4242))
 
 
 class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
