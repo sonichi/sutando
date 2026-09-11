@@ -109,6 +109,8 @@ density is the mean horizontal gradient of a downscaled grayscale screen grab:
 glyph strokes produce dense vertical edges, wallpaper produces almost none. A
 card the owner has dragged is never repositioned again.
 
+![The panel sitting in the lower right, clear of the message it is about.](design-voice-navigation-and-triage-placement.png)
+
 **Persistence.** The card stays until the owner dismisses it. Nothing retracts it
 on a timer, because a decision surface that disappears mid-read has to be fetched
 and re-read.
@@ -128,6 +130,9 @@ A triage card is `show_card` with the fields the queue already supplies:
 proposition, reason, the freshness line, and the five actions.
 
 ### 3. Resolving what "this" means — exists, and is why figure 2 works
+
+![The URL selected in the Discord message, blue highlight over the
+link.](design-voice-navigation-and-triage-highlight.png)
 
 The owner does not read a URL aloud. They highlight it and say *"open this"*.
 Turning that into an absolute URL is its own problem, and the answer is a
@@ -162,6 +167,9 @@ must not cache a queue position, because `next_item` recomputes from the live
 reaction log on every call by design.
 
 ### 6. Voice — exists, unchanged
+
+![The voice panel: "Can you open this highlighted URL in the notch?" answered by
+"Okay, I've opened that URL in the notch."](design-voice-navigation-and-triage-voice.png)
 
 Voice is already the input half; the surface is the output half that was missing.
 The owner speaks the request and speaks the answer, and what the card adds is that
