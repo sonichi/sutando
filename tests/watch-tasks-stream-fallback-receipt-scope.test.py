@@ -93,9 +93,8 @@ so, hl = run("worker-1", "worker-1")
 check("worker-1 still bypasses on its OWN receipt",
       hl == BYPASSED and any("TASK_FILE" in s for s in so), f"{so} {hl}")
 
-# keweichen at c40e6e61: STATE_DIR re-resolved the CHECKOUT workspace while every
-# other state path followed the argv-derived WORKSPACE_DIR, so this very test wrote
-# and then deleted a real installation's sentinel.
+# STATE_DIR once re-resolved the CHECKOUT workspace while every other state path
+# followed argv-derived WORKSPACE_DIR, so this test deleted a live sentinel.
 _canon = Path(subprocess.run(["bash", str(REPO / "scripts/sutando-config.sh"), "workspace"],
                              capture_output=True, text=True).stdout.strip()) / "state" / "watch-tasks-stream.pid"
 _had = _canon.exists()
