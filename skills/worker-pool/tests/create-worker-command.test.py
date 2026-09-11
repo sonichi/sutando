@@ -4,12 +4,11 @@
 The defect it closes: spawning wrote an identity while the roster was recompiled
 separately, so a missed step left a worker that runs and cannot be addressed.
 
-Run: python3 tests/create-worker-command.test.py
+Run: python3 skills/worker-pool/tests/create-worker-command.test.py
 """
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -18,16 +17,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import create_worker as cw  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
-import spawn_worker as sw  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location(
-    "create_worker", REPO / "scripts" / "create-worker.py")
-cw = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(cw)
+import spawn_worker as sw  # noqa: E402
 
 ROOM = "!abc:ag2.space"
 

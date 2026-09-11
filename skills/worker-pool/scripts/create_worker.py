@@ -11,7 +11,7 @@ written: two worker records on disk, one in the roster.
 So this composes; it decides nothing. The roster stays the core's artifact and
 the binding stays the owner's declaration.
 
-Run: python3 scripts/create-worker.py --folder <dir> --label "<name>" [--room <id>]
+Run: python3 skills/worker-pool/scripts/create_worker.py --folder <dir> --label "<name>" [--room <id>]
 """
 from __future__ import annotations
 
@@ -21,8 +21,13 @@ import os
 import sys
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
-sys.path.insert(0, str(_REPO / "src"))
+_SCRIPTS = Path(__file__).resolve().parent
+_REPO = _SCRIPTS.parents[2]
+# Sibling skill scripts, then the core's src/ for the workspace resolver
+# (repo root is parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
+for _p in (str(_SCRIPTS), str(_REPO / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import pool_roster as pr  # noqa: E402
 

@@ -1,6 +1,6 @@
 ---
 name: worker-pool
-description: "Worker-pool modules that the core does not need: the owner-authored bindings + compiled roster the router reads, a worker's durable identity records (worker / session / incarnation), the spawner that creates a worker, and the per-instance watcher gate its session boots through. Optional — the core boots and delivers with this skill absent."
+description: "Worker-pool modules that the core does not need: the owner-authored bindings + compiled roster the router reads, a worker's durable identity records (worker / session / incarnation), the spawner that creates a worker, the one owner command that spawns + binds + recompiles the roster, and the per-instance watcher gate its session boots through. Optional — the core boots and delivers with this skill absent."
 user-invocable: false
 ---
 
@@ -18,10 +18,26 @@ loads it and must keep working without it.
 | `scripts/pool_roster.py` | Bindings the owner writes; a roster the core compiles; the router only reads. |
 | `scripts/worker_identity.py` | A worker's durable identity: which worker, which conversation, which run. |
 | `scripts/spawn_worker.py` | Create a worker: an identity, a delivery folder, a tmux session, a watcher. |
+| `scripts/create_worker.py` | The owner's one command: spawn, bind a room, recompile the roster — so the roster cannot be left stale. |
 | `scripts/worker_bootstrap.py` | Does THIS instance still need its watcher? The gate `/startup --worker` runs. |
 
 Tests are the skill's own: `tests/*.test.py`, discovered by CI's
 `find tests skills -name '*.test.py'` and measured by the same coverage gate.
+
+## Creating a worker
+
+```bash
+python3 skills/worker-pool/scripts/create_worker.py --folder <dir> --label "<name>" [--room <id>]
+```
+
+One command because the steps were separable: spawning wrote an identity, the
+binding was hand-edited, the roster was recompiled by hand — miss the third and
+the worker runs, has an id, and receives nothing, since the router reads only
+the roster. It composes `spawn_worker` and `pool_roster`'s own writer and
+decides nothing; it refuses (exit 2) before creating anything when run from a
+worker (`SUTANDO_INSTANCE_ID` set) or on a checkout without per-instance
+watcher sentinels, and exits 1 loudly if the worker was created but the roster
+could not be recompiled. `--dry-run` prints the plan; `--json` prints the ids.
 
 ## What stays in src (the boundary)
 
@@ -42,7 +58,7 @@ records always, and reads a roster, a worker identity or a spawner never.
 ## How the core reaches this skill
 
 Nothing in `src/` imports these modules — verified by
-`git grep 'pool_roster\|worker_identity\|spawn_worker\|worker_bootstrap' -- src scripts`,
+`git grep 'pool_roster\|worker_identity\|spawn_worker\|create_worker\|worker_bootstrap' -- src scripts`,
 which returns no hit outside this skill.
 
 There is exactly **one seam**, and it runs the other way — the core's
@@ -63,10 +79,11 @@ script uses.
 
 ## More is coming
 
-This is part A of an owner-directed restructure. #4108 (the spawn launcher) is
-re-homed here and lands next. The remaining pool work still targets `src/` today
-and must re-home as each lands:
+This is part A of an owner-directed restructure. #4108 (the spawn launcher) and
+#4115 (the create-worker command) are re-homed here; they land in that order.
+The remaining pool work still targets `src/` today and must re-home as each
+lands:
 
-#4110 · #4115 · #4119 · #4120 · #4121 · #4162 · #4175 · #4176
+#4110 · #4119 · #4120 · #4121 · #4162 · #4175 · #4176
 
 #4176 edits `src/pool_roster.py` directly and must be rebased onto this move.
