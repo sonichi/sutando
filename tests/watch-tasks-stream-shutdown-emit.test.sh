@@ -38,8 +38,16 @@ check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
 check "both shutdown call sites go through the shutdown emitter" \
       "2" "$(grep -cE '^\s+emit_task_file "\$filename"' "$WATCHER" || true)"
-check "the handler-fallback site goes through its own emitter" \
-      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$filename"' "$WATCHER" || true)"
+# The shared settle policy names no emitter of its own, so each caller keeps its
+# destination: borrowing fd 9 in normal drain would be the #2934 shape again.
+check "the shared settle policy emits only through the emitter it was handed" \
+      "1" "$(grep -cE '^\s+"\$emit_fn" "\$filename"' "$WATCHER" || true)"
+check "the handler-fallback site hands it its own emitter" \
+      "1" "$(grep -cE '^\s+settle_handler_outcome .+ emit_fallback_task_file$' "$WATCHER" || true)"
+check "the shutdown receipt site hands it the shutdown emitter" \
+      "1" "$(grep -cE '^\s+settle_handler_outcome .+ emit_task_file$' "$WATCHER" || true)"
+check "and those are ALL of its call sites (a new one cannot slip past both)" \
+      "2" "$(grep -cE '^\s+settle_handler_outcome ' "$WATCHER" || true)"
 
 # The call sites above are worthless if the definitions never load. There is no
 # `set -e` here, so a missing function is rc=127 and NON-FATAL: the watcher would
