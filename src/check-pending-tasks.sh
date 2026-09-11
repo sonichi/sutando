@@ -37,7 +37,8 @@ for f in "$TASKS_DIR"/*.txt; do
   # declined it and must not touch it, so it is not the core's to answer.
   TASK_ID="${BASENAME%.txt}"
   if compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.txt" > /dev/null 2>&1 \
-     || compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.accepted" > /dev/null 2>&1; then
+     || compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.accepted" > /dev/null 2>&1 \
+     || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
     continue
   fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery

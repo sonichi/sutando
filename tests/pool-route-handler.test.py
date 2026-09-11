@@ -145,16 +145,37 @@ class TestFailureAfterTheProbe(Base):
         p = self.ws / "logs" / "pool-route-handler.log"
         return p.read_text() if p.exists() else ""
 
-    def test_a_refused_pass_exits_nonzero_and_says_why(self):
-        """Probe 0 queued it as taken, so a non-zero run falls back to the live
-        core, never to the owner. The reason goes to the log the watcher lacks."""
+    def test_a_refused_pass_defers_and_exits_zero(self):
+        """A failed delivery keeps the task the worker's: a retry marker, exit 0
+        (so the watcher never hands it to the core), the reason in the log."""
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
              "bindings": {"!room:x": [W, "f" * 32]}}))
         t = self.task_file("task-1", channel_id="!room:x")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 1)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         self.assertIn("refused", self.log())
+        self.assertTrue((self.ws / "state" / "pool-route-retry" / "task-1").exists())
         self.assertFalse((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_the_retry_pass_delivers_a_deferred_task_and_clears_its_marker(self):
+        """The fault is repaired by re-delivery, not by the core answering."""
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
+             "bindings": {"!room:x": [W, "f" * 32]}}))
+        t = self.task_file("task-1", channel_id="!room:x")
+        h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.roster()  # the fault is fixed: one target again
+        out = h.retry_pass(str(self.ws))
+        self.assertEqual(out["delivered"], ["task-1"])
+        self.assertFalse((self.ws / "state" / "pool-route-retry" / "task-1").exists())
+        self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_the_retry_pass_drops_a_marker_whose_payload_is_gone(self):
+        self.roster()
+        d = self.ws / "state" / "pool-route-retry"; d.mkdir(parents=True)
+        (d / "task-9").write_text("refused: x\n")
+        self.assertEqual(h.retry_pass(str(self.ws))["gone"], ["task-9"])
+        self.assertFalse((d / "task-9").exists())
 
     def test_a_task_archived_before_the_run_is_nothing_to_route(self):
         """Seen live: the worker finished and the bridge archived the payload
