@@ -538,5 +538,42 @@ class TestAcceptIsExclusive(Base):
         self.assertTrue((self.root / "deliveries" / "core" / pd.LOCK_NAME).exists())
 
 
+class TestPayloadVerb(Base):
+    """`payload` resolves a sentinel NAME to the body it points at, for callers
+    outside python — so no shell re-spells the name grammar or the tasks/ layout."""
+    def setUp(self):
+        super().setUp()
+        (self.root / "tasks").mkdir(parents=True, exist_ok=True)
+        self.body = pd.payload_path(self.root, "task-7")
+        self.body.write_text("the task body\n")
+
+    def run_main(self, *args):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = pd.main(["--workspace", str(self.root), *args])
+        return rc, buf.getvalue().strip()
+
+    def test_a_sentinel_name_resolves_to_its_payload(self):
+        rc, out = self.run_main("payload", "--sentinel", "task-7.txt")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, str(self.body))
+
+    def test_a_task_id_resolves_too(self):
+        rc, out = self.run_main("payload", "--task-id", "task-7")
+        self.assertEqual((rc, out), (0, str(self.body)))
+
+    def test_a_name_that_is_not_a_sentinel_is_refused(self):
+        self.assertEqual(self.run_main("payload", "--sentinel", "task-7")[0], 1)
+
+    def test_a_sentinel_with_no_payload_is_refused_not_invented(self):
+        self.assertEqual(self.run_main("payload", "--sentinel", "task-9.txt")[0], 1)
+
+    def test_results_dir_is_named_once_not_composed_by_each_caller(self):
+        self.assertEqual(pd.result_path(self.root, "task-7").parent,
+                         pd.results_dir(self.root))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -94,6 +94,36 @@ class TestRefusals(Base):
         self.assertIn("no identity here", why)
 
 
+class TestMain(Base):
+    """In process, so the CLI's own branches are measured and not just run."""
+    def run_main(self, *args):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = wb.main(list(args))
+        return rc, buf.getvalue().splitlines()
+
+    def test_a_worker_with_no_watcher_is_told_to_start(self):
+        rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
+                                "--workspace", str(self.ws))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[0], "start")
+        self.assertIn(WORKER, out[1])
+
+    def test_an_unknown_exits_two(self):
+        rc, out = self.run_main("--instance", "", "--inbox", self.inbox,
+                                "--workspace", str(self.ws))
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_no_workspace_given_falls_back_to_the_loader(self):
+        """Not the spawner's env var: a worker shares the host's workspace, so
+        the canonical loader is the only resolution path here."""
+        rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+        self.assertIn(out[0], ("start", "skip", "unknown"))
+        self.assertIn(rc, (0, 2))
+
+
 class TestCli(Base):
     def test_the_cli_reports_start_and_exits_zero(self):
         r = subprocess.run([sys.executable, str(GATE), "--instance", WORKER,
