@@ -33,6 +33,7 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
+  dispatch_dir="${10:-}"
   # The watcher keeps only the exit code; a handler that died outside its own
   # logging left no trace, so its stderr and the code land in one file.
   runner_log="$workspace/logs/task-event-handler-runner.log"
@@ -51,6 +52,9 @@ if [ "${1:-}" = "--handler-runner" ]; then
     handler_rc=$?
   fi
   printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >> "$runner_log" 2>/dev/null || true
+  # The receipt outlives this process: the drain reads it when it finds the
+  # pid gone, so an exited runner is never mistaken for a dead one.
+  [ -n "$dispatch_dir" ] && printf '%s\n' "$handler_rc" > "$dispatch_dir/settled/$filename.rc" 2>/dev/null
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
 fi
@@ -281,7 +285,7 @@ finish_handler_task() {
     fi
     rm -f "$settled"
   fi
-  rm -f "$worker_receipt"
+  rm -f "$worker_receipt" "$DISPATCH_DIR/settled/$filename.rc"
   drain_dispatch_queue
 }
 
@@ -323,9 +327,11 @@ drain_dispatch_queue() {
       running_count=$((running_count + 1))
       continue
     fi
-    # rc decides whether the sender gets a terminal-failure reply — only when
-    # the worker died before producing a deliverable result.
-    if handler_result_exists "$filename"; then
+    # A runner that EXITED left its rc receipt; only a runner that DIED left
+    # none, and then a deliverable result is the one thing that says success.
+    if [ -f "$DISPATCH_DIR/settled/$filename.rc" ]; then
+      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" "$(cat "$DISPATCH_DIR/settled/$filename.rc" 2>/dev/null || echo 1)"
+    elif handler_result_exists "$filename"; then
       finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 0
     else
       finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1
@@ -355,7 +361,8 @@ drain_dispatch_queue() {
       "$RESULTS_DIR" \
       "$__REPO_ROOT" \
       "$WATCH_RUNTIME_DIR/events" \
-      "$(basename "$marker")" &
+      "$(basename "$marker")" \
+      "$DISPATCH_DIR" &
     printf '%s\n' "$!" > "$worker_receipt"
     activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
     running_count=$((running_count + 1))
