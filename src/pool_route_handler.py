@@ -10,9 +10,11 @@ The watcher's handler protocol carries the design's recipient rules exactly:
     probe 3   decline      not a roster hit -- unbound, or a name never created.
                             The core takes it; it is a recipient, not a fallback.
     probe 0   taken        every target is on the roster, OR the roster cannot be
-                            read. The real run delivers; if it fails, the watcher
-                            hands the task to the live core, which answers as the
-                            owner's agent -- a delivery fault is never owner noise.
+                            read. The real run delivers; if it fails the task stays
+                            the worker's under state/pool-route-retry/<id> and the
+                            run still exits 0 -- the core repairs delivery, it never
+                            answers a worker's task (owner rule). `--retry-pass`
+                            re-delivers every marked task.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -91,14 +93,20 @@ def _log(workspace, line: str) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--task-file", required=True)
+    p.add_argument("--task-file", default=None)
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
+    p.add_argument("--retry-pass", action="store_true")
     for ignored in ("--runtime", "--results-dir", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    if args.retry_pass:
+        print(json.dumps(retry_pass(ws)))
+        return 0
+    if not args.task_file:
+        p.error("--task-file is required unless --retry-pass")
     try:
         task = read_task(args.task_file)
     except FileNotFoundError:
@@ -112,23 +120,60 @@ def main(argv=None) -> int:
     if code == DECLINE:
         return DECLINE
 
+    return _deliver(ws, task)
+
+
+def retry_dir(workspace) -> Path:
+    return pr._root(workspace) / "state" / "pool-route-retry"
+
+
+def _defer(ws, task_id: str, reason: str) -> int:
+    """A failed delivery keeps the task the worker's: mark it for the retry
+    pass and exit 0 so the watcher never hands it to the core."""
+    d = retry_dir(ws)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / task_id).write_text(time.strftime("%Y-%m-%dT%H:%M:%S ") + reason + "\n")
+    _log(ws, f"{task_id}: deferred for retry: {reason}")
+    return 0
+
+
+def _deliver(ws, task: dict) -> int:
+    task_id = task.get("id") or "?"
     try:
         out = rt.route(ws, task, None)
     except rt.RouterRefused as e:
-        _log(ws, f"{task.get('id')}: refused: {e}")
-        print(f"pool-route-handler: {e}", file=sys.stderr)
-        return 1
+        return _defer(ws, task_id, f"refused: {e}")
     except Exception:
-        _log(ws, f"{task.get('id')}: crashed:\n" + traceback.format_exc())
-        raise
+        _log(ws, f"{task_id}: crashed:\n" + traceback.format_exc())
+        return _defer(ws, task_id, "crashed (traceback logged)")
     if out.get("failed"):
         # Unreachable via the probe, which declines these; kept so a direct
         # caller cannot turn an unknown name into a delivery.
         print(json.dumps(out), file=sys.stderr)
         return DECLINE
-    _log(ws, f"{task.get('id')}: delivered={out.get('delivered')} "
+    try:
+        (retry_dir(ws) / task_id).unlink()
+    except OSError:
+        pass
+    _log(ws, f"{task_id}: delivered={out.get('delivered')} "
              f"already={out.get('already')} skipped={out.get('skipped')} -> 0")
     return 0
+
+
+def retry_pass(ws) -> dict:
+    """Re-deliver every marked task whose payload is still in tasks/."""
+    outcome = {"delivered": [], "still_deferred": [], "gone": []}
+    d = retry_dir(ws)
+    for marker in sorted(d.iterdir()) if d.is_dir() else []:
+        payload = pr._root(ws) / "tasks" / f"{marker.name}.txt"
+        if not payload.is_file():
+            marker.unlink()
+            outcome["gone"].append(marker.name)
+            continue
+        _deliver(ws, read_task(str(payload)))
+        outcome["delivered" if not marker.exists() else "still_deferred"].append(marker.name)
+    _log(ws, f"retry pass: {json.dumps(outcome)}")
+    return outcome
 
 
 def _workspace_arg(argv) -> "str | None":
