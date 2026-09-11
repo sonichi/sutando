@@ -42,12 +42,32 @@ class RunnerGlobTest(unittest.TestCase):
         )
 
     def test_py_find_is_recursive(self) -> None:
+        """`find` over a ROOT, never a flat glob. Asserted on the behaviour, not
+        the exact root list, which grew a second (optional) root for skills/."""
+        py_script = self._scripts().get("test:py", "")
+        self.assertRegex(
+            py_script, r"find [^|;]*-name '\*\.test\.py'",
+            "Python runner must use a recursive `find`, not a flat glob")
+        self.assertNotIn(
+            "tests/*.test.py", py_script,
+            "a flat glob would skip every relocated test")
+
+    def test_py_discovery_includes_the_skills_root(self) -> None:
+        """A skill owns its own tests/ dir, so discovery must reach skills/ —
+        otherwise a suite that moves into a skill silently stops running."""
         py_script = self._scripts().get("test:py", "")
         self.assertIn(
-            "find tests -name '*.test.py'",
-            py_script,
-            "Python runner must use a recursive `find`, not a flat glob",
-        )
+            "skills", py_script,
+            "test:py must discover skills/**/*.test.py, not just tests/")
+
+    def test_recursive_find_discovers_a_skill_owned_test(self) -> None:
+        out = subprocess.run(
+            ["find", "skills", "-name", "*.test.py"],
+            cwd=REPO, capture_output=True, text=True, check=True).stdout
+        self.assertTrue(
+            [p for p in out.splitlines() if p.strip()],
+            "expected at least one *.test.py under skills/ (e.g. "
+            "skills/worker-pool/tests/); the skills root would be untested otherwise")
 
     def test_recursive_find_discovers_nested_tests(self) -> None:
         """The recursive find must return at least one test under a SUBDIRECTORY
