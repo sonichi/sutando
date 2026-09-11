@@ -341,7 +341,13 @@ reap_wedged_voice_agent() {
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid
   [ -f "$pid_file" ] || return 0
-  stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
+  # LINE 1, through the one shared reader. `cat` fed the whole sentinel to
+  # `ps -p`, which answers "Invalid process id" for every identity record.
+  stale_pid="$(sentinel_pid_in "$pid_file" 2>/dev/null || true)"
+  if [ -z "$stale_pid" ]; then
+    echo "  ⚠ $pid_file names no readable pid on line 1; leaving it alone"
+    return 0
+  fi
 
   # `ps` failing is NOT "the pid is not a watcher". A denied or unavailable ps
   # skipped the ownership check entirely and still fell through to the release

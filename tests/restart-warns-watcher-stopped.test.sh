@@ -18,11 +18,15 @@ RS="$REPO/src/restart.sh"
 fails=0
 ck() { if [ "$2" = "0" ]; then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi; }
 
-grep -q 'pkill -f "watch-tasks"' "$RS"; ck "restart.sh still stops the watcher (guards the rest)" $?
+# Sentinel-scoped since #4167: `pkill -f "watch-tasks"` matched every watcher on
+# a pool host, so a core restart killed the workers' drains too.
+grep -q '^_stop_own_task_watcher "' "$RS"; ck "restart.sh still stops its own watcher (guards the rest)" $?
+! grep -v '^[[:space:]]*#' "$RS" | grep -q 'pkill.*watch-tasks'
+ck "and does it without a host-wide pattern kill" $?
 
-# The warning must sit AFTER the pkill: printed before, it describes a watcher
+# The warning must sit AFTER the stop: printed before, it describes a watcher
 # that is still running.
-kill_line=$(grep -n 'pkill -f "watch-tasks"' "$RS" | head -1 | cut -d: -f1)
+kill_line=$(grep -n '^_stop_own_task_watcher "' "$RS" | head -1 | cut -d: -f1)
 warn_line=$(grep -n 'task watcher STOPPED' "$RS" | head -1 | cut -d: -f1)
 [ -n "$warn_line" ]; ck "a watcher-stopped warning exists" $?
 [ -n "$warn_line" ] && [ "$warn_line" -gt "$kill_line" ]; ck "the warning follows the kill, not precedes it" $?
