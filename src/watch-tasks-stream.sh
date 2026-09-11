@@ -33,6 +33,7 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
+  dispatch_dir="${10:-}"
   # The watcher keeps only the exit code; a handler that died outside its own
   # logging left no trace, so its stderr and the code land in one file.
   runner_log="$workspace/logs/task-event-handler-runner.log"
@@ -51,6 +52,18 @@ if [ "${1:-}" = "--handler-runner" ]; then
     handler_rc=$?
   fi
   printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >> "$runner_log" 2>/dev/null || true
+  # The receipt outlives this process: the drain reads it when it finds the
+  # pid gone, so an exited runner is never mistaken for a dead one.
+  if [ -n "$dispatch_dir" ]; then
+    # Same-dir temp then rename: a redirection onto the final path truncates it
+    # first, so a kill between open and write publishes an empty exit code.
+    rc_temporary="$dispatch_dir/settled/.$filename.rc.$$"
+    if printf '%s\n' "$handler_rc" > "$rc_temporary" 2>/dev/null; then
+      mv -f "$rc_temporary" "$dispatch_dir/settled/$filename.rc" 2>/dev/null || rm -f "$rc_temporary"
+    else
+      rm -f "$rc_temporary"
+    fi
+  fi
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
 fi
@@ -246,8 +259,49 @@ release_dispatch_lock() {
   rmdir "$DISPATCH_DIR/lock" 2>/dev/null || true
 }
 
+# The claim/fallback/failure policy for a run that produced an exit code. Shared:
+# the drain settles a completion, shutdown settles a receipt the fifo never carried.
+settle_handler_outcome() {
+  local filename="$1" task_path="$2" rc="$3" emit_fn="$4" claim_settled
+  if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
+    claim_settled=1
+    claim_disposition "$filename"
+    case $? in
+      0)
+        echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
+        # An unsettled publish leaves the claim held rather than clobbering a
+        # destination this watcher does not own; cross-restart retry is separate.
+        publish_terminal_failure "$filename" "failed" || claim_settled=0
+        ;;
+      1)
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+        "$emit_fn" "$filename"
+        ;;
+      *)
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+        ;;
+    esac
+    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+  elif [ "$rc" -eq 0 ]; then
+    release_task_claim "$filename" || true
+  fi
+  return 0
+}
+
+# A present receipt is not yet a settlement: only a complete numeric body is an
+# exit code, and anything shorter must take the missing-receipt recovery.
+read_settled_rc() {
+  local filename="$1" rc
+  rc="$(cat "$DISPATCH_DIR/settled/$filename.rc" 2>/dev/null)" || return 1
+  case "$rc" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$rc"
+}
+
 finish_handler_task() {
-  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled
+  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt
   filename="$(basename "$task_path")"
   worker_receipt="$DISPATCH_DIR/workers/$filename"
   settled="$DISPATCH_DIR/settled/$filename.worker"
@@ -256,32 +310,10 @@ finish_handler_task() {
   # then claim release. A signal between event and release may duplicate the
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
-    if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
-      claim_settled=1
-      claim_disposition "$filename"
-      case $? in
-        0)
-          echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
-          # An unsettled publish leaves the claim held rather than clobbering a
-          # destination this watcher does not own; cross-restart retry is separate.
-          publish_terminal_failure "$filename" "failed" || claim_settled=0
-          ;;
-        1)
-          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-          echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          emit_fallback_task_file "$filename"
-          ;;
-        *)
-          echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
-          ;;
-      esac
-      [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
-    elif [ "$rc" -eq 0 ]; then
-      release_task_claim "$filename" || true
-    fi
+    settle_handler_outcome "$filename" "$task_path" "$rc" emit_fallback_task_file
     rm -f "$settled"
   fi
-  rm -f "$worker_receipt"
+  rm -f "$worker_receipt" "$DISPATCH_DIR/settled/$filename.rc"
   drain_dispatch_queue
 }
 
@@ -302,7 +334,7 @@ PYEOF
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
+  local filename worker_pid handler_rc
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -323,9 +355,11 @@ drain_dispatch_queue() {
       running_count=$((running_count + 1))
       continue
     fi
-    # rc decides whether the sender gets a terminal-failure reply — only when
-    # the worker died before producing a deliverable result.
-    if handler_result_exists "$filename"; then
+    # A runner that EXITED left a COMPLETE rc receipt; a runner that DIED left
+    # none or a partial one, and then a deliverable result is the only success.
+    if handler_rc="$(read_settled_rc "$filename")"; then
+      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" "$handler_rc"
+    elif handler_result_exists "$filename"; then
       finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 0
     else
       finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1
@@ -355,7 +389,8 @@ drain_dispatch_queue() {
       "$RESULTS_DIR" \
       "$__REPO_ROOT" \
       "$WATCH_RUNTIME_DIR/events" \
-      "$(basename "$marker")" &
+      "$(basename "$marker")" \
+      "$DISPATCH_DIR" &
     printf '%s\n' "$!" > "$worker_receipt"
     activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
     running_count=$((running_count + 1))
@@ -493,7 +528,7 @@ _tmux_wake() {
 #   either way so nothing downstream needs to observe them again.
 fallback_outstanding_handlers() {
   local marker task_path filename settled made_progress found claim owner_id cleanup_ready claim_settled
-  local worker_receipt worker_pid job_pid
+  local worker_receipt worker_pid job_pid handler_rc
   [ -n "$DISPATCH_DIR" ] && [ -d "$DISPATCH_DIR" ] || return
   : > "$DISPATCH_DIR/shutting-down"
   shopt -s nullglob
@@ -509,7 +544,11 @@ fallback_outstanding_handlers() {
       mv "$marker" "$settled" 2>/dev/null || continue
       task_path="$(cat "$settled")"
       filename="$(basename "$task_path")"
-      if claim_is_ours "$filename"; then
+      # A run that already returned left a complete receipt, so it has a real
+      # outcome; only a receipt-less marker was interrupted mid-flight.
+      if handler_rc="$(read_settled_rc "$filename")"; then
+        settle_handler_outcome "$filename" "$task_path" "$handler_rc" emit_task_file
+      elif claim_is_ours "$filename"; then
         claim_settled=1
         claim_disposition "$filename"
         case $? in
@@ -530,7 +569,7 @@ fallback_outstanding_handlers() {
         esac
         [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
       fi
-      rm -f "$settled"
+      rm -f "$settled" "$DISPATCH_DIR/settled/$filename.rc"
       made_progress=1
     done
     [ "$found" -eq 1 ] || break
@@ -596,6 +635,8 @@ fallback_outstanding_handlers() {
   # prevents new dispatch, so these local artifacts are now safe to sweep.
   for settled in "$DISPATCH_DIR/settled/"*.worker \
       "$DISPATCH_DIR/settled/"*.cleanup \
+      "$DISPATCH_DIR/settled/"*.rc \
+      "$DISPATCH_DIR/settled/".*.rc.* \
       "$DISPATCH_DIR/settled/claim-"*; do
     rm -f "$settled"
   done
