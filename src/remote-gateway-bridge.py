@@ -57,6 +57,7 @@ set_dirs(task_dir=WS / "tasks", result_dir=WS / "results", state_dir=WS / "state
 from task_envelope import stamp_text  # noqa: E402  (adapter-edge stamper)
 from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
 set_task_stamper(stamp_text)
+from result_claimant import resolve_claimant  # noqa: E402  (adapter-edge layout)
 os.environ.setdefault("REMOTE_MEDIA_DIR", str(WS / "data" / "remote-media"))
 
 from ag2_sparrow import send_allowlist as _send_allowlist  # noqa: E402
@@ -215,6 +216,9 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+
+# Same seam as set_task_stamper, and assigned after the exec for the reason above.
+set_claimant_resolver(resolve_claimant)  # noqa: F821  (defined by the exec above)
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
