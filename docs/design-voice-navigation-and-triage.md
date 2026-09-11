@@ -47,10 +47,25 @@ commitment rather than a raw question, its premise re-verified at scan time by
 `triage_freshness` against the pull requests it names. It is the strongest
 decision unit in the system.
 
-**And it is currently scattered across three places** — sutando-life's own page,
+sutando-life gives it a page of its own — `static/triage.html`, whose own
+description is the design in one sentence:
+
+> Everything that needs your call, from every source, one at a time in rank
+> order. Approve, reject, or reply, then move on. Your decisions are recorded for
+> the agent to act on; nothing here reorders itself by what you pick.
+
+One card at a time: a waiting label, the proposition, the detail, per-item
+options, then approve / reject / reply and a list of what is already in progress.
+No board, no backlog to scan. It refreshes on its own every fifteen minutes as a
+standalone job, and a ↻ appears only when something new has actually arrived.
+
+Which is a good page — and a page. To answer one item the owner leaves whatever
+they were doing, and the queue is one-at-a-time by design, so **the trip is paid
+per item.** Every property that makes the unit good widens the gap.
+
+**The same unit is currently scattered across three destinations** — that page,
 `#4003`'s web client, and Discord messages like the one above. One model, three
-destinations, each of which you go to. Every property that makes the unit good
-widens the gap: one-at-a-time means the trip is paid *per item*.
+places, each of which you go to.
 
 Both halves are the same gap, and it costs three things:
 
