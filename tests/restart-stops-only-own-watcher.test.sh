@@ -9,7 +9,8 @@
 # The kill is a real one: two decoy processes whose argv contains
 # `watch-tasks-stream` run in the sandbox, only ONE of them is named by a
 # sentinel, and the test asserts which of the two is still alive afterwards.
-# `kill` is a bash builtin, so a PATH stub could not observe this.
+# No process-ops fake here — this file deliberately exercises the REAL signal
+# path end to end, which the call-log tests in restart-scope-isolation cannot.
 #
 # Run: bash tests/restart-stops-only-own-watcher.test.sh
 set -u
@@ -32,7 +33,7 @@ trap cleanup EXIT
 # pgrep, launchctl, the workspace lookup) is absent or stubbed.
 mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state" "$SB/own" "$SB/peer"
 cp "$REPO/src/restart.sh" "$SB/src/restart.sh"
-cp "$REPO/src/watcher_sentinel.sh" "$SB/src/watcher_sentinel.sh"
+cp "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
 cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
@@ -74,7 +75,16 @@ disown "$OWN_PID" "$PEER_PID" 2>/dev/null   # job-control "Terminated" notices a
 # disagree with restart.sh about which file names this instance.
 SENTINEL="$( . "$SB/src/watcher_sentinel.sh"; sentinel_path_for "$SB/workspace/state" )"
 [ -n "$SENTINEL" ]; ck "sentinel path resolved in the sandbox (harness is sound)" $?
-printf '%s\n' "$OWN_PID" > "$SENTINEL"
+
+# The identity record the watcher-side writer produces. A bare pid proves
+# nothing about WHICH watcher wears it, so restart.sh refuses to signal one
+# (checked at the end of this file).
+stamp() {                       # stamp <pid> <code_path> [incarnation]
+  printf '%s\ninstance=\nincarnation=%s\ncode_path=%s\nversion=test\nworkspace=%s\n' \
+    "$1" "${3:-inc1}" "$2" "$SB/workspace" > "$SENTINEL"
+  printf '%s\n' "${3:-inc1}" > "${SENTINEL%.pid}.incarnation"
+}
+stamp "$OWN_PID" "$SB/own/watch-tasks-stream.sh"
 
 alive() { kill -0 "$1" 2>/dev/null; }
 alive "$OWN_PID" && alive "$PEER_PID"; ck "both decoy watchers are running before the restart" $?
@@ -119,10 +129,30 @@ ck "the warning follows the stop, not precedes it" $?
 /bin/sleep 30 & INNOCENT=$!
 DECOYS="$DECOYS $INNOCENT"
 disown "$INNOCENT" 2>/dev/null
-printf '%s\n' "$INNOCENT" > "$SENTINEL"
+stamp "$INNOCENT" "$SB/own/watch-tasks-stream.sh"
 out2="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
 alive "$INNOCENT"; ck "a sentinel pid whose argv is not a watcher is NOT killed" $?
-grep -q "watcher stop: sentinel pid $INNOCENT is not a live watch-tasks-stream" <<<"$out2"; ck "and the refusal is said aloud" $?
+grep -q "argv: pid $INNOCENT is not a live watch-tasks-stream" <<<"$out2"; ck "and the refusal is said aloud" $?
+
+# --- the peer watcher, named by a record that is not ours --------------------
+# The peer is a genuine, live watcher running this very checkout — every check
+# an argv scan can make passes. Only its recorded identity says it is another
+# instance's, and that alone must be enough to refuse.
+printf '%s\ninstance=other-worker\nincarnation=inc1\ncode_path=%s\nversion=test\nworkspace=%s\n' \
+  "$PEER_PID" "$SB/peer/watch-tasks-stream.sh" "$SB/workspace" > "$SENTINEL"
+printf 'inc1\n' > "${SENTINEL%.pid}.incarnation"
+out3="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
+alive "$PEER_PID"; ck "a live peer watcher recorded under another instance SURVIVES" $?
+grep -q "instance: .* says \"other-worker\"" <<<"$out3"; ck "and the report names the check that refused" $?
+
+# --- a pre-identity sentinel ------------------------------------------------
+# Before the watcher writes a record there is nothing to check the pid against,
+# and `kill -0` answering is not ownership. Refuse rather than guess.
+printf '%s\n' "$PEER_PID" > "$SENTINEL"
+out4="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"; rc4=$?
+alive "$PEER_PID"; ck "a pid-only sentinel does NOT authorise a signal" $?
+grep -q "records a pid only" <<<"$out4"; ck "and says the record is what is missing" $?
+[ -f "$SENTINEL" ]; ck "an unconfirmed sentinel is left in place, not deleted" $?
 
 echo
 [ "$fails" -eq 0 ] && { echo "all ok"; exit 0; } || { echo "$fails FAILED"; exit 1; }

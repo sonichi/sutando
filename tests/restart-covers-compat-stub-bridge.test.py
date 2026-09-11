@@ -16,7 +16,7 @@ name therefore has a blind spot for stub-launched instances:
 
 `src/restart.sh` had that gap twice, and the second one is worse than the first:
 
-  1. the `pkill` list could not kill a stub-launched bridge, and
+  1. the kill list could not kill a stub-launched bridge, and
   2. `STOP_PATTERNS` could not SEE it either — so restart would report every
      service stopped while one kept running.
 
@@ -69,7 +69,7 @@ class RestartCoversBothNames(unittest.TestCase):
     def test_pkill_targets_the_deprecated_name(self):
         """THE pin — fails on the parent commit."""
         self.assertRegex(
-            self.text, rf'pkill -f "{DEPRECATED}"',
+            self.text, rf'pops_pattern_kill "{DEPRECATED}"',
             "restart.sh must kill stub-launched bridges; the current-name pkill "
             "cannot match their argv",
         )
@@ -85,7 +85,7 @@ class RestartCoversBothNames(unittest.TestCase):
 
     def test_the_current_name_is_still_covered(self):
         """Guard against 'fixing' this by swapping one name for the other."""
-        self.assertRegex(self.text, rf'pkill -f "{CURRENT}"')
+        self.assertRegex(self.text, rf'pops_pattern_kill "{CURRENT}"')
         m = re.search(r"STOP_PATTERNS=\((.*?)\)", self.text, re.S)
         self.assertIn(CURRENT, m.group(1))
 
