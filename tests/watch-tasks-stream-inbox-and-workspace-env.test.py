@@ -104,39 +104,46 @@ def _state_root(extra_env: dict, td: Path) -> tuple[bool, bool, bool]:
     return under_ws.is_dir(), under_inbox.is_dir(), inbox.is_dir()
 
 
-class TestInboxEnvSeam(unittest.TestCase):
+class _WatcherTempDirCase(unittest.TestCase):
+    """The watcher leaves a FIFO and a child behind, so cleanup must tolerate
+    errors — on 3.9 that is rmtree(ignore_errors), not a TemporaryDirectory kwarg."""
+
+    def setUp(self) -> None:
+        self.td = Path(tempfile.mkdtemp(prefix="watcher-env-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.td, ignore_errors=True)
+
+
+class TestInboxEnvSeam(_WatcherTempDirCase):
     def test_unset_the_watcher_watches_its_workspace_tasks_folder(self):
         """Control: absent the variable, the resolved workspace still decides."""
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            tasks, override = _watched_dir({}, Path(td))
+        tasks, override = _watched_dir({}, self.td)
         self.assertTrue(tasks, "the workspace's tasks/ was not the watched folder")
         self.assertFalse(override)
 
     def test_set_the_named_inbox_is_watched_and_tasks_is_not_created(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            tasks, override = _watched_dir(
-                {"SUTANDO_TASKS_DIR": str(Path(td) / "deliveries")}, Path(td)
-            )
+        tasks, override = _watched_dir(
+            {"SUTANDO_TASKS_DIR": str(self.td / "deliveries")}, self.td
+        )
         self.assertTrue(override, "the named inbox was not the watched folder")
         self.assertFalse(tasks, "an instance with its own inbox must not create <ws>/tasks/")
 
 
-class TestWorkspaceEnvSeam(unittest.TestCase):
+class TestWorkspaceEnvSeam(_WatcherTempDirCase):
     def test_an_explicit_workspace_keeps_derived_state_out_of_the_inbox_tree(self):
         """Whoever names the inbox names the workspace; the watcher must not
         infer it from <ws>/deliveries/<id>."""
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            ws_hit, inbox_hit, watched = _state_root(
-                {"SUTANDO_WORKSPACE_DIR": str(Path(td) / "ws")}, Path(td)
-            )
+        ws_hit, inbox_hit, watched = _state_root(
+            {"SUTANDO_WORKSPACE_DIR": str(self.td / "ws")}, self.td
+        )
         self.assertTrue(watched, "the named inbox was never watched — the rest is vacuous")
         self.assertTrue(ws_hit, "claims dir was not created under the explicit workspace")
         self.assertFalse(inbox_hit, "claims dir leaked under deliveries/")
 
     def test_without_it_the_inbox_parent_is_taken_as_the_workspace(self):
         """Control: the seam exists — absent the variable, state lands under deliveries/."""
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            ws_hit, inbox_hit, watched = _state_root({}, Path(td))
+        ws_hit, inbox_hit, watched = _state_root({}, self.td)
         self.assertTrue(watched, "the named inbox was never watched — the rest is vacuous")
         self.assertTrue(inbox_hit, "the inbox's parent was not taken as the workspace")
         self.assertFalse(ws_hit)
