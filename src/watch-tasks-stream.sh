@@ -54,7 +54,9 @@ if [ "${1:-}" = "--handler-runner" ]; then
   printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >> "$runner_log" 2>/dev/null || true
   # The receipt outlives this process: the drain reads it when it finds the
   # pid gone, so an exited runner is never mistaken for a dead one.
-  [ -n "$dispatch_dir" ] && printf '%s\n' "$handler_rc" > "$dispatch_dir/settled/$filename.rc" 2>/dev/null
+  if [ -n "$dispatch_dir" ]; then
+    printf '%s\n' "$handler_rc" > "$dispatch_dir/settled/$filename.rc" 2>/dev/null
+  fi
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
 fi

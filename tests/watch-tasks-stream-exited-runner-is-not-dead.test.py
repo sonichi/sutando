@@ -16,7 +16,9 @@ from __future__ import annotations
 import importlib.util
 import os
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -65,6 +67,64 @@ def scenario_receipt_outranks_missing_result():
         h.stop()
 
 
+def scenario_the_runner_writes_the_receipt():
+    """The producer half, driven through the real --handler-runner call: a handler
+    that exits 7 must leave `7` in the settled receipt, written before the fifo
+    signal. Fabricating the receipt would pin the drain and not the runner."""
+    with tempfile.TemporaryDirectory(prefix="runner-receipt-") as tmp:
+        root = Path(tmp)
+        ws = root / "ws"
+        (ws / "logs").mkdir(parents=True)
+        (ws / "results").mkdir()
+        dispatch = root / "dispatch"
+        for sub in ("pending", "running", "settled", "workers"):
+            (dispatch / sub).mkdir(parents=True)
+        handler = root / "handler.sh"
+        handler.write_text("#!/bin/sh\nexit 7\n")
+        handler.chmod(0o755)
+        task = ws / "task-demo.txt"
+        task.write_text("task: demo\n")
+        fifo = root / "events"
+        os.mkfifo(fifo)
+        # The runner's HANDLER_DONE write blocks until a reader opens the fifo.
+        rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        env = dict(os.environ)
+        env.update(SUTANDO_TASKS_DIR=str(ws / "tasks"), SUTANDO_WORKSPACE_DIR=str(ws),
+                   SUTANDO_WORKSPACE=str(ws))
+
+        def run(*extra):
+            return subprocess.run(
+                ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), "--handler-runner",
+                 str(handler), "claude", str(ws), str(task), str(ws / "results"), str(REPO),
+                 str(fifo), "task-demo.txt", *extra],
+                env=env, timeout=60, capture_output=True, text=True)
+
+        proc = run(str(dispatch))
+        check("runner: the --handler-runner call exits 0", proc.returncode == 0,
+              f"rc={proc.returncode} stderr={proc.stderr[-200:]!r}")
+        receipt = dispatch / "settled" / "task-demo.txt.rc"
+        check("runner: the real runner writes the rc receipt", receipt.is_file())
+        check("runner: the receipt carries the handler's exit code",
+              receipt.is_file() and receipt.read_text().strip() == "7",
+              receipt.read_text() if receipt.is_file() else "<absent>")
+        signalled = b""
+        deadline = time.time() + 10
+        while b"\n" not in signalled and time.time() < deadline:
+            try:
+                signalled += os.read(rfd, 4096)
+            except BlockingIOError:
+                time.sleep(0.05)
+        check("runner: the fifo still carries HANDLER_DONE with the same rc",
+              signalled.decode().strip() == "HANDLER_DONE: 7 task-demo.txt", repr(signalled))
+
+        receipt.unlink(missing_ok=True)
+        compat = run()  # back-compat control: the old nine-argument call shape
+        check("back-compat control: the receipt-less call shape still exits 0",
+              compat.returncode == 0, f"rc={compat.returncode} stderr={compat.stderr[-200:]!r}")
+        check("back-compat control: it writes no receipt", not receipt.exists())
+        os.close(rfd)
+
+
 def scenario_a_dead_runner_is_still_reaped():
     h = reap.Harness()  # default handler sleeps forever: a runner that can be killed
     h.start()
@@ -83,6 +143,7 @@ def scenario_a_dead_runner_is_still_reaped():
 
 if __name__ == "__main__":
     scenario_receipt_outranks_missing_result()
+    scenario_the_runner_writes_the_receipt()
     scenario_a_dead_runner_is_still_reaped()
     print(f"{len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
