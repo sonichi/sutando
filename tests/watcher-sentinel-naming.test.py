@@ -15,6 +15,7 @@ with each other and disagreed with production, which is why "the two agree" is
 no longer an assertion here.
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -302,6 +303,51 @@ class AnUnavailableEncoderIsNotADefaultInstance(unittest.TestCase):
 
         with unittest.mock.patch("importlib.util.spec_from_file_location", boom):
             self.assertIsNone(up._runtime_identity())
+
+
+class AnEnrolledDefaultInstallKeepsTheHistoricNames(unittest.TestCase):
+    """keweichen at a5933d4f: the compatibility test above uses an UNENROLLED
+    empty state dir, so it misses the normal upgrade shape. An enrolled install
+    with no instance env set is the ordinary single-host case, and it was
+    renaming both its sentinel and its durable fallback receipts on upgrade --
+    stranding the historic records as a dead peer."""
+
+    ENROLLED = "@enrolled:ag2.space"
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            os.environ.pop(k, None)
+        (self.d / "auth").mkdir(parents=True, exist_ok=True)
+        (self.d / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": self.ENROLLED}))
+
+    def test_the_sentinel_keeps_the_historic_bare_name(self):
+        self.assertEqual(up.watcher_sentinel_path(self.d).name,
+                         "watch-tasks-stream.pid",
+                         "an enrolled default install must not rename its "
+                         "sentinel on upgrade; the historic file would remain "
+                         "enumerated as a dead peer")
+
+    def test_the_fallback_receipts_keep_the_global_directory(self):
+        """The second durable record keweichen named. Renaming it silently
+        changes the namespace of receipts that already exist."""
+        self.assertEqual(up.handler_fallbacks_dir(self.d).name,
+                         "task-event-handler-fallbacks")
+
+    def test_an_instance_id_still_separates_watchers_on_an_enrolled_host(self):
+        """The compatibility fix must not cost what the change is FOR."""
+        names = set()
+        for inst in ("worker-1", "worker-2"):
+            os.environ["SUTANDO_INSTANCE_ID"] = inst
+            try:
+                names.add(up.watcher_sentinel_path(self.d).name)
+            finally:
+                os.environ.pop("SUTANDO_INSTANCE_ID", None)
+        names.add(up.watcher_sentinel_path(self.d).name)
+        self.assertEqual(len(names), 3,
+                         f"worker-1, worker-2 and default must stay distinct: {names}")
 
 
 if __name__ == "__main__":

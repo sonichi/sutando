@@ -521,7 +521,13 @@ def instance_scope_key(state_dir, instance=None, agent=None) -> str:
     rundir, ikey = ident
     inst = instance if instance is not None else rundir.instance_id()
     who = agent if agent is not None else rundir.agent_id(state_dir)
-    if inst == ikey.DEFAULT_INSTANCE and who == rundir.DEFAULT_ACTOR:
+    # The canonical actor for a state dir is its ENROLLED agent where one exists
+    # — the same pair `stated_default_identity()` reports. Comparing against the
+    # bare constant instead made every enrolled single-instance install rename
+    # its sentinel and its fallback receipts on upgrade, stranding the historic
+    # records as a dead peer.
+    canonical_actor = rundir.enrolled_agent_id(state_dir) or rundir.DEFAULT_ACTOR
+    if inst == ikey.DEFAULT_INSTANCE and who == canonical_actor:
         return ""
     return ikey.instance_key(who, inst)
 
