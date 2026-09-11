@@ -17,19 +17,30 @@ loads it and must keep working without it.
 | --- | --- |
 | `scripts/pool_roster.py` | Bindings the owner writes; a roster the core compiles; the router only reads. |
 | `scripts/worker_identity.py` | A worker's durable identity: which worker, which conversation, which run. |
+| `scripts/pool_delivery.py` | The `deliveries/<recipient>/` sentinel grammar: accept, hold, release. |
 
 Tests are the skill's own: `tests/*.test.py`, discovered by CI's
 `find tests skills -name '*.test.py'` and measured by the same coverage gate.
 
 ## What stays in src (the boundary)
 
-`src/pool_delivery.py` stays in the core. Despite the `pool_` name it is the
-core's own **delivery-record grammar** — the sentinel/accept rules in
-`deliveries/<recipient>/` that the core's task hook and watcher read on every
-task, pool or no pool. Moving it would break a host with no skill installed.
+The test is *who reads it with zero workers configured*: the core reads a
+roster or a worker identity never, and — measured on `main`, not assumed —
+reads delivery records never either.
 
-The line is *who reads it with zero workers configured*: the core reads delivery
-records always, and reads a roster or a worker identity never.
+```
+src/check-pending-tasks.sh   deliveries 0   pool_delivery 0
+src/watch-tasks-stream.sh    deliveries 0   pool_delivery 0
+```
+
+`pool_delivery.py` is the only file implementing the `deliveries/<recipient>/`
+sentinel grammar; every other `deliveries` match in `src/` is an unrelated sense
+of the word in a comment. An earlier draft of this section kept it in the core on
+the grounds that the task hook and watcher read it on every task — that describes
+the caller #4167 would have added, and #4167 was closed before it landed.
+
+So all three pool modules move together, and the boundary rule is unchanged — it
+is the same rule, applied to a fact that moved.
 
 ## How the core reaches this skill
 

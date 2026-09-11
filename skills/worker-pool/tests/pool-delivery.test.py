@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for src/pool_delivery.py — a real filesystem, no mocks."""
+"""Contract tests for skills/worker-pool/scripts/pool_delivery.py — a real filesystem, no mocks."""
 import json
 import os
 import subprocess
@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import pool_delivery as pd
 
 
@@ -340,7 +341,7 @@ class TestPayload(Base):
 class TestCLI(Base):
     def run_cli(self, *args):
         return subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parents[1] / "src" / "pool_delivery.py"),
+            [sys.executable, str(SCRIPTS / "pool_delivery.py"),
              "--workspace", str(self.root), *args],
             capture_output=True, text=True, timeout=30)
 
