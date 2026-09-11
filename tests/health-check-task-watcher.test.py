@@ -15,6 +15,7 @@ Covers:
   b) core alive, sentinel absent → warn
   c) core alive, sentinel holds a dead PID → warn (crashed, sentinel left behind)
   d) core alive, PID alive but argv is not the watcher → warn (PID reuse)
+  d2) ...including when only the OS-authoritative argv vector denies it
   e) core alive, PID alive and argv names the watcher → ok
   f) core alive, sentinel unparseable → warn (not a crash)
   g) the check is registered in run_checks' output
@@ -38,6 +39,11 @@ Covers:
   x) `--fix` actually REACHES the repair (warn never enters `issues`)
   y) under `--json` the repair line stays off stdout, so JSON still parses
   y2) ...and the repair pass's own `_`-prefixed keys stay out of the payload
+
+Hermeticity: every pid below is fabricated, so `_proc_argv_vector` — the
+OS-authoritative reader `_is_watcher_argv` prefers over the injected argv — is
+fabricated module-wide too. Case (aa) spawns real processes and restores the
+real reader for its own duration.
 
 Run: python3 tests/health-check-task-watcher.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -68,6 +74,30 @@ spec.loader.exec_module(hc)
 # Captured before any case swaps it in, so a failing case cannot leak a stub.
 _REAL_PROC_ARGV = hc._proc_argv
 
+# Captured before the module-wide fabrication below: case (aa) spawns real
+# processes, so the real reader is its subject and must stay reachable.
+_HOST_ARGV_VECTOR = hc._proc_argv_vector
+
+_ARGV_VECTORS: "dict[int, list[str]]" = {}
+
+
+def _fabricated_argv_vector(pid: int) -> "list[str] | None":
+    """The OS-authoritative argv reader `_is_watcher_argv` prefers, fabricated
+    for the whole module.
+
+    Every pid these fixtures name is invented, so on a host where one really
+    exists the real reader decides the verdict and the injected argv is ignored.
+    A pid absent from the map has no authoritative vector -- the macOS
+    behaviour this suite was written against, now stated rather than inherited.
+    """
+    try:
+        return _ARGV_VECTORS.get(int(pid))
+    except (TypeError, ValueError):
+        return None
+
+
+hc._proc_argv_vector = _fabricated_argv_vector
+
 
 def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
     """Build a temp workspace. `core_alive` stamps a fresh heartbeat file;
@@ -90,6 +120,7 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
 def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None,
               pid_instance: "str | None" = "",
               pid_actor: "str | None" = "",
+              argv_vectors: "dict | None" = None,
               trees: dict | None = None, parents: dict | None = None) -> dict:
     """Call check_task_watcher against a temp WORKSPACE_DIR. `argv` patches
     the _proc_argv probe: None = leave the real one (only used where no PID
@@ -99,13 +130,20 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     it has unknown parentage. The parent probes are stubbed unconditionally —
     `trees` invents pids, and an unstubbed probe reads the HOST's process table,
     where a fabricated pid may really exist and carry a real parent.
+    
+    `argv_vectors` maps a fabricated pid to the OS-authoritative argv vector the
+    module-wide fabrication reports for it; a pid absent from it has none, so
+    the injected flat `argv` decides.
     """
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
                  hc._pid_actor_id)
+        saved_vectors = dict(_ARGV_VECTORS)
         try:
+            _ARGV_VECTORS.clear()
+            _ARGV_VECTORS.update({int(p): v for p, v in (argv_vectors or {}).items()})
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
@@ -118,6 +156,8 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             hc._pid_actor_id = lambda pid: pid_actor
             return hc.check_task_watcher()
         finally:
+            _ARGV_VECTORS.clear()
+            _ARGV_VECTORS.update(saved_vectors)
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
              hc._pid_actor_id) = saved
@@ -547,6 +587,22 @@ def case_d_pid_reuse_warns() -> list[str]:
     return []
 
 
+def case_d2_an_OS_vector_that_denies_the_script_is_PID_reuse() -> list[str]:
+    """The flattened argv names the watcher and the authoritative vector denies
+    it; the OS wins. This is the exact host shape the fixtures used to inherit
+    by accident — now injected, so the branch is covered on every platform."""
+    r = run_check(core_alive=True, pid_text="4242",
+                  argv="bash src/watch-tasks-stream.sh",
+                  argv_vectors={4242: ["/usr/bin/python3",
+                                       "/opt/app/unrelated-worker.py"]})
+    if r["status"] != "warn":
+        return [f"d2) an OS vector denying the script should warn, got "
+                f"{r['status']} ({r['detail']})"]
+    if "reuse" not in r["detail"]:
+        return [f"d2) detail should name PID reuse, got {r['detail']!r}"]
+    return []
+
+
 def case_e_live_watcher_is_ok() -> list[str]:
     r = run_check(core_alive=True, pid_text="4242", argv="bash src/watch-tasks-stream.sh")
     if r["status"] != "ok":
@@ -781,6 +837,10 @@ def case_aa_argv_classification_binds_to_the_executed_script():
 
     fails = []
     tmp = tempfile.mkdtemp()
+    # The module-wide fabrication would answer for these pids; here the real
+    # reader IS the subject, and the processes it reads are real.
+    saved_vector = hc._proc_argv_vector
+    hc._proc_argv_vector = _HOST_ARGV_VECTOR
 
     def mk(rel):
         path = os.path.join(tmp, rel)
@@ -810,6 +870,7 @@ def case_aa_argv_classification_binds_to_the_executed_script():
                 proc.kill()
                 proc.wait()
     finally:
+        hc._proc_argv_vector = saved_vector
         shutil.rmtree(tmp, ignore_errors=True)
     return fails
 
@@ -837,6 +898,7 @@ def main() -> int:
         ("b", case_b_sentinel_absent_warns),
         ("c", case_c_dead_pid_warns),
         ("d", case_d_pid_reuse_warns),
+        ("d2", case_d2_an_OS_vector_that_denies_the_script_is_PID_reuse),
         ("e", case_e_live_watcher_is_ok),
         ("f", case_f_unparseable_sentinel_warns),
         ("g", case_g_registered_in_run_checks),
