@@ -201,5 +201,49 @@ class BindingsInTheSnapshot(unittest.TestCase):
         self.assertEqual(pa.snapshot(pr.load_roster(ws), now=1)["bindings"], {})
 
 
+class EnsureAtBoot(unittest.TestCase):
+    def _ws(self, version=1):
+        ws = Path(tempfile.mkdtemp())
+        pr.compile_roster(ws, {"w1": {"label": "alpha", "state": "live"}}, {}, version=version)
+        return ws
+
+    def test_an_existing_roster_without_the_file_gets_one(self):
+        ws = self._ws()
+        path = pa.ensure_advertisement(ws, now=5)
+        self.assertEqual(path, pa.advertisement_path(ws))
+        self.assertEqual(json.loads(path.read_text())["workers"]["roster_version"], 1)
+
+    def test_a_current_file_is_left_alone(self):
+        ws = self._ws()
+        path = pa.write_advertisement(ws, now=5)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        pa.ensure_advertisement(ws, now=9)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_a_roster_that_moved_past_the_file_rewrites_it(self):
+        ws = self._ws()
+        pa.write_advertisement(ws, now=5)
+        pr.compile_roster(ws, {"w1": {"label": "alpha", "state": "live"},
+                              "w2": {"label": "beta", "state": "live"}}, {}, version=2)
+        got = json.loads(pa.ensure_advertisement(ws, now=9).read_text())
+        self.assertEqual(got["workers"]["roster_version"], 2)
+        self.assertEqual(sorted(got["profile_workers"]), ["w1", "w2"])
+
+    def test_no_roster_means_nothing_and_is_not_an_error(self):
+        ws = Path(tempfile.mkdtemp())
+        self.assertIsNone(pa.ensure_advertisement(ws))
+        self.assertFalse(pa.advertisement_path(ws).exists())
+        self.assertEqual(pa.main(["--workspace", str(ws), "--ensure"]), 0)
+
+    def test_the_cli_ensure_writes_for_an_existing_roster(self):
+        ws = self._ws()
+        self.assertEqual(pa.main(["--workspace", str(ws), "--ensure"]), 0)
+        self.assertTrue(pa.advertisement_path(ws).exists())
+
+    def test_boot_calls_ensure(self):
+        boot = (Path(__file__).resolve().parent.parent / "src" / "startup.sh").read_text()
+        self.assertIn('pool_advertise.py" --workspace "$WORKSPACE" --ensure', boot)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

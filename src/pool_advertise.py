@@ -128,12 +128,36 @@ def write_advertisement(workspace, now=None) -> Path:
     return path
 
 
+def ensure_advertisement(workspace, now=None):
+    """Write the advertisement when the roster has moved past it (or it is
+    missing); None when there is no roster. For boot, where a compile may
+    have happened while nothing was running to advertise it."""
+    roster_file = pr.roster_path(workspace)
+    if not roster_file.exists():
+        return None
+    path = advertisement_path(workspace)
+    version = pr.load_roster(workspace).get("version")
+    try:
+        current = json.loads(path.read_text())["workers"]["roster_version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        current = None
+    if current is not None and current == version:
+        return path
+    return write_advertisement(workspace, now=now)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="build the pool's broker advertisement")
     ap.add_argument("--workspace", default=None)
     ap.add_argument("--write", action="store_true",
                     help="also write state/pool-advertisement.json for the bridge")
+    ap.add_argument("--ensure", action="store_true",
+                    help="write the file only if the roster has moved past it; no roster is not an error")
     a = ap.parse_args(argv)
+    if a.ensure:
+        path = ensure_advertisement(a.workspace)
+        print(path if path else "pool-advertise: no roster, nothing to advertise", file=sys.stderr)
+        return 0
     try:
         ad = advertisement(a.workspace)
         if a.write:

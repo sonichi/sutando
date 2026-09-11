@@ -48,6 +48,7 @@ class Base(unittest.TestCase):
             (Path(workspace) / "deliveries" / wid).mkdir(parents=True)
             (Path(workspace) / "state" / "workers" / wid).mkdir(parents=True)
             return {"worker_id": wid, "label": kw.get("label") or wid,
+                    "runtime": kw.get("runtime") or "claude",
                     "cwd": kw.get("cwd") or str(repo),
                     "delivery_dir": str(Path(workspace) / "deliveries" / wid),
                     "tmux": {"socket": "/tmp/s.sock", "session_name": f"w-{wid}"}}
@@ -72,6 +73,27 @@ class TestTheRosterCannotGoStale(Base):
         labels = [w["label"] for w in got["profile_workers"].values()]
         self.assertEqual(labels, ["alpha"])
         self.assertEqual(len(got["workers"]["live_cores"]) + len(got["workers"]["dead_cores"]), 1)
+
+    def test_the_resolved_runtime_reaches_the_roster_and_the_advertisement(self):
+        self.assertEqual(self.run_cli("--label", "Research", "--runtime", "codex"), 0)
+        wid = self.spawned[0]
+        self.assertEqual(pr.load_roster(self.ws)["workers"][wid]["runtime"], "codex")
+        got = json.loads((self.ws / "state" / "pool-advertisement.json").read_text())
+        self.assertEqual(got["profile_workers"][wid], {"label": "Research", "runtime": "codex"})
+
+    def test_an_advertisement_write_failure_is_reported_as_itself(self):
+        real = cw.pa.write_advertisement
+        cw.pa.write_advertisement = lambda ws, now=None: (_ for _ in ()).throw(OSError(28, "No space left"))
+        self.addCleanup(lambda: setattr(cw.pa, "write_advertisement", real))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli("--label", "alpha")
+        self.assertEqual(rc, 1)
+        self.assertIn(self.spawned[0], pr.load_roster(self.ws)["workers"])  # routable
+        self.assertIn("is routable", err.getvalue())
+        self.assertIn("advertisement could not be written", err.getvalue())
+        self.assertNotIn("roster could not be compiled", err.getvalue())
+        self.assertFalse((self.ws / "state" / "pool-advertisement.json").exists())
 
     def test_creating_a_worker_puts_it_in_the_roster(self):
         self.assertEqual(self.run_cli("--label", "reviewer"), 0)
