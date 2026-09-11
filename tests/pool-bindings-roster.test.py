@@ -17,8 +17,10 @@ Run: python3 tests/pool-bindings-roster.test.py
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -262,6 +264,137 @@ class TestBindingLoss(Base):
         pr.compile_roster(self.ws, live(W1, W2), {"!x:ag2.space": W1})
         got = pr.compile_roster(self.ws, live(W1, W2), {"!x:ag2.space": W2})
         self.assertEqual(pr.targets_for(got, "!x:ag2.space"), [W2])
+
+
+# Each child loads the roster inside the production compile and waits at a
+# barrier for its peer, so both read one predecessor and publish in a fixed order.
+CONCURRENT_WRITER = """
+import json, os, sys, time
+sys.path.insert(0, {src!r})
+import pool_roster as pr
+
+ws, room, mine, peer, wrote_first, order = sys.argv[1:7]
+real_load = pr.load_roster
+
+
+def wait_for(path, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline and not os.path.exists(path):
+        time.sleep(0.01)
+
+
+def barriered(workspace):
+    got = real_load(workspace)
+    open(mine, "w").close()
+    # Bounded: under a lock the peer cannot arrive, so this must time out
+    # rather than deadlock the serialised head.
+    wait_for(peer, 3.0)
+    if order == "second":
+        wait_for(wrote_first, 5.0)
+    return got
+
+
+pr.load_roster = barriered
+if order == "second":
+    wait_for(peer, 5.0)   # the first writer is inside compile before this starts
+try:
+    got = pr.compile_roster(ws, {workers!r}, {{"!base:ag2.space": {w1!r}, room: {w1!r}}})
+    print(json.dumps(["OK", got["version"], None]))
+except pr.RosterError as e:
+    print(json.dumps(["RosterError", None, str(e)]))
+if order == "first":
+    open(wrote_first, "w").close()
+"""
+
+
+class TestConcurrentCompiles(Base):
+    """A shared mutable record has ONE writer contract, and a concurrency test
+    calls the production writer. `os.replace` is atomic for the READER; it does
+    not stop two writers validating a shrink against the same predecessor and
+    both publishing, which re-aims the first writer's room at the core — the
+    exact loss this module refuses sequentially. Found in review of this PR."""
+
+    def _run_pair(self):
+        """kewei's repro: both compiles read version 1, then publish left-first."""
+        pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        prog = CONCURRENT_WRITER.format(src=str(REPO / "src"), workers=live(W1), w1=W1)
+        script = self.ws / "writer.py"
+        script.write_text(prog, encoding="utf-8")
+        first_wrote = self.ws / "wrote-first"
+        procs = []
+        for room, name, peer, order in (
+                ("!left:ag2.space", "ready-l", "ready-r", "first"),
+                ("!right:ag2.space", "ready-r", "ready-l", "second")):
+            procs.append(subprocess.Popen(
+                [sys.executable, str(script), str(self.ws), room,
+                 str(self.ws / name), str(self.ws / peer), str(first_wrote), order],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        return [json.loads(p.communicate()[0].strip() or '["CRASH",null,null]') for p in procs]
+
+    def test_a_stale_concurrent_compile_is_refused_not_silently_applied(self):
+        left, right = self._run_pair()
+        outcomes = sorted(o[0] for o in (left, right))
+        self.assertEqual(outcomes, ["OK", "RosterError"],
+                         f"both writers succeeded: {left} {right}")
+        final = pr.load_roster(self.ws)
+        self.assertEqual(pr.targets_for(final, "!left:ag2.space"), [W1],
+                         "the published room was silently re-aimed at the core")
+        self.assertEqual(final["version"], 2)
+        loser = left if left[0] == "RosterError" else right
+        self.assertIn("!left:ag2.space", loser[2])
+        self.assertEqual(pr.targets_for(final, "!right:ag2.space"), [pr.CORE])
+
+    def test_concurrent_compiles_allocate_distinct_versions(self):
+        """Two writers reading one predecessor otherwise allocate one version."""
+        pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        seen, errors = [], []
+
+        def compile_once():
+            try:
+                seen.append(pr.compile_roster(self.ws, live(W1),
+                                              {"!base:ag2.space": W1})["version"])
+            except Exception as exc:  # noqa: BLE001 — a lost race surfaces here
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=compile_once) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(seen), list(range(2, 14)))
+        self.assertEqual(pr.load_roster(self.ws)["version"], 13)
+
+    def test_a_compile_from_a_superseded_version_is_refused(self):
+        """The caller reads, decides, then compiles; the roster moved between."""
+        read = pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        pr.compile_roster(self.ws, live(W1, W2),
+                          {"!base:ag2.space": W1, "!other:ag2.space": W2})
+        with self.assertRaises(pr.RosterError) as e:
+            pr.compile_roster(self.ws, live(W1),
+                              {"!base:ag2.space": W1, "!mine:ag2.space": W1},
+                              expect_version=read["version"])
+        self.assertIn("version", str(e.exception))
+        kept = pr.load_roster(self.ws)
+        self.assertEqual(kept["version"], 2)
+        self.assertEqual(pr.targets_for(kept, "!other:ag2.space"), [W2])
+        self.assertEqual(pr.targets_for(kept, "!mine:ag2.space"), [pr.CORE])
+
+    def test_a_compile_on_the_version_it_read_is_accepted(self):
+        read = pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        got = pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1},
+                                expect_version=read["version"])
+        self.assertEqual(got["version"], read["version"] + 1)
+
+    def test_the_lock_sidecar_is_not_a_roster_record(self):
+        """The guard lives beside the record it guards, so it must not read as
+        one to anything listing state, and must survive the publication."""
+        pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        state = self.ws / "state"
+        self.assertEqual(sorted(p.name for p in state.glob("*.json")), ["roster.json"])
+        self.assertTrue((state / "roster.json.lock").exists())
+        self.assertEqual(pr.load_roster(self.ws)["version"], 1)
+        self.assertEqual(list(state.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

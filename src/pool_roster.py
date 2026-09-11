@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from record_lock import record_lock  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -132,12 +133,20 @@ def unknown_targets(roster: dict, targets) -> list:
 
 
 def compile_roster(workspace, workers: dict, bindings=None, version=None,
-                   allow_unbind=None) -> dict:
+                   allow_unbind=None, expect_version=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended.
 
     A source that loses its binding is re-aimed at the core, so a compile whose
     bindings SHRINK is refused unless `allow_unbind` names the sources released.
+
+    That refusal is only worth anything if it is still true when the roster is
+    published, so the predecessor read, the shrink check, the version and the
+    publication are ONE critical section under `<roster>.lock`.
+
+    A caller decides what to pass from a roster it read BEFORE calling; it names
+    that version as `expect_version` and is refused if the roster moved since,
+    instead of overwriting the writer that moved it.
     """
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
     for wid, row in (workers or {}).items():
@@ -163,15 +172,23 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None,
                 f"binding {source!r} names {missing} which are not workers — "
                 "a binding to a nonexistent target fails every task from that source")
 
-    prev = load_roster(workspace) or {}
-    dropped = sorted(set(prev.get("bindings") or {}) - set(bindings) - set(allow_unbind or ()))
-    if dropped:
-        raise RosterError(
-            f"compile would drop {len(dropped)} binding(s) {dropped} — those sources "
-            "would silently re-aim at the core; name them in allow_unbind to release them")
+    with record_lock(roster_path(workspace)):
+        prev = load_roster(workspace) or {}
+        current = int(prev.get("version") or 0)
+        if expect_version is not None and current != expect_version:
+            raise RosterError(
+                f"roster moved to version {current} since this compile read version "
+                f"{expect_version} — publishing would erase that writer's roster; "
+                "re-read it and recompile")
 
-    roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
-              "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "workers": dict(workers or {}), "bindings": bindings}
-    _write_atomic(roster_path(workspace), roster)
+        dropped = sorted(set(prev.get("bindings") or {}) - set(bindings) - set(allow_unbind or ()))
+        if dropped:
+            raise RosterError(
+                f"compile would drop {len(dropped)} binding(s) {dropped} — those sources "
+                "would silently re-aim at the core; name them in allow_unbind to release them")
+
+        roster = {"version": version if version is not None else current + 1,
+                  "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "workers": dict(workers or {}), "bindings": bindings}
+        _write_atomic(roster_path(workspace), roster)
     return roster
