@@ -4,6 +4,7 @@
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
 #   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
+#                  (implies --scope all: the binary cannot be replaced under the running app)
 #   --scope core          (default) this instance's own session and the components it owns
 #   --scope worker <id>   that worker's watcher and tmux session, nothing else
 #   --scope all           adds the host-wide components every instance shares
@@ -19,8 +20,10 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=process-ops.sh
 . "$REPO/src/process-ops.sh" || { echo "restart.sh: src/process-ops.sh unreadable — refusing to touch any process" >&2; exit 1; }
 
-# Distinct rc: "I could not prove that watcher is mine" is not "stopped".
+# Distinct rc: "I could not prove that watcher is mine" is not "stopped", and
+# "I signalled it and it is still there" is neither.
 RC_WATCHER_UNCONFIRMED=3
+RC_WATCHER_NOT_STOPPED=4
 
 SCOPE="core"
 WORKER_ID=""
@@ -48,6 +51,12 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# A rebuild replaces the app BINARY, so it is an app-wide lifecycle by
+# definition: under core scope it built over a running app and relaunched none.
+if [ "$REBUILD_APP" -eq 1 ] && [ "$SCOPE" = "core" ]; then
+    SCOPE="all"
+    echo "restart.sh: --rebuild-app implies --scope all (the app must be stopped to be replaced)"
+fi
 case "$SCOPE" in
     core|all) ;;
     worker) [ -n "$WORKER_ID" ] || { echo "restart.sh: --scope worker needs an instance id: --scope worker <id>" >&2; exit 2; } ;;
@@ -72,66 +81,54 @@ _shutdown_state() {
   }
 }
 
-# `kill -0` (pops_alive) proves a pid EXISTS and that we may signal it. It never
-# proves the pid is OURS — a dead watcher's number is reissued, and the next
-# holder answers identically. Ownership is the sentinel's identity record
-# agreeing with the live process on every field it claims; a check that cannot
-# be answered is a refusal, never a pass.
+# `kill -0` (pops_alive) proves a pid EXISTS, never that it is OURS: a dead
+# watcher's number is reissued and the next holder answers identically. The
+# policy that decides ownership is src/watcher_identity.py, shared with
+# health-check.py; this function is only its process I/O.
+#
 # Sets WATCHER_OWNER_PID on success, WATCHER_OWNER_REASON on refusal. NOT via
 # stdout: `$( )` is a subshell and the reason would die with it.
 _confirm_watcher_owner() {
     local sentinel="$1" want_instance="${2:-}" want_workspace="${3:-}"
-    local pid argv recorded code_path inc inc_file inc_live
+    local owner pid code_path argv inc_file wrote_rc=0
     WATCHER_OWNER_REASON=""; WATCHER_OWNER_PID=""
-    pid="$(head -n1 "$sentinel" 2>/dev/null | tr -d '[:space:]')"
-    case "$pid" in ''|*[!0-9]*)
-        WATCHER_OWNER_REASON="line 1 of $sentinel is not a pid (read \"$pid\")"; return 1 ;;
-    esac
-    if ! sentinel_has_record "$sentinel"; then
-        WATCHER_OWNER_REASON="$sentinel records a pid only — no instance, incarnation or code_path to check pid $pid against"
+    if [ -z "${PY_BIN:-}" ]; then
+        WATCHER_OWNER_REASON="no runnable python3 — the ownership policy cannot be asked, so nothing is ours to signal"
         return 1
     fi
-    # Unconditional: the default instance's key IS the empty string, so a
-    # "compare only when non-empty" gate never checks the core's own sentinel.
-    recorded="$(sentinel_record_field "$sentinel" instance)"
-    if [ "$recorded" != "$want_instance" ]; then
-        WATCHER_OWNER_REASON="instance: $sentinel says \"$recorded\", this scope resolves \"$want_instance\""
+    inc_file="$(sentinel_incarnation_path "$sentinel")"
+    # The record half: a COMPLETE identity naming this install, this instance and
+    # the incarnation the live marker exposes. A missing field is a refusal.
+    if ! owner="$("$PY_BIN" "$REPO/src/watcher_identity.py" owner-pid \
+                    --sentinel "$sentinel" --instance "$want_instance" \
+                    --workspace "$want_workspace" --incarnation-file "$inc_file" 2>&1)"; then
+        WATCHER_OWNER_REASON="$owner"
         return 1
     fi
-    recorded="$(sentinel_record_field "$sentinel" workspace)"
-    if [ -n "$recorded" ] && [ -n "$want_workspace" ] && [ "$recorded" != "$want_workspace" ]; then
-        WATCHER_OWNER_REASON="workspace: $sentinel says \"$recorded\", this install is \"$want_workspace\""
-        return 1
-    fi
-    code_path="$(sentinel_record_field "$sentinel" code_path)"
-    if [ -z "$code_path" ]; then
-        WATCHER_OWNER_REASON="code_path: $sentinel records none, so pid $pid's argv cannot be matched to our checkout"
-        return 1
-    fi
+    IFS=$'\t' read -r pid code_path <<< "$owner"
     if ! pops_alive "$pid"; then
         WATCHER_OWNER_REASON="pid $pid is not alive"
         return 1
     fi
+    # The process half: the EXECUTED script, never containment. `python3 -c pass
+    # /x/watch-tasks-stream.sh` carries that path as data and must not confirm.
     argv="$(pops_argv "$pid")"
-    case "$argv" in *"$WATCHER_SENTINEL_STEM"*) ;; *)
-        WATCHER_OWNER_REASON="argv: pid $pid is not a live $WATCHER_SENTINEL_STEM"; return 1 ;;
-    esac
-    case "$argv" in *"$code_path"*) ;; *)
-        WATCHER_OWNER_REASON="code_path: pid $pid does not run $code_path"; return 1 ;;
-    esac
-    inc="$(sentinel_record_field "$sentinel" incarnation)"
-    if [ -n "$inc" ]; then
-        inc_file="$(sentinel_incarnation_path "$sentinel")"
-        if [ ! -f "$inc_file" ]; then
-            WATCHER_OWNER_REASON="incarnation: $sentinel claims \"$inc\" but the live process exposes no marker at $inc_file"
-            return 1
-        fi
-        inc_live="$(head -n1 "$inc_file" 2>/dev/null | tr -d '[:space:]')"
-        if [ "$inc_live" != "$inc" ]; then
-            WATCHER_OWNER_REASON="incarnation: $sentinel claims \"$inc\", the live marker says \"$inc_live\""
-            return 1
-        fi
+    if ! WATCHER_OWNER_REASON="$("$PY_BIN" "$REPO/src/watcher_identity.py" runs-watcher \
+                    --pid "$pid" --argv "$argv" --code-path "$code_path" 2>&1)"; then
+        return 1
     fi
+    # The shared age policy the startup reaper also asks; errexit-safe, since a
+    # bare call would abort the caller on its rc 1 (reissued) or 2 (unknown).
+    sentinel_pid_wrote_file "$pid" "$sentinel" || wrote_rc=$?
+    if [ "$wrote_rc" -eq 1 ]; then
+        WATCHER_OWNER_REASON="stale sentinel: pid $pid started AFTER $sentinel was stamped — a reissued pid, not its owner"
+        return 1
+    fi
+    if [ "$wrote_rc" -ne 0 ]; then
+        WATCHER_OWNER_REASON="stale sentinel: whether pid $pid wrote $sentinel is UNMEASURABLE — an unprovable owner is a refusal"
+        return 1
+    fi
+    WATCHER_OWNER_REASON=""
     WATCHER_OWNER_PID="$pid"
 }
 
@@ -151,7 +148,22 @@ _stop_watcher_at() {            # <sentinel> [expected-instance] [expected-works
     fi
     pid="$WATCHER_OWNER_PID"
     echo "  watcher stop: signalling this core's watcher (pid $pid)"
-    pops_signal "$pid" TERM
+    # The sentinel is the only record of a watcher that is still running, so it
+    # is released after the stop is CONFIRMED and never before.
+    if ! pops_signal "$pid" TERM; then
+        echo "  watcher stop: SIGNAL FAILED for pid $pid — $sentinel left in place so a retry can still name it"
+        return "$RC_WATCHER_NOT_STOPPED"
+    fi
+    local tries="${SUTANDO_WATCHER_STOP_TICKS:-30}" i=0
+    while [ "$i" -lt "$tries" ]; do
+        pops_alive "$pid" || break
+        pops_grace_tick
+        i=$((i+1))
+    done
+    if pops_alive "$pid"; then
+        echo "  watcher stop: pid $pid is STILL ALIVE after TERM and $tries ticks of grace — $sentinel left in place"
+        return "$RC_WATCHER_NOT_STOPPED"
+    fi
     sentinel_release_if_owner "$sentinel" "$pid"
     return 0
 }

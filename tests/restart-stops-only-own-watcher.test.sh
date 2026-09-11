@@ -35,6 +35,7 @@ mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state" "$SB/own" "$SB/
 cp "$REPO/src/restart.sh" "$SB/src/restart.sh"
 cp "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
 cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
+cp "$REPO/src/watcher_identity.py" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 
@@ -142,6 +143,19 @@ printf 'inc1\n' > "${SENTINEL%.pid}.incarnation"
 out3="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
 alive "$PEER_PID"; ck "a live peer watcher recorded under another instance SURVIVES" $?
 grep -q "instance: .* says \"other-worker\"" <<<"$out3"; ck "and the report names the check that refused" $?
+
+# --- the misleading DATA argument -------------------------------------------
+# A REAL process carrying the watcher's own path as an ordinary argument of an
+# interpreter that is not executing it. Containment confirmed this and killed it.
+bash -c 'while :; do /bin/sleep 0.2; done' "$SB/own/watch-tasks-stream.sh" & DATA_PID=$!
+DECOYS="$DECOYS $DATA_PID"
+disown "$DATA_PID" 2>/dev/null
+stamp "$DATA_PID" "$SB/own/watch-tasks-stream.sh"
+out5="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
+alive "$DATA_PID"; ck "a process merely CARRYING the watcher path is NOT killed" $?
+grep -q "argv: pid $DATA_PID is not a live watch-tasks-stream" <<<"$out5"
+ck "and the refusal names the executed-script check" $?
+[ -f "$SENTINEL" ]; ck "its sentinel is retained, not deleted" $?
 
 # --- a pre-identity sentinel ------------------------------------------------
 # Before the watcher writes a record there is nothing to check the pid against,

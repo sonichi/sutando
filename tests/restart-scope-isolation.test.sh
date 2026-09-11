@@ -24,7 +24,7 @@ SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT
 # stubbed, absent, or routed to the fake.
 mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state"
 cp "$REPO/src/restart.sh" "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
-cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
+cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$REPO/src/watcher_identity.py" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$SB/src/startup.sh"
@@ -80,9 +80,14 @@ run() {                         # run <args...> -> $OUT, $RC, call log in $LOG
   ( cd "$SB" && PATH="$SB/bin:$PATH" env \
       SUTANDO_PROCESS_OPS="$FAKE" POPS_LOG="$LOG" \
       POPS_ALIVE_PIDS="$CORE_PID $W1_PID $W2_PID" \
-      "POPS_ARGV_$CORE_PID=/bin/bash $CODE" \
+      "POPS_ARGV_$CORE_PID=${CORE_ARGV:-/bin/bash $CODE}" \
       "POPS_ARGV_$W1_PID=/bin/bash $CODE" \
       "POPS_ARGV_$W2_PID=/bin/bash $CODE" \
+      "POPS_ELAPSED_$CORE_PID=${CORE_ELAPSED-10:00}" \
+      "POPS_ELAPSED_$W1_PID=10:00" "POPS_ELAPSED_$W2_PID=10:00" \
+      POPS_SIGNAL_RC="${POPS_SIGNAL_RC:-0}" \
+      POPS_SIGNAL_SURVIVORS="${POPS_SIGNAL_SURVIVORS:-}" \
+      SUTANDO_WATCHER_STOP_TICKS="${SUTANDO_WATCHER_STOP_TICKS:-3}" \
       POPS_LAUNCHCTL_PRINT_RC="${POPS_LAUNCHCTL_PRINT_RC:-1}" \
       "$@" > "$SB/out.txt" 2>/dev/null )
   RC=$?
@@ -170,12 +175,61 @@ arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
 sed -i.bak "s|^workspace=.*|workspace=/another/install|" "$CORE_SENT"
 refuses "another install's workspace" "workspace:"
 
+# A COMPLETE record is the requirement: an absent claim must never read as
+# "matches the empty default", which is exactly what the default core's key is.
+for field in instance incarnation code_path workspace; do
+  arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+  grep -v "^$field=" "$CORE_SENT" > "$CORE_SENT.tmp" && mv "$CORE_SENT.tmp" "$CORE_SENT"
+  refuses "a record with no $field" "$field:"
+done
+
+# The misleading DATA argument: kewei's probe. The path is carried as an operand
+# of an interpreter that is not running it, and containment alone confirmed it.
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+CORE_ARGV="python3 -c pass $CODE" refuses "a watcher path passed as DATA" "argv: pid $CORE_PID is not a live watch-tasks-stream"
+
+# Two tokens, a shell, and the script name — but a DIFFERENT script is executed.
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+CORE_ARGV="/bin/bash $SB/src/other.sh $CODE" refuses "a shell running some OTHER script" "argv:"
+
+# The stale/reissued process, through the shared age policy: a pid that started
+# AFTER the sentinel was stamped cannot be the process that stamped it.
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+touch -t 202601010000 "$CORE_SENT"
+CORE_ELAPSED="00:01" refuses "a process younger than its sentinel" "reissued pid"
+
+# ...and an UNMEASURABLE age is not permission either.
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+CORE_ELAPSED="" refuses "an unmeasurable process age" "UNMEASURABLE"
+
 # The control for (c): with every field correct the SAME harness confirms and
 # signals, so the refusals above are the guard firing, not the fake misbehaving.
 arm
 restart --stop-only; out="$OUT"
 [ "$RC" = 0 ] && [ "$(signalled)" = "$CORE_PID" ]
 ck "(c) CONTROL: a fully correct record IS confirmed and signalled" $?
+
+# ============================================ (c2) the stop must actually stop
+# The sentinel is the only record of a watcher that is still running. Releasing
+# it on a stop that did not happen loses the identity a retry would need.
+stop_failed() {                 # stop_failed <label> <expected-substring>
+  restart --stop-only; out="$OUT"
+  [ "$RC" = "4" ];                       ck "(c2) $1 — distinct rc 4, not success" $?
+  [ -f "$CORE_SENT" ];                   ck "(c2) $1 — the sentinel is RETAINED" $?
+  grep -q "$2" <<<"$out";                ck "(c2) $1 — the failure is reported" $?
+  ! grep -q "task watcher STOPPED" <<<"$out"
+  ck "(c2) $1 — and nothing claims the watcher was stopped" $?
+}
+
+arm; POPS_SIGNAL_RC=1 stop_failed "a signal that fails" "SIGNAL FAILED for pid $CORE_PID"
+arm; POPS_SIGNAL_SURVIVORS="$CORE_PID" stop_failed "a watcher alive after TERM" "STILL ALIVE after TERM"
+
+# The control for (c2): the same harness with a delivering signal releases the
+# sentinel and exits 0, so the two retentions above are the guard, not inertia.
+arm; restart --stop-only; out="$OUT"
+[ "$RC" = 0 ] && [ ! -e "$CORE_SENT" ]
+ck "(c2) CONTROL: a delivered signal DOES release the sentinel and exit 0" $?
+grep -q '^grace_tick$' "$LOG" || true   # the happy path may need no tick at all
 
 # =========================================== (d) the peer is never named at all
 arm
@@ -224,6 +278,16 @@ grep -q "STUB-STARTUP-REACHED" <<<"$out"; ck "(e) --scope=all runs to completion
 arm; restart; out="$OUT"
 grep -q "Sutando.app not relaunched" <<<"$out"
 ck "(e) core scope does not relaunch an app it never stopped" $?
+
+# --rebuild-app replaces the app binary, so it must reach the app lifecycle even
+# though the caller named no scope: under core it built over a live app.
+arm; restart --rebuild-app --stop-only; out="$OUT"
+grep -q "implies --scope all" <<<"$out"; ck "(e) --rebuild-app says it widened the scope" $?
+grep -q '^pattern_kill src/Sutando/Sutando$' "$LOG"
+ck "(e) --rebuild-app DOES stop the app it is about to replace" $?
+
+# src/stop.sh promises "all services"; the default core scope is not that.
+grep -q -- '--scope all' "$REPO/src/stop.sh"; ck "(e) src/stop.sh asks for the scope it promises" $?
 
 restart --scope nonsense; out="$OUT"; ck "(e) an unknown scope is rejected, not defaulted" "$([ "$RC" = 2 ] && echo 0 || echo 1)"
 restart --scope worker; out="$OUT"; ck "(e) --scope worker without an id is rejected" "$([ "$RC" = 2 ] && echo 0 || echo 1)"

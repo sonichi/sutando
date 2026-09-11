@@ -27,6 +27,7 @@ build() {                       # build <sandbox> [perturbation]
   cp "$REPO/src/restart.sh" "$sb/src/restart.sh"
   cp "$REPO/src/process-ops.sh" "$REPO/src/watcher_sentinel.sh" "$sb/src/"
   cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$sb/src/"
+  cp "$REPO/src/watcher_identity.py" "$sb/src/"
   cp -R "$REPO/src/runtime-api" "$sb/src/runtime-api"
   cp "$REPO/scripts/python-binary.sh" "$sb/scripts/python-binary.sh"
   cat > "$sb/scripts/sutando-config.sh" <<CFG
@@ -96,6 +97,7 @@ run() {                         # run <sandbox> -> stdout of a full restart
       SUTANDO_PROCESS_OPS="$FAKE" POPS_LOG="$1/ops.log" POPS_ALIVE_PIDS="$WPID" \
       SUTANDO_PY="$REPO_PY" \
       "POPS_ARGV_$WPID=/bin/bash $1/src/watch-tasks-stream.sh" \
+      "POPS_ELAPSED_$WPID=10:00" \
       /bin/bash "$1/src/restart.sh" 2>/dev/null )
 }
 

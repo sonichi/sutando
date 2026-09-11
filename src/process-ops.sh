@@ -30,6 +30,14 @@ pops_alive() { kill -0 "$1" 2>/dev/null; }
 # The full argv of one pid, empty when it cannot be read.
 pops_argv() { ps -p "$1" -o args= 2>/dev/null; }
 
+# Elapsed run time of one pid, `ps` format ([[DD-]HH:]MM:SS), empty when unread.
+# src/watcher_sentinel.sh: a process younger than the sentinel did not write it.
+pops_elapsed() { ps -p "$1" -o etime= 2>/dev/null; }
+
+# One tick of the grace a signalled process gets to exit. Absolute, because a
+# stubbed `sleep` on PATH would turn the wait into no wait at all.
+pops_grace_tick() { /bin/sleep "${1:-0.1}"; }
+
 # Host-wide pattern kill. Matches processes of every instance on the machine,
 # so only an all-scope caller may use it, and never for a watcher.
 pops_pattern_kill() { pkill -f "$1" 2>/dev/null; }

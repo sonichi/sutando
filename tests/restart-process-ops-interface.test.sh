@@ -28,7 +28,8 @@ scan() {
 [ -r "$OPS" ]; ck "src/process-ops.sh exists and is readable" $?
 
 # The interface the owner declared, plus the two inspection calls ownership needs.
-for fn in pops_signal pops_alive pops_argv pops_pattern_kill pops_pattern_running \
+for fn in pops_signal pops_alive pops_argv pops_elapsed pops_grace_tick \
+          pops_pattern_kill pops_pattern_running \
           pops_name_running pops_launchctl pops_tmux pops_port_listening; do
   grep -q "^$fn()" "$OPS"; ck "process-ops.sh exposes $fn" $?
 done
@@ -53,6 +54,13 @@ LOG="$SB/ops.log"; : > "$LOG"
 out="$(POPS_LOG="$LOG" SUTANDO_PROCESS_OPS="$REPO/tests/fixtures/process-ops-fake.sh" \
        bash -c '. "$1"; pops_pattern_kill "nothing-real"; pops_signal 424242 TERM' _ "$OPS" 2>&1)"
 grep -q '^pattern_kill nothing-real$' "$LOG"; ck "SUTANDO_PROCESS_OPS routes calls to the fake" $?
+# Every name the interface declares must exist in the fake too: one the fake
+# omits falls through to `command not found`, not to the real implementation.
+for fn in pops_signal pops_alive pops_argv pops_elapsed pops_grace_tick \
+          pops_pattern_kill pops_pattern_running \
+          pops_name_running pops_launchctl pops_tmux pops_port_listening; do
+  grep -q "^$fn()" "$REPO/tests/fixtures/process-ops-fake.sh"; ck "the fake implements $fn" $?
+done
 grep -q '^signal 424242 TERM$' "$LOG"; ck "the fake records signals instead of sending them" $?
 
 # An unreadable injection must fail loudly: silently falling through to the real

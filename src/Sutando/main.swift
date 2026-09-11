@@ -2289,7 +2289,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notify("Sutando", "Restarting all services...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [repoRoot + "/src/restart.sh"]
+        // --scope all: this button says "Restarting all services", and the
+        // default core scope leaves the web client, proxy and this app running.
+        proc.arguments = [repoRoot + "/src/restart.sh", "--scope", "all"]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         DispatchQueue.global(qos: .utility).async {
