@@ -88,7 +88,7 @@ an answer or a decision arrives where the work already is. The surface sits at
 the top of the display near the notch, is placed out of the way of whatever the
 owner is using, and stays until dismissed.
 
-Five components, three of which already exist and are reused unchanged.
+Six components. Three of them already exist and are reused as they are.
 
 ### 1. The notch app — new
 
@@ -113,14 +113,38 @@ card the owner has dragged is never repositioned again.
 on a timer, because a decision surface that disappears mid-read has to be fetched
 and re-read.
 
-### 2. Card kinds — new
+### 2. What a card can show — new
 
-The watched file carries a typed envelope, so a new kind is a new case in one
-renderer rather than a new mechanism. Two kinds cover the figures above: a **web
-card** (a URL, rendered in place — figure 2) and a **triage card** (proposition,
-reason, freshness line, five actions — figure 3).
+The watched file carries a typed envelope, so adding a kind is a new case in one
+renderer rather than a new mechanism. Three tools write it today:
 
-### 3. In-channel navigation — exists, gains an output
+| Tool | Renders |
+|---|---|
+| `show_web` | a URL, loaded in place — figure 2 |
+| `show_card` | structured rows: a title and labelled lines — the shape a triage item needs |
+| `fold_notch` | dismisses the current card |
+
+A triage card is `show_card` with the fields the queue already supplies:
+proposition, reason, the freshness line, and the five actions.
+
+### 3. Resolving what "this" means — exists, and is why figure 2 works
+
+The owner does not read a URL aloud. They highlight it and say *"open this"*.
+Turning that into an absolute URL is its own problem, and the answer is a
+fallback chain rather than one lookup:
+
+1. If the selection is in Discord, `read_selected_discord_text` resolves it and
+   returns the `href` — necessary because the visible label and the real target
+   often differ.
+2. If that resolver finds nothing, a vision query reads the highlighted text off
+   the screen.
+3. The clipboard is used only when the owner says they copied something.
+
+The ordering is the design. Asking the owner to copy a link they have already
+highlighted would hand the work back to them, which is the trip this is meant to
+remove.
+
+### 4. In-channel navigation — exists, gains an output
 
 `skills/discord-voice-overlay/` already tracks the visible Discord channel, the
 hovered message, and the current selection, behind four tools
@@ -128,7 +152,7 @@ hovered message, and the current selection, behind four tools
 `inspect_hovered_discord_message`, `read_selected_discord_text`). They answer by
 speech and nowhere else. Each gains an optional path that also writes a card.
 
-### 4. The triage client — new, thin
+### 5. The triage client — new, thin
 
 sutando-life already serves the queue over HTTP (`GET /api/triage`,
 `/api/triage/freshness`, `POST /api/triage/action`). The notch is a client of
@@ -137,7 +161,7 @@ owner's answer back. No new ranking, no new queue, no new protocol — and the c
 must not cache a queue position, because `next_item` recomputes from the live
 reaction log on every call by design.
 
-### 5. Voice — exists, unchanged
+### 6. Voice — exists, unchanged
 
 Voice is already the input half; the surface is the output half that was missing.
 The owner speaks the request and speaks the answer, and what the card adds is that
