@@ -9115,11 +9115,17 @@ def check_task_watcher() -> dict:
     # A sentinel fault must not be skipped by an earlier remediation return:
     # UNKNOWN or conflicting records veto destructive advice about extra trees.
     tracked = {str(p) for p in live}
-    if (unprovable or collided) and extras_present(trees, live):
+    # EVERY classified record, not just the unprovable ones: a dead, reused or
+    # unreadable sentinel vanished just as silently through the extras returns.
+    if faults and extras_present(trees, live):
+        _veto = ("no stop or restart is advised while a sentinel record is unprovable or "
+                 "conflicting — resolve the records first"
+                 if (unprovable or collided) else
+                 "these records name instances whose watcher state is already known-bad; "
+                 "resolve them before acting on the untracked tree(s)")
         return {"name": name, "status": "warn",
-                "detail": "; ".join(faults) + ". Untracked watcher tree(s) are "
-                          "present too, but no stop or restart is advised while a sentinel record "
-                          "is unprovable or conflicting — resolve the records first"}
+                "detail": "; ".join(faults) + f". Untracked watcher tree(s) are present too, but "
+                          f"{_veto}"}
     extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
         # A root count is not an identity: only a shared sentinel target makes

@@ -697,6 +697,19 @@ class ExtraTreesKeepTheirMultiplicity(unittest.TestCase):
     """keweichen: extras distinct from every TRACKED target can still duplicate
     EACH OTHER, and calling them "not duplicates" erased that."""
 
+    def test_a_DEAD_record_also_survives_the_extras_path(self):
+        """keweichen: the veto covered only unprovable/collided; dead, reused and
+        unreadable records still vanished through the extras returns."""
+        argv = {"100": WATCHER_ARGV, "200": WATCHER_ARGV}
+        r = run({"watch-tasks-stream-A.pid": "100\n",
+                 "watch-tasks-stream-D.pid": "777\n"},
+                {"100": {"100"}, "200": {"200"}},
+                argv=lambda pid: argv.get(str(pid)),
+                targets={"100": "A.pid", "200": "B.pid"})
+        self.assertIn("crashed", r["detail"])
+        self.assertIn("777", r["detail"])
+        self.assertNotIn("Do NOT stop them", r["detail"])
+
     def test_two_extras_on_one_target_are_duplicates_of_each_other(self):
         r = run({"watch-tasks-stream-A.pid": "100\n"},
                 {"100": {"100"}, "200": {"200"}, "300": {"300"}},
