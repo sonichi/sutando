@@ -24,6 +24,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(_REPO / "src"))
 
+import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import spawn_worker as sw  # noqa: E402
@@ -147,6 +148,9 @@ def main(argv=None) -> int:
 
     try:
         roster = compile_with(workspace, made["worker_id"], a.label, a.room)
+        # The picker follows the roster only through this file (the bridge
+        # sends it); a compile without it leaves the picker one worker behind.
+        pa.write_advertisement(workspace)
     except (pr.RosterError, OSError) as e:
         # The worker exists and the roster does not know it: say so loudly with
         # the repair, or it becomes the silent stale-roster case again.

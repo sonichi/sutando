@@ -16,7 +16,10 @@ retry policy belong to whatever already talks to the broker.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import tempfile
+import os
 import sys
 import time
 from pathlib import Path
@@ -83,12 +86,48 @@ def advertisement(workspace, now=None) -> dict:
             "profile_patch": {"workers": profile_workers(roster)}}
 
 
+ADVERTISEMENT_FILE = "pool-advertisement.json"
+
+
+def advertisement_path(workspace) -> Path:
+    """Beside the roster: the bridge reads this file and sends the two bodies."""
+    return pr.roster_path(workspace).parent / ADVERTISEMENT_FILE
+
+
+def write_advertisement(workspace, now=None) -> Path:
+    """Persist the advertisement for the bridge: `workers` is the exact
+    POST /v1/workers body, `profile_workers` the profile card's workers field.
+    Written whole-or-not (temp file + replace) so a reader never sees a torn file."""
+    ad = advertisement(workspace, now)
+    path = advertisement_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"ts": ad["workers_snapshot"]["ts"],
+                       "workers": ad["workers_snapshot"],
+                       "profile_workers": ad["profile_patch"]["workers"]},
+                      indent=2, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(prefix=".pool-advertisement.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return path
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="build the pool's broker advertisement")
     ap.add_argument("--workspace", default=None)
+    ap.add_argument("--write", action="store_true",
+                    help="also write state/pool-advertisement.json for the bridge")
     a = ap.parse_args(argv)
     try:
-        print(json.dumps(advertisement(a.workspace), indent=2))
+        ad = advertisement(a.workspace)
+        if a.write:
+            print(write_advertisement(a.workspace), file=sys.stderr)
+        print(json.dumps(ad, indent=2))
     except FileNotFoundError as e:
         print(f"pool-advertise: {e}", file=sys.stderr)
         return 2

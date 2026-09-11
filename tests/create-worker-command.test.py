@@ -65,6 +65,14 @@ class Base(unittest.TestCase):
 
 
 class TestTheRosterCannotGoStale(Base):
+    def test_creating_a_worker_writes_the_advertisement_file(self):
+        self.run_cli("--label", "alpha")
+        got = json.loads((self.ws / "state" / "pool-advertisement.json").read_text())
+        self.assertEqual(sorted(got), ["profile_workers", "ts", "workers"])
+        labels = [w["label"] for w in got["profile_workers"].values()]
+        self.assertEqual(labels, ["alpha"])
+        self.assertEqual(len(got["workers"]["live_cores"]) + len(got["workers"]["dead_cores"]), 1)
+
     def test_creating_a_worker_puts_it_in_the_roster(self):
         self.assertEqual(self.run_cli("--label", "reviewer"), 0)
         roster = pr.load_roster(self.ws)

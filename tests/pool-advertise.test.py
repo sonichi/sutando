@@ -125,5 +125,38 @@ class TestCli(Base):
         self.assertIn("no roster", err.getvalue())
 
 
+class AdvertisementFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        pr.compile_roster(self.ws, {"w1": {"label": "alpha", "state": "live",
+                                            "runtime": "claude"}}, {}, version=1)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_file_carries_both_bodies_exactly(self):
+        path = pa.write_advertisement(self.ws, now=1700000000)
+        self.assertEqual(path, self.ws / "state" / "pool-advertisement.json")
+        got = json.loads(path.read_text())
+        ad = pa.advertisement(self.ws, now=1700000000)
+        self.assertEqual(got["ts"], 1700000000)
+        self.assertEqual(got["workers"], ad["workers_snapshot"])
+        self.assertEqual(got["profile_workers"], ad["profile_patch"]["workers"])
+        self.assertEqual(got["profile_workers"]["w1"]["label"], "alpha")
+
+    def test_the_write_leaves_no_temp_file_behind(self):
+        pa.write_advertisement(self.ws)
+        names = sorted(p.name for p in (self.ws / "state").iterdir())
+        self.assertNotIn(True, [n.startswith(".pool-advertisement.") for n in names])
+        self.assertIn("pool-advertisement.json", names)
+
+    def test_no_roster_means_no_file(self):
+        empty = Path(tempfile.mkdtemp())
+        with self.assertRaises(FileNotFoundError):
+            pa.write_advertisement(empty)
+        self.assertFalse((empty / "state" / "pool-advertisement.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
