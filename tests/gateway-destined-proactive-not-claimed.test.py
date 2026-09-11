@@ -141,9 +141,8 @@ if failures:
     print("--- bridge output tail ---")
     print(out)
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
-# The stub gateway's serve_forever runs as a daemon thread with no stop condition;
-# interpreter finalization racing one of its writes aborts the process after the
-# assertions have already passed (same teardown race as #3800).
+# serve_forever is a daemon thread with no stop condition; interpreter
+# finalization can race its writes and abort after the assertions pass.
 sys.stdout.flush()
 sys.stderr.flush()
 os._exit(1 if failures else 0)
