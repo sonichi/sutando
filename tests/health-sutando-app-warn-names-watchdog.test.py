@@ -38,8 +38,17 @@ detail = "".join(re.findall(r'"([^"]*)"', m.group(1))) if m else ""
 
 ck("it still names the hotkey consequence", "hotkeys" in detail)
 ck("it names checkWatcher by name", "checkWatcher" in detail)
-ck("it says a dead watcher is NOT recovered",
-   re.search(r"watcher is not recovered", detail, re.I) is not None)
+ck("it says the watcher goes unrecovered",
+   re.search(r"recovered by nothing", detail, re.I) is not None)
+# The claim must carry the CLI-idle condition: checkWatcher defers to the loop
+# whenever cliIsWorking(), so "the app recovers it" overstates the guarantee.
+ck("and scopes it to when the CLI is busy", "while the CLI is busy" in detail)
+
+# The GREEN branch had the same hotkey-only identity, which is why one-line
+# fixes to the warn leave the probe still describing a keyboard convenience.
+green = re.search(r'return f"running \(\{watch\}[^"]*"', SRC)
+ck("the running-line names the watchdog too", green is not None)
+ck("and the watchdog label is defined", 'watcher-watchdog' in SRC)
 
 # The premise the message asserts must be true of the app, or the message lies.
 SWIFT = REPO / "src" / "Sutando" / "main.swift"
@@ -48,6 +57,8 @@ sw = SWIFT.read_text() if SWIFT.exists() else ""
 ck("checkWatcher() is defined there", "func checkWatcher()" in sw)
 ck("and it really pgreps for the watcher",
    re.search(r'"-f",\s*"watch-tasks"', sw) is not None)
+ck("cliIsWorking() gates the poke, so the message's scoping is true",
+   "if cliIsWorking()" in sw)
 
 print("\nall ok" if fails == 0 else f"\n{fails} FAILED")
 sys.exit(0 if fails == 0 else 1)

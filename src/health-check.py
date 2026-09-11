@@ -10894,7 +10894,8 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
         labels = "/".join(e["label"] for e in entries if e.get("label"))
     except (OSError, ValueError, TypeError, AttributeError):
         labels = ""
-    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+    watch = "watcher-watchdog + hotkeys"
+    return f"running ({watch}: {labels})" if labels else f"running ({watch}, none published)"
 
 
 def _outermost_bundle(comm: str) -> Optional[Path]:
@@ -12865,11 +12866,12 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # The app also runs checkWatcher(), so "not running" means a dead task
-            # watcher is never recovered — name that, not only the hotkeys.
+            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
+            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
                            "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is not recovered"})
+                                     "absent, so a dead task watcher is recovered by nothing "
+                                     "while the CLI is busy"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
