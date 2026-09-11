@@ -9,7 +9,7 @@ at 300 s — archived into the recovery DM on the next boot instead of being re-
 watcher's sweep. These pin: an import task that has started is never archived, whatever its
 age; one that has not started gets a 30-minute line, not 5; everything else keeps the old rules.
 
-Review of #4177 (qingyun-wu, john-the-dev) added three rules, each pinned below with the
+Review of #4177 (qingyun-wu, john-the-dev) added four rules, each pinned below with the
 reviewer's own repro: (B1) an import task is one carrying a run INTENT — the wizard header,
 `/import-claude-context` as a standalone token, or a documented trigger sentence — never a
 path or bare skill-name mention, so "Review PR 4177 which touches
@@ -17,7 +17,10 @@ skills/import-claude-context/SKILL.md" (3 days old) is an orphan like on main; (
 terminal phases `write_status` produces (`done`, `staged`, `discarded`, `forgot`) end the run
 and count as done, and the phase set is pinned against the writer scripts; (B3) a started
 import whose status.json has not moved for IMPORT_STALL_S (3600 s) is `import-stalled` —
-still left in tasks/, but reported so the recovery DM names it.
+still left in tasks/, but reported so the recovery DM names it; (B4, TestRunIdentity)
+status.json is one global file, so a status counts for a task only when its `task_id` is the
+task's id — an older run A ending after a new request B was queued must never mark B done,
+and a status with no task_id at all keeps the task (`import-unbound`), never archives it.
 
 Run: python3 tests/task-orphan-check-classify.test.py
 """
@@ -43,6 +46,7 @@ IMPORT_SCRIPTS = REPO / "skills" / "import-claude-context" / "scripts"
 
 NOW = 1789134000.0  # 2026-09-11T13:40:00Z
 IMPORT_ID = "task-claude-import-1789133620883"  # queued 13:33:40Z, 379 s before NOW
+OLDER_RUN_ID = "task-claude-import-1789040000000"
 
 
 def _load() -> types.ModuleType:
@@ -85,10 +89,14 @@ class Workspace:
         p.write_text(text)
         return p
 
-    def status(self, phase: str, updated: float) -> None:
+    def status(self, phase: str, updated: float, task_id: str | None = None,
+               run_id: str | None = "6f1c2e0a-9d0b-4a3e-8f4b-1c2d3e4f5a6b") -> None:
+        """status.json as `_common.write_status` shapes it. task_id=None is the legacy /
+        unbound shape (no writer identity); pass the task's id to bind the status to it."""
         d = self.root / "data" / "claude-import"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "status.json").write_text(json.dumps({"phase": phase, "updated_at": iso(updated)}))
+        (d / "status.json").write_text(json.dumps({"phase": phase, "updated_at": iso(updated),
+                                                   "task_id": task_id, "run_id": run_id}))
 
     def cleanup(self):
         self.tmp.cleanup()
@@ -131,27 +139,31 @@ class TestImportTask(ClassifyBase):
         """The acknowledgement's on-disk twin (status.json written after the task) exempts it:
         a 2-hour-old task whose run is still moving is resumed, not orphaned."""
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 7200))
-        self.ws.status("summarizing", NOW - 600)
+        self.ws.status("summarizing", NOW - 600, task_id=IMPORT_ID)
         row = self.one()
         self.assertEqual(row["verdict"], "import-resume")
         self.assertEqual(row["import_intent"], "channel")
+        self.assertEqual(row["import_task_id"], IMPORT_ID)
         self.assertEqual(row["import_phase"], "summarizing")
         self.assertEqual(row["import_idle_s"], 600)
         self.assertIn("summarizing", row["reason"])
         self.assertIn("never archived", row["reason"])
 
     def test_status_from_an_earlier_import_does_not_count_as_started(self):
-        """A previous run's status.json predates this task: it has NOT started."""
+        """A previous run's status.json, bound to its own task: this one has NOT started."""
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 1801))
-        self.ws.status("staged", NOW - 90000)
-        self.assertEqual(self.one()["verdict"], "orphan")
+        self.ws.status("staged", NOW - 90000, task_id=OLDER_RUN_ID)
+        row = self.one()
+        self.assertEqual(row["verdict"], "orphan")
+        self.assertIn(f"belongs to another run (task_id {OLDER_RUN_ID})", row["reason"])
 
-    def test_status_phase_done_after_the_task_is_a_completion_marker(self):
+    def test_status_phase_done_bound_to_the_task_is_a_completion_marker(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 7200))
-        self.ws.status("done", NOW - 100)
+        self.ws.status("done", NOW - 100, task_id=IMPORT_ID)
         row = self.one()
         self.assertEqual(row["verdict"], "done")
         self.assertIn("phase done", row["reason"])
+        self.assertIn(f"bound to this task (task_id {IMPORT_ID})", row["reason"])
 
     # --- B2 (qingyun-wu): every phase the writers produce, decided explicitly ------------
 
@@ -178,7 +190,7 @@ class TestImportTask(ClassifyBase):
         for phase in ("done", "staged", "discarded", "forgot"):
             with self.subTest(phase=phase):
                 self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
-                self.ws.status(phase, NOW - 3 * 86400 + 60)
+                self.ws.status(phase, NOW - 3 * 86400 + 60, task_id=IMPORT_ID)
                 row = self.one()
                 self.assertEqual(row["verdict"], "done")
                 self.assertIn(f"phase {phase}", row["reason"])
@@ -188,7 +200,7 @@ class TestImportTask(ClassifyBase):
         for phase in ("indexed", "extracted", "summarizing", "rolling-up"):
             with self.subTest(phase=phase):
                 self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
-                self.ws.status(phase, NOW - 600)
+                self.ws.status(phase, NOW - 600, task_id=IMPORT_ID)
                 row = self.one()
                 self.assertEqual(row["verdict"], "import-resume")
                 self.assertIn(f"phase {phase}", row["reason"])
@@ -196,7 +208,7 @@ class TestImportTask(ClassifyBase):
     def test_unknown_phase_stays_resumable(self):
         """A phase this classifier has never heard of is not evidence the run ended."""
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
-        self.ws.status("frobnicating", NOW - 600)
+        self.ws.status("frobnicating", NOW - 600, task_id=IMPORT_ID)
         self.assertEqual(self.one()["verdict"], "import-resume")
 
     # --- B3 (john-the-dev): a started import has a recency bound ----------------------
@@ -206,7 +218,7 @@ class TestImportTask(ClassifyBase):
         again (machine slept mid-run). Reported, so the recovery DM names it; still in
         tasks/ so the watcher's sweep can resume it."""
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
-        self.ws.status("scanning", NOW - 3 * 86400 + 5)
+        self.ws.status("scanning", NOW - 3 * 86400 + 5, task_id=IMPORT_ID)
         row = self.one()
         self.assertEqual(row["verdict"], "import-stalled")
         self.assertEqual(row["import_phase"], "scanning")
@@ -217,21 +229,21 @@ class TestImportTask(ClassifyBase):
 
     def test_started_import_moved_ten_minutes_ago_is_resume(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
-        self.ws.status("scanning", NOW - 600)
+        self.ws.status("scanning", NOW - 600, task_id=IMPORT_ID)
         self.assertEqual(self.one()["verdict"], "import-resume")
 
     def test_stall_line_is_one_hour(self):
         self.assertEqual(self.mod.IMPORT_STALL_S, 3600)
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 7200))
-        self.ws.status("summarizing", NOW - 3599)
+        self.ws.status("summarizing", NOW - 3599, task_id=IMPORT_ID)
         self.assertEqual(self.one()["verdict"], "import-resume")
-        self.ws.status("summarizing", NOW - 3600)
+        self.ws.status("summarizing", NOW - 3600, task_id=IMPORT_ID)
         self.assertEqual(self.one()["verdict"], "import-stalled")
 
     def test_terminal_phase_wins_over_staleness(self):
         """A run that ended a week ago is done, not stalled."""
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 8 * 86400))
-        self.ws.status("done", NOW - 7 * 86400)
+        self.ws.status("done", NOW - 7 * 86400, task_id=IMPORT_ID)
         self.assertEqual(self.one()["verdict"], "done")
 
     def test_result_file_beats_everything(self):
@@ -279,7 +291,7 @@ class TestImportTask(ClassifyBase):
             with self.subTest(trigger=trig):
                 self.ws.task("task-1789000000000.txt",
                              self.review_task(f"{self.REVIEW_BODY}, then {trig}."))
-                self.ws.status("summarizing", NOW - 600)
+                self.ws.status("summarizing", NOW - 600, task_id="task-1789000000000")
                 row = self.one()
                 self.assertTrue(row["import"], trig)
                 self.assertEqual(row["import_intent"], trig)
@@ -346,18 +358,166 @@ class TestImportTask(ClassifyBase):
         d.mkdir(parents=True)
         (d / "status.json").write_text(json.dumps({"phase": "indexed"}))
         with unittest.mock.patch.object(Path, "stat", side_effect=OSError("gone")):
-            self.assertEqual(self.mod.import_status(self.ws.root), ("indexed", None))
+            self.assertEqual(self.mod.import_status(self.ws.root), ("indexed", None, None))
 
     def test_status_without_updated_at_falls_back_to_its_mtime(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 1000))
         d = self.ws.root / "data" / "claude-import"
         d.mkdir(parents=True)
         p = d / "status.json"
-        p.write_text(json.dumps({"phase": "indexed"}))
+        p.write_text(json.dumps({"phase": "indexed", "task_id": IMPORT_ID}))
         os.utime(p, (NOW - 500, NOW - 500))
         self.assertEqual(self.one()["verdict"], "import-resume")
+        p.write_text(json.dumps({"phase": "indexed"}))   # unbound: mtime decides started-ness
+        os.utime(p, (NOW - 500, NOW - 500))
+        self.assertEqual(self.one()["verdict"], "import-unbound")
         os.utime(p, (NOW - 5000, NOW - 5000))
         self.assertEqual(self.one()["verdict"], "fresh")
+
+
+class TestRunIdentity(ClassifyBase):
+    """B4 (qingyun-wu, confirmed by john-the-dev): status.json is one global file. A status
+    counts for a task only when its `task_id` is the task's id; a timestamp is not a receipt."""
+
+    TERMINAL = ("done", "staged", "discarded", "forgot")
+
+    def _b(self, queued: float, task_id: str = IMPORT_ID) -> None:
+        self.ws.task(f"{task_id}.txt", import_task_text(task_id=task_id, queued=queued))
+
+    def test_older_run_ending_after_a_new_request_never_marks_it_done(self):
+        """The reviewers' interleaving: request B queued at T; run A (an earlier request)
+        ends at T+100 — status.json bound to A's id at a terminal phase. B was never
+        executed, so it is `orphan` past the 30-minute line (the recovery DM's re-queue
+        line is what the owner must hear) or `fresh` under it — never `done`."""
+        for phase in self.TERMINAL:
+            with self.subTest(phase=phase, age="past the line"):
+                self._b(NOW - 1801)
+                self.ws.status(phase, NOW - 1701, task_id=OLDER_RUN_ID)
+                row = self.one()
+                self.assertEqual(row["verdict"], "orphan", row)
+                self.assertEqual(row["import_task_id"], OLDER_RUN_ID)
+                self.assertIn("never started", row["reason"])
+                self.assertIn(f"belongs to another run (task_id {OLDER_RUN_ID})", row["reason"])
+                self.assertNotIn("import_phase", row)
+            with self.subTest(phase=phase, age="young"):
+                self._b(NOW - 379)
+                self.ws.status(phase, NOW - 279, task_id=OLDER_RUN_ID)
+                row = self.one()
+                self.assertEqual(row["verdict"], "fresh", row)
+                self.assertEqual(row["import_task_id"], OLDER_RUN_ID)
+
+    def test_matching_run_completion_control(self):
+        """Same status, same timing, B's own id → the run B started ended: `done`."""
+        for phase in self.TERMINAL:
+            with self.subTest(phase=phase):
+                self._b(NOW - 1801)
+                self.ws.status(phase, NOW - 1701, task_id=IMPORT_ID)
+                row = self.one()
+                self.assertEqual(row["verdict"], "done", row)
+                self.assertEqual(row["import_task_id"], IMPORT_ID)
+                self.assertEqual(row["import_phase"], phase)
+                self.assertIn(f"bound to this task (task_id {IMPORT_ID})", row["reason"])
+
+    def test_legacy_status_without_task_id_newer_than_the_task_is_import_unbound(self):
+        """A status.json with no task_id (a pre-#4177 writer, or index.py run without
+        --task-id) that post-dates the task may be its run or another's: never archived,
+        listed in the recovery DM with the re-run line, whatever the phase or age."""
+        for phase in self.TERMINAL + ("indexed", "summarizing", "frobnicating"):
+            for queued in (NOW - 379, NOW - 1801, NOW - 3 * 86400):
+                with self.subTest(phase=phase, queued=int(NOW - queued)):
+                    self._b(queued)
+                    self.ws.status(phase, queued + 60, task_id=None)
+                    row = self.one()
+                    self.assertEqual(row["verdict"], "import-unbound", row)
+                    self.assertIsNone(row["import_task_id"])
+                    self.assertEqual(row["import_phase"], phase)
+                    self.assertEqual(row["import_idle_s"], int(NOW - queued - 60))
+                    self.assertIn("cannot be matched to this request", row["reason"])
+                    self.assertIn("never archived", row["reason"])
+                    self.assertIn("recovery DM", row["reason"])
+        out = self.mod.classify_workspace(self.ws.root, NOW)
+        self.assertEqual(out["counts"], {"import-unbound": 1, "total": 1})
+
+    def test_legacy_status_older_than_the_task_is_not_started(self):
+        """No task_id and older than the task: cannot be this task's run — not started."""
+        self._b(NOW - 1801)
+        self.ws.status("done", NOW - 90000, task_id=None)
+        row = self.one()
+        self.assertEqual(row["verdict"], "orphan")
+        self.assertIsNone(row["import_task_id"])
+        self.assertIn("predates this task and carries no task_id", row["reason"])
+        self._b(NOW - 379)
+        self.assertEqual(self.one()["verdict"], "fresh")
+
+    def test_resume_requires_the_bound_id(self):
+        """A resumable phase moving now: bound → import-resume; another task's → this one
+        has not started (fresh / orphan by age); no id → import-unbound."""
+        for queued, unstarted in ((NOW - 379, "fresh"), (NOW - 3 * 86400, "orphan")):
+            with self.subTest(age=int(NOW - queued)):
+                self._b(queued)
+                self.ws.status("summarizing", NOW - 600, task_id=IMPORT_ID)
+                self.assertEqual(self.one()["verdict"], "import-resume")
+                self.ws.status("summarizing", NOW - 600, task_id=OLDER_RUN_ID)
+                self.assertEqual(self.one()["verdict"], unstarted)
+                self.ws.status("summarizing", NOW - 300, task_id=None)   # after the task
+                self.assertEqual(self.one()["verdict"], "import-unbound")
+
+    def test_stalled_requires_the_bound_id(self):
+        """Frozen for three days: bound → import-stalled; another task's → orphan (this
+        request never ran); no id → import-unbound (kept, reported)."""
+        self._b(NOW - 3 * 86400)
+        self.ws.status("scanning", NOW - 3 * 86400 + 5, task_id=IMPORT_ID)
+        self.assertEqual(self.one()["verdict"], "import-stalled")
+        self.ws.status("scanning", NOW - 3 * 86400 + 5, task_id=OLDER_RUN_ID)
+        self.assertEqual(self.one()["verdict"], "orphan")
+        self.ws.status("scanning", NOW - 3 * 86400 + 5, task_id=None)
+        row = self.one()
+        self.assertEqual(row["verdict"], "import-unbound")
+        self.assertEqual(row["import_idle_s"], 3 * 86400 - 5)
+
+    def test_bound_status_counts_by_identity_not_by_clock(self):
+        """The id is the proof: a status bound to this task counts even when its stamp
+        reads earlier than the task's (clock skew between writers)."""
+        self._b(NOW - 1801)
+        self.ws.status("done", NOW - 1901, task_id=IMPORT_ID)
+        self.assertEqual(self.one()["verdict"], "done")
+        self.ws.status("summarizing", NOW - 1901, task_id=IMPORT_ID)
+        self.assertEqual(self.one()["verdict"], "import-resume")
+
+    def test_blank_or_non_string_task_id_reads_as_unbound(self):
+        self._b(NOW - 379)
+        d = self.ws.root / "data" / "claude-import"
+        d.mkdir(parents=True, exist_ok=True)
+        for tid in ("", "   ", 7, ["x"]):
+            with self.subTest(task_id=tid):
+                (d / "status.json").write_text(json.dumps({"phase": "done", "updated_at": iso(NOW - 100),
+                                                           "task_id": tid}))
+                row = self.one()
+                self.assertEqual(row["verdict"], "import-unbound")
+                self.assertIsNone(row["import_task_id"])
+
+    def test_production_writer_stamps_the_task_id_the_classifier_reads(self):
+        """End to end through the importer's real writer: state.json's `run` (what
+        index.py --task-id stores) is what `_common.write_status` stamps on every phase,
+        and the classifier reads exactly that key. Bound to B → done; bound to A → orphan."""
+        sys.path.insert(0, str(IMPORT_SCRIPTS))
+        try:
+            import _common as writer  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(IMPORT_SCRIPTS))
+        self._b(NOW - 1801)
+        d = self.ws.root / "data" / "claude-import"
+        d.mkdir(parents=True, exist_ok=True)
+        for owner, verdict in ((IMPORT_ID, "done"), (OLDER_RUN_ID, "orphan"), (None, "import-unbound")):
+            with self.subTest(owner=owner):
+                (d / "state.json").write_text(json.dumps(
+                    {"sessions": {}, "projects": {},
+                     "run": {"task_id": owner, "run_id": "r-1", "started_at": iso(NOW - 1700)}}))
+                status = writer.write_status(d, "done", sessions=3)
+                self.assertEqual((status["task_id"], status["run_id"]), (owner, "r-1"))
+                row = self.one()   # written just now: newer than the task under the real clock
+                self.assertEqual(row["verdict"], verdict, row)
+                self.assertEqual(row["import_task_id"], owner)
 
 
 class TestOrdinaryTasks(ClassifyBase):
@@ -493,6 +653,13 @@ class TestCli(unittest.TestCase):
         out = json.loads(res.stdout)
         self.assertEqual(out["counts"], {"fresh": 1, "total": 1})
         self.assertEqual(out["tasks"][0]["verdict"], "fresh")
+
+    def test_cli_interleaving_reports_the_status_owner(self):
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 1801))
+        self.ws.status("done", NOW - 100, task_id=OLDER_RUN_ID)
+        out = json.loads(self.run_cli("--workspace", str(self.ws.root), "--now", str(NOW)).stdout)
+        self.assertEqual(out["counts"], {"orphan": 1, "total": 1})
+        self.assertEqual(out["tasks"][0]["import_task_id"], OLDER_RUN_ID)
 
     def test_workspace_resolved_through_sutando_config(self):
         mod = _load()

@@ -85,7 +85,9 @@ class TestOrphanCheckExemption(unittest.TestCase):
     def test_step_3a_rules_are_stated(self):
         self.assertIn("Step 3a", self.text)
         for needle in ("channel_id: onboarding-wizard", "data/claude-import/status.json",
-                       "IMPORT-RESUME", "IMPORT-STALLED", "1800 s", "3600 s", "never archive it",
+                       "IMPORT-RESUME", "IMPORT-STALLED", "IMPORT-UNBOUND", "1800 s", "3600 s",
+                       "never archive it", "only by identity, never by timestamp",
+                       "`status.task_id == <id>`", "`index.py --task-id <id>`",
                        "`/import-claude-context` as a standalone token",
                        "A path or a bare skill-name mention is **not** an intent",
                        "`done`, `staged`, `discarded`, `forgot`"):
@@ -101,7 +103,32 @@ class TestOrphanCheckExemption(unittest.TestCase):
     def test_summary_counts_the_new_verdicts(self):
         self.assertIn("import-resume): I", self.text)
         self.assertIn("import-stalled): S", self.text)
-        self.assertIn("M+K+I+S+J", self.text)
+        self.assertIn("import-unbound): U", self.text)
+        self.assertIn("M+K+I+S+U+J", self.text)
+
+    def test_recovery_dm_lists_unbound_and_stalled_imports_without_moving_them(self):
+        self.assertIn("`unbound_imports`", self.text)
+        self.assertIn("cannot be matched to this request", self.text)
+        self.assertIn("Entries of `stalled_imports` and `unbound_imports` are **not** moved", self.text)
+
+
+class TestIndexIsToldItsTask(unittest.TestCase):
+    """Step 1 passes the task id to index.py, so every status.json the run writes can be
+    matched back to the task by the orphan check."""
+
+    def setUp(self):
+        self.text = IMPORT_SKILL.read_text()
+
+    def test_step_one_passes_the_task_id(self):
+        m = re.search(r"^1\. \*\*Index\*\*(.*?)(?=^2\. )", self.text, re.S | re.M)
+        assert m, "step 1 missing"
+        self.assertIn("index.py --task-id <id> --json", m.group(1))
+        self.assertIn("always pass it", m.group(1))
+        self.assertIn("`run: {task_id, run_id, started_at}`", m.group(1))
+
+    def test_flag_and_files_tables_name_the_run_identity(self):
+        self.assertIn("| `--task-id <id>` | index |", self.text)
+        self.assertIn("`state.json` `run` = `{task_id, run_id, started_at}`", self.text)
 
 
 if __name__ == "__main__":

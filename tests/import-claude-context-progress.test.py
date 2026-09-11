@@ -45,6 +45,10 @@ def _j(path: Path, obj) -> None:
     path.write_text(json.dumps(obj), encoding="utf-8")
 
 
+RUN = {"task_id": "task-claude-import-1789133620883", "run_id": "0d5b7c2e-1f3a-4b6c-9d8e-2a4b6c8d0e1f",
+       "started_at": "2026-09-10T00:00:00Z"}
+
+
 def make_data(data: Path) -> None:
     _j(data / "index.json", {
         "generated_at": "2026-09-10T00:00:00Z", "root": "/Users/o/.claude/projects",
@@ -60,7 +64,7 @@ def make_data(data: Path) -> None:
     _j(data / "state.json", {"sessions": {
         f"{SLUG_A}/{U1}": {"extracted_at": "2026-09-10T00:01:00Z", "chunks": 2},
         f"{SLUG_A}/{U4}": {"extracted_at": "2026-09-10T00:01:00Z", "chunks": 0, "skipped_empty": True},
-    }, "projects": {}})
+    }, "projects": {}, "run": RUN})
 
 
 class TestProgress(unittest.TestCase):
@@ -80,7 +84,8 @@ class TestProgress(unittest.TestCase):
         self.assertEqual((r["projects"], r["rolled_up"], r["entities"], r["staged"]), (2, 0, False, False))
         st = self._status()
         self.assertEqual(st["phase"], "summarizing")
-        self.assertEqual({k: v for k, v in st.items() if k not in ("phase", "updated_at")},
+        self.assertEqual((st["task_id"], st["run_id"]), (RUN["task_id"], RUN["run_id"]))  # carried
+        self.assertEqual({k: v for k, v in st.items() if k not in ("phase", "updated_at", "task_id", "run_id")},
                          {k: v for k, v in r.items() if k != "phase"})
 
         _j(self.data / "summaries" / SLUG_A / f"{U1}.json", {"summary": "s"})
@@ -103,6 +108,7 @@ class TestProgress(unittest.TestCase):
         r = self.m.progress(self.data)
         self.assertEqual((r["phase"], r["staged"]), ("staged", True))
         self.assertEqual(self._status()["phase"], "staged")
+        self.assertEqual(self._status()["task_id"], RUN["task_id"])
 
     def test_no_index_is_refused(self):
         (self.data / "index.json").unlink()

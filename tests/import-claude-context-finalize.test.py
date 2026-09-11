@@ -163,6 +163,17 @@ class TestMemorySinks(Base):
         self.assertEqual(status["phase"], "done")
         self.assertFalse(status["memory_row"])
 
+    def test_status_carries_the_run_from_state(self):
+        """finalize's `done` (and every other phase it writes) carries the run identity
+        index.py stored in state.json, so the orphan check can match it to its task."""
+        run = {"task_id": "task-claude-import-1789133620883", "run_id": "r-fin", "started_at": "2026-09-10T00:00:00Z"}
+        (self.data / "state.json").write_text(json.dumps({"sessions": {}, "projects": {}, "run": run}))
+        self._finalize()
+        status = json.loads((self.data / "status.json").read_text())
+        self.assertEqual((status["phase"], status["task_id"], status["run_id"]),
+                         ("done", run["task_id"], run["run_id"]))
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["run"], run)
+
     def test_missing_index_is_created_without_asking_the_budget(self):
         (self.mem / "MEMORY.md").unlink()
         c, run, _log = self._finalize()

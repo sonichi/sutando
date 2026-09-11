@@ -15,22 +15,39 @@ step 3 (archive moves, the aggregated DM) from the verdicts printed here.
 Verdicts (first match wins):
   done            a completion marker exists — results/<id>.txt (live or
                   archived) or results/proactive-<id>.txt[.sending];
-                  for an import task, also status.json at a TERMINAL phase
-                  (`done`, `staged`, `discarded`, `forgot`) from a run that
-                  started after the task was queued — the run reached its
-                  end; a staged digest waits on an owner reply, which
-                  arrives as a new task.
-  import-stalled  an import task whose run has started (status.json newer
-                  than the task), is at a resumable phase, but whose
-                  status.json has not moved for IMPORT_STALL_S (3600 s):
-                  left in tasks/ (the watcher's sweep still resumes it) but
-                  reported, so step 3 lists it in the recovery DM.
-  import-resume   an import task whose run has started, is at a resumable
-                  phase and moved within the stall bound: left in tasks/
-                  for the watcher's sweep, never archived, whatever its age.
+                  for an import task, also status.json BOUND TO THIS TASK
+                  (`task_id` equal to the task's `id:`) at a TERMINAL phase
+                  (`done`, `staged`, `discarded`, `forgot`) — the run this
+                  task started reached its end; a staged digest waits on an
+                  owner reply, which arrives as a new task.
+  import-stalled  an import task whose bound run is at a resumable phase but
+                  whose status.json has not moved for IMPORT_STALL_S
+                  (3600 s): left in tasks/ (the watcher's sweep still resumes
+                  it) but reported, so step 3 lists it in the recovery DM.
+  import-resume   an import task whose bound run is at a resumable phase and
+                  moved within the stall bound: left in tasks/ for the
+                  watcher's sweep, never archived, whatever its age.
+  import-unbound  an import task, and a status.json newer than it that
+                  carries NO task_id (a legacy writer, or index.py run
+                  without --task-id): it may be this task's run or another's,
+                  so it is never archived — left in tasks/ and listed in the
+                  recovery DM ("an import run started but cannot be matched
+                  to this request; say 'import my Claude history' to re-run").
+                  Fail toward recovery: a spurious DM line is cheap, a wrong
+                  archive loses the owner's import.
   fresh           younger than the age line — 300 s for any task, 1800 s for
-                  an import task that has not started yet.
+                  an import task whose run has not started.
   orphan          no marker and past the age line: step 3 applies.
+
+Identity rule (review of #4177, qingyun-wu + john-the-dev): status.json is one
+global file, so its timestamp alone cannot say WHOSE run it reports — an older
+run A ending (done/staged/discarded/forgot) after a genuine new request B was
+queued read as B's completion, and B was archived without ever executing. A
+status counts for a task only when `status.task_id == task.id` (index.py
+`--task-id` mints the run and `_common.write_status` stamps every phase with
+it). A status bound to a DIFFERENT task is, for this task, the same as no
+status: B gets the not-started rule (fresh under 30 min, else orphan with the
+recovery line — it was never executed, which is what the owner must hear).
 
 An *import task* is an owner-tier task that carries a run INTENT: the legacy
 desktop header `channel_id: onboarding-wizard`, the slash command
@@ -142,23 +159,26 @@ def import_intent(headers: dict, body: str) -> str:
     return " ".join(m.group(0).split()) if m else ""
 
 
-def import_status(workspace: Path) -> tuple[str, float | None]:
-    """(phase, updated_at epoch) from data/claude-import/status.json; ("", None)
-    when absent or unreadable."""
+def import_status(workspace: Path) -> tuple[str, float | None, str | None]:
+    """(phase, updated_at epoch, task_id) from data/claude-import/status.json;
+    ("", None, None) when absent or unreadable. task_id is None when the
+    status carries none (legacy writer, or a run started without --task-id)."""
     p = workspace.joinpath(*IMPORT_STATUS)
     try:
         data = json.loads(p.read_text())
     except (OSError, ValueError):
-        return "", None
+        return "", None, None
     if not isinstance(data, dict):
-        return "", None
+        return "", None, None
     updated = parse_iso(str(data.get("updated_at") or ""))
     if updated is None:
         try:
             updated = p.stat().st_mtime
         except OSError:
             updated = None
-    return str(data.get("phase") or ""), updated
+    tid = data.get("task_id")
+    tid = tid.strip() if isinstance(tid, str) and tid.strip() else None
+    return str(data.get("phase") or ""), updated, tid
 
 
 def completion_marker(results_dir: Path, task_id: str) -> str:
@@ -209,37 +229,57 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     if intent:
         row["import"] = True
         row["import_intent"] = intent
-        phase, updated = import_status(workspace)
-        started = updated is not None and updated >= queued_at
-        if started:
+        phase, updated, status_task = import_status(workspace)
+        present = updated is not None
+        if present:
+            row["import_task_id"] = status_task
+        # The status is THIS task's run only by identity, never by timestamp.
+        bound = present and status_task is not None and status_task == task_id
+        # A status with no task_id that post-dates the task may be its run or
+        # another's: not enough to archive, enough to report.
+        unbound = present and status_task is None and updated >= queued_at
+        if bound or unbound:
             idle_s = max(0, int(now - updated))
             row["import_phase"] = phase or "unknown"
             row["import_idle_s"] = idle_s
-        if started and phase in IMPORT_TERMINAL_PHASES:
+        if bound and phase in IMPORT_TERMINAL_PHASES:
             row.update(verdict="done",
                        reason=f"import run ended: data/claude-import/status.json phase {phase} "
-                              "(terminal), written after this task was queued")
+                              f"(terminal), bound to this task (task_id {task_id})")
             return row
-        if started and idle_s >= IMPORT_STALL_S:
+        if bound and idle_s >= IMPORT_STALL_S:
             row.update(verdict="import-stalled",
                        reason=f"consented import started but stalled at phase {phase or 'unknown'}: "
-                              f"status.json last moved {idle_s}s ago (>= {IMPORT_STALL_S}s); "
-                              "left in tasks/ so the watcher's sweep can resume it, never archived — "
-                              "list it in the recovery DM")
+                              f"status.json (bound to this task) last moved {idle_s}s ago "
+                              f"(>= {IMPORT_STALL_S}s); left in tasks/ so the watcher's sweep can "
+                              "resume it, never archived — list it in the recovery DM")
             return row
-        if started:
+        if bound:
             row.update(verdict="import-resume",
                        reason=f"consented import already started (phase {phase or 'unknown'}, "
-                              f"moved {idle_s}s ago); resumable — left in tasks/ for the "
-                              "watcher's sweep, never archived")
+                              f"moved {idle_s}s ago, status.json bound to this task); resumable — "
+                              "left in tasks/ for the watcher's sweep, never archived")
             return row
+        if unbound:
+            row.update(verdict="import-unbound",
+                       reason=f"an import run started after this task was queued (phase "
+                              f"{phase or 'unknown'}, moved {idle_s}s ago) but status.json carries "
+                              "no task_id, so it cannot be matched to this request; left in tasks/, "
+                              "never archived — list it in the recovery DM with the re-run line")
+            return row
+        if not present:
+            why = "no status.json"
+        elif status_task is not None:
+            why = f"status.json belongs to another run (task_id {status_task})"
+        else:
+            why = "status.json predates this task and carries no task_id"
         if age_s < IMPORT_FRESH_AGE_S:
             row.update(verdict="fresh",
-                       reason=f"consented import not started yet, queued {age_s}s ago "
+                       reason=f"consented import not started yet ({why}), queued {age_s}s ago "
                               f"(< {IMPORT_FRESH_AGE_S}s): watcher will handle")
             return row
         row.update(verdict="orphan",
-                   reason=f"consented import never started in {age_s}s "
+                   reason=f"consented import never started ({why}) in {age_s}s "
                           f"(>= {IMPORT_FRESH_AGE_S}s), no completion marker")
         return row
 
