@@ -181,12 +181,57 @@ def scenario_the_writer_refuses_a_name_outside_the_pools_grammar() -> None:
             check(f"rejects task id {task_id!r}", True)
 
 
+def scenario_a_failed_rename_leaves_nothing_behind() -> None:
+    """The flag is either there or not there. A writer that half-published and
+    left its temp file would hand the next reader a name it cannot classify."""
+    print("\nscenario: the rename fails")
+    ws = Path(tempfile.mkdtemp(prefix="mark-done-fail-"))
+    tid = "task-blocked"
+    # A directory squatting the flag's own name: rename onto it cannot succeed.
+    blocked = pool_delivery.done_flag(ws, WORKER, tid)
+    blocked.mkdir(parents=True)
+    raised = False
+    try:
+        pool_delivery.mark_done(ws, WORKER, tid)
+    except OSError:
+        raised = True
+    check("the writer raises rather than reporting a finish", raised)
+    beside = sorted(p.name for p in blocked.parent.iterdir())
+    check("and no temp file survives the failure", beside == [blocked.name], str(beside))
+    # The reader's half of the same state: malformed, so it names nobody.
+    try:
+        result_claimant.resolve_claimant(ws / "state", tid)
+        check("the drain refuses to attribute the squatted name", False, "it returned a worker")
+    except result_claimant.Unattributable as exc:
+        check("the drain refuses to attribute the squatted name",
+              "not a regular file" in str(exc), str(exc))
+
+
+def scenario_the_cli_entry_point_writes_the_same_flag() -> None:
+    """The watcher reaches the writer through this argv, so it is covered here
+    in-process — a subprocess run would exercise it and measure nothing."""
+    print("\nscenario: pool_delivery.py mark-done")
+    ws = Path(tempfile.mkdtemp(prefix="mark-done-cli-"))
+    rc = pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER,
+                             "mark-done", "--task-id", "task-viacli"])
+    check("the CLI reports success", rc == 0)
+    check("and the drain resolves the flag it wrote",
+          result_claimant.resolve_claimant(ws / "state", "task-viacli") == WORKER)
+    try:
+        pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER, "mark-done"])
+        check("a missing --task-id is rejected, not defaulted", False, "it was accepted")
+    except SystemExit as exc:
+        check("a missing --task-id is rejected, not defaulted", exc.code != 0, str(exc.code))
+
+
 def main() -> int:
     scenario_the_drain_never_sees_a_result_before_its_flag()
     scenario_racing_finishers_do_not_clobber_each_other()
     scenario_a_repeated_finish_is_idempotent()
     scenario_a_crash_after_the_flag_is_the_recoverable_half()
     scenario_the_writer_refuses_a_name_outside_the_pools_grammar()
+    scenario_a_failed_rename_leaves_nothing_behind()
+    scenario_the_cli_entry_point_writes_the_same_flag()
     print("\n" + ("FAILURES: " + ", ".join(FAILURES) if FAILURES else "all checks passed"))
     return 1 if FAILURES else 0
 
