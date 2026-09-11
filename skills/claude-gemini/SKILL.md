@@ -26,6 +26,24 @@ ARGUMENTS: $ARGUMENTS
 - Keep Gemini in the same repo by changing into the target workspace before running it.
 - Prefer `--output-format json` or `stream-json` when another tool will consume the output.
 
+## Delegating Work That Touches `workspace/`
+
+Gemini's own file tools (`read_file`, `write_file`, `glob`, `search_file_content`) honor
+`.gitignore`. This repo ignores `workspace/*` (`.gitignore`), and the workspace is where every
+piece of per-user runtime state lives — `tasks/`, `results/`, `state/`, `logs/`, memory. So those
+tools cannot see any of it, and a run told to read or write there fails with
+`File path ... is ignored by configured ignore patterns`, often retrying the same call instead of
+falling back.
+
+- **A delegation that touches the workspace must be told to use shell commands only** — `cat`,
+  `ls`, `printf`, `mv`, heredocs. Say so in the prompt; the run will otherwise reach for a file
+  tool first and burn turns on the error.
+- **`--approval-mode plan` has no shell tool at all**, so read-only mode has no route to workspace
+  state: file tools are filtered out and `run_shell_command` is unavailable. Read-only questions
+  about runtime state need a mode that can run commands, or the caller must pass the content in.
+- **Paths outside the repo are rejected** as resolving outside the allowed directories (a
+  `~/Library/LaunchAgents` read, for example). Pass `--include-directories <dir>` for those.
+
 ## Quick Checks
 
 ```bash
