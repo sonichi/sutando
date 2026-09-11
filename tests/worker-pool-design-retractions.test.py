@@ -58,10 +58,15 @@ REJECTED = [
      "os.rename",
      "a socket, RPC or message bus between pool members. An agent session "
      "exposes no port, so the filesystem is the substrate."),
-    (r"target_worker|fan_out",
+    # Reject a sender-carried field DECIDING placement, not the field name:
+    # the gateway's target_worker -> requested_worker boundary mapping is prescribed.
+    (r"\bfan_out\b"
+     r"|target_worker[^.;]{0,60}\b(?:honou?r\w*|obey\w*|decide\w*|select\w*|choose\w*|routes?|routed)\b"
+     r"|\b(?:honou?r\w*|obey\w*|follow\w*|routes?|routed)\b[^.;]{0,40}target_worker",
      "roster",
-     "sender-directed routing headers. Placement is read from the roster; a "
-     "sender's message is not a routing instruction."),
+     "a sender-carried routing field that bypasses the roster (fan_out, or a "
+     "target honoured as sent). Placement is read from the roster; a header "
+     "reaches the router only as requested_worker, gated on that roster."),
     (r"least[- ]loaded|busy[- ]cap|auto[- ]?scal(?:e|es|ing)"
      r"|sticky (?:auto-)?affinity|overflow to (?:another|an|the next)",
      "Bindings hold until the owner changes them",
@@ -77,7 +82,7 @@ REJECTED = [
      r"|claims?/ *(?:and|\+) *(?:accepts|receipts|fallbacks)"
      r"|(?:claim|accept|receipt) (?:file|marker|token) "
      r"(?:is|means|marks|records|indicates)",
-     "renaming it claims",
+     "atomic and exclusive",
      "a second claim protocol expressed through separate claim, fallback and "
      "receipt files. Several writers expressing one state through different "
      "files is the defect; one atomically renamed record is the answer. Note "
@@ -190,6 +195,29 @@ class RejectedMechanismsAreNotPrescribed(unittest.TestCase):
                     f"a denial of {pattern!r} was read as a prescription")
 
 
+class ABoundaryMappingIsNotAPrescription(unittest.TestCase):
+    """Discriminating control for the routing-header rejection: naming a field
+    in order to translate it at the boundary is not asserting the mechanism."""
+
+    MAPPING = ("The gateway maps the broker's target_worker onto requested_worker at "
+               "the boundary, so one field reaches the router.")
+    HONOURED = "The router honours target_worker exactly as the sender set it."
+
+    def test_the_mapping_sentence_is_exempt(self):
+        pattern = REJECTED[6][0]
+        self.assertEqual(live_hits(self.MAPPING, pattern), [])
+
+    def test_a_header_honoured_as_sent_still_fires(self):
+        pattern = REJECTED[6][0]
+        self.assertNotEqual(live_hits(self.HONOURED, pattern), [])
+
+    def test_the_mapping_is_not_exempt_by_denial_vocabulary(self):
+        """The exemption must come from the pattern, not from DENIAL words the
+        mapping sentence happens to lack — otherwise a denial-worded prescription
+        would pass for the same reason."""
+        self.assertFalse(any(d in self.MAPPING.lower() for d in DENIAL))
+
+
 class HistoryStaysInTheNotes(unittest.TestCase):
     def test_normative_doc_carries_no_revision_history(self):
         flat = _flat(DOC.read_text(encoding="utf-8")).lower()
@@ -207,7 +235,7 @@ _PROBES = {
     REJECTED[3][0]: "A per-worker plist keeps each seat alive with KeepAlive.",
     REJECTED[4][0]: "A command whose stamp authorises it proceeds straight to execution.",
     REJECTED[5][0]: "Each executor opens a socket back to the scheduler and streams progress over it.",
-    REJECTED[6][0]: "The submitting client sets target_worker in the header and the queue honours it.",
+    REJECTED[6][0]: "The submitting client sets target_worker in the header and the queue honours it as sent.",
     REJECTED[7][0]: "The placement pass hands the ticket to the least-loaded seat currently under its cap.",
     REJECTED[8][0]: "Each worker runs a per-worker proactive loop that wakes on a timer to look for work.",
     REJECTED[9][0]: "A claim file marks that a seat took the ticket, and a receipt file records that it finished.",
