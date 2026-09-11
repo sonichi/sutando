@@ -14,6 +14,17 @@ instance of that drift: auth_preflight.py checked only the vanilla name,
 so a scoped-keychain install (the common case) always read as logged-out
 even while genuinely authenticated, and `bash src/restart.sh` permanently
 aborted startup on a healthy host (2026-09-11).
+
+Property worth stating rather than assuming (review, #4196, 2026-09-11): the
+scoped name is a pure function of the config_dir STRING, not of the machine —
+two different hosts with the same CLAUDE_CONFIG_DIR path produce the identical
+service name (confirmed live: two independent hosts both produced
+`Claude Code-credentials-b0888206` from the same path string). Harmless while
+each machine's Keychain stays local, as it does today; it would become a
+genuine collision (two different secrets, one name) only if some future
+mechanism merged keychain items across machines. Neither observed nor
+implemented anywhere in this codebase as of this fix — noted so it is a known
+property if that ever changes, not a surprise.
 """
 from __future__ import annotations
 
