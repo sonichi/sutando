@@ -36,12 +36,21 @@ for f in "$TASKS_DIR"/*.txt; do
   # A pool worker owns any task with a sentinel in its delivery folder. Which
   # names count is pool_delivery's to say; a second spelling here would drift.
   TASK_ID="${BASENAME%.txt}"
-  HELD_BY_WORKER=0
-  if [ -n "$PYBIN" ] && "$PYBIN" "$REPO_DIR/src/pool_delivery.py" \
-       --workspace "$WORKSPACE" --held "$TASK_ID" >/dev/null 2>&1; then
-    HELD_BY_WORKER=1
+  # 0 held, 1 not held, anything else "could not say". No interpreter is the
+  # separate refusal below, so it keeps reading as 1 rather than as a crash.
+  HELD_RC=1
+  if [ -n "$PYBIN" ]; then
+    "$PYBIN" "$REPO_DIR/src/pool_delivery.py" \
+      --workspace "$WORKSPACE" --held "$TASK_ID" >/dev/null 2>&1
+    HELD_RC=$?
   fi
-  if [ "$HELD_BY_WORKER" = 1 ] || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
+  if [ "$HELD_RC" -gt 1 ]; then
+    # Unknown is not a negative: reporting it would tell the core to answer work
+    # a worker may already hold, and dropping it silently would hide the fault.
+    echo "check-pending-tasks: $TASK_ID — pool_delivery could not say whether a worker holds it (exit $HELD_RC); not reported" >&2
+    continue
+  fi
+  if [ "$HELD_RC" = 0 ] || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
     continue
   fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
