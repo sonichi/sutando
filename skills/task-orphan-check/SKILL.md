@@ -51,6 +51,7 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
    - **`<workspace>/results/archive/<id>.txt`** exists → **DONE** (post-archive case).
    - **`<workspace>/results/proactive-<id>.txt`** OR `.sending` variant exists → see step 2b below for the in-progress-vs-done split.
+   - **`<workspace>/deliveries/<worker>/<id>.accepted`** (or `.claimed`) exists → **DELIVERED**: the route handler handed the task to a pool worker and the worker accepted it. It is in flight there, and the worker's finish archives the task file, so this pass leaves it in `tasks/`, never archives it and never re-queues it, whatever its age. Count it in the summary; do not list it in the recovery DM. (2026-09-11: three owner asks accepted by a worker were archived by this pass and re-queued, so the owner got two answers each.)
 
    **Step 2b — `.sending` contract clarification** (per qingyun-sutando review of #1074):
    - `results/<id>.txt` (no suffix) → task completed AND result body written. **DONE.**
@@ -84,6 +85,7 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
 
 4. **Classify outcome**:
    - **DONE** → archive the task file: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Log: `done: completion marker found at <path>`.
+   - **DELIVERED** → leave alone. Log: `delivered: held by worker <inbox>, its finish archives it`.
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
    - **IMPORT-RESUME** → leave alone (see step 3a). Log: `import-resume: consented import already started (phase <p>)`.
    - **IMPORT-STALLED** → leave alone, but append it to the in-pass `stalled_imports` list so step 3b names it in the DM (see step 3a). Log: `import-stalled: consented import stalled at phase <p>, status.json last moved <idle>s ago`.
@@ -195,11 +197,12 @@ orphan-check complete:
   left fresh for watcher: K
   left for the watcher as a started import (import-resume): I
   left for the watcher but reported as stalled (import-stalled): S
+  left with a pool worker that accepted it (delivered): D
   left for the watcher but reported as unmatched (import-unbound): U
   recovered as orphan (sentinel result written): J
 ```
 
-The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+I+S+U+J ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
+The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+I+S+U+J+D ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
 
 ## What this DOES NOT touch
 

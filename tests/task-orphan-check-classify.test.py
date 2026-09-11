@@ -678,5 +678,62 @@ class TestCli(unittest.TestCase):
             self.assertIsNone(mod.resolve_workspace())
 
 
+class TestWorkerDelivery(ClassifyBase):
+    """A task a pool worker has accepted is in flight there, not an orphan.
+
+    2026-09-11: the route handler delivered three owner asks to a worker
+    (deliveries/<worker>/<id>.accepted); the boot pass read no marker, archived
+    them past 300 s and the core re-queued them, so the owner got two answers each.
+    """
+
+    HELD_ID = "task-88f8f3535989bf32f7"
+    WORKER = "39041ce6a4444e28bf94859ec2426270"
+
+    def held_task(self, queued: float = NOW - 2400) -> Path:
+        return self.ws.task(f"{self.HELD_ID}.txt", chat_task_text(self.HELD_ID, queued, source="ag2space"))
+
+    def mark(self, suffix: str = ".accepted", task_id: str | None = None, worker: str | None = None) -> Path:
+        inbox = self.ws.root / "deliveries" / (worker or self.WORKER)
+        inbox.mkdir(parents=True, exist_ok=True)
+        p = inbox / f"{task_id or self.HELD_ID}{suffix}"
+        p.write_text("")
+        return p
+
+    def test_control_without_a_marker_is_an_orphan(self):
+        """The discriminator: same task, no marker, past the age line -> orphan."""
+        self.held_task()
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_accepted_by_a_worker_is_delivered_whatever_its_age(self):
+        self.held_task(queued=NOW - 3 * 86400)
+        marker = self.mark(".accepted")
+        row = self.one()
+        self.assertEqual(row["verdict"], "delivered", row)
+        self.assertIn(str(marker), row["reason"])
+
+    def test_claimed_by_a_worker_is_delivered_too(self):
+        self.held_task()
+        self.mark(".claimed")
+        self.assertEqual(self.one()["verdict"], "delivered")
+
+    def test_another_tasks_marker_does_not_count(self):
+        self.held_task()
+        self.mark(".accepted", task_id="task-4a5b4bfd1daacdaba2")
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_a_result_file_still_wins_over_delivery(self):
+        """The worker finished: its result is the completion marker, delivery is history."""
+        self.held_task()
+        self.mark(".accepted")
+        (self.ws.root / "results" / f"{self.HELD_ID}.txt").write_text("done\n")
+        self.assertEqual(self.one()["verdict"], "done")
+
+    def test_delivered_is_counted(self):
+        self.held_task()
+        self.mark(".accepted")
+        out = self.mod.classify_workspace(self.ws.root, NOW)
+        self.assertEqual(out["counts"], {"delivered": 1, "total": 1})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

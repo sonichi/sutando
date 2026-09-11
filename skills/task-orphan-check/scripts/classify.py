@@ -35,6 +35,10 @@ Verdicts (first match wins):
                   to this request; say 'import my Claude history' to re-run").
                   Fail toward recovery: a spurious DM line is cheap, a wrong
                   archive loses the owner's import.
+  delivered       a pool worker holds it — deliveries/<worker>/<id>.accepted
+                  (or .claimed) exists: the worker's finish archives the
+                  task, so it is left in tasks/ and never archived here,
+                  whatever its age; counted, not listed in the recovery DM.
   fresh           younger than the age line — 300 s for any task, 1800 s for
                   an import task whose run has not started.
   orphan          no marker and past the age line: step 3 applies.
@@ -192,6 +196,23 @@ def completion_marker(results_dir: Path, task_id: str) -> str:
     return ""
 
 
+DELIVERY_SUFFIXES = (".accepted", ".claimed")
+
+
+def worker_delivery(workspace: Path, task_id: str) -> str:
+    """Path of a worker's in-flight marker for the task, or ''."""
+    # Grammar is pool_delivery's: deliveries/<worker>/<task-id><suffix>; matched
+    # by path only so this skill stays importable with no pool skill installed.
+    root = workspace / "deliveries"
+    if not root.is_dir():
+        return ""
+    for inbox in sorted(p for p in root.iterdir() if p.is_dir()):
+        for suffix in DELIVERY_SUFFIXES:
+            if (inbox / f"{task_id}{suffix}").is_file():
+                return str(inbox / f"{task_id}{suffix}")
+    return ""
+
+
 def channel_label(headers: dict) -> str:
     name = headers.get("room_name") or headers.get("channel_name")
     cid = headers.get("channel_id") or headers.get("chat_id") or ""
@@ -223,6 +244,11 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     marker = completion_marker(workspace / "results", task_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
+        return row
+    held = worker_delivery(workspace, task_id)
+    if held:
+        row.update(verdict="delivered",
+                   reason=f"a worker holds it ({held}); its finish archives the task — left in tasks/")
         return row
 
     intent = import_intent(headers, parsed.body)
