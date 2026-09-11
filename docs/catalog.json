@@ -167,6 +167,16 @@
    "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
    "last_verified": "2026-08-04"
   },
+  "docs/design-voice-navigation-and-triage.md": {
+   "title": "Voice navigation and triage",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "proposed notch surface for sutando-life triage: placement policy, in-channel navigation rendering, one-at-a-time proposal card",
+   "last_verified": "2026-09-11"
+  },
   "docs/host-cli-bindings.md": {
    "title": "Host CLI bindings",
    "audience": [

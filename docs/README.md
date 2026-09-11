@@ -66,6 +66,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Sparrow delivery identity — frozen definitions](sparrow-delivery-identity.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
+- [Voice navigation and triage RFC](design-voice-navigation-and-triage.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
