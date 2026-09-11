@@ -79,6 +79,7 @@ class TestPlan(Base):
     def test_the_watcher_is_pointed_at_the_workers_own_folder(self):
         p = sw.plan(self.ws, REPO)
         self.assertEqual(p["env"]["SUTANDO_TASKS_DIR"], p["delivery_dir"])
+        self.assertEqual(p["env"]["SUTANDO_WORKSPACE_DIR"], str(self.ws))
         self.assertIn(p["worker_id"], p["env"]["SUTANDO_TASKS_DIR"])
 
     def test_working_directory_is_separate_from_the_delivery_directory(self):
@@ -144,6 +145,7 @@ class TestSpawn(Base):
         self.assertEqual(env["SUTANDO_TMUX_SESSION"], got["tmux"]["session_name"])
         self.assertEqual(env["SUTANDO_INSTANCE_ID"], got["worker_id"])
         self.assertEqual(env["SUTANDO_TASKS_DIR"], got["delivery_dir"])
+        self.assertEqual(env["SUTANDO_WORKSPACE_DIR"], str(self.ws))
         self.assertEqual(env["SUTANDO_CLAUDE_SESSION_ID"], got["runtime_session_id"])
         self.assertFalse(any("send-keys" in c for c in t.calls))
 
