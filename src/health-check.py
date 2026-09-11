@@ -3174,6 +3174,47 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
+    """Warn when a long-running skills process is executing code older than disk.
+
+    `live-tree-drift` covers the repo side; nothing covered the skills side, and a
+    skill pulled while its driver is running does not reach that driver -- the
+    process froze its code at launch. Measured 2026-09-10: three pulls in one day
+    left the content driver on superseded code, visible only as the `v=<sha>` stamp
+    in its own log, compared by hand. Absent stamp or absent repo is ok, not warn:
+    a driver that never ran has no drift.
+    """
+    name = "skills-driver-code-drift"
+    import re as _re
+    ws = workspace or resolve_workspace()
+    log = Path(ws) / "state" / "content-driver.log"
+    skills = Path(ws) / "skill-repos" / "sutando-skills"
+    if not log.exists() or not (skills / ".git").exists():
+        return {"name": name, "status": "ok",
+                "detail": "no content-driver log or skills checkout — nothing long-running to compare"}
+    try:
+        stamps = _re.findall(r"v=[0-9a-f]+@([0-9a-f]+)", log.read_text(errors="replace"))
+        running = stamps[-1] if stamps else ""
+        # git_argv, never a bare "git": the stock macOS /usr/bin/git is a CLT stub
+        # that raises an install dialog no timeout or except can suppress.
+        head = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--short", "HEAD"),
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except GitUnavailable:
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host — not asserting drift"}
+    except Exception:
+        return {"name": name, "status": "ok", "detail": "could not read driver stamp or skills HEAD — not asserting drift"}
+    if not running:
+        return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
+    if not head:
+        return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
+    if running == head:
+        return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
+    return {"name": name, "status": "warn",
+            "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
+                       f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "
+                       f"Re-arm the driver (TaskStop + Monitor) and confirm the stamp moves to {head}.")}
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -9583,6 +9624,7 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
 
 # The one owned hook whose effect leaves the workspace; excluded from unattended repair.
 _TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
 
 
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
@@ -11635,6 +11677,25 @@ def check_claude_hook_registration(
                   "you intend to enable it"
                   if only_archive else
                   "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
+        # The omit flag gates DEPRECATED_HOOKS, so prescribing it skips the very pruning a
+        # foreign entry needs and reports `removed=0`, which reads as a successful run.
+        if foreign:
+            # The flag gates ONE deprecated entry (the legacy archive `cp`), not pruning
+            # at large — every other DEPRECATED_HOOKS entry is pruned with it set.
+            archive_foreign = [f for f in foreign if _TRANSCRIPT_ARCHIVE_FAMILY in f]
+            if archive_foreign:
+                remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
+                          "— that flag is what adds the legacy archive form to the prune list, so with "
+                          f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
+                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
+                          "archiver: if this host does not want it, delete that one PreCompact entry "
+                          "afterwards")
+            else:
+                remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
+                          "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
+                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
+                          "installed. If an entry is genuinely foreign (another program or checkout) "
+                          "the installer cannot own it — remove that one by hand")
         if dead and not missing and not foreign:
             remedy = ("re-run the installer that owns each family — it prunes dead copies "
                       "(`bash scripts/install-personal-claude-hook.sh`, "
@@ -12453,6 +12514,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
+    checks.append(check_skills_driver_code_drift())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:

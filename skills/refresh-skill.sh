@@ -61,28 +61,59 @@ refresh_one() {
   sync; sleep "$SETTLE_S"
   rm -rf "$link"
   ln -s "$target" "$link"
-  if [ -L "$link" ]; then echo "  refreshed $name"; else echo "  ERROR restoring $name symlink!"; fi
+  if [ -L "$link" ]; then
+    echo "  refreshed $name"
+    return 0
+  fi
+  echo "  ERROR restoring $name symlink!"
+  return 1
+}
+
+# Wait every background refresh in a chunk and retain failure if ANY child
+# failed. A bare `wait` reports only the job it waits for, which made --all
+# discard an earlier restore failure when another child completed cleanly.
+wait_refresh_batch() {
+  local pid rc=0
+  for pid in "$@"; do
+    wait "$pid" || rc=1
+  done
+  return "$rc"
 }
 
 main() {
   mkdir -p "$SKILLS_DST"
   [ "$#" -ge 1 ] || { echo "usage: refresh-skill.sh <name> [<name> ...] | --all" >&2; exit 2; }
+  local failed=0
   if [ "$1" = "--all" ]; then
     # Each skill's settle is WAITING, not work, so --all runs them concurrently.
     # Chunked, not unbounded: a crash strands at most $REFRESH_SKILL_JOBS as copies,
     # which refresh_one then refuses to touch ("not a symlink").
     local any=0 running=0
+    local -a pids=()
     for link in "$SKILLS_DST"/*; do
       [ -L "$link" ] || continue
       refresh_one "$(basename "$link")" &
+      pids+=("$!")
       any=1; running=$((running + 1))
-      if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi
+      if [ "$running" -ge "$JOBS" ]; then
+        wait_refresh_batch "${pids[@]}" || failed=1
+        pids=(); running=0
+      fi
     done
-    wait
+    if [ "${#pids[@]}" -gt 0 ]; then
+      wait_refresh_batch "${pids[@]}" || failed=1
+    fi
     [ "$any" = 1 ] || echo "  (no symlinked skills under $SKILLS_DST)"
   else
-    for name in "$@"; do refresh_one "$name"; done
+    for name in "$@"; do
+      refresh_one "$name" || failed=1
+    done
   fi
-  echo "done — updated skills are live in the running session (no restart)."
+  if [ "$failed" = 0 ]; then
+    echo "done — updated skills are live in the running session (no restart)."
+  else
+    echo "done — one or more skills failed to refresh; see errors above." >&2
+  fi
+  return "$failed"
 }
 main "$@"
