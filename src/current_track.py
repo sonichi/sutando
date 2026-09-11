@@ -59,6 +59,25 @@ PIN_DEFAULT = re.compile(
 )
 
 
+CONDENSED_NOTE = "_[rotation condensed this entry; the full text is in the archive]_\n"
+
+
+def condense(entry: str, pin=PIN_DEFAULT) -> str:
+    """Heading + only the lines a consumer greps as live state.
+
+    A hold is a LINE, so carrying its whole entry to keep it greppable spends
+    the read budget on prose no consumer reads.
+    """
+    lines = entry.splitlines(keepends=True)
+    if not lines or not pin:
+        return entry
+    held = [l for l in lines[1:] if pin.search(l)]
+    if not held:
+        return entry
+    body = lines[0] + CONDENSED_NOTE + "".join(held)
+    return body if body.endswith("\n") else body + "\n"
+
+
 def lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
@@ -160,6 +179,9 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     if not entries:
         return RotateResult(text, "", True)
     pinned = {i for i, e in enumerate(entries) if pin and pin.search(e)}
+    # A pin buys its HOLD LINES a place in the head, not its whole entry. Charge
+    # the stub, so the bytes it no longer holds go back to the age walk.
+    stub = {i: condense(entries[i], pin) for i in pinned}
     facing = _orientation(entries)
     # Walk from the NEWEST end, whichever that is; a pin never stops the walk, or an
     # old hold would freeze the archive and rotation would free nothing.
@@ -168,23 +190,42 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     # Undetermined orientation protects BOTH ends: the live entry sits at one of
     # them, and no walk direction can be shown to keep it.
     keep = set(pinned) | ({0, len(entries) - 1} if facing is None else set())
+    ends = {0, len(entries) - 1} if facing is None else set()
     # Every entry kept BEFORE the walk is spent budget; charging only the pins let
     # the walk fill the whole cap on top of the protected ends.
-    budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in keep)
+    budget = keep_bytes - _size(preamble) - sum(
+        _size(stub.get(i, entries[i])) if i in pinned and i not in ends else _size(entries[i])
+        for i in keep)
     # The exception exists to keep the LIVE ANCHOR whole. Ask whether THAT entry is
     # already kept -- pinned, or a protected end -- not why it might have been.
     used, started = 0, order[0] in keep
+    walked = set()
     for i in order:
+        if i in pinned and i not in ends:
+            # The stub is already charged, so reaching a pin buys back only the rest.
+            # The newest entry is exempt from the cap, or rotation hides the live anchor.
+            upgrade = _size(entries[i]) - _size(stub[i])
+            if i == order[0] or used + upgrade <= budget:
+                used += upgrade
+                walked.add(i)
+            continue
         if i in keep:
             continue
         if started and used + _size(entries[i]) > budget:
             break
         used += _size(entries[i])
         keep.add(i)
+        walked.add(i)
         started = True
-    head = preamble + "".join(entries[i] for i in sorted(keep))
-    archived = "".join(entries[i] for i in sorted(set(range(len(entries))) - keep))
-    pinned_bytes = sum(_size(entries[i]) for i in pinned)
+    # A pinned entry the walk also reached is recent, so it stays whole; one kept
+    # only by its pin is carried as the stub and its full text goes to the archive.
+    shrunk = {i for i in pinned if i not in walked and i not in ends
+              and _size(stub[i]) < _size(entries[i])}
+    render = {i: (stub[i] if i in shrunk else entries[i]) for i in keep}
+    head = preamble + "".join(render[i] for i in sorted(keep))
+    archived = "".join(entries[i]
+                       for i in sorted((set(range(len(entries))) - keep) | shrunk))
+    pinned_bytes = sum(_size(render[i]) for i in pinned if i in render)
     return RotateResult(head, archived, _size(head) > keep_bytes, pinned_bytes, len(pinned))
 
 

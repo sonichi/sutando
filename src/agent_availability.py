@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from util_paths import watcher_sentinel_path
 from workspace_default import resolve_workspace
 
 AVAILABILITY = ("available", "busy_accepting", "busy_unavailable", "offline", "unknown")
@@ -177,7 +178,9 @@ def _session_started_at(ws: Path) -> float | None:
     """When this core session's task watcher started: it dispatches every task that gets a snapshot and
     dies with the session, so its pid file's mtime is the session boundary (the heartbeat writer is not)."""
     try:
-        return (ws / "state" / "watch-tasks-stream.pid").stat().st_mtime
+        # The writer names this path per instance; a literal here reads another
+        # session's sentinel, or none, and resurrects its snapshot as live work.
+        return watcher_sentinel_path(ws / "state").stat().st_mtime
     except OSError:
         return None
 
