@@ -1,5 +1,9 @@
 # Sutando
 
+> ⚠ **You are on `integration/multi-worker` — a preview branch, never merged.** It is the
+> fifteen open multi-worker PRs merged together so the design can be run and CI'd before
+> they land. Review and merge the PRs themselves; see [`docs/integration-multi-worker.md`](docs/integration-multi-worker.md).
+
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Developer_(May_17%E2%80%9319)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers?since=daily)
 
 **My AI Stand — Realtime by Day, Rewriting Itself by Night.**
