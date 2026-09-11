@@ -25,7 +25,9 @@ A declined event queues no real run, so the watcher drives the same pass over
 `--retry-pass` on that branch too: a host whose traffic is all unbound would
 otherwise never re-deliver deferred work. The probe itself stays read-only.
 
-Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
+Run: named by the pool's install in $SUTANDO_TASK_EVENT_HANDLER, which the
+core's watcher (see dispatch_task in src/watch-tasks-stream.sh) and its Stop
+hook (--parked) both run without knowing what it points at.
 """
 from __future__ import annotations
 
@@ -37,7 +39,10 @@ import time
 import traceback
 from pathlib import Path
 
+# Skill script: siblings here, the core's own modules in src/ (repo root is
+# parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402

@@ -8,7 +8,7 @@ The rules whose violation sends work to someone the owner never addressed:
   * liveness is never read — a sentinel is a file a late worker still finds;
   * work already in flight (`.accepted`) is NOT re-delivered.
 
-Run: python3 tests/pool-router-pass.test.py
+Run: python3 skills/worker-pool/tests/pool-router-pass.test.py
 """
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_delivery as pd  # noqa: E402
 

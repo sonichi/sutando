@@ -199,6 +199,9 @@ jobs:
           # New regressions in the other suites still fail CI immediately.
           # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
           known_failures_file="tests/shell-ci-known-failures.txt"
+          # `skills` too, for the same reason as the Python step below: a skill
+          # owns its own tests/, and the root is optional on a trimmed checkout.
+          sh_roots=(tests); if [ -d skills ]; then sh_roots+=(skills); fi
           while IFS= read -r f; do
             echo "→ $f"
             # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
@@ -234,7 +237,7 @@ jobs:
                 failed=1
               fi
             fi
-          done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
+          done < <(find "${sh_roots[@]}" -name '*.test.sh' -not -path '*/node_modules/*' | sort)
           exit "$failed"
 
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension

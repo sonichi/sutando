@@ -4,7 +4,7 @@
 The exit code IS the routing decision — the watcher acts on nothing else — so
 each branch is pinned against the rule it encodes rather than against a number.
 
-Run: python3 tests/pool-route-handler.test.py
+Run: python3 skills/worker-pool/tests/pool-route-handler.test.py
 """
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
 import pool_route_handler as h  # noqa: E402

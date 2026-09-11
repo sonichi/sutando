@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A failed retry-marker write must not settle unrecoverable work
-# (@keweichen's REQUEST_CHANGES blocker 1 on #4110, src/pool_route_handler.py:163-178).
+# (@keweichen's REQUEST_CHANGES blocker 1 on #4110, now the skill's pool_route_handler _defer).
 #
 # THE DEFECT. `_defer` wrote ONE marker store. With that path obstructed the run
 # still exited 0, so the watcher released its claim, `retry_pass` — which
@@ -21,12 +21,17 @@
 # ISOLATION: a mktemp workspace, asserted to be neither the live one nor the repo
 # before anything is written. Nothing here starts, signals or reads a live watcher.
 #
-# Run: bash tests/pool-route-marker-failure-recovery.test.sh
+# Run: bash skills/worker-pool/tests/pool-route-marker-failure-recovery.test.sh
 set -u
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-HANDLER="$REPO/src/pool_route_handler.py"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+SCRIPTS="$HERE/../scripts"
+HANDLER="$SCRIPTS/pool_route_handler.py"
 HOOK="$REPO/src/check-pending-tasks.sh"
+# The core hook holds no path to this skill: it asks whatever handler the pool's
+# install named. Unnamed, it can ask nobody — which is case 2's whole point.
+export SUTANDO_TASK_EVENT_HANDLER="$HANDLER"
 
 TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-markerfail.XXXXXX")"
 export SUTANDO_TEST_MODE=1
@@ -113,7 +118,7 @@ printf 'not a directory\n' > "$WS/state/pool-route-retry"
 printf 'not a directory\n' > "$WS/tasks/.pool-route-retry"
 ERR="$("$PYBIN" "$HANDLER" --task-file "$WS/tasks/task-nowhere.txt" --workspace "$WS" 2>&1 >/dev/null)"
 RC=$?
-UNSETTLED="$("$PYBIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); import pool_route_handler as h; print(h.UNSETTLED)' "$REPO/src")"
+UNSETTLED="$("$PYBIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); import pool_route_handler as h; print(h.UNSETTLED)' "$SCRIPTS")"
 [ "$RC" = "$UNSETTLED" ] && ok "no store anywhere exits UNSETTLED ($UNSETTLED), not 0" \
                          || bad "no store anywhere exits UNSETTLED" "exit was $RC, expected $UNSETTLED"
 case "$ERR" in

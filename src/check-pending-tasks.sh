@@ -51,17 +51,17 @@ for f in "$TASKS_DIR"/*.txt; do
     continue
   fi
   if [ "$HELD_RC" = 0 ]; then continue; fi
-  # A task parked for a retry pass is a worker's too. Which stores hold a marker
-  # is the route handler's to say; a path spelled here drifts from the writer.
+  # A task parked for a retry pass is a worker's too. The handler the pool's
+  # install named answers; core holds no path to it, so a skill can move.
   PARKED_RC=1
-  if [ -n "$PYBIN" ]; then
-    "$PYBIN" "$REPO_DIR/src/pool_route_handler.py" \
+  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "${SUTANDO_TASK_EVENT_HANDLER}" ]; then
+    "$SUTANDO_TASK_EVENT_HANDLER" \
       --workspace "$WORKSPACE" --parked "$TASK_ID" >/dev/null 2>&1
     PARKED_RC=$?
   fi
   if [ "$PARKED_RC" -gt 1 ]; then
     # Same rule as the hold above: an unanswerable question is not a negative.
-    echo "check-pending-tasks: $TASK_ID — pool_route_handler could not say whether it is parked for retry (exit $PARKED_RC); not reported" >&2
+    echo "check-pending-tasks: $TASK_ID — the task-event handler could not say whether it is parked for retry (exit $PARKED_RC); not reported" >&2
     continue
   fi
   if [ "$PARKED_RC" = 0 ]; then continue; fi

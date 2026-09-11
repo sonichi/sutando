@@ -22,9 +22,13 @@ import os
 import sys
 from pathlib import Path
 
+# Skill script: siblings here, the core's own modules in src/ (repo root is
+# parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_delivery as pd  # noqa: E402
+
 import pool_roster as pr  # noqa: E402
 
 PRIORITY_ORDER = {"urgent": 0, "normal": 1, "low": 2}

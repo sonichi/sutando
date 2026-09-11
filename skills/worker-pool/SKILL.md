@@ -1,6 +1,6 @@
 ---
 name: worker-pool
-description: "Worker-pool modules that the core does not need: the owner-authored bindings + compiled roster the router reads, a worker's durable identity records (worker / session / incarnation), the spawner that creates a worker, and the per-instance watcher gate its session boots through. Optional — the core boots and delivers with this skill absent."
+description: "Worker-pool modules that the core does not need: the owner-authored bindings + compiled roster the router reads, the router pass and the task-event handler that runs it, a worker's durable identity records (worker / session / incarnation), the spawner that creates a worker, and the per-instance watcher gate its session boots through. Optional — the core boots and delivers with this skill absent."
 user-invocable: false
 ---
 
@@ -16,6 +16,8 @@ loads it and must keep working without it.
 | Script | Purpose |
 | --- | --- |
 | `scripts/pool_roster.py` | Bindings the owner writes; a roster the core compiles; the router only reads. |
+| `scripts/pool_router.py` | The router pass: resolve one admitted task against the roster, write deliveries. |
+| `scripts/pool_route_handler.py` | The router, as the core watcher's task-event handler. |
 | `scripts/worker_identity.py` | A worker's durable identity: which worker, which conversation, which run. |
 | `scripts/spawn_worker.py` | Create a worker: an identity, a delivery folder, a tmux session, a watcher. |
 | `scripts/worker_bootstrap.py` | Does THIS instance still need its watcher? The gate `/startup --worker` runs. |
@@ -29,6 +31,14 @@ Tests are the skill's own: `tests/*.test.py`, discovered by CI's
 core's own **delivery-record grammar** — the sentinel/accept rules in
 `deliveries/<recipient>/` that the core's task hook and watcher read on every
 task, pool or no pool. Moving it would break a host with no skill installed.
+Its `--held` question and its `payload` subcommand are core for the same reason:
+the watcher resolves a sentinel to its payload on every delivery-inbox event.
+
+So does the watcher's side of the **task-event handler protocol** in
+`src/watch-tasks-stream.sh` — the probe/real-run exit codes, the `UNSETTLED`
+rc-5 branch that keeps a claim, and the `--retry-pass` it runs on a decline.
+Those are numbers and a verb, not a file: the core runs whatever
+`$SUTANDO_TASK_EVENT_HANDLER` names, and names nothing itself.
 
 So do the launcher's worker-mode seams (`src/agent/*/start-cli.sh`,
 `src/agent/codex/cli/task-notifier.sh`, `src/watch-tasks-stream.sh`): they are
@@ -42,15 +52,27 @@ records always, and reads a roster, a worker identity or a spawner never.
 ## How the core reaches this skill
 
 Nothing in `src/` imports these modules — verified by
-`git grep 'pool_roster\|worker_identity\|spawn_worker\|worker_bootstrap' -- src scripts`,
+`git grep 'pool_roster\|pool_router\|pool_route_handler\|worker_identity\|spawn_worker\|worker_bootstrap' -- src scripts`,
 which returns no hit outside this skill.
 
-There is exactly **one seam**, and it runs the other way — the core's
-`/startup --worker` (in `skills/startup/SKILL.md`) needs this skill's watcher
-gate. It runs `$SUTANDO_WORKER_BOOTSTRAP`, which `scripts/spawn_worker.py` sets
-in the worker session's env and `src/agent/claude/cli/start-cli.sh` forwards
-without knowing what it points at. Unset — a core install with this skill absent
-— the startup skill treats it as `unknown` and starts nothing.
+There are exactly **two seams**, and both run the other way — an env var the
+core forwards and reads, never a path it holds.
+
+`$SUTANDO_WORKER_BOOTSTRAP` names this skill's watcher gate for the core's
+`/startup --worker` (in `skills/startup/SKILL.md`). `scripts/spawn_worker.py`
+sets it in the worker session's env and `src/agent/claude/cli/start-cli.sh`
+forwards it without knowing what it points at. Unset — a core install with this
+skill absent — the startup skill treats it as `unknown` and starts nothing.
+
+`$SUTANDO_TASK_EVENT_HANDLER` names `scripts/pool_route_handler.py`. The pool's
+install sets it; `start-cli.sh` forwards it verbatim and never locates a handler
+by filename (`tests/start-cli-task-event-handler-env.test.sh`). Three core
+callers run it: the watcher's probe and real run, the watcher's `--retry-pass`
+on a declined event, and the Stop hook's `--parked` question
+(`src/check-pending-tasks.sh`). Unset, the watcher dispatches to the core as it
+always did and the hook reports the task — nothing could have parked it, because
+no router ran. Named but unable to answer, `--parked` exits 2 and the hook
+reports nothing and says so: unknown is not a negative.
 
 Any further core-side caller must inject the path the same way (that env var, or
 a `manifest.json` `config` entry per `skills/MANIFEST.md`), never hardcode it. A
@@ -63,10 +85,10 @@ script uses.
 
 ## More is coming
 
-This is part A of an owner-directed restructure. #4108 (the spawn launcher) is
-re-homed here and lands next. The remaining pool work still targets `src/` today
-and must re-home as each lands:
+This is part A of an owner-directed restructure. #4108 (the spawn launcher) and
+#4110 (the router pass) are re-homed here; they land in that order. The
+remaining pool work still targets `src/` today and must re-home as each lands:
 
-#4110 · #4115 · #4119 · #4120 · #4121 · #4162 · #4175 · #4176
+#4115 · #4119 · #4120 · #4121 · #4162 · #4175 · #4176
 
 #4176 edits `src/pool_roster.py` directly and must be rebased onto this move.

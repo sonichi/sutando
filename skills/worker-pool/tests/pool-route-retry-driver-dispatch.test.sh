@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The retry driver has to be reachable on the UNBOUND event path (@keweichen's
-# [P2] on #4110, src/pool_route_handler.py:128).
+# [P2] on #4110, now skills/worker-pool/scripts/pool_route_handler.py main()).
 #
 # THE DEFECT. dispatch_task probes first and only queues a real run on exit 0/4.
 # An unbound task classifies 3, so the real run — the only thing that called
@@ -21,12 +21,13 @@
 # ISOLATION: a mktemp workspace; nothing here starts, signals or reads the live
 # watcher, and no fswatch is launched.
 #
-# Run: bash tests/pool-route-retry-driver-dispatch.test.sh
+# Run: bash skills/worker-pool/tests/pool-route-retry-driver-dispatch.test.sh
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$HERE/../src"
-HANDLER="$SRC/pool_route_handler.py"
+REPO="$(cd "$HERE/../../.." && pwd)"
+SRC="$REPO/src"
+HANDLER="$HERE/../scripts/pool_route_handler.py"
 FAILED=0
 ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=1; }
@@ -53,7 +54,7 @@ setup() {   # $1 = channel_id of the waking task
 run_dispatch() {
   BODY="$(awk '/^dispatch_task\(\) \{/,/^\}/' "$SRC/watch-tasks-stream.sh")"
   SUTANDO_TASK_EVENT_HANDLER="$HANDLER" WORKSPACE_DIR="$WS" RESULTS_DIR="$WS/results" \
-  DISPATCH_DIR="$WS/dispatch" FALLBACKS_DIR="$WS/fallbacks" __REPO_ROOT="$HERE/.." \
+  DISPATCH_DIR="$WS/dispatch" FALLBACKS_DIR="$WS/fallbacks" __REPO_ROOT="$REPO" \
   BODY="$BODY" bash -c '
     set -u
     queued_activity_row()     { :; }

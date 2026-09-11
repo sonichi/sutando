@@ -19,10 +19,12 @@
 # an ordinary core inbox is asserted UNCHANGED, so the fix cannot be "always
 # rewrite the path".
 #
-# Run: bash tests/pool-worker-inbox-composition.test.sh
+# Run: bash skills/worker-pool/tests/pool-worker-inbox-composition.test.sh
 set -u
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+SCRIPTS="$HERE/../scripts"
 FAILED=0
 ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=1; }
@@ -43,7 +45,7 @@ printf 'id: task-body\nchannel_id: !room:x\ntask: the body a worker must read\n'
 PAYLOAD_BYTES="$(wc -c < "$WS/tasks/task-body.txt" | tr -d ' ')"
 
 # 1. Route it with the production router: the delivery is a sentinel, not a copy.
-ROUTED="$("$PYBIN" - "$REPO/src" "$WS" <<'PY'
+ROUTED="$("$PYBIN" - "$SCRIPTS" "$WS" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
 import pool_roster as pr, pool_router as rt
@@ -137,12 +139,12 @@ GOT="$(run_probe "$INBOX" deliveries "$INBOX/task-stale.txt")"
 
 # 5. BOTH RUNTIMES resolve results to <workspace>/results, under exactly the env
 #    spawn_worker hands the launcher. Both resolutions are lifted from production.
-"$PYBIN" - "$REPO" "$WS" "$W" > "$WS/plan-env" <<'PY'
+"$PYBIN" - "$SCRIPTS" "$REPO" "$WS" "$W" > "$WS/plan-env" <<'PY'
 import sys
-sys.path.insert(0, sys.argv[1] + "/src")
+sys.path.insert(0, sys.argv[1])
 import spawn_worker
-p = spawn_worker.plan(sys.argv[2], sys.argv[1], runtime="claude",
-                      socket="/tmp/sutando-test.sock", worker_id=sys.argv[3])
+p = spawn_worker.plan(sys.argv[3], sys.argv[2], runtime="claude",
+                      socket="/tmp/sutando-test.sock", worker_id=sys.argv[4])
 for k, v in sorted(p["env"].items()):
     print(f"{k}={v}")
 PY

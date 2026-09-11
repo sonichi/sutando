@@ -90,8 +90,8 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # What KIND of inbox this is, named by whoever named it: a watcher that inferred
 # "this looks like a delivery folder" from the path would decide it for itself.
 INBOX_KIND="${SUTANDO_INBOX_KIND:-tasks}"
-# The handler's answer for "I could record this nowhere durable": keep the claim
-# rather than settle or fall back. Owner: src/pool_route_handler.py UNSETTLED.
+# The handler's answer for "I could record this nowhere durable": keep the claim,
+# never settle or fall back. A protocol number: no handler is named here.
 HANDLER_UNSETTLED_RC=5
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
