@@ -650,10 +650,12 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> list[Path]:
     # Sibling `results/archive-*/` dirs — only _exact_result knew these.
     out += [results_dir / d / fname
             for d in _subdirs(results_dir, lambda n: n.startswith("archive-"))]
-    # Flat gateway form `archive/<id>-<epoch>.txt`, newest last as before.
-    flat = sorted(archive.glob(f"{task_id}-*.txt"))
-    if flat:
-        out.append(flat[-1])
+    # Re-archive form `<id>-<epoch>.txt`, flat and inside month dirs. The suffix
+    # must be an epoch or a LONGER id's re-archive is served under this one (#3526).
+    for directory in (archive, *(archive / m for m in months)):
+        stamped = _epoch_suffixed(directory, task_id)
+        if stamped:
+            out.append(stamped[-1])
     return out
 
 
