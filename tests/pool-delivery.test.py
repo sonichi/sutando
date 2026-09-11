@@ -375,6 +375,56 @@ class TestEmit(Base):
         self.assertEqual(e.exception.code, 0)
 
 
+class TestHeldByWorker(Base):
+    """The Stop hook's exemption, owned here so the two cannot spell one
+    grammar differently (@keweichen P1 #4 on #4110)."""
+
+    def _held(self, task_id):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), "--held", task_id])
+        return rc, buf.getvalue().strip()
+
+    def test_every_accepted_name_counts_as_held(self):
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                d = self.root / "deliveries" / "worker-1"
+                d.mkdir(parents=True, exist_ok=True)
+                sentinel = d / f"task-1{suffix}"
+                sentinel.touch()
+                self.assertEqual(pd.held_by_worker(self.root, "task-1"), "worker-1")
+                self.assertEqual(self._held("task-1"), (0, "worker-1"))
+                sentinel.unlink()
+
+    def test_the_cores_own_inbox_is_not_a_hold(self):
+        self.ws.deliver("core", "task-1")
+        self.assertIsNone(pd.held_by_worker(self.root, "task-1"))
+        self.assertEqual(self._held("task-1"), (1, ""))
+
+    def test_an_undelivered_task_is_not_held(self):
+        self.ws.payload("task-1")
+        self.assertEqual(self._held("task-1"), (1, ""))
+
+    def test_no_deliveries_tree_at_all_is_not_held(self):
+        import shutil
+        shutil.rmtree(self.root / "deliveries", ignore_errors=True)
+        self.assertIsNone(pd.held_by_worker(self.root, "task-1"))
+
+    def test_a_non_recipient_directory_is_skipped(self):
+        """`deliveries/` can hold a stray name the recipient grammar refuses;
+        `deliveries_dir` would raise on it, so it must never be asked."""
+        bad = self.root / "deliveries" / "Not A Recipient"
+        bad.mkdir(parents=True, exist_ok=True)
+        (bad / "task-1.txt").touch()
+        self.assertIsNone(pd.held_by_worker(self.root, "task-1"))
+
+    def test_a_command_is_still_required_without_held(self):
+        with self.assertRaises(SystemExit):
+            pd.main(["--workspace", str(self.root)])
+
+
 class TestCliDispatch(Base):
     def _main(self, *args):
         import io
