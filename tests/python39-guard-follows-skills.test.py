@@ -19,6 +19,16 @@ WF = REPO / ".github" / "workflows" / "python39-compat.yml"
 SCANNER = REPO / "scripts" / "check-python39-compat.py"
 
 
+def _triggers_on_skill_python(block: str) -> bool:
+    """True when a `paths:` block has a LIVE entry under skills/ ending in .py."""
+    for ln in block.splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        if "skills/" in ln and ln.strip().endswith(".py'"):
+            return True
+    return False
+
+
 class TestPython39GuardFollowsSkills(unittest.TestCase):
     def test_workflow_triggers_on_skill_python(self):
         text = WF.read_text()
@@ -28,9 +38,17 @@ class TestPython39GuardFollowsSkills(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 2,
                                 "expected pull_request AND push path lists in python39-compat.yml")
         for i, b in enumerate(blocks):
-            self.assertTrue(any("skills/" in ln and ln.strip().endswith(".py'") for ln in b.splitlines()),
+            self.assertTrue(_triggers_on_skill_python(b),
                             f"path list #{i+1} does not trigger on any skills/**.py — production "
                             f"python that moved into a skill would not run this job:\n{b}")
+
+    def test_a_commented_out_skills_path_does_not_count(self):
+        # The block regex admits comments so a comment cannot break the match;
+        # the membership test must then skip them, or a disabled entry reads as live.
+        live = "      - 'src/**/*.py'\n      - 'skills/**/*.py'\n"
+        disabled = "      - 'src/**/*.py'\n      # - 'skills/**/*.py'\n"
+        self.assertTrue(_triggers_on_skill_python(live))
+        self.assertFalse(_triggers_on_skill_python(disabled))
 
     def test_scanner_default_targets_include_skills(self):
         text = SCANNER.read_text()
