@@ -12865,7 +12865,11 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+            # The app also runs checkWatcher(), so "not running" means a dead task
+            # watcher is never recovered — name that, not only the hotkeys.
+            checks.append({"name": "sutando-app", "status": "warn",
+                           "detail": "not running — hotkeys disabled AND checkWatcher is "
+                                     "absent, so a dead task watcher is not recovered"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
