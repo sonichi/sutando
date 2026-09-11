@@ -50,9 +50,21 @@ for f in "$TASKS_DIR"/*.txt; do
     echo "check-pending-tasks: $TASK_ID — pool_delivery could not say whether a worker holds it (exit $HELD_RC); not reported" >&2
     continue
   fi
-  if [ "$HELD_RC" = 0 ] || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
+  if [ "$HELD_RC" = 0 ]; then continue; fi
+  # A task parked for a retry pass is a worker's too. Which stores hold a marker
+  # is the route handler's to say; a path spelled here drifts from the writer.
+  PARKED_RC=1
+  if [ -n "$PYBIN" ]; then
+    "$PYBIN" "$REPO_DIR/src/pool_route_handler.py" \
+      --workspace "$WORKSPACE" --parked "$TASK_ID" >/dev/null 2>&1
+    PARKED_RC=$?
+  fi
+  if [ "$PARKED_RC" -gt 1 ]; then
+    # Same rule as the hold above: an unanswerable question is not a negative.
+    echo "check-pending-tasks: $TASK_ID — pool_route_handler could not say whether it is parked for retry (exit $PARKED_RC); not reported" >&2
     continue
   fi
+  if [ "$PARKED_RC" = 0 ]; then continue; fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
   # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then

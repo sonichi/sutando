@@ -87,6 +87,9 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 # workspace; the spawner names the workspace explicitly.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+# The handler's answer for "I could record this nowhere durable": keep the claim
+# rather than settle or fall back. Owner: src/pool_route_handler.py UNSETTLED.
+HANDLER_UNSETTLED_RC=5
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
 # may run at once; further eligible tasks stay as tiny on-disk receipts instead
@@ -254,7 +257,11 @@ finish_handler_task() {
   # then claim release. A signal between event and release may duplicate the
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
-    if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
+    if [ "$rc" = "$HANDLER_UNSETTLED_RC" ] && claim_is_ours "$filename"; then
+      # Ownership is recorded nowhere, so holding the claim is the only record
+      # left; releasing it would publish a worker's task to the live core.
+      echo "watch-tasks-stream: task handler could not durably park $filename (exit $rc); keeping the claim and NOT falling back to the live core" >&2
+    elif [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
       claim_settled=1
       claim_disposition "$filename"
       case $? in
