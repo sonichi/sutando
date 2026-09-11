@@ -31,6 +31,8 @@ catches neither reliably, which is why this is a hash and not a timestamp.
             refresh-skill.sh) after it was read. rc 1 if any drifted. No --skill.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -48,12 +50,28 @@ def _session_id() -> str:
     return (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
 
 
-def _load(state_dir: Path) -> dict:
+def _load(state_dir: Path) -> "tuple[dict, str]":
+    """(receipts, error). A non-empty error means the store is UNREADABLE, which is
+    not the same fact as an empty one.
+
+    Collapsing corruption, a wrong top-level type and every I/O error into {} makes
+    --audit print "nothing read in full yet" over a store it could not parse -- a
+    broken probe reporting clean, which is the failure this whole file exists to
+    prevent. Callers decide the severity: --check stays conservative (demand the
+    read), --audit refuses to answer.
+    """
+    path = state_dir / RECEIPTS
+    if not path.exists():
+        return {}, ""                      # genuinely empty: no receipts yet
     try:
-        data = json.loads((state_dir / RECEIPTS).read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = json.loads(path.read_text())
+    except OSError as e:
+        return {}, f"{path} is unreadable: {e}"
+    except ValueError as e:
+        return {}, f"{path} is not valid JSON: {e}"
+    if not isinstance(data, dict):
+        return {}, f"{path} holds {type(data).__name__}, not an object"
+    return data, ""
 
 
 def _key(session: str, path: Path) -> str:
@@ -74,6 +92,28 @@ def _preconditions(skill: Path, marker: str):
     return True, ""
 
 
+@contextlib.contextmanager
+def _exclusive(state_dir: Path):
+    """Hold the whole read-modify-write, not just the file swap.
+
+    Two record() calls could each load the same snapshot and each write the WHOLE
+    store back, so one receipt is silently erased while both callers see rc=0 --
+    and a later --audit then reports clean for a skill nobody is tracking. A lock
+    around the swap alone does not help; the critical section is load->mutate->write.
+    Not `workspace_lock.py`: that is a heartbeated singleton ROLE lock for long-lived
+    pollers, a different primitive from a short mutual-exclusion window.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(state_dir / (RECEIPTS + ".lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def check(skill: Path, state_dir: Path, marker: str) -> int:
     ok, why = _preconditions(skill, marker)
     if not ok:
@@ -84,7 +124,12 @@ def check(skill: Path, state_dir: Path, marker: str) -> int:
         print("CANNOT ANSWER: CLAUDE_CODE_SESSION_ID is unset, so a receipt cannot be "
               "scoped to a reader — read the file in full", file=sys.stderr)
         return 2
-    rec = _load(state_dir).get(_key(session, skill))
+    store, load_err = _load(state_dir)
+    if load_err:
+        # Conservative on this path: an unreadable store cannot authorise a skip.
+        print(f"FULL READ REQUIRED: {load_err}")
+        return 1
+    rec = store.get(_key(session, skill))
     digest = _digest(skill)
     if not rec:
         print(f"FULL READ REQUIRED: no receipt for this session ({session[:8]}) — "
@@ -112,19 +157,29 @@ def record(skill: Path, state_dir: Path, marker: str) -> int:
               "different session skip a read it never did", file=sys.stderr)
         return 2
     import datetime
+    import tempfile
     state_dir.mkdir(parents=True, exist_ok=True)
-    data = _load(state_dir)
-    text = skill.read_text(errors="ignore")
-    data[_key(session, skill)] = {
-        "sha256": _digest(skill),
-        "bytes": skill.stat().st_size,
-        "lines": text.count("\n") + 1,
-        "recorded_at": datetime.datetime.now(datetime.timezone.utc)
-                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    tmp = state_dir / (RECEIPTS + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-    tmp.replace(state_dir / RECEIPTS)
+    # load -> mutate -> write is ONE critical section; see _exclusive.
+    with _exclusive(state_dir):
+        data, load_err = _load(state_dir)
+        if load_err:
+            print(f"REFUSED: {load_err}; refusing to overwrite a store I cannot read",
+                  file=sys.stderr)
+            return 2
+        text = skill.read_text(errors="ignore")
+        data[_key(session, skill)] = {
+            "sha256": _digest(skill),
+            "bytes": skill.stat().st_size,
+            "lines": text.count("\n") + 1,
+            "recorded_at": datetime.datetime.now(datetime.timezone.utc)
+                            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        # A FIXED .tmp name is itself a collision between two writers; mkstemp in the
+        # same directory keeps the rename atomic and the scratch name unique.
+        fd, tmp_name = tempfile.mkstemp(dir=str(state_dir), prefix=RECEIPTS + ".", suffix=".tmp")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp_name, state_dir / RECEIPTS)
     print(f"recorded: {skill.name} {skill.stat().st_size} B read in full by session "
           f"{session[:8]} (sha {_digest(skill)[:12]})")
     return 0
@@ -142,7 +197,11 @@ def audit(state_dir: Path) -> int:
         print("CANNOT ANSWER: CLAUDE_CODE_SESSION_ID is unset, so this session's "
               "receipts cannot be identified", file=sys.stderr)
         return 2
-    mine = {k: v for k, v in _load(state_dir).items() if k.startswith(session + ":")}
+    store, load_err = _load(state_dir)
+    if load_err:
+        print(f"CANNOT ANSWER: {load_err}", file=sys.stderr)
+        return 2
+    mine = {k: v for k, v in store.items() if k.startswith(session + ":")}
     if not mine:
         print(f"no receipts for this session ({session[:8]}) -- nothing read in full yet")
         return 0

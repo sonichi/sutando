@@ -12,6 +12,10 @@ parsing and the same exit codes while staying visible to coverage.
 """
 import contextlib
 import importlib.util
+import json
+import subprocess
+import sys
+import threading
 import io
 import os
 import tempfile
@@ -150,6 +154,50 @@ class ReceiptContract(unittest.TestCase):
     def test_check_without_skill_is_an_arg_error(self):
         with self.assertRaises(SystemExit):
             run(["--state-dir", str(self.state), "--check"])
+
+    # --- review findings from qingyun-wu on 46f48bd5 -----------------------
+    def test_concurrent_records_do_not_erase_each_other(self):
+        """P2: load->mutate->write was unserialised, so two record() calls could each
+        load the same snapshot and each write the WHOLE store back. Both returned 0
+        while only one receipt survived, and --audit then reported clean for a skill
+        nobody was tracking. Real processes, because the race is between writers."""
+        a, b = self.d / "A.md", self.d / "B.md"
+        a.write_text("aaa\n"); b.write_text("bbb\n")
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID="sess-race")
+        procs = [subprocess.Popen(
+            [sys.executable, str(REPO / "scripts" / "skill-read-receipt.py"),
+             "--skill", str(f), "--state-dir", str(self.state), "--record"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            for f in (a, b)]
+        rcs = [p.wait() for p in procs]
+        self.assertEqual(rcs, [0, 0], "both records reported success")
+        store = json.loads((self.state / srr.RECEIPTS).read_text())
+        names = sorted(Path(k.split(":", 1)[1]).name for k in store)
+        self.assertEqual(names, ["A.md", "B.md"],
+                         f"a reported-successful receipt was erased: {names}")
+
+    def test_audit_REFUSES_a_corrupt_store_instead_of_reporting_clean(self):
+        """P2: _load collapsed corruption, a wrong top-level type and every I/O error
+        into {}, which --audit rendered as 'nothing read in full yet', rc=0. A broken
+        probe reporting clean is the exact failure this file exists to prevent."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        for corrupt in ("{ truncated", "[]", "null"):
+            (self.state / srr.RECEIPTS).write_text(corrupt)
+            rc, out = run(["--state-dir", str(self.state), "--audit"])
+            self.assertEqual(rc, 2, f"{corrupt!r} -> rc={rc}: {out}")
+            self.assertIn("CANNOT ANSWER", out)
+
+    def test_record_refuses_to_overwrite_a_store_it_cannot_read(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / srr.RECEIPTS).write_text("{ truncated")
+        rc, out = run(self._base() + ["--record"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("REFUSED", out)
+
+    def test_a_missing_store_is_empty_not_corrupt(self):
+        """The distinction has to cut both ways, or every fresh state dir refuses."""
+        rc, out = run(["--state-dir", str(self.d / "never-used"), "--audit"])
+        self.assertEqual(rc, 0, out)
 
 
 if __name__ == "__main__":
