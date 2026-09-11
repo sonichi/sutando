@@ -24,6 +24,10 @@ source =
 
 omit =
     tests/*
+    # A skill owns its own tests/; they EXECUTE (ci.yml's find roots) but they
+    # are assertions, not product — measuring them dilutes the diff gate.
+    skills/*/tests/*
+    skills/*/*/tests/*
     */node_modules/*
     */.venv/*
     */venv/*
