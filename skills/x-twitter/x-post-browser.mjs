@@ -235,7 +235,7 @@ function releaseProfileLock() {
   // writes its cookie jar lazily and flushes on clean shutdown; a SIGKILL before
   // that flush drops every cookie set since the last write — which is exactly the
   // auth cookies from a sign-in that just happened.
-  const graceMs = Number(process.env.X_PROFILE_GRACE_MS || 10000);
+  const graceMs = Number(setting('X_PROFILE_GRACE_MS', '10000'));
   const { remaining, waitedMs, exitedCleanly } = waitForProfileExit(
     pidsForProfile,
     graceMs,
