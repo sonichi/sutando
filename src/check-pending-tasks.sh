@@ -33,6 +33,13 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
+  # A pool worker owns any task with a sentinel in its delivery folder. The core
+  # declined it and must not touch it, so it is not the core's to answer.
+  TASK_ID="${BASENAME%.txt}"
+  if compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.txt" > /dev/null 2>&1 \
+     || compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.accepted" > /dev/null 2>&1; then
+    continue
+  fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
   # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then
