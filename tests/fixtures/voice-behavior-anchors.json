@@ -565,18 +565,18 @@
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
    }
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
    }
   },
   {

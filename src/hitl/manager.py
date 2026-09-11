@@ -44,6 +44,19 @@ AUTH_KIND = "auth"
 ID_RE = re.compile(r"^hitl_[A-Za-z0-9_-]+$")
 
 
+def _activity(task_ids, to_phase: str, reason: str) -> None:
+    """A requirement is the scheduler's WAITING; its end is RUNNING again. Never breaks HITL."""
+    if not task_ids:
+        return
+    try:
+        import activity_bus as _bus
+        store = _bus.ActivityStore()
+        for tid in task_ids:
+            store.apply(_bus.LifecycleTransition(tid, to_phase, reason=reason))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
     writes here, the supervisor projects from here. One store, one card."""
@@ -171,7 +184,9 @@ class HitlManager:
                 req.decided_by = POLICY_DECIDER
                 req.transition(STATUS_IN_PROGRESS)
             self.store.save(req)
-            return req
+        if req.decided_by != POLICY_DECIDER and req.status not in TERMINAL_STATUSES:
+            _activity(req.blocked_task_ids, "WAITING", req.kind)  # policy-answered: nobody is waiting
+        return req
 
     def active(self) -> List[HumanRequirement]:
         return [r for r in self.store.all() if r.status not in TERMINAL_STATUSES]
@@ -219,7 +234,8 @@ class HitlManager:
                 return []
             req.transition(status)
             self.store.save(req)
-            return list(req.blocked_task_ids)
+        _activity(req.blocked_task_ids, "RUNNING", status)
+        return list(req.blocked_task_ids)
 
     def link_blocked_task(self, req_id: str, task_id: str) -> None:
         with self.store.locked():

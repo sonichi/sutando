@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "owner": "github:sonichi/sutando",
   "stability": "experimental",
-  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering.",
+  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent').",
   "permissions": {
     "network": false,
     "filesystem": "read-write",
@@ -22,5 +22,8 @@
       "event": "Stop",
       "command": "./hooks/activity-hook.py"
     }
-  ]
+  ],
+  "config": {
+    "AGENT_DISPLAY_NAME": ""
+  }
 }

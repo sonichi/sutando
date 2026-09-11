@@ -108,6 +108,58 @@ class IdentityCaveatSurfaces(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual({t["name"] for t in targets}, {"a", "b"})
 
+    def test_authority_caveat_reaches_the_operator(self):
+        """The field that reached nobody (#3965).
+
+        It records a Stand's self-stated refusal to cast a formal vote on a
+        collaborator-routed ask — a routing constraint, and the one thing that
+        stops an unauthorized request going out.
+        """
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "authority_caveat": "DECLINES a collaborator-routed vote"}}
+        _, rc, err = self._resolve(roster)
+        self.assertIn("AUTHORITY CAVEAT 'a'", err)
+        self.assertIn("DECLINES a collaborator-routed vote", err)
+        self.assertEqual(rc, 0)
+
+    def test_a_caveat_field_nobody_has_named_yet_still_prints(self):
+        """THE discriminating arm: this is what makes it derived rather than
+        enumerated. A hardcoded ('identity','authority') pair passes every
+        other arm here and fails only this one — which is precisely how
+        `authority_caveat` came to exist unread beside a field that was read.
+        """
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "jurisdiction_caveat": "invented for this test"}}
+        _, rc, err = self._resolve(roster)
+        self.assertIn("JURISDICTION CAVEAT 'a'", err)
+        self.assertEqual(rc, 0)
+
+    def test_every_caveat_on_one_entry_prints(self):
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "identity_caveat": "shared login",
+                        "authority_caveat": "declines the vote",
+                        "room_caveat": "wrong room"}}
+        _, _, err = self._resolve(roster)
+        for label in ("IDENTITY CAVEAT", "AUTHORITY CAVEAT", "ROOM CAVEAT"):
+            self.assertIn(label, err)
+
+    def test_a_non_caveat_field_is_not_printed(self):
+        """Control for the loop: matching too widely would dump the whole
+        entry to stderr, and 'everything is surfaced' is indistinguishable
+        from 'nothing is' once the operator stops reading it.
+        """
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "note": "ordinary prose", "github": "someone"}}
+        _, _, err = self._resolve(roster)
+        self.assertNotIn("CAVEAT", err)
+
+    def test_an_empty_caveat_is_not_printed(self):
+        # An empty string is absence, not a caveat worth a line.
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "authority_caveat": ""}}
+        _, _, err = self._resolve(roster)
+        self.assertNotIn("CAVEAT", err)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

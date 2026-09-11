@@ -21,7 +21,12 @@ entry never starves the batch: resolvable reviewers are still notified and
 the worst refusal becomes the exit — 0 all resolved; 2 unknown reviewer;
 3 entry unusable (no stand/room); 4 allowlist known-false (route via owner).
 
-Roster: <workspace>/data/collaboration-intelligence/reviewer-stands.json
+Roster: <workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-stands.json
+  (unioned across every host by roster_union.host_rosters(). The flat
+   <workspace>/data/... path is the LEGACY location and is still read. Note
+   the order: host_rosters() lists it LAST, but roster_paths() below puts
+   this host's SELECTED file first -- and roster_path() selects the flat one
+   while this host is unmigrated, so a stale flat row then WINS a collision.)
   {"rui": {"human": "@rui:ag2.space", "stand": "@sutando-rui:ag2.space",
            "room": "!triage:ag2.space", "allowlisted": true, "gh": "john-the-dev"}}
 `allowlisted` is evidence, not hope: true (a mention has triggered this
@@ -139,10 +144,12 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             continue
         stand, room = entry.get("stand"), entry.get("room")
         why = stated_reason(entry)
-        # A caveat nobody prints is a note, not a step. Shared-login entries
-        # look like one actor from GitHub; surface it here, before the send.
-        if entry.get("identity_caveat"):
-            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
+        # A caveat nobody prints is a note, not a step. Derived from the entry:
+        # a named field list misses the next caveat silently.
+        for field in sorted(k for k in entry if k.endswith("_caveat")):
+            if entry.get(field):
+                label = field[: -len("_caveat")].upper().replace("_", " ")
+                print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "

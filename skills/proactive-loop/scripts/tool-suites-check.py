@@ -39,9 +39,30 @@ SENTINEL = "tool-suites-last-run.json"
 EXTRAS = "tool-suites-extra.json"       # {"suites": ["tests/x.test.py", ...]}
 
 
-def tools_and_suites(scripts: Path):
-    suites = sorted(p for p in scripts.glob("*.test.py"))
-    tools = sorted(p for p in scripts.glob("*.py") if not p.name.endswith(".test.py"))
+
+def watched_dirs(ws: Path):
+    """Every immediate subdir of the workspace holding a top-level *.py.
+
+    Named dirs were the bug: `(scripts, tools)` misses a host whose tools live in
+    `bin/`, and the trigger then reports fresh forever while that dir's tools go
+    unstat'd. Over-watching costs a stat; under-watching costs a gate that is
+    green by construction.
+    """
+    if not ws.is_dir():
+        return []
+    return sorted(
+        (d for d in ws.iterdir()
+         if d.is_dir() and not d.name.startswith(".") and any(d.glob("*.py"))),
+        key=lambda d: d.name,
+    )
+
+
+def tools_and_suites(dirs):
+    """Union over EVERY candidate dir, not the first that matches: a workspace
+    mid-migration holds .py in both, and picking one hides the other's suites."""
+    found = [p for d in dirs for p in d.glob("*.py")]
+    suites = sorted(p for p in found if p.name.endswith(".test.py"))
+    tools = sorted(p for p in found if not p.name.endswith(".test.py"))
     return tools, suites
 
 
@@ -128,25 +149,75 @@ def _warn_if_uncarried(decl: Path) -> None:
 
     Advisory only — a backup concern must never fail a test run.
     """
-    ws = decl.parent.parent
+    # hosts/<host>/X is two deep, state/X one: parent.parent lands inside the
+    # workspace for the carried path and would probe the wrong tree.
+    ws = decl.parent.parent.parent if decl.parent.parent.name == "hosts" else decl.parent.parent
     try:
         r = subprocess.run(["git", "-C", str(ws), "ls-files", "--error-unmatch",
                             str(decl.relative_to(ws))],
                            capture_output=True, text=True, timeout=10)
     except Exception:
         return                      # no git, no repo, or a path outside it: not our business
+    # git exits 128 for "not a git repository" WITHOUT raising, so the guard above
+    # never saw it: a workspace with no vault repo reported every file untracked.
+    if r.returncode == 128 or "not a git repository" in r.stderr:
+        return
     if r.returncode != 0:
+        move = ("" if decl.parent.parent.name == "hosts" else
+                f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no "
+                f"config edit. Do NOT add a state/ path to vault.sync.include: the vault emits "
+                f"carve-outs after includes so a `state/` exclude re-ignores it, and `include` "
+                f"REPLACES the carrier set rather than extending it (see sync-workspace.sh:36-45).")
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
-              f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no config "
-              f"edit. Do NOT add a state/ path to vault.sync.include: the vault emits carve-outs "
-              f"after includes so a `state/` exclude re-ignores it, and `include` REPLACES the "
-              f"carrier set rather than extending it (see sync-workspace.sh:36-45).",
+              f"If it is lost, the suites it registers stop running SILENTLY (absent = no "
+              f"extras). {move}".rstrip(),
               file=sys.stderr)
 
 
 def newest_mtime(paths) -> float:
     return max((p.stat().st_mtime for p in paths), default=0.0)
+
+
+def declared_ledgers(decl_or_statedir: Path):
+    """Ledger filenames a suite asserts over, declared beside the extra suites.
+
+    Declared rather than globbed or inferred: `state/` also holds service
+    heartbeats rewritten every few seconds, and no pattern separates a ledger
+    from telemetry -- only the person who wrote the suite knows which it is.
+    """
+    f = decl_or_statedir
+    if f.is_dir():
+        f = f / EXTRAS
+    if not f.is_file():
+        return []
+    try:
+        decl = json.loads(f.read_text()).get("ledgers", [])
+    except Exception as e:
+        raise ExtrasError(f"{f} is unreadable: {e}") from e
+    if not isinstance(decl, list):
+        raise ExtrasError(f"{f}: 'ledgers' must be a list, got {type(decl).__name__}")
+    return [d for d in decl if isinstance(d, str) and d.strip() and d != SENTINEL]
+
+
+def live_inputs(statedir: Path, decl_or_statedir: Path):
+    """The declared ledgers that exist, EXCLUDING this script's own sentinel.
+
+    Freshness over tool+suite mtimes alone skips a suite whose fixture is a live
+    ledger -- the ledger moves, the suite file does not.
+    """
+    return [statedir / n for n in sorted(set(declared_ledgers(decl_or_statedir)))
+            if (statedir / n).is_file()]
+
+
+def freshness_inputs(ws: Path, host, tools, suites):
+    """Every path whose mtime may retire the freshness skip.
+
+    Exists so the WIRING is assertable: passing the state dir here instead of
+    the resolved extras path selects nothing on a host that declares its
+    ledgers in the carried `hosts/<host>/` copy, and an empty selection is
+    stable, so a churn test still passes.
+    """
+    return list(tools) + list(suites) + live_inputs(ws / "state", extras_path(ws, host))
 
 
 def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple[bool, str]":
@@ -202,14 +273,15 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
-    scripts, statedir = ws / "scripts", ws / "state"
-    if not scripts.is_dir():
-        print(f"CANNOT ANSWER: no {scripts}", file=sys.stderr)
-        return 2
-    tools, suites = tools_and_suites(scripts)
+    statedir = ws / "state"
+    # DISCOVER the dirs; never name them. A fixed list is the same defect one
+    # name later — a third dir is unwatched and its staleness is silent (3852-r3).
+    candidates = watched_dirs(ws)
+    tools, suites = tools_and_suites(candidates)
     try:
         host = a.host or resolve_host(Path(a.repo).resolve())
-        extras = extra_suites(extras_path(ws, host), Path(a.repo).resolve())
+        decl = extras_path(ws, host)
+        extras = extra_suites(decl, Path(a.repo).resolve())
     except ExtrasError as e:
         print(f"CANNOT ANSWER: {e}", file=sys.stderr)
         return 2
@@ -222,7 +294,7 @@ def main(argv=None) -> int:
     sf = statedir / SENTINEL
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     now = time.time()
-    newest = newest_mtime(tools + suites)
+    newest = newest_mtime(freshness_inputs(ws, host, tools, suites))
     go, why = should_run(state, newest, a.max_age_hours * 3600, now)
     if a.force:
         go, why = True, "--force"

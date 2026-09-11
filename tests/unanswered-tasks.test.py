@@ -260,18 +260,35 @@ for marker in ("[no-send]", "[REPLIED]"):
 
 # The guard must fire on an EMPTY queue too: a lazy per-task import means a
 # missing result_markers.py reports "none" instead of refusing.
+import shutil
+import subprocess
+
+_REPO = Path(__file__).resolve().parent.parent
+
+
+def _fake_repo(d: Path, with_soundness: bool):
+    """A repo holding unanswered-tasks.py and, optionally, its judgement owner —
+    but never result_markers.py, so the grammar owner is the missing one."""
+    (d / "src").mkdir(); (d / "scripts").mkdir()
+    shutil.copy(_REPO / "scripts" / "unanswered-tasks.py", d / "scripts" / "unanswered-tasks.py")
+    if with_soundness:
+        shutil.copy(_REPO / "src" / "dedup_soundness.py", d / "src" / "dedup_soundness.py")
+    ws = d / "ws"; (ws / "tasks").mkdir(parents=True); (ws / "results").mkdir()
+    return subprocess.run([sys.executable, str(d / "scripts" / "unanswered-tasks.py"),
+                           "--workspace", str(ws)], capture_output=True, text=True, cwd=d)
+
+
 with tempfile.TemporaryDirectory() as d:
-    import shutil
-    import subprocess
-    root = Path(d)
-    (root / "src").mkdir(); (root / "scripts").mkdir()
-    shutil.copy(Path(__file__).resolve().parent.parent / "scripts" / "unanswered-tasks.py",
-                root / "scripts" / "unanswered-tasks.py")
-    ws = root / "ws"; (ws / "tasks").mkdir(parents=True); (ws / "results").mkdir()
-    proc = subprocess.run([sys.executable, str(root / "scripts" / "unanswered-tasks.py"),
-                           "--workspace", str(ws)], capture_output=True, text=True, cwd=root)
+    proc = _fake_repo(Path(d), with_soundness=True)
     check(proc.returncode == 2 and "result_markers" in proc.stderr,
           "refuses (exit 2) when result_markers.py is unimportable, even with an empty queue")
+
+with tempfile.TemporaryDirectory() as d:
+    # Exit 2, not 1: the loop's checkers reserve 1 for a real finding, so a
+    # broken tool exiting 1 reads as damage to the user's data.
+    proc = _fake_repo(Path(d), with_soundness=False)
+    check(proc.returncode == 2 and "dedup_soundness" in proc.stderr,
+          "refuses (exit 2) when src/dedup_soundness.py is unimportable")
 
 
 # The real shape: ONE shared room, many senders. Comparing channels is silent
@@ -303,13 +320,17 @@ with tempfile.TemporaryDirectory() as d:
 # Error and edge paths. The refusal is asserted above too, but via subprocess,
 # where no tracer follows — so these drive the same branches in-process.
 
+# These now live in src/dedup_soundness.py, shared with the PRE-write guard, so
+# the assertions follow the code to its owner rather than through a re-export.
+_ds = uat.dedup_soundness
+
 with tempfile.TemporaryDirectory() as d:
     root = Path(d); (root / "tasks").mkdir()
     (root / "tasks" / "task-live.txt").write_text("id: live\n")
-    check(uat._task_exists(root / "tasks", "task-live") is True,
-          "_task_exists: True while the task is still LIVE in tasks/ (not yet archived)")
-    check(uat._task_exists(root / "tasks", "task-never") is False,
-          "_task_exists: False for an id that never existed here")
+    check(_ds.task_exists(root / "tasks", "task-live") is True,
+          "task_exists: True while the task is still LIVE in tasks/ (not yet archived)")
+    check(_ds.task_exists(root / "tasks", "task-never") is False,
+          "task_exists: False for an id that never existed here")
 
 with tempfile.TemporaryDirectory() as d:
     check(uat._read(Path(d)) is None, "_read: a directory (OSError) reads as None rather than raising")
@@ -325,9 +346,9 @@ with tempfile.TemporaryDirectory() as d:
 # so the refusal runs in-process instead of in a child the tracer cannot see.
 import contextlib
 import io
-_saved_markers, _had_mod = uat._MARKERS, "result_markers" in sys.modules
+_saved_markers, _had_mod = _ds._MARKERS, "result_markers" in sys.modules
 _saved_mod = sys.modules.get("result_markers")
-uat._MARKERS = None
+_ds._MARKERS = None
 sys.modules["result_markers"] = None
 _err = io.StringIO()
 try:
@@ -343,7 +364,7 @@ finally:
         sys.modules["result_markers"] = _saved_mod
     else:
         sys.modules.pop("result_markers", None)
-    uat._MARKERS = _saved_markers
+    _ds._MARKERS = _saved_markers
 
 check(uat._markers() is not None,
       "CONTROL: _markers still works afterwards — the refusal test restored global state")

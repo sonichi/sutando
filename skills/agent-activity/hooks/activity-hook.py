@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from local_task_protocol import find_result  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
@@ -69,6 +71,22 @@ def open_tasks(log: Path) -> dict[str, dict]:
             done.add(t["id"])
         elif t["id"] not in done and t["id"] not in out:
             out[t["id"]] = {"task": t, "room": r.get("room") if isinstance(r.get("room"), str) else None}
+    return out
+
+
+def indexed_open_tasks(ws: Path) -> dict[str, dict]:
+    """{task_id: {"task", "room"}} from the writer's index, in the shape open_tasks() returns."""
+    try:
+        sys.path.insert(0, str(WRITER.parent))
+        from activity import open_task_index
+        idx = open_task_index(ws)
+    except Exception:  # noqa: BLE001 - the hook never fails the tool it observed
+        return {}
+    out: dict[str, dict] = {}
+    for tid, e in idx.items():
+        t = e.get("task") if isinstance(e, dict) else None
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            out[tid] = {"task": t, "room": e.get("room") if isinstance(e.get("room"), str) else None}
     return out
 
 
@@ -116,7 +134,10 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         fcntl.flock(lk, fcntl.LOCK_EX)
         binds = load_json(p["bind"], {})
         binds[task_id] = session_id
+        # The same open set completion uses: the live log plus the writer's index, so a task whose
+        # rows rotated out keeps its binding while another session picks up the next task.
         alive = open_tasks(p["log"])
+        alive.update(indexed_open_tasks(p["ws"]))
         binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
         tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
         tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
@@ -145,15 +166,43 @@ def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:
         fields: dict = {}
         for l in p.read_text(encoding="utf-8", errors="replace").splitlines():
             k, _, v = l.partition(":")
-            if k in ("user_id", "task", "channel_id") and k not in fields:
+            if k in ("user_id", "task", "channel_id", "sender_name", "source_message_id") and k not in fields:
                 fields[k] = v.strip()
         task = {"id": task_id}
         if fields.get("user_id"):
             task["from"] = fields["user_id"]
+        if fields.get("sender_name"):
+            task["sender"] = fields["sender_name"]
         if fields.get("task"):
             task["text"] = fields["task"][:160]
+        if fields.get("source_message_id"):
+            task["event"] = fields["source_message_id"]  # the client mounts the card under this message
         return task, fields.get("channel_id") or None
     return None
+
+
+def manifest_config(key: str) -> str:
+    """This skill's declared setting (manifest.json `config`), the source below an env override."""
+    try:
+        data = json.loads((Path(__file__).resolve().parents[1] / "manifest.json").read_text())
+        val = (data.get("config") or {}).get(key)
+        return val if isinstance(val, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def pickup_line(task: dict) -> str:
+    """The lifecycle's first row as the owner reads it: which agent, whose message, its start."""
+    agent = os.environ.get("AGENT_DISPLAY_NAME") or manifest_config("AGENT_DISPLAY_NAME") or "Your agent"
+    who = task.get("sender") or task.get("from") or "unknown"
+    text = task.get("text") or ""
+    return f"{agent} is working on a task from {who}: {text[:20]}{'…' if len(text) > 20 else ''}"
+
+
+def answered(ws: Path, task_id: str) -> bool:
+    """A result exists — live, or archived in any shape the delivery paths write (the shared lookup
+    knows the epoch-suffixed, month-partitioned and retention layouts): the task is finished."""
+    return find_result(ws / "results", task_id) is not None
 
 
 def working_line(tool_name: str, tool_input) -> str | None:
@@ -209,15 +258,38 @@ def done_text(tool_input_json: str) -> str:
     return "closed, no message sent from here" if NO_SEND.search(tool_input_json) else "replied"
 
 
-def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run) -> None:
+def consolidated_into(ws: Path, task_id: str) -> str | None:
+    """When the result is a `[deduped: task-X]` pointer, the event id of X's message (the one whose
+    reply answered this task too), else None. The marker grammar is result_markers'; never re-read here."""
+    path = ws / "results" / f"{task_id}.txt"
+    try:
+        body = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for a in parse_markers(body).actions:
+        if a.kind == "skip" and a.value == "deduped":
+            target = (a.extra or "").strip()
+            if target and not target.startswith("task-"):
+                target = f"task-{target}"
+            found = task_header(ws, target) if target else None
+            return (found[0].get("event") if found else None) or ""
+    return None
+
+
+def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run,
+         into: str | None = None) -> None:
     if kind == "done":
         cmd = [sys.executable, str(WRITER), "done", line, "--task-id", task["id"], "--workspace", str(ws)]
+        if into:
+            cmd += ["--into", into]
     else:
         cmd = [sys.executable, str(WRITER), "append", line, "--kind", kind, "--task-id", task["id"], "--workspace", str(ws)]
     if isinstance(task.get("from"), str):
         cmd += ["--from", task["from"]]
     if isinstance(task.get("text"), str):
         cmd += ["--text", task["text"]]
+    if isinstance(task.get("event"), str):
+        cmd += ["--event", task["event"]]
     if room:
         cmd += ["--room", room]
     run(cmd, capture_output=True)
@@ -245,15 +317,17 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         # First touch of a task file by this session: bind it and write its processing row from the
         # task's own headers — the agent never has to remember to.
         for tid in task_file_refs(blob):
-            if tid in binds:
+            # A late touch of an answered task (a dedup check, a re-read) must not reopen it.
+            if tid in binds or answered(p["ws"], tid):
                 continue
             found = task_header(p["ws"], tid)
             if not found:
                 continue
             task, room = found
+            line = pickup_line(task)
             bind(p, tid, sid)
-            emit("processing", "picked up", task, room, p["ws"], run)
-            out.append(("processing", "picked up"))
+            emit("processing", line, task, room, p["ws"], run)
+            out.append(("processing", line))
         if out:
             return out
         if result_file_refs(blob):
@@ -269,13 +343,19 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])
+        # A long task's rows may have rotated out of the live log; the writer's index still holds it
+        # open, so its result write still closes it and still leaves a summary.
+        for tid, e in indexed_open_tasks(p["ws"]).items():
+            opened.setdefault(tid, e)
         # The result write closes the task only once the file exists: the tool ran, was not denied,
         # and produced the artifact. The text says what the result did (a marker body reached nobody).
         for tid in result_file_refs(blob):
             if tid in opened and binds.get(tid) == sid and (p["ws"] / "results" / f"{tid}.txt").exists():
                 task, room = opened[tid]["task"], opened[tid]["room"]
-                text = done_text(blob)
-                emit("done", text, task, room, p["ws"], run)
+                into = consolidated_into(p["ws"], tid)
+                # A dedup pointer answered this message under another one: say so, and name it.
+                text = "consolidated" if into is not None else done_text(blob)
+                emit("done", text, task, room, p["ws"], run, into=into or None)
                 out.append(("done", text))
     elif event == "Stop":
         tp = payload.get("transcript_path")

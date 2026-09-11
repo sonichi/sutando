@@ -434,6 +434,28 @@ and loads whichever repo it reviews.
     IN_PROGRESS run carries `conclusion == ""`, so a filter keyed only on it calls a running
     check failing.
 
+21. **When a diff makes a synchronous action asynchronous, review the WINDOW it opens, not
+    just the helper that opens it.** The new helper can be entirely correct — good retry
+    semantics, good error taxonomy, tested — while the defect lives in what the *caller*
+    still does at settle time with state it captured at call time. Lesson 2 covers the
+    unchanged code a diff newly *reaches*; this is the unchanged code a diff newly
+    *delays*. The question to ask is not "is the helper correct?" but "what else can
+    change between the call and the settle, and does the continuation re-read it?"
+    Two things make this easy to miss. The reviewable artifact is the helper, so attention
+    lands there; and the window's size is usually stated as a feature (a retry budget, a
+    backoff) rather than as a hazard, so the very sentence that should raise the question
+    reads as reassurance.
+    *Grounded by:* ag2-space/cinny-webclient#903, 2026-09-06. `writeToTerminal()` added an
+    attach-retry of up to 20 × 250ms — five seconds — and the composer's `.then()` called
+    `resetEditor(editor)` on success, having captured `editor` and the terminal-mode flag at
+    submit time. So a user who typed during the retry lost what they typed. The reviewer who
+    approved that head had read the caller and quoted those exact lines while flagging
+    something else in them; the P1 was filed against the same sha six minutes later. The fix
+    moved the decision into a pure `settleTerminalSend()` that re-reads the editor and the
+    mode *at settle time* — which is also what made it testable under node.
+    Cheap form: for each side effect in a newly-async continuation, name the state it
+    depends on and check the continuation re-reads it rather than closing over it.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml

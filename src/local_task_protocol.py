@@ -57,6 +57,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -204,6 +205,9 @@ KNOWN_HEADER_KEYS = (
     # Which worker the sender asked for. INTENT, not placement: the pool's
     # own binding table decides, and no claim path consults this header.
     "requested_worker",
+    # A card click the HITL store already recorded, passed on for the turn it causes;
+    # the core trusts it, so the guard must defang a forged copy in body text.
+    "hitl_click",
     # Provenance (`promoted` for taskify output). Header status defangs a
     # forged body copy; the tier, not this field, is the authorization boundary.
     "origin",
@@ -796,7 +800,15 @@ def set_task_stamper(fn) -> None:
 def write_task_file(tasks_dir: "Path | str", task_id: str,
                     headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
     """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
-    enters the Durable Work Model's `pending` state the moment this returns."""
+    enters the Durable Work Model's `pending` state the moment this returns.
+
+    A hard kill between staging and publish leaves the `.<task_id>.*.tmp`
+    behind, and nothing reaps it: the dot and the missing `.txt` that keep it
+    out of the watcher keep it out of every sweep too, and `find_task_file`'s
+    `{task_id}.*` glob cannot match a leading-dot name either. Bounded — one
+    small file per hard kill inside a sub-millisecond window — and deliberately
+    not reaped, because a reaper would race a live writer for the same names.
+    """
     if not valid_task_id(task_id):
         raise ValueError(f"not a canonical task id: {task_id!r}")
     hdrs = list(headers)
@@ -810,5 +822,21 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(apply_task_stamper(serialize_task_last(hdrs, task_body)))
+    text = apply_task_stamper(serialize_task_last(hdrs, task_body))
+    # `task:` is last, so a partial file still PARSES with the ask short or empty.
+    # mkstemp is per-writer unique; the dot and `.tmp` keep it out of task sweeps.
+    fd, staged = tempfile.mkstemp(prefix=f".{task_id}.", suffix=".tmp", dir=str(d))
+    tmp = Path(staged)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return path

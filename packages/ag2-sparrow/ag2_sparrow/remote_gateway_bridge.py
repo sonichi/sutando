@@ -294,6 +294,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -718,6 +719,7 @@ def _read_private_json(path: Path) -> "dict | None":
 
 def _gateway_owner() -> str:
     global _GATEWAY_OWNER_DM_HINT
+    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
     identity = _reenroll_identity()
     answer = _req("GET", "/v1/agents")
     agents = answer.get("agents") if isinstance(answer, dict) else None
@@ -910,10 +912,21 @@ def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
     return (*candidates[0], answer) if len(candidates) == 1 else None
 
 
+def _released_review_body(raw: str) -> str:
+    """Room text for an owner-released result. Markers are stripped, never executed:
+    the release posts to the original room only and uploads nothing."""
+    parsed = parse_markers(raw)
+    dropped = sum(1 for action in parsed.actions if action.kind == "attach")
+    if not dropped:
+        return parsed.body
+    note = f"({dropped} attachment{'' if dropped == 1 else 's'} not published)"
+    return f"{parsed.body}\n\n{note}" if parsed.body else note
+
+
 def _publish_review(path: Path, record: dict) -> bool:
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
-    body = str(record.get("withheld_body") or "")
+    body = _released_review_body(str(record.get("withheld_body") or ""))
     if not room.startswith("!") or not body:
         record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
                        "card_resolution_pending": True})
@@ -989,6 +1002,11 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "applied" and getattr(handler, "last_turn", False):
+        # Recorded, and the requirement asked for a turn: the same relay task goes on to
+        # the core (idempotent by id) with a header saying it is a click, not an order.
+        task["hitl_click"] = "true"
+        return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
         # A non-owner typed a label as a reply: that is a message, not a click
         # to decline; it must reach _write_task like any other text.
@@ -1214,7 +1232,11 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if not PROACTIVE_ROOM:
+    if GATEWAY_INSTANCE:
+        return 0  # only the primary gateway (launched without GATEWAY_INSTANCE) projects the owner's cards
+    room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
+    if not room:
+        _held("the runtime prompt card")
         return 0
     if time.monotonic() < _HITL_BACKOFF["until"]:
         return 0
@@ -1236,7 +1258,7 @@ def _project_hitl(log=print) -> int:
         return 0
     try:
         done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       PROACTIVE_ROOM)
+                       room)
     except Exception:
         _hitl_backoff_bump(log)  # a raising sender is a refusal too
         raise
@@ -1323,6 +1345,101 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
+# connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
+                  "held_logged": 0.0}
+ROUTING_REFRESH_S = 300.0
+ROUTING_RETRY_S = 30.0
+OWNER_PRIVATE = "owner_private"
+CURRENT_ROOM = "current_room"
+SELECTED_MEMBERS = "selected_members"
+SYSTEM = "system"
+
+
+def _routing_file() -> Path:
+    return _STATE / f"owner-routing{_INST_SUFFIX}.json"
+
+
+def _load_routing() -> None:
+    if _ROUTING["loaded"]:
+        return
+    _ROUTING["loaded"] = True
+    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
+    try:
+        d = json.loads(_routing_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    # another agent's reading, or this agent's reading from another gateway, authorizes nothing
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+
+
+def refresh_routing(force: bool = False) -> None:
+    """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    _load_routing()
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
+    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
+        _ROUTING.update(owner_dm="", persisted="", loaded=False)
+        _load_routing()
+        force = True
+    now = time.time()
+    if not force and now < _ROUTING["next"]:
+        return
+    try:
+        _gateway_owner()
+    except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _GATEWAY_OWNER_DM_HINT:
+        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
+        try:
+            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
+            os.replace(tmp, f)
+            _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        except OSError:
+            _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
+            return
+    _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
+
+
+def _held(what: str) -> None:
+    """An owner-private message with no owner DM reading is held, and the log says so once per window."""
+    now = time.time()
+    if now - _ROUTING["held_logged"] >= ROUTING_REFRESH_S:
+        _ROUTING["held_logged"] = now
+        _log(f"holding {what}: no owner DM reading from the gateway yet (never the pinned room)")
+
+
+def resolve_destination(audience: str, *, room_id: str | None = None,
+                        recipients: list | None = None) -> str | list[str]:
+    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM, the last
+    reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
+    caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
+    SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
+    configured destination. Eligibility is the instance, never the pin: only the primary (launched
+    without GATEWAY_INSTANCE) owns unaddressed nudges and projects cards."""
+    if audience == OWNER_PRIVATE:
+        refresh_routing()
+        return _ROUTING["owner_dm"]
+    if audience == CURRENT_ROOM:
+        return room_id or ""
+    if audience == SELECTED_MEMBERS:
+        return list(recipients or [])
+    if audience == SYSTEM:
+        return PROACTIVE_ROOM or ""
+    raise ValueError(f"unknown audience {audience!r}")
+
+
+def proactive_room() -> str:
+    """Owner-directed by default: a proactive message or an owner-private card goes to the owner."""
+    return resolve_destination(OWNER_PRIVATE)
 
 # Runtime self-report (#3279 verification layer 3): a host loader may inject
 # {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
@@ -1603,6 +1720,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
                 "requested_worker", "priority",
+                # A card click already recorded in the HITL store, passed on for the turn it
+                # causes: the core answers [no-send] and lets its Stop hook do the work.
+                "hitl_click",
                 "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -1925,8 +2045,12 @@ def _one_line(value) -> str:
     practice and a stray newline only ever indicates an injection attempt.
 
     Load-bearing: this producer does no body defanging, so the flatten is the
-    only thing stopping a field from forging a registered header line."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    only thing stopping a field from forging a registered header line.
+
+    Folds on str.splitlines()' own set, not on CR/LF: readers split with
+    splitlines(), so any narrower set leaves a separator that is one line to
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
@@ -3267,7 +3391,10 @@ def _post_proactive() -> None:
             continue
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
+        if route == "send" and peek_room is None and GATEWAY_INSTANCE:
+            continue  # a named secondary never owns unaddressed nudges; the primary runs without GATEWAY_INSTANCE
+        if route == "send" and peek_room is None and not proactive_room():
+            _held(f"owner-directed {f.name}")
             continue
         if PROACTIVE_CLAIM_GATE is not None:
             try:
@@ -3298,9 +3425,9 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
-                route == "send" and room_override is None and not PROACTIVE_ROOM):
-            # Hand back rather than eat: a foreign target seen only post-claim,
-            # or one that vanished with no default (room_id=None loses the body).
+                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+            # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
+            # and left an unaddressed body this instance may not own or cannot place.
             try:
                 claim.rename(f)
             except OSError:
@@ -3337,7 +3464,7 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
-        dest_room = room_override or PROACTIVE_ROOM
+        dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
@@ -3490,13 +3617,19 @@ def _delivery_core() -> DeliveryCore:
 def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
-    rescanned every pass and the refusal is invisible."""
+    rescanned every pass and the refusal is invisible.
+
+    The printed command must carry BOTH ids on a named instance: the record is
+    keyed by the broker id and the body file by the local one, so neither alone
+    recovers both halves.
+    """
     try:
-        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        rfile.rename(UNDELIVERABLE_RESULTS_DIR /
-                     f"{rfile.stem}-{int(time.time())}.txt")
+        undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
         _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/, it will NOT be re-sent")
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
+             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"requeue {_broker_tid(tid)} "
+             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")
@@ -4112,6 +4245,7 @@ def main() -> None:
     backoff = 1
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
+    refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
