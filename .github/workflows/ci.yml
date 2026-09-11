@@ -307,8 +307,7 @@ jobs:
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
-          roots=(tests); if [ -d skills ]; then roots+=(skills); fi
-          find "${roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          bash scripts/discover-python-tests.sh > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"

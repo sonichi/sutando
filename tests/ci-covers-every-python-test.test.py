@@ -12,70 +12,29 @@ guard -- had never run in CI.
 """
 import glob
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
 COVGATE = REPO / "scripts" / "coverage-gate.sh"
-
-
-def _uncommented(text: str) -> str:
-    """Shell/YAML lines with comments removed. Applied to BOTH halves: an earlier
-    cut stripped comments only while locating the `find`, then scanned the raw
-    text for assignments, so `# roots+=(skills)` still counted."""
-    out = []
-    for ln in text.splitlines():
-        if ln.lstrip().startswith("#"):
-            continue
-        out.append(ln.split(" #", 1)[0])
-    return "\n".join(out)
-
-
-def _find_roots_in(wiring: Path):
-    """The roots the `find ... -name '*.test.py'` in ONE file actually passes.
-
-    Parses the CONSUMER, not the declaration, and honours assignment ORDER: a
-    later `roots=(...)` resets what earlier `+=` appended."""
-    text = _uncommented(wiring.read_text())
-    cmd = [ln for ln in text.splitlines()
-           if re.search(r"find\s+.+-name\s+'\*\.test\.py'", ln)]
-    if not cmd:
-        raise AssertionError(f"no `find ... -name '*.test.py'` COMMAND in {wiring.name}")
-    if len(cmd) > 1:
-        raise AssertionError(f"{wiring.name} has {len(cmd)} test-discovery finds; "
-                             "this guard assumes one and would check only part of it")
-    m = re.search(r"find\s+(.+?)\s+-name\s+'\*\.test\.py'", cmd[0])
-    args = m.group(1).strip()
-    var = re.fullmatch(r'"\$\{(\w+)\[@\]\}"', args)
-    if not var:
-        return {a.strip('"\'') for a in args.split() if not a.startswith("-")}
-    name = var.group(1)
-    roots = set()
-    # ANCHORED on the exact variable (a bare \w* also matched `oldroots`), and
-    # applied in source order so a reset after an append is not silently unioned.
-    for a in re.finditer(rf"(?:^|[;\s]){re.escape(name)}(\+?=)\(([^)]*)\)", text, re.M):
-        vals = {t for t in a.group(2).split() if t and not t.startswith("$")}
-        roots = (roots | vals) if a.group(1) == "+=" else set(vals)
-    return roots
-
-
-def ci_find_roots():
-    """Per-file root sets, keyed by wiring file. Never unioned: each runner must
-    independently reach every required root."""
-    return {w.name: _find_roots_in(w) for w in (CI, COVGATE)}
+DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
 
 
 def discovered_by_find():
-    """What EVERY runner's find roots reach (intersection is the honest floor)."""
-    per_file = ci_find_roots()
-    if not per_file or not all(per_file.values()):
-        raise AssertionError(f"a wiring file passes no find roots: {per_file}")
-    roots = set.intersection(*per_file.values())
-    found = set()
-    for root in sorted(roots):
-        found |= {str(Path(p)) for p in glob.glob(f"{root}/**/*.test.py", recursive=True)}
-    return {p for p in found if "node_modules" not in p}
+    """What CI actually discovers — by RUNNING the one discovery owner.
+
+    Earlier revisions parsed `find` and its root assignments out of ci.yml and
+    coverage-gate.sh. Four review rounds found four ways that lied (unioned
+    roots hiding a one-sided loss, comments, reset-vs-append order, assignments
+    placed after the consumer). Reading a declaration is not observing the
+    behaviour; executing the shared helper is."""
+    out = subprocess.run(["bash", str(DISCOVER)], cwd=str(REPO),
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise AssertionError(f"{DISCOVER.name} failed rc={out.returncode}: {out.stderr.strip()}")
+    return {p for p in out.stdout.split() if p and "node_modules" not in p}
 
 
 def named_in_workflows():
