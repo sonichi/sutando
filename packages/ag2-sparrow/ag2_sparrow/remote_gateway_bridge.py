@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -2422,6 +2423,171 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+_POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
+# A roster row is ~100 bytes, so this is >10k workers; past it the loop would
+# re-read and re-parse a runaway file every pass before it can poll for tasks.
+_POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
+_workers_pushed_identity = ""
+_workers_push_retry_at = 0.0
+_advertisement_unavailable_logged = False
+
+# 404/405/501 are the broker saying "this endpoint does not exist here"; every
+# other status is a live endpoint failing, which a short retry can clear.
+_UNSUPPORTED_ENDPOINT_STATUS = frozenset({404, 405, 501})
+
+
+def _read_pool_advertisement() -> "tuple[str, dict | None]":
+    """The pool's roster-derived advertisement -> (identity, record), or
+    ("", None) when the record is UNAVAILABLE — absent, unreadable, mid-write,
+    malformed, or carrying only one of its two halves.
+
+    The identity is a digest of the record's canonical content and is the ONE
+    change signal both publications key on. mtime is not: a restore that lands
+    below the prior file's mtime is new content the picker must see, and the
+    two halves keyed on different signals disagreed on exactly that record.
+
+    Availability is a tri-state, and None is the only "cannot read it" value: a
+    record whose maps are empty is AVAILABLE and means "the pool is empty", an
+    intentional clear the callers must push. Collapsing the two (the pre-fix
+    (0.0, {})) is what let a deleted or half-written file PUT a profile card
+    with no `workers`, and the broker REPLACES that document.
+
+    Both halves are validated from this one read so a one-sided record cannot
+    POST a status map whose labels never ship. This runs in the task loop
+    BEFORE the /v1/tasks poll and may never raise: the outer handler backs off
+    and retries the same file, so any exception here — a RecursionError from a
+    deeply nested value, not only OSError/ValueError — would stall intake for
+    as long as that file stays. The size is bounded before the parse so a
+    runaway file cannot cost the loop a full read per pass either."""
+    try:
+        if _POOL_ADVERTISEMENT_FILE.stat().st_size > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return ("", None)
+        rec = json.loads(_POOL_ADVERTISEMENT_FILE.read_text())
+        canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
+        return ("", None)
+    if not isinstance(rec, dict):
+        return ("", None)
+    if not isinstance(rec.get("workers"), dict):
+        return ("", None)
+    if not isinstance(rec.get("profile_workers"), dict):
+        return ("", None)
+    return (hashlib.sha256(canonical.encode()).hexdigest(), rec)
+
+
+def _advertisement_or_none() -> "tuple[str, dict | None]":
+    """_read_pool_advertisement, logging the availability edge once per edge so
+    an absent producer cannot fill the log at the loop's cadence."""
+    global _advertisement_unavailable_logged
+    identity, rec = _read_pool_advertisement()
+    if rec is None:
+        if not _advertisement_unavailable_logged:
+            _advertisement_unavailable_logged = True
+            _log(f"pool advertisement unavailable ({_POOL_ADVERTISEMENT_FILE.name}"
+                 " missing or unreadable) — keeping the last pushed pool state")
+    elif _advertisement_unavailable_logged:
+        _advertisement_unavailable_logged = False
+        _log("pool advertisement readable again")
+    return (identity, rec)
+
+
+def _defer_push(what: str, e: "urllib.error.HTTPError", now: float) -> float:
+    """The retry taxonomy both pushes share -> the absolute retry-at."""
+    if e.code in _UNSUPPORTED_ENDPOINT_STATUS:
+        _log(f"{what} deferred 1h: broker has no such endpoint (HTTP {e.code})")
+        return now + 3600
+    _log(f"{what} failed, retrying in 5m: endpoint exists, HTTP {e.code}")
+    return now + 300
+
+
+def _maybe_push_workers_snapshot() -> bool:
+    """Push-on-change relay of the pool's workers snapshot (the worker
+    picker's read path). An unavailable advertisement pushes NOTHING and
+    leaves the broker holding the last snapshot we sent; an unsupported
+    endpoint backs the push off an hour and any other HTTP status 5m;
+    nothing here may ever break the task loop."""
+    global _workers_pushed_identity, _workers_push_retry_at
+    now = time.time()
+    if now < _workers_push_retry_at:
+        return False
+    identity, ad = _advertisement_or_none()
+    if ad is None:
+        return False
+    if identity == _workers_pushed_identity:
+        return False
+    try:
+        _req("POST", "/v1/workers", ad["workers"], timeout=15)
+    except urllib.error.HTTPError as e:
+        _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _workers_push_retry_at = now + 300
+        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        return False
+    _workers_pushed_identity = identity
+    _log("workers-snapshot pushed")
+    return True
+
+
+_profile_pushed_identity = ""
+_profile_push_retry_at = 0.0
+
+
+def _build_agent_profile(workers: "dict") -> "dict":
+    """The instance's identity card for PUT /v1/agents/{mxid}/profile.
+    Only instance-authoritative fields — appearance is user/platform-owned
+    and the broker drops it from instance PUTs anyway.
+
+    `workers` comes from an advertisement the caller already established is
+    AVAILABLE: the broker REPLACES the profile document, so this function must
+    never be reached with a map it could not read."""
+    name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    try:
+        host_id = socket.gethostname().split(".")[0]
+    except OSError:
+        host_id = "unknown-host"
+    return {"display": {"name": name},
+            "host": {"host_id": host_id, "kind": "local"},
+            "workers": workers}
+
+
+def _maybe_push_agent_profile() -> bool:
+    """Push-on-change relay of the agent's profile card. An unavailable
+    advertisement pushes NOTHING: the card carries the `workers` map the
+    picker draws and the broker REPLACES the document, so a card built from
+    a record we could not read would erase the pool. Same retry taxonomy as
+    the workers-snapshot push; nothing here may break the task loop."""
+    global _profile_pushed_identity, _profile_push_retry_at
+    now = time.time()
+    if now < _profile_push_retry_at:
+        return False
+    mxid = _reenroll_identity()
+    if not mxid:
+        return False  # identity may appear mid-episode; recheck next loop
+    identity, ad = _advertisement_or_none()
+    if ad is None:
+        return False
+    # The same record identity the workers push keys on, so the two halves
+    # can never disagree on whether a record is new; mxid may change mid-run.
+    key = f"{mxid}\n{identity}"
+    if key == _profile_pushed_identity:
+        return False
+    card = _build_agent_profile(ad["profile_workers"])
+    try:
+        _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid)}/profile",
+             card, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_push_retry_at = _defer_push("agent-profile push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _profile_push_retry_at = now + 300
+        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        return False
+    _profile_pushed_identity = key
+    _log(f"agent-profile pushed for {mxid}")
+    return True
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -4256,6 +4422,10 @@ def main() -> None:
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
+            # Behind the delivery retries: these are 15s best-effort pushes and
+            # must never sit between a pending result and its next attempt.
+            _maybe_push_workers_snapshot()
+            _maybe_push_agent_profile()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
