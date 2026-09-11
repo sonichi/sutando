@@ -29,7 +29,7 @@ services, and lets startup recreate the managed task notifier.
 
 ### Step 1 — Pull + durable restart handoff (mechanical)
 
-Before pulling, the script consults `<workspace>/hosts/<host>/witness-owed/` (`src/witness_owed.py check`): if the target head newly contains a merged live-path PR whose post-restart witness is still owed (REVIEW.md lesson 15), it exits 4 and leaves HEAD alone. Post the round trip and `close` the record, or on the host that owes it pass `--canary owner/repo#N`, which marks the record for this host only and proceeds.
+Before pulling, the script consults `<workspace>/hosts/<host>/witness-owed/` (`src/witness_owed.py check`): if the target head newly contains a merged live-path PR whose post-restart witness is still owed (REVIEW.md lesson 15), it exits 4 and leaves HEAD alone. Post the round trip and `close` the record, or on the host that owes it pass `--canary owner/repo#N`, which marks the record for this host only and proceeds. The gate reads the target SHA it pinned after `git fetch` and fast-forwards to exactly that object, so a remote that moves mid-run cannot activate a head the gate never checked. Its freshness bound `SUTANDO_WITNESS_MAX_AGE` is declared in this skill's `manifest.json` `config` block (env override wins; seconds, finite and > 0).
 
 Run the helper. It aborts safely on a dirty tree or a non-fast-forward, pulls
 `--ff-only`, and launches `src/restart.sh` in the persistent

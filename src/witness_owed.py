@@ -13,16 +13,41 @@ Records live under <workspace>/hosts/<host>/witness-owed/<owner>-<repo>#<pr>.jso
 closed/ once the witness is posted. Readers scan every host's directory, so a
 record opened on one host refuses activation on all of them. Policy only: no
 transport, no provider calls, no workspace resolution beyond what is handed in.
+
+PUBLICATION CONTRACT — what "published" means, and when the gate may trust it.
+
+A hold is PUBLISHED when this host's witness-owed subtree AND a stamp naming
+its exact bytes have been pushed to the vault. The stamp is a claim, never
+proof: `publish()` writes it, and the push that makes it true belongs to the
+caller. So `open` takes `--publish-with <command>` and runs it synchronously;
+if that command fails the stamp is removed again, leaving the host visibly
+unpublished, and the exit code says the hold is local-only. A hold that never
+left its host binds only that host — which is why an unpublished host cannot
+activate (`unpublished()` -> a blocking hit) and why failing to publish is
+loud rather than silent.
+
+The gate may trust a peer host's directory only when ALL of:
+  (a) the deploying host's own PULL leg succeeded this run — the caller's job
+      (`sync-workspace.sh --pull-strict`, exit 3 on a refused pull);
+  (b) the peer's stamp names the host whose directory holds it;
+  (c) the stamp's digest describes the bytes that actually arrived;
+  (d) the stamp is younger than max-age and not from the future.
+Any of (b)-(d) failing makes that host stale, and a stale host blocks by
+itself: a directory whose freshness cannot be established is not evidence
+that it holds no hold.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +57,7 @@ _RECORD_KEY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 _STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_HOST_ILLEGAL = re.compile(r"[/\\\x00-\x1f\x7f]")
 TOMBSTONE_FIELDS = ("repo", "pr", "head", "owed_by", "witness", "closed_by", "closed_at")
 FIELDS = ("repo", "pr", "head", "host", "reason", "opened_by", "opened_at")
 STAMP_NAME = ".published"
@@ -40,10 +65,14 @@ DEFAULT_MAX_AGE_S = 3600.0
 
 
 def validate_host(host: object) -> str:
-    """A host becomes a path component, so it must be ONE ordinary segment.
-    A bare non-empty check let `../../x` resolve outside the workspace."""
-    if not isinstance(host, str) or not _HOST.match(host) or host in (".", ".."):
-        raise ValueError(f"host must be one path segment matching {_HOST.pattern}, got {host!r}")
+    """ONE ordinary path segment, and no narrower: the label is whatever
+    `_host_label()` resolved, and that contract trims the ENDS only — so the
+    legal `My Mac` keeps its space, while `/`, `.`, `..` and control
+    characters stay refused because they would resolve somewhere else."""
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise ValueError(f"host must be a non-empty label with no leading/trailing space, got {host!r}")
+    if host in (".", "..") or _HOST_ILLEGAL.search(host):
+        raise ValueError(f"host must be ONE path segment (no '/', '\\', control chars, '.' or '..'), got {host!r}")
     return host
 
 
@@ -128,6 +157,23 @@ def _atomic_write(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+@contextmanager
+def record_lock(workspace: Path, host: str, repo: str, pr: int):
+    """One writer at a time for one record key on one host.
+
+    Each `_atomic_write` is atomic on its own, which is not the invariant: a
+    close is READ -> archive -> unlink, and an open landing between the read
+    and the unlink had its brand-new hold deleted by the close of the old one."""
+    d = records_dir(workspace, host) / ".locks"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / f"{record_key(repo, pr)}.lock", "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def open_record(workspace: Path, repo: str, pr: int, head: str, host: str,
                 reason: str, opened_by: str) -> Path:
     """Write the owed-witness record. Every field is required: a record that
@@ -140,9 +186,10 @@ def open_record(workspace: Path, repo: str, pr: int, head: str, host: str,
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{name} must be a non-empty string")
     path = record_path(workspace, host, repo, pr)
-    _atomic_write(path, {"repo": repo, "pr": int(pr), "head": head, "host": host,
-                         "reason": reason.strip(), "opened_by": opened_by,
-                         "opened_at": _now(), "canary": None})
+    with record_lock(workspace, host, repo, pr):
+        _atomic_write(path, {"repo": repo, "pr": int(pr), "head": head, "host": host,
+                             "reason": reason.strip(), "opened_by": opened_by,
+                             "opened_at": _now(), "canary": None})
     return path
 
 
@@ -229,7 +276,7 @@ def records_digest(workspace: Path, host: str) -> str:
     h = sha256()
     if d.is_dir():
         for f in sorted(x for x in d.rglob("*") if x.is_file() and x.name != STAMP_NAME
-                        and not x.name.endswith(".tmp")):
+                        and not x.name.endswith((".tmp", ".lock"))):
             h.update(str(f.relative_to(d)).encode())
             h.update(b"\0")
             h.update(f.read_bytes())
@@ -267,6 +314,27 @@ def unpublished(workspace: Path, host: str) -> bool:
     return stamp.get("records") != digest
 
 
+class NotPublished(RuntimeError):
+    """The record is on this host only: its push did not land."""
+
+
+def publish_push(workspace: Path, host: str, publish_with: str) -> None:
+    """Stamp, run the CALLER'S push command, and verify the stamp still
+    describes the subtree. The command is injected, never named here: this
+    module carries policy, and the vault transport lives at the edge.
+
+    On any failure the stamp is removed again, so the host reads unpublished
+    and its own gate refuses to activate rather than trusting a local hold."""
+    publish(workspace, host)
+    rc = subprocess.run(["bash", "-c", publish_with]).returncode
+    if rc == 0 and not unpublished(workspace, host):
+        return
+    (records_dir(workspace, host) / STAMP_NAME).unlink(missing_ok=True)
+    raise NotPublished(
+        f"publish command exited {rc}: this hold is on {host} only, so no peer's gate "
+        "can see it. Fix the vault push and re-run; until then the hold binds this host.")
+
+
 def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
                 now: datetime | None = None) -> list[str]:
     """Foreign hosts whose stamp is missing or older than max_age_s: the view
@@ -295,6 +363,19 @@ def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
         if age > max_age_s or age < -60:
             out.append(h)
     return out
+
+
+def validate_max_age(value: object) -> float:
+    """`float("inf")`/`float("nan")` parse happily and then disable expiry
+    entirely, so an unbounded window claimed a finite one. This is the Python
+    boundary the shell check said it was enforcing."""
+    try:
+        f = float(value)          # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"max age must be a number of seconds, got {value!r}") from None
+    if not math.isfinite(f) or f <= 0:
+        raise ValueError(f"max age must be finite and > 0 seconds, got {value!r}")
+    return f
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -368,6 +449,8 @@ def blocking(workspace: Path, repo_root: Path, target_ref: str,
     that owes the witness. With max_age_s, a foreign host whose stamp is
     missing or older blocks by itself: its records cannot be called fresh."""
     hits = []
+    if max_age_s is not None:
+        max_age_s = validate_max_age(max_age_s)
     if max_age_s is not None and host:
         # A peer cannot fix this one and neither can waiting: the operator can.
         if unpublished(workspace, host):
@@ -401,15 +484,16 @@ def mark_canary(workspace: Path, repo: str, pr: int, host: str) -> Path:
     """Declare `host` the canary. Only the host that owes the witness may:
     a record marked by any other host would release an activation the
     deferral never covered."""
-    path = find_record(workspace, repo, pr)
-    if path is None:
-        raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
-    data = json.loads(path.read_text())
-    if data.get("host") != host:
-        raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}")
-    data["canary"] = host
-    data["canary_at"] = _now()
-    _atomic_write(path, data)
+    with record_lock(workspace, host, repo, pr):
+        path = find_record(workspace, repo, pr)
+        if path is None:
+            raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
+        data = json.loads(path.read_text())
+        if data.get("host") != host:
+            raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}")
+        data["canary"] = host
+        data["canary_at"] = _now()
+        _atomic_write(path, data)
     return path
 
 
@@ -419,18 +503,25 @@ def close_record(workspace: Path, repo: str, pr: int, witness: str, host: str) -
     refuses a foreign-host deletion, so any other host must tombstone."""
     if not isinstance(witness, str) or not witness.strip():
         raise ValueError("witness must name where the round trip was posted")
-    path = find_record(workspace, repo, pr)
-    if path is None:
-        raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
-    data = json.loads(path.read_text())
-    if data.get("host") != host:
-        raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}: "
-                         "tombstone it from this host instead")
-    data["witness"] = witness.strip()
-    data["closed_at"] = _now()
-    closed = path.parent / "closed" / path.name
-    _atomic_write(closed, data)
-    path.unlink()
+    with record_lock(workspace, host, repo, pr):
+        path = find_record(workspace, repo, pr)
+        if path is None:
+            raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
+        raw = path.read_text()
+        data = json.loads(raw)
+        if data.get("host") != host:
+            raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}: "
+                             "tombstone it from this host instead")
+        data["witness"] = witness.strip()
+        data["closed_at"] = _now()
+        closed = path.parent / "closed" / path.name
+        _atomic_write(closed, data)
+        # Compare-and-swap, so a writer that ignored the lock still cannot have
+        # its hold deleted: unlink only the bytes this close actually archived.
+        if path.read_text() != raw:
+            raise ValueError(f"{repo}#{pr} was rewritten while closing; the new record stands "
+                             f"(archived copy kept at {closed})")
+        path.unlink()
     return closed
 
 
@@ -466,12 +557,16 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("key"); o.add_argument("--head", required=True)
     o.add_argument("--host", required=True); o.add_argument("--reason", required=True)
     o.add_argument("--by", required=True)
+    o.add_argument("--publish-with", metavar="CMD",
+                   help="shell command that pushes this workspace (e.g. "
+                        "'bash scripts/sync-workspace.sh --push-only'); the record is "
+                        "published only if it succeeds. Exit 6 when it does not.")
     sub.add_parser("list")
     c = sub.add_parser("check")
     c.add_argument("--ref", required=True); c.add_argument("--current")
     c.add_argument("--repo-root", default="."); c.add_argument("--host")
     c.add_argument("--repo", help="owner/name of the deployment target; scopes (#N) matches")
-    c.add_argument("--max-age", type=float, help="seconds; a foreign host stamped older than this blocks")
+    c.add_argument("--max-age", help="seconds; a foreign host stamped older than this blocks")
     m = sub.add_parser("canary"); m.add_argument("key"); m.add_argument("--host", required=True)
     x = sub.add_parser("close"); x.add_argument("key"); x.add_argument("--witness", required=True)
     x.add_argument("--host", required=True)
@@ -489,14 +584,28 @@ def main(argv: list[str] | None = None) -> int:
         ws = resolve_workspace(migrate=False)
     if a.cmd == "open":
         repo, pr = _split(a.key)
-        print(open_record(ws, repo, pr, a.head, a.host, a.reason, a.by)); return 0
+        print(open_record(ws, repo, pr, a.head, a.host, a.reason, a.by))
+        if not a.publish_with:
+            print("witness-owed: NOT PUBLISHED — this hold binds only this host until its "
+                  "subtree is pushed; re-run with --publish-with, or push the vault now.",
+                  file=sys.stderr)
+            return 0
+        try:
+            publish_push(ws, a.host, a.publish_with)
+        except NotPublished as exc:
+            print(f"witness-owed: {exc}", file=sys.stderr); return 6
+        return 0
     if a.cmd == "list":
         for rec in list_open(ws):
             print(f"{rec['repo']}#{rec['pr']} head={rec['head'][:8]} host={rec['host']} "
                   f"canary={rec.get('canary')} reason={rec['reason']}")
         return 0
     if a.cmd == "check":
-        hits = blocking(ws, Path(a.repo_root), a.ref, a.current, a.host, a.repo, a.max_age)
+        try:
+            max_age = validate_max_age(a.max_age) if a.max_age is not None else None
+        except ValueError as exc:
+            print(f"witness-owed: {exc}", file=sys.stderr); return 2
+        hits = blocking(ws, Path(a.repo_root), a.ref, a.current, a.host, a.repo, max_age)
         for rec in hits:
             print(f"witness owed: {rec['repo']}#{rec['pr']} head={rec['head'][:8]} "
                   f"host={rec['host']} — {rec['reason']}", file=sys.stderr)

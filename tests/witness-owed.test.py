@@ -333,9 +333,9 @@ class UpgradeWiring(unittest.TestCase):
 
     def test_self_upgrade_checks_the_record_before_it_pulls(self):
         gate = self.SRC.index("witness_owed.py")
-        pull = self.SRC.index("git pull --ff-only")
+        pull = self.SRC.index("git merge --ff-only")
         self.assertLess(gate, pull, "the gate must run before the head changes")
-        self.assertIn('check --ref "$REMOTE/$BRANCH"', self.SRC)
+        self.assertIn('check --ref "$TARGET_SHA"', self.SRC)
         self.assertIn("--current HEAD", self.SRC)
         self.assertIn("--canary", self.SRC)
 
@@ -498,14 +498,14 @@ class UpgradePublicationWiring(unittest.TestCase):
     def test_this_host_publishes_before_it_reads_the_fleet(self):
         publish = self.sh.index('publish --host "$GATE_HOST"')
         sync = self.sh.index('bash "$REPO/scripts/sync-workspace.sh"')
-        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        check = self.sh.index('check --ref "$TARGET_SHA"')
         self.assertLess(publish, sync, "the stamp must travel WITH the records the sync pushes")
         self.assertLess(sync, check, "the fleet is read before it is refreshed")
 
     def test_the_pre_gate_sync_is_a_full_tick_not_pull_only(self):
         # --pull-only never publishes this host, so a fleet of pull-only
         # updaters ages every stamp out and then refuses forever.
-        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        check = self.sh.index('check --ref "$TARGET_SHA"')
         # Only INVOCATIONS count: the first draft of this assertion matched its
         # own explanatory comment and failed on prose.
         calls = [ln for ln in self.sh[:check].splitlines()
@@ -518,14 +518,258 @@ class UpgradePublicationWiring(unittest.TestCase):
         # gate refuses the very host the canary was declared for.
         declare = self.sh.index('canary "$CANARY" --host "$GATE_HOST"')
         publish = self.sh.index('publish --host "$GATE_HOST"', declare)
-        check = self.sh.index('check --ref "$REMOTE/$BRANCH"')
+        check = self.sh.index('check --ref "$TARGET_SHA"')
         self.assertLess(publish, check)
 
     def test_nothing_heavy_sits_between_the_pull_and_the_restart_handoff(self):
         # A synchronous vault push here delayed the handoff past its budget.
-        pull = self.sh.index('git pull --ff-only')
+        pull = self.sh.index('git merge --ff-only')
         handoff = self.sh.index('new-session -d -s "$SERVICE_SESSION"')
         self.assertNotIn("sync-workspace.sh", self.sh[pull:handoff])
+
+
+class Round7Serialization(Fixture):
+    """keweichen round-5 P1-3: close and open on one record key must not
+    interleave. The control is the production writers, raced."""
+
+    HEAD_A, HEAD_B = "a" * 40, "b" * 40
+
+    def _race(self, mod=wo):
+        """Run keweichen's ordering: pause close() the instant it archives,
+        let a concurrent open() fire, then resume. Returns (errors, close_exc)."""
+        import threading
+        import time
+        mod.open_record(self.ws, "o/r", 12, self.HEAD_A, HOST_A, "why", "me")
+        paused, errors, real_write = threading.Event(), [], mod._atomic_write
+
+        def instrumented(path, data):
+            real_write(path, data)
+            if path.parent.name == "closed":
+                paused.set()
+                time.sleep(1.5)
+
+        def opener():
+            if not paused.wait(10):
+                errors.append("close never archived")
+                return
+            try:
+                mod.open_record(self.ws, "o/r", 12, self.HEAD_B, HOST_A, "reopened", "me")
+            except Exception as exc:             # noqa: BLE001 - the race IS the subject
+                errors.append(repr(exc))
+
+        t = threading.Thread(target=opener)
+        t.start()
+        mod._atomic_write = instrumented
+        close_exc = None
+        try:
+            mod.close_record(self.ws, "o/r", 12, "https://x/12", HOST_A)
+        except Exception as exc:                 # noqa: BLE001 - same
+            close_exc = exc
+        finally:
+            mod._atomic_write = real_write
+        t.join(20)
+        return errors, close_exc
+
+    def _closed_head(self):
+        return json.loads((wo.records_dir(self.ws, HOST_A) / "closed"
+                           / wo.record_key("o/r", 12)).read_text())["head"]
+
+    def test_a_close_cannot_delete_a_concurrently_reopened_hold(self):
+        errors, close_exc = self._race()
+        self.assertEqual(errors, [], f"the concurrent open failed: {errors}")
+        self.assertIsNone(close_exc, f"the serialized close must succeed: {close_exc!r}")
+        # THE POINT: the lock serializes them, so the reopened B survives the
+        # close of A — the old ordering archived A and unlinked B.
+        heads = [r["head"] for r in wo.list_open(self.ws)]
+        self.assertEqual(heads, [self.HEAD_B],
+                         f"the reopened hold vanished; closed={self._closed_head()}")
+        self.assertEqual(self._closed_head(), self.HEAD_A)
+
+    def test_without_the_lock_the_close_refuses_rather_than_deleting(self):
+        """Control: disable ONLY the lock and the production compare-and-swap
+        still refuses to unlink bytes it did not archive."""
+        import contextlib
+        real_lock = wo.record_lock
+        wo.record_lock = lambda *a, **k: contextlib.nullcontext()
+        try:
+            errors, close_exc = self._race()
+        finally:
+            wo.record_lock = real_lock
+        self.assertEqual(errors, [])
+        self.assertIsInstance(close_exc, ValueError)
+        self.assertIn("rewritten while closing", str(close_exc))
+        self.assertEqual([r["head"] for r in wo.list_open(self.ws)], [self.HEAD_B],
+                         "an unlocked close deleted the reopened hold")
+
+    def test_the_lock_file_is_not_part_of_what_is_published(self):
+        wo.open_record(self.ws, "o/r", 12, self.HEAD_A, HOST_A, "why", "me")
+        wo.publish(self.ws, HOST_A)
+        self.assertTrue(list((wo.records_dir(self.ws, HOST_A) / ".locks").glob("*.lock")))
+        self.assertFalse(wo.unpublished(self.ws, HOST_A), "a lock file moved the digest")
+
+
+class Round7SerializationControl(Fixture):
+    """Before/after on ONE fixture: the PRE-FIX writer, built from the shipped
+    module by disabling exactly the two added mechanisms, loses the hold."""
+
+    HEAD_A, HEAD_B = Round7Serialization.HEAD_A, Round7Serialization.HEAD_B
+    _race = Round7Serialization._race
+    _closed_head = Round7Serialization._closed_head
+
+    def _prefix_module(self):
+        src = (ROOT / "src" / "witness_owed.py").read_text()
+        out = src.replace("fcntl.flock(fh.fileno(), fcntl.LOCK_EX)", "pass", 1)
+        out = out.replace("fcntl.flock(fh.fileno(), fcntl.LOCK_UN)", "pass", 1)
+        out = out.replace("if path.read_text() != raw:", "if False:", 1)
+        self.assertNotIn("LOCK_EX", out, "the lock substitution was a no-op")
+        self.assertNotIn("path.read_text() != raw", out, "the CAS substitution was a no-op")
+        mod = importlib.util.module_from_spec(spec)
+        exec(compile(out, "witness_owed_prefix", "exec"), mod.__dict__)
+        return mod
+
+    def test_the_pre_fix_writer_reproduces_the_lost_hold(self):
+        control = self._prefix_module()
+        errors, close_exc = self._race(control)
+        self.assertEqual(errors, [])
+        self.assertIsNone(close_exc, "the pre-fix close raised; it used to succeed silently")
+        # CONTROL: close archived A and unlinked the newly opened B.
+        self.assertEqual(wo.list_open(self.ws), [], "the pre-fix defect did not reproduce")
+        self.assertEqual(self._closed_head(), self.HEAD_A)
+
+
+class Round7HostLabel(Fixture):
+    """keweichen round-5 P1-4: the helper must accept every label the host
+    contract can produce, and still refuse anything that is not one segment."""
+
+    def test_a_legal_label_with_a_space_is_accepted_end_to_end(self):
+        # `_host_label()`/`_host()` trim the ENDS only, so `My Mac` is legal and
+        # `hosts/My Mac/` is the directory the vault carries.
+        self.assertEqual(wo.validate_host("My Mac"), "My Mac")
+        p = wo.open_record(self.ws, "o/r", 12, self.owed, "My Mac", "why", "me")
+        self.assertEqual(p.relative_to(self.ws).parts[:3], ("hosts", "My Mac", "witness-owed"))
+        later = self.merge_topology()
+        hits = wo.blocking(self.ws, self.repo, later, self.base, host="My Mac", target_repo="o/r")
+        self.assertEqual([h["host"] for h in hits], ["My Mac"],
+                         "a legal host label made the gate raise instead of answering")
+        self.assertEqual(wo.records_digest(self.ws, "My Mac") != wo.EMPTY_DIGEST, True)
+
+    def test_the_shell_and_python_host_resolvers_agree_that_ends_are_trimmed(self):
+        """Data pin on the contract this validator follows: both resolvers trim
+        the ends only, which is exactly why an internal space must be kept."""
+        py = (ROOT / "src" / "util_paths.py").read_text()
+        sh = (ROOT / "scripts" / "sync-workspace.sh").read_text()
+        self.assertIn("label containing a space is preserved", sh)
+        self.assertIn("Matches SutandoConfig.hostLabel()", py)
+
+    def test_a_host_that_is_not_one_segment_is_still_refused(self):
+        for bad in ("../../escaped", "a/b", ".", "..", "", "  ", " lead", "trail ",
+                    "nul\x00", "bell\x07", "back\\slash"):
+            with self.assertRaises(ValueError, msg=f"host {bad!r} was accepted"):
+                wo.validate_host(bad)
+
+
+class Round7Publication(Fixture):
+    """keweichen round-5 P1-1: what "published" means, and when the gate may
+    trust a peer's directory."""
+
+    def _peer_ws(self):
+        return Path(self.tmp.name) / "ws-peer"
+
+    def _push_cmd(self):
+        """Stand-in for the vault push: copy this host's subtree to the peer."""
+        import shlex
+        return (f"cp -R {shlex.quote(str(self.ws / 'hosts'))} "
+                f"{shlex.quote(str(self._peer_ws()))}/")
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
+                               "--workspace", str(self.ws), *args],
+                              capture_output=True, text=True)
+
+    def test_a_published_hold_opened_on_one_host_blocks_the_gate_on_another(self):
+        peer = self._peer_ws(); peer.mkdir(parents=True)
+        r = self._cli("open", "o/r#12", "--head", self.owed, "--host", HOST_A,
+                      "--reason", "no supervised lane", "--by", "001",
+                      "--publish-with", self._push_cmd())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(wo.unpublished(self.ws, HOST_A), "a successful push left the host unpublished")
+        later = self.merge_topology()
+        hits = wo.blocking(peer, self.repo, later, self.base, host=HOST_B,
+                           target_repo="o/r", max_age_s=3600)
+        self.assertEqual([(h["repo"], h["pr"]) for h in hits], [("o/r", 12)],
+                         "a published hold was invisible to the peer's gate")
+
+    def test_a_push_that_fails_withdraws_the_stamp_and_says_the_hold_is_local(self):
+        r = self._cli("open", "o/r#12", "--head", self.owed, "--host", HOST_A,
+                      "--reason", "no supervised lane", "--by", "001",
+                      "--publish-with", "exit 7")
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        self.assertIn("on host-a only", r.stderr)
+        self.assertFalse((wo.records_dir(self.ws, HOST_A) / wo.STAMP_NAME).exists(),
+                         "a failed push left a stamp claiming peers can see the hold")
+        # And the un-published host cannot activate: it blocks on itself.
+        later = self.merge_topology()
+        hits = wo.blocking(self.ws, self.repo, later, self.base, host=HOST_A,
+                           target_repo="o/r", max_age_s=3600)
+        self.assertTrue(any(h.get("stale") and "publish and push" in h["reason"] for h in hits),
+                        f"an unpublished host activated anyway: {hits}")
+
+    def test_open_without_publish_with_says_the_hold_is_not_in_force_fleet_wide(self):
+        r = self._cli("open", "o/r#12", "--head", self.owed, "--host", HOST_A,
+                      "--reason", "no supervised lane", "--by", "001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("NOT PUBLISHED", r.stderr)
+        self.assertTrue(wo.unpublished(self.ws, HOST_A))
+
+    def test_the_deploying_host_must_have_pulled_before_it_trusts_the_fleet(self):
+        """The (a) clause of the contract is the caller's: upgrade.sh asks for
+        the strict tick, whose exit 3 is a refused pull."""
+        sh = (ROOT / "skills" / "self-upgrade" / "scripts" / "upgrade.sh").read_text()
+        self.assertIn('sync-workspace.sh" --pull-strict', sh)
+        self.assertIn('if [ "$GATE_SYNC_RC" = "3" ]', sh)
+
+
+class Round7MaxAge(Fixture):
+    """keweichen round-5 P2: a bound that accepts infinity is not a bound."""
+
+    def test_the_python_boundary_rejects_infinity_nan_and_non_positive(self):
+        for bad in ("1e400", "inf", "-inf", "nan", "0", "-1", "abc", None):
+            with self.assertRaises(ValueError, msg=f"max age {bad!r} was accepted"):
+                wo.validate_max_age(bad)
+        self.assertEqual(wo.validate_max_age("3600"), 3600.0)
+
+    def test_blocking_refuses_an_infinite_bound_rather_than_disabling_expiry(self):
+        self.open12(host=HOST_A)
+        with self.assertRaises(ValueError):
+            wo.blocking(self.ws, self.repo, self.base, None, HOST_B, "o/r", float("inf"))
+
+    def test_the_cli_exits_2_on_an_unbounded_max_age_instead_of_passing(self):
+        r = subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
+                            "--workspace", str(self.ws), "check", "--ref", self.base,
+                            "--repo-root", str(self.repo), "--max-age", "1e400"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("finite", r.stderr)
+
+
+class Round7Declaration(unittest.TestCase):
+    """keweichen round-5 P2: the bound is declared in the skill manifest, per
+    CLAUDE.md, and the shell keeps no second copy of its rule."""
+
+    MANIFEST = ROOT / "skills" / "self-upgrade" / "manifest.json"
+    SRC = (ROOT / "skills/self-upgrade/scripts/upgrade.sh").read_text()
+
+    def test_the_manifest_declares_the_setting_with_a_default(self):
+        m = json.loads(self.MANIFEST.read_text())
+        self.assertTrue(m.get("enabled"), "a disabled manifest declares nothing")
+        self.assertEqual(m["config"]["SUTANDO_WITNESS_MAX_AGE"], "3600")
+
+    def test_the_updater_reads_env_then_manifest_and_owns_no_numeric_policy(self):
+        self.assertIn('GATE_MAX_AGE="${SUTANDO_WITNESS_MAX_AGE:-}"', self.SRC)
+        self.assertIn("skills/self-upgrade/manifest.json", self.SRC)
+        # The finite/positive rule lives in the helper that consumes the value.
+        self.assertIn("from witness_owed import validate_max_age", self.SRC)
+        self.assertNotIn("awk -v v=", self.SRC, "the shell kept its own copy of the bound's rule")
 
 
 if __name__ == "__main__":

@@ -286,8 +286,17 @@ and loads whichever repo it reviews.
     failing command pasted. "No supervised job is loaded" is not eligibility when the installer
     can load one. When eligible, the author (1) files the owed witness as a durable record —
     `python3 src/witness_owed.py --workspace "$WORKSPACE" open owner/repo#N --head <sha> --host
-    <host> --reason "<why no target exists>" --by <agent>` — written under the carried
-    `hosts/<host>/witness-owed/` subtree so every host sees it — and (2) says so in the PR body
+    <host> --reason "<why no target exists>" --by <agent> --publish-with 'bash
+    scripts/sync-workspace.sh --push-only'` — written under the carried
+    `hosts/<host>/witness-owed/` subtree so every host sees it. `--publish-with` is the
+    publication contract, not a convenience: a hold is in force fleet-wide only once its
+    subtree AND the stamp naming its bytes have been PUSHED, so the push runs synchronously
+    and a failure is exit 6 with the stamp withdrawn, leaving the host visibly unpublished
+    and unable to activate. A hold that never left its host binds only that host. On the
+    reading side, a peer's directory is trusted only when the deploying host's own pull leg
+    succeeded this run (`sync-workspace.sh --pull-strict`) and that peer's stamp names it,
+    describes the bytes that arrived, and is younger than the declared max age; otherwise
+    the host is stale and blocks by itself — and (2) says so in the PR body
     in those terms. The PR may then be approved and merged on its harness proof. `self-upgrade`
     reads the record and refuses to fast-forward a live core onto any head that newly contains
     the owed PR (`src/witness_owed.py check`, exit 3) until the exact-head round trip is posted
