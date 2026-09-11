@@ -78,7 +78,12 @@ def with_status(payload, *, pgrep_returns=False, app_data="", write=True):
 
 
 def case_a_fresh_connected() -> list[str]:
-    v, pgrepped = with_status({"connected": True, "ts": time.time()}, pgrep_returns=False)
+    # last_ok_ts present: this case pins the pgrep-avoidance path, not the
+    # never-polled rule (case m). Without it the fixture IS a never-polled lane.
+    v, pgrepped = with_status(
+        {"connected": True, "ts": time.time(), "last_ok_ts": time.time() - 5},
+        pgrep_returns=False,
+    )
     fails = []
     if v is not True:
         fails.append(f"a) fresh+connected should be True, got {v!r}")
@@ -159,7 +164,9 @@ def case_h_threshold_clears_poll_gap() -> list[str]:
         return [f"h) threshold {ciw.GATEWAY_STATUS_MAX_AGE_S}s does not clear the "
                 "35s worst-case healthy write gap"]
     # And a write inside that gap must still read fresh.
-    v, pgrepped = with_status({"connected": True, "ts": time.time() - 35})
+    v, pgrepped = with_status(
+        {"connected": True, "ts": time.time() - 35, "last_ok_ts": time.time() - 35}
+    )
     if v is not True or pgrepped:
         return ["h) a 35s-old sidecar (healthy long-poll gap) must still be trusted"]
     return []
@@ -211,6 +218,26 @@ def case_l_never_connected_stays_down() -> list[str]:
     return [] if v is False else [f"l) never-connected must read down, got {v!r}"]
 
 
+def case_m_connected_without_last_ok_stays_down():
+    """`connected` alone is not serving: a lane that never completed a poll
+    carries connected=true with last_ok_ts null. This is the shape a dead
+    bridge's own final write leaves behind, and the reason cases a) and h)
+    above had to name a last_ok_ts — before this rule they were this case."""
+    fails = []
+    for label, doc in (
+        ("null", {"connected": True, "ts": time.time(), "last_ok_ts": None}),
+        ("absent", {"connected": True, "ts": time.time()}),
+    ):
+        v, _ = with_status(doc)
+        if v is not False:
+            fails.append(f"m) connected with {label} last_ok_ts should be False, got {v!r}")
+    # The reconnect grace must not rescue it either — there is no success to age.
+    v, _ = with_status({"connected": False, "ts": time.time(), "last_ok_ts": None, "backoff_s": 5})
+    if v is not False:
+        fails.append(f"m) backoff grace must not apply to a never-polled lane, got {v!r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_fresh_connected),
@@ -225,6 +252,7 @@ def main() -> int:
         ("j", case_j_auth_rejection_stays_down),
         ("k", case_k_sustained_outage_stays_down),
         ("l", case_l_never_connected_stays_down),
+        ("m", case_m_connected_without_last_ok_stays_down),
     ]
     all_failures = []
     for label, fn in cases:

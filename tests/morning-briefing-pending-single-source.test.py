@@ -47,7 +47,7 @@ field. Both consumers must agree it is not waiting.
 
 ## [RESOLVED?] Did this actually ship?
 Question punctuation is NOT a resolution. This is an open uncertainty and must
-survive on both surfaces (review [P1] 2026-07-28: `(?![\w-])` let `?` through,
+survive on both surfaces (review [P1] 2026-07-28: `(?![\\w-])` let `?` through,
 so an open ask was classified resolved and vanished from notifier AND briefing).
 
 ## [DONE?] Still waiting for confirmation

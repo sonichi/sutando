@@ -72,6 +72,13 @@ resolve_python() {
 		return 0
 	fi
 
+	_sutando_safe_path_python
+}
+
+# Echo the PATH python3 when it is safe to execute, or NOTHING. Split out of
+# resolve_python so a module-aware resolver can reuse the stub rules verbatim
+# rather than restating them -- a second copy of this is a modal dialog.
+_sutando_safe_path_python() {
 	_path_py="$(command -v python3 2>/dev/null)" || _path_py=""
 	[ -n "$_path_py" ] || return 0
 
@@ -108,6 +115,33 @@ resolve_python() {
 	if _sutando_developer_tools_installed; then
 		printf '%s' "$_path_py"
 	fi
+	return 0
+}
+
+# Echo a runnable python3 that can `import $2`, or NOTHING. Same candidate order
+# and same stub rules as resolve_python, but a candidate that cannot import the
+# module is SKIPPED rather than returned.
+#
+# resolve_python answers "which interpreter runs", which is a different question
+# from "which interpreter runs THIS". A bundled runtime without a channel's
+# third-party dep satisfies the first and fails the second, and a caller that
+# probes only the first answer concludes no interpreter exists while a usable
+# one sits further down the same list.
+#
+# $1 = repo root. $2 = module the caller needs (e.g. slack_bolt).
+resolve_python_for_module() {
+	_repo="${1:-.}"
+	_mod="${2:-}"
+	[ -n "$_mod" ] || { resolve_python "$_repo"; return 0; }
+
+	for _cand in "${SUTANDO_PY:-}" "$_repo/../runtime/python/bin/python3" \
+	             "$(_sutando_safe_path_python)"; do
+		[ -n "$_cand" ] && [ -x "$_cand" ] || continue
+		if "$_cand" -c "import $_mod" >/dev/null 2>&1; then
+			printf '%s' "$_cand"
+			return 0
+		fi
+	done
 	return 0
 }
 

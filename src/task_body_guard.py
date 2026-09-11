@@ -61,6 +61,17 @@ _FENCE_RE = re.compile(r"^={3,}")
 _LINE_SEP_RE = re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
+def header_safe_value(value) -> str:
+    """Flatten a value so it cannot open a second line in a `key: value` header.
+
+    Derived from `str.splitlines()` rather than enumerated, so the folded set is
+    the reader's set by construction — a bridge that strips only `\\n` leaves
+    `\\r`, U+2028 and six others intact, and every task-file reader that scans
+    with `splitlines()` then sees a forged `access_tier: owner`.
+    """
+    return " ".join(str(value).splitlines()) if value is not None else ""
+
+
 def confine_user_content(text: str) -> str:
     """Return `text` with any header-field-like or fence-like line defanged.
 

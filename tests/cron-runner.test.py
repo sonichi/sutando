@@ -489,7 +489,9 @@ def test_run_drops_stale_catchup_slot():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))
@@ -522,7 +524,9 @@ def test_drop_line_is_timestamped():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))
@@ -837,6 +841,26 @@ def test_malformed_shell_command_is_skipped_and_not_retried():
         finally:
             cr.REPO_ROOT = original_repo_root
 
+
+
+# A dense schedule must not expand the whole day under run()'s state lock.
+# Pin the call bound, not a duration — elapsed time is host-dependent.
+def test_dense_schedule_does_not_expand_the_day():
+    import time as _t
+    calls = {"mk": 0}
+    real = _t.mktime
+    cr.time.mktime = lambda *a: (calls.__setitem__("mk", calls["mk"] + 1) or real(*a))
+    try:
+        now = int(real((2026, 6, 15, 14, 37, 0, 0, 0, -1)))
+        assert cr.cron_period_seconds("* * * * *", now) == 60
+        # one hour is 60 minutes x <=2 epochs, plus the day/noon probes
+        assert calls["mk"] < 200, f"expanded the day: {calls['mk']} mktime calls"
+    finally:
+        cr.time.mktime = real
+    print("OK: dense '* * * * *' stays under the per-hour bound")
+
+
+test_dense_schedule_does_not_expand_the_day()
 
 if __name__ == "__main__":
     _run_all()

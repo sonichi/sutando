@@ -91,6 +91,33 @@ for label, section in SHAPES.items():
             "-- the retired pattern's coverage is not what the regression assumed",
         )
 
+
+# 4. The guard and the read must name the SAME file: on disagreement `qs` is
+# empty, prints "None", and the honest parse-failure branch never fires.
+_snip = re.search(r"pq_out=\$\(python3 -c \"\n(.*?)\"\s*2>/dev/null\)",
+                  src, re.S)
+check("the extractor snippet is still locatable", bool(_snip))
+if _snip:
+    with tempfile.TemporaryDirectory() as td:
+        real = Path(td) / "pending-questions.md"
+        real.write_text("## UNIQUEMARKER-guarded-file question\n\nbody\n")
+        code = _snip.group(1).replace("$REPO", str(REPO)).replace("$PQ_PATH", str(real))
+
+        def run(src_code):
+            return subprocess.run([sys.executable, "-c", src_code],
+                                  capture_output=True, text=True).stdout
+
+        fixed = run(code)
+        # Negative control: strip the binding and the read reverts to whatever
+        # the module resolved on its own — the pre-fix behaviour.
+        unbound = run(re.sub(r"^m\.PQ_FILE = _P\(.*\)$", "", code, flags=re.M))
+
+        check("the read uses the guarded file", "UNIQUEMARKER" in fixed,
+              f"-- got {fixed.strip()[:60]!r}")
+        check("control: without the binding it does NOT read the guarded file",
+              "UNIQUEMARKER" not in unbound,
+              "-- the test cannot distinguish bound from unbound")
+
 print()
 if failures:
     print(f"FAILED ({len(failures)}): " + "; ".join(failures))

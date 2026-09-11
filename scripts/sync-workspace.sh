@@ -364,11 +364,41 @@ _host_ws_segment() {
 
 LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
+# Holder identity = pid + process start time, so a pid recycled after a reboot
+# (/tmp survives reboots on macOS) fails the check instead of passing kill -0.
+_proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'; }
+
 acquire_lock() {
-    # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.
+    # Stale means the HOLDER IS GONE (or its identity does not match), not
+    # "older than N minutes": a run whose report step outlasts the cadence must
+    # not be overtaken by the next starter. The age bound below is a loud
+    # backstop for a holder that is alive but wedged, not the liveness test.
+    local max_min="${SUTANDO_SYNC_LOCK_MAX_MIN:-180}"
     if [ -d "$LOCK_DIR" ]; then
-        if find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
-            log "Stale lock removed (older than 10 min)"
+        local holder="" hstart="" now_start=""
+        [ -f "$LOCK_DIR/pid" ] && holder="$(head -1 "$LOCK_DIR/pid" 2>/dev/null)"
+        [ -f "$LOCK_DIR/start" ] && hstart="$(head -1 "$LOCK_DIR/start" 2>/dev/null)"
+        [ -n "$holder" ] && now_start="$(_proc_start "$holder")"
+        if [ -n "$holder" ] && [ -n "$now_start" ] && { [ -z "$hstart" ] || [ "$hstart" = "$now_start" ]; }; then
+            if find "$LOCK_DIR" -maxdepth 0 -mmin +"$max_min" 2>/dev/null | grep -q .; then
+                log "WARNING: lock holder pid $holder is alive but the lock is older than ${max_min} min — reclaiming (hung sync?)"
+                echo "sync-workspace: WARNING reclaiming a ${max_min}+ min lock from live pid $holder (hung sync?)" >&2
+                rm -rf "$LOCK_DIR"
+            else
+                log "Another sync (pid $holder) already in progress, exiting."
+                echo "sync-workspace: another instance is running (pid $holder), skipping."
+                exit 0
+            fi
+        elif [ -n "$holder" ]; then
+            if [ -n "$now_start" ]; then
+                log "Stale lock removed (pid $holder is alive but started at '$now_start', lock says '$hstart' — recycled pid)"
+            else
+                log "Stale lock removed (holder pid $holder is gone)"
+            fi
+            rm -rf "$LOCK_DIR"
+        elif find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+            # A lock with no pid file predates this rule; age is all it can say.
+            log "Stale lock removed (no holder recorded, older than 10 min)"
             rm -rf "$LOCK_DIR"
         fi
     fi
@@ -377,6 +407,8 @@ acquire_lock() {
         echo "sync-workspace: another instance is running, skipping."
         exit 0
     fi
+    echo "$$" > "$LOCK_DIR/pid"
+    _proc_start "$$" > "$LOCK_DIR/start"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
@@ -1172,6 +1204,14 @@ _resolve_conflicts_keep_ours() {
         # best-effort: a backup failure must never block the merge.
         if git checkout --ours -- "$f" 2>/dev/null; then
             git add -- "$f"
+        elif [ -e "$f" ] || [ -L "$f" ]; then
+            # Carrier enforcement untracks while KEEPING bytes on disk, so a
+            # DD path can still hold live local state git no longer owns.
+            # `--cached` resolves the index; `-f` would delete that data.
+            # `-L` because `-e` FOLLOWS the link: a dangling symlink reads as
+            # absent and would take the deleting branch (the `workspace` link
+            # is exactly this shape while its target is unavailable).
+            git rm -q --cached -- "$f" 2>/dev/null || true
         else
             git rm -f -- "$f" 2>/dev/null || true
         fi
@@ -1226,6 +1266,17 @@ _migrate_flat_anchor() {
     echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
 }
 
+# Commit modified + new carrier files before a pull. Runs generate_exclude first
+# so an out-of-carrier path cannot ride into the vault on this commit.
+_commit_local_pre_pull() {
+    generate_exclude 2>/dev/null || true
+    git add --ignore-removal . 2>/dev/null || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+        git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
+            && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"
+    fi
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
@@ -1273,6 +1324,10 @@ _pull_only_impl() {
         fi
         [ "$_co_rc" -eq 0 ] || die "pull-only: failed to switch to $current_branch (git checkout exit $_co_rc); see $LOG"
     fi
+
+    # A refused pull resets to pre_pull_sha, so local edits must already be IN
+    # it; deletions stay unstaged for the push-side tripwire to count.
+    _commit_local_pre_pull
 
     # Pro #1445 review fix #2: snapshot pre-pull state for the mass-deletion
     # tripwire on the pull side. The push-side tripwire only catches staged
@@ -1689,9 +1744,24 @@ _migrate_from_legacy_impl() {
     fi
     if [ -d "$legacy_dir/notes" ]; then
         if [ "$DRY_RUN" = "1" ]; then
-            local n_notes
+            local n_notes excluded_size
             n_notes=$(find "$legacy_dir/notes" -type f -not -path "$legacy_dir/notes/generated/*" -not -path "$legacy_dir/notes/media/*" 2>/dev/null | wc -l | tr -d ' ')
-            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ~2.65 GB media left archived in legacy)" >&2
+            excluded_size=$(
+                {
+                    if [ -d "$legacy_dir/notes/generated" ]; then
+                        du -skL "$legacy_dir/notes/generated" 2>/dev/null || true
+                    fi
+                    if [ -d "$legacy_dir/notes/media" ]; then
+                        du -skL "$legacy_dir/notes/media" 2>/dev/null || true
+                    fi
+                } | awk '{kb += $1} END {
+                    if (kb >= 1048576) printf "%.2f GB", kb / 1048576
+                    else if (kb >= 1024) printf "%.1f MB", kb / 1024
+                    else if (kb > 0) printf "%d KB", kb
+                    else printf "0B"
+                }'
+            )
+            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ${excluded_size} generated/media left archived in legacy)" >&2
         else
             rsync -a --exclude='generated/' --exclude='media/' "$legacy_dir/notes"/ "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
             log "_migrate_from_legacy_impl: rsynced notes/ (excl generated,media) → workspace/notes/"

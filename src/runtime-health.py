@@ -33,6 +33,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
 
@@ -190,13 +193,9 @@ def _run(cmd):
 
 
 def _core_running():
-    # rc None = the probe itself could not run (tmux absent / PATH broken) → that
-    # is UNKNOWN, not "not running". A real has-session miss returns rc 1, which
-    # stays False. (qingyun CR on #2527: probe-unavailable must not be a down-vote.)
-    rc, _ = _run(["tmux", "-S", TMUX_SOCKET, "has-session", "-t", SESSION])
-    if rc is None:
-        return None
-    return rc == 0
+    # None = unobserved (tmux absent, hung, or a client the server refused) and
+    # never a down-vote; only a server that answered "no session" is False.
+    return _tmux_has_session(TMUX_SOCKET, SESSION, timeout=8)
 
 
 def _gateway_configured():

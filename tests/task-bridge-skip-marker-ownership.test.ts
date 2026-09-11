@@ -204,6 +204,23 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '[deduped: task-123]', owns, origin), true);
 	});
 
+	// A correct predicate still leaks if the branches compose wrongly, so this
+	// composes the result-loop's gate order rather than re-testing the grammar.
+	it('neither empty spelling reaches the fallthrough — result-loop gate order', () => {
+		const owns = () => true;              // this bridge dispatched it
+		const origin = () => undefined;       // no foreign origin recorded
+		for (const body of ['[deduped:]', '[deduped: ]']) {
+			const file = `${OWN}.txt`;
+			assert.equal(isSkipMarked(file, body), true,
+				`loop gate 1 missed ${JSON.stringify(body)} — falls through to onResult()`);
+			assert.equal(mayRetireSkipMarked(file, body, owns, origin), true,
+				`loop gate 2 refused ${JSON.stringify(body)} — result would be left unarchived`);
+		}
+		// Negative control: an ordinary body must NOT take the silent branch,
+		// or the guard would swallow every real reply.
+		assert.equal(isSkipMarked(`${OWN}.txt`, 'an ordinary reply'), false);
+	});
+
 	it('matches result_markers.py exactly on the grammar edges', () => {
 		const py: [string, boolean][] = [
 			['[deduped: task-123]',         true ],
@@ -211,8 +228,10 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 			['[deduped: phone-abc.task-9]', true ],  // any target, not just task-*
 			['[DEDUPED: task-123]',         true ],  // case-insensitive
 			['  [deduped:task-123]',        true ],
-			['[deduped: ]',                 true ],  // whitespace target: Python accepts
-			['[deduped:]',                  false],  // empty: Python rejects
+			['[deduped: ]',                 true ],  // whitespace target
+			// Both empty spellings must parse alike: the shared Python parser maps
+			// '[deduped: ]' and '[deduped:]' alike to skip(deduped, extra='').
+			['[deduped:]',                  true ],
 		];
 		for (const [body, want] of py) {
 			assert.equal(isSkipMarked(`${OWN}.txt`, body), want,

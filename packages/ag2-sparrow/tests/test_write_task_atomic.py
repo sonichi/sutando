@@ -41,13 +41,14 @@ def test_write_task_publishes_atomically_and_completely():
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
         m = _load(base)
-        tid = m._write_task(_task())
+        tid, durable = m._write_task(_task())
         dest = m.TASKS_DIR / f"{tid}.txt"
         assert tid == "task-1784500000000"
+        assert durable, "a committed queue write must be ackable as durable"
         assert dest.exists(), "task file must be published"
         # No temp sidecar left behind — the tmp+rename must have completed.
-        assert not (dest.with_suffix(".txt.tmp")).exists()
-        # The watcher globs task-*.txt; the tmp name (…​.txt.tmp) must not match it.
+        assert not list(m.TASKS_DIR.glob(f"{tid}.txt.*.tmp"))
+        # The watcher globs task-*.txt; the staged name (.txt.<pid>.<uuid>.tmp) must not match.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
@@ -74,21 +75,17 @@ def test_write_task_never_leaves_partial_file_on_publish_crash():
         m = _load(base)
         tid = "task-1784500000001"
         dest = m.TASKS_DIR / f"{tid}.txt"
-        orig_rename = pathlib.Path.rename
+        orig_replace = m.os.replace
 
-        def boom(self, target):
+        def boom(src, target):
             raise OSError("simulated crash at publish")
 
-        pathlib.Path.rename = boom
+        m.os.replace = boom
         try:
-            raised = False
-            try:
-                m._write_task(_task(tid))
-            except OSError:
-                raised = True
-            assert raised, "a failed publish must surface, not silently succeed"
+            assert m._write_task(_task(tid)) is None, (
+                "a failed publish must report failure, not a queued task")
         finally:
-            pathlib.Path.rename = orig_rename
+            m.os.replace = orig_replace
         # The watcher-visible .txt must NOT exist — only nothing or a .tmp sidecar.
         assert not dest.exists(), "partial task must never be visible to the watcher"
         print("PASS test_write_task_never_leaves_partial_file_on_publish_crash")
@@ -101,14 +98,14 @@ def test_write_task_is_idempotent_under_redelivery():
         base = pathlib.Path(d)
         m = _load(base)
         t = _task("task-1784500000002")
-        tid1 = m._write_task(t)
+        tid1, _ = m._write_task(t)
         first = (m.TASKS_DIR / f"{tid1}.txt").read_text()
         # Redeliver the SAME id with a DIFFERENT body: the guard must skip the
         # rewrite entirely (return the id, leave the queued file byte-for-byte).
         # A modified body proves the guard fired — an identical body could pass
         # even with no guard at all.
         redelivered = dict(t, task="[AG2Space qingyun] TAMPERED redelivery body")
-        tid2 = m._write_task(redelivered)
+        tid2, _ = m._write_task(redelivered)
         assert tid1 == tid2
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [m.TASKS_DIR / f"{tid1}.txt"]
         # Untouched — the original queued content wins, not the redelivery.
@@ -129,7 +126,7 @@ def test_write_task_does_not_reexecute_a_completed_task():
         arch = m.TASKS_DIR / "archive"
         arch.mkdir(parents=True, exist_ok=True)
         (arch / f"{tid}.txt").write_text(f"id: {tid}\ntask: handled earlier\n")
-        assert m._write_task(_task(tid)) == tid
+        assert m._write_task(_task(tid)) == (tid, True)
         # NOT re-queued — nothing live for the watcher to execute a second time.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == []
         rfile = m.RESULTS_DIR / f"{tid}.txt"
@@ -142,7 +139,7 @@ def test_write_task_does_not_reexecute_a_completed_task():
         tid = "task-1784500000011"
         m.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         (m.ARCHIVE_RESULTS_DIR / f"{tid}-1784500000999.txt").write_text("earlier reply\n")
-        assert m._write_task(_task(tid)) == tid
+        assert m._write_task(_task(tid)) == (tid, True)
         assert list(m.TASKS_DIR.glob("task-*.txt")) == []
         rfile = m.RESULTS_DIR / f"{tid}.txt"
         assert rfile.exists() and rfile.read_text().startswith("[no-send]")
@@ -168,7 +165,7 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         malicious_chan = "!room'; touch /tmp/ag2sparrow_pwned; #"
         t = _task("task-1784500000020")
         t["channel_id"] = malicious_chan
-        tid = m._write_task(t)
+        tid, _ = m._write_task(t)
         body = (m.TASKS_DIR / f"{tid}.txt").read_text()
         context_line = next(ln for ln in body.splitlines() if "room_ops.py read" in ln)
         context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]

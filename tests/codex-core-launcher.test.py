@@ -6,6 +6,7 @@ import shutil
 import signal
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -34,6 +35,27 @@ def _read_count(path):
         return 0
 
 
+def _read_when_nonempty(path, deadline):
+    """Poll until `path` holds non-empty text, or return None past `deadline`.
+
+    Same class as _read_count: existence is not readiness, because every writer
+    here truncates before it writes. Returns None rather than "" so a miss can
+    never be mistaken for content -- an empty string still satisfies assertIn's
+    and assertNotIn's argument contract, so a caller handed "" reports on data
+    it never observed. Returns the FIRST non-empty read, so a chunked writer can
+    still yield a prefix -- unchanged from the exists()-then-read it replaces.
+    """
+    while time.monotonic() < deadline:
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            text = ""
+        if text:
+            return text
+        time.sleep(0.01)
+    return None
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -53,8 +75,13 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/delivery/readiness.py",
             "src/result_markers.py",
             "src/task_priority.py",
+            "src/task_archive.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
+            # util_paths refuses without these: it can read neither half of
+            # the identity, so it will not hand out the shared historic name.
+            "src/runtime-api/instance_key.py",
+            "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
             "src/workspace_default.py",
             "src/sutando_config.py",
@@ -115,9 +142,12 @@ exit 0
         # Stub the heartbeat writer: the launcher must start it (it is the sole
         # writer of state/cores/<host>.alive that cron-runner gates fires on).
         # Record that it ran; exit immediately so no daemon lingers in the test.
+        # `--stop` is the restart handoff: the real CLI ends other writers and exits; the stub just exits.
         (self.root / "src/core_heartbeat.py").write_text(
-            "import os\n"
+            "import os, sys\n"
             "from pathlib import Path\n"
+            "if '--stop' in sys.argv:\n"
+            "    sys.exit(0)\n"
             "Path(os.environ['HEARTBEAT_PID']).write_text(str(os.getpid()))\n"
             "with open(os.environ['HEARTBEAT_LOG'], 'w') as f:\n"
             "    f.write('heartbeat-started')\n"
@@ -145,7 +175,19 @@ exit 0
 ''')
 
     def tearDown(self):
-        self.tmp.cleanup()
+        # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
+        pid_file = Path(self.tmp.name) / "heartbeat.pid"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(int(pid_file.read_text()), 0)
+            except (FileNotFoundError, ValueError, ProcessLookupError):
+                break
+            time.sleep(0.01)
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _write_exe(self, name, body):
         path = self.bin / name
@@ -155,10 +197,15 @@ exit 0
     def _wait_for_heartbeat_exit(self):
         pid_file = Path(self.tmp.name) / "heartbeat.pid"
         deadline = time.monotonic() + 5
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(pid_file.exists(), "heartbeat stub did not record its pid")
-        pid = int(pid_file.read_text())
+        # Wait for parseable CONTENT, not existence: write_text() creates and
+        # truncates before writing, so exists() goes true while the file is empty.
+        pid = None
+        while pid is None and time.monotonic() < deadline:
+            try:
+                pid = int(pid_file.read_text())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.01)
+        self.assertIsNotNone(pid, "heartbeat stub did not record its pid")
         while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
@@ -290,12 +337,10 @@ exit 0
         self.assertIn("has-session -t =sutando-core-watcher", calls)
 
         monitor_log = Path(self.tmp.name) / "monitor.log"
-        for _ in range(50):
-            if monitor_log.exists():
-                break
-            time.sleep(0.01)
-        self.assertTrue(monitor_log.exists(), "managed core-input monitor did not start")
-        self.assertIn("--session sutando-core", monitor_log.read_text())
+        monitor_text = _read_when_nonempty(monitor_log, time.monotonic() + 5)
+        self.assertIsNotNone(monitor_text,
+                             "managed core-input monitor did not start")
+        self.assertIn("--session sutando-core", monitor_text)
 
         scheduler_log = Path(self.tmp.name) / "scheduler.log"
         self.assertTrue(scheduler_log.exists(), "Codex scheduler was not reconciled")
@@ -380,14 +425,31 @@ exit 0
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         # The writer is backgrounded (&); give it a moment to record it ran.
-        deadline = time.time() + 5
-        while not marker.exists() and time.time() < deadline:
-            time.sleep(0.05)
-        self.assertTrue(
-            marker.exists(),
+        marker_text = _read_when_nonempty(marker, time.monotonic() + 5)
+        self.assertIsNotNone(
+            marker_text,
             "launcher did not start the core heartbeat writer",
         )
-        self.assertEqual(marker.read_text(), "heartbeat-started")
+        self.assertEqual(marker_text, "heartbeat-started")
+
+    def test_restart_resolves_the_heartbeat_interpreter_once_for_stop_and_start(self):
+        # The resolver records who called it. The launcher (any $(...) depth keeps $0 and $$) must
+        # resolve exactly once and hand that one interpreter to both the --stop and the start.
+        calls = Path(self.tmp.name) / "resolve-calls"
+        with open(self.root / "scripts/python-binary.sh", "a") as f:
+            f.write(
+                "\nresolve_python() {\n"
+                f"  printf '%s:%s\\n' \"$$\" \"$0\" >> '{calls}'\n"
+                f"  printf '%s' '{sys.executable}'\n"
+                "}\n"
+            )
+        marker = Path(self.tmp.name) / "heartbeat.log"
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        started = _read_when_nonempty(marker, time.monotonic() + 5)
+        mine = [l for l in calls.read_text().splitlines() if l.endswith("start-cli.sh")]
+        self.assertEqual(len(mine), 1, f"the launcher must resolve once, in its own shell: {mine}")
+        self.assertEqual(started, "heartbeat-started", "no replacement writer started after --stop")
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
@@ -1021,11 +1083,11 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         process = subprocess.Popen(["/bin/bash", str(script)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.monotonic() + 2
-        while not self.log.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(self.log.exists(), "notifier never observed the live core")
-        calls_while_busy = self.log.read_text()
+        calls_while_busy = _read_when_nonempty(self.log, time.monotonic() + 2)
+        # Must fail on a miss: assertNotIn below PASSES against "", so an empty
+        # read would report success without ever observing the notifier.
+        self.assertIsNotNone(calls_while_busy,
+                             "notifier never observed the live core")
         busy.unlink()
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, stderr or stdout)

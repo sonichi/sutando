@@ -23,7 +23,9 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
-task); usage errors exit 2. See SKILL.md for the boundary + the parity epic.
+task); usage errors exit 2. `--strict`, placed BEFORE the subcommand, is the
+opt-in exception: it exits 1 on `ok:false`, for shell callers that gate on the
+exit code. The default is unchanged. See SKILL.md for the boundary + the parity epic.
 `events stream` is the one JSONL surface: one compact JSON line per delivered
 event (journal-friendly), then a one-line summary.
 """
@@ -46,9 +48,16 @@ import members as _members # noqa: E402
 import events as _events   # noqa: E402
 
 
+def _strict_rc(res, strict):
+    """Default stays 0 on a failed op: callers batch these and read `ok`.
+    --strict is for shell callers, where exit 0 reads as delivered."""
+    return 1 if strict and isinstance(res, dict) and res.get("ok") is False else 0
+
+
 def _events_stream(a):
     """`events stream`: one compact JSON line per event (journal-friendly), a
-    one-line JSON summary last. Exits 0 for any structured outcome — a
+    one-line JSON summary last. Exits 0 for any structured outcome unless
+    --strict, which exits 1 on ok:false — a
     disconnect without --cursor-file is a structured ok:false, not a crash.
     With --cursor-file the durable-cursor wrapper reconnects forever (#184);
     without it, one connection is made and its end is reported."""
@@ -71,7 +80,7 @@ def _events_stream(a):
     except (_events.StreamDisconnected, RuntimeError) as e:
         out = {"ok": False, "events": seen["n"], "cursor": seen["cursor"], "reason": str(e)}
     print(json.dumps(out, ensure_ascii=False), flush=True)
-    return 0
+    return _strict_rc(out, getattr(a, "strict", False))
 
 
 def _dispatch_events(a):
@@ -110,6 +119,9 @@ def _main(argv):
     p = sub.add_parser("read", help="pull recent room history")
     p.add_argument("room_id")
     p.add_argument("--limit", type=int, default=_read.DEFAULT_LIMIT)
+    p.add_argument("--oldest-first", action="store_true",
+                   help="render oldest->newest so `| tail` shows the LATEST messages "
+                        "(default newest-first makes tail show the oldest)")
     p.add_argument("--before", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
@@ -199,6 +211,10 @@ def _main(argv):
     p.add_argument("room_id")
     p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--worker", default=None,
+                   help="worker id to stamp on the event (space.ag2.worker) so the "
+                        "client renders attribution; defaults to worker-$SUTANDO_WORKER_SEAT "
+                        "when that env var is set, pass '' to post unstamped")
     p.add_argument("--reply-to", dest="reply_to", default=None,
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
@@ -215,9 +231,12 @@ def _main(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
     if a.cmd == "read":
-        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before)
+        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
+                              oldest_first=a.oldest_first)
     elif a.cmd == "fetch":
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
@@ -258,8 +277,10 @@ def _main(argv):
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
                                reply_to=a.reply_to)
     elif a.cmd == "say":
-        res = _say.say(a.message, a.room_id, a.agent_mxid,
-                       reply_to=a.reply_to)
+        _kw = {"reply_to": a.reply_to}
+        if a.worker:
+            _kw["worker"] = a.worker
+        res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
     elif a.cmd == "grant":
         import grant as _grant
         try:
@@ -274,7 +295,7 @@ def _main(argv):
         fn = _react.react if a.cmd == "react" else _react.unreact
         res = fn(a.room_id, a.event_id, key, a.agent_mxid)
     print(json.dumps(res, indent=2))
-    return 0
+    return _strict_rc(res, a.strict)
 
 
 if __name__ == "__main__":

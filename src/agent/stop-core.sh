@@ -26,6 +26,38 @@ fi
 
 # Kill the watcher sibling first if present (same cleanup start-cli.sh does on
 # --restart), then the core session itself.
+# Publish the durable stop tombstone BEFORE killing sessions, and only on the
+# path that actually stops one — the no-session early exit above must NOT write
+# it, or a crashed core probed by stop-core would be masked from recovery.
+# Best-effort: stopping must never fail because the tombstone could not land.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# An explicit stop must mark the shutdown sentinel, not only the heartbeat
+# tombstone: they are different files with different readers, and the sentinel
+# is what docs/graceful-shutdown.md promises an explicit stop sets.
+PY_BIN=""
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  PY_BIN="$(resolve_python "$REPO")"
+fi
+_mark_shutdown() {
+  if [ -z "$PY_BIN" ]; then
+    echo "stop-core: no runnable python3 — shutdown sentinel NOT marked" >&2
+    return 1
+  fi
+  "$PY_BIN" "$REPO/src/shutdown.py" mark "stop-core.sh" >/dev/null || {
+    echo "stop-core: shutdown.py mark failed — sentinel is NOT set" >&2
+    return 1
+  }
+}
+# Best-effort by decision, not by omission: "stop means stop" (#2401), so a
+# sentinel that cannot be written must not prevent the stop.
+_mark_shutdown || true
+
+python3 "$SCRIPT_DIR/../core_heartbeat.py" --mark-stopped \
+  || echo "stop-core: warning — could not write stop tombstone (recover-core may treat this as a crash)" >&2
+
 tmux -S "$TMUX_SOCKET" kill-session -t "=${SESSION}-watcher" 2>/dev/null || true
 tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION"
 echo "stop-core: $SESSION stopped (socket $TMUX_SOCKET)"

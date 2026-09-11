@@ -79,7 +79,7 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos; each is linked by its OWN installer, not by `skills/install.sh` |
 | `.env` | ❌ no | Per-host secret | Tokens, API keys — must NOT sync |
 
-The sync default is "synced unless excluded"; per-host runtime sub-paths are excluded via the carrier-set gitignore (per PR #1447) + `vault.sync.exclude` user overrides.
+The sync default is "excluded unless included": `sync-workspace.sh` writes a whitelist (`*` ignores everything, then the carrier set from `vault.sync.include` is un-ignored — see its Section 4 and `.git/info/exclude`). `vault.sync.exclude` narrows that carrier set; it is not what keeps an unlisted path out. Per-host runtime sub-paths (e.g. `data/`) are unsynced because nothing includes them (per PR #1447).
 
 ### `skill-repos/` — where skill source repos are cloned
 

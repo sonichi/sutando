@@ -81,39 +81,9 @@ See [Sutando architecture boundaries](docs/architecture-boundaries.md) for the
 normative definitions of core, adapters, apps, skills, tooling, and workspace
 state.
 
-```
-    You ──voice (browser)──► Voice agent ─────────┐
-     │                       (Gemini Live,        │
-     │                        WS on :9900)        ├──► inline tools (instant,
-     │                                            │    in-process: describe_screen,
-     ├──phone (Twilio)─────► Conversation server ─┤    get_current_time, hang_up,
-     │                       (Gemini Live,        │    dtmf, ...)
-     │                        WS on :3100)        │
-     │                                            └──┐
-     │                                               │   file bridge       .──────▶────────.
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ─────────► |               |
-     │                                               │                    |   Core        |
-     │                                               │                    |   agent ↻     |
-     └──discord───────────► Discord bridge ──────────┘                    |               |
-                                                                           `──────◀────────'
-                                                                                  │
-                                                                                  ▼
-                                                                          uses anything:
-                                                                          email, calendar,
-                                                                          browser, files,
-                                                                          phone, reminders...
-                                    ◄── results/ ◄────────────────────────────────┘
-                                (spoken via voice/phone,
-                                 text via Telegram/Discord)
+![Sutando architecture: voice and phone realtime agents use inline tools for instant actions; Telegram and Discord bridges queue larger work to tasks/, the scheduled proactive loop watches tasks/, and the core agent executes work with available tools before returning results to each channel.](docs/assets/sutando-architecture.png)
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 15 minutes
-        (`*/15 * * * *` in the per-host `crons.json`). The skill
-        runs as a 10-minute pass that keeps a persistent watcher on
-        `tasks/` via Claude Code's `Monitor` tool — pending tasks are
-        processed the moment they arrive, not just on the cron tick.
-        Each pass also runs health checks and picks the next build-log
-        item autonomously.
-```
+The core agent's loop is a cron job that fires `/proactive-loop` every 15 minutes (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando backs that off to every 30 minutes when 7-day quota utilization reaches 80%, restoring the configured cadence once an authoritative routed reading drops below it; missing, stale, rejected, or unrouted telemetry holds the slower cadence and reports why. Each pass keeps a persistent watcher on `tasks/` via Claude Code's `Monitor` tool, so tasks are processed on arrival rather than on the tick, and also runs health checks and picks the next build-log item.
 
 Four processes work together:
 - **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
@@ -365,7 +335,13 @@ To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sut
 - Learns from your corrections and adapts over time
 - Notifies you on Discord and voice when it completes autonomous work
 
-It consumes API quota proportional to how much work it finds to do.
+It consumes API quota proportional to how much work it finds to do. The Claude
+core protects weekly headroom by changing the autonomous loop to a 30-minute
+cadence at 80% 7-day utilization and restoring the configured cadence after the
+quota window resets and an authoritative routed reading confirms recovery. Unavailable
+telemetry reports whether it is stale, rejected, or unrouted while retaining the safer
+cadence. Owner tasks still arrive immediately through the streaming
+watcher while the autonomous loop is throttled.
 
 Autonomous self-development is enabled by default. To run Sutando in a stable
 product context without idle-time code evolution, set

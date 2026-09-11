@@ -91,7 +91,7 @@ class DeliveryFailure:
     """The facts of one failed (or fell-back) delivery, for owner-DM + audit."""
 
     task_id: str
-    tier: str            # "owner" | "team" | "other" (or "" if unknown)
+    tier: str            # "owner" | "team" | "guest" (or "" if unknown)
     surface: str         # "discord" | "slack" | "telegram" | "voice" | ...
 
     error: str  # short human-readable cause

@@ -105,7 +105,9 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
         return f"bash {REPO / 'src/agent/codex/cli/task-notifier.sh'}"
 
     def expected_notifier(self) -> str:
-        return f"bash {hc._expected_codex_notifier_entrypoint()}"
+        # Quote like tmux does. An unquoted path splits on its spaces, so this
+        # suite failed on any checkout under e.g. ~/Library/Application Support.
+        return f"bash {shlex.quote(str(hc._expected_codex_notifier_entrypoint()))}"
 
     def test_bare_watcher_can_be_green_while_managed_notifier_is_missing(self):
         self.write_local_core()

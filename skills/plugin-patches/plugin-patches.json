@@ -4,8 +4,8 @@
     {
       "patch": "discord-access-append.patch",
       "target_glob": "plugins/cache/claude-plugins-official/discord/*/skills/access/SKILL.md",
-      "applied_marker": "group append",
-      "desc": "discord:access — add the safer `group append` / `group rm-allow` subcommands (append-without-replace; avoids the lock-yourself-out trap of stock `group add`, which overwrites the channel allowlist). Upstream candidate for claude-plugins-official."
+      "applied_marker": "scripts/access-mutate.py",
+      "desc": "discord:access — route all 8 mutating subcommands through the locked `scripts/access-mutate.py` CLI (access_store.mutate_access_file) instead of freehand Read/Write, and add the safer `group append` / `group rm-allow` subcommands (append-without-replace; avoids the lock-yourself-out trap of stock `group add`, which overwrites the channel allowlist). Upstream candidate for claude-plugins-official. NOTE: the marker was previously the literal string \"group append\", which collides with this same string occurring naturally in the pristine plugin's own freehand heading — apply_one() checked the marker before ever attempting the dry-run, so it silently reported \"already applied\" and the patch was never actually applied in production. Keep this marker specific to the patched (CLI-routed) content, never a phrase that could occur in unrelated prose."
     }
   ]
 }

@@ -39,7 +39,7 @@ def _blocker(s) -> str:
     return t[0] if t else ""
 
 
-def canonical_key(items) -> str:
+def canonical_lines(items) -> "list[str]":
     """`id:blocker` lines, sorted. Order- and wording-independent by construction.
 
     `gated_on` is reduced to its leading token — `owner`, `ci`, `upstream`,
@@ -62,27 +62,41 @@ def canonical_key(items) -> str:
         if not blocker:
             raise ValueError(f"held-list entry has no gated_on: {it!r}")
         out.append(f"{ident}:{blocker}")
-    return "\n".join(sorted(set(out)))
+    return sorted(set(out))
+
+
+def canonical_key(items) -> str:
+    return "\n".join(canonical_lines(items))
 
 
 def held_hash(items) -> str:
     return hashlib.sha1(canonical_key(items).encode("utf-8")).hexdigest()[:16]
 
 
-def read_state(path: Path) -> dict:
-    try:
-        doc = json.loads(path.read_text())
-        return doc if isinstance(doc, dict) else {}
-    except (OSError, ValueError):
-        return {}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from idle_state import ABORT, REFUSED, locked_update  # noqa: E402
 
 
-def write_state(path: Path, doc: dict) -> None:
-    """Per-PID staging: several loop processes may publish this file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc))
-    os.replace(tmp, path)
+def record_outcome(path: Path, outcome: str) -> dict:
+    """Maintain `streak` and the two cumulative totals, under an exclusive lock.
+
+    Counters, unlike `last_surfaced_hash`, cannot use last-writer-wins: two
+    processes that both read total=5 would both write 6 and one pass would
+    vanish. The hash path is unaffected — replacing it with a stale-but-valid
+    hash costs at most one extra surface.
+    """
+    def bump(doc):
+        noop = outcome == "noop"
+        doc["streak"] = int(doc.get("streak") or 0) + 1 if noop else 0
+        key = "noop_total" if noop else "substantive_total"
+        doc[key] = int(doc.get(key) or 0) + 1
+        doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return doc
+
+    doc = locked_update(path, bump)
+    if doc is REFUSED:
+        raise SystemExit(2)
+    return doc
 
 
 def main(argv=None) -> int:
@@ -91,7 +105,19 @@ def main(argv=None) -> int:
     ap.add_argument("--commit", action="store_true",
                     help="record the hash when it differs")
     ap.add_argument("--items", help="JSON held-list; default reads stdin")
+    ap.add_argument("--pass-outcome", choices=("substantive", "noop"),
+                    help="RECORD-ONLY: maintain streak + totals and exit; "
+                         "reads no stdin and ignores --items")
     a = ap.parse_args(argv)
+
+    # Record-only, and it must return BEFORE any stdin access: under cron stdin
+    # is an open pipe that is never written, so a read here blocks forever.
+    if a.pass_outcome:
+        doc = record_outcome(Path(a.state), a.pass_outcome)
+        print(f"{a.pass_outcome} streak={doc['streak']} "
+              f"noop_total={doc.get('noop_total', 0)} "
+              f"substantive_total={doc.get('substantive_total', 0)}")
+        return 0
 
     raw = a.items if a.items is not None else sys.stdin.read()
     try:
@@ -104,19 +130,49 @@ def main(argv=None) -> int:
         return 2
 
     try:
+        lines = canonical_lines(items)
         h = held_hash(items)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
     path = Path(a.state)
-    doc = read_state(path)
-    changed = doc.get("last_surfaced_hash") != h
-    if changed and a.commit:
+    seen = {}
+
+    def compare_and_commit(doc):
+        # Compare INSIDE the lock: a doc read before acquiring it is stale, so
+        # committing it back erases whatever landed in between.
+        changed = doc.get("last_surfaced_hash") != h
+        prev = doc.get("last_surfaced_ids")
+        have_ids = isinstance(prev, list)
+        seen["changed"] = changed
+        if changed:
+            # Without the previous ids a hash change is unauditable: a renamed
+            # id and a genuinely new blocker are the same opaque digest move.
+            if have_ids:
+                now = set(lines)
+                before = set(str(x) for x in prev)
+                added, gone = sorted(now - before), sorted(before - now)
+                print(f"changed: +{added} -{gone}", file=sys.stderr)
+            else:
+                print("changed: no previous ids recorded (first commit "
+                      "or pre-upgrade state)", file=sys.stderr)
+        elif a.commit and not have_ids:
+            # A legacy state carries the hash but no ids. A quiet pass is the
+            # only cheap chance to seed them BEFORE the set moves.
+            print("backfilled: recorded ids for an existing hash", file=sys.stderr)
+        if not (a.commit and (changed or not have_ids)):
+            return ABORT
         doc["last_surfaced_hash"] = h
+        doc["last_surfaced_ids"] = lines
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        write_state(path, doc)
-    print(f"{'post' if changed else 'quiet'} {h}")
+        return None
+
+    if locked_update(path, compare_and_commit) is REFUSED:
+        # Fail OPEN on the decision, CLOSED on the write: a torn record must
+        # never suppress the surface, and must never be overwritten either.
+        compare_and_commit({})
+    print(f"{'post' if seen['changed'] else 'quiet'} {h}")
     return 0
 
 

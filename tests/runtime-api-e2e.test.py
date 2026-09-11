@@ -38,6 +38,12 @@ REPO = Path(__file__).resolve().parent.parent
 SERVER = REPO / "src" / "runtime-api" / "server.py"
 CLI = REPO / "src" / "runtime-cli" / "sutando-runtime.py"
 
+# Under the coverage gate, subprocesses must self-instrument or their
+# execution (daemon + CLI) counts as zero — same pattern as voice-lock.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+
 FAILS: list = []
 
 
@@ -48,7 +54,7 @@ def check(cond, msg):
 
 
 def cli(*args, expect_rc=0, timeout=30):
-    p = subprocess.run([sys.executable, str(CLI), *args],
+    p = subprocess.run([*PYBASE, str(CLI), *args],
                        capture_output=True, text=True, timeout=timeout,
                        env=ENV)
     if p.returncode != expect_rc:
@@ -71,7 +77,7 @@ def wait_socket(path, timeout=10):
 
 
 def start_daemon():
-    proc = subprocess.Popen([sys.executable, str(SERVER)], env=ENV,
+    proc = subprocess.Popen([*PYBASE, str(SERVER)], env=ENV,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True)
     if not wait_socket(ENV["SUTANDO_RUNTIME_SOCKET"]):
@@ -81,16 +87,40 @@ def start_daemon():
     return proc
 
 
+class _HitlStoreView:
+    """The owner-side view of the daemon's HITL store, in the record shape the
+    older ActionStore returned, so the scenario reads as the owner sees it."""
+
+    def __init__(self, ha_dir):
+        sys.path.insert(0, str(REPO / "src"))
+        sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+        from hitl.manager import HitlManager, HitlStore  # noqa: E402
+        from ha_adapter import HumanActionAdapter  # noqa: E402
+        self.adapter = HumanActionAdapter(str(ha_dir))
+        self.manager = self.adapter.manager
+
+    def get(self, aid):
+        req = self.manager.get(aid)
+        if req is None:
+            return None
+        subj = req.subject or {}
+        return {"action_id": req.id, "status": req.status,
+                "card_event_id": self.manager.projection_target(req.id),
+                "questions": [{"question": req.message,
+                               "options": [{"label": a.label} for a in req.actions],
+                               "multiSelect": bool(subj.get("multi_select"))}]}
+
+    def resolve(self, aid, answers, by):
+        self.adapter.resolve(aid, answers, by)
+        return True
+
+
 def ha_store():
-    spec = importlib.util.spec_from_file_location(
-        "ha", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "human_action.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.ActionStore(ENV["SUTANDO_HA_DIR"])
+    return _HitlStoreView(ENV["SUTANDO_HA_DIR"])
 
 
 def pending_action_for(request_id, store, timeout=5):
-    aid = "ha_" + request_id.split("-", 1)[-1][:24]
+    aid = "hitl_" + request_id.split("-", 1)[-1][:24]
     deadline = time.time() + timeout
     while time.time() < deadline:
         rec = store.get(aid)
@@ -131,11 +161,18 @@ GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
 
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
 ENV = {**os.environ,
+       # instance lock + run dir must not collide with a live daemon's default
+       "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
        "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
+       "SUTANDO_RUNTIME_STATE": str(Path(TMP) / "state"),
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
+       "SUTANDO_HOST_LABEL": "e2e-host",  # runtime.* reads its own beat by label
+       "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
+       "SUTANDO_TMUX_SOCKET": "/tmp/e2e-tmux.sock",
+       "SUTANDO_TMUX_SESSION": "e2e-core",
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -157,9 +194,9 @@ def main() -> int:
         # `answer <action_id> N` and _ANSWER_RE only matches ha_ + HEX. A
         # non-hex id silently strands the card (live finding 2026-07-26).
         import re as _re
-        _answer_re = _re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9])")
-        check(act is not None and _answer_re.search(f"answer {act['action_id']} 1") is not None,
-              "ha action id matches DecisionHandler's answer grammar (hex-only)")
+        _id_re = _re.compile(r"^hitl_[A-Za-z0-9_-]+$")
+        check(act is not None and _id_re.match(act["action_id"]) is not None,
+              "requirement id matches the HITL store id contract")
         check(act is not None and act["status"] == "pending"
               and not act.get("card_event_id")
               and "Approve" in json.dumps(act["questions"]),
@@ -199,7 +236,7 @@ def main() -> int:
         check(w3b["status"] == "resolved" and w3b["result"]["answer"],
               "multi_select resolves with the chosen options")
         # 3c. free_text is a clean v0 rejection (dead path would strand forever)
-        p3c = subprocess.run([sys.executable, str(CLI), "elicitation", "request",
+        p3c = subprocess.run([*PYBASE, str(CLI), "elicitation", "request",
                               "--question", "Say anything", "--type", "free_text"],
                              capture_output=True, text=True, env=ENV)
         check(p3c.returncode == 1 and "not supported in v0" in p3c.stderr,
@@ -225,7 +262,7 @@ def main() -> int:
               and GW["posts"][-1]["room_id"] == "!room:example.org",
               "capability.execute delivers via gateway, verified by event_id")
         # one-time consumption: the same approval cannot authorize a second send
-        p4 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        p4 = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"hello"}',
@@ -235,7 +272,7 @@ def main() -> int:
               "an approval authorizes exactly ONE execution (consumed)")
         # UNGATED governed action → refused BEFORE any gateway contact
         posts_before = len(GW["posts"])
-        p4u = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        p4u = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"sneaky"}'],
@@ -303,14 +340,14 @@ def main() -> int:
                   "--resource", '{"roomId":"!room:example.org"}',
                   "--input", '{"body":"benign approved body"}')
         actbi = pending_action_for(rbi["requestId"], store)
-        card_bi = json.loads((Path(ENV["SUTANDO_HA_DIR"]) / (actbi["action_id"] + ".json")).read_text())
+        card_bi = store.get(actbi["action_id"])
         check('"body": "benign approved body"' in card_bi["questions"][0]["question"]
               or 'benign approved body' in card_bi["questions"][0]["question"],
               "approval card SHOWS the governed input (the body the owner approves)")
         store.resolve(actbi["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rbi["requestId"], "--timeout", "10")
         posts_bi = len(GW["posts"])
-        pbi = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pbi = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"SUBSTITUTED-UNSHOWN-BODY"}',
@@ -334,7 +371,7 @@ def main() -> int:
         actb = pending_action_for(rb["requestId"], store)
         store.resolve(actb["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rb["requestId"], "--timeout", "10")
-        pb = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pb = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"cross"}',
@@ -348,7 +385,7 @@ def main() -> int:
         actb2 = pending_action_for(rb2["requestId"], store)
         store.resolve(actb2["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rb2["requestId"], "--timeout", "10")
-        pb2 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pb2 = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"cross2"}',
@@ -358,7 +395,7 @@ def main() -> int:
               "approval bound to another resource cannot authorize this send")
 
         # idempotency-key REUSE with a different fingerprint → rejected
-        pk = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pk = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"DIFFERENT"}',
@@ -415,7 +452,7 @@ def main() -> int:
               "unknown capability action fails cleanly")
 
         # 5. unknown id → error
-        p = subprocess.run([sys.executable, str(CLI), "request", "get", "nope-1"],
+        p = subprocess.run([*PYBASE, str(CLI), "request", "get", "nope-1"],
                            capture_output=True, text=True, env=ENV)
         check(p.returncode == 1 and "unknown requestId" in p.stderr,
               "unknown requestId is a clean protocol error")
@@ -473,12 +510,221 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         g8 = cli("request", "get", r8["requestId"])
         check(g8["status"] == "cancelled",
               "late owner answer cannot overwrite a terminal state (CAS)")
+
+        # 9. agent discovery through the REAL daemon + CLI (Sutando Server
+        # slice 1): cores heartbeats surface as identity+liveness; a stale
+        cores = Path(ENV["SUTANDO_RUNTIME_STATE"]) / "cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "status": "running"}))
+        stale = cores / "stale-host.alive"
+        stale.write_text(json.dumps({"host": "stale-host"}))
+        _old = time.time() - 300
+        os.utime(stale, (_old, _old))
+        al = cli("agent", "list")
+        by_id = {a["agentId"]: a for a in al["agents"]}
+        check(by_id.get("e2e-host", {}).get("alive") is True
+              and by_id.get("stale-host", {}).get("alive") is False,
+              "agent list: fresh beat alive, stale beat present-but-dead")
+        st9 = cli("agent", "status", "e2e-host")
+        check(st9["alive"] is True and st9["pid"] == 42,
+              "agent status resolves identity + heartbeat metadata via CLI")
+        cli("agent", "status", "no-such-agent", expect_rc=1)
+        check(True, "agent status for unknown id exits 1 (loud, not empty)")
+
+        # 10. identity surface (sutando.*) through the real daemon + CLI.
+        # The daemon booted before core-status.json existed — identity reads
+        Path(ENV["SUTANDO_RUNTIME_STATE"], "core-status.json").write_text(
+            json.dumps({"status": "running", "step": "e2e", "ts": 1}))
+        s10 = cli("sutando", "status")
+        check(s10.get("status") == "running" and s10.get("step") == "e2e",
+              "sutando status reflects live core-status.json")
+        i10 = cli("sutando", "info")
+        check(i10.get("agentId") == "@test-agent:example.org",
+              "sutando info reports the daemon-resolved actor id")
+        a10 = cli("sutando", "allowlist")
+        check(isinstance(a10.get("channels"), dict),
+              "sutando allowlist answers with a channels map")
+
+        # 11. task pipeline (task.*) through the real daemon + CLI: submit
+        # lands a canonical task file, status tracks it, a result completes
+        t11 = cli("task", "submit", "e2e: do the thing", "--priority", "low")
+        tid11 = t11["taskId"]
+        check(t11["state"] == "pending", "task submit returns pending")
+        tf = Path(TMP) / "tasks" / f"{tid11}.txt"
+        check(tf.is_file() and "access_tier: owner" in tf.read_text()
+              and "task: e2e: do the thing" in tf.read_text(),
+              "submit wrote a canonical owner-tier task file")
+        d11 = cli("task", "details", tid11)
+        check(d11["task"] == "e2e: do the thing" and d11["priority"] == "low",
+              "task details round-trips through the real parser")
+        Path(TMP, "results").mkdir(exist_ok=True)
+        Path(TMP, "results", f"{tid11}.txt").write_text("all done")
+        s11 = cli("task", "status", tid11)
+        check(s11["state"] == "done", "a result file completes the task")
+        r11 = cli("task", "get-result", tid11)
+        check(r11["result"] == "all done", "task get-result returns the body")
+        t12 = cli("task", "submit", "cancel me")
+        c12 = cli("task", "cancel", t12["taskId"])
+        check(c12["cancelled"] == "requested" and c12.get("cancelTaskId"),
+              "cancel emits a CANCEL_INSTRUCTION signal task")
+
+        # 13. runtime surface (runtime.*): health is the coarse end-user
+        # readout (fresh e2e-host beat from section 9 + live core-status
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "socket": "/tmp/e2e-tmux.sock"}))
+        h13 = cli("runtime", "health")
+        check(h13["state"] == "online" and h13.get("currentActivity") == "e2e",
+              "runtime health: online + current activity from core-status")
+        d13 = cli("runtime", "details")
+        check(d13.get("pid") == 42 and d13.get("socket") == "/tmp/e2e-tmux.sock"
+              and d13.get("runtimeSocket", "").endswith("rt.sock"),
+              "runtime details: pid + tmux socket + daemon runtime socket")
+        i13 = cli("sutando", "info")
+        check("pid" not in i13 and "socket" not in i13
+              and "runtimeSocket" not in i13,
+              "sutando info no longer leaks runtime internals")
+
+        # 14. human_action.* (third HITL type) through the real daemon + CLI:
+        # request mirrors a Done/Decline card; the owner's card answer
+        h14 = cli("human-action", "request", "--action", "Sign the e2e form",
+                  "--instructions", "Review it first")
+        act14 = pending_action_for(h14["requestId"], store)
+        check(act14 is not None
+              and "Sign the e2e form" in json.dumps(act14["questions"])
+              and [o["label"] for o in act14["questions"][0]["options"]] == ["Done", "Decline"],
+              "human_action card carries the act + Done/Decline options")
+        store.resolve(act14["action_id"], {"1": [1]}, "@owner:example.org")
+        w14 = cli("request", "wait", h14["requestId"], "--timeout", "10")
+        check(w14["status"] == "completed" and w14["resolvedBy"] == "@owner:example.org",
+              "owner card answer Done resolves the request to completed")
+        # Live negative control over the REAL socket: the plain Unix client
+        # that raised the request must not be able to settle it (review P1).
+        h15 = cli("human-action", "request", "--action", "Plug in the drive")
+        cli("human-action", "complete", h15["requestId"], "--note", "done irl",
+            expect_rc=1)
+        s15 = cli("human-action", "status", h15["requestId"])
+        check(s15["status"] == "pending",
+              "ungranted CLI complete leaves the durable row pending")
+        act15 = pending_action_for(h15["requestId"], store)
+        check(act15 is not None and act15["status"] == "pending",
+              "ungranted CLI complete leaves the card open for the human")
+        store.resolve(act15["action_id"], {"1": [1]}, "@owner:example.org")
+        w15 = cli("request", "wait", h15["requestId"], "--timeout", "10")
+        check(w15["status"] == "completed",
+              "the human's own card answer still settles the action")
+
+        # 15. task waiting_for_* weave: a live task with a pending HITL
+        # request is parked in its waiting state; resolving the request
+        t16 = cli("task", "submit", "e2e: needs a signature")
+        tid16 = t16["taskId"]
+        h16 = cli("human-action", "request", "--action", "Sign it",
+                  "--task-id", tid16)
+        st16 = cli("task", "status", tid16)
+        check(st16["state"] == "waiting_for_human_action"
+              and st16["waitingOn"] == ["waiting_for_human_action"],
+              "pending human_action parks the task in waiting_for_human_action")
+        act16 = pending_action_for(h16["requestId"], store)
+        store.resolve(act16["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", h16["requestId"], "--timeout", "10")
+        st16b = cli("task", "status", tid16)
+        check(st16b["state"] == "pending",
+              "resolving the request returns the task to the normal lifecycle")
+
+        # 15b. enumeration (acceptance-test gap 1): a client with NO known
+        # ids lists live tasks and pending human requests.
+        tl = cli("task", "list")
+        ids15 = [t["taskId"] for t in tl["tasks"]]
+        check(tid16 in ids15 and t12["taskId"] in ids15,
+              "task list enumerates live tasks without prior ids")
+        h15b = cli("human-action", "request", "--action", "List me")
+        rl = cli("request", "list")
+        rl_ids = [r["requestId"] for r in rl["requests"]]
+        check(h15b["requestId"] in rl_ids
+              and any(r.get("action") == "List me" for r in rl["requests"]),
+              "request list enumerates pending human requests with summaries")
+        act15b = pending_action_for(h15b["requestId"], store)
+        store.resolve(act15b["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", h15b["requestId"], "--timeout", "10")
+        rl2 = cli("request", "list")
+        check(h15b["requestId"] not in [r["requestId"] for r in rl2["requests"]],
+              "resolved requests leave the pending list")
+
+        # 16. instance manifest registry (M1): the daemon registered itself at
+        # boot; file-based discovery answers through the CLI; the manifest is
+        l17 = cli("instance", "list")
+        inst = [m for m in l17["instances"]
+                if m.get("identity", {}).get("agent_id") == "@test-agent:example.org"]
+        check(len(inst) == 1 and inst[0]["status"] == "running"
+              and inst[0]["endpoint"]["path"].endswith("rt.sock"),
+              "daemon wrote its instance manifest at boot (status running)")
+        mtext = Path(inst[0]["_file"]).read_text().lower()
+        check(all(n not in mtext for n in ("token", "secret", "password")),
+              "manifest carries no secrets")
+        rt18 = inst[0].get("runtime", {})
+        check(rt18.get("tmux_socket") == "/tmp/e2e-tmux.sock"
+              and rt18.get("session") == "e2e-core",
+              "manifest records the tmux attach coords (socket + session)")
+        at18 = subprocess.run(
+            [*PYBASE, str(CLI), "instance", "attach",
+             "@test-agent:example.org", "--print"],
+            capture_output=True, text=True, env=ENV)
+        check(at18.stdout.strip() ==
+              "tmux -S /tmp/e2e-tmux.sock attach-session -t e2e-core",
+              "attach resolves the tmux argv from the manifest")
+        check(inst[0].get("launcher", {}).get("args") == ["serve"]
+              and inst[0]["launcher"]["executable"].endswith("bin/sutando"),
+              "manifest carries a structured launcher (no shell strings)")
+
+        # 16b. same-instance double start is refused by the instance lock
+        # (different instances may run in parallel; this one may not fork).
+        dup = subprocess.run(
+            [sys.executable, str(REPO / "src" / "runtime-api" / "server.py")],
+            env=ENV, capture_output=True, text=True, timeout=15)
+        check(dup.returncode != 0 and "refusing double start" in
+              (dup.stderr + dup.stdout),
+              "second server for the SAME instance exits loudly (lock held)")
+        # ...and its exit must not stamp the LIVE daemon's manifest. It was
+        # refused before registering, so it has no instance to stop.
+        _live = [json.loads(f.read_text())
+                 for f in (Path(TMP) / "instances").glob("*.json")
+                 if "test-agent" in f.name]
+        check(len(_live) == 1 and _live[0]["status"] == "running",
+              "a refused duplicate leaves the live manifest running")
+        check(cli("sutando", "info").get("agentId") == "@test-agent:example.org",
+              "...and the first daemon is still serving after the refusal")
     finally:
         daemon.terminate()
         try:
             daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:
             daemon.kill()
+    # 17. clean shutdown (SIGTERM) marks the manifest stopped — discovery
+    # still lists the instance with the daemon fully down.
+    _mf = Path(TMP) / "instances"
+    _stopped = [json.loads(f.read_text()) for f in _mf.glob("*.json")
+                if "test-agent" in f.name]
+    check(len(_stopped) == 1 and _stopped[0]["status"] == "stopped",
+          "SIGTERM shutdown marked the instance manifest stopped")
+
+    # 18. the start verb: with the daemon fully down, `instance start` reads
+    # the manifest, execs the recorded launcher and waits for the endpoint —
+    st18 = cli("instance", "start", "@test-agent:example.org")
+    check(st18.get("ok") is True and st18.get("state") == "started",
+          "start verb boots a stopped instance via its manifest launcher")
+    i18 = cli("sutando", "info")
+    check(i18.get("agentId") == "@test-agent:example.org",
+          "restarted instance answers with the same identity")
+    st18b = cli("instance", "start", "@test-agent:example.org")
+    check(st18b.get("state") == "already_running",
+          "start verb is idempotent on a live instance (attachable, not just socket)")
+    # the started instance must be ATTACHABLE: identity verified over its socket
+    i18b = cli("sutando", "info")
+    check(i18b.get("agentId") == "@test-agent:example.org",
+          "started instance is attachable — identity verified over its socket")
+    import signal as _signal
+    os.kill(st18["pid"], _signal.SIGTERM)
+    time.sleep(1.5)
 
     print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0

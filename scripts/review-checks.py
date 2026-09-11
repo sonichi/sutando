@@ -9,6 +9,7 @@ one `file:line: hardcoded path (tok): text` per violation to stdout; exit is 0
 when the scan runs (with or without hits — the caller decides pass/fail from
 whether anything was printed) and non-zero only if the scanner itself crashes,
 so the runner can fail closed."""
+import fnmatch
 import os
 import re
 import sys
@@ -27,8 +28,21 @@ allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
 paired = [tuple(x.strip() for x in a.split("::", 1))
           for a in os.environ.get("RC_ALLOW_PAIRED", "").split("\n")
           if a and "::" in a]
+# checks.hardcoded-paths.skip_glob: exempts only a matched file's inner-removal
+# lines (see '+' handling below) — an inner addition stays in scope.
+skip_globs = [g for g in os.environ.get("RC_SKIP_GLOB", "").split("\n") if g]
 DELIMS = set("\"'()" + ", ;=" + chr(96) + chr(9))   # quotes, brackets, backtick, tab, etc.
 SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")
+
+
+def _skip_file(f):
+    """File-class exemption: never scanned at all."""
+    return bool(SKIP.search(f))
+
+
+def _patch_file(f):
+    """skip_glob match: only its INNER-REMOVAL lines are exempt, not the file."""
+    return any(fnmatch.fnmatchcase(f, g) for g in skip_globs)
 
 
 def token_at(s, pos):
@@ -825,6 +839,7 @@ def _hunk_body(all_lines, start):
 def main():
     diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
+    is_patch = False
     ln = 0
     cur_file = ""
     hits = 0
@@ -889,7 +904,8 @@ def main():
                 f = f[2:]
             cur_file = f
             ln = 0
-            skip = bool(SKIP.search(f))
+            skip = _skip_file(f)
+            is_patch = _patch_file(f)
             in_doc = False
             prev_added = None
             in_block = False
@@ -925,9 +941,13 @@ def main():
             prev_added = _code_part(raw[1:])
             continue
         if raw.startswith("+"):
+            line = raw[1:]
             if skip:
                 continue
-            line = raw[1:]
+            # A skip_glob file is exempt ONLY on its nested diff's own removal
+            # lines; an inner addition is what a re-applied patch introduces.
+            if is_patch and line.startswith("-"):
+                continue
             cur = ln
             ln += 1
             # Decide skip from the state at the line's START, then advance it —

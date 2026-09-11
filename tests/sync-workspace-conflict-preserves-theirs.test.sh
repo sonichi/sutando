@@ -71,6 +71,54 @@ _resolve_conflicts_keep_ours "origin/dd2" "$TMP/bk2" 2>/dev/null
 [ -z "$(git diff --name-only --diff-filter=U)" ]
 check $? "DD conflict (no stage 3) resolves without crashing"
 
+# --- A DD path can still hold LIVE local state, and `-f` deleted it ----------
+# Carrier enforcement (`_enforce_carrier_set_pre`) untracks paths outside this
+# host's carrier set with `git rm --cached` — bytes stay on disk — and commits
+# that removal, so it propagates. A peer whose carrier set differs then merges
+# a deletion for a path its own app is still WRITING. The old fallback ran
+# `git rm -f`, which removed the working-tree file: reported fleet-wide as
+# data/task-workstreams.json vanishing (absent, not emptied) three times in
+# ~35 min on one host.
+#
+# The index state is built with plumbing rather than a merge on purpose: a
+# plain delete/delete MERGES CLEANLY and leaves no unmerged path, so a fixture
+# that "resolves" would pass vacuously without ever exercising the branch.
+WS3="$TMP/ws3"; mkdir -p "$WS3"; cd "$WS3" || exit 1
+git init -q .; git config user.email t@t; git config user.name t
+mkdir -p data; printf 'base\n' > data/task-workstreams.json
+git add -A; git commit -qm base
+DD_BLOB="$(git rev-parse HEAD:data/task-workstreams.json)"
+git rm -q --cached data/task-workstreams.json
+printf '100644 %s 1\tdata/task-workstreams.json\n' "$DD_BLOB" | git update-index --index-info
+printf 'LIVE LOCAL STATE\n' > data/task-workstreams.json
+
+[ -n "$(git diff --name-only --diff-filter=U)" ]
+check $? "fixture really IS a DD conflict (guards against a vacuous pass)"
+! git checkout --ours -- data/task-workstreams.json 2>/dev/null
+check $? "fixture really takes the fallback (--ours fails on DD, as the comment says)"
+
+_resolve_conflicts_keep_ours "origin/peer-dd" "$TMP/bk3" >/dev/null 2>&1
+
+[ -z "$(git diff --name-only --diff-filter=U)" ]
+check $? "DD+on-disk: conflict is resolved, so the merge can still conclude"
+[ -f data/task-workstreams.json ]
+check $? "THE POINT: a DD path that still exists on disk is NOT deleted"
+grep -q 'LIVE LOCAL STATE' data/task-workstreams.json 2>/dev/null
+check $? "DD+on-disk: the local bytes are intact, not just the path"
+
+# Control: when the path genuinely is gone, the -f branch must still resolve.
+WS4="$TMP/ws4"; mkdir -p "$WS4"; cd "$WS4" || exit 1
+git init -q .; git config user.email t@t; git config user.name t
+mkdir -p data; printf 'base\n' > data/gone.json
+git add -A; git commit -qm base
+DD_BLOB2="$(git rev-parse HEAD:data/gone.json)"
+git rm -q --cached data/gone.json
+printf '100644 %s 1\tdata/gone.json\n' "$DD_BLOB2" | git update-index --index-info
+rm -f data/gone.json
+_resolve_conflicts_keep_ours "origin/peer-dd2" "$TMP/bk4" >/dev/null 2>&1
+[ -z "$(git diff --name-only --diff-filter=U)" ]
+check $? "control: an absent DD path still resolves (the -f branch is untouched)"
+
 # --- BLOCKER 1 regression: a backup WRITE FAILURE must be loud and must not
 # --- be summarised as success (john-the-dev #2476). Force it the way the
 # --- reviewer did: make the backup's parent dir a regular FILE.
@@ -113,6 +161,31 @@ check $? "default backup root lives under the git dir (never trackable)"
 # code it passed for the wrong reason — that default root sat OUTSIDE the repo,
 # so git status was trivially clean. The under-the-git-dir check above is the
 # one that actually discriminates.)
+
+# --- A DANGLING SYMLINK is local state too, and `-e` FOLLOWS the link, so it
+# --- reads as absent and takes the DELETING branch. This repo's own `workspace`
+# --- link has exactly that shape whenever its target is unavailable.
+# --- Built with PLUMBING (stage 1 only): a plain delete/delete merges CLEANLY
+# --- and would never reach the fallback at all — a vacuous pass. (I shipped
+# --- that fixture first and only the mutation run below caught it.)
+WS3="$TMP/ws3"; mkdir -p "$WS3"; cd "$WS3" || exit 1
+git init -q .; git config user.email t@t; git config user.name t
+printf 'seed\n' > seed; git add seed; git commit -qm base
+BLOB="$(printf '/nonexistent-target-xyz' | git hash-object -w --stdin)"
+printf '120000 %s 1\tlink\n' "$BLOB" | git update-index --index-info
+ln -s /nonexistent-target-xyz link          # live local state git no longer owns
+
+[ -n "$(git ls-files -u -- link)" ]
+check $? "fixture: link is genuinely UNMERGED (stage 1 only), not a clean merge"
+[ -L link ] && [ ! -e link ]
+check $? "fixture: the path is a DANGLING symlink (-L true, -e false)"
+
+_resolve_conflicts_keep_ours "origin/none" "$TMP/bk3" 2>/dev/null
+
+[ -L link ]
+check $? "THE POINT: a dangling symlink SURVIVES the DD fallback (\`-e\` alone deletes it)"
+[ -z "$(git ls-files -u -- link)" ]
+check $? "dangling-symlink DD conflict is still resolved in the index"
 
 printf '\n%s: %d passed, %d failed\n' "sync conflict preserves theirs" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

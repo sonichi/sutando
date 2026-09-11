@@ -482,6 +482,9 @@ bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 # PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
 # at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
 
+# The sentinel is NOT cleared here. This runs ~850 lines before the
+# `exec start-cli.sh` below, which clears it once a core is verified live.
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -664,7 +667,12 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
+# THIS instance's sentinel only. The reaper deliberately kills a watcher that
+# OWNS its sentinel -- right for a leftover of this instance, fatal for a peer's
+# running one, and startup no longer precedes every watcher on a pool host.
+if __sentinel="$(sentinel_path_for "$WORKSPACE/state")" && [ -n "$__sentinel" ]; then
+  reap_stale_task_watcher "$__sentinel"
+fi
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —

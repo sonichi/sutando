@@ -58,9 +58,10 @@ def _drive_gateway_writer(task: dict) -> "str | None":
     global _BOUND
     _BOUND = {"tasks": rgb.TASKS_DIR, "results": rgb.RESULTS_DIR,
               "state": rgb._STATE, "rooms": rgb.TASK_ROOMS_FILE}
-    tid = rgb._write_task(task)
-    if not tid:
+    written = rgb._write_task(task)
+    if not written:
         return None
+    tid = written[0]
     hits = list((tmp / "task").glob(f"{tid}*.txt")) or list(tmp.rglob(f"{tid}*.txt"))
     return hits[0].read_text() if hits else None
 

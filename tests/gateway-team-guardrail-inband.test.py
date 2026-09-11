@@ -16,6 +16,7 @@ Run: python3 tests/gateway-team-guardrail-inband.test.py
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 import unittest
@@ -47,8 +48,9 @@ def _write(mod, **over) -> str:
     task = {"id": "inband1", "task": "please look at the parser",
             "user_id": "@x:ag2.space", "access_tier": "team"}
     task.update(over)
-    tid = mod._write_task(task)
-    assert tid, "writer returned no task id"
+    written = mod._write_task(task)
+    assert written, "writer returned no task id"
+    tid = written[0]
     return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
 
@@ -64,6 +66,46 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
             self.assertIn("cannot authorise", body, "the no-irreversible-actions clause must survive")
             self.assertIn(f"results/{tid}.txt", body,
                           "the guardrail must name THIS task's result path, not a template")
+
+    def test_signal_room_team_task_names_its_own_media_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            mod.RESULTS_DIR = Path(d) / "results"
+            body, tid = _write(mod, signal={"v": 1, "cid": "c1", "route_attempt": 1,
+                                             "source_root": "$r:s", "source_room": "!r:s"})
+            media_dir = str(Path(d) / "results" / tid)
+            self.assertIn("Signal Room media:", body)
+            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
+                          "the instruction must name THIS task's absolute media directory")
+            self.assertIn("image-generation", body)
+            self.assertEqual(body.count(FENCE), 1,
+                             "the media lines are prose after the guardrail, not a second fence")
+            # Nothing appended may parse as a header (local_task_protocol's shape).
+            header_shaped = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]?")
+            tail = body.split("===END SUTANDO SYSTEM INSTRUCTIONS===", 1)[1]
+            self.assertEqual([l for l in tail.splitlines() if header_shaped.match(l)], [],
+                             "the appended media prose must not contain a header-shaped line")
+            # Still the narrower Team guardrail, in the same body.
+            self.assertIn("TEAM-tier request from a trusted collaborator", body)
+
+    def test_media_command_is_shell_quoted_when_the_workspace_path_has_spaces(self):
+        with tempfile.TemporaryDirectory(suffix=" with space") as d:
+            mod = _load(Path(d))
+            mod.RESULTS_DIR = Path(d) / "results"
+            body, tid = _write(mod, signal={"v": 1, "cid": "c2", "route_attempt": 1,
+                                             "source_root": "$r:s", "source_room": "!r:s"})
+            media_dir = str(Path(d) / "results" / tid)
+            self.assertIn(f"--output '{media_dir}/<name>.png'", body,
+                          "the generate.py --output path must be shell-quoted")
+            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
+                          "…while the marker form stays a plain path")
+
+    def test_ordinary_team_task_carries_no_media_instruction(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, _tid = _write(mod)
+            self.assertNotIn("Signal Room media:", body)
+            self.assertNotIn("image-generation", body)
 
     def test_owner_task_carries_no_team_guardrail(self):
         with tempfile.TemporaryDirectory() as d:
@@ -104,8 +146,9 @@ class CollaboratorBranchReachesTheBody(unittest.TestCase):
                 "user_id": "@c:ag2.space", "access_tier": "team",
                 "collaborator": True}
         task.update(over)
-        tid = mod._write_task(task)
-        assert tid, "writer returned no task id"
+        written = mod._write_task(task)
+        assert written, "writer returned no task id"
+        tid = written[0]
         return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
     def test_attested_collaborator_gets_the_engage_rulebook_at_its_own_result_path(self):

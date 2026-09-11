@@ -16,20 +16,12 @@ gateway — the client passes them through verbatim.
 from __future__ import annotations
 
 import base64
-import json
 import os
 
-from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
-                    HTTPError, URLError)
+from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason_from,
+                      HTTPError, URLError)
 
 DEFAULT_FOLDER = "room-live-context"
-
-# Statuses whose degrade_reason() text is a DIAGNOSIS the server's own message
-# must not overwrite — 401 points at the bearer token, 403 at room membership.
-# Kept as a named set rather than an inline `in (401, 403)` so the reason it
-# exists is attached to it: this is not "auth-ish codes", it is "codes where a
-# wrong reason sends someone to the wrong subsystem".
-_AUTH_STATUSES = frozenset({401, 403})
 
 
 def _result(ok, *, room_id=None, folder=None, name=None, content=None,
@@ -80,19 +72,7 @@ def _call(op, room_id, agent_mxid, gate, extra):
         # server's message is APPENDED, never substituted — surfacing what the
         # server said without letting it overwrite what the status code means.
         # Dropping it entirely would trade one silent loss for another.
-        reason = degrade_reason(e.code)
-        try:
-            parsed = json.loads(e.read().decode("utf-8") or "{}")
-        except Exception:
-            parsed = None
-        server_msg = ""
-        if isinstance(parsed, dict) and parsed.get("error"):
-            server_msg = str(parsed["error"])
-        if server_msg:
-            if e.code in _AUTH_STATUSES:
-                reason = f"{reason} (server said: {server_msg})"
-            else:
-                reason = server_msg
+        reason = degrade_reason_from(e)
         return _result(False, room_id=room_id, folder=extra.get("folder"),
                        name=extra.get("filename"), reason=reason)
     except (URLError, TimeoutError) as e:

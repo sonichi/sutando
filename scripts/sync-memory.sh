@@ -444,7 +444,7 @@ done
 # gap so a rebuilt host restores its plugin/hook/permission config. Sourced
 # from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
 # legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
-SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+SETTINGS_SRC="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path settings.json)"
 if [ -f "$SETTINGS_SRC" ]; then
     copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
 fi

@@ -1,6 +1,6 @@
 ---
 name: x-twitter
-description: "Post tweets, search, read mentions, and check engagement on X (Twitter) via API v2."
+description: "Post to X via a signed-in browser session (live method — no API keys); API v2 path for search/read/engagement."
 ---
 
 # X (Twitter)
@@ -20,6 +20,41 @@ known tweet id. Not for other social platforms.
 - **Done =** the command prints the new tweet id / the result rows; a post with no id back did not publish.
 
 ## Usage
+
+## Posting — use the browser session (live method)
+
+The OAuth1 API post path below is **NOT wired** on this fleet: posting needs 4 write
+keys (X_API_KEY/SECRET + X_ACCESS_TOKEN/SECRET) that are not in the vault. Posting is
+NOT credit-gated — it just needs those keys, which we don't have. **Do not conclude "X
+is blocked."** The working path is a signed-in Chrome-for-Testing browser session:
+
+```bash
+# Is the profile signed in?  (headless, exit 0 = yes, 2 = no)
+node skills/x-twitter/x-post-browser.mjs check
+
+# Owner signs in once (headed GUI window; email/phone — Google/Apple OAuth stay blocked)
+node skills/x-twitter/x-post-browser.mjs login
+
+# Compose only, screenshot, DO NOT publish  (always run this first)
+node skills/x-twitter/x-post-browser.mjs post "Your tweet text" --dry-run
+
+# Publish  (only after owner OKs the dry-run)
+node skills/x-twitter/x-post-browser.mjs post "Your tweet text"
+```
+
+- Profile: `<workspace>/data/x-browser-profile`, resolved through `scripts/sutando-config.sh workspace`
+  (override with `$X_BROWSER_PROFILE`, declared in this skill's `manifest.json`). Per-host, holds live
+  session cookies, and never synced — `data/` is in the vault `exclude` list. A profile still sitting at
+  the pre-#2133 location is used with a one-line notice until you move it, so upgrading does not cost you
+  a fresh sign-in. `$X_LOGIN_DONE_SENTINEL` and `$X_LOGIN_TIMEOUT_ITERS` are declared alongside it but are
+  test/CI controls — there is no reason to set them by hand. Sign-in
+  survives ONLY because `check`/`post` strip Playwright's `--use-mock-keychain` so
+  cookies decrypt with the real login keychain — see
+  `memory/reference_x_browser_signin_oauth_blocked_use_email_phone.md`.
+- **Always `--dry-run` first and confirm with the owner before publishing.** Nothing
+  posts without an explicit OK.
+
+## API v2 usage (search / read / engagement — reads only, no post keys)
 
 ```bash
 # Post

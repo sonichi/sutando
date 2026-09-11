@@ -54,14 +54,16 @@ def run(coro):
 _n = 0
 
 
-def fresh(executors=None, actor="test-actor"):
+def fresh(executors=None, actor="test-actor", granted=frozenset()):
     """A dispatcher over disposable store + human-action dir."""
     global _n
     _n += 1
     d = Path(tempfile.mkdtemp(prefix=f"rt-disp-{_n}-"))
     store = RequestStore(str(d / "state.sqlite"))
     ha = HumanActionAdapter(str(d / "ha"))
-    return RuntimeDispatcher(store, ha, actor, executors or {}), store, ha, d
+    return (RuntimeDispatcher(store, ha, actor, executors or {},
+                              granted_methods=granted),
+            store, ha, d)
 
 
 def approve(ha, disp, rid, decision="approved", answer=None):
@@ -77,6 +79,11 @@ def approve(ha, disp, rid, decision="approved", answer=None):
 print("── dispatch table ──")
 d, store, ha, _ = fresh()
 raises("unknown method → -32601", lambda: run(d.handle("no.such", {})), code=-32601)
+raises("ungranted human_action.complete → -32601 before any param check",
+       lambda: run(d.handle("human_action.complete", {})), code=-32601)
+_dg, _, _, _ = fresh(granted=frozenset({"human_action.complete"}))
+raises("granted human_action.complete still requires requestId",
+       lambda: run(_dg.handle("human_action.complete", {})), code=-32602)
 raises("approval.request requires action", lambda: run(d.handle("approval.request", {})),
        code=-32602, substr="action")
 raises("elicitation.request requires question",
@@ -287,6 +294,85 @@ d.recover()
 check("recovery relinks a pending approval to its card", a_rid in d._ha_of, str(d._ha_of))
 check("recovery relinks a pending elicitation to its card", e_rid in d._ha_of, str(d._ha_of))
 check("recovered approval is still pending", store.get(a_rid)["status"] == "pending")
+
+print("── approval.respond (device-plane; needs a daemon-resolved grant) ──")
+d0, store0, ha0, _ = fresh(actor="ungranted")
+ra0 = run(d0.handle("approval.request", {"action": "x.y"}))
+raises("respond WITHOUT a grant is not callable (fails closed)",
+       lambda: run(d0.handle("approval.respond",
+                             {"requestId": ra0["requestId"],
+                              "decision": "approve"})),
+       code=-32601, substr="grant")
+check("ungranted respond leaves the approval pending",
+      store0.get(ra0["requestId"])["status"] == "pending")
+d, store, ha, _ = fresh(actor="responder",
+                        granted=frozenset({"approval.respond"}))
+raises("respond requires requestId",
+       lambda: run(d.handle("approval.respond", {})), code=-32602, substr="requestId")
+raises("respond requires a valid decision",
+       lambda: run(d.handle("approval.respond", {"requestId": "r", "decision": "maybe"})),
+       code=-32602, substr="decision")
+raises("respond on unknown request",
+       lambda: run(d.handle("approval.respond",
+                            {"requestId": "nope", "decision": "approve"})),
+       code=-32602, substr="unknown")
+ra = run(d.handle("approval.request", {"action": "x.y"}))
+rr = run(d.handle("approval.respond",
+                  {"requestId": ra["requestId"], "decision": "approve"}))
+check("respond approves and reports the transition",
+      rr["status"] == "approved", str(rr))
+check("approved is durable", store.get(ra["requestId"])["status"] == "approved")
+rr2 = run(d.handle("approval.respond",
+                   {"requestId": ra["requestId"], "decision": "reject"}))
+check("second respond reports alreadyTerminal, never flips the row",
+      rr2.get("alreadyTerminal") and store.get(ra["requestId"])["status"] == "approved",
+      str(rr2))
+re_ = run(d.handle("elicitation.request",
+                   {"question": "q?", "type": "single_select",
+                    "options": ["a", "b"]}))
+raises("respond refuses a non-approval request type",
+       lambda: run(d.handle("approval.respond",
+                            {"requestId": re_["requestId"], "decision": "approve"})),
+       code=-32602, substr="approval")
+rd = run(d.handle("approval.request", {"action": "z.z"}))
+rrd = run(d.handle("approval.respond",
+                   {"requestId": rd["requestId"], "decision": "reject"}))
+check("respond reject denies", rrd["status"] == "denied", str(rrd))
+
+print("── schedule / task param edges ──")
+raises("schedule.list without a schedules surface",
+       lambda: run(d.handle("schedule.list", {})), code=-32601, substr="schedule")
+raises("task.* without a task pipeline is a clean -32601",
+       lambda: run(d.handle("task.status", {})), code=-32601, substr="task pipeline")
+raises("request.get without requestId",
+       lambda: run(d.handle("request.get", {})), code=-32602, substr="requestId")
+
+print("── configured-surface branches ──")
+sys.path.insert(0, str(REPO / "src"))
+from schedules_view import SchedulesView  # noqa: E402
+import json as _j
+import tempfile as _tf
+_sd = Path(_tf.mkdtemp(prefix="rt-disp-sched-"))
+(_sd / "crons.json").write_text(_j.dumps([{"name": "x", "cron": "*/5 * * * *",
+                                           "prompt": "p"}]))
+d.schedules = SchedulesView(_sd / "crons.json")
+rows = run(d.handle("schedule.list", {}))
+check("schedule.list serves configured rows through the dispatcher",
+      rows["schedules"] and rows["schedules"][0]["name"] == "x", str(rows))
+
+from tasks_view import TasksView  # noqa: E402
+_td = Path(_tf.mkdtemp(prefix="rt-disp-tasks-"))
+(_td / "tasks").mkdir(); (_td / "results").mkdir()
+d.tasks = TasksView(_td / "tasks", _td / "results", "@disp:test")
+raises("task.status with a pipeline but no taskId",
+       lambda: run(d.handle("task.status", {})), code=-32602, substr="taskId")
+raises("task.details unknown id",
+       lambda: run(d.handle("task.details", {"taskId": "task-none"})),
+       code=-32602, substr="unknown task")
+raises("task.submit empty text is a ValueError -> -32602",
+       lambda: run(d.handle("task.submit", {"task": "   "})), code=-32602)
+raises("request.wait without requestId",
+       lambda: run(d.handle("request.wait", {})), code=-32602, substr="requestId")
 
 print()
 if FAILS:

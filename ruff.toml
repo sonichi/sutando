@@ -26,7 +26,13 @@ exclude = [
 [lint]
 # E4 = imports, E7 = statement style, E9 = syntax/IO errors, F = pyflakes.
 # F is the real prize: undefined names, unused imports, broken .format() calls.
-select = ["E4", "E7", "E9", "F"]
+#
+# W605 is the one W rule selected, and it is here because it is a deadline, not
+# a style preference: an unrecognised escape in a non-raw literal is a
+# SyntaxWarning today and becomes a SyntaxError in a future Python, at which
+# point the file stops importing. The rest of W is pycodestyle whitespace and
+# stays off with the other style rules.
+select = ["E4", "E7", "E9", "F", "W605"]
 
 ignore = [
     # Module-level import not at top of file. This is STRUCTURAL here, not

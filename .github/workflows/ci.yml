@@ -158,6 +158,7 @@ jobs:
           timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
@@ -225,8 +226,41 @@ jobs:
               fi
             else
               echo "$output" | grep -E 'FAIL|^Summary' || true
+              # A listed suite that PASSES is a stale entry, and a stale entry
+              # un-gates a suite nobody thinks is un-gated. Fail so the list
+              # cannot silently outlive the failures it excuses.
+              if grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
+                echo "✖ stale allowlist entry: $f passed — delete its line from $known_failures_file"
+                failed=1
+              fi
             fi
           done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
+          exit "$failed"
+
+      # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
+      # later: these suites existed and CI discovered none of them, so a .mjs
+      # suite could fail at HEAD while the run reported green.
+      - name: Run ESM standalone tests
+        run: |
+          failed=0
+          while IFS= read -r f; do
+            echo "→ $f"
+            # Same `if ! output=$(...)` form as the shell step: a bare assignment
+            # would abort the whole step under `bash -e` on the first failure and
+            # mask every later suite.
+            if ! output=$(timeout -k 5 300 node "$f" 2>&1); then
+              echo "✖ esm test failed: $f"
+              echo "$output"
+              failed=1
+            else
+              # Every suite must contribute a visible verdict. With a narrower
+              # pattern four of seven printed nothing, so a step that ran
+              # everything looked like a loop that matched no files — a green
+              # indistinguishable from absence. `tail -1` is the backstop for a
+              # suite whose closing line matches none of these.
+              echo "$output" | grep -E 'FAIL|^all ok|^all passed|^PASS' || echo "$output" | tail -1
+            fi
+          done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
 
   python-standalone-tests:

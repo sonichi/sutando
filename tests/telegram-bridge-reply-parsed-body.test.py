@@ -44,16 +44,16 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
         anchor = "for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):"
         start = SRC.find(anchor)
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
-        # End at the loop's own dedent, not a character count: a fixed window
-        # drops assertions off the end as the body grows, or overruns into other code.
-        lines = SRC[start:].splitlines(keepends=True)
-        indent = len(lines[0]) - len(lines[0].lstrip())
-        body = [lines[0]]
-        for line in lines[1:]:
-            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+        # End on the loop's own dedent, not a character count. A fixed window is
+        # a latent break: any insertion pushes the last assertion off its edge.
+        head = SRC.rfind("\n", 0, start) + 1
+        indent = len(SRC[head:start])
+        end = len(SRC)
+        for m in re.finditer(r"^[ \t]*(?=\S)", SRC[start:], re.M):
+            if m.start() and len(m.group()) <= indent:
+                end = start + m.start()
                 break
-            body.append(line)
-        return "".join(body)
+        return SRC[start:end]
 
     def test_send_reply_uses_parsed_body_not_reply_text(self):
         """send_reply() must receive parsed.body, not the raw reply_text.

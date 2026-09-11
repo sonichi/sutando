@@ -46,9 +46,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BRIDGE = REPO / "src" / "discord-bridge.py"
+sys.path.insert(0, str(REPO / "src"))
 
+import access_store  # noqa: E402
+
+# Path resolution moved to access_store.py (#3318); only the
+# backup/restore/validate helpers stay bridge-local.
 _HELPERS = (
-    "_resolve_access_file",
     "_is_valid_access_doc",
     "_write_owner_only",
     "_backup_access_to_disk",
@@ -203,21 +207,58 @@ class TestBackup(_Base):
         self.assertTrue(flags & os.O_EXCL, "temp must be O_EXCL (no reuse of a broader file)")
 
 
-class TestAccessPathResolution(_Base):
+class TestAccessPathResolution(unittest.TestCase):
+    """access_store.resolve_discord_access_file (#3318 blocker 1: extracted out
+    of discord-bridge.py so the skill-callable CLI resolves the identical
+    file). Drives the REAL production function — not an AST-extracted copy —
+    with CLAUDE_CONFIG_DIR + resolve_workspace pointed at an isolated tmpdir."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="dc-dbak-resolve-"))
+        self._old_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.d / "ccd")
+        self._old_resolve_workspace = access_store.resolve_workspace
+        access_store.resolve_workspace = lambda *a, **kw: self.d / "workspace"
+        self.canonical = self.d / "ccd" / "channels" / "discord" / "access.json"
+        self.backup = self.d / "workspace" / "state" / "auth" / "discord-access-backup.json"
+
+    def tearDown(self):
+        if self._old_config_dir is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._old_config_dir
+        access_store.resolve_workspace = self._old_resolve_workspace
+
     def test_legacy_fallback_preserved_before_first_durable_backup(self):
-        """Fresh migration-window installs still use channel_access_path until
-        a durable backup has been seeded."""
+        """Fresh migration-window installs still resolve via channel_access_path
+        (which owns the canonical/legacy choice itself) until a durable backup
+        has been seeded — resolve_discord_access_file must defer to it, not
+        bypass it."""
         self.assertFalse(self.backup.exists())
-        self.assertEqual(
-            self.ns["_resolve_access_file"](),
-            self.access.parent / "legacy-access.json",
-        )
+        sentinel = self.d / "legacy-sentinel-access.json"
+        old_cap = access_store.channel_access_path
+        access_store.channel_access_path = lambda source: sentinel
+        try:
+            self.assertEqual(access_store.resolve_discord_access_file(), sentinel)
+        finally:
+            access_store.channel_access_path = old_cap
 
     def test_durable_backup_pins_missing_live_file_to_canonical_path(self):
         """Once state/auth has a valid backup, a missing canonical live file is
-        a wipe to restore—not permission to resurrect stale legacy state."""
-        self.backup_to_disk({"allowFrom": ["OWNER"], "tierMap": {"OWNER": "owner"}})
-        self.assertEqual(self.ns["_resolve_access_file"](), self.access)
+        a wipe to restore — not permission to resurrect stale legacy state.
+        Proven by showing the canonical path wins even when channel_access_path
+        (the legacy-fallback authority) would have returned something else."""
+        self.backup.parent.mkdir(parents=True, exist_ok=True)
+        self.backup.write_text(json.dumps({"allowFrom": ["OWNER"], "tierMap": {"OWNER": "owner"}}))
+        sentinel = self.d / "legacy-sentinel-access.json"
+        old_cap = access_store.channel_access_path
+        access_store.channel_access_path = lambda source: sentinel
+        try:
+            result = access_store.resolve_discord_access_file()
+        finally:
+            access_store.channel_access_path = old_cap
+        self.assertEqual(result, self.canonical)
+        self.assertNotEqual(result, sentinel)
 
 
 class TestRestore(_Base):
@@ -328,7 +369,13 @@ class TestWiredIntoBridge(unittest.TestCase):
         self.src = BRIDGE.read_text()
 
     def test_backup_file_under_state_auth(self):
-        self.assertIn('ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "discord-access-backup.json"', self.src)
+        # Path resolution moved to access_store.py (#3318 blocker 1) so the
+        # skill-callable CLI shares it; the bridge now binds by reference.
+        self.assertIn("ACCESS_BACKUP_FILE = discord_access_backup_file()", self.src)
+        self.assertEqual(
+            access_store.discord_access_backup_file().parts[-3:],
+            ("state", "auth", "discord-access-backup.json"),
+        )
 
     def test_helpers_defined(self):
         for name in _HELPERS:
@@ -348,11 +395,13 @@ class TestWiredIntoBridge(unittest.TestCase):
         )
 
     def test_backup_called_at_write_sites(self):
-        # Every atomic access.json write-back should mirror a durable backup.
+        # Every atomic write-back mirrors a durable backup, passed BY REFERENCE
+        # (backup=_backup_access_to_disk) to the shared mutator, not called direct.
+        self.assertIn("def _backup_access_to_disk(", self.src, "missing helper def")
         self.assertGreaterEqual(
-            self.src.count("_backup_access_to_disk("), 4,
-            "expected _backup_access_to_disk wired at the tier-map seed, thread-engage, "
-            "and pairing write sites (+ the helper def)")
+            self.src.count("backup=_backup_access_to_disk"), 3,
+            "expected _backup_access_to_disk wired by reference at the "
+            "tier-map seed, thread-engage, and pairing write sites")
 
 
 if __name__ == "__main__":

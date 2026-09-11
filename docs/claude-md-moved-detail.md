@@ -35,13 +35,18 @@ api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
+{"host": "...", "pid": ..., "heartbeat_pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...",
+ "socket": "...", "session": "sutando-core", "locality": {"kind": "local|cloud", "host": "..."},
+ "backend": "tmux", "tmux_binary": "/opt/homebrew/bin/tmux", "tmux_version": "3.6b", "tmux_server_version": "3.6b",
+ "tmux_verified": true, "tmux_candidates": ["/opt/homebrew/bin/tmux"], "schema_version": 4}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`backend` / `tmux_binary` / `tmux_version` / `tmux_server_version` / `tmux_verified` / `tmux_candidates` (schema 4): a tmux client **verified** to speak to this core's server — the first of the PATH `tmux` (what the launchers run) and `SUTANDO_TMUX_BIN` (what the app exports) that proves two facts with two commands — `display-message -p -t =<session> '#{version}|#{socket_path}'` must answer with the **server's own socket path** (tmux renders `#{session_name}` empty under `-t`, so the session is never taken from that output), and `has-session -t =<session>` on the **same binary** must resolve the observed session (an arbitrary executable that exits 0 is rejected; a `-V` that does not start with `tmux` records no version) — with its `-V`, and the version the **server itself** reports. Every probe the writer makes (session discovery, core pid) goes through that same client, so a protocol-refused PATH `tmux` beside a compatible exported one still finds the session. `restart.sh` and the Codex launcher's `--restart` run `core_heartbeat.py --stop` first, so an upgrade hands `.alive` to the new writer instead of keeping the old one (and its old schema) alive. Recorded because tmux versions with incompatible protocols cannot talk to each other, and a client that cannot connect reads a live core as absent; a reader starts from the recorded client instead of guessing. `tmux_binary` is a compatible client, **not** a claim about who created the server; when nothing speaks the fields are null and `tmux_verified` is false. The backend record is re-verified on every beat; the client the probes use is re-chosen at most once per beat (a hit is kept ~10 s, a miss retried every call). `--stop` signals only the writer(s) this checkout's own records name (its pidfile and `.alive`'s `heartbeat_pid`) after `ps` shows an interpreter running exactly this script — never an argv sweep — and both restart paths resolve that interpreter through `scripts/python-binary.sh`, failing closed with a warning when none resolves. A reader should still re-verify before trusting a recorded path — it may have moved. `pid` is the core's, `heartbeat_pid` the writer's (schema 3); `session` is the observed tmux session.
 
 `locality` is the core's self-reported {kind: local|cloud, host} (Track 10) —
 additive and informational; mtime remains the liveness signal, so readers that
@@ -58,9 +63,15 @@ without trusting a foreign caller's ambient env.
 `<workspace>/state/auth/` holds **per-host install/identity state**
 that survives across upgrades and MUST NOT be wiped by transient-state cleanup
 jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
+Current contents (the protection is DIRECTORY-level — everything under
+`state/auth/` is exempt, including additions after this list):
 - `cloud-auth.json` — per-host cloud-side auth credentials
 - `device.json` — per-host device identity (UUID + provisioning metadata)
+- `ag2space.json` — enrolled agent identity (stand_id source)
+- `stand.json` — Stand record + OwnerBinding (owner-confirmed, 2026-08-23)
+- `entrance-links.json` — verified EntranceLink records (I2)
+- `task-hmac.key` — task-envelope trust root
+- `devices/`, `pairing/`, `scp-tls/`, `scp-wss.token` — SCP device auth
 
 Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
 were loose at workspace root, mistreated as transient JSON snapshots and

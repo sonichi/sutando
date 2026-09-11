@@ -26,7 +26,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 _HERE = Path(__file__).resolve().parent
 import sys  # noqa: E402
@@ -35,6 +35,7 @@ sys.path.insert(0, str(_HERE))
 from protocol import ELICITATION_TYPES, ProtocolError  # noqa: E402
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
+from capability_registry import EphemeralCapabilityRegistry  # noqa: E402
 
 
 def _log(msg: str) -> None:
@@ -114,11 +115,28 @@ class RuntimeDispatcher:
 
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
-                 executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS):
+                 executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
+                 agents_view=None, identity_view=None, tasks_view=None,
+                 runtime_view=None, schedules_view=None,
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None,
+                 granted_methods: frozenset = frozenset()):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
+        # Caller grants, resolved DAEMON-SIDE per transport (a paired device's
+        # granted_methods). The plain Unix socket grants nothing: default empty.
+        self.granted_methods = frozenset(granted_methods)
         self.executors = executors
+        # Discovery/identity/task views — injected like executors so tests
+        # compose tmp-dir views; None = those methods unavailable.
+        self.agents = agents_view
+        self.identity = identity_view
+        self.tasks = tasks_view
+        self.runtime = runtime_view
+        self.schedules = schedules_view
+        self.capability_registry = (
+            capability_registry if capability_registry is not None
+            else EphemeralCapabilityRegistry())
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -136,7 +154,7 @@ class RuntimeDispatcher:
         approval by design."""
         n = relinked = 0
         for rec in self.store.pending():
-            if rec["requestType"] in ("approval", "elicitation"):
+            if rec["requestType"] in ("approval", "elicitation", "human_action"):
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 relinked += 1
             elif rec["requestType"] == "capability":
@@ -183,15 +201,143 @@ class RuntimeDispatcher:
                 raise ProtocolError(-32602, f"{etype} requires options")
             return self._issue("elicitation", method, params,
                                required=("question",))
+        if method == "human_action.request":
+            return self._issue("human_action", method, params,
+                               required=("action",))
+        if method in ("human_action.complete", "human_action.decline"):
+            # Settling a human-only action is the same authority claim as
+            # approval.respond: the requester must never settle its own request.
+            if method not in self.granted_methods:
+                raise ProtocolError(
+                    -32601, f"{method} requires an authorized device grant — "
+                            "not callable on this transport (the human settles "
+                            "the action on its card)")
+            return self._human_action_settle(method, params)
+        if method == "approval.respond":
+            # Fails closed: only a transport whose caller carries this grant
+            # may resolve approvals — a requester must never approve itself.
+            if method not in self.granted_methods:
+                raise ProtocolError(
+                    -32601, "approval.respond requires an authorized device "
+                            "grant — not callable on this transport")
+            return self._approval_respond(params)
+        if method == "human_action.status":
+            return self._get(params)
+        if method == "capability.list":
+            return self.capability_registry.list(params)
+        if method == "capability.read":
+            return await self.capability_registry.read(params)
         if method == "capability.execute":
             return await self._capability(params)
+        if method == "request.list":
+            # Pending human-collaboration requests, newest first — what a
+            # fresh client renders as "waiting on a human" after install.
+            out = []
+            for rec in self.store.pending():
+                p = rec.get("params") or {}
+                out.append({"requestId": rec["requestId"],
+                            "requestType": rec["requestType"],
+                            **({"taskId": rec["taskId"]} if rec.get("taskId") else {}),
+                            **({"question": p["question"]} if p.get("question") else {}),
+                            **({"action": p["action"]} if p.get("action") else {}),
+                            **({"createdAt": rec["createdAt"]}
+                               if rec.get("createdAt") else {})})
+            return {"requests": out}
         if method == "request.get":
             return self._get(params)
         if method == "request.wait":
             return await self._wait(params)
         if method == "request.cancel":
             return self._cancel(params)
+        if method == "agent.list":
+            return self._agents().list_agents()
+        if method == "agent.status":
+            agent_id = params.get("agentId")
+            if not agent_id:
+                raise ProtocolError(-32602, "missing required param: agentId")
+            entry = self._agents().agent_status(agent_id)
+            if entry is None:
+                raise ProtocolError(-32602, f"unknown agent: {agent_id!r}")
+            return entry
+        if method.startswith("sutando."):
+            if self.identity is None:
+                raise ProtocolError(-32601,
+                                    "identity surface is not configured on this daemon")
+            if method == "sutando.stand":
+                return self.identity.stand_card(bool(params.get("details")))
+            if method == "sutando.resolve":
+                return self.identity.resolve(str(params.get("provider") or ""),
+                                             str(params.get("subject") or ""))
+            fn = {"sutando.info": self.identity.info,
+                  "sutando.channels": self.identity.entrances,
+                  "sutando.entrances": self.identity.entrances,
+                  "sutando.status": self.identity.status,
+                  "sutando.owner": self.identity.owner,
+                  "sutando.allowlist": self.identity.allowlist}.get(method)
+            if fn is not None:
+                return fn()
+        if method.startswith("runtime."):
+            if self.runtime is None:
+                raise ProtocolError(-32601,
+                                    "runtime surface is not configured on this daemon")
+            fn = {"runtime.health": self.runtime.health,
+                  "runtime.details": self.runtime.details}.get(method)
+            if fn is not None:
+                return fn()
+        if method == "schedule.list":
+            if self.schedules is None:
+                raise ProtocolError(-32601,
+                                    "schedule surface is not configured on this daemon")
+            return self.schedules.list_schedules()
+        if method.startswith("task."):
+            return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")
+
+    def _task(self, method: str, params: dict) -> dict:
+        if self.tasks is None:
+            raise ProtocolError(-32601,
+                                "task pipeline is not configured on this daemon")
+        try:
+            if method == "task.submit":
+                if not params.get("task"):
+                    raise ProtocolError(-32602, "missing required param: task")
+                return self.tasks.submit(params["task"],
+                                         priority=params.get("priority") or "normal")
+            if method == "task.list":
+                return self.tasks.list_tasks()
+            if method == "task.list_results":
+                return self.tasks.list_results()
+            if method == "task.get_result":
+                # taskId is OPTIONAL here — absent means "the newest result".
+                tid = params.get("taskId")
+                out = self.tasks.get_result(tid)
+                if out is None:
+                    raise ProtocolError(
+                        -32602,
+                        f"no result for task: {tid!r}" if tid
+                        else "no results found yet")
+                return out
+            tid = params.get("taskId")
+            if not tid:
+                raise ProtocolError(-32602, "missing required param: taskId")
+            if method == "task.status":
+                return self.tasks.status(tid)
+            if method == "task.details":
+                out = self.tasks.details(tid)
+                if out is None:
+                    raise ProtocolError(-32602, f"unknown task: {tid!r}")
+                return out
+            if method == "task.cancel":
+                return self.tasks.cancel(tid)
+        except ValueError as e:
+            raise ProtocolError(-32602, str(e)) from e
+        raise ProtocolError(-32601, f"unknown method {method}")
+
+    def _agents(self):
+        if self.agents is None:
+            raise ProtocolError(-32601,
+                                "agent discovery is not configured on this daemon")
+        return self.agents
 
     def _issue(self, rtype: str, method: str, params: dict, required=()) -> dict:
         for k in required:
@@ -200,8 +346,9 @@ class RuntimeDispatcher:
         rec = self.store.create(rtype, method, self.actor_id, params,
                                 task_id=params.get("taskId"),
                                 expires_in_s=params.get("expiresInS"))
-        opener = (self.ha.open_approval if rtype == "approval"
-                  else self.ha.open_elicitation)
+        opener = {"approval": self.ha.open_approval,
+                  "human_action": self.ha.open_human_action}.get(
+                      rtype, self.ha.open_elicitation)
         try:
             self._ha_of[rec["requestId"]] = opener(rec)
         except Exception as e:  # noqa: BLE001 — mirror failure = failed request
@@ -214,6 +361,64 @@ class RuntimeDispatcher:
             raise ProtocolError(-32603,
                                 f"could not open the human-action card: {e}") from e
         return {"requestId": rec["requestId"], "status": "pending"}
+
+    def _human_action_settle(self, method: str, params: dict) -> dict:
+        """API-side completion: the human confirmed out-of-band (e.g. via CLI)
+        instead of answering the card. Resolves the request AND closes the
+        card so it does not dangle for CardPoster."""
+        rid = params.get("requestId")
+        if not rid:
+            raise ProtocolError(-32602, "missing required param: requestId")
+        rec = self.store.get(rid)
+        if rec is None:
+            raise ProtocolError(-32602, f"unknown requestId: {rid!r}")
+        if rec["requestType"] != "human_action":
+            raise ProtocolError(-32602,
+                                f"{rid!r} is a {rec['requestType']} request — "
+                                "human_action.complete/decline apply only to "
+                                "human_action requests")
+        if rec["status"] != "pending":
+            return {"requestId": rid, "status": rec["status"],
+                    "alreadyTerminal": True}
+        status = ("completed" if method == "human_action.complete"
+                  else "declined")
+        note = params.get("note")
+        self.store.transition(rid, status,
+                              result={"note": note} if note else None,
+                              resolved_by=self.actor_id)
+        aid = self._ha_of.get(rid) or ha_action_id(rid)
+        self.ha.close(aid, self.actor_id, note=note)
+        return {"requestId": rid, "status": status}
+
+    def _approval_respond(self, params: dict) -> dict:
+        """Resolve an approval from an authorized client (e.g. a paired wearable
+        granted approval.respond). Mirrors the owner's card answer: approve →
+        approved, reject → denied. Same CAS terminal-immutability as every other
+        resolution path, so a late/duplicate respond — or a concurrent card
+        answer — cannot overwrite a resolved request; the mirrored card is closed
+        so it does not dangle. Reachable only when the composed granted_methods
+        carries approval.respond (see handle()); off by default."""
+        rid = params.get("requestId")
+        if not rid:
+            raise ProtocolError(-32602, "missing required param: requestId")
+        decision = params.get("decision")
+        if decision not in ("approve", "reject"):
+            raise ProtocolError(-32602, "decision must be 'approve' or 'reject'")
+        rec = self.store.get(rid)
+        if rec is None:
+            raise ProtocolError(-32602, f"unknown requestId: {rid!r}")
+        if rec["requestType"] != "approval":
+            raise ProtocolError(
+                -32602, f"{rid!r} is a {rec['requestType']} request — "
+                "approval.respond applies only to approval requests")
+        if rec["status"] != "pending":
+            return {"requestId": rid, "status": rec["status"],
+                    "alreadyTerminal": True}
+        status = "approved" if decision == "approve" else "denied"
+        self.store.transition(rid, status, resolved_by=self.actor_id)
+        aid = self._ha_of.get(rid) or ha_action_id(rid)
+        self.ha.close(aid, self.actor_id)
+        return {"requestId": rid, "status": status}
 
     async def _capability(self, params: dict) -> dict:
         action = params.get("action")
@@ -388,6 +593,15 @@ class RuntimeDispatcher:
         if status == "expired":
             self.store.transition(request_id, "expired", resolved_by=resolved_by)
             return
+        if rec["requestType"] == "human_action":
+            chosen = self.ha.first_answer(answers or {},
+                                          [{"label": "Done"}, {"label": "Decline"}])
+            labels = chosen if isinstance(chosen, list) else [chosen]
+            done = any(str(c).strip().lower() == "done" for c in labels if c)
+            self.store.transition(request_id,
+                                  "completed" if done else "declined",
+                                  resolved_by=resolved_by)
+            return
         if rec["requestType"] == "approval":
             chosen = self.ha.first_answer(answers or {},
                                           [{"label": "Approve"}, {"label": "Deny"}])
@@ -416,4 +630,3 @@ class RuntimeDispatcher:
             except Exception as e:  # noqa: BLE001 — resolver must never die
                 _log(f"resolver error (isolated): {e}")
             await asyncio.sleep(RESOLVER_POLL_S)
-

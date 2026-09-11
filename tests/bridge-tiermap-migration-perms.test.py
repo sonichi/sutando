@@ -45,19 +45,32 @@ for rel in ("src/discord-bridge.py", "src/slack-bridge.py", "src/telegram-bridge
     check(f"{rel}: no bare write_text feeds an os.replace into ACCESS_FILE",
           not offenders, "; ".join(offenders))
 
-# And the two migration publishers specifically route through the helper.
-for rel, marker in (("src/discord-bridge.py", "grandfathered"),
-                    ("src/slack-bridge.py", "grandfathered")):
-    src = (REPO / rel).read_text()
-    block = None
-    for m in re.finditer(r"tmp = ACCESS_FILE\.with_suffix\(.*?\n(.*?)os\.replace\(tmp, ACCESS_FILE\)",
-                         src, re.S):
-        if marker in src[m.end():m.end() + 400]:
-            block = m.group(1)
-            break
-    check(f"{rel}: tier-map migration temp is written via write_private_text",
-          block is not None and "write_private_text(tmp," in block,
-          "block not found" if block is None else block.strip()[:70])
+# Discord routes through access_store's shared locked writer; slack still
+# has its own inline tmp/os.replace. Check each publisher on its actual path.
+src = (REPO / "src/slack-bridge.py").read_text()
+block = None
+for m in re.finditer(r"tmp = ACCESS_FILE\.with_suffix\(.*?\n(.*?)os\.replace\(tmp, ACCESS_FILE\)",
+                     src, re.S):
+    if "grandfathered" in src[m.end():m.end() + 400]:
+        block = m.group(1)
+        break
+check("src/slack-bridge.py: tier-map migration temp is written via write_private_text",
+      block is not None and "write_private_text(tmp," in block,
+      "block not found" if block is None else block.strip()[:70])
+
+dsrc = (REPO / "src/discord-bridge.py").read_text()
+check("src/discord-bridge.py: tier-map migration routes through access_store.mutate_access_file",
+      "mutate_access_file(ACCESS_FILE, _mutator" in dsrc,
+      "mutate_access_file call not found in ensure_tier_map_seeded")
+
+# That shared owner must itself never promote a umask-created temp: the temp
+# has to be os.open()'d 0600 (O_CREAT|O_EXCL) directly, not write_text()+chmod.
+asrc = (REPO / "src/access_store.py").read_text()
+m = re.search(r"def _atomic_write_owner_only\(.*?\n(.*?)\ndef ", asrc, re.S)
+block = m.group(1) if m else None
+check("src/access_store.py: _atomic_write_owner_only creates the temp born owner-only (no write_text)",
+      block is not None and "os.O_CREAT" in block and "0o600" in block and ".write_text(" not in block,
+      "function not found" if block is None else block.strip()[:120])
 
 print()
 if failures:
