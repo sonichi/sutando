@@ -77,8 +77,7 @@ SENTINEL="$( . "$SB/src/watcher_sentinel.sh"; sentinel_path_for "$SB/workspace/s
 [ -n "$SENTINEL" ]; ck "sentinel path resolved in the sandbox (harness is sound)" $?
 
 # The identity record the watcher-side writer produces. A bare pid proves
-# nothing about WHICH watcher wears it, so restart.sh refuses to signal one
-# (checked at the end of this file).
+# nothing about WHICH watcher wears it — refused at the end of this file.
 stamp() {                       # stamp <pid> <code_path> [incarnation]
   printf '%s\ninstance=\nincarnation=%s\ncode_path=%s\nversion=test\nworkspace=%s\n' \
     "$1" "${3:-inc1}" "$2" "$SB/workspace" > "$SENTINEL"
@@ -135,9 +134,8 @@ alive "$INNOCENT"; ck "a sentinel pid whose argv is not a watcher is NOT killed"
 grep -q "argv: pid $INNOCENT is not a live watch-tasks-stream" <<<"$out2"; ck "and the refusal is said aloud" $?
 
 # --- the peer watcher, named by a record that is not ours --------------------
-# The peer is a genuine, live watcher running this very checkout — every check
-# an argv scan can make passes. Only its recorded identity says it is another
-# instance's, and that alone must be enough to refuse.
+# A genuine live watcher of this very checkout: every argv check passes. Only
+# the recorded identity says it is another instance's, and that must suffice.
 printf '%s\ninstance=other-worker\nincarnation=inc1\ncode_path=%s\nversion=test\nworkspace=%s\n' \
   "$PEER_PID" "$SB/peer/watch-tasks-stream.sh" "$SB/workspace" > "$SENTINEL"
 printf 'inc1\n' > "${SENTINEL%.pid}.incarnation"

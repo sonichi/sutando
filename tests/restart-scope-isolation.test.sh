@@ -102,9 +102,8 @@ note "signalled: [$(signalled)]  expected: [$CORE_PID]"
 [ -f "$W1_SENT" ] && [ -f "$W2_SENT" ]; ck "(a) both workers' sentinels are untouched" $?
 ! grep -q 'watch-tasks' "$LOG"; ck "(a) no pattern match of any kind names a watcher" $?
 
-# The control for (a): the sentinel scoping IS the guard. A restart.sh that also
-# pattern-killed watchers would show it in the same log.
-# Injected at the stop step, not appended: --stop-only exits before EOF.
+# The control for (a): a restart.sh that ALSO pattern-killed watchers shows it
+# in the same log. Injected at the stop step — --stop-only exits before EOF.
 sed 's|^_stop_own_task_watcher "|pops_pattern_kill "watch-tasks"\n&|' \
     "$SB/src/restart.sh" > "$SB/src/restart-perturbed.sh"
 grep -q '^pops_pattern_kill "watch-tasks"$' "$SB/src/restart-perturbed.sh"

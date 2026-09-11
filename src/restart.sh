@@ -173,9 +173,8 @@ _stop_own_task_watcher() {
         echo "  watcher stop: could not resolve the sentinel for instance \"${instance:-<this process>}\" — every watcher left alone"
         return "$RC_WATCHER_UNCONFIRMED"
     fi
-    # Compare the record against the key ENCODED IN THE PATH we resolved, never
-    # the raw id: util_paths derives one from the other, and the suffix is the
-    # canonical form both this scope and the watcher's own writer agree on.
+    # The key ENCODED IN THE RESOLVED PATH, never the raw id: that suffix is the
+    # canonical form this scope and the watcher's own writer both derive.
     expect_instance="$(basename "$sentinel")"
     expect_instance="${expect_instance#"$WATCHER_SENTINEL_STEM"}"
     expect_instance="${expect_instance%.pid}"
@@ -276,10 +275,9 @@ fi
 pops_pattern_kill "conversation-server"
 pops_pattern_kill "ngrok"
 
-# --- app-wide, every instance on this host shares these ----------------------
-# web-client (one listener per host), the launchd credential proxy every session
-# authenticates through, and the desktop app. A core restart must leave all of
-# them running or it takes them away from the other instances.
+# --- app-wide: every instance on this host shares these ----------------------
+# The web-client listener, the launchd proxy every session authenticates
+# through, and the desktop app. Stopping one takes it from the other instances.
 if [ "$SCOPE" = "all" ]; then
     pops_pattern_kill "web-client.ts"
     # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
@@ -357,10 +355,9 @@ if [ "$REBUILD_APP" -eq 1 ]; then
     fi
 fi
 
-# Relaunch what the app-wide stop killed. This belongs here, not in startup.sh:
-# that file is guarded headless (tests/startup-headless.test.sh) and owns no
-# desktop UI. Scope-gated with the kill: relaunching an app this scope never
-# stopped would adopt another instance's component.
+# Relaunch what the app-wide stop killed — startup.sh is guarded headless and
+# owns no desktop UI. Scope-gated WITH the kill: relaunching an app this scope
+# never stopped would adopt another instance's component.
 APP_BIN="$REPO/src/Sutando/Sutando"
 if [ "$SCOPE" != "all" ]; then
     echo "  ⊘ Sutando.app not relaunched — scope is $SCOPE and it was never stopped"

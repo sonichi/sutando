@@ -7,9 +7,8 @@
 # checks passing. Arm 3 below is that exact perturbation, and this file fails on
 # it — which is the only reason to have both.
 #
-# The sandbox now arms a CONFIRMED watcher stop (a full sentinel record plus the
-# recording process-ops fake), because the warning is only true when a watcher
-# was actually stopped; arm 4 holds the opposite case.
+# The sandbox arms a CONFIRMED stop (full sentinel record + the recording fake),
+# because the warning is only true when a watcher was stopped; arm 4 is the rest.
 #
 # Run: bash tests/restart-warns-watcher-stopped-behavior.test.sh
 set -u
@@ -20,9 +19,8 @@ fails=0
 ck() { if [ "$2" = "0" ]; then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi; }
 
 # Build an isolated copy whose restart.sh resolves REPO to the sandbox (it uses
-# `dirname "$0"/..`). Every process-touching call is routed to the fake, which
-# records instead of signalling, so kill-vs-print ORDER is observable in one
-# stream and no process on the host is touched.
+# `dirname "$0"/..`). Every process-touching call goes to the fake, so
+# kill-vs-print ORDER is observable in one stream and no host process is touched.
 build() {                       # build <sandbox> [perturbation]
   local sb="$1" perturb="${2:-none}"
   mkdir -p "$sb/src" "$sb/bin" "$sb/scripts" "$sb/workspace/state"
