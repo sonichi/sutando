@@ -266,6 +266,32 @@ it. The ordinary case resolves itself with nobody sweeping. What remains for the
 core is work belonging to a worker that will not return, which ends in a question to
 the owner, and reporting so a long-accepted delivery is visible.
 
+**Recovery policy (owner-settled).** The core's default duty toward a troubled
+worker is to bring that worker back; moving its task to another executor is the
+owner's decision, never the core's. In order:
+
+1. Every anomaly enters recovery first. The core diagnoses the cause, then takes
+   the action that fits it: a crashed session is relaunched through the launcher;
+   an exhausted five-hour quota is recovered by waiting for the window to refresh,
+   not by relaunching again and again.
+2. While recovery or waiting runs, the task keeps its owner, its context and its
+   progress. The core does not run it. A failed delivery is deferred under
+   `state/pool-route-retry/<task-id>` and re-delivered by the retry pass; the
+   core's own pending-task check treats a deferred task as held, not unprocessed.
+3. Offline, a timeout, or a recovery that failed are not, by themselves, an
+   authorisation to take the task over.
+4. When a takeover has to be considered, the core asks the owner with enough to
+   decide: why the worker is unavailable, what was tried, when recovery is expected
+   or that it is unknown, and which tasks are affected — then whether to keep
+   waiting, or which tasks the core may take over or reassign. The owner may wait
+   for the sake of continuity; without an explicit answer the task stays where it is.
+5. After the owner agrees, the handoff is explicit: results and context are kept,
+   and the original worker is told which tasks moved, so neither side runs them
+   twice.
+
+Less noise for the owner means the core carries the diagnosis and the recovery;
+a change of executor is still the owner's call.
+
 ## Supervision
 
 A periodic OS timer — five minutes, not a session cron — samples **work, not
