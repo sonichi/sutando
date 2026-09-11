@@ -13,6 +13,8 @@ POLICY test (test-inventory.md §5, Phase 0/4).
 from __future__ import annotations
 
 import json
+import tempfile
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -41,24 +43,46 @@ class RunnerGlobTest(unittest.TestCase):
             "non-recursive tests/*.test.ts would skip every relocated test",
         )
 
-    def test_py_find_is_recursive(self) -> None:
-        """`find` over a ROOT, never a flat glob. Asserted on the behaviour, not
-        the exact root list, which grew a second (optional) root for skills/."""
-        py_script = self._scripts().get("test:py", "")
-        self.assertRegex(
-            py_script, r"find [^|;]*-name '\*\.test\.py'",
-            "Python runner must use a recursive `find`, not a flat glob")
-        self.assertNotIn(
-            "tests/*.test.py", py_script,
-            "a flat glob would skip every relocated test")
+    def _discover(self, files):
+        """Run the SHIPPED helper over a synthetic tree; return what it found."""
+        with tempfile.TemporaryDirectory() as td:
+            for rel in files:
+                f = Path(td) / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("")
+            d = Path(td) / "scripts"
+            d.mkdir(exist_ok=True)
+            shutil.copy2(REPO / "scripts" / "discover-python-tests.sh",
+                         d / "discover-python-tests.sh")
+            r = subprocess.run(["bash", "scripts/discover-python-tests.sh"],
+                               cwd=td, capture_output=True, text=True)
+            return r.returncode, [ln for ln in r.stdout.splitlines() if ln]
+
+    def test_py_discovery_is_recursive(self) -> None:
+        """Discovery reaches a NESTED file. A flat glob returns only the top level.
+
+        Asserted by running the helper, not by matching `find` in package.json:
+        the text moved when discovery gained one owner, and a text match cannot
+        follow it."""
+        rc, found = self._discover(["tests/top.test.py",
+                                    "tests/deep/nested/buried.test.py"])
+        self.assertEqual(rc, 0)
+        self.assertIn("tests/deep/nested/buried.test.py", found,
+                      "a nested test was not discovered — discovery is not recursive")
 
     def test_py_discovery_includes_the_skills_root(self) -> None:
-        """A skill owns its own tests/ dir, so discovery must reach skills/ —
-        otherwise a suite that moves into a skill silently stops running."""
-        py_script = self._scripts().get("test:py", "")
-        self.assertIn(
-            "skills", py_script,
-            "test:py must discover skills/**/*.test.py, not just tests/")
+        """A skill owns its own tests/ dir, so discovery must REACH skills/.
+
+        The previous form asserted "skills" appeared in the runner text, which it
+        does inside the zero-discovery refusal message — so the assertion passed
+        with the skills root removed from the helper entirely."""
+        rc, found = self._discover(["tests/a.test.py",
+                                    "skills/demo/tests/b.test.py"])
+        self.assertEqual(rc, 0)
+        self.assertIn("skills/demo/tests/b.test.py", found,
+                      "discovery never reached skills/ — a suite moved into a "
+                      "skill would silently stop running")
+
 
     def test_recursive_find_discovers_a_skill_owned_test(self) -> None:
         out = subprocess.run(
