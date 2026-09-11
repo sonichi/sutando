@@ -9,7 +9,9 @@ owner; these pins stop a runner re-growing its own copy, which is what made the
 drift invisible before.
 """
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,11 +27,20 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
         self.assertTrue(DISCOVER.is_file(), f"{DISCOVER} missing")
         self.assertTrue(DISCOVER.stat().st_mode & 0o111, f"{DISCOVER} is not executable")
 
-    def test_every_runner_invokes_the_helper(self):
+    def test_every_runner_ACTIVELY_invokes_the_helper(self):
+        """A substring assertion passes on a COMMENT naming the helper while the
+        runner writes an empty file list and exits green — measured, not feared."""
         for r in RUNNERS:
-            self.assertIn(DISCOVER.name, r.read_text(),
-                          f"{r.name} does not call {DISCOVER.name} — it is discovering "
-                          "tests some other way, and the guard cannot see how")
+            active = [ln for ln in r.read_text().splitlines()
+                      if DISCOVER.name in ln and not ln.lstrip().startswith("#")
+                      and not re.match(r"^[^#]*#[^#]*" + re.escape(DISCOVER.name), ln)]
+            self.assertTrue(active,
+                            f"{r.name} names {DISCOVER.name} only in a comment (or not at all) — "
+                            "a named-but-uncalled helper leaves the runner discovering nothing")
+            self.assertTrue(any(re.search(r"(^|[|;&(]\s*)(bash|sh)?\s*[^#]*" + re.escape(DISCOVER.name)
+                                          + r"[^#]*>", ln) for ln in active),
+                            f"{r.name} mentions {DISCOVER.name} outside a comment but never "
+                            f"executes it into an output: {active}")
 
     def test_no_runner_reimplements_discovery(self):
         for r in RUNNERS:
@@ -47,6 +58,29 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
         if (REPO / "skills").is_dir():
             self.assertTrue(any(p.startswith("skills/") for p in paths),
                             "skills/ exists but the helper reached none of it")
+
+    def test_a_commented_out_call_does_not_satisfy_delegation(self):
+        """keweichen's mutation, committed: the runner names the helper in a
+        comment and writes an empty list. CI then runs zero tests and exits
+        green, so this must be indistinguishable from no delegation at all."""
+        mutated = ': > "$RECDIR/files"  # ' + DISCOVER.name
+        active = [ln for ln in [mutated]
+                  if DISCOVER.name in ln and not ln.lstrip().startswith("#")
+                  and not re.match(r"^[^#]*#[^#]*" + re.escape(DISCOVER.name), ln)]
+        self.assertEqual(active, [],
+                         "a commented-out call is being counted as an active one")
+
+    def test_the_helper_refuses_to_emit_an_empty_list(self):
+        """Zero discovered tests must fail closed AT the helper. A consumer handed
+        an empty list runs nothing, records failed=0 and exits green — and because
+        this suite is itself discovered by the helper, it would not run to notice."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "tests").mkdir()
+            shutil.copy(DISCOVER, Path(td) / DISCOVER.name)
+            r = subprocess.run(["bash", DISCOVER.name], cwd=td, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0,
+                            "helper exited 0 with no tests discovered — silently green")
+        self.assertEqual(r.stdout.strip(), "", "helper emitted a list while refusing")
 
     def test_the_helper_is_order_and_comment_proof_by_construction(self):
         """The property the parser could never hold: there is nothing to parse."""

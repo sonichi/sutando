@@ -13,4 +13,14 @@ set -euo pipefail
 roots=(tests)
 [ -d skills ] && roots+=(skills)
 
-find "${roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort
+out=$(find "${roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort)
+
+# Zero discovered tests is a broken checkout or a broken root list, never a
+# legitimate "nothing to run" -- a consumer handed an empty list exits green.
+if [ -z "$out" ]; then
+  echo "discover-python-tests: found NO test files under ${roots[*]} -- refusing to" >&2
+  echo "  hand a consumer an empty list; a runner given zero tests exits green." >&2
+  exit 3
+fi
+
+printf '%s\n' "$out"
