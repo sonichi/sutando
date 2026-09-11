@@ -128,9 +128,23 @@ def main() -> None:
                          "dialog: user + assistant text; "
                          "all: dialog + tool-call names + system lines")
     ap.add_argument("--max-chars", type=int, default=200_000)
+    ap.add_argument("--tail-bytes", type=int, default=0,
+                    help="read only the LAST N bytes of the transcript "
+                         "(0 = whole file). Bounds dump I/O on multi-GB-class "
+                         "transcripts; the boot recap uses 8388608 (8 MiB) so "
+                         "boot cost stops scaling with session length. The "
+                         "tail keeps the RECENT end — which is what a catchup "
+                         "needs (open loops live at the end, not the start).")
+    ap.add_argument("--transcripts-dir", default=None,
+                    help="read transcripts from this directory instead of the "
+                         "resolved workspace project dir. Hook for hermetic "
+                         "tests and worktree A/B runs — the supported "
+                         "override surface (no env var).")
     args = ap.parse_args()
 
-    sessions = sorted(transcripts_dir().glob("*.jsonl"),
+    tdir = (Path(args.transcripts_dir) if args.transcripts_dir
+            else transcripts_dir())
+    sessions = sorted(tdir.glob("*.jsonl"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     if not sessions:
         sys.exit("no transcripts found")
@@ -145,6 +159,22 @@ def main() -> None:
     out: list = []
     total = 0
     with open(path, errors="replace") as f:
+        if args.tail_bytes:
+            size = path.stat().st_size
+            if size > args.tail_bytes:
+                pos = size - args.tail_bytes
+                f.seek(pos)
+                # Discard the partial line the seek landed in — but only if
+                # it IS partial. When pos lands exactly on a record boundary
+                # (the previous byte is a newline), an unconditional
+                # readline() would silently drop one COMPLETE record.
+                with open(path, "rb") as bf:
+                    bf.seek(pos - 1)
+                    if bf.read(1) != b"\n":
+                        f.readline()
+                out.append(f"...[tail: last {args.tail_bytes} bytes of "
+                           f"{size} — re-run with --tail-bytes 0 for the "
+                           "full session]")
         for line in f:
             try:
                 d = json.loads(line)
