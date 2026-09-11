@@ -108,6 +108,7 @@ def main(argv=None) -> int:
     code, _targets = classify(ws, task)
     if args.probe:
         return code
+    _log(ws, f"{task.get('id')}: run classify={code} targets={_targets}")
     if code == DECLINE:
         return DECLINE
 
@@ -125,8 +126,35 @@ def main(argv=None) -> int:
         # caller cannot turn an unknown name into a delivery.
         print(json.dumps(out), file=sys.stderr)
         return DECLINE
+    _log(ws, f"{task.get('id')}: delivered={out.get('delivered')} "
+             f"already={out.get('already')} skipped={out.get('skipped')} -> 0")
     return 0
 
 
+def _workspace_arg(argv) -> "str | None":
+    args = list(sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(args):
+        if a == "--workspace" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--workspace="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def run(argv=None) -> int:
+    """Every exit of the real run leaves a log line: the watcher keeps only
+    the code, and a silent non-zero exit cannot be diagnosed afterwards."""
+    try:
+        rc = main(argv)
+    except SystemExit:
+        raise
+    except BaseException:
+        _log(_workspace_arg(argv), "unhandled:\n" + traceback.format_exc())
+        raise
+    if rc != 0 and "--probe" not in (sys.argv[1:] if argv is None else argv):
+        _log(_workspace_arg(argv), f"run exited {rc}")
+    return rc
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())
