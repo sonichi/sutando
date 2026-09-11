@@ -3,7 +3,7 @@
 // sign-in's auth cookies are the newest thing in that jar, so they are what is lost.
 //
 // Run: node tests/x-profile-lock-wait.test.mjs
-import { waitForProfileExit } from '../skills/x-twitter/profile-lock-wait.mjs';
+import { waitForProfileExit, DEFAULT_GRACE_MS } from '../skills/x-twitter/profile-lock-wait.mjs';
 
 let fails = 0;
 const ck = (name, cond) => { console.log((cond ? '  ok   ' : '  FAIL ') + name); if (!cond) fails++; };
@@ -66,7 +66,10 @@ function holder(afterMs, c, known = true) {
   let threw = null;
   try { waitForProfileExit(counting, Number('abc'), c.sleep, c.now); } catch (e) { threw = e; }
   ck('a NaN grace terminates instead of spinning', threw === null);
-  ck('and it does not silently wait forever', iters <= 2);
+  // `iters <= 2` used to stand here. It passed only because NaN collapsed to a 0
+  // grace and exited on the first check — it pinned the defect's side effect, not
+  // termination. The bound is now grace/sleep (10000/250 = 40) plus slack.
+  ck('and it terminates within the grace, not after it', iters > 0 && iters <= 50);
 }
 // 7. exitedCleanly and remaining DISAGREE under an unknown probe — that disagreement
 //    is the flag's whole purpose, so anything recomputing it from `remaining` is wrong.
@@ -77,6 +80,28 @@ function holder(afterMs, c, known = true) {
   ck('unknown probe: exitedCleanly is FALSE despite that', r.exitedCleanly === false);
   ck('so remaining.length===0 is NOT a substitute for exitedCleanly',
      (r.remaining.length === 0) !== r.exitedCleanly);
+}
+
+// 8. A non-finite grace must fall back to the DEFAULT, not to 0. Falling back to 0
+//    makes the first deadline check true, so holders are SIGKILLed with no flush —
+//    the un-flushed kill this whole module exists to prevent, restored silently.
+{
+  const stuck = () => ({ known: true, pids: ['4242'] });
+  const sane = (() => { const c = clock(); return waitForProfileExit(stuck, 10000, c.sleep, c.now); })();
+  const nan  = (() => { const c = clock(); return waitForProfileExit(stuck, Number('abc'), c.sleep, c.now); })();
+  const neg  = (() => { const c = clock(); return waitForProfileExit(stuck, -5, c.sleep, c.now); })();
+  ck('a NaN grace waits the DEFAULT, not zero', nan.waitedMs === DEFAULT_GRACE_MS);
+  ck('a negative grace waits the DEFAULT too', neg.waitedMs === DEFAULT_GRACE_MS);
+  ck('garbage is indistinguishable from a sane default, not from 0',
+     nan.waitedMs === sane.waitedMs);
+}
+// 9. An EXPLICIT 0 is a real choice and must survive. It is the one input that
+//    should kill immediately, and conflating it with garbage loses that.
+{
+  const c = clock();
+  const r = waitForProfileExit(() => ({ known: true, pids: ['7'] }), 0, c.sleep, c.now);
+  ck('an explicit 0 still means kill immediately', r.waitedMs === 0);
+  ck('so 0 and garbage are NOT the same output', r.waitedMs !== DEFAULT_GRACE_MS);
 }
 
 console.log(fails === 0 ? '\nall ok' : `\n${fails} FAILED`);
