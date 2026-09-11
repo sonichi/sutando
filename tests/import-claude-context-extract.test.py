@@ -181,6 +181,16 @@ class TestCleaningAndRedaction(Base):
 
 
 class TestStateAndSelection(Base):
+    def test_status_carries_the_run_the_index_minted(self):
+        """index.py --task-id mints the run; extract's status.json carries the same ids
+        without being told (they ride in state.json)."""
+        run = self.m.index_mod.index(self.root, out_dir=self.out, task_id="task-claude-import-1")["run"]
+        self.m.extract(self.root, out_dir=self.out)
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["phase"], status["task_id"], status["run_id"]),
+                         ("extracted", "task-claude-import-1", run["run_id"]))
+        self.assertEqual(json.loads((self.out / "state.json").read_text())["run"], run)
+
     def test_new_skips_unchanged_and_picks_up_a_touched_file(self):
         c = self.m.extract(self.root, out_dir=self.out)
         self.assertEqual((c["extracted"], c["skipped_unchanged"], c["skipped_empty"]), (2, 0, 2))

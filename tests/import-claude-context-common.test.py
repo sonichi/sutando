@@ -92,6 +92,42 @@ class TestCommon(unittest.TestCase):
             self.m.write_status(self.tmp, "indexed", title="Widget build")
         self.assertEqual(json.loads((self.tmp / "status.json").read_text())["phase"], "indexed")
 
+    def test_status_carries_the_run_identity_from_state(self):
+        """#4177 review: status.json names WHOSE run it reports. Without a `run` in
+        state.json both ids are null (a legacy state, or index.py run without --task-id);
+        with one, every write_status call carries them without being told."""
+        s = self.m.write_status(self.tmp, "indexed", sessions=1)
+        self.assertEqual((s["task_id"], s["run_id"]), (None, None))
+        self.assertEqual(self.m.run_identity(self.tmp), {"task_id": None, "run_id": None})
+        st = self.m.load_state(self.tmp)
+        st[self.m.RUN_KEY] = {"task_id": "task-claude-import-1789133620883", "run_id": "r-1",
+                              "started_at": "2026-09-11T13:33:41Z"}
+        self.m.save_state(self.tmp, st)
+        s = self.m.write_status(self.tmp, "extracted", extracted=2)
+        on_disk = json.loads((self.tmp / "status.json").read_text())
+        self.assertEqual((on_disk["task_id"], on_disk["run_id"], on_disk["phase"], on_disk["extracted"]),
+                         ("task-claude-import-1789133620883", "r-1", "extracted", 2))
+        self.assertEqual(s, on_disk)
+        # a keyword of the same name overrides the stored identity; None is allowed
+        s = self.m.write_status(self.tmp, "done", task_id="task-other", run_id=None)
+        self.assertEqual((s["task_id"], s["run_id"]), ("task-other", None))
+        # a malformed `run` (not a dict, or non-string ids) reads as no identity
+        for bad in ("r-1", ["a"], {"task_id": 5, "run_id": ""}):
+            st[self.m.RUN_KEY] = bad
+            self.m.save_state(self.tmp, st)
+            self.assertEqual(self.m.run_identity(self.tmp), {"task_id": None, "run_id": None}, bad)
+
+    def test_status_ids_are_the_only_strings_allowed(self):
+        """The counts-only guard stands: the two id keys take a string or None, every
+        other string (a title, a path) is still refused, and a non-string id is refused."""
+        for kw in ({"title": "Widget build"}, {"path": "/Users/o/x"}, {"task_id": 7},
+                   {"run_id": ["r"]}, {"phase_note": "x"}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                self.m.write_status(self.tmp, "indexed", **kw)
+        self.assertFalse((self.tmp / "status.json").exists())
+        s = self.m.write_status(self.tmp, "indexed", task_id="task-1", run_id="r-1", sessions=1)
+        self.assertEqual(set(s), {"phase", "updated_at", "task_id", "run_id", "sessions"})
+
     def test_parse_since(self):
         self.assertIsNone(self.m.parse_since(None))
         self.assertIsNone(self.m.parse_since(""))

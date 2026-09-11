@@ -36,6 +36,15 @@ Modes:
                  the last index run (the `new` count is always reported)
   --json         print the counts as JSON — counts only, never titles, prompts
                  or paths (the onboarding card reads this)
+  --task-id ID   the task this run answers (the task header `id:`; for a
+                 message-triggered run the owner message's task id). A full
+                 pass is a RUN START: it mints a `run_id` (uuid4) and stores
+                 `run: {task_id, run_id, started_at}` in state.json, which
+                 every status.json write (here and in extract / progress /
+                 finalize) carries, so the orphan check can tell whose run a
+                 status is. Omitted → `task_id: null` (the orphan check then
+                 keeps the task rather than archiving it); run_id is minted
+                 regardless.
 
 Counts: `sessions` is every non-sidechain transcript; `empty` the ones with no
 assistant message at all (aborted / never-answered — extract.py skips them,
@@ -51,6 +60,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -377,14 +387,22 @@ COUNT_KEYS = (
 )
 
 
+def new_run(task_id=None) -> dict:
+    """The identity of a run that starts now: the initiating task (None when
+    the caller did not say) and a fresh uuid4 run id."""
+    return {"task_id": task_id or None, "run_id": str(uuid.uuid4()), "started_at": now_iso()}
+
+
 def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False,
-          since=None, new_only=False) -> dict:
+          since=None, new_only=False, task_id=None) -> dict:
     """Index the transcripts under `root` (default: stock ~/.claude/projects).
 
     Returns a dict with the counts (see COUNT_KEYS), `session_keys` (the
-    sessions listed — only the changed ones with new_only) and, for a full
-    pass, the full `index` structure that was (or, with dry_run, would be)
-    written to `<out_dir>/index.json`.
+    sessions listed — only the changed ones with new_only), `run` (the
+    identity minted for this run — `task_id` / `run_id` / `started_at`; None
+    for the two read-only modes, which start no run) and, for a full pass,
+    the full `index` structure that was (or, with dry_run, would be) written
+    to `<out_dir>/index.json`.
     """
     root = Path(root) if root else default_root()
     out_dir = Path(out_dir)
@@ -414,11 +432,15 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
             "counts_only": True, "dry_run": True,
             "session_keys": [session_key(slug, p.stem) for slug, e in listing.items()
                              for p, _st in e["sessions"]],
+            "run": None,   # a stat pass starts no run
         }
         return result
 
     state = _common.load_state(out_dir) if not counts_only else {"sessions": {}}
     known = state["sessions"]
+    # A full pass is a run start: mint the identity now, store it with the
+    # state below so every later status.json write carries it.
+    run = new_run(task_id) if not dry_run else None
     scanned = {}
     new_keys = []
     all_keys = []
@@ -486,6 +508,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
             for s in p["sessions"]:
                 rec = known.setdefault(session_key(s["slug"], s["uuid"]), {})
                 rec.update({"mtime_ns": s["mtime_ns"], "size": s["size"], "indexed_at": stamp})
+        state[_common.RUN_KEY] = run
         _common.save_state(out_dir, state)
         write_status(out_dir, "indexed", sessions=counts["sessions"], projects=counts["projects"],
                      conversations=counts["conversations"], empty=counts["empty"],
@@ -496,6 +519,7 @@ def index(root=None, *, out_dir, projects=None, dry_run=False, counts_only=False
     result["session_keys"] = new_keys if new_only else all_keys
     result["new_session_keys"] = new_keys
     result["index"] = index_doc
+    result["run"] = run
     return result
 
 
@@ -524,11 +548,14 @@ def main(argv=None) -> int:
     ap.add_argument("--counts-only", action="store_true", help="readdir+stat only; opens no transcript")
     ap.add_argument("--new", action="store_true", help="list only sessions changed since the last index")
     ap.add_argument("--json", action="store_true", help="print counts as JSON (counts only)")
+    ap.add_argument("--task-id", default=None,
+                    help="the task this run answers (task header `id:`); stored with the minted run id "
+                         "in state.json and every status.json so the orphan check can match them")
     a = ap.parse_args(_common.absorb_dash_values(argv, ("--projects",)))
 
     out_dir = _common.data_dir(a.workspace, a.out_dir)
     r = index(a.root, out_dir=out_dir, projects=split_csv(a.projects), dry_run=a.dry_run,
-              counts_only=a.counts_only, since=a.since, new_only=a.new)
+              counts_only=a.counts_only, since=a.since, new_only=a.new, task_id=a.task_id)
     if a.json:
         print(json.dumps({k: r.get(k) for k in COUNT_KEYS}, sort_keys=True))
     else:

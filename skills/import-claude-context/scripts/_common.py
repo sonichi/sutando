@@ -2,8 +2,8 @@
 """Shared plumbing for the import-claude-context scripts.
 
 Deliberately small: the data-dir resolution, the two JSON side files
-(`state.json` per session, `status.json` counts only) and a few helpers every
-script needs. No transcript parsing lives here — that is index.py (LLM-free
+(`state.json` per session plus the run identity, `status.json` counts and the
+run identity only) and a few helpers every script needs. No transcript parsing lives here — that is index.py (LLM-free
 metadata) and session-recap's extract.py (the dialog stream).
 """
 from __future__ import annotations
@@ -149,12 +149,39 @@ def save_state(out_dir: Path, state: dict) -> None:
     write_json(out_dir / STATE_FILE, state)
 
 
+# state.json `run` = the identity index.py mints at run start; every status.json
+# carries it so the orphan check can tell WHOSE run a status is (#4177 review).
+RUN_KEY = "run"
+RUN_ID_KEYS = ("task_id", "run_id")
+
+
+def run_identity(out_dir: Path) -> dict:
+    """`{"task_id", "run_id"}` of the run recorded in state.json (`run`), each
+    None when unset — a legacy state file, or a run started without one."""
+    run = load_json(out_dir / STATE_FILE, {}).get(RUN_KEY)
+    run = run if isinstance(run, dict) else {}
+    out = {}
+    for k in RUN_ID_KEYS:
+        v = run.get(k)
+        out[k] = v if isinstance(v, str) and v else None
+    return out
+
+
 def write_status(out_dir: Path, phase: str, **counts) -> dict:
-    """status.json carries the phase and COUNTS only — never titles, paths or text."""
+    """status.json carries the phase, the run identity (`task_id`, `run_id` —
+    read from state.json's `run`, so every writer carries them without being
+    told; a keyword of the same name overrides) and COUNTS only — never
+    titles, paths or text. The two id keys are the only strings allowed."""
+    ids = {k: counts.pop(k) for k in RUN_ID_KEYS if k in counts}
+    for k, v in ids.items():
+        if v is not None and not isinstance(v, str):
+            raise ValueError(f"status.json {k} must be a string or None; got {v!r}")
     for k, v in counts.items():
         if not isinstance(v, (int, bool)) and v is not None:
             raise ValueError(f"status.json takes counts only; {k}={v!r}")
     status = {"phase": phase, "updated_at": now_iso()}
+    status.update(run_identity(out_dir))
+    status.update(ids)
     status.update(counts)
     write_json(out_dir / STATUS_FILE, status)
     return status

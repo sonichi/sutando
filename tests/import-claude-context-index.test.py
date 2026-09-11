@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -193,10 +194,40 @@ class TestFullPass(Base):
         status = json.loads((self.out / "status.json").read_text())
         self.assertEqual(status["phase"], "indexed")
         self.assertEqual(status["sessions"], 2)
-        self.assertEqual(set(status) - {"phase", "updated_at"},
+        self.assertEqual(set(status) - {"phase", "updated_at", "task_id", "run_id"},
                          {"sessions", "projects", "conversations", "empty", "new", "sidechains",
                           "subagent_files"})
         self.assertEqual((status["conversations"], status["empty"]), (2, 0))
+
+    def test_full_pass_mints_a_run_bound_to_the_task(self):
+        """#4177 review: a full pass is a run start. `--task-id` (the task header `id:`)
+        and a fresh uuid4 land in state.json `run` and in status.json, so the orphan check
+        can tell this task's run from an older one ending after it was queued."""
+        task = "task-claude-import-1789133620883"
+        res = self.m.index(self.root, out_dir=self.out, task_id=task)
+        run = res["run"]
+        self.assertEqual(run["task_id"], task)
+        self.assertEqual(str(uuid.UUID(run["run_id"])), run["run_id"])
+        self.assertEqual(uuid.UUID(run["run_id"]).version, 4)
+        self.assertRegex(run["started_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        state = json.loads((self.out / "state.json").read_text())
+        self.assertEqual(state["run"], run)
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["task_id"], status["run_id"]), (task, run["run_id"]))
+        # a second full pass is a new run: fresh id, and the task id it was given (or none)
+        again = self.m.index(self.root, out_dir=self.out)
+        self.assertIsNone(again["run"]["task_id"])
+        self.assertNotEqual(again["run"]["run_id"], run["run_id"])
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((status["task_id"], status["run_id"]), (None, again["run"]["run_id"]))
+        self.assertEqual(json.loads((self.out / "state.json").read_text())["run"], again["run"])
+        # an empty task id reads as none
+        self.assertIsNone(self.m.new_run("")["task_id"])
+
+    def test_read_only_modes_start_no_run(self):
+        self.assertIsNone(self.m.index(self.root, out_dir=self.out, dry_run=True, task_id="task-1")["run"])
+        self.assertIsNone(self.m.index(self.root, out_dir=self.out, counts_only=True, task_id="task-1")["run"])
+        self.assertFalse(self.out.exists())
 
     def test_empty_sessions_are_counted_and_left_out_of_conversations(self):
         # an aborted session: the owner typed, nothing ever answered (assistant_msgs 0)
@@ -330,6 +361,15 @@ class TestCli(Base):
         for leak in ("Widget build", "Beta launch", "Build the widget", str(self.root), SLUG_A, CWD_A):
             self.assertNotIn(leak, out)
         self.assertFalse(self.out.exists())
+
+    def test_task_id_flag_binds_the_run(self):
+        rc, out = self._run(["--root", str(self.root), "--out-dir", str(self.out), "--json",
+                             "--task-id", "task-claude-import-1789133620883"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(set(json.loads(out)), set(self.m.COUNT_KEYS))   # ids are not counts
+        status = json.loads((self.out / "status.json").read_text())
+        self.assertEqual(status["task_id"], "task-claude-import-1789133620883")
+        self.assertEqual(status["run_id"], json.loads((self.out / "state.json").read_text())["run"]["run_id"])
 
     def test_projects_flag_takes_a_dash_leading_slug(self):
         rc, out = self._run(["--root", str(self.root), "--out-dir", str(self.out), "--dry-run",
