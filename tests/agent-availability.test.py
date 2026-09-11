@@ -349,5 +349,58 @@ class WedgeFoldIsTotal(unittest.TestCase):
         self.assertEqual(set(av._WEDGE_KIND_TO_SIGNAL.values()) - {"working", "idle", "wedged", "unknown"}, set())
 
 
+class SessionBoundaryReadsTheWriterSPath(unittest.TestCase):
+    """Reported by qingyun-wu on #3875 at b93e92e6.
+
+    The sentinel writer names its file per instance; this reader held the
+    historic literal. A restarted idle core then read session_start=None and
+    scored a previous session's RUNNING snapshot as current work -- reported
+    busy_unavailable until that snapshot's freshness expired. Their fix
+    prescription was explicit that selecting the newest peer sentinel is NOT
+    the remedy, so this pins the reader to the writer's OWN path.
+    """
+
+    def _ws(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "state").mkdir()
+        return d
+
+    def test_the_reader_finds_what_the_writer_wrote(self):
+        from util_paths import watcher_sentinel_path
+        ws = self._ws()
+        written = watcher_sentinel_path(ws / "state")
+        written.write_text("4242\n")
+        os.utime(written, (995.0, 995.0))
+        self.assertEqual(av._session_started_at(ws), 995.0,
+            "the reader did not see the file the writer names")
+
+    def test_no_historic_literal_survives_in_the_reader(self):
+        src = (Path(__file__).resolve().parents[1] / "src" / "agent_availability.py").read_text()
+        self.assertNotIn('"watch-tasks-stream.pid"', src,
+            "a hardcoded sentinel name here is the defect: the writer scopes it per instance")
+        self.assertIn("watcher_sentinel_path", src,
+            "the reader must route through the same path owner as the writer")
+
+    def test_a_foreign_instances_sentinel_is_not_adopted(self):
+        # The forbidden fix (newest peer sentinel) would pass the first test and
+        # fail this one: a sibling's file must not become this session's start.
+        from util_paths import watcher_sentinel_path
+        ws = self._ws()
+        foreign = ws / "state" / "watch-tasks-stream-someone-else+worker-9.pid"
+        foreign.write_text("999\n")
+        os.utime(foreign, (995.0, 995.0))
+        mine = watcher_sentinel_path(ws / "state")
+        if mine.exists():
+            self.skipTest("this environment resolves to the same path; nothing foreign to test")
+        self.assertIsNone(av._session_started_at(ws),
+            "a peer's sentinel was adopted as this session's boundary")
+
+    def test_absent_sentinel_reads_as_unknown_not_zero(self):
+        ws = self._ws()
+        self.assertIsNone(av._session_started_at(ws),
+            "no sentinel must be None (unknown), never a falsy timestamp")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

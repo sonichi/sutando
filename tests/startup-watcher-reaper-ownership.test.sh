@@ -124,11 +124,54 @@ else
 fi
 fi  # have_fn
 
-# --- wiring: startup.sh must delegate, not re-implement ------------------------
-if grep -q 'reap_stale_task_watcher "\$WORKSPACE/state/watch-tasks-stream.pid"' "$REPO/src/startup.sh"; then
-  ok "startup.sh delegates to the shared reaper"
+# --- wiring: startup.sh must delegate, and reap only THIS instance -------------
+# This used to assert `sentinel_paths_in` — the enumeration of EVERY instance's
+# sentinel. The reaper deliberately kills a watcher that owns its sentinel, so
+# that loop killed a peer's live watcher and removed its record.
+if grep -q 'reap_stale_task_watcher "\$__sentinel"' "$REPO/src/startup.sh" \
+   && grep -q 'sentinel_path_for "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
+  ok "startup.sh delegates to the shared reaper for its OWN sentinel"
 else
   bad "startup.sh delegates to the shared reaper" "call site not found"
+fi
+if grep -q 'sentinel_paths_in "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
+  bad "startup.sh reaps only its own identity" "it still enumerates every instance's sentinel"
+else
+  ok "startup.sh reaps only its own identity"
+fi
+
+# --- peer survival: the property the enumeration assertion could not express ---
+# LIMIT, measured: this case calls sentinel_path_for + the reaper DIRECTLY, so it
+# proves the scoped shape is safe -- it does NOT re-fail if startup.sh regresses
+# to the enumeration. The two greps above are what pin the wiring; restoring the
+# loop failed exactly those two while this case still reported ok.
+if [ -n "${have_fn:-}" ] && command -v sentinel_path_for >/dev/null 2>&1; then
+  _pt="$(mktemp -d)"; mkdir -p "$_pt/state" "$_pt/src"
+  printf '#!/bin/bash\nsleep 60\n' > "$_pt/src/watch-tasks-stream.sh"; chmod +x "$_pt/src/watch-tasks-stream.sh"
+  bash "$_pt/src/watch-tasks-stream.sh" & _a=$!
+  bash "$_pt/src/watch-tasks-stream.sh" & _b=$!
+  sleep 2
+  echo "$_a" > "$_pt/state/watch-tasks-stream.pid"
+  echo "$_b" > "$_pt/state/watch-tasks-stream-peer-b+w2.pid"
+  if kill -0 "$_a" 2>/dev/null && kill -0 "$_b" 2>/dev/null; then
+    if _s="$(sentinel_path_for "$_pt/state")" && [ -n "$_s" ]; then
+      reap_stale_task_watcher "$_s" >/dev/null 2>&1
+    fi
+    sleep 1
+    if kill -0 "$_b" 2>/dev/null && [ -f "$_pt/state/watch-tasks-stream-peer-b+w2.pid" ]; then
+      ok "a peer instance's live watcher and sentinel both survive this startup"
+    else
+      bad "a peer instance survives this startup" "the peer was killed or its sentinel removed"
+    fi
+    if kill -0 "$_a" 2>/dev/null; then
+      bad "this instance's own stale watcher is still reaped" "it survived, so the reap did nothing"
+    else
+      ok "this instance's own stale watcher is still reaped"
+    fi
+  else
+    bad "peer-survival fixture" "a fixture watcher was not alive; the case measured nothing"
+  fi
+  kill "$_a" "$_b" 2>/dev/null; rm -rf "$_pt"
 fi
 if grep -q 'rm -f "\$WATCHER_PID_FILE"' "$REPO/src/startup.sh"; then
   bad "startup.sh keeps no unguarded copy" "the inline rm -f is still there"
