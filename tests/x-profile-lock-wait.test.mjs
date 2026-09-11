@@ -93,10 +93,20 @@ function holder(afterMs, c, known = true) {
   ck('a NaN grace waits the DEFAULT, not zero', nan.waitedMs === DEFAULT_GRACE_MS);
   // `10s` is the realistic typo for a *_MS var — `abc` is not what anyone writes.
   // `Infinity` is non-finite the other way and must fall back too, or it hangs.
-  for (const raw of ['10s', 'Infinity']) {
+  for (const raw of ['10s', 'Infinity', '1e999']) {
     const c2 = clock();
-    const r2 = waitForProfileExit(stuck, Number(raw), c2.sleep, c2.now);
-    ck(`X_PROFILE_GRACE_MS=${raw} falls back to the DEFAULT`, r2.waitedMs === DEFAULT_GRACE_MS);
+    // Bounded probe, not `stuck`: with the isFinite half removed, an Infinity
+    // grace spins forever and a bare arm HANGS CI instead of failing it.
+    let n = 0;
+    const bounded = () => {
+      if (++n > 1000) throw new Error(`did not terminate for ${raw}`);
+      return { known: true, pids: ['4242'] };
+    };
+    let caught = null, r2 = null;
+    try { r2 = waitForProfileExit(bounded, Number(raw), c2.sleep, c2.now); } catch (e) { caught = e; }
+    ck(`X_PROFILE_GRACE_MS=${raw} terminates`, caught === null);
+    ck(`X_PROFILE_GRACE_MS=${raw} falls back to the DEFAULT`,
+       r2 !== null && r2.waitedMs === DEFAULT_GRACE_MS);
   }
   ck('a negative grace waits the DEFAULT too', neg.waitedMs === DEFAULT_GRACE_MS);
   ck('garbage is indistinguishable from a sane default, not from 0',
