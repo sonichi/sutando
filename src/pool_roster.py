@@ -132,7 +132,7 @@ def unknown_targets(roster: dict, targets) -> list:
     return [t for t in targets if t not in known]
 
 
-def compile_roster(workspace, workers: dict, bindings=None, version=None,
+def compile_roster(workspace, workers: dict, bindings=None,
                    allow_unbind=None, expect_version=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended.
@@ -146,7 +146,9 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None,
 
     A caller decides what to pass from a roster it read BEFORE calling; it names
     that version as `expect_version` and is refused if the roster moved since,
-    instead of overwriting the writer that moved it.
+    instead of overwriting the writer that moved it. That check is only as
+    good as the token, so the writer alone allocates it: every publication
+    advances the version, and no caller can publish under a reused one.
     """
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
     for wid, row in (workers or {}).items():
@@ -187,7 +189,7 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None,
                 f"compile would drop {len(dropped)} binding(s) {dropped} — those sources "
                 "would silently re-aim at the core; name them in allow_unbind to release them")
 
-        roster = {"version": version if version is not None else current + 1,
+        roster = {"version": current + 1,
                   "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "workers": dict(workers or {}), "bindings": bindings}
         _write_atomic(roster_path(workspace), roster)

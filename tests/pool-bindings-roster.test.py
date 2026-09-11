@@ -386,6 +386,44 @@ class TestConcurrentCompiles(Base):
                                 expect_version=read["version"])
         self.assertEqual(got["version"], read["version"] + 1)
 
+    def test_a_publication_cannot_keep_the_version_a_stale_compile_will_cite(self):
+        """kewei's repro on this PR: an intervening publication that reused
+        version 1 let a compile citing expect_version=1 erase it. Only the
+        writer allocates the token now, so no publication leaves it in place."""
+        read = pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1})
+        with self.assertRaises(TypeError):
+            pr.compile_roster(self.ws, live(W1, W2), {"!base:ag2.space": W2},
+                              version=read["version"])
+        between = pr.compile_roster(self.ws, live(W1, W2), {"!base:ag2.space": W2})
+        self.assertEqual(between["version"], read["version"] + 1)
+        with self.assertRaises(pr.RosterError) as e:
+            pr.compile_roster(self.ws, live(W1), {"!base:ag2.space": W1},
+                              expect_version=read["version"])
+        self.assertIn("version", str(e.exception))
+        kept = pr.load_roster(self.ws)
+        self.assertEqual(kept["version"], between["version"])
+        self.assertEqual(pr.targets_for(kept, "!base:ag2.space"), [W2])
+        self.assertEqual(sorted(kept["workers"]), sorted([W1, W2]))
+
+    def test_every_publication_advances_the_version_strictly(self):
+        """Whatever shape a compile takes, the stored version moves past the
+        one it read; two publications never share a token."""
+        seen = []
+        for i in range(8):
+            before = (pr.load_roster(self.ws) or {}).get("version", 0)
+            if i % 3 == 0:
+                got = pr.compile_roster(self.ws, live(W1, W2), {"!base:ag2.space": W1})
+            elif i % 3 == 1:
+                got = pr.compile_roster(self.ws, live(W1, W2), {"!base:ag2.space": W2},
+                                        expect_version=before)
+            else:
+                got = pr.compile_roster(self.ws, live(W1, W2), {},
+                                        allow_unbind=["!base:ag2.space"])
+            self.assertGreater(got["version"], before)
+            self.assertEqual(pr.load_roster(self.ws)["version"], got["version"])
+            seen.append(got["version"])
+        self.assertEqual(seen, list(range(1, 9)))
+
     def test_the_lock_sidecar_is_not_a_roster_record(self):
         """The guard lives beside the record it guards, so it must not read as
         one to anything listing state, and must survive the publication."""
