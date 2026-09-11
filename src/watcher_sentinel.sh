@@ -20,9 +20,36 @@
 # Elapsed time (`ps -o etime=`) is used rather than an absolute start time
 # because `date -j -f` is BSD-only and CI runs ubuntu.
 #
-# The sentinel format is untouched — a bare pid. Three readers int() the whole
-# file (health-check.py, services_status.py, and the tests), so a richer token
-# would convert this bug into a different false "watcher is broken" signal.
+# LINE 1 is a bare pid, and stays that way: three readers int() the first line
+# (health-check.py, services_status.py, and the tests). Lines 2+ are optional
+# `key=value` identity claims — instance, incarnation, code_path, version,
+# started_at, workspace — which a signaller reads to establish that the process
+# wearing that pid is the watcher THIS install started. A record carrying no
+# such lines is a pre-identity sentinel and proves nothing beyond the number.
+
+# --- the identity record -----------------------------------------------------
+# One `key=value` claim from lines 2+, empty when absent. Line 1 is the pid and
+# is never a field, so a pid-only sentinel yields nothing for every key.
+sentinel_record_field() {
+  local pid_file="$1" key="$2"
+  [ -f "$pid_file" ] || return 0
+  tail -n +2 "$pid_file" 2>/dev/null \
+    | awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+# True when the sentinel carries any identity claim at all.
+sentinel_has_record() {
+  local pid_file="$1"
+  [ -f "$pid_file" ] || return 1
+  tail -n +2 "$pid_file" 2>/dev/null | grep -q '^[a-z_][a-z_]*='
+}
+
+# The marker a live watcher exposes its incarnation through, beside its own
+# sentinel: <stem>[-<instance>].pid -> <stem>[-<instance>].incarnation.
+sentinel_incarnation_path() {
+  local pid_file="$1"
+  printf '%s' "${pid_file%.pid}.incarnation"
+}
 
 # --- naming ------------------------------------------------------------------
 # The stem only. The per-instance SUFFIX is not computed here: src/util_paths.py
@@ -33,14 +60,16 @@ WATCHER_SENTINEL_STEM="watch-tasks-stream"
 # The sentinel THIS process writes. $1 = state dir. Asks the Python owner, which
 # reads SUTANDO_INSTANCE_ID and the enrolled actor exactly as the run dir does.
 # A failure is fatal: guessing a path here is how two instances share one file.
+# $2, when given, names ANOTHER instance's sentinel instead of this process's —
+# the only way a caller can address a worker without guessing the filename.
 sentinel_path_for() {
-  local state_dir="$1" here out
+  local state_dir="$1" instance="${2:-}" here out
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   local py
   # shellcheck source=../scripts/python-binary.sh
   . "$here/../scripts/python-binary.sh" || return 1
   py="$(require_python "$here/.." "resolve the watcher sentinel")" || return 1
-  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
+  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel "$state_dir" ${instance:+"$instance"})"; then
     echo "watcher_sentinel: could not resolve the sentinel path" >&2
     return 1
   fi
@@ -130,7 +159,9 @@ sentinel_release_if_owner() {
   claim="${pid_file}.claim.$$"
 
   mv "$pid_file" "$claim" 2>/dev/null || return 0   # lost the race, or already gone
-  content="$(cat "$claim" 2>/dev/null || true)"
+  # Line 1 only: the identity lines below it are claims ABOUT the owner, not the
+  # owner's name, and comparing the whole file would never match a record.
+  content="$(head -n1 "$claim" 2>/dev/null | tr -d '[:space:]' || true)"
 
   if [ "$content" = "$expected_pid" ]; then
     rm -f "$claim"

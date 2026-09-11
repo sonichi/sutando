@@ -596,10 +596,14 @@ if __name__ == "__main__":
     # Path resolution for shell callers, so there is no second implementation
     # of the identity encoding to keep in step with this one.
     if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
-        print(watcher_sentinel_path(sys.argv[2]))
+        # An optional instance names ANOTHER instance's sentinel; omitted, the
+        # identity is resolved from this process's own environment as before.
+        print(watcher_sentinel_path(sys.argv[2],
+                                    instance=(sys.argv[3] if len(sys.argv) > 3 else None)))
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
     else:
-        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+        print("usage: util_paths.py {watcher-sentinel <state-dir> [instance]"
+              "|handler-fallbacks-dir <state-dir>}",
               file=sys.stderr)
         raise SystemExit(2)
