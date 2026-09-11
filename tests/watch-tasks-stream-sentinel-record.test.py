@@ -196,7 +196,8 @@ def test_record_and_marker(ws: Path, bin_dir: Path, box: Path) -> None:
         check("instance is the key encoded in the resolved sentinel path",
               f.get("instance") == "", f"got {f.get('instance')!r} for watch-tasks-stream.pid")
         check("code_path is the ABSOLUTE path of the running script",
-              f.get("code_path") == str(REPO / "src" / "watch-tasks-stream.sh"),
+              Path(f.get("code_path", "")).resolve()
+              == (REPO / "src" / "watch-tasks-stream.sh").resolve(),
               f"got {f.get('code_path')!r}")
         check("workspace is the resolved workspace, not the repo",
               Path(f.get("workspace", "")).resolve() == ws.resolve(),
@@ -359,6 +360,93 @@ def test_handover_race(ws: Path, bin_dir: Path, box: Path) -> None:
                 w.hard_stop()
 
 
+# The pre-fix steal, verbatim in shape: probe, `rm -rf`, `mkdir`. Two ops, so
+# two stealers interleave and both return 0 — the control for the arm below.
+UNSAFE_ACQUIRE = """
+acquire() {
+  local lk dl
+  lk="$(sentinel_lock_path "$1")"
+  dl=$(( $(date +%s) + 0 ))
+  while ! mkdir "$lk" 2>/dev/null; do
+    if find "$lk" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then
+      rm -rf "$lk"
+      continue
+    fi
+    [ "$(date +%s)" -lt "$dl" ] || return 1
+    sleep 0.05
+  done
+  return 0
+}
+"""
+
+SHIPPED_ACQUIRE = """
+acquire() { sentinel_lock_acquire "$1" 0; }
+"""
+
+
+def lock_race(box: Path, tag: str, impl: str, trials: int, n: int,
+              abandoned: bool = True) -> "tuple[int, int, int, list[str]]":
+    """N real PROCESSES race for one lock, `trials` times. -> (multi, one, zero).
+
+    Separate processes, not `( … ) &` subshells: a subshell inherits its
+    parent's `$$`, which no two real acquirers ever share.
+
+    A 0s acquire timeout keeps a loser from spinning the default 10s — the
+    winner never releases here, so every loser is destined to time out anyway.
+    """
+    root = box / "lockrace" / tag
+    shutil.rmtree(root, ignore_errors=True)
+    for i in range(trials):
+        d = root / f"t{i}"
+        (d / "watch-tasks-stream.lock").mkdir(parents=True)
+        if abandoned:
+            old = time.time() - 600
+            os.utime(d / "watch-tasks-stream.lock", (old, old))
+    acq = root / "acquire.sh"
+    acq.write_text(f'. "{SENTINEL_SH}"\n{impl}\n'
+                   'acquire "$1/watch-tasks-stream.pid" && echo WON >> "$1/out"\n')
+    driver = (f'for d in "{root}"/t*; do\n'
+              f'  : > "$d/out"\n'
+              f'  for i in $(seq 1 {n}); do bash "{acq}" "$d" & done\n'
+              f'  wait\n'
+              f'done\n')
+    subprocess.run(["bash", "-c", driver], capture_output=True, text=True)
+    won = [(root / f"t{i}" / "out").read_text().count("WON") for i in range(trials)]
+    multi = sum(1 for w in won if w > 1)
+    one = sum(1 for w in won if w == 1)
+    residue = [q.name for q in root.rglob("*.lock.ste*")]
+    return multi, one, trials - multi - one, residue
+
+
+def test_lock_is_mutually_exclusive(box: Path) -> None:
+    """`sentinel_lock_acquire` is what serialises the record against the marker.
+
+    Two holders inside that section land a record from one writer beside a
+    marker from the other — the mismatched pair the incarnation exists to make
+    impossible — so the lock reintroduces B2 through the mechanism that closed it.
+    """
+    # 50x4, not more: CI caps a python suite at 120s and runs them in parallel,
+    # and the control below double-wins ~1 trial in 6 — 50 makes a zero ~1e-4.
+    trials, n = 50, 4
+    multi, one, zero, residue = lock_race(box, "shipped", SHIPPED_ACQUIRE, trials, n)
+    check(f"an ABANDONED lock has exactly ONE stealer ({trials} trials x {n} acquirers)",
+          multi == 0 and one == trials, f"{multi} trials with >1 winner, {one} with 1, {zero} with 0")
+    check("  ...and no steal lock is left behind", not residue, f"residue: {residue[:4]}")
+
+    m2, o2, z2, _ = lock_race(box, "unsafe", UNSAFE_ACQUIRE, trials, n)
+    check("CONTROL: the rm+mkdir steal lets MORE THAN ONE stealer win",
+          m2 > 0, f"0 of {trials} double-won — the harness cannot detect the defect "
+                  f"it is here to detect, so the arm above is vacuous")
+    check("  ...and it is the STEAL that differs, not the harness",
+          o2 + m2 == trials, f"{z2} trials had no winner at all")
+
+    f_multi, f_one, f_zero, _ = lock_race(box, "held", SHIPPED_ACQUIRE, 25, n,
+                                          abandoned=False)
+    check("CONTROL: a FRESH held lock is never stolen — mkdir excludes all 25",
+          f_multi == 0 and f_one == 0 and f_zero == 25,
+          f"{f_multi} with >1 winner, {f_one} with 1, {f_zero} with 0")
+
+
 def main() -> int:
     print("watch-tasks-stream sentinel record:")
     box = Path(tempfile.mkdtemp(prefix="sentinel-record-"))
@@ -372,6 +460,7 @@ def main() -> int:
         test_record_and_marker(box / "ws-a", bin_dir, box)
         test_atomic_publish(box)
         test_handover_race(box / "ws-b", bin_dir, box)
+        test_lock_is_mutually_exclusive(box)
     finally:
         shutil.rmtree(box, ignore_errors=True)
 

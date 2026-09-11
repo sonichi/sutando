@@ -79,16 +79,34 @@ sentinel_lock_path() {
   printf '%s' "${1%.pid}.lock"
 }
 
-# A holder killed mid-section would wedge every later start, so a lock older
-# than the timeout is stolen; the section itself is two renames long.
+# Abandoned = untouched for a full minute (`find -mmin`, whose unit is minutes)
+# — a DIFFERENT number from the ${2:-10}s a caller waits to acquire, below.
+sentinel_lock_abandoned() {
+  find "$1" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .
+}
+
+# A holder killed mid-section would wedge every later start, so an ABANDONED
+# lock is removed under a SECOND lock, which only one stealer can hold.
 sentinel_lock_acquire() {
-  local lock deadline
+  local lock steal deadline
   lock="$(sentinel_lock_path "$1")"
+  steal="${lock}.steal"
   deadline=$(( $(date +%s) + ${2:-10} ))
   while ! mkdir "$lock" 2>/dev/null; do
-    if find "$lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then
-      rm -rf "$lock"
-      continue
+    if sentinel_lock_abandoned "$lock"; then
+      if mkdir "$steal" 2>/dev/null; then
+        # RE-probe under the steal lock. `$lock` is never renamed away, so a
+        # winner that took it since the probe above is still there to be seen.
+        if sentinel_lock_abandoned "$lock"; then
+          rm -rf "$lock"
+        fi
+        rmdir "$steal" 2>/dev/null || true
+        continue
+      fi
+      # A stealer killed between those two lines wedges the steal, not the lock.
+      if sentinel_lock_abandoned "$steal"; then
+        rm -rf "$steal"
+      fi
     fi
     [ "$(date +%s)" -lt "$deadline" ] || return 1
     sleep 0.05
