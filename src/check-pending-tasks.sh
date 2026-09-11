@@ -33,16 +33,24 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
-  # Another instance owns any task with a sentinel in its delivery folder. This
-  # one declined it and must not touch it, so it is not this one's to answer.
+  # Which folder is this instance's own, and which sentinel names count as held,
+  # are pool_delivery's to say; a second spelling here drifts from the owner.
   TASK_ID="${BASENAME%.txt}"
-  HELD_ELSEWHERE=0
-  for _d in "$WORKSPACE"/deliveries/*/; do
-    [ -d "$_d" ] || continue
-    [ "$(basename "$_d")" = core ] && continue   # the core's own inbox is not another instance's
-    if [ -e "$_d$TASK_ID.txt" ] || [ -e "$_d$TASK_ID.accepted" ]; then HELD_ELSEWHERE=1; break; fi
-  done
-  if [ "$HELD_ELSEWHERE" = 1 ]; then continue; fi
+  # 0 held, 1 not held, anything else "could not say". No interpreter is the
+  # separate refusal below, so it keeps reading as 1 rather than as a crash.
+  HELD_RC=1
+  if [ -n "$PYBIN" ]; then
+    "$PYBIN" "$REPO_DIR/src/pool_delivery.py" \
+      --workspace "$WORKSPACE" --held "$TASK_ID" >/dev/null 2>&1
+    HELD_RC=$?
+  fi
+  if [ "$HELD_RC" -gt 1 ]; then
+    # Unknown is not a negative: reporting it would tell this instance to answer
+    # work a peer may already hold, and dropping it silently would hide the fault.
+    echo "check-pending-tasks: $TASK_ID — pool_delivery could not say whether another instance holds it (exit $HELD_RC); not reported" >&2
+    continue
+  fi
+  if [ "$HELD_RC" = 0 ]; then continue; fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
   # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then

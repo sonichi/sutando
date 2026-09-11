@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -362,6 +363,103 @@ class TestCLI(Base):
         r = self.run_cli("sweep")
         self.assertIn('"ready"', r.stdout)
         self.assertIn("task-1", r.stdout)
+
+
+class TestHeldByOtherInstance(Base):
+    """"Somebody else already has this" is one decision with one owner: who I am
+    comes from SUTANDO_INSTANCE_ID, and every sentinel name here counts."""
+
+    def _claim(self, recipient, task_id, suffix):
+        d = self.root / "deliveries" / recipient
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{task_id}{suffix}").write_text("", encoding="utf-8")
+
+    def test_an_absent_deliveries_tree_holds_nothing(self):
+        self.assertIsNone(pd.held_by_other_instance(self.root / "nope", "task-1"))
+
+    def test_a_peer_holding_it_is_named(self):
+        self._claim("w1", "task-1", ".txt")
+        self.assertEqual(pd.held_by_other_instance(self.root, "task-1", "core"), "w1")
+
+    def test_every_accepted_spelling_counts_including_the_legacy_one(self):
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                self._claim("w1", "task-1", suffix)
+                self.assertEqual(
+                    pd.held_by_other_instance(self.root, "task-1", "core"), "w1",
+                    f"{suffix} is a hold to find(); it must be one here too")
+                (self.root / "deliveries" / "w1" / f"task-1{suffix}").unlink()
+
+    def test_my_own_folder_is_never_a_hold(self):
+        """Whichever instance I am: my declining is what put it in front of me."""
+        self._claim("core", "task-1", ".accepted")
+        self._claim("w1", "task-2", ".accepted")
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-2", "w1"))
+
+    def test_the_perspective_reverses_with_the_instance(self):
+        """The same two folders, read from each side — the pair is the test."""
+        self._claim("core", "task-1", ".accepted")
+        self.assertEqual(pd.held_by_other_instance(self.root, "task-1", "w1"), "core")
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
+
+    def test_self_defaults_to_the_instance_env_then_core(self):
+        self._claim("core", "task-1", ".accepted")
+        with unittest.mock.patch.dict(os.environ, {"SUTANDO_INSTANCE_ID": "w1"}):
+            self.assertEqual(pd.self_recipient(), "w1")
+            self.assertEqual(pd.held_by_other_instance(self.root, "task-1"), "core")
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(pd.self_recipient(), pd.CORE_RECIPIENT)
+            self.assertIsNone(pd.held_by_other_instance(self.root, "task-1"))
+
+    def test_a_folder_no_recipient_may_be_named_holds_nothing(self):
+        self._claim("NOT_A_RECIPIENT", "task-1", ".accepted")
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
+
+    def test_another_id_is_not_this_one(self):
+        self._claim("w1", "task-2", ".accepted")
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
+
+
+class TestHeldCli(Base):
+    """The caller is a shell hook, so the exit code IS the contract: 0 held,
+    1 not held, HELD_UNKNOWN when the lookup could not answer."""
+
+    def run_cli(self, *args, env=None):
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "src" / "pool_delivery.py"),
+             "--workspace", str(self.root), *args],
+            capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
+
+    def test_held_exits_zero_and_names_the_holder(self):
+        self.ws.deliver("w1", "task-1")
+        r = self.run_cli("--held", "task-1")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "w1"), r.stderr)
+
+    def test_not_held_exits_one(self):
+        self.assertEqual(self.run_cli("--held", "task-1").returncode, 1)
+
+    def test_the_env_instance_decides_whose_folder_is_own(self):
+        self.ws.deliver("w1", "task-1")
+        self.assertEqual(self.run_cli("--held", "task-1",
+                                      env={"SUTANDO_INSTANCE_ID": "w1"}).returncode, 1)
+
+    def test_an_unreadable_tree_is_unknown_not_free(self):
+        """Exit 1 here would read as "nobody holds it" and hand the task over."""
+        if os.getuid() == 0:
+            self.skipTest("root reads an unreadable directory")
+        self.ws.deliver("w1", "task-1")
+        d = self.root / "deliveries"
+        d.chmod(0o000)
+        try:
+            r = self.run_cli("--held", "task-1")
+        finally:
+            d.chmod(0o755)
+        self.assertEqual(r.returncode, pd.HELD_UNKNOWN, r.stdout)
+        self.assertIn("PermissionError", r.stderr)
+
+    def test_a_command_is_still_required_without_held(self):
+        self.assertEqual(self.run_cli().returncode, 2)
 
 
 class TestEmit(Base):
