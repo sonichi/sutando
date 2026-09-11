@@ -698,6 +698,57 @@ class TestHelpers(Base):
         self.assertNotIn("junk", people)
 
 
+class TestPublishedPeopleMatchTheDigest(Base):
+    """PR #4127 review: what `--commit` publishes to people.json must be exactly what
+    the digest showed. A person cited twice by a landed project and once by the staged
+    one crosses the two-citation floor only through the union; `--stage` now previews
+    the post-union field change and a full `--commit` publishes the staged set verbatim.
+    `published_field_diffs` lists a person only when the published fields differ."""
+
+    def _run(self, *args):
+        out = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--json", *args])
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def test_diffs_list_only_changed_fields(self):
+        pub = [({"name": "Ada Lovelace", "email": "ada@example.com", "role": "Principal",
+                 "company": "Analytical"}, [1, 2, 3], None),
+               ({"name": "Grace Hopper", "email": "g@h.example", "role": "Admiral"}, [1, 2], None),
+               ({"name": "Grace B. Hopper", "email": "g@h.example", "role": "Admiral",
+                 "identifiers": {"emails": ["g@h.example", "grace@navy.example"]}}, [1, 2], None),
+               ({"name": "New Person", "role": "advisor"}, [1, 2], None)]
+        prev = {"people": [
+            {"name": "Ada Lovelace", "email": "ada@example.com", "role": "CTO", "company": "Analytical"},
+            {"name": "Grace Hopper", "email": "g@h.example", "role": "Admiral"}]}
+        rows = self.m.published_field_diffs(pub, prev)   # Grace(1) unchanged, New absent
+        self.assertEqual(rows, [
+            ("Ada Lovelace", ["role: CTO → Principal"], 3),
+            ("Grace B. Hopper", ["name: Grace Hopper → Grace B. Hopper", "+1 email"], 2)])
+
+    def test_shared_person_role_change_is_previewed_and_published_verbatim(self):
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        self.assertIn("Role: CTO", next(p for p in self._export() if p["name"] == "Ada Lovelace")["doc"])
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = "Principal Engineer"     # people[0] is Ada in the fixture
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        self._run("--stage", "--projects", "beta")
+        staged = self.data / "staged"
+        self.assertIn("Ada Lovelace — role: CTO → Principal Engineer", (staged / "review.md").read_text())
+        staged_ada = next(p for p in json.loads((staged / "people.json").read_text())
+                          if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: Principal Engineer", staged_ada["doc"])
+        self._run("--commit")
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertEqual(published_ada["doc"], staged_ada["doc"])
+        self.assertIn("Role: Principal Engineer", published_ada["doc"])
+        self.assertNotIn("Role: CTO", published_ada["doc"])
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     sys.exit(0 if result.wasSuccessful() else 1)

@@ -997,6 +997,63 @@ class TestApprovedPeopleInputs(Base):
         self.assertEqual(m.people_changed_since_approval(self.data, out, {"projects": {SLUG_B: {}}}), [SLUG_B])
 
 
+class TestStagedPeopleMatchTheDigest(Base):
+    """PR #4127 review, `finalize.py` `approved_entities_after` / `_absorb`: with a
+    person cited twice by an approved project and once by the selected one, `--stage`
+    computed a selected-only people set (below the floor -> absent from staged
+    people.json and review.md), yet `--commit` unioned in the approved project's
+    citations and published a role change nobody reviewed. Now `--stage` computes the
+    published post-union set, the digest previews the concrete field change, and a
+    full `--commit` publishes the staged set verbatim."""
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def test_stage_previews_a_shared_persons_role_change_and_commit_publishes_it(self):
+        self._run("--stage", "--projects", "alpha")          # Ada lands via alpha: role CTO, 2 alpha cites
+        self._run("--commit")
+        self.assertIn("Role: CTO", next(p for p in self._export() if p["name"] == "Ada Lovelace")["doc"])
+        # the coordinator re-runs entities and Ada's role changes; only beta is staged and
+        # beta cites Ada once — below the floor alone, over it after the union with alpha
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = "Principal Engineer"
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Updates to people already in your export", review)
+        self.assertIn("Ada Lovelace — role: CTO → Principal Engineer", review)
+        staged_ada = next(p for p in json.loads((self.staged / "people.json").read_text())
+                          if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: Principal Engineer", staged_ada["doc"])
+        self.assertNotIn("Role: CTO", staged_ada["doc"])
+        rc, c, _ = self._run("--commit")                     # "bring it in" for beta
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertEqual(published_ada["doc"], staged_ada["doc"])     # exactly what the digest showed
+        self.assertIn("Role: Principal Engineer", published_ada["doc"])
+        self.assertNotIn("Role: CTO", published_ada["doc"])
+
+    def test_a_change_the_digest_does_not_show_keeps_the_approved_fields(self):
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        # Ada's role changes live AND beta no longer cites her: beta contributes nothing, so
+        # the published Ada comes entirely from alpha's approved fields — nothing to review
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = "VP Engineering"
+        ents["people"][0]["citations"] = [_cite(SLUG_A, U1), _cite(SLUG_A, U2)]
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn("VP Engineering", review)
+        staged_ada = next(p for p in json.loads((self.staged / "people.json").read_text())
+                          if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: CTO", staged_ada["doc"])        # the approved role, not the live one
+        self.assertNotIn("VP Engineering", staged_ada["doc"])
+        rc, c, _ = self._run("--commit")
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: CTO", published_ada["doc"])
+        self.assertNotIn("VP Engineering", published_ada["doc"])
+
+
 class HeldBase(Base):
     def _mark_personal(self, slug, uuid, reason="family matter", drop_from_rollup=True):
         """What the classifier + coordinator leave behind: a `personal` summary

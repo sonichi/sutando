@@ -1479,6 +1479,46 @@ def _changed_section(changed, approved: dict, index_doc: dict, kept: str) -> str
     return text + "\n"
 
 
+def published_field_diffs(published, approved_entities) -> list:
+    """[(name, [diff, …], citations)] for each person in the post-union PUBLISHED
+    set whose reviewable fields (role, company, relationship, name, or a wider
+    email set) differ from the person the approved export was built from
+    (`approved/people-inputs.json`, matched by `_same_person`). A person with no
+    approved counterpart is new — the "New" list already carries them; one whose
+    fields equal the approved entry has nothing to review and is left out. This
+    is what makes the commit's change to `people.json` visible in the digest."""
+    prev = [q for q in (approved_entities or {}).get("people") or [] if isinstance(q, dict)]
+    rows = []
+    for p, cites, _existing in published:
+        match = next((q for q in prev if _same_person(p, q)), None)
+        if match is None:
+            continue
+        diffs = []
+        for label in ("role", "company", "relationship"):
+            old, new = _one_line(match.get(label), 60), _one_line(p.get(label), 60)
+            if old != new:
+                diffs.append(f"{label}: {old or '—'} → {new or '—'}")
+        old_name, new_name = _norm_name(match.get("name")), _norm_name(p.get("name"))
+        if store_name_key(old_name) != store_name_key(new_name):
+            diffs.append(f"name: {old_name} → {new_name}")
+        gained = [e for e in _emails_of(p) if e.lower() not in {x.lower() for x in _emails_of(match)}]
+        if gained:
+            diffs.append(f"+{_n(len(gained), 'email')}")
+        if diffs:
+            rows.append((_one_line(p.get("name"), 80), diffs, len(cites)))
+    return rows
+
+
+def _people_diff_section(rows) -> str:
+    """The published field changes for people already in the approved export."""
+    if not rows:
+        return ""
+    text = f"\nUpdates to people already in your export ({len(rows)}) — the commit publishes these:\n"
+    for name, diffs, n in rows:
+        text += f"- {name} — {'; '.join(diffs)} (now {_n(n, 'citation')})\n"
+    return text
+
+
 def _held_section(held_rows) -> str:
     """The held sessions by date and reason only — never a title, never a quote."""
     rows = list(held_rows or [])
@@ -1499,7 +1539,7 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
                   outcomes: dict, memory_bytes: int, n_memory_projects: int, n_sessions: int,
                   run_kind: str, merged=None, state=None, held=None, held_rows=None, stale=None,
                   known_checked: bool = False, ambiguous=None, changed=None, approved=None,
-                  people_changed=None) -> str:
+                  people_changed=None, people_diffs=None) -> str:
     """The digest the owner reads before anything lands — the one place
     transcript-derived text is shown to them."""
     first, last = date_range(index_doc, slugs)
@@ -1524,6 +1564,7 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
         text += _bullets("Open threads", _thread_lines(slug, r, entities))
         text += _bullets("Decisions", _decision_lines(slug, r, entities)) + "\n"
     text += _people_section(candidates, ambiguous, below_floor, merged, known_checked)
+    text += _people_diff_section(people_diffs or [])
     if people_changed:
         text += "\n" + _changed_section(people_changed, approved or {}, index_doc, "in your People export").rstrip("\n") + "\n"
     text += (f"\n## Memory\n\n{memory_bytes:,} B summary (cap {MEMORY_LIMIT:,} B) covering "
@@ -1633,9 +1674,14 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
     memory_text = render_memory_file(preview, index_doc, n_preview)
     (smem / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
 
-    candidates, below_floor, ambiguous = people_candidates(entities, projects=set(slugs), known=known)
-    people = people_payloads(entities, index_doc, projects=set(slugs), known=known)
+    # The staged people set is exactly what --commit will publish: the selected projects'
+    # live citations and fields unioned with every other landed project's approved ones.
+    union_projects = set(approved) | set(slugs)
+    post_union = approved_entities_after(data_dir, entities, slugs, union_projects)
+    candidates, below_floor, ambiguous = people_candidates(post_union, projects=union_projects, known=known)
+    people = people_payloads(post_union, index_doc, projects=union_projects, known=known)
     _common.write_json(sdir / STAGED_PEOPLE, people)
+    people_diffs = published_field_diffs(candidates, _entity_lists(load_people_inputs(data_dir).get("entities")))
     people_changed = [s for s in people_changed_since_approval(data_dir, entities, state) if s not in slugs]
     n_sessions = session_total(index_doc, summaries, slugs, rollups, state, held)
     rows = held_rows(index_doc, inp["all_summaries"], held,
@@ -1648,7 +1694,8 @@ def stage(*, data_dir: Path, ws: Path, run_kind: str = "user", projects=None, ex
                       memory_bytes=len(memory_text.encode("utf-8")), n_memory_projects=len(preview),
                       n_sessions=n_sessions, run_kind=run_kind, merged=merged, state=state,
                       held=held, held_rows=rows, stale=stale_here, known_checked=known is not None,
-                      ambiguous=amb_rows, changed=changed, approved=approved, people_changed=people_changed),
+                      ambiguous=amb_rows, changed=changed, approved=approved, people_changed=people_changed,
+                      people_diffs=people_diffs),
         encoding="utf-8")
     tally = {k: sum(1 for v in outcomes.values() if v == k) for k in ("created", "updated", "unchanged")}
     n_existing = sum(1 for p in people if p.get("existing"))
@@ -1749,10 +1796,13 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
     (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
     row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(committed)))
     print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
-    # The chosen projects' people come from the entities the owner just reviewed; every other
-    # landed project's from its approved inputs — a later entities.json never refreshes those.
+    # people.json publishes exactly the reviewed set: verbatim from staged/people.json on a
+    # full commit (fingerprint-guarded), else a subset re-derives its slice the way --stage did.
     approved_entities = approved_entities_after(data_dir, entities, chosen, committed)
-    people = people_payloads(approved_entities, index_doc, projects=set(committed), known=known)
+    if set(chosen) == set(pending):
+        people = _common.load_json(staged_dir(data_dir) / STAGED_PEOPLE, [])
+    else:
+        people = people_payloads(approved_entities, index_doc, projects=set(committed), known=known)
     save_people_export(data_dir, people, approved_entities, set(committed), known)
     _common.save_state(data_dir, state)
 
