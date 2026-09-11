@@ -471,8 +471,8 @@
     "maintainers"
    ],
    "status": "draft",
-   "canonical_for": "the v1 worker pool: the single local pool supervisor, the executor interface and runtime adapters, the transactional task state machine, room-to-worker binding and routing, worker lifecycle and health, and the staged PRs",
-   "last_verified": "2026-09-08"
+   "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
+   "last_verified": "2026-09-11"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",

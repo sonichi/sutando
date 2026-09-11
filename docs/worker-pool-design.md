@@ -230,11 +230,7 @@ pending deliveries and notifies its recipient, including after a restart. Its
 notices are recoverable from durable state, and **a notice is not proof of
 acceptance**.
 
-**The core never switches intake protocols** — it reads `deliveries/core/` always,
-and the worker count changes only what the handler decides. And "untouched" must be
-accepted honestly: moving supervision and moving delivery from a pipe to a file *are*
-changes to the single-core path, so if today's behaviour must be preserved for the
-first pool release, they stay out of its default path.
+**The core's intake does not change in the first release** — it keeps today's path: the watcher hands it every task the router's handler declines, exactly as before any pool existed. Reading `deliveries/core/` instead is the switch FLAG-1 below defers, and the cost accepted meanwhile is two intake protocols. "Untouched" must be accepted honestly either way: moving supervision and moving delivery from a pipe to a file *are* changes to the single-core path, so while today's behaviour must be preserved they stay out of its default path.
 
 ## Completion
 
