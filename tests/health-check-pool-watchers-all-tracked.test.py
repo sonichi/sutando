@@ -263,6 +263,60 @@ class SingleInstanceUnchanged(unittest.TestCase):
         self.assertIn("is dead", r["detail"])
 
 
+class NoLiveFaultsAggregateBeforeAnyAdvice(unittest.TestCase):
+    """keweichen at a5933d4f: each no-live early return preceded the aggregate,
+    so a second fault class was discarded and an UNKNOWN turned into restart
+    advice for a watcher it could not identify. The single-fault cases above are
+    the positive controls; these are the cross-product."""
+
+    UNREADABLE = {"watch-tasks-stream.pid": "not-a-pid\n"}
+
+    def test_unreadable_plus_unprovable_does_not_advise_restart(self):
+        r = run(dict(self.UNREADABLE, **{"watch-tasks-stream-b.pid": "100\n"}),
+                {}, verdicts={"100": None})
+        self.assertNotIn("restart the watcher", r["detail"],
+            "an unprovable identity must veto restart advice; restarting can "
+            "duplicate the live watcher behind the pid we could not identify")
+
+    def test_unreadable_plus_unprovable_keeps_BOTH_records(self):
+        r = run(dict(self.UNREADABLE, **{"watch-tasks-stream-b.pid": "100\n"}),
+                {}, verdicts={"100": None})
+        self.assertIn("unreadable PID sentinel", r["detail"])
+        self.assertIn("UNKNOWN", r["detail"],
+            "the aggregate must carry every class, not the first one matched")
+
+    def test_dead_plus_unreadable_keeps_both(self):
+        r = run(dict(self.UNREADABLE, **{"watch-tasks-stream-b.pid": "100\n"}),
+                {}, argv="")
+        self.assertIn("unreadable PID sentinel", r["detail"])
+        self.assertIn("is dead", r["detail"])
+
+    def test_unprovable_with_visible_roots_gives_no_stop_advice(self):
+        """With roots visible the advice names pids to stop. An unprovable
+        sentinel must suppress that too -- same veto, other direction."""
+        r = run(dict(self.UNREADABLE, **{"watch-tasks-stream-b.pid": "100\n"}),
+                {"200": {"200"}}, verdicts={"100": None}, targets={})
+        # Assert it REACHES the aggregate first: unfixed, this returned early
+        # with restart advice and never reached the roots branch, so a bare
+        # assertNotIn("safe to stop") passed for the wrong reason.
+        self.assertIn("watcher(s) still run", r["detail"],
+            "must reach the roots aggregate, not return on the first fault")
+        self.assertNotIn("restart the watcher", r["detail"],
+            "advising a restart while a watcher tree is visible is the "
+            "duplicate-maker this branch exists to prevent")
+        self.assertNotIn("safe to stop", r["detail"],
+            "a stop list published beside an unprovable identity invites "
+            "killing the watcher we could not identify")
+
+    def test_single_fault_positive_controls_are_unchanged(self):
+        unreadable = run(self.UNREADABLE, {})
+        self.assertIn("restart the watcher", unreadable["detail"],
+            "lone unreadable sentinel still warrants a restart")
+        unprovable = run({"watch-tasks-stream.pid": "100\n"}, {},
+                         verdicts={"100": None})
+        self.assertIn("not restarting and not stopping", unprovable["detail"])
+
+
 class TheRestampTargetComesFromTheWATCHERsIdentity(unittest.TestCase):
     """A sentinel-less watcher is re-stamped at ITS path, never at this process's.
 

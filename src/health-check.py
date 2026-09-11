@@ -9056,22 +9056,25 @@ def check_task_watcher() -> dict:
                 live[spid] = sp
 
     if not live:
-        if unreadable and not dead_pids and not reused:
-            return {"name": name, "status": "warn",
-                    "detail": f"unreadable PID sentinel ({unreadable[0][1]}) — restart the watcher"}
-        if unprovable and not dead_pids and not reused:
+        # ONE aggregate over EVERY record class, built before any advice. A
+        # per-class early return drops the classes below it, and a dropped
+        # UNKNOWN becomes restart advice for the very watcher it could not
+        # identify.
+        notes = []
+        if unreadable:
+            notes.append(f"unreadable PID sentinel ({unreadable[0][1]})")
+        if unprovable:
             upid, uargv, _usp = unprovable[0]
-            return {"name": name, "status": "warn",
-                    "detail": f"UNKNOWN: cannot prove pid {upid} is the watcher from its argv "
-                              f"({uargv[:50]}) — not restarting and not stopping it; "
-                              f"re-check when the process vector is readable"}
-        if reused and not dead_pids:
-            # PID reuse: the sentinel outlived the watcher and the OS handed the
-            # number to something else. `kill -0` alone would call this alive.
+            notes.append(f"UNKNOWN: cannot prove pid {upid} is the watcher from its argv "
+                         f"({uargv[:50]})")
+        if reused:
             rpid, rargv, _rsp = reused[0]
-            return {"name": name, "status": "warn",
-                    "detail": f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}"}
+            notes.append(f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}")
+        # An identity we cannot prove vetoes BOTH directions: a restart may
+        # duplicate the live watcher behind it, a stop may kill it.
+        veto = bool(unprovable)
         pid = dead_pids[0][0] if dead_pids else 0
+
         if roots:
             # A dead sentinel does NOT mean nothing drains tasks/ — restarting
             # here is what makes the duplicates.
@@ -9087,14 +9090,33 @@ def check_task_watcher() -> dict:
                 f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "",
                 (f"; do NOT stop {', '.join(_sole)} — the only watcher for that instance, "
                  f"and its sentinel is already dead") if _sole else ""])
+            _lead = ("; ".join(notes) + "; ") if notes else ""
+            _lead += (f"sentinel pid {pid} is dead but " if dead_pids
+                      else "no live sentinel but ")
+            _stop = ("no stop advice while a sentinel identity is unprovable" if veto
+                     else f"ownerless, safe to stop: {', '.join(own) or 'none'}")
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still "
+                    "detail": f"{_lead}{len(roots)} watcher(s) still "
                               f"run; tasks/ IS being drained{_blind}. "
-                              f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
+                              f"{_stop}; "
                               f"supervised, leave alone (a live parent owns them): "
                               f"{', '.join(sup) or 'none'}"}
+
+        if not notes and dead_pids:
+            return {"name": name, "status": "warn",
+                    "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); "
+                              f"restart it"}
+        if dead_pids:
+            notes.append(f"sentinel pid {pid} is dead (crashed — sentinel left behind)")
+        if veto:
+            advice = ("not restarting and not stopping it; re-check when the process "
+                      "vector is readable")
+        elif unreadable or dead_pids:
+            advice = "restart the watcher"
+        else:
+            advice = ""
         return {"name": name, "status": "warn",
-                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
+                "detail": "; ".join(notes) + (f" — {advice}" if advice else "")}
 
     faults = []
     if dead_pids:
