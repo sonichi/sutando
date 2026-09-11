@@ -87,6 +87,9 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 # workspace; the spawner names the workspace explicitly.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+# What KIND of inbox this is, named by whoever named it: a watcher that inferred
+# "this looks like a delivery folder" from the path would decide it for itself.
+INBOX_KIND="${SUTANDO_INBOX_KIND:-tasks}"
 # The handler's answer for "I could record this nowhere durable": keep the claim
 # rather than settle or fall back. Owner: src/pool_route_handler.py UNSETTLED.
 HANDLER_UNSETTLED_RC=5
@@ -391,8 +394,21 @@ queue_handler_task() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename
+  local task_path="$1" rc filename payload="$1"
   filename="$(basename "$task_path")"
+  # A delivery inbox holds 0-byte sentinels that NAME their payload; which name
+  # points at which body is pool_delivery's grammar, asked here, never spelled.
+  if [ "${INBOX_KIND:-tasks}" = "deliveries" ]; then
+    payload="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
+      --workspace "$WORKSPACE_DIR" payload --sentinel "$filename")"
+  fi
+  # Everything below is handed the payload: the handler routes on --task-file,
+  # and an empty body names no recipient and answers nobody.
+  if [ -z "$payload" ] || [ ! -f "$payload" ]; then
+    echo "watch-tasks-stream: $filename names no readable payload; not dispatching it" >&2
+    return
+  fi
+  task_path="$payload"
   queued_activity_row "$filename"
   if [ -z "$DISPATCH_DIR" ]; then
     emit_dispatch_task_file "$filename"
