@@ -37,8 +37,8 @@ import local_task_protocol as ltp  # noqa: E402
 
 SOURCE = "worker-picker"
 
-# A header the broker may stamp instead of relying on the sentence. Read from
-# ABOVE `task:` only, like `requested_worker`, so a body cannot forge one.
+# A header the broker may stamp instead of relying on the sentence. In
+# KNOWN_HEADER_KEYS, so the strict parser reads it ABOVE `task:` only.
 COMMAND_HEADER = "picker_command"
 COMMAND_ARGS_HEADER = "picker_args"
 COMMANDS = ("add", "pin", "unpin")
@@ -62,38 +62,80 @@ def _refuse_no_room(action: str) -> None:
           file=sys.stderr)
 
 
-def _structured(headers: dict, room: str) -> "dict | None":
-    """The intent from a stamped command, or None when there is no usable one.
+def _bad(name: str, reason: str) -> dict:
+    """Refuse a stamped command and say which rule it broke — an unnamed
+    refusal is indistinguishable from 'the sentence did not match'."""
+    print(f"worker-picker: refusing {name!r} — {reason}", file=sys.stderr)
+    return {"action": "malformed", "command": name, "reason": reason}
 
-    An UNKNOWN command returns None rather than falling through to the prose:
-    a broker that names a verb we do not implement must not be answered by
-    guessing from a sentence written for a different one.
+
+def _worker_names(args: dict) -> "list | None":
+    """The pin target as a list of names, or None if it is not one.
+
+    A bare string is REJECTED, not accepted as a one-element list: iterating
+    one yields its characters, which is how `"w1"` became six workers.
     """
+    if "workers" in args:
+        got = args["workers"]
+        if not isinstance(got, list):
+            return None
+    elif "worker" in args:
+        got = [args["worker"]]
+    else:
+        return None
+    if not got or not all(isinstance(w, str) and w.strip() for w in got):
+        return None
+    return [w.strip() for w in got]
+
+
+def _structured(headers: dict, room: str) -> "dict | None":
+    """The intent from a stamped command, or None when none was stamped.
+
+    Only an ABSENT `picker_command` returns None and lets the sentence decide.
+    Present-but-unusable — empty, an unknown verb, args that are not an object
+    or do not fit the verb's schema — is an explicit refusal: a broker that
+    stamped something we cannot honour must not be answered by guessing from a
+    sentence written for a different command.
+    """
+    if COMMAND_HEADER not in headers:
+        return None
     name = (headers.get(COMMAND_HEADER) or "").strip()
     if not name:
-        return None
+        return _bad(name, "empty picker_command")
     if name not in COMMANDS:
         return {"action": "unsupported", "command": name}
-    args = {}
+
+    args: dict = {}
     raw = (headers.get(COMMAND_ARGS_HEADER) or "").strip()
     if raw:
         try:
             parsed = json.loads(raw)
-            args = parsed if isinstance(parsed, dict) else {}
         except ValueError:
-            # A stamped command we cannot read is a refusal, not a reason to
-            # trust the sentence: nothing proves the two say the same thing.
-            return {"action": "malformed", "command": name}
+            return _bad(name, "picker_args is not JSON")
+        if not isinstance(parsed, dict):
+            return _bad(name, "picker_args is not a JSON object")
+        args = parsed
+
     if name == "add":
         label = args.get("label")
-        return {"action": "add", "label": str(label) if label else None}
-    workers = args.get("workers") or ([args["worker"]] if args.get("worker") else [])
-    at = room or str(args.get("room") or "")
+        if label is not None and not isinstance(label, str):
+            return _bad(name, "label must be a string")
+        return {"action": "add", "label": label.strip() if label and label.strip() else None}
+
+    # Every remaining command is room-scoped, and the room is the header's
+    # alone — `picker_args` may name one, and it is never read.
+    if not room:
+        return _bad(name, "no channel_id header")
     if name == "unpin":
-        return {"action": "unpin", "room": at}
-    return {"action": "pin", "room": at,
-            "workers": [str(w) for w in workers],
-            "dedicated": bool(args.get("dedicated"))}
+        return {"action": "unpin", "room": room}
+    workers = _worker_names(args)
+    if workers is None:
+        return _bad(name, "workers must be a non-empty list of names")
+    dedicated = args.get("dedicated", False)
+    if not isinstance(dedicated, bool):
+        return _bad(name, "dedicated must be a boolean")
+    return {"action": "pin", "room": room,
+            "workers": workers, "dedicated": dedicated}
 
 
 def parse(headers: dict, body: str) -> "dict | None":

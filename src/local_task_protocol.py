@@ -191,6 +191,9 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # Which worker-picker button was pressed, and its JSON arguments. Header
+    # status is the whole point: the reader takes them from above `task:` only.
+    "picker_command", "picker_args",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
