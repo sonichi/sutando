@@ -13,9 +13,12 @@ it read as a comfort feature.
 
 Run: python3 tests/health-sutando-app-warn-names-watchdog.test.py
 """
+import importlib.util
 import pathlib
 import re
+import subprocess
 import sys
+from unittest.mock import patch
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SRC = (REPO / "src" / "health-check.py").read_text()
@@ -72,6 +75,50 @@ ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in t
 # this goes RED on correct code. Widen the pattern then — do not delete the check.
 ck("and that guard actually returns early",
    re.search(r"if cliIsWorking\(\)\s*\{[^}]*\breturn\b", body, re.S) is not None)
+
+
+# Drive the branch for real: everything above reads source, so the message could
+# be deleted and the file would still parse and still pass.
+_spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+_hc = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_hc)
+except SystemExit:
+    pass
+
+
+class _Pgrep:
+    """pgrep returncode 1 = no match, which is how the app reads as stopped."""
+
+    def __init__(self, rc):
+        self.returncode, self.stdout, self.stderr = rc, "", ""
+
+
+def _rows(rc):
+    real = subprocess.run
+
+    def fake(cmd, *a, **kw):
+        if isinstance(cmd, (list, tuple)) and cmd and "pgrep" in str(cmd[0]):
+            return _Pgrep(rc)
+        return real(cmd, *a, **kw)
+
+    # Both are needed: the pgrep block sits inside the "installed" branch, so a
+    # host without the app never reaches the ok-stopped path at all.
+    with patch.object(_hc, "menubar_app_state", return_value="installed"), \
+         patch.object(_hc.subprocess, "run", side_effect=fake):
+        checks = _hc.run_all_checks()
+    return [c for c in checks if isinstance(c, dict) and c.get("name") == "sutando-app"]
+
+
+try:
+    stopped = _rows(1)
+    ck("driving pgrep->stopped emits exactly one sutando-app row", len(stopped) == 1)
+    d = stopped[0]["detail"] if stopped else ""
+    ck("the emitted row is a warn", bool(stopped) and stopped[0]["status"] == "warn")
+    ck("the EMITTED detail names checkWatcher", "checkWatcher" in d)
+    ck("the EMITTED detail scopes it to a busy CLI", "while the CLI is busy" in d)
+except Exception as e:  # a drive that cannot run must fail, never skip
+    ck(f"the ok-stopped branch is drivable ({type(e).__name__}: {e})", False)
 
 print("\nall ok" if fails == 0 else f"\n{fails} FAILED")
 sys.exit(0 if fails == 0 else 1)
