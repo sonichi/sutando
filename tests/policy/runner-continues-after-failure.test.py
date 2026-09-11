@@ -176,6 +176,32 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0,
                          "a vendored failing test must not fail the local run")
 
+    def test_absent_optional_root_still_discovers_the_mandatory_one(self) -> None:
+        """A skill is optional, so a tree with no skills/ is not a broken
+        discovery — it must report a TRUE count, not the partial-list refusal."""
+        r = self._run({"a.test.py": PASSING, "b.test.py": PASSING})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2 file(s) ran, all passed", r.stdout)
+        self.assertNotIn("refusing to report a count", r.stdout)
+
+    def test_both_roots_are_discovered_when_both_exist(self) -> None:
+        """And the skills root is really searched: a failing suite under a
+        skill must be run and must fail the run, not be silently skipped."""
+        with tempfile.TemporaryDirectory() as td:
+            tests = Path(td) / "tests"
+            tests.mkdir()
+            (tests / "a.test.py").write_text(PASSING)
+            skill = Path(td) / "skills" / "x" / "tests"
+            skill.mkdir(parents=True)
+            (skill / "b.test.py").write_text(FAILING)
+            r = subprocess.run(["sh", "-c", self._runner()],
+                               cwd=td, capture_output=True, text=True, timeout=120)
+        self.assertIn("skills/x/tests/b.test.py", r.stdout,
+                      "a suite under skills/ was never discovered")
+        self.assertIn("2 file(s) ran", r.stdout)
+        self.assertNotEqual(r.returncode, 0,
+                            "a failing skill-owned suite must fail the run")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
