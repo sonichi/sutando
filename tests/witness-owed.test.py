@@ -681,10 +681,9 @@ class Round7Publication(Fixture):
         return (f"cp -R {shlex.quote(str(self.ws / 'hosts'))} "
                 f"{shlex.quote(str(self._peer_ws()))}/")
 
-    def _cli(self, *args):
-        return subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
-                               "--workspace", str(self.ws), *args],
-                              capture_output=True, text=True)
+    # In-process, so the CLI branches under test are actually instrumented;
+    # `test_entry_point_runs_as_a_process` covers the process path separately.
+    _cli = Cli._run
 
     def test_a_published_hold_opened_on_one_host_blocks_the_gate_on_another(self):
         peer = self._peer_ws(); peer.mkdir(parents=True)
@@ -743,13 +742,16 @@ class Round7MaxAge(Fixture):
         with self.assertRaises(ValueError):
             wo.blocking(self.ws, self.repo, self.base, None, HOST_B, "o/r", float("inf"))
 
+    _run = Cli._run
+
     def test_the_cli_exits_2_on_an_unbounded_max_age_instead_of_passing(self):
-        r = subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
-                            "--workspace", str(self.ws), "check", "--ref", self.base,
-                            "--repo-root", str(self.repo), "--max-age", "1e400"],
-                           capture_output=True, text=True)
+        r = self._run("check", "--ref", self.base, "--repo-root", str(self.repo),
+                      "--max-age", "1e400")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("finite", r.stderr)
+        # And a legal bound still runs the gate rather than tripping the guard.
+        self.assertEqual(self._run("check", "--ref", self.base, "--repo-root",
+                                   str(self.repo), "--max-age", "3600").returncode, 0)
 
 
 class Round7Declaration(unittest.TestCase):
