@@ -236,6 +236,70 @@ class TestOneRosterPerRun(Base):
         self.assertIn("roster=v1", (self.ws / "logs" / "pool-route-handler.log").read_text())
 
 
+class TestRetryDriver(Base):
+    """kewei's P1 on #4110: `_defer()` marked work for a retry pass that
+    nothing in production ran. Every real run is now that driver."""
+
+    def log(self):
+        p = self.ws / "logs" / "pool-route-handler.log"
+        return p.read_text() if p.exists() else ""
+
+    def mark(self, task_id, channel="!room:x"):
+        d = self.ws / "state" / "pool-route-retry"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / task_id).write_text("refused: earlier\n")
+        self.task_file(task_id, channel_id=channel)
+
+    def test_the_next_handler_run_redelivers_a_marked_task(self):
+        self.roster()
+        self.mark("task-old")
+        t = self.task_file("task-new", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-old.txt").exists())
+        self.assertFalse((self.ws / "state" / "pool-route-retry" / "task-old").exists())
+        self.assertIn("retry task-old: delivered", self.log())
+
+    def test_a_marker_whose_payload_is_gone_is_dropped_with_a_log_line(self):
+        self.roster()
+        self.mark("task-old")
+        (self.ws / "tasks" / "task-old.txt").unlink()
+        t = self.task_file("task-new", channel_id="!room:x")
+        h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertFalse((self.ws / "state" / "pool-route-retry" / "task-old").exists())
+        self.assertIn("retry task-old: payload gone", self.log())
+
+    def test_the_bound_holds_so_the_waking_task_is_still_handled(self):
+        self.roster()
+        for i in range(4):
+            self.mark(f"task-old{i}")
+        t = self.task_file("task-new", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws),
+                                 "--retry-limit", "3"]), 0)
+        done = [i for i in range(4)
+                if not (self.ws / "state" / "pool-route-retry" / f"task-old{i}").exists()]
+        self.assertEqual(len(done), 3)
+        self.assertTrue((self.ws / "deliveries" / W / "task-new.txt").exists())
+
+    def test_a_crash_in_the_pass_still_routes_the_waking_task(self):
+        """The driver is opportunistic; it must never cost the task that
+        triggered it."""
+        self.roster()
+        t = self.task_file("task-new", channel_id="!room:x")
+        with unittest.mock.patch.object(h, "retry_pass", side_effect=RuntimeError("boom")):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-new.txt").exists())
+        self.assertIn("retry pass crashed", self.log())
+
+    def test_the_probe_runs_no_retry_pass(self):
+        """The probe is the watcher's read-only question; it must not deliver."""
+        self.roster()
+        self.mark("task-old")
+        t = self.task_file("task-new", channel_id="!room:x")
+        h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"])
+        self.assertTrue((self.ws / "state" / "pool-route-retry" / "task-old").exists())
+
+
+
 class TestFailureAfterTheProbe(Base):
     def log(self):
         p = self.ws / "logs" / "pool-route-handler.log"

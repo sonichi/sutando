@@ -13,8 +13,10 @@ The watcher's handler protocol carries the design's recipient rules exactly:
                             read. The real run delivers; if it fails the task stays
                             the worker's under state/pool-route-retry/<id> and the
                             run still exits 0 -- the core repairs delivery, it never
-                            answers a worker's task (owner rule). `--retry-pass`
-                            re-delivers every marked task.
+                            answers a worker's task (owner rule). Every real run
+                            re-delivers marked tasks (oldest first, bounded) BEFORE
+                            its own, so the next event is the retry driver;
+                            `--retry-pass` is the same pass, run by hand.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -41,6 +43,12 @@ TAKE = 0
 
 # Every one of these selects a recipient, so every one is header-only.
 ROUTING_KEYS = ("id", "channel_id", "source", "access_tier", "requested_worker")
+
+# A run that inherited a backlog must still handle the task that woke it; the
+# rest waits for the next event rather than stalling this one.
+RETRY_LIMIT = 20
+
+_UNSET = object()
 
 
 def read_task(task_file: str) -> dict:
@@ -101,17 +109,25 @@ def main(argv=None) -> int:
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
     p.add_argument("--retry-pass", action="store_true")
+    p.add_argument("--retry-limit", type=int, default=RETRY_LIMIT)
     for ignored in ("--runtime", "--results-dir", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
     if args.retry_pass:
-        print(json.dumps(retry_pass(ws)))
+        print(json.dumps(retry_pass(ws, limit=args.retry_limit)))
         return 0
     if not args.task_file:
         p.error("--task-file is required unless --retry-pass")
     roster = pr.load_roster(ws)
+    if not args.probe:
+        # The production retry driver: the event that woke this run is what
+        # re-delivers what an earlier run deferred. A crash here routes anyway.
+        try:
+            retry_pass(ws, roster, limit=args.retry_limit)
+        except Exception:
+            _log(ws, "retry pass crashed:\n" + traceback.format_exc())
     try:
         task = read_task(args.task_file)
     except FileNotFoundError:
@@ -178,20 +194,29 @@ def _deliver(ws, task: dict, roster) -> int:
     return 0
 
 
-def retry_pass(ws) -> dict:
-    """Re-deliver every marked task whose payload is still in tasks/, all
-    against the one roster this pass read."""
-    roster = pr.load_roster(ws)
-    outcome = {"delivered": [], "still_deferred": [], "gone": []}
+def retry_pass(ws, roster=_UNSET, limit: int = RETRY_LIMIT) -> dict:
+    """Re-deliver marked tasks whose payload is still in tasks/, oldest first.
+
+    Bounded by `limit`; the same roster the caller classified against is used,
+    so one run never re-delivers against a version it did not report.
+    """
+    if roster is _UNSET:
+        roster = pr.load_roster(ws)
+    outcome = {"delivered": [], "still_deferred": [], "gone": [], "held_over": 0}
     d = retry_dir(ws)
-    for marker in sorted(d.iterdir()) if d.is_dir() else []:
+    markers = sorted(d.iterdir(), key=lambda m: (m.stat().st_mtime, m.name)) if d.is_dir() else []
+    outcome["held_over"] = max(0, len(markers) - limit)
+    for marker in markers[:limit]:
         payload = _ws(ws) / "tasks" / f"{marker.name}.txt"
         if not payload.is_file():
             marker.unlink()
             outcome["gone"].append(marker.name)
+            _log(ws, f"retry {marker.name}: payload gone; marker dropped")
             continue
         _deliver(ws, read_task(str(payload)), roster)
-        outcome["delivered" if not marker.exists() else "still_deferred"].append(marker.name)
+        state = "delivered" if not marker.exists() else "still_deferred"
+        outcome[state].append(marker.name)
+        _log(ws, f"retry {marker.name}: {state}")
     _log(ws, f"retry pass: {json.dumps(outcome)}")
     return outcome
 
