@@ -128,6 +128,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
+- **`process-ops.sh`** — The ONE seam through which restart.sh touches a process.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
@@ -142,7 +143,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
 - **`repo_root.sh`** — Resolve the DURABLE repo that supplies the running `src/` code.
-- **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
+- **`restart.sh`** — Sutando restart — stops the services in the declared SCOPE, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
