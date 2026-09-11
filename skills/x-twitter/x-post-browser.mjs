@@ -279,6 +279,10 @@ function authTokenOnDisk() {
 }
 
 // ─── login: GUI launch via LaunchServices (REAL keychain, findable window) ───
+// Cookie encryption key lives in a profile-local file, not the login Keychain.
+// A context without keychain access would otherwise drop every cookie on load.
+const PASSWORD_STORE_ARG = '--password-store=basic';
+
 if (cmd === 'login') {
   if (!CHROME_APP) {
     console.error('Could not find a "Google Chrome for Testing.app" in the Playwright cache.');
@@ -292,6 +296,7 @@ if (cmd === 'login') {
   execFileSync('open', [
     '-n', '-a', CHROME_APP, '--args',
     `--user-data-dir=${PROFILE_DIR}`,
+    PASSWORD_STORE_ARG,
     '--no-first-run', '--no-default-browser-check',
     'https://x.com/login',
   ]);
@@ -330,6 +335,7 @@ const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
   // CRITICAL: strip --use-mock-keychain so cookie values are decrypted with the
   // SAME real login-keychain key the GUI login used. With the mock key, Chrome
   // can't decrypt the saved session and drops every cookie → silent sign-out.
+  args: [PASSWORD_STORE_ARG],
   ignoreDefaultArgs: ['--use-mock-keychain'],
 });
 

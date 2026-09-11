@@ -49,7 +49,8 @@ node skills/x-twitter/x-post-browser.mjs post "Your tweet text"
   a fresh sign-in. `$X_LOGIN_DONE_SENTINEL` and `$X_LOGIN_TIMEOUT_ITERS` are declared alongside it but are
   test/CI controls — there is no reason to set them by hand. Sign-in
   survives ONLY because `check`/`post` strip Playwright's `--use-mock-keychain` so
-  cookies decrypt with the real login keychain — see
+  cookies use a profile-local key (`--password-store=basic`), not the login
+  keychain — a context without keychain access would drop them all; see
   `memory/reference_x_browser_signin_oauth_blocked_use_email_phone.md`.
 - **Always `--dry-run` first and confirm with the owner before publishing.** Nothing
   posts without an explicit OK.
