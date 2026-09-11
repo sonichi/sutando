@@ -81,44 +81,9 @@ See [Sutando architecture boundaries](docs/architecture-boundaries.md) for the
 normative definitions of core, adapters, apps, skills, tooling, and workspace
 state.
 
-```
-    You ──voice (browser)──► Voice agent ─────────┐
-     │                       (Gemini Live,        │
-     │                        WS on :9900)        ├──► inline tools (instant,
-     │                                            │    in-process: describe_screen,
-     ├──phone (Twilio)─────► Conversation server ─┤    get_current_time, hang_up,
-     │                       (Gemini Live,        │    dtmf, ...)
-     │                        WS on :3100)        │
-     │                                            └──┐
-     │                                               │   file bridge       .──────▶────────.
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ─────────► |               |
-     │                                               │                    |   Core        |
-     │                                               │                    |   agent ↻     |
-     └──discord───────────► Discord bridge ──────────┘                    |               |
-                                                                           `──────◀────────'
-                                                                                  │
-                                                                                  ▼
-                                                                          uses anything:
-                                                                          email, calendar,
-                                                                          browser, files,
-                                                                          phone, reminders...
-                                    ◄── results/ ◄────────────────────────────────┘
-                                (spoken via voice/phone,
-                                 text via Telegram/Discord)
+![Sutando architecture: voice and phone realtime agents use inline tools for instant actions; Telegram and Discord bridges queue larger work to tasks/, the scheduled proactive loop watches tasks/, and the core agent executes work with available tools before returning results to each channel.](docs/assets/sutando-architecture.png)
 
-    ↻ = a cron job normally fires the `/proactive-loop` skill every 15 minutes
-        (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando
-        automatically backs that loop off to every 30 minutes when 7-day
-        quota utilization reaches 80%, then restores the configured cadence
-        after an authoritative, routed quota reading drops below the threshold.
-        Missing, stale, rejected, or unrouted telemetry holds the safer 30-minute
-        cadence and reports the reason instead of silently restoring a fast loop. The skill
-        runs as a 10-minute pass that keeps a persistent watcher on
-        `tasks/` via Claude Code's `Monitor` tool — pending tasks are
-        processed the moment they arrive, not just on the cron tick.
-        Each pass also runs health checks and picks the next build-log
-        item autonomously.
-```
+The core agent's loop is a cron job that fires `/proactive-loop` every 15 minutes (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando backs that off to every 30 minutes when 7-day quota utilization reaches 80%, restoring the configured cadence once an authoritative routed reading drops below it; missing, stale, rejected, or unrouted telemetry holds the slower cadence and reports why. Each pass keeps a persistent watcher on `tasks/` via Claude Code's `Monitor` tool, so tasks are processed on arrival rather than on the tick, and also runs health checks and picks the next build-log item.
 
 Four processes work together:
 - **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
