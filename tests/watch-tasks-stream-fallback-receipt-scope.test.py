@@ -21,7 +21,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 
-def run(watcher_instance, receipt_owner):
+def run(watcher_instance, receipt_owner, want_state=False):
     """receipt_owner: None | 'default' | '<instance>' — whose receipt exists."""
     tmp = Path(tempfile.mkdtemp(prefix="b4-"))
     ws = tmp / "ws"
@@ -52,7 +52,7 @@ def run(watcher_instance, receipt_owner):
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, start_new_session=True)
-    out, t0 = [], time.time()
+    out, t0, seen_state = [], time.time(), set()
     try:
         os.set_blocking(p.stdout.fileno(), False)
         while time.time() - t0 < 8:
@@ -61,13 +61,17 @@ def run(watcher_instance, receipt_owner):
                 c = p.stdout.read()
                 if c: out.append(c)
             except Exception: pass
+            # Sample WHILE the watcher lives: its cleanup trap unlinks the
+            # sentinel on exit, so a post-hoc listing is always empty.
+            seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
             if log.exists() and "handle" in log.read_text(): break
             if any("TASK_FILE" in c for c in out): break
     finally:
         try: os.killpg(os.getpgid(p.pid), 15)
         except Exception: pass
         p.wait(timeout=5)
-    return "".join(out).strip().splitlines(), (log.read_text().split() if log.exists() else [])
+    _res = "".join(out).strip().splitlines(), (log.read_text().split() if log.exists() else [])
+    return (sorted(seen_state), _res) if want_state else _res
 
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
@@ -97,18 +101,22 @@ check("worker-1 still bypasses on its OWN receipt",
 # followed argv-derived WORKSPACE_DIR, so this test deleted a live sentinel.
 _canon = Path(subprocess.run(["bash", str(REPO / "scripts/sutando-config.sh"), "workspace"],
                              capture_output=True, text=True).stdout.strip()) / "state" / "watch-tasks-stream.pid"
-_had = _canon.exists()
-_before = _canon.read_bytes() if _had else None
-_canon.parent.mkdir(parents=True, exist_ok=True)
-if not _had:
-    _canon.write_bytes(b"sentinel-control-do-not-touch\n")
-    _before = _canon.read_bytes()
-run(None, None)
-_after = _canon.read_bytes() if _canon.exists() else None
-if not _had:
-    _canon.unlink(missing_ok=True)
-check("a pre-existing CHECKOUT sentinel is byte-for-byte untouched by this test",
-      _after == _before, f"before={_before!r} after={_after!r}")
+# READ-ONLY on the canonical path: never seed, never unlink. Seeding-then-
+# unlinking deletes the sentinel of a watcher that starts mid-test.
+_before = (_canon.exists(), _canon.read_bytes() if _canon.exists() else None)
+_scratch_seen, _ = run(None, None, want_state=True)
+_after = (_canon.exists(), _canon.read_bytes() if _canon.exists() else None)
+
+# The race-free discriminator: the watcher must have written INTO the argv-derived
+# scratch workspace. This fails on the pre-fix source and needs no canonical write.
+check("the watcher's sentinel lands in the SCRATCH workspace, not the checkout",
+      _scratch_seen == ["watch-tasks-stream.pid"],
+      f"sampled while alive, scratch state held {_scratch_seen}")
+
+check("the canonical CHECKOUT sentinel is unchanged (read-only check)",
+      _after == _before,
+      f"before={_before!r} after={_after!r} -- either this test wrote it, or a real "
+      f"watcher started mid-run; both are worth a human look")
 
 print(f"watch-tasks-stream-fallback-receipt-scope: {5 - len(FAILURES)}/5 passed")
 sys.exit(1 if FAILURES else 0)
