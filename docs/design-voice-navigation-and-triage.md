@@ -11,6 +11,16 @@ owner down at both ends of a task, in the same way and for the same reason.
 What does this message refer to? The answer is in a scrollback, a page, another
 tab — and going to get it abandons the context the task is in.
 
+![A Discord message asking for an approve/reject verdict on a drafted post. The
+draft's only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
+
+The screenshot is the gap in one frame. A decision is being asked for —
+`approve — this is the post` / `reject — drop it, I take the next item` — and it
+cannot be made on the page that asks for it. Ruling on the draft means reading
+the article it is built from, which means leaving Discord for a browser. By the
+time the answer is known, the message that asked is somewhere behind a window.
+**The place a decision is requested is not a place a decision can be made.**
+
 **Between tasks, the next one is unknown.** "What should I do next" is itself
 work, and it is the work `sonichi/sutando-life` triage exists to remove: one
 proposal at a time, each an authored commitment with a `why`, its premise
