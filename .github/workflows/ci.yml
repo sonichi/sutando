@@ -305,9 +305,10 @@ jobs:
           RECDIR="$(mktemp -d)"
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
-          # `skills` too: a skill owns its own tests/ (skills/worker-pool/tests/),
-          # and a suite that moves out of tests/ must not stop running.
-          find tests skills -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # `skills` too: a skill owns its own tests/, so a suite that moves into one
+          # keeps running; the root is optional, and `&&` would abort under bash -e.
+          roots=(tests); if [ -d skills ]; then roots+=(skills); fi
+          find "${roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
