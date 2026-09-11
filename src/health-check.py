@@ -8782,6 +8782,34 @@ def _watcher_sentinel_target(state_dir, pid):
         return None
 
 
+def _peer_multiplicity_parts(groups, tracked_targets, ps_out):
+    """Peer targets carrying more than one root, ownership deciding which stays.
+
+    Computed on EVERY path, never only when no tracked-target duplicate exists:
+    a duplicate on one target must not hide a duplicate on another.
+    """
+    peer = {t: rs for t, rs in groups.items()
+            if t not in tracked_targets and len(rs) > 1}
+    if not peer:
+        return []
+    own_x, sup_x = _split_roots_by_owner(
+        [r for rs in peer.values() for r in rs], ps_out)
+    parts = []
+    for tgt, rs in peer.items():
+        _s = [r for r in rs if r in sup_x]
+        _o = [r for r in rs if r in own_x]
+        if _s and _o:
+            parts.append(f"{', '.join(rs)} share one instance — keep the supervised "
+                         f"{', '.join(_s)} and stop the ownerless {', '.join(_o)}")
+        elif _s:
+            parts.append(f"{', '.join(rs)} share one instance and are ALL supervised — "
+                         f"reduce through the launcher that owns them, do NOT stop them")
+        else:
+            parts.append(f"{', '.join(rs)} share one instance — keep ONE and stop "
+                         f"the rest")
+    return parts
+
+
 def _group_roots_by_target(state_dir, roots):
     """(target -> [pids], unresolvable pids). The ONE identity policy both the
     sentinel-present and no-sentinel branches classify with."""
@@ -9165,28 +9193,8 @@ def check_task_watcher() -> dict:
                               f"recreates a duplicate for one instance and removes the only "
                               f"watcher for another. Resolve identity first"}
         if distinct and not dupes:
-            _peer = {}
-            for tgt, rs in _groups.items():
-                if tgt not in tracked_targets and len(rs) > 1:
-                    _peer[tgt] = rs
-            if _peer:
-                # "stop the rest" must never name a supervised root: ownership
-                # decides WHICH peer stays, and a launcher owns its own count.
-                _own_x, _sup_x = _split_roots_by_owner(
-                    [r for rs in _peer.values() for r in rs], ps_out)
-                _parts = []
-                for tgt, rs in _peer.items():
-                    _s = [r for r in rs if r in _sup_x]
-                    _o = [r for r in rs if r in _own_x]
-                    if _s and _o:
-                        _parts.append(f"{', '.join(rs)} share one instance — keep the supervised "
-                                      f"{', '.join(_s)} and stop the ownerless {', '.join(_o)}")
-                    elif _s:
-                        _parts.append(f"{', '.join(rs)} share one instance and are ALL supervised — "
-                                      f"reduce through the launcher that owns them, do NOT stop them")
-                    else:
-                        _parts.append(f"{', '.join(rs)} share one instance — keep ONE and stop "
-                                      f"the rest")
+            _parts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+            if _parts:
                 _act = "; among themselves " + "; ".join(_parts)
             else:
                 _act = ". Do NOT stop them"
@@ -9197,8 +9205,16 @@ def check_task_watcher() -> dict:
                               f"register their sentinels"}
         keep = ", ".join(str(p) for p in sorted(live))
         own, sup = _split_roots_by_owner(dupes, ps_out)
-        extra_note = ("" if not distinct else
-                      f" ({len(distinct)} further tree(s) are a different instance, left alone)")
+        # The peer analysis runs here too: a tracked-target duplicate must not
+        # make a duplicate on ANOTHER target vanish into "left alone".
+        _pparts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+        if distinct and _pparts:
+            extra_note = (f" ({len(distinct)} further tree(s) are a different instance — not "
+                          f"duplicates of a tracked watcher, but among themselves "
+                          f"{'; '.join(_pparts)})")
+        else:
+            extra_note = ("" if not distinct else
+                          f" ({len(distinct)} further tree(s) are a different instance, left alone)")
         return {"name": name, "status": "warn",
                 "detail": f"{len(trees)} watcher trees running — {len(dupes)} share a sentinel "
                           f"target with a tracked watcher, so those duplicate its work{extra_note}. "

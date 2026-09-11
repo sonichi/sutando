@@ -1047,6 +1047,50 @@ class StopAdviceNeverTargetsASupervisedWatcher(unittest.TestCase):
             "unreadable identity must not authorise reduction")
 
 
+class PeerMultiplicitySurvivesATrackedTargetDuplicate(unittest.TestCase):
+    """keweichen: peer multiplicity was analysed only under `distinct and not
+    dupes`, so ONE duplicate on a tracked target hid a duplicate on a PEER
+    target. Kept apart from the no-live tests: these exercise the extras path
+    with a healthy tracked watcher present."""
+
+    A_SENT = "watch-tasks-stream-a.pid"
+    B_SENT = "watch-tasks-stream-b.pid"
+
+    def _mixed(self, parents=None):
+        """A tracked on 100; 200 duplicates A; 300+400 both target B."""
+        return run({self.A_SENT: "100\n"},
+                   {"100": {"100"}, "200": {"200"}, "300": {"300"}, "400": {"400"}},
+                   targets={"100": self.A_SENT, "200": self.A_SENT,
+                            "300": self.B_SENT, "400": self.B_SENT},
+                   parent=(lambda pid, p=None, _m=(parents or {}): _m.get(str(pid), "1")))
+
+    def test_a_tracked_duplicate_does_not_hide_a_peer_duplicate(self):
+        d = self._mixed()["detail"]
+        self.assertIn("300, 400", d,
+            "the B pair share a target and must be named as duplicates of each "
+            "other, not folded into a 'different instance, left alone' count")
+
+    def test_peer_only_control_still_reduces(self):
+        """The control that always worked: without A's duplicate the same B pair
+        is reported. It must NOT change -- that is what makes the case above
+        discriminating rather than a rewrite."""
+        d = run({self.A_SENT: "100\n"},
+                {"100": {"100"}, "300": {"300"}, "400": {"400"}},
+                targets={"100": self.A_SENT, "300": self.B_SENT,
+                         "400": self.B_SENT})["detail"]
+        self.assertIn("300, 400", d)
+
+    def test_mixed_ownership_peer_pair_keeps_the_supervised_one(self):
+        d = self._mixed({"300": "999"})["detail"]
+        self.assertIn("keep the supervised 300", d)
+        self.assertIn("stop the ownerless 400", d)
+
+    def test_all_supervised_peer_pair_routes_through_the_launcher(self):
+        d = self._mixed({"300": "999", "400": "998"})["detail"]
+        self.assertIn("reduce through the launcher", d)
+        self.assertNotIn("keep ONE and stop", d,
+            "stopping a supervised root tells an operator to kill a live child")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
