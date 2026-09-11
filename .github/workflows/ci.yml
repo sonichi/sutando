@@ -253,7 +253,12 @@ jobs:
               echo "$output"
               failed=1
             else
-              echo "$output" | grep -E 'FAIL|^all ok' || true
+              # Every suite must contribute a visible verdict. With a narrower
+              # pattern four of seven printed nothing, so a step that ran
+              # everything looked like a loop that matched no files — a green
+              # indistinguishable from absence. `tail -1` is the backstop for a
+              # suite whose closing line matches none of these.
+              echo "$output" | grep -E 'FAIL|^all ok|^all passed|^PASS' || echo "$output" | tail -1
             fi
           done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
