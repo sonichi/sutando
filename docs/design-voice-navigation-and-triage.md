@@ -54,10 +54,14 @@ description is the design in one sentence:
 > order. Approve, reject, or reply, then move on. Your decisions are recorded for
 > the agent to act on; nothing here reorders itself by what you pick.
 
-One card at a time: a waiting label, the proposition, the detail, per-item
-options, then approve / reject / reply and a list of what is already in progress.
-No board, no backlog to scan. It refreshes on its own every fifteen minutes as a
-standalone job, and a ↻ appears only when something new has actually arrived.
+![sutando-life's triage page: a header reading "Triage 40", a line reading "1 of
+40", and a single card with the question, its detail, and Approve / Reject /
+Reply / Next / Dismiss.](design-voice-navigation-and-triage-triage-page.jpg)
+
+One card at a time out of forty: a waiting label, the proposition, the detail,
+and the five actions. No board, no backlog to scan. It refreshes on its own every
+fifteen minutes as a standalone job, and a ↻ appears only when something new has
+actually arrived.
 
 Which is a good page — and a page. To answer one item the owner leaves whatever
 they were doing, and the queue is one-at-a-time by design, so **the trip is paid
