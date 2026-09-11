@@ -98,6 +98,9 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,
                 "SUTANDO_TASKS_DIR": delivery_dir,
+                # The watcher infers the workspace from its inbox; a delivery
+                # folder would put state/ and results/ under deliveries/.
+                "SUTANDO_WORKSPACE_DIR": str(workspace),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo)},
     }
 

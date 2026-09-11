@@ -102,6 +102,39 @@ def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
         time.sleep(0.2)
 
 
+def _state_root(extra_env: dict, td: Path):
+    """Run a private watcher on a delivery folder with a stub handler set, so it
+    creates its claims dir at boot; report where that dir landed."""
+    import signal
+    root = td / "repo"
+    if not root.exists():
+        shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+    ws = td / "ws"; ws.mkdir(exist_ok=True)
+    (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
+    handler = td / "handler.sh"; handler.write_text("#!/bin/bash\nexit 3\n"); handler.chmod(0o755)
+    inbox = td / "deliveries" / ("b" * 32)
+    env = {**os.environ, "SUTANDO_RESULTS_DIR": str(ws / "results"), "SUTANDO_TASKS_DIR": str(inbox),
+           "SUTANDO_TASK_EVENT_HANDLER": str(handler), **extra_env}
+    env.pop("SUTANDO_WORKSPACE_DIR", None) if "SUTANDO_WORKSPACE_DIR" not in extra_env else None
+    p = subprocess.Popen(["bash", str(root / "src" / "watch-tasks-stream.sh")], cwd=str(root), env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    under_ws = ws / "state" / "task-event-handler-claims"
+    under_inbox = td / "deliveries" / "state" / "task-event-handler-claims"
+    try:
+        deadline = time.time() + 6
+        while time.time() < deadline and not (under_ws.is_dir() or under_inbox.is_dir()) and p.poll() is None:
+            time.sleep(0.1)
+        return under_ws.is_dir(), under_inbox.is_dir()
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+        time.sleep(0.2)
+
+
 class TestWatcherGate(unittest.TestCase):
     def test_unset_the_core_watches_its_workspace_tasks_folder(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -115,6 +148,21 @@ class TestWatcherGate(unittest.TestCase):
         self.assertTrue(override, "the delivery folder was not the watched folder")
         self.assertFalse(core, "the worker must not create or watch the core's tasks/")
 
+
+    def test_an_explicit_workspace_keeps_a_workers_state_out_of_deliveries(self):
+        """The spawner names the workspace; the watcher must not infer it from
+        the delivery folder it watches."""
+        with tempfile.TemporaryDirectory() as td:
+            ws_hit, inbox_hit = _state_root({"SUTANDO_WORKSPACE_DIR": str(Path(td) / "ws")}, Path(td))
+        self.assertTrue(ws_hit, "claims dir was not created under the explicit workspace")
+        self.assertFalse(inbox_hit, "claims dir leaked under deliveries/")
+
+    def test_without_it_the_inbox_parent_is_taken_as_the_workspace(self):
+        """Control: the seam exists — absent the variable, state lands under deliveries/."""
+        with tempfile.TemporaryDirectory() as td:
+            ws_hit, inbox_hit = _state_root({}, Path(td))
+        self.assertTrue(inbox_hit)
+        self.assertFalse(ws_hit)
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)
