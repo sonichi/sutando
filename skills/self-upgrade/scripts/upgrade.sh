@@ -11,14 +11,16 @@
 #   - run the post-upgrade health check / report to the owner
 #
 # Usage:
-#   bash skills/self-upgrade/scripts/upgrade.sh [--remote <name>] [--branch <name>] [--no-restart]
-# Exit codes: 0 = upgraded (or already latest); 2 = aborted (dirty tree / not FF-able)
+#   bash skills/self-upgrade/scripts/upgrade.sh [--remote <name>] [--branch <name>] [--no-restart] [--canary owner/repo#N]
+# Exit codes: 0 = upgraded (or already latest); 2 = aborted (dirty tree / not FF-able);
+#             4 = refused by the witness-owed gate (or the gate could not run)
 
 set -uo pipefail
 
 REMOTE="origin"
 BRANCH="main"
 DO_RESTART=1
+CANARY=""
 SERVICE_SESSION="sutando-services"
 DONE_MARKER=""
 while [ $# -gt 0 ]; do
@@ -26,6 +28,7 @@ while [ $# -gt 0 ]; do
     --remote) REMOTE="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --no-restart) DO_RESTART=0; shift ;;
+    --canary) CANARY="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -69,31 +72,104 @@ if [ "$DO_RESTART" = "1" ]; then
   fi
 fi
 
-# 2. Fetch + measure the gap.
+# 2. Fetch, then PIN the target: $REMOTE/$BRANCH is mutable, so gating one
+#    resolution of it and pulling another activates a head the gate never saw.
 git fetch "$REMOTE" --quiet || { echo "self-upgrade: git fetch failed" >&2; exit 2; }
+TARGET_SHA="$(git rev-parse --verify -q "$REMOTE/$BRANCH^{commit}" || true)"
+[ -n "$TARGET_SHA" ] || { echo "self-upgrade: ABORT — cannot resolve $REMOTE/$BRANCH to a commit" >&2; exit 2; }
 LOCAL="$(git rev-parse --short HEAD)"
-BEHIND="$(git rev-list --count "HEAD..$REMOTE/$BRANCH" 2>/dev/null || echo 0)"
-AHEAD="$(git rev-list --count "$REMOTE/$BRANCH..HEAD" 2>/dev/null || echo 0)"
-echo "self-upgrade: local=$LOCAL  behind=$BEHIND  ahead=$AHEAD"
+BEHIND="$(git rev-list --count "HEAD..$TARGET_SHA" 2>/dev/null || echo 0)"
+AHEAD="$(git rev-list --count "$TARGET_SHA..HEAD" 2>/dev/null || echo 0)"
+echo "self-upgrade: local=$LOCAL  behind=$BEHIND  ahead=$AHEAD  target=${TARGET_SHA:0:8}"
 
 if [ "$BEHIND" = "0" ]; then
   echo "self-upgrade: already at latest ($LOCAL). Nothing to pull."
   exit 0
 fi
 if [ "$AHEAD" != "0" ]; then
-  echo "self-upgrade: ABORT — local is $AHEAD commit(s) ahead of $REMOTE/$BRANCH; not a fast-forward. Resolve manually." >&2
+  echo "self-upgrade: ABORT — local is $AHEAD commit(s) ahead of ${TARGET_SHA:0:8} ($REMOTE/$BRANCH); not a fast-forward. Resolve manually." >&2
   exit 2
 fi
 
 # 3. Heads-up if a rebuild is likely needed (dependency/build files changed).
-REBUILD="$(git diff --name-only "HEAD..$REMOTE/$BRANCH" | grep -iE 'package.*\.json|package-lock|tsconfig|\.swift$|requirements' || true)"
+REBUILD="$(git diff --name-only "HEAD..$TARGET_SHA" | grep -iE 'package.*\.json|package-lock|tsconfig|\.swift$|requirements' || true)"
 if [ -n "$REBUILD" ]; then
   echo "self-upgrade: NOTE — dependency/build files changed; a rebuild (npm ci / tsc) may be needed after restart:"
   echo "$REBUILD" | sed 's/^/    /'
 fi
 
-# 4. Fast-forward pull — the actual code upgrade.
-git pull --ff-only "$REMOTE" "$BRANCH" || { echo "self-upgrade: git pull --ff-only failed" >&2; exit 2; }
+# 3.5 Witness-owed gate: a merged live-path PR that still owes its post-restart
+#     round trip (REVIEW.md lesson 15) is not activated here, except as a declared
+#     canary on the host that owes it. Runs BEFORE the pull so a refusal leaves HEAD
+#     alone, and FAILS CLOSED: a gate it cannot run is a gate it cannot pass.
+GATE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+GATE_HOST="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
+GATE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+GATE_HELPER="$REPO/src/witness_owed.py"
+[ -n "$GATE_WS" ] || { echo "self-upgrade: ABORT — cannot resolve the workspace, so the witness-owed gate cannot run" >&2; exit 4; }
+# An unresolved host label cannot release anything (no canary matches ""), so
+# `check` still runs; only a canary declaration needs the label and fails closed.
+[ -n "$GATE_PY" ] || { echo "self-upgrade: ABORT — no usable python (sutando-config.sh python-bin), so the witness-owed gate cannot run" >&2; exit 4; }
+[ -f "$GATE_HELPER" ] || { echo "self-upgrade: ABORT — $GATE_HELPER is missing, so the witness-owed gate cannot run" >&2; exit 4; }
+# The target repository scopes the gate: another project's (#N) is not ours.
+GATE_URL="$(git remote get-url "$REMOTE" 2>/dev/null || true)"
+GATE_REPO="$(printf '%s' "$GATE_URL" | sed -E 's#/+$##; s#\.git$##' | sed -nE 's#^.*[/:]([^/:]+)/([^/:]+)$#\1/\2#p')"
+[ -n "$GATE_REPO" ] || { echo "self-upgrade: ABORT — cannot derive owner/name from remote '$REMOTE' ($GATE_URL), so the witness-owed gate cannot scope its records" >&2; exit 4; }
+# Fleet view: with the vault on, refresh it first and fail closed if that fails;
+# with it off, foreign host subtrees are a fleet this host cannot refresh.
+GATE_VAULT="$(bash "$REPO/scripts/sutando-config.sh" vault-enabled 2>/dev/null || true)"
+# Declared in this skill's manifest, read env > manifest > built-in per
+# skills/MANIFEST.md; the shell no longer keeps its own copy of the bound's rule.
+GATE_MAX_AGE="${SUTANDO_WITNESS_MAX_AGE:-}"
+[ -n "$GATE_MAX_AGE" ] || GATE_MAX_AGE="$("$GATE_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["SUTANDO_WITNESS_MAX_AGE"])' "$REPO/skills/self-upgrade/manifest.json" 2>/dev/null || true)"
+[ -n "$GATE_MAX_AGE" ] || GATE_MAX_AGE=3600
+# nan/inf parse as floats and disable expiry while claiming a bound; the check
+# lives once, in the helper that consumes the value.
+PYTHONDONTWRITEBYTECODE=1 "$GATE_PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); from witness_owed import validate_max_age; validate_max_age(sys.argv[2])' "$REPO/src" "$GATE_MAX_AGE" 2>/dev/null ||
+  { echo "self-upgrade: ABORT — witness max age must be a finite number of seconds > 0, got '$GATE_MAX_AGE' (declared in skills/self-upgrade/manifest.json)" >&2; exit 4; }
+if [ "$GATE_VAULT" = "true" ]; then
+  # Stamp before the sync so this host's own records travel WITH the claim that
+  # peers can see them; a stamp pushed without its records is a false claim.
+  [ -n "$GATE_HOST" ] && "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" publish --host "$GATE_HOST" >/dev/null 2>&1 || true
+  # --pull-strict, not the default tick: the default returns the PUSH's rc and
+  # its zero says nothing about whether peer records arrived (exit 3 = pull leg).
+  GATE_SYNC_RC=0
+  bash "$REPO/scripts/sync-workspace.sh" --pull-strict || GATE_SYNC_RC=$?
+  if [ "$GATE_SYNC_RC" = "3" ]; then
+    echo "self-upgrade: ABORT — vault sync's PULL leg failed, so this host's view of the fleet's witness-owed records is not current" >&2
+    exit 4
+  elif [ "$GATE_SYNC_RC" != "0" ]; then
+    echo "self-upgrade: ABORT — vault sync failed (exit $GATE_SYNC_RC, push leg), so the fleet's witness-owed records cannot be called fresh" >&2
+    exit 4
+  fi
+elif [ -d "$GATE_WS/hosts" ] && [ -n "$GATE_HOST" ] && find "$GATE_WS/hosts" -mindepth 2 -maxdepth 2 -name witness-owed -not -path "$GATE_WS/hosts/$GATE_HOST/*" | grep -q .; then
+  echo "self-upgrade: ABORT — foreign host witness-owed subtrees exist but the vault is disabled, so they cannot be refreshed" >&2
+  echo "  Enable the vault, or re-stamp this host's view once its records are current:" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS publish --host ${GATE_HOST:-<this-host>}" >&2
+  exit 4
+fi
+if [ -n "$CANARY" ]; then
+  [ -n "$GATE_HOST" ] || { echo "self-upgrade: ABORT — cannot resolve this host's label, so it cannot be declared the canary for $CANARY" >&2; exit 4; }
+  "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" canary "$CANARY" --host "$GATE_HOST" >/dev/null ||
+    { echo "self-upgrade: ABORT — cannot declare $GATE_HOST the canary for $CANARY (no open record, or a different host owes it)" >&2; exit 4; }
+  # The declaration changed this host's record, so the stamp no longer
+  # describes it; re-stamp before the gate reads it back.
+  "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" publish --host "$GATE_HOST" >/dev/null 2>&1 || true
+  echo "self-upgrade: canary activation of $CANARY declared for $GATE_HOST — post the round trip and close the record"
+fi
+if ! "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" check --ref "$TARGET_SHA" --current HEAD --repo-root "$REPO" --repo "$GATE_REPO" --max-age "$GATE_MAX_AGE" ${GATE_HOST:+--host "$GATE_HOST"}; then
+  echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
+  echo "  Post the exact-head round trip to the PR thread, then close the record ON THE OWING HOST:" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS close owner/repo#N --witness <url> --host <owing-host>" >&2
+  echo "  From any OTHER host, tombstone it instead (same arguments, --host is THIS host):" >&2
+  echo "    $GATE_PY $GATE_HELPER --workspace $GATE_WS tombstone owner/repo#N --witness <url> --host ${GATE_HOST:-<this-host>}" >&2
+  echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
+  exit 4
+fi
+
+# 4. Fast-forward to the PINNED object — the actual code upgrade. `git pull`
+#    would fetch again and activate whatever the remote moved to since the gate.
+git merge --ff-only "$TARGET_SHA" || { echo "self-upgrade: fast-forward to ${TARGET_SHA:0:8} failed" >&2; exit 2; }
 NOW="$(git rev-parse --short HEAD)"
 echo "self-upgrade: pulled $LOCAL -> $NOW (0 behind)"
 

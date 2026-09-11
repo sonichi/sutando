@@ -3314,8 +3314,10 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                 "detail": f"live checkout is on {expected!r} but {behind} commits behind "
                           f"origin/{expected} — merged fixes are not running here, and a "
                           "guard that never shipped to this machine reports nothing (so "
-                          "silence reads as health). Refresh with "
-                          f"`git -C {repo} pull --ff-only` + restart. Count is against the "
+                          "silence reads as health). Refresh THROUGH THE GATE with "
+                          f"`bash {repo}/skills/self-upgrade/scripts/upgrade.sh` (it fast-forwards "
+                          "and restarts; a direct `git pull` activates a head that still owes its "
+                          "witness). Count is against the "
                           "last-fetched ref; this probe does not fetch."}
     # Count is the wrong instrument for BEHAVIORAL staleness, and the threshold
     # above is deliberately 10 to avoid alert fatigue — correctly, since `main`
@@ -3361,15 +3363,15 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                         "count is not available)")
             # "of them" needs a total to refer to.
             share = f"{len(subset)} commit(s) change"
-            refresh = (f"`git -C {repo} fetch --unshallow` first; `pull --ff-only` cannot "
-                       "apply without a shared history")
+            refresh = (f"`git -C {repo} fetch --unshallow` first; the gate-aware updater's "
+                       "`--ff-only` cannot apply without a shared history")
         else:
             distance = (f"live checkout is on {expected!r} and only {behind} commit(s) behind "
                         f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
                         "nag threshold")
             # The count above is the TOTAL, so "of them" keeps the subset a subset.
             share = f"{len(subset)} of them change"
-            refresh = f"`git -C {repo} pull --ff-only`"
+            refresh = f"`bash {repo}/skills/self-upgrade/scripts/upgrade.sh` (gate-aware; a direct `git pull` bypasses it)"
         tail = (f"Measured against the last-fetched ref; this probe does not fetch, "
                 f"so it can only under-report.")
         if stale_skills:
@@ -3388,7 +3390,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "and while the checkout is behind those agree exactly. "
                           f"({'; '.join(stale_services[:3])}"
                           f"{'; …' if len(stale_services) > 3 else ''}) Refresh with "
-                          f"{refresh} + restart the affected service. {tail}"}
+                          f"{refresh}, which restarts the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")

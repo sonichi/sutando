@@ -1,0 +1,21 @@
+{
+  "name": "self-upgrade",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Pull the repo to latest and restart background services behind the witness-owed first-deploy gate. Manifest present to DECLARE config per skills/MANIFEST.md; it contributes no runtime tools.",
+  "access_tier": "owner",
+  "enabled": true,
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "SUTANDO_WITNESS_MAX_AGE": "3600"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

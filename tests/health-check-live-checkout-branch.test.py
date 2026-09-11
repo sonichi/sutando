@@ -84,6 +84,7 @@ hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
 
 FAILS: list[str] = []
+_real_service_sources = hc._running_service_sources
 
 
 def check(cond: bool, msg: str) -> None:
@@ -919,6 +920,34 @@ def main() -> int:
             sys.modules.pop("git_binary", None)
         else:
             sys.modules["git_binary"] = real_mod
+
+    # aa) The PRESCRIPTION must route through the witness-owed gate: a bare
+    #     `git pull --ff-only` activates a head still owing its witness.
+    GATE_CMD = "skills/self-upgrade/scripts/upgrade.sh"
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), hc._BEHIND_WARN_DEFAULT + 2)
+        far = hc.check_live_checkout_branch(work)["detail"]
+    check(GATE_CMD in far, f"aa) far-behind guidance names the gate-aware updater, got {far[:140]}")
+    check("pull --ff-only" not in far,
+          f"aa) far-behind guidance must not prescribe a bare pull, got {far[:140]}")
+
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        near = hc.check_live_checkout_branch(work)["detail"]
+    check(GATE_CMD in near, f"aa) stale-skill guidance names the gate-aware updater, got {near[:140]}")
+    check("pull --ff-only" not in near,
+          f"aa) stale-skill guidance must not prescribe a bare pull, got {near[:140]}")
+
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["src/example-service.py"])
+        hc._running_service_sources = lambda: ["src/example-service.py"]
+        try:
+            svc = hc.check_live_checkout_branch(work)["detail"]
+        finally:
+            hc._running_service_sources = _real_service_sources
+    check(GATE_CMD in svc, f"aa) stale-service guidance names the gate-aware updater, got {svc[:140]}")
+    check("pull --ff-only" not in svc,
+          f"aa) stale-service guidance must not prescribe a bare pull, got {svc[:140]}")
 
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")
