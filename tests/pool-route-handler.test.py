@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -185,6 +186,64 @@ class TestFailureAfterTheProbe(Base):
         Path(t).unlink()
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         self.assertIn("gone before the run", self.log())
+
+
+class TestRunAndDeferral(Base):
+    """`run()` is the diagnostic instrument: every exit of the real run leaves
+    a log line, and a deferral never turns into a non-zero exit."""
+
+    def log(self):
+        p = self.ws / "logs" / "pool-route-handler.log"
+        return p.read_text() if p.exists() else ""
+
+    def test_a_normal_run_logs_the_code_it_returns(self):
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.run(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertIn("run returning rc=0", self.log())
+
+    def test_a_probe_logs_nothing_about_its_return(self):
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        h.run(["--task-file", t, "--workspace", str(self.ws), "--probe"])
+        self.assertNotIn("run returning", self.log())
+
+    def test_an_exception_outside_main_is_logged_and_re_raised(self):
+        with unittest.mock.patch.object(h, "main", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                h.run(["--task-file", "x", "--workspace", str(self.ws)])
+        self.assertIn("unhandled:", self.log())
+        self.assertIn("RuntimeError: boom", self.log())
+
+    def test_a_systemexit_passes_through_unlogged(self):
+        with unittest.mock.patch.object(h, "main", side_effect=SystemExit(2)):
+            with self.assertRaises(SystemExit):
+                h.run(["--task-file", "x", "--workspace", str(self.ws)])
+        self.assertNotIn("unhandled:", self.log())
+
+    def test_workspace_arg_is_read_in_both_spellings(self):
+        self.assertEqual(h._workspace_arg(["--workspace", "/w"]), "/w")
+        self.assertEqual(h._workspace_arg(["--workspace=/w2"]), "/w2")
+        self.assertIsNone(h._workspace_arg(["--task-file", "t"]))
+
+    def test_the_retry_pass_cli_prints_its_outcome(self):
+        self.roster()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = h.main(["--retry-pass", "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())["delivered"], [])
+
+    def test_a_deferral_whose_marker_cannot_be_written_still_exits_zero(self):
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
+             "bindings": {"!room:x": [W, "f" * 32]}}))
+        (self.ws / "state" / "pool-route-retry").write_text("a file where the dir should be")
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertIn("deferred WITHOUT marker", self.log())
 
 
 if __name__ == "__main__":

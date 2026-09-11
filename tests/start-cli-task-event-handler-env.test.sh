@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pins start-cli's handler wiring: a caller-set SUTANDO_TASK_EVENT_HANDLER is
-# forwarded verbatim; absent, the repo's own router is the default; with neither,
-# nothing is forwarded (a core booted without it routes nothing).
+# forwarded verbatim; absent, nothing is forwarded — core never locates a handler
+# by filename, even when the repo ships one.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -16,11 +16,12 @@ out="$(run_probe "$STARTCLI" SUTANDO_TASK_EVENT_HANDLER=/elsewhere/handler.py)"
 printf '%s\n' "$out" | grep -qx 'SUTANDO_TASK_EVENT_HANDLER=/elsewhere/handler.py'
 check $? "caller preset is forwarded verbatim"
 
-# 2. No preset, repo router present -> the repo copy is the default.
+# 2. No preset, repo router present -> nothing forwarded: core never locates a
+#    handler by filename (the pool's install names it).
 [ -x "$REPO/src/pool_route_handler.py" ] || chmod +x "$REPO/src/pool_route_handler.py"
 out="$(run_probe "$STARTCLI")"
-printf '%s\n' "$out" | grep -qx "SUTANDO_TASK_EVENT_HANDLER=$REPO/src/pool_route_handler.py"
-check $? "absent preset defaults to the repo's own router"
+! printf '%s\n' "$out" | grep -q 'SUTANDO_TASK_EVENT_HANDLER='
+check $? "absent preset forwards nothing even though the repo ships a router"
 
 # 3. Neither: a mirror of the repo without the router forwards nothing. bash's
 # logical cd keeps $0 under the mirror, so start-cli resolves REPO to it.
