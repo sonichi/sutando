@@ -75,7 +75,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="worker watcher bootstrap decision")
     ap.add_argument("--instance", default=os.environ.get("SUTANDO_INSTANCE_ID", ""))
     ap.add_argument("--inbox", default=os.environ.get("SUTANDO_TASKS_DIR", ""))
-    ap.add_argument("--workspace", default=os.environ.get("SUTANDO_WORKSPACE_DIR", ""))
+    # Not the spawner's env var: a worker SHARES the host's workspace, so the
+    # canonical loader is the answer and the contract's only resolution path.
+    ap.add_argument("--workspace", default="")
     a = ap.parse_args(argv)
     workspace = a.workspace
     if not workspace:
