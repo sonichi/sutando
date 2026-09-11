@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_text  # noqa: E402
+from active_code import active_lines, active_text, unquoted  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
@@ -48,12 +48,37 @@ def _uncommented(text: str) -> str:
     return active_text(text)
 
 
+def _run_bodies(text: str) -> list[str]:
+    """Lines inside a workflow `run:` value — the only place a command executes.
+
+    A path under `name:` or `if:` is data; scanning the whole file counts it."""
+    out, indent = [], None
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        m = re.match(r"-?\s*run:\s*\|?-?\s*(.*)$", stripped)
+        if m and re.search(r"(^|\s)run:", stripped):
+            indent = len(ln) - len(ln.lstrip())
+            if m.group(1):
+                out.append(m.group(1))
+            continue
+        if indent is not None:
+            if stripped and (len(ln) - len(ln.lstrip())) <= indent:
+                indent = None
+            else:
+                out.append(ln)
+    return out
+
+
 def named_in_workflows():
-    """Files any workflow ACTIVELY invokes, e.g. `python3 path/to/x.py`."""
+    """Files any workflow ACTIVELY invokes, e.g. `python3 path/to/x.py`.
+
+    Quoted text is blanked first: `echo 'python3 x.py'` names x.py without
+    running it, and counting it masks a genuinely orphaned test."""
     named = set()
     for wf in (REPO / ".github" / "workflows").glob("*.yml"):
-        for m in re.finditer(r"python3?\s+(\S+\.py)", _uncommented(wf.read_text())):
-            named.add(m.group(1))
+        for ln in active_lines("\n".join(_run_bodies(wf.read_text()))):
+            for m in re.finditer(r"python3?\s+(\S+\.py)", unquoted(ln)):
+                named.add(m.group(1))
     return named
 
 

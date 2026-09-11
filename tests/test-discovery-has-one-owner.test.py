@@ -139,6 +139,31 @@ class TestAdjacentGuardDefects(unittest.TestCase):
             m.subprocess = real
         self.assertEqual(got, {"tests/space name.test.py", "tests/ok.test.py"})
 
+    def test_a_quoted_call_in_a_run_body_is_not_a_caller(self):
+        """`echo 'python3 x.py'` names a path without running it.
+
+        Counting it masks the file from the orphan check, which is the one
+        thing this guard exists to find."""
+        m = self._guard()
+        with tempfile.TemporaryDirectory() as td:
+            wf = Path(td) / ".github" / "workflows"
+            wf.mkdir(parents=True)
+            (wf / "x.yml").write_text(
+                "      - run: python3 real/thing.py\n"
+                "      - run: echo 'python3 packages/x/test_echoed.py'\n"
+                "      - name: python3 packages/x/test_nameonly.py\n")
+            real = m.REPO
+            m.REPO = Path(td)
+            try:
+                named = m.named_in_workflows()
+            finally:
+                m.REPO = real
+        self.assertIn("real/thing.py", named)
+        self.assertNotIn("packages/x/test_echoed.py", named,
+                         "a quoted path read as an invocation")
+        self.assertNotIn("packages/x/test_nameonly.py", named,
+                         "a path under name: is data, not a command")
+
     def test_a_commented_invocation_is_not_an_active_caller(self):
         """Drives named_in_workflows() over a real workflow file on disk."""
         m = self._guard()
