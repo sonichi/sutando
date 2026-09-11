@@ -420,11 +420,9 @@ dispatch_task() {
 # the session and turn into an orphan. The trap below removes the file on a
 # clean exit; the Stop hook removes it after the kill on dirty exits.
 #
-# Same workspace resolution as TASKS_DIR (above): M0 cutover routes through
-# the canonical loader. Living under state/ matches the workspace contract
-# in CLAUDE.md (loose status/state files belong there). Post-v0.8 the legacy
-# env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
-STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
+# Derived from WORKSPACE_DIR like CLAIMS_DIR and FALLBACKS_DIR, never re-resolved:
+# an argv tasks dir moves every other state path but left this one on the checkout.
+STATE_DIR="$WORKSPACE_DIR/state"
 mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.

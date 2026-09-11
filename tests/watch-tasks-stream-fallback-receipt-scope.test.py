@@ -93,5 +93,23 @@ so, hl = run("worker-1", "worker-1")
 check("worker-1 still bypasses on its OWN receipt",
       hl == BYPASSED and any("TASK_FILE" in s for s in so), f"{so} {hl}")
 
-print(f"watch-tasks-stream-fallback-receipt-scope: {4 - len(FAILURES)}/4 passed")
+# keweichen at c40e6e61: STATE_DIR re-resolved the CHECKOUT workspace while every
+# other state path followed the argv-derived WORKSPACE_DIR, so this very test wrote
+# and then deleted a real installation's sentinel.
+_canon = Path(subprocess.run(["bash", str(REPO / "scripts/sutando-config.sh"), "workspace"],
+                             capture_output=True, text=True).stdout.strip()) / "state" / "watch-tasks-stream.pid"
+_had = _canon.exists()
+_before = _canon.read_bytes() if _had else None
+_canon.parent.mkdir(parents=True, exist_ok=True)
+if not _had:
+    _canon.write_bytes(b"sentinel-control-do-not-touch\n")
+    _before = _canon.read_bytes()
+run(None, None)
+_after = _canon.read_bytes() if _canon.exists() else None
+if not _had:
+    _canon.unlink(missing_ok=True)
+check("a pre-existing CHECKOUT sentinel is byte-for-byte untouched by this test",
+      _after == _before, f"before={_before!r} after={_after!r}")
+
+print(f"watch-tasks-stream-fallback-receipt-scope: {5 - len(FAILURES)}/5 passed")
 sys.exit(1 if FAILURES else 0)
