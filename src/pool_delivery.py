@@ -161,8 +161,11 @@ def held_by_other_instance(workspace, task_id: str,
         # in front of its Stop hook. A name no recipient may own holds nothing.
         if not d.is_dir() or d.name == me or not RECIPIENT.match(d.name):
             continue
-        if find(workspace, d.name, task_id) is not None:
-            return d.name
+        # The lock the writers take: find() probes three names, and a
+        # release() rename between two of them hides a hold that never ended.
+        with arbitration(workspace, d.name):
+            if find(workspace, d.name, task_id) is not None:
+                return d.name
     return None
 
 
