@@ -33,7 +33,8 @@ WATCHER_ARGV = "bash src/watch-tasks-stream.sh"
 
 
 def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
-        parent="1", pid_instance=None, pid_actor="", targets=None, verdicts=None) -> dict:
+        parent="1", pid_instance=None, pid_actor="", targets=None, verdicts=None,
+        ps="") -> dict:
     """`sentinels` maps filename -> contents; `trees` maps root pid -> members.
 
     `pid_instance` is what the WATCHER's own environment yields: a string names
@@ -59,8 +60,9 @@ def run(sentinels: dict, trees: dict, argv=WATCHER_ARGV, core_alive=True,
                 hc._is_watcher_argv = (
                     lambda a, pid=None, _v=verdicts: _v.get(str(pid), True))
             hc._watcher_trees = lambda *a, **k: trees
-            hc._ps_snapshot = lambda *a, **k: ""
-            hc._pid_parent = lambda pid, ps=None: parent
+            hc._ps_snapshot = lambda *a, **k: ps
+            hc._pid_parent = (parent if callable(parent)
+                              else (lambda pid, _p=None: parent))
             hc._fresh_local_core_record = lambda *a, **k: ({} if core_alive else None)
             hc._pid_instance_id = lambda pid: pid_instance
             hc._pid_actor_id = lambda pid: pid_actor
@@ -710,12 +712,37 @@ class ExtraTreesKeepTheirMultiplicity(unittest.TestCase):
         self.assertIn("777", r["detail"])
         self.assertNotIn("Do NOT stop them", r["detail"])
 
+    W2 = "bash /repo/src/watch-tasks-stream.sh"
+
+    def _peer(self, parents):
+        """Extras 200 and 300 both on target B; `parents` sets their ownership."""
+        ps = f"  900 1 /bin/zsh -l\n  100 1 {self.W2}\n  200 {parents['200']} {self.W2}\n" \
+             f"  300 {parents['300']} {self.W2}\n"
+        return run({"watch-tasks-stream-A.pid": "100\n"},
+                   {"100": {"100"}, "200": {"200"}, "300": {"300"}},
+                   parent=lambda pid, p=None: parents.get(str(pid), "1"),
+                   ps=ps,
+                   targets={"100": "A.pid", "200": "B.pid", "300": "B.pid"})
+
+    def test_peer_duplicates_MIXED_keep_the_supervised_one(self):
+        """qingyun-wu at 5425c7ad: "keep ONE and stop the rest" can name a
+        watcher with a live parent — the thing this PR exists to prevent."""
+        r = self._peer({"100": "1", "200": "900", "300": "1"})
+        self.assertIn("keep the supervised 200", r["detail"])
+        self.assertIn("stop the ownerless 300", r["detail"])
+
+    def test_peer_duplicates_ALL_supervised_are_not_stopped(self):
+        r = self._peer({"100": "1", "200": "900", "300": "900"})
+        self.assertIn("ALL supervised", r["detail"])
+        self.assertIn("do NOT stop them", r["detail"])
+        self.assertNotIn("keep ONE and stop", r["detail"])
+
     def test_two_extras_on_one_target_are_duplicates_of_each_other(self):
         r = run({"watch-tasks-stream-A.pid": "100\n"},
                 {"100": {"100"}, "200": {"200"}, "300": {"300"}},
                 targets={"100": "A.pid", "200": "B.pid", "300": "B.pid"})
         self.assertIn("share one instance", r["detail"])
-        self.assertIn("keep ONE of each", r["detail"])
+        self.assertIn("keep ONE and stop the rest", r["detail"])
         # the old wording called them "not duplicates" full stop, which erased
         # that they duplicate EACH OTHER; qualified is fine, unqualified is not.
         self.assertNotIn("not duplicates; each", r["detail"])

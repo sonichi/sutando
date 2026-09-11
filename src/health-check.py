@@ -9148,9 +9148,24 @@ def check_task_watcher() -> dict:
                 if tgt not in tracked_targets and len(rs) > 1:
                     _peer[tgt] = rs
             if _peer:
-                _act = ("; among themselves " + "; ".join(
-                    f"{', '.join(rs)} share one instance" for rs in _peer.values())
-                    + " — keep ONE of each and stop the rest")
+                # "stop the rest" must never name a supervised root: ownership
+                # decides WHICH peer stays, and a launcher owns its own count.
+                _own_x, _sup_x = _split_roots_by_owner(
+                    [r for rs in _peer.values() for r in rs], ps_out)
+                _parts = []
+                for tgt, rs in _peer.items():
+                    _s = [r for r in rs if r in _sup_x]
+                    _o = [r for r in rs if r in _own_x]
+                    if _s and _o:
+                        _parts.append(f"{', '.join(rs)} share one instance — keep the supervised "
+                                      f"{', '.join(_s)} and stop the ownerless {', '.join(_o)}")
+                    elif _s:
+                        _parts.append(f"{', '.join(rs)} share one instance and are ALL supervised — "
+                                      f"reduce through the launcher that owns them, do NOT stop them")
+                    else:
+                        _parts.append(f"{', '.join(rs)} share one instance — keep ONE and stop "
+                                      f"the rest")
+                _act = "; among themselves " + "; ".join(_parts)
             else:
                 _act = ". Do NOT stop them"
             return {"name": name, "status": "warn",
