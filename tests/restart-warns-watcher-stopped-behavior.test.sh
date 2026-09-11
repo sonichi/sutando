@@ -20,6 +20,23 @@ build() {                       # build <sandbox> [perturbation]
   local sb="$1" perturb="${2:-none}"
   mkdir -p "$sb/src" "$sb/bin"
   cp "$REPO/src/restart.sh" "$sb/src/restart.sh"
+  # Stubs FIRST. A perturbation that aborts below used to return with bin/ empty,
+  # and run()'s PATH fell through to the real pkill — killing the host's watchers.
+  printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$sb/src/startup.sh"
+  printf '#!/bin/sh\necho "STUB-PKILL $*"\nexit 0\n'  > "$sb/bin/pkill"
+  for c in pgrep launchctl ngrok lsof id open killall osascript tmux nohup; do
+    printf '#!/bin/sh\nexit 1\n' > "$sb/bin/$c"
+  done
+  printf '#!/bin/sh\nexit 0\n' > "$sb/bin/sleep"
+  # PATH stays stub-only, so every binary is named here explicitly. Adding /bin
+  # instead would expose the real launchctl, which restart.sh uses to bootout jobs.
+  # These are read-only or scoped to the sandbox; nothing here can signal a process.
+  for c in bash sh dirname basename seq cat grep sed awk tr head tail wc \
+           mktemp rm mkdir cp mv ls test env printf date stat; do
+    [ -x "/bin/$c" ] && ln -sf "/bin/$c" "$sb/bin/$c"
+    [ -x "/usr/bin/$c" ] && ln -sf "/usr/bin/$c" "$sb/bin/$c"
+  done
+  chmod +x "$sb/src/startup.sh" "$sb/bin/"*
   case "$perturb" in
     disable-warning)
       "$REPO_PY" - "$sb/src/restart.sh" <<'PY' || return 1
@@ -33,15 +50,17 @@ open(p, "w").write(s)
 PY
       ;;
   esac
-  printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$sb/src/startup.sh"
-  printf '#!/bin/sh\necho "STUB-PKILL $*"\nexit 0\n'  > "$sb/bin/pkill"
-  for c in pgrep launchctl ngrok; do printf '#!/bin/sh\nexit 1\n' > "$sb/bin/$c"; done
-  printf '#!/bin/sh\nexit 0\n' > "$sb/bin/sleep"
-  chmod +x "$sb/src/startup.sh" "$sb/bin/"*
 }
 
 run() {                         # run <sandbox> -> stdout of a full restart
-  ( cd "$sb" && PATH="$1/bin:$PATH" bash "$1/src/restart.sh" 2>/dev/null )
+  # Refuse an unbuilt sandbox, and use ONLY the stub PATH. Both are load-bearing:
+  # a missing stub must be `command not found`, never the host's real binary.
+  if [ ! -x "$1/bin/pkill" ] || [ ! -x "$1/src/startup.sh" ]; then
+    echo "REFUSED-UNBUILT-SANDBOX"; return 0
+  fi
+  # /bin/bash by absolute path: the stub-only PATH applies to the script's own
+  # lookups, and would otherwise hide the interpreter running it.
+  ( cd "$1" && PATH="$1/bin" /bin/bash "$1/src/restart.sh" 2>/dev/null )
 }
 
 # Assertions on one captured run. Returns 0 when the warning behaviour holds.
@@ -94,7 +113,7 @@ ck "restart.sh itself starts no watcher (its own claim, on its own output)" $?
 sb="$SB_ROOT/off"
 if build "$sb" disable-warning; then perturbed=0; else perturbed=1; fi
 ck "the disabling perturbation applied (control is not vacuous)" "$perturbed"
-out_off="$(run "$sb")"
+if [ "$perturbed" = "0" ]; then out_off="$(run "$sb")"; else out_off=""; fi
 grep -q "STUB-STARTUP-REACHED" <<<"$out_off"
 ck "control still runs (perturbation is narrow, not a broken script)" $?
 if [ "$perturbed" != "0" ]; then
