@@ -59,9 +59,12 @@ def read_task(task_file: str) -> dict:
     return task
 
 
-def classify(workspace, task: dict) -> tuple[int, list]:
-    """(exit code, targets) without delivering anything."""
-    roster = pr.load_roster(workspace)
+def classify(task: dict, roster) -> tuple[int, list]:
+    """(exit code, targets) without delivering anything.
+
+    The roster is passed in, never loaded here: classification and delivery
+    must decide against ONE version, and two loads are two decisions.
+    """
     if roster is None:
         # Take, never decline: the run refuses and the core answers by fallback,
         # so an unreadable file never picks a worker.
@@ -108,23 +111,26 @@ def main(argv=None) -> int:
         return 0
     if not args.task_file:
         p.error("--task-file is required unless --retry-pass")
+    roster = pr.load_roster(ws)
     try:
         task = read_task(args.task_file)
     except FileNotFoundError:
         # Finished and archived between the probe and this run: nothing to route.
         _log(ws, f"{args.task_file}: gone before the run; nothing to route")
         return 0
-    code, _targets = classify(ws, task)
+    code, _targets = classify(task, roster)
     if args.probe:
         return code
-    _log(ws, f"{task.get('id')}: run classify={code} targets={_targets}")
+    version = roster.get("version") if roster else None
+    _log(ws, f"{task.get('id')}: run classify={code} targets={_targets} "
+             f"roster=v{version}")
     if code == DECLINE:
         if not task.get("channel_id"):
             _log(ws, f"{task.get('id')}: no channel_id header — the core takes it; "
                      "routing metadata is never read from a task body")
         return DECLINE
 
-    return _deliver(ws, task)
+    return _deliver(ws, task, roster)
 
 
 def retry_dir(workspace) -> Path:
@@ -147,10 +153,12 @@ def _defer(ws, task_id: str, reason: str) -> int:
     return 0
 
 
-def _deliver(ws, task: dict) -> int:
+def _deliver(ws, task: dict, roster) -> int:
     task_id = task.get("id") or "?"
+    if roster is None:
+        return _defer(ws, task_id, "refused: roster is absent or unreadable")
     try:
-        out = rt.route(ws, task, None)
+        out = rt.route(ws, task, roster)
     except rt.RouterRefused as e:
         return _defer(ws, task_id, f"refused: {e}")
     except Exception:
@@ -171,7 +179,9 @@ def _deliver(ws, task: dict) -> int:
 
 
 def retry_pass(ws) -> dict:
-    """Re-deliver every marked task whose payload is still in tasks/."""
+    """Re-deliver every marked task whose payload is still in tasks/, all
+    against the one roster this pass read."""
+    roster = pr.load_roster(ws)
     outcome = {"delivered": [], "still_deferred": [], "gone": []}
     d = retry_dir(ws)
     for marker in sorted(d.iterdir()) if d.is_dir() else []:
@@ -180,7 +190,7 @@ def retry_pass(ws) -> dict:
             marker.unlink()
             outcome["gone"].append(marker.name)
             continue
-        _deliver(ws, read_task(str(payload)))
+        _deliver(ws, read_task(str(payload)), roster)
         outcome["delivered" if not marker.exists() else "still_deferred"].append(marker.name)
     _log(ws, f"retry pass: {json.dumps(outcome)}")
     return outcome
