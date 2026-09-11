@@ -17,15 +17,32 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
+COVGATE = REPO / "scripts" / "coverage-gate.sh"
+
+
+def ci_find_roots():
+    """The roots CI actually passes to `find`, read from the wiring itself.
+
+    Hardcoding them here restates the contract instead of checking it: the
+    binding below was assigned and never read, so dropping a root from CI left
+    this guard green."""
+    roots = set()
+    for wiring in (CI, COVGATE):
+        text = wiring.read_text()
+        for m in re.finditer(r"(?:^|\s)_?\w*roots\+?=\(([^)]*)\)", text):
+            roots |= {t for t in m.group(1).split() if t and not t.startswith("$")}
+    return roots
 
 
 def discovered_by_find():
-    """What `find tests skills -name '*.test.py'` reaches.
-
-    Both roots: a skill owns its own tests/ dir, so a suite that moves out of
-    tests/ into skills/<name>/tests/ stays discovered rather than going silent."""
+    """What CI's own find roots reach."""
+    roots = ci_find_roots()
+    if not roots:
+        raise AssertionError(
+            "could not read any find root out of %s or %s — the guard cannot "
+            "assert coverage it never parsed" % (CI.name, COVGATE.name))
     found = set()
-    for root in ("tests", "skills"):
+    for root in sorted(roots):
         found |= {str(Path(p)) for p in glob.glob(f"{root}/**/*.test.py", recursive=True)}
     return {p for p in found if "node_modules" not in p}
 
