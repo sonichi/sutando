@@ -35,9 +35,17 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 ### Step 2 — Classify each task
 
+**Run the classifier; do not re-derive the verdicts by hand:**
+
+```bash
+python3 skills/task-orphan-check/scripts/classify.py        # add --workspace DIR to override
+```
+
+It prints one JSON object — `tasks[]` with `id`, `source`, `access_tier`, `channel_id`, `label` (the readable channel label step 3b uses), `age_s`, `import`, `verdict` (`done` / `fresh` / `orphan` / `import-resume`) and a `reason` naming the marker or age line it matched — plus `counts`. Read-only: it moves and writes nothing; step 3 acts on its verdicts. The rules it encodes are the ones below (pinned by `tests/task-orphan-check-classify.test.py`); if you change a rule, change the script and its test, then this prose.
+
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
-1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (Discord channel or ag2.space room id — both producers supply it, and the later `contextNotFrom`/requeue workflow needs the exact id, so never discard it in favor of the friendly name), `chat_id` (Telegram), `room_name` / `channel_name` (whichever the surface carries — ag2.space sends `room_name` and no `channel_name`, so a reader that parses only the latter gets nothing and step 3b falls back to the raw id), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
+1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (Discord channel or ag2.space room id — both producers supply it, and the later `contextNotFrom`/requeue workflow needs the exact id, so never discard it in favor of the friendly name), `chat_id` (Telegram), `room_name` / `channel_name` (whichever the surface carries — ag2.space sends `room_name` and no `channel_name`, so a reader that parses only the latter gets nothing and step 3b falls back to the raw id), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner). The classifier reads them with `local_task_protocol.parse_task_headers_lenient` — the shape-union parser — because this pass sees files from every writer and era: the desktop's legacy Claude-import writer is task-mid (`task:` before `channel_id:`), and the strict task-last parser would read its `channel_id` and `priority` as absent.
 
 2. **Cross-reference completion markers** (any single match = task already completed):
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
@@ -64,9 +72,16 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
    - If <300s (5 min) → FRESH (genuinely just arrived; watcher will pick it up normally).
    - Else → ORPHAN (no completion marker AND old enough to be from a previous session).
 
+   **Step 3a — consented Claude-Code import tasks are not orphans at 5 minutes.** A task is an *import task* when it is owner-tier and either carries `channel_id: onboarding-wizard` (the desktop's legacy Import-button writer, `claude_import.rs`) or its body names `import-claude-context`. The import is consented, idempotent and resumable (`skills/import-claude-context/SKILL.md`), and its main task is expected to take seconds — but on 2026-09-11 (desktop v0.6.8-rc3, engine 4b02fbaf) the core answered the greeting, ran its boot recap and went idle without starting it, so at 322 s the prose rule above would have archived a task the owner had just consented to and posted it in the recovery DM instead of letting the watcher's startup sweep re-emit it. Its marker is `<workspace>/data/claude-import/status.json` — written by `index.py` in the same seconds as the acknowledgement DM (`results/proactive-<ts>.txt`, which the bridge claims and archives, so it cannot serve as a marker) — read as *this task's* only when its `updated_at` (else mtime) is not older than the task's `timestamp:`:
+   - started (`status.json` newer than the task) and phase `done` → **DONE** (the import landed; archive).
+   - started, any other phase → **IMPORT-RESUME**: leave `tasks/<id>.txt` alone whatever its age, never archive it, never list it in step 3b's DM. The watcher's sweep re-emits it and the skill resumes from disk. Log: `import-resume: consented import already started (phase <p>)`.
+   - not started and younger than **1800 s (30 min)** → FRESH.
+   - not started and older → ORPHAN like any other task (step 3 aggregates it; the re-queue line in the DM restarts it, and so does the owner saying "import my Claude history").
+
 4. **Classify outcome**:
    - **DONE** → archive the task file: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Log: `done: completion marker found at <path>`.
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
+   - **IMPORT-RESUME** → leave alone (see step 3a). Log: `import-resume: consented import already started (phase <p>)`.
    - **ORPHAN** → write a recovery result: see step 3.
 
 ### Step 3 — Recover orphan tasks (tier-aware)
@@ -166,10 +181,11 @@ orphan-check complete:
   total live tasks scanned: N
   archived as done (completion marker found): M
   left fresh for watcher: K
+  left for the watcher as a started import (import-resume): I
   recovered as orphan (sentinel result written): J
 ```
 
-The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+J ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
+The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+I+J ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
 
 ## What this DOES NOT touch
 
@@ -183,7 +199,7 @@ The summary lands in the conversation buffer so the agent's first turn (and oper
 
 A task that arrived <5 minutes before a crash, executed its side effect, then died before writing its result file has NO completion marker AND looks FRESH (age < 5min) → orphan-check leaves it for the watcher → side effect re-fires. Unavoidable without per-side-effect markers, and the `.sending` markers only close it for Discord.
 
-**Currently covered:** Discord DM delivery (PR #1048's `.sending`), file presence in `results/`.
+**Currently covered:** Discord DM delivery (PR #1048's `.sending`), file presence in `results/`, the Claude-Code import's `data/claude-import/status.json` (step 3a — the import is resumable, so this marker exempts rather than re-fires).
 
 **Residual hole, in priority order:**
 - Voice agent side effects (no marker file yet).
@@ -195,8 +211,8 @@ Conservative default for the hole: any orphan without a CLEAR completion marker 
 
 ## What it MIGHT need in the future
 
-- **More side-effect markers** (see "Known residual risk" above): voice/phone/Telegram especially.
-- **Promote to a deterministic script** (`scripts/orphan-check.py` mirror) once the marker set + age rules are stable enough that unit tests buy more than they cost. The current SKILL-only ship trades testability for being one less code-path to maintain; flip if/when the rules grow past "marker-or-not + age-vs-5min".
+- **More side-effect markers** (see "Known residual risk" above): voice/phone/Telegram especially. Add them to `scripts/classify.py` (`completion_marker` / the import branch) and its test, then to the prose.
+- **Promote the rest to a script.** Classification (step 2) became `scripts/classify.py` on 2026-09-11, when the rules grew past "marker-or-not + age-vs-5min" (the import exemption, step 3a). The recovery half (step 3's moves and the aggregated DM) is still agent-executed prose; mirror it too once a second special case appears.
 
 ## Failure modes
 
@@ -216,15 +232,9 @@ That would lose tasks that legitimately arrived in the gap between previous sess
 - **#1066 (still open as of skill draft)** — VasiliyRad's bumper in-place-write fix. Becomes moot if #1049 is reverted. Recommend close as "superseded by /task-orphan-check."
 - **#1072 (this PR's sibling)** — `/startup` skill. Invokes `/task-orphan-check` as step 1 if installed.
 
-## Implementation note: this skill ships SKILL.md only
+## Implementation note: classification is a script, recovery is prose
 
-For now, the skill is markdown — the agent reads the procedure above and executes it via Read + Bash + Write tool calls. No `scripts/orphan-check.sh` because:
-
-1. The classification rules are LLM-judgment territory (cross-reference multiple markers, compute age relative to "now," decide between three outcomes).
-2. A bash script would re-implement what the agent does natively, adding a separate code path to test + maintain.
-3. The work is small per-pass (typically 0-3 live tasks; rarely >10 even after a long crash).
-
-If the workload grows or we want deterministic testing, a `scripts/orphan-check.py` mirror is the natural next step.
+Step 2 runs `scripts/classify.py` (read-only, stdlib + `src/local_task_protocol.py`; `tests/task-orphan-check-classify.test.py`). It exists because the rules stopped being "marker-or-not + age-vs-5min" the day the import exemption (step 3a) was needed, and a rule that only lives in prose is applied by whichever reading the agent makes that boot — the 2026-09-11 run reasoned its way to "would now classify … as an ORPHAN" about a task it had itself left unstarted. Steps 3–5 (the archive moves, the aggregated DM, the summary) stay agent-executed: they are small per pass (typically 0-3 live tasks) and each is a plain Bash/Write call over the classifier's verdicts.
 
 ## Iteration log
 
@@ -233,3 +243,4 @@ If the workload grows or we want deterministic testing, a `scripts/orphan-check.
 - v0.1.2 — 2026-05-26 — tier-aware orphan recovery. Step 2.1 now parses `access_tier:` (default `owner` for legacy task files lacking the field). Step 3 rewritten as a decision table branching on `source` + `access_tier`: voice/phone → silent archive; team/other → `[no-send]` archive; owner discord/telegram/slack/chat → defer to new step 3b (consolidated proactive DM aggregating all owner-tier orphans this pass into ONE `proactive-orphan-recovery-<ts>.txt` instead of N per-channel sentinels). New step 3c bomb-guard collapses any future >5-deliveries-to-one-channel into a single summary post (no-op today; defense for future branch additions). Triggered by 2026-05-26 noise-bomb post-mortem (`feedback_orphan_check_tier_classify_before_sentinel`): v0.1.1 sentinel-blasted 22 stale tasks across #ep013 (13), #talk (4), voice channels (4), and DM (1) — wrong default for high-volume team-tier orphans whose threads had moved on, and wrong shape (N per-channel posts) for owner-tier ones. Sibling work on cross-fleet bridges (qingyun-sutando MacBook branch) adds defensive bot-user_id tier-filter so peer bots' stale tasks don't tier as `owner` via allowFrom inheritance — that's the upstream cause of the same skill running on a sibling fleet seeing 21/22 of one fleet's orphans as `owner` rather than `team`.
 - v0.1.3 — 2026-05-26 — liususan091219 (Maddy / MBP node) review pass on PR #1241. **(1)** Row 3's `source` column was an enumeration (`discord / telegram / slack / chat / unknown`), which under literal reading meant a task with `source: whatsapp` (or any future surface) + `access_tier: owner` matched no row and wedged in `tasks/` forever. Rewritten as a true catch-all (`any source not matched by row 1`). **(2)** Added explicit "Invocation contract" paragraph at the top of Step 3 documenting the assumed-no-race-window guarantee (orphan-check runs at `/startup` step 1 before the watcher attaches), plus a standalone-invocation workaround (`tasks/<id>.txt.deferred` suffix so the watcher's `task-*.txt` glob skips deferred-owner files between step 3 and step 3b). Sibling PR #1233 (bridge-side bot-sender tier-downgrade) closed at owner request 2026-05-27 01:44Z; this PR now standalone.
 - v0.1.4 — 2026-05-27 — per Chi 17:50Z Discord. Decision table collapsed from 3 rows to 2 (voice/phone silent + everything-else aggregated). **Team/other-tier orphans now flow into the same proactive DM as owner-tier** (was: `[no-send]` archive, owner had zero visibility); aggregated DM gains a `By tier:` line so the tier-mix is scannable. Step 3b adds explicit preview-extraction that strips the bridge-injected `===SUTANDO SYSTEM INSTRUCTIONS===` block before slicing the first 100 chars — non-owner task bodies put the block at the FRONT, so unprocessed previews would have leaked boilerplate, not user content. Step 3c bomb-guard restructured: total-deferred-count cap (truncate preview list to 20 + "+X more" footer when >30 deferred) becomes layer 1; per-channel-delivery cap demoted to layer 2 (future-proofing no-op today). The system-instructions block is **preserved in the archived task file body** — only the preview-in-DM strips it. Re-queueing via `mv tasks/archive/<id>.txt tasks/` preserves sandboxing for non-owner tiers.
+- v0.1.5 — 2026-09-11 — step 2 promoted to `scripts/classify.py` (+ `tests/task-orphan-check-classify.test.py`); new step 3a. Trigger: desktop v0.6.8-rc3 (engine 4b02fbaf) queued the consented Claude-Code import as `task-claude-import-<ms>.txt` (`channel_id: onboarding-wizard`, task-mid, `priority: low`); the core answered the owner's greeting, finished the startup ceremony (boot recap, `/startup complete`) and went idle without starting it, then reasoned that "the orphan-check rule would now classify task-claude-import-… as an ORPHAN" at 322 s. Under the 5-minute line that consented, resumable task would have been archived into the recovery DM on the next boot instead of being re-emitted by the watcher's sweep. Now: an import task whose run started (`data/claude-import/status.json` newer than the task) is `import-resume` — left in `tasks/`, never archived, whatever its age; one that has not started gets a 30-minute line; phase `done` after the task is a completion marker. Header reads use the lenient (shape-union) parser because the desktop writer is task-mid. The desktop is moving the import request into the first-contact DM message, so the task-file form is a legacy/fallback trigger — kept covered because installed clients still write it.

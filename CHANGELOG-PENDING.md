@@ -23,6 +23,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- import-claude-context: the import starts in the same turn as the hello. The onboarding trigger is now the owner's first-contact DM message ("… Then import my Claude Code history: I consented on the onboarding card at <ISO> …"), the Settings sentence is a user ask, and the desktop's task-file form (`channel_id: onboarding-wizard`, `priority: low`) stays as a legacy trigger; step 0 no longer says the import "can wait a minute" — on a fresh v0.6.8-rc3 install the core answered the greeting, finished the startup ceremony and left the consented task in `tasks/` until the owner nudged it (nothing re-delivers a task the watcher has emitted; `priority: low` orders, it does not hold). task-orphan-check: step 2 is now `scripts/classify.py` (read-only, tested), and a consented import task is never archived as an orphan once its run has started (`data/claude-import/status.json` newer than the task → `import-resume`, left for the watcher's sweep); an unstarted one gets a 30-minute line instead of 5.
 - report-feedback: read the desktop host's Keychain session (origin-scoped `AG2_CLOUD_TOKEN_*` key) so filing works on Tauri installs, and default the cloud origin to `sutando.ag2.space` (the retired `.ai` host drops the bearer across its redirect).
 
 ## Changed
