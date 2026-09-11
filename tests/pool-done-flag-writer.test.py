@@ -107,7 +107,9 @@ def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
               wait_for(lambda: pool_delivery.is_done_flag(flag)), str(flag))
         check("and the drain resolves it to this worker after the fact",
               result_claimant.resolve_claimant(h.ws / "state", tid) == WORKER)
-        beside = [p.name for p in flag.parent.iterdir()] if flag.parent.is_dir() else []
+        # `done/` is per WORKER: the nudge that drove the reap is still in its
+        # handler, so its own `.pending` is a live record, not this task's residue.
+        beside = _records_of(flag.parent, tid)
         check("neither a temp file nor the spent `.pending` is left beside it",
               beside == [flag.name], str(beside))
     finally:
@@ -248,6 +250,13 @@ def scenario_a_crash_after_the_record_is_the_recoverable_half() -> None:
     pool_delivery.mark_done(ws, WORKER, tid, published=True)
     check("a promoted record with no result reads as finished (drained), not died",
           pool_delivery.residue(ws, WORKER, tid) == "finished")
+
+
+def _records_of(d: Path, tid: str) -> list[str]:
+    """Every name in `d` that belongs to `tid`: its stages and their temp files."""
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.name.lstrip(".").startswith(tid + "."))
 
 
 def _sentinel(d: Path, tid: str) -> Path:
