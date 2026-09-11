@@ -202,9 +202,18 @@ class TestRuntimeStartFailure(Base):
         self.assertEqual(sessions[0]["session_id"], t.launches()[0]["SUTANDO_CLAUDE_SESSION_ID"])
 
     def test_the_worker_runs_the_runtime_the_core_is_configured_for(self):
-        t = FakeTmux(runtime="codex")
+        t = FakeTmux(runtime="claude")
         got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
-        self.assertEqual(got["runtime"], "codex")
+        self.assertEqual(got["runtime"], "claude")
+        argv = t.calls[-1]
+        self.assertEqual(argv[argv.index("--runtime") + 1], "claude")
+
+    def test_a_configured_runtime_without_worker_mode_is_refused(self):
+        """Worker mode is a property of the ADAPTER. Spawning under one that
+        has none reports a worker the launcher cannot actually isolate."""
+        with self.assertRaises(sw.SpawnRefused):
+            sw.spawn(self.ws, REPO, runner=FakeTmux(runtime="codex"),
+                     require_sentinel=False)
 
 
 class TestSentinelProbe(Base):
@@ -216,6 +225,18 @@ class TestSentinelProbe(Base):
         fake.mkdir(parents=True)
         (fake / "util_paths.py").write_text("# no sentinel helper here\n")
         self.assertFalse(sw.per_instance_sentinel_supported(self.ws / "repo"))
+
+    def test_false_on_a_checkout_that_only_SPELLS_it(self):
+        """The probe reads a resolved path, not the source: one shared sentinel
+        is refused however the function that returns it is named."""
+        fake = self.ws / "shared" / "src"
+        fake.mkdir(parents=True)
+        (fake / "util_paths.py").write_text(
+            "import sys\n"
+            "def watcher_sentinel_path(state_dir, instance=None, agent=None):\n"
+            "    return state_dir + '/watch-tasks-stream.pid'\n"
+            "print(watcher_sentinel_path(sys.argv[2]))\n")
+        self.assertFalse(sw.per_instance_sentinel_supported(self.ws / "shared"))
 
     def test_false_when_the_file_is_absent(self):
         self.assertFalse(sw.per_instance_sentinel_supported(self.ws / "nope"))
@@ -294,7 +315,8 @@ class TestWorkerIsolation(Base):
         choose which code the worker runs, not just where it runs."""
         p = sw.plan(self.ws, "/anchor/repo", cwd="/some/other/checkout")
         self.assertEqual(p["cwd"], "/some/other/checkout")
-        self.assertEqual(p["launcher_argv"], ["bash", "/anchor/repo/src/agent/start-cli.sh"])
+        self.assertEqual(p["launcher_argv"],
+                         ["bash", "/anchor/repo/src/agent/start-cli.sh", "--runtime", "claude"])
         self.assertEqual(p["env"]["SUTANDO_CLAUDE_WORKING_DIR"], "/some/other/checkout")
 
     def test_two_workers_declare_different_instances_and_sessions(self):
