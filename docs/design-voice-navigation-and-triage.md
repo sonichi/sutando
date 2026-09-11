@@ -6,24 +6,35 @@ Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 
 ### Within a task
 
-A task is worked in one place. What is needed to finish it is usually in another,
-and retrieving it means leaving the first.
+Many of the decisions Sutando asks for are comparisons. An agent produces
+something and the owner is asked whether it is right, which means holding the
+agent's output against whatever it was derived from and seeing whether the two
+agree.
 
 ![A Discord message asking for an approve/reject verdict on a drafted post. Its
 only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
 
-An agent has drafted a social post and is asking the owner to approve or reject
-it. The draft's claims come from the linked article, which is not in the message.
-To judge the draft the owner opens that link in a browser, reads it, and comes
-back. While reading, the draft is behind another window.
+Above, an agent has drafted a social post from a news article and is asking the
+owner to approve or reject it. Deciding means checking the draft's two claims
+against the article. The article is not in the message; it is behind the link.
+
+A screen shows one window at a time, so the owner opens the link, and the draft
+they are judging disappears behind the browser. The comparison now has to be done
+from memory: read the article, remember what the draft said, decide. Memory is
+the weak half, so in practice this becomes several trips back and forth — and
+each trip costs the place it came from, because coming back means finding the
+message again.
+
+The reading was never the expensive part. The expensive part is that the two
+halves of a comparison cannot be on screen together.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
 that URL in the notch."](design-voice-navigation-and-triage-context-closed.png)
 
-Here the owner asked for the article by voice and it opened in a panel next to
-the message. The draft and its source are visible at the same time, and Discord
-was not left.
+Here the owner asked for the article by voice and it opened in a panel beside the
+message. Draft and article are both visible, so the comparison is done by looking
+rather than by remembering, and there is no trip to come back from.
 
 ### Across tasks
 
