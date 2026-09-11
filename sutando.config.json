@@ -2,6 +2,9 @@
   "core": {
     "runtime": "claude"
   },
+  "sandbox": {
+    "runtime": "codex"
+  },
   "workspace": {
     "path": "${REPO_DIR}/workspace"
   },

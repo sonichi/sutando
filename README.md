@@ -149,7 +149,7 @@ core session.
 `bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
 
 **Optional** — each unlocks one feature and degrades alone:
-- [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
+- [Gemini API key](https://ai.google.dev) — voice, and the non-owner sandbox when `sandbox.runtime` is `gemini` (text/core paths work without it)
 - `pip3 install discord.py` / `slack_bolt` — Discord / Slack bridges (Telegram needs no package)
 - ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
 - tmux (`brew install tmux`) — Sutando.app watcher auto-restart; the core starts without it

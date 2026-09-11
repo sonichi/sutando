@@ -81,7 +81,10 @@ class SandboxPromptArgument(unittest.TestCase):
 
     def test_handler_composes_the_argument_after_enrichment_and_writes_no_file(self):
         src = inspect.getsource(db_bridge._handle_discord_message)
-        self.assertEqual(src.count("sandbox_prompt_argument(codex_prompt_text)"), 2)
+        # The handler composes the argument once and hands it to the rulebook builder,
+        # which places it in the team and other Stage-1 commands (checked at startup).
+        self.assertEqual(src.count("_tier_rulebooks(sandbox_prompt_argument(codex_prompt_text))"), 1)
+        self.assertEqual(inspect.getsource(db_bridge._tier_rulebooks).count("{quoted_task}"), 2)
         self.assertNotIn("write_text(user_task_text)", src)
         self.assertLess(src.index("codex_prompt_text = user_task_text  # pragma: no cover"),
                         src.index("sandbox_prompt_argument(codex_prompt_text)"))

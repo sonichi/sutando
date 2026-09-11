@@ -77,7 +77,10 @@ class DiscordBridgeEmitsGuest(unittest.TestCase):
 
     def test_the_guest_rulebook_exists_and_the_other_key_is_gone(self):
         src = (REPO / "src" / "discord-bridge.py").read_text()
-        table = src[src.index("tier_instructions = {"):src.index("tier_instructions.get(")]
+        # The books are built by _tier_rulebooks so the sandbox runtime rendering can be
+        # checked against them at startup. The table is that function's body.
+        start = src.index("def _tier_rulebooks(")
+        table = src[start:src.index("\ndef ", start + 1)]
         self.assertIn('"guest": (', table)
         self.assertNotIn('"other": (', table)
         self.assertIn("GUEST tier sender", table)

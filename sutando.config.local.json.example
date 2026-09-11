@@ -10,6 +10,11 @@
     "checkout_behind_warn": 10
   },
 
+  "sandbox": {
+    "_comment": "Read-only sandbox that answers non-owner (team/other) tasks. Default codex. Set gemini on an install without Codex CLI: needs the gemini CLI on PATH and GEMINI_API_KEY (or other gemini auth) in .env. SUTANDO_SANDBOX_RUNTIME overrides per-invocation.",
+    "runtime": "gemini"
+  },
+
   "workspace": {
     "_comment": "Override the workspace location. Default is ${REPO_DIR}/workspace (in-repo). Set this only if you want the workspace outside the repo (e.g. on a different volume).",
     "path": "/absolute/path/to/your/workspace"

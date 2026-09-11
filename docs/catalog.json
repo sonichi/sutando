@@ -108,6 +108,16 @@
    "canonical_for": "Codex core setup and rollback",
    "last_verified": "2026-08-04"
   },
+  "docs/gemini-sandbox.md": {
+   "title": "Gemini as the non-owner sandbox",
+   "audience": [
+    "users",
+    "operators"
+   ],
+   "status": "active",
+   "canonical_for": "sandbox.runtime: delegating team/other Discord tasks to the Gemini CLI on installs without Codex CLI",
+   "last_verified": "2026-09-02"
+  },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
    "audience": [
