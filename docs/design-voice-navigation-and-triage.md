@@ -4,12 +4,26 @@ Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 
 ## Problem: the context gap
 
+Finishing a task quickly requires understanding its context. Sutando slows the
+owner down at both ends of a task, in the same way and for the same reason.
+
+| | The gap |
+|---|---|
+| **Getting there** | The answer is somewhere else. Going to it abandons where you are. |
+| **Understanding it** | What arrives is a list, a board, a scrollback. It must be scanned before it can be used. |
+| **Trusting it** | It was written earlier. Nothing says which parts are still true. |
+
+Sutando can already *speak* across this gap — the voice agent answers about the
+current channel and about what needs deciding. Speech does not close it. Speech
+cannot be skimmed, cannot put evidence beside a claim, and is gone from the
+agent's context in about ten minutes.
+
 ### Within a task
 
-Many of the decisions Sutando asks for are comparisons. An agent produces
-something and the owner is asked whether it is right, which means holding the
-agent's output against whatever it was derived from and seeing whether the two
-agree.
+Mid-task, the context is elsewhere. What did this channel already decide? What
+does this message refer to? Many of the decisions Sutando asks for are
+comparisons: an agent produces something and the owner is asked whether it is
+right, which means holding the output against whatever it came from.
 
 ![A Discord message asking for an approve/reject verdict on a drafted post. Its
 only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
@@ -26,7 +40,8 @@ each trip costs the place it came from, because coming back means finding the
 message again.
 
 The reading was never the expensive part. The expensive part is that the two
-halves of a comparison cannot be on screen together.
+halves of a comparison cannot be on screen together — the first row of the table
+above, paid once per trip.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
@@ -38,9 +53,9 @@ rather than by remembering, and there is no trip to come back from.
 
 ### Across tasks
 
-After one task finishes, deciding what to do next takes effort of its own.
-
-`sonichi/sutando-life` does that deciding. It collects the items that need the
+Between tasks, the next one is unknown. "What should I do next" is itself work,
+and it is the work `sonichi/sutando-life` triage exists to remove. It does that
+deciding. It collects the items that need the
 owner from every source, ranks them, and shows one at a time. Each item is a
 proposal the agent commits to carrying out, with a stated reason, so approving or
 rejecting it answers something specific. Before an item is shown,
