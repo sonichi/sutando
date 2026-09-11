@@ -37,12 +37,15 @@ if [ "${1:-}" = "--handler-runner" ]; then
   # logging left no trace, so its stderr and the code land in one file.
   runner_log="$workspace/logs/task-event-handler-runner.log"
   mkdir -p "$workspace/logs" 2>/dev/null || true
+  # The log is opened best-effort on fd 3 BEFORE the handler runs: a log that
+  # cannot be opened must never become the handler's own failure.
+  if exec 3>>"$runner_log" 2>/dev/null; then handler_err=3; else handler_err=2; fi
   if "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
       --task-file "$task_path" \
       --results-dir "$results" \
-      --repo "$repo" >/dev/null 2>>"$runner_log"; then
+      --repo "$repo" >/dev/null 2>&"$handler_err"; then
     handler_rc=0
   else
     handler_rc=$?
