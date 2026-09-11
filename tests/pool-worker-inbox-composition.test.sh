@@ -60,7 +60,6 @@ SENT_BYTES="$(wc -c < "$INBOX/task-body.txt" | tr -d ' ')"
 
 # 2. THE CASE. dispatch_task, lifted verbatim, run over the worker's inbox with
 #    a handler that records the file it was actually given.
-# The stub handler: it records the --task-file it was actually given.
 cat > "$WS/record-handler.sh" <<'H'
 #!/bin/bash
 prev=""
