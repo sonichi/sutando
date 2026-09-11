@@ -87,6 +87,12 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 # workspace; the spawner names the workspace explicitly.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+# What KIND of inbox this is, named by whoever named it: a watcher that inferred
+# "this looks like a delivery folder" from the path would decide it for itself.
+INBOX_KIND="${SUTANDO_INBOX_KIND:-tasks}"
+# The handler's answer for "I could record this nowhere durable": keep the claim
+# rather than settle or fall back. Owner: src/pool_route_handler.py UNSETTLED.
+HANDLER_UNSETTLED_RC=5
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
 # may run at once; further eligible tasks stay as tiny on-disk receipts instead
@@ -254,7 +260,11 @@ finish_handler_task() {
   # then claim release. A signal between event and release may duplicate the
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
-    if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
+    if [ "$rc" = "$HANDLER_UNSETTLED_RC" ] && claim_is_ours "$filename"; then
+      # Ownership is recorded nowhere, so holding the claim is the only record
+      # left; releasing it would publish a worker's task to the live core.
+      echo "watch-tasks-stream: task handler could not durably park $filename (exit $rc); keeping the claim and NOT falling back to the live core" >&2
+    elif [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
       claim_settled=1
       claim_disposition "$filename"
       case $? in
@@ -384,8 +394,21 @@ queue_handler_task() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename
+  local task_path="$1" rc filename payload="$1"
   filename="$(basename "$task_path")"
+  # A delivery inbox holds 0-byte sentinels that NAME their payload; which name
+  # points at which body is pool_delivery's grammar, asked here, never spelled.
+  if [ "${INBOX_KIND:-tasks}" = "deliveries" ]; then
+    payload="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
+      --workspace "$WORKSPACE_DIR" payload --sentinel "$filename")"
+  fi
+  # Everything below is handed the payload: the handler routes on --task-file,
+  # and an empty body names no recipient and answers nobody.
+  if [ -z "$payload" ] || [ ! -f "$payload" ]; then
+    echo "watch-tasks-stream: $filename names no readable payload; not dispatching it" >&2
+    return
+  fi
+  task_path="$payload"
   queued_activity_row "$filename"
   if [ -z "$DISPATCH_DIR" ]; then
     emit_dispatch_task_file "$filename"
@@ -414,6 +437,11 @@ dispatch_task() {
     fi
   elif [ "$rc" -eq 3 ]; then
     emit_dispatch_task_file "$filename"
+    # A declined task gets no real run, so nothing else would drive whatever the
+    # handler deferred; a host seeing only declines would park that work forever.
+    "$SUTANDO_TASK_EVENT_HANDLER" \
+      --workspace "$WORKSPACE_DIR" \
+      --retry-pass >/dev/null 2>&1 || true
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
     emit_dispatch_task_file "$filename"

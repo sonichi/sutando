@@ -137,6 +137,30 @@ def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     return None
 
 
+# Third answer for --held, kept out of the 0/1 pair so an unreadable delivery
+# tree cannot be read as "nobody holds this".
+HELD_UNKNOWN = 2
+
+
+def held_by_worker(workspace, task_id: str) -> str | None:
+    """The worker holding `task_id` under ANY sentinel name, or None.
+
+    One grammar for "a worker already has this", legacy `.claimed` included —
+    a second spelling elsewhere reads accepted work as unprocessed.
+    """
+    root = _root(workspace) / "deliveries"
+    if not root.is_dir():
+        return None
+    for d in sorted(root.iterdir()):
+        # The core's own inbox is not a hold: the core declining is what put
+        # the task in front of the Stop hook in the first place.
+        if not d.is_dir() or d.name == "core" or not RECIPIENT.match(d.name):
+            continue
+        if find(workspace, d.name, task_id) is not None:
+            return d.name
+    return None
+
+
 @contextlib.contextmanager
 def arbitration(workspace, recipient: str):
     """One lock per folder around publish, accept and release, so a check of
@@ -270,13 +294,31 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command",
+    ap.add_argument("command", nargs="?",
                     choices=("sweep", "pending", "watch", "residue", "payload"))
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel", help="a sentinel filename, for `payload`")
+    ap.add_argument("--held", metavar="TASK_ID",
+                    help="exit 0 if a worker holds this task, 1 if none does, "
+                         f"{HELD_UNKNOWN} if that could not be determined")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
+
+    if a.held:
+        try:
+            holder = held_by_worker(ws, a.held)
+        except Exception as e:
+            # A crash and "no worker holds it" are different answers; a caller
+            # that cannot tell them apart reads a broken lookup as a free task.
+            print(f"pool_delivery: --held {a.held}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return HELD_UNKNOWN
+        if holder:
+            print(holder)
+        return 0 if holder else 1
+    if not a.command:
+        ap.error("a command is required unless --held")
 
     if a.command == "payload":
         # A sentinel names a payload and holds none. Callers outside python ask
