@@ -472,6 +472,58 @@ def test_reply_verification_needs_a_tweet_this_submit_created():
           f"a 20-char prefix on a new tweet is not the reply ({r3})")
 
 
+def test_an_unreadable_baseline_refuses_to_submit():
+    """qingyun-wu at da3eac107: swallowing a failed baseline read into [] made
+    every pre-existing tweet look new, so a no-op submit reported success. Driven
+    through the production cmd_reply, with the keystroke recorded not stubbed out."""
+    import json as _json
+    TEXT = "the whole reply text that already exists on the page"
+    # One article already on the page carrying the full text — the row the
+    # reviewer's table used. A correct baseline must see it and refuse.
+    for label, baseline in (("browser-error", "__RAISE__"),
+                            ("invalid-json", "not json at all"),
+                            ("wrong-shape", '{"ids": ["1"]}')):
+        mod = load()
+        mod.ensure_tab = lambda *a, **k: None
+        mod.time.sleep = lambda *_a, **_k: None
+        submitted = []
+        mod._os_submit_via_keystroke = lambda: submitted.append(1)
+
+        def rj(js, *a, **k):
+            if "ids.push" in js:
+                if baseline == "__RAISE__":
+                    raise mod.BrowserError("no tab")
+                return baseline
+            if "seen" in js:
+                return _json.dumps({"posted": True})   # the page would say yes
+            return "ok"
+        mod.run_js = rj
+        try:
+            rc, out = _out(mod.cmd_reply, "1", TEXT)
+            raised = False
+        except mod.BrowserError as e:
+            rc, out, raised = None, str(e), True
+        check(raised and not submitted,
+              f"{label}: an unreadable baseline must refuse BEFORE the keystroke "
+              f"(raised={raised}, submits={len(submitted)}, {out!r})")
+        check("NOT sent" in out,
+              f"{label}: the refusal must say the reply was not sent ({out!r})")
+
+    # CONTROL: a readable baseline still submits and still reports honestly.
+    mod = load()
+    mod.ensure_tab = lambda *a, **k: None
+    mod.time.sleep = lambda *_a, **_k: None
+    submitted = []
+    mod._os_submit_via_keystroke = lambda: submitted.append(1)
+    mod.run_js = lambda js, *a, **k: (
+        '["1"]' if "ids.push" in js
+        else _json.dumps({"posted": False}) if "seen" in js else "ok")
+    rc, out = _out(mod.cmd_reply, "1", TEXT)
+    check(submitted and rc == 1 and "not confirmed" in out,
+          f"a readable baseline still submits and admits non-confirmation "
+          f"(submits={len(submitted)}, rc={rc}, {out!r})")
+
+
 def test_reply_baseline_is_taken_before_the_keystroke():
     """Order is the whole mechanism: a baseline read after the submit already
     contains the new tweet, so nothing could ever look new."""

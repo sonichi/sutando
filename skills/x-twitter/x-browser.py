@@ -342,14 +342,15 @@ _STATUS_IDS_JS = (
 )
 
 
-def _rendered_status_ids() -> list:
-    """Status ids on the page right now. The pre-submit call is the baseline that
-    makes 'a tweet matching the text' mean 'a tweet this submit created'."""
+def _rendered_status_ids() -> "list | None":
+    """Status ids on the page right now, or None when the page could not be read.
+    None is NOT an empty page: an empty list says every later match is new, which
+    is the false-success this baseline exists to prevent."""
     try:
         ids = json.loads(run_js(_STATUS_IDS_JS))
     except (ValueError, BrowserError):
-        return []
-    return [str(i) for i in ids] if isinstance(ids, list) else []
+        return None
+    return [str(i) for i in ids] if isinstance(ids, list) else None
 
 
 def _reply_verify_js(text: str, before) -> str:
@@ -388,6 +389,11 @@ def cmd_reply(ref: str, text: str) -> int:
         raise BrowserError("reply composer did not open")
     time.sleep(0.5)
     before = _rendered_status_ids()
+    if before is None:
+        # Refuse an irreversible public action we already know we cannot confirm.
+        # Submitting first would leave a post nobody can prove exists.
+        raise BrowserError("cannot read the pre-submit baseline — not submitting; "
+                           "the reply was NOT sent, retry when the page reads")
     _os_submit_via_keystroke()
     time.sleep(4.0)
     if json.loads(run_js(_reply_verify_js(text, before))).get("posted"):
