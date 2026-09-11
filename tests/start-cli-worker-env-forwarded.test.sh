@@ -38,8 +38,11 @@ check $? "spawn_worker.plan() produced a session env ($(wc -l < "$TMP/plan-env" 
 # shellcheck disable=SC2046
 env -i HOME="$HOME" PATH="$STUB_PATH" $(cat "$TMP/plan-env") \
     bash "$STARTCLI" --print-core-env > "$TMP/fwd" 2>/dev/null
-grep -q "SUTANDO_CORE_SESSION=1" "$TMP/fwd"
+# Not the core marker: a worker launch deliberately carries none.
+grep -q "SUTANDO_CORE_RUNTIME=claude" "$TMP/fwd"
 check $? "the --print-core-env probe returned the assembled allowlist"
+! grep -q "SUTANDO_CORE_SESSION=1" "$TMP/fwd"
+check $? "a worker session is not handed the canonical core's marker"
 
 # The required set is the INTERSECTION of what the spawner sets and what the
 # watcher reads from env — neither file alone names it, so neither can drift.

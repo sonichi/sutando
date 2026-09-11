@@ -10,6 +10,7 @@ Run: python3 tests/worker-mode-is-gated-on-env.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -18,6 +19,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def scratch():
+    """A temp dir whose removal tolerates a straggler from the watcher's process
+    group. The kwarg that used to buy that is 3.10+, and CONTRIBUTING.md's
+    supported floor is 3.9."""
+    path = tempfile.mkdtemp()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 REPO = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
@@ -137,13 +150,13 @@ def _state_root(extra_env: dict, td: Path):
 
 class TestWatcherGate(unittest.TestCase):
     def test_unset_the_core_watches_its_workspace_tasks_folder(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with scratch() as td:
             core, override = _watched_dir({}, Path(td))
         self.assertTrue(core, "the core's tasks/ was not the watched folder")
         self.assertFalse(override)
 
     def test_set_a_worker_watches_its_delivery_folder_only(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with scratch() as td:
             core, override = _watched_dir({"SUTANDO_TASKS_DIR": str(Path(td) / "deliveries")}, Path(td))
         self.assertTrue(override, "the delivery folder was not the watched folder")
         self.assertFalse(core, "the worker must not create or watch the core's tasks/")

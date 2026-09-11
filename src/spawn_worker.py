@@ -18,12 +18,15 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+import pool_delivery as pd  # noqa: E402
 
 import worker_identity as wi  # noqa: E402
 
@@ -40,6 +43,11 @@ WATCHER = "src/watch-tasks-stream.sh"
 LAUNCHER = "src/agent/start-cli.sh"
 
 
+# Worker mode is a property of an ADAPTER, not of the pool: a runtime is
+# listed here once its launcher isolates a worker's session, cwd and state.
+WORKER_MODE_RUNTIMES = ("claude",)
+
+
 class SpawnRefused(Exception):
     """A precondition failed. Nothing was created."""
 
@@ -48,20 +56,33 @@ def _run(argv, **kw):
     return subprocess.run(argv, capture_output=True, text=True, **kw)
 
 
-def per_instance_sentinel_supported(repo) -> bool:
+def per_instance_sentinel_supported(repo, runner=_run) -> bool:
     """Does this checkout give each watcher its OWN sentinel?
 
     On a single-sentinel checkout the Nth watcher erases the (N-1)th stamp, so
     spawning corrupts the core's own liveness signal rather than the worker's.
-    Fail closed: refuse rather than half-create.
+
+    Ask the resolver what it RESOLVES, not what it is spelled: run the repo's
+    own `util_paths.py watcher-sentinel` under two instance identities and
+    require two different paths. A checkout that returns one shared sentinel
+    answers the same string twice, however its function is named. Out of
+    process, so a `util_paths` already imported from another checkout cannot
+    answer for this one. Fail closed: refuse rather than half-create.
     """
-    # Read the file, never import it: a cached `util_paths` from another
-    # checkout would report on this process, not the repo asked about.
-    try:
-        src = (Path(repo) / "src" / "util_paths.py").read_text(encoding="utf-8")
-    except OSError:
+    script = Path(repo) / "src" / "util_paths.py"
+    if not script.is_file():
         return False
-    return "def watcher_sentinel_path" in src
+    seen = set()
+    with tempfile.TemporaryDirectory() as state_dir:
+        for probe in ("sentinel-probe-a", "sentinel-probe-b"):
+            env = {**os.environ, "SUTANDO_INSTANCE_ID": probe}
+            r = runner([sys.executable, str(script), "watcher-sentinel",
+                        str(Path(state_dir) / "state")], env=env)
+            out = (r.stdout or "").strip()
+            if r.returncode != 0 or not out:
+                return False
+            seen.add(out)
+    return len(seen) == 2
 
 
 def session_exists(name: str, socket=None, runner=_run) -> bool:
@@ -83,7 +104,7 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     before anything exists and testable without tmux."""
     socket = socket or default_socket()
     worker_id = worker_id or wi.new_worker_id()
-    delivery_dir = str(Path(workspace) / "deliveries" / worker_id)
+    delivery_dir = str(pd.deliveries_dir(workspace, worker_id))
     return {
         "worker_id": worker_id,
         "label": label or worker_id,
@@ -91,16 +112,22 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
         "cwd": str(cwd or repo),
         "delivery_dir": delivery_dir,
         "tmux": {"socket": socket, "session_name": wi.tmux_session_name(worker_id)},
-        # Absolute, from `repo`: a relative path would resolve against the
-        # session's cwd, so `cwd` would silently pick which code the worker runs.
-        "launcher_argv": ["bash", str(Path(repo) / LAUNCHER)],
+        # Absolute, from `repo`: relative, `cwd` would pick which code runs.
+        # `--runtime`: unselected, the dispatcher rereads the CORE's config.
+        "launcher_argv": ["bash", str(Path(repo) / LAUNCHER), "--runtime", runtime],
         "env": {"SUTANDO_TMUX_SOCKET": socket,
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,
                 "SUTANDO_TASKS_DIR": delivery_dir,
+                # The inbox holds sentinels, not task bodies. The reader is TOLD
+                # that here; inferring it from the path is the reader deciding.
+                "SUTANDO_INBOX_KIND": "deliveries",
                 # The watcher infers the workspace from its inbox; a delivery
                 # folder would put state/ and results/ under deliveries/.
                 "SUTANDO_WORKSPACE_DIR": str(workspace),
+                # Named, not derived: every runtime writes its answers where the
+                # bridges drain them, which is the workspace's own results/.
+                "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo)},
     }
 
@@ -117,7 +144,12 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     """
     socket = socket or default_socket()
     runtime = runtime or core_runtime(repo, runner)
-    if require_sentinel and not per_instance_sentinel_supported(repo):
+    if runtime not in WORKER_MODE_RUNTIMES:
+        raise SpawnRefused(
+            f"runtime {runtime!r} has no worker mode — its launcher would run "
+            f"the canonical-core bootstrap; supported: "
+            f"{', '.join(WORKER_MODE_RUNTIMES)}")
+    if require_sentinel and not per_instance_sentinel_supported(repo, runner):
         raise SpawnRefused(
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")

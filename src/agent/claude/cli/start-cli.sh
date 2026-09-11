@@ -61,6 +61,10 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WORKER_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 [ -n "$WORKER_INSTANCE" ] && SURFACE_ARGS=()
+# `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
+# a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
+BOOT_PROMPT="/startup"
+[ -n "$WORKER_INSTANCE" ] && BOOT_PROMPT="/startup --worker"
 SESSION_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_RESUME:-}" ]; then
   SESSION_ARGS=(--resume "$SUTANDO_CLAUDE_RESUME")
@@ -79,7 +83,13 @@ fi
 # Snapshot what we INHERITED before the export below overwrites it: the
 # in-session restart guard must not read the marker this script sets itself.
 CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
-export SUTANDO_CORE_SESSION=1
+# A worker is not the canonical core: the marker is what makes a session claim
+# the core's bootstrap, so exporting it would make every worker a second core.
+if [ -n "$WORKER_INSTANCE" ]; then
+  unset SUTANDO_CORE_SESSION
+else
+  export SUTANDO_CORE_SESSION=1
+fi
 
 # Called ONLY from paths that create or heal a core. Attaching to a live one
 # must not clear: that would cancel a `--stop-only` still waiting to be observed.
@@ -122,7 +132,8 @@ restore_shutdown_sentinel() {
   _SENTINEL_STASH=""
 }
 export SUTANDO_CORE_RUNTIME=claude
-CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
+CORE_ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude)
+[ -n "$WORKER_INSTANCE" ] || CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=1)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 [ -n "$WORKER_INSTANCE" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$WORKER_INSTANCE")
@@ -130,6 +141,10 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
 # workspace from it: unforwarded, its results/ and state/ land under deliveries/.
 [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+# The other two halves of the same seam: what the inbox holds, and where answers
+# go. Derived in-session they become deliveries/results, which no bridge drains.
+[ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+[ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -652,6 +667,7 @@ apply_tmux_defaults() {
 # core/socket can never suppress this one.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
@@ -742,7 +758,7 @@ if tmux_session_exists; then
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
   CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "/startup")
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
@@ -786,7 +802,10 @@ fi
 # line per launch; consecutive entries bound each session's lifetime, which
 # is what session-recap tooling needs to pick the right transcript (owner
 # ask 2026-07-13). Best-effort: never block the launch on it.
-if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
+# A worker boot is not a core launch; health-check reads the newest row as the
+# current core's, so a worker appended here retires the core's own boundary.
+if [ -z "$WORKER_INSTANCE" ] \
+   && _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
   mkdir -p "$_ws/state" 2>/dev/null || true
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -809,7 +828,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   set +e
   exec claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "/startup"
+    -- "$BOOT_PROMPT"
   _exec_rc=$?
   set -e
   restore_shutdown_sentinel
@@ -845,7 +864,7 @@ if [ -t 1 ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "/startup" || true
+    -- "$BOOT_PROMPT" || true
   # Create-then-attach rather than `new-session -A`, so the sentinel clears only
   # once a session demonstrably exists; the poll below is the single verdict.
   for _ in $(seq 1 25); do
@@ -864,7 +883,7 @@ else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "/startup"
+    -- "$BOOT_PROMPT"
   # Verify the core actually came up before reporting success. Without this a
   # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
