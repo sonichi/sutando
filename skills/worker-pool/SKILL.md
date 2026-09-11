@@ -29,14 +29,19 @@ roster or a worker identity never, and — measured on `main`, not assumed —
 reads delivery records never either.
 
 ```
-src/check-pending-tasks.sh   deliveries 0   pool_delivery 0
-src/watch-tasks-stream.sh    deliveries 0   pool_delivery 0
+$ git grep -c -E 'deliveries|pool_delivery' origin/main -- \
+      src/check-pending-tasks.sh src/watch-tasks-stream.sh
+origin/main:src/watch-tasks-stream.sh:1
+
+$ git grep -n 'import pool_delivery|from pool_delivery' origin/main -- src/
+(no output)
 ```
 
-`pool_delivery.py` is the only file implementing the `deliveries/<recipient>/`
-sentinel grammar; every other `deliveries` match in `src/` is an unrelated sense
-of the word in a comment. An earlier draft of this section kept it in the core on
-the grounds that the task hook and watcher read it on every task — that describes
+The one hit is `watch-tasks-stream.sh:86`, a COMMENT about workspace resolution
+-- not a read. No file in `src/` imports `pool_delivery`, which is the question
+that decides the boundary; the word count never was.
+
+An earlier draft of this section kept it in the core on the grounds that the task hook and watcher read it on every task — that describes
 the caller #4167 would have added, and #4167 was closed before it landed.
 
 So all three pool modules move together, and the boundary rule is unchanged — it
