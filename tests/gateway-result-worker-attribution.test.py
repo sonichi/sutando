@@ -84,6 +84,15 @@ class WorkerAttribution(unittest.TestCase):
         # finisher must agree by construction, not by two matching guesses.
         return pool_delivery.mark_done(self.tmp, wid, tid, published=published)
 
+    def _link(self, at: Path) -> Path:
+        # A symlink to a perfectly good regular file: stat() sees a flag, and
+        # the name still attests nothing about who wrote it.
+        target = self.tmp / "elsewhere.flag"
+        target.write_text("")
+        at.parent.mkdir(parents=True, exist_ok=True)
+        at.symlink_to(target)
+        return at
+
     def _core_flag(self, core: str, tid: str) -> Path:
         # Named exactly as finish_task writes it: the full result stem, prefix
         # included. A bare-id fixture agrees with a prefix bug and hides it.
@@ -164,6 +173,40 @@ class WorkerAttribution(unittest.TestCase):
         tid = "task-4pendingstage000e"
         self._worker_flag("worker-1", tid, published=False)
         self.assertEqual(self._doc(tid)["metadata"]["worker_id"], "worker-1")
+
+    def test_control_a_symlink_at_the_pool_flag_is_not_a_finish(self):
+        tid = "task-8symlinkflag0000f"
+        at = self._link(pool_delivery.done_flag(self.tmp, "worker-1", tid))
+        self.assertFalse(pool_delivery.is_done_flag(at), "the pool contract must reject it")
+        self.assertNotIn("metadata", self._doc(tid))
+        hit = self._abstained()
+        self.assertEqual(len(hit), 1, f"expected one abstention log, got {self.logs}")
+        self.assertIn("not a regular file", hit[0])
+        self.assertEqual(self.mod._worker_of(tid), "")
+
+    def test_control_a_symlink_at_the_pending_record_is_not_a_finish(self):
+        tid = "task-8symlinkpend0000f"
+        self._link(pool_delivery.pending_flag(self.tmp, "worker-1", tid))
+        self.assertNotIn("metadata", self._doc(tid))
+        self.assertIn("not a regular file", self._abstained()[0])
+
+    def test_control_a_symlinked_pool_flag_does_not_let_the_legacy_core_win(self):
+        # Mixed layout, symlink flavour: following the link would count worker-1
+        # and make the reply ambiguous; ignoring it would stamp core-2. Neither.
+        tid = "task-9mixedsymlink000g"
+        self._link(pool_delivery.done_flag(self.tmp, "worker-1", tid))
+        self._core_flag("core-2", tid)
+        doc = self._doc(tid)
+        self.assertNotIn("metadata", doc)
+        self.assertEqual(self.mod._worker_of(tid), "")
+        self.assertIn("not a regular file", self._abstained()[0])
+
+    def test_control_a_symlinked_legacy_flag_does_not_let_the_pool_worker_win(self):
+        tid = "task-9mixedsymlink001h"
+        self._worker_flag("worker-1", tid)
+        self._link(self.tmp / "state" / "cores" / "core-2" / "done" / f"{tid}.flag")
+        self.assertNotIn("metadata", self._doc(tid))
+        self.assertEqual(self.mod._worker_of(tid), "")
 
     def test_control_a_malformed_pool_flag_does_not_let_the_legacy_core_win(self):
         # Mixed layout: dropping the malformed one on the floor would leave the

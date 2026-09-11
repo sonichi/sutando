@@ -307,6 +307,58 @@ class TestFlagStages(Base):
         self.assertIsNone(pd.flag_stage(self.root, "core", "task-1"))
 
 
+class TestFlagPredicate(Base):
+    """What is a record: a regular file at the name, reached without following
+    a link. Anything else is malformed state and names nobody."""
+
+    def _link(self, at: Path) -> Path:
+        target = self.root / "elsewhere.flag"
+        target.write_text("", encoding="utf-8")
+        at.parent.mkdir(parents=True, exist_ok=True)
+        at.symlink_to(target)
+        return at
+
+    def test_a_symlink_to_a_regular_file_is_not_a_flag(self):
+        self.assertFalse(pd.is_done_flag(self._link(pd.done_flag(self.root, "core", "task-1"))))
+        self.assertIsNone(pd.flag_stage(self.root, "core", "task-1"))
+
+    def test_a_symlinked_pending_record_is_not_a_flag_either(self):
+        self.assertFalse(pd.is_done_flag(self._link(pd.pending_flag(self.root, "core", "task-1"))))
+        self.assertIsNone(pd.flag_stage(self.root, "core", "task-1"))
+
+    def test_a_dangling_symlink_is_not_a_flag(self):
+        at = pd.done_flag(self.root, "core", "task-1")
+        at.parent.mkdir(parents=True)
+        at.symlink_to(self.root / "nowhere")
+        self.assertFalse(pd.is_done_flag(at))
+
+    def test_a_directory_is_not_a_flag(self):
+        at = pd.done_flag(self.root, "core", "task-1")
+        at.mkdir(parents=True)
+        self.assertFalse(pd.is_done_flag(at))
+
+    def test_a_symlinked_flag_does_not_retire_accepted_work(self):
+        # residue must read the malformed record as no record at all.
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        self._link(pd.done_flag(self.root, "core", "task-1"))
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "died-mid-work")
+
+    def test_absence_is_quiet_and_an_unreadable_tree_is_not(self):
+        self.assertFalse(pd.is_done_flag(pd.done_flag(self.root, "core", "task-1")))
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 0o000 directory anyway")
+        at = pd.done_flag(self.root, "core", "task-1")
+        at.parent.mkdir(parents=True)
+        at.touch()
+        at.parent.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                pd.is_done_flag(at)
+        finally:
+            at.parent.chmod(0o755)
+
+
 class TestSweep(Base):
     def test_releases_work_a_crash_left_accepted(self):
         self.ws.payload("task-1")

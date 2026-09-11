@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -118,18 +119,28 @@ def pending_flag(workspace: Path, recipient: str, task_id: str) -> Path:
 
 
 def is_done_flag(path) -> bool:
-    """Completion evidence is a REGULAR file and nothing else: a directory at
-    the name is malformed state, and reading it as a finish invents a claimant.
+    """Completion evidence is a REGULAR file and nothing else: a directory or a
+    symlink at the name is malformed state, and reading either as a finish
+    invents a claimant — a link points wherever its author chose.
 
-    Only absence answers False quietly. Any other stat error propagates — a
-    tree that cannot be read is not an empty tree, and a reader deciding that
-    for itself is how one claimant hides and another gets stamped.
+    Opened O_NOFOLLOW and judged by fstat, so the link cannot be swapped in
+    between a look and a read. Only absence answers False quietly. Any other
+    error propagates — a tree that cannot be read is not an empty tree, and a
+    reader deciding that for itself is how one claimant hides and another gets
+    stamped.
     """
     try:
-        st = os.stat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except (FileNotFoundError, NotADirectoryError):
         return False
-    return stat.S_ISREG(st.st_mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # the name is a symlink
+            return False
+        raise
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
 
 
 def flag_stage(workspace, recipient: str, task_id: str) -> str | None:
