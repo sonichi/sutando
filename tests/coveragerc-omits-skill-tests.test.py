@@ -12,7 +12,7 @@ It asserts the PATTERNS decide correctly rather than reading a generated XML, so
 needs no coverage run and still flips the moment an omit line goes.
 """
 import configparser
-import fnmatch
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -40,7 +40,33 @@ def _omit_patterns():
 
 
 def _omitted(path, patterns):
-    return any(fnmatch.fnmatch(path, p) for p in patterns)
+    """Coverage.py semantics, NOT stdlib fnmatch.
+
+    stdlib `*` crosses `/`; Coverage.py's does not. Measured counterexample
+    (keweichen, 2026-09-11): pattern `skills/*tests/*` vs path
+    `skills/worker-pool/tests/x.test.py` -> fnmatch True, Coverage False. Using
+    fnmatch here would pass a .coveragerc that Coverage.py reads differently,
+    which is the whole failure this file exists to prevent."""
+    try:
+        from coverage.files import FnmatchMatcher       # the real thing when present
+        return FnmatchMatcher([p for p in patterns]).match(path)
+    except Exception:
+        pass
+    for pat in patterns:
+        rx, i = "", 0
+        while i < len(pat):
+            c = pat[i]
+            if pat.startswith("**", i):
+                rx += ".*"; i += 2
+            elif c == "*":
+                rx += "[^/]*"; i += 1
+            elif c == "?":
+                rx += "[^/]"; i += 1
+            else:
+                rx += re.escape(c); i += 1
+        if re.fullmatch(rx, path):
+            return True
+    return False
 
 
 class TestCoveragercOmitsSkillTests(unittest.TestCase):
