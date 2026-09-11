@@ -647,10 +647,18 @@ if __name__ == "__main__":
         if _pid is None:
             raise SystemExit(1)
         print(_pid)
+    elif len(sys.argv) >= 4 and sys.argv[1] == "sentinel-field":
+        # Same bridge for the identity claims on lines 2+, so the shell never
+        # re-spells the grammar. Exit 1 (printing nothing) when the key is absent.
+        _val = read_sentinel_record(sys.argv[2]).get(sys.argv[3])
+        if _val is None:
+            raise SystemExit(1)
+        print(_val)
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
     else:
         print("usage: util_paths.py {watcher-sentinel <state-dir> [instance]"
-              "|sentinel-pid <sentinel>|handler-fallbacks-dir <state-dir>}",
+              "|sentinel-pid <sentinel>|sentinel-field <sentinel> <key>"
+              "|handler-fallbacks-dir <state-dir>}",
               file=sys.stderr)
         raise SystemExit(2)
