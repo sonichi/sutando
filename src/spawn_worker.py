@@ -73,11 +73,13 @@ def per_instance_sentinel_supported(repo, runner=_run) -> bool:
     if not script.is_file():
         return False
     seen = set()
-    with tempfile.TemporaryDirectory() as state_dir:
+    # A throwaway directory, not a state tree: the resolver joins onto whatever
+    # it is handed, and the answer under test is the NAME, not the location.
+    with tempfile.TemporaryDirectory() as scratch:
         for probe in ("sentinel-probe-a", "sentinel-probe-b"):
             env = {**os.environ, "SUTANDO_INSTANCE_ID": probe}
             r = runner([sys.executable, str(script), "watcher-sentinel",
-                        str(Path(state_dir) / "state")], env=env)
+                        scratch], env=env)
             out = (r.stdout or "").strip()
             if r.returncode != 0 or not out:
                 return False
