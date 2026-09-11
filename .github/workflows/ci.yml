@@ -306,7 +306,7 @@ jobs:
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
-          # keeps running; the root is optional, and `&&` would abort under bash -e.
+          # keeps running; the root is optional, so it is added only when present.
           roots=(tests); if [ -d skills ]; then roots+=(skills); fi
           find "${roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b

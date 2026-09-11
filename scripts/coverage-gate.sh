@@ -122,8 +122,8 @@ else
 fi
 export RECDIR COVGATE_TIMEOUT
 
-# `skills` too: a skill owns its own tests/ and the gate must measure them; the
-# root is optional, and `&&` (not `if`) would exit the script under `set -e`.
+# `skills` too: a skill owns its own tests/ and the gate must run them; the
+# root is optional, so it is added only when present.
 _covgate_roots=(tests); if [ -d skills ]; then _covgate_roots+=(skills); fi
 find "${_covgate_roots[@]}" -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
 # Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
