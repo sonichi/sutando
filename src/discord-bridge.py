@@ -3051,10 +3051,9 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
     """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
     [attach:] markers here. Path authorization stays with the transport
     allowlist; [channel:] redirects stay blocked regardless. Default off."""
-    for section in ("groups", "channels"):
-        cfg = (access_data.get(section) or {}).get(str(channel_id))
-        if isinstance(cfg, dict):
-            return cfg.get("collaboratorAttachments") is True
+    cfg = (access_data.get("groups") or {}).get(str(channel_id))
+    if isinstance(cfg, dict):
+        return cfg.get("collaboratorAttachments") is True
     return False
 
 
@@ -4213,15 +4212,21 @@ async def _handle_discord_message(message, force=False):
         # confident about. Removing the gate trades a few cheap reads for never
         # skipping it; only a pure greeting/ack is exempt. Supersedes the
         # self-contained-judgment form (root-cause 2026-06-25).
+        # The depth is stated HERE: the reader's own default is one page of ten,
+        # which measured as "the last ten messages" and was reported as absence.
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str} --limit 50` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
-            f'until this message stands on its own, then answer from the reconstructed '
-            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
-            f'message looks self-contained or you feel you already understand it — felt '
-            f'confidence is exactly the signal that fails. The only exception is a pure '
-            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
+            f'until this message stands on its own. That command returns ONE page of at '
+            f'most 50 messages; if the referent is not in it, continue OLDER with '
+            f'`--until <ISO time or message id>` until it is. If you stop before the '
+            f'message stands on its own, say so — name the oldest timestamp you read — '
+            f'never report a fact as absent from messages you did not read. Then answer '
+            f'from the reconstructed thread, NOT from memory. Do this every time; do NOT '
+            f'skip it because the message looks self-contained or you feel you already '
+            f'understand it — felt confidence is exactly the signal that fails. The only '
+            f'exception is a pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():

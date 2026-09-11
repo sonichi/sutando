@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Tests for `check_skills_driver_code_drift` in src/health-check.py.
+
+`live-tree-drift` covers the repo side. Nothing covered the skills side, and a
+skill pulled while its driver is running does not reach that driver: the process
+froze its code at launch. Measured 2026-09-10 — three pulls in one day left the
+content driver executing superseded code, and the only evidence was the
+`v=<sha>@<git>` stamp the driver writes into its own log, compared by hand.
+
+Covers:
+  a) stamp == skills HEAD            -> ok, naming the sha
+  b) stamp != skills HEAD            -> warn, naming BOTH shas and the remedy
+  c) NEWEST stamp decides            -> warn when an older matching stamp
+     precedes a newer mismatching one (a `stamps[0]` read would report ok
+     on a driver that has since drifted — the exact failure being probed)
+  d) no content-driver log           -> ok (a driver that never ran has no drift)
+  e) skills checkout absent          -> ok (nothing to compare against)
+  f) log present, no stamp in it     -> ok (driver logged before stamping)
+  g) unreadable skills HEAD          -> ok (degrade; never invent an alarm)
+  i) git not runnable (OSError)     -> ok (degrade, never a false alarm)
+  j) real-Git control: the probe's git argv is never a bare "git"
+  j2) absent-CLT control: no runnable git -> ok degrade
+  h) POSITIVE CONTROL + MUTATION: the equality test is exercised, not just
+     read. Inverting `running == head` in the source must break arm (a) —
+     without this, deleting the comparison passes every other arm.
+
+Run: python3 tests/health-check-skills-driver-drift.test.py
+Exit code: 0 on pass, 1 on fail.
+"""
+from __future__ import annotations
+import importlib.util
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HC_SRC = REPO / "src" / "health-check.py"
+spec = importlib.util.spec_from_file_location("hc", HC_SRC)
+hc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hc)
+
+FAILS: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    print(("  ok   " if cond else "  FAIL ") + msg)
+    if not cond:
+        FAILS.append(msg)
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _mk_ws(td: str, *, skills: bool = True, log_lines: list[str] | None = None) -> tuple[Path, str]:
+    """A workspace with a sutando-skills checkout and a content-driver log.
+
+    Returns (workspace, skills_head_short). head is "" when no checkout was made.
+    """
+    ws = Path(td) / "workspace"
+    (ws / "state").mkdir(parents=True)
+    head = ""
+    if skills:
+        sk = ws / "skill-repos" / "sutando-skills"
+        sk.mkdir(parents=True)
+        _git(sk, "init", "-q", "-b", "main")
+        _git(sk, "config", "user.email", "t@example.com")
+        _git(sk, "config", "user.name", "t")
+        (sk / "f.txt").write_text("x\n")
+        _git(sk, "add", "f.txt")
+        _git(sk, "commit", "-q", "-m", "init")
+        head = _git(sk, "rev-parse", "--short", "HEAD")
+    if log_lines is not None:
+        (ws / "state" / "content-driver.log").write_text("\n".join(log_lines) + "\n")
+    return ws, head
+
+
+def main() -> int:
+    # a) the healthy case: the running stamp is the skills HEAD.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])   # head is known only after init
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] driver started\n")
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok" and head in r["detail"],
+              f"a) stamp matches skills HEAD -> ok naming it, got {r}")
+
+    # b) the case the probe exists for.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["[v=e1e1f151715f@0000000] driver started"])
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "warn", f"b) stamp differs -> warn, got {r}")
+        check("0000000" in r["detail"] and head in r["detail"],
+              f"b) warn names BOTH the running sha and the disk HEAD, got {r['detail']}")
+        check("Re-arm" in r["detail"],
+              f"b) warn carries the remedy, got {r['detail']}")
+
+    # c) the newest stamp decides. An older MATCHING stamp must not mask a
+    #    newer mismatching one — a `stamps[0]` read reports ok here.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text(
+            f"[v=aaaaaaaaaaaa@{head}] driver started\n"
+            "[v=bbbbbbbbbbbb@0000000] driver re-armed on older code\n")
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "warn" and "0000000" in r["detail"],
+              f"c) NEWEST stamp decides (older match must not mask it), got {r}")
+
+    # d) no log at all.
+    with tempfile.TemporaryDirectory() as td:
+        ws, _ = _mk_ws(td, log_lines=None)
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok", f"d) no driver log -> ok, got {r}")
+
+    # e) no skills checkout.
+    with tempfile.TemporaryDirectory() as td:
+        ws, _ = _mk_ws(td, skills=False, log_lines=["[v=e1e1f151715f@abc1234] x"])
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok", f"e) no skills checkout -> ok, got {r}")
+
+    # f) a log with no stamp in it.
+    with tempfile.TemporaryDirectory() as td:
+        ws, _ = _mk_ws(td, log_lines=["driver started", "CONTENT_ITEM_EXPIRED: 1"])
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok" and "no stamp" in r["detail"],
+              f"f) log without a stamp -> ok, got {r}")
+
+    # g) skills dir has .git but HEAD is unreadable (no commit yet) -> degrade.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "workspace"
+        (ws / "state").mkdir(parents=True)
+        sk = ws / "skill-repos" / "sutando-skills"
+        sk.mkdir(parents=True)
+        _git(sk, "init", "-q", "-b", "main")          # no commit: rev-parse fails
+        (ws / "state" / "content-driver.log").write_text("[v=e1e1f151715f@abc1234] x\n")
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok" and "could not read" in r["detail"],
+              f"g) unreadable skills HEAD -> ok degrade naming THAT cause, got {r}")
+
+    # i) git is not runnable at all -> the except arm degrades to ok. A probe
+    #    that cannot measure must not invent an alarm.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] x\n")
+        real_run = hc.subprocess.run
+
+        def _boom(*a, **k):
+            raise OSError("git: not found")
+
+        hc.subprocess.run = _boom
+        try:
+            r = hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.subprocess.run = real_run
+        check(r["status"] == "ok" and "not asserting drift" in r["detail"],
+              f"i) git unrunnable -> ok degrade, not a false alarm, got {r}")
+
+    # The macOS /usr/bin/git stub raises an install dialog no timeout can suppress.
+    # Assert the ARGV built, not the verdict: a decision test cannot see the invoke.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text("[v=e1e1f151715f@" + head + "] x\n")
+        real_run = hc.subprocess.run
+        seen = []
+
+        def _spy(argv, *a, **k):
+            seen.append(argv)
+            return real_run(argv, *a, **k)
+
+        hc.subprocess.run = _spy
+        try:
+            hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.subprocess.run = real_run
+        gitcalls = [c for c in seen if c and "rev-parse" in list(c)]
+        check(bool(gitcalls), "j) the probe invokes git at all (guards the arm below)")
+        check(all(list(c)[0] != "git" for c in gitcalls),
+              "j) NO call is a bare 'git' - it goes through the resolver, got " + repr(gitcalls))
+
+    # j2) resolver reports no runnable git -> ok degrade, naming that cause.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text("[v=e1e1f151715f@" + head + "] x\n")
+        real_argv = hc.git_argv
+
+        def _no_git(*a):
+            raise hc.GitUnavailable("no runnable git on this host")
+
+        hc.git_argv = _no_git
+        try:
+            r = hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.git_argv = real_argv
+        check(r["status"] == "ok" and "no runnable git" in r["detail"],
+              "j2) absent CLT -> ok degrade naming the cause, got " + repr(r))
+
+    # h) POSITIVE CONTROL + MUTATION. Arm (a) must depend on the equality test.
+    #    Invert it in the source, load THAT, and prove the healthy case breaks.
+    src = HC_SRC.read_text()
+    target = "    if running == head:"
+    check(src.count(target) == 1,
+          "h) the mutated predicate is present exactly once (update the arm if it moved)")
+    if src.count(target) == 1:
+        with tempfile.TemporaryDirectory() as td:
+            mutated = src.replace(target, "    if running != head:", 1)
+            mpath = Path(td) / "hc_mutant.py"
+            mpath.write_text(mutated)
+            mspec = importlib.util.spec_from_file_location("hc_mut", mpath)
+            mhc = importlib.util.module_from_spec(mspec)
+            mspec.loader.exec_module(mhc)
+            ws, head = _mk_ws(td, log_lines=["placeholder"])
+            (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] x\n")
+            rm = mhc.check_skills_driver_code_drift(ws)
+            check(rm["status"] != "ok",
+                  "h) inverting `running == head` breaks the healthy case "
+                  f"(the comparison is exercised, not merely present), got {rm}")
+
+    print()
+    if FAILS:
+        print(f"{len(FAILS)} FAILED")
+        for f in FAILS:
+            print("  - " + f)
+        return 1
+    print("all ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
