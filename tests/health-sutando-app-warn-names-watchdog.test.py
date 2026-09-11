@@ -68,7 +68,8 @@ ck("and it really pgreps for the watcher",
    re.search(r'"-f",\s*"watch-tasks"', body) is not None)
 ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in the file",
    "if cliIsWorking()" in body)
-# A guard whose body was emptied would still match the line above.
+# `[^}]*` cannot cross a nested block: add any inner brace before the return and
+# this goes RED on correct code. Widen the pattern then — do not delete the check.
 ck("and that guard actually returns early",
    re.search(r"if cliIsWorking\(\)\s*\{[^}]*\breturn\b", body, re.S) is not None)
 
