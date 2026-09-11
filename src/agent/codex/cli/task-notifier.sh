@@ -10,14 +10,18 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
-TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+# An inbox is not always <workspace>/tasks: a pool worker watches
+# <workspace>/deliveries/<id>, whose parent is deliveries/, not the workspace.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+INBOX_KIND="${SUTANDO_INBOX_KIND:-tasks}"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+TASK_HANDLER_CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
-TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
@@ -32,8 +36,15 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 COMPOSER_READY_TIMEOUT="${SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT:-30}"
 # Poll the composer at the caller's cadence; the default is human-scale.
 COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
+CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$WORKSPACE_DIR/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
+# Test probe: report the resolved trees, so the suite reads what this script
+# ACTUALLY derives rather than a copy. No production caller passes it.
+if [ "${1:-}" = "--print-paths" ]; then
+  printf 'TASKS_DIR=%s\nWORKSPACE_DIR=%s\nRESULTS_DIR=%s\nTASK_HANDLER_CLAIMS_DIR=%s\nCORE_STATUS_FILE=%s\n' \
+    "$TASKS_DIR" "$WORKSPACE_DIR" "$RESULTS_DIR" "$TASK_HANDLER_CLAIMS_DIR" "$CORE_STATUS_FILE"
+  exit 0
+fi
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -44,8 +55,8 @@ probe_optional_task_handler() {
   [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime codex \
-    --workspace "$(dirname "$TASKS_DIR")" \
-    --task-file "$TASKS_DIR/$filename" \
+    --workspace "$WORKSPACE_DIR" \
+    --task-file "$(payload_file "$filename")" \
     --results-dir "$RESULTS_DIR" \
     --repo "$REPO" \
     --probe >/dev/null
@@ -105,6 +116,18 @@ prepare_workstream_context() {
     echo "task-notifier: workstream context lookup failed for $filename; continuing without context" >&2
     rm -f "$candidate"
   fi
+}
+
+# A sentinel names its payload and holds none; pool_delivery owns that mapping,
+# so the prompt and the handler probe ask it rather than re-spelling tasks/.
+payload_file() {
+  local filename="$1"
+  if [ "$INBOX_KIND" != "deliveries" ]; then
+    printf '%s\n' "$TASKS_DIR/$filename"
+    return 0
+  fi
+  "$NOTIFIER_PY" "$REPO/src/pool_delivery.py" \
+    --workspace "$WORKSPACE_DIR" payload --sentinel "$filename"
 }
 
 has_result() {
@@ -224,7 +247,7 @@ PY
 # appear. Log to the workspace log dir when it exists, and always to stderr.
 log_notifier() {
   local msg="task-notifier: $*" dir
-  dir="$(dirname "$TASKS_DIR")/logs"
+  dir="$WORKSPACE_DIR/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
 }
@@ -319,7 +342,7 @@ deliver_prompt() {
 }
 
 submit_task() {
-  local filename="$1" wait_for_result="${2:-0}" prompt started
+  local filename="$1" wait_for_result="${2:-0}" prompt started payload
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -327,7 +350,9 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  payload="$(payload_file "$filename")"
+  [ -n "$payload" ] || return 0
+  prompt="Sutando task ready: $filename. Read $payload, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi

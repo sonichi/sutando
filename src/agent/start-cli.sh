@@ -28,10 +28,26 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
-runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
-  echo "start-cli: failed to resolve core runtime" >&2
-  exit 1
-}
+# `--runtime <name>` names the runtime for THIS launch (leading arg only). A
+# caller that recorded one must not get the core's config substituted for it.
+requested_runtime=""
+if [ "${1:-}" = "--runtime" ]; then
+  requested_runtime="${2:-}"
+  if [ -z "$requested_runtime" ]; then
+    echo "start-cli: --runtime needs a value" >&2
+    exit 2
+  fi
+  shift 2
+fi
+
+if [ -n "$requested_runtime" ]; then
+  runtime="$requested_runtime"
+else
+  runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
+    echo "start-cli: failed to resolve core runtime" >&2
+    exit 1
+  }
+fi
 
 case "$runtime" in
   claude|codex)

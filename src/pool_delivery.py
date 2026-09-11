@@ -87,8 +87,14 @@ def archived_payload(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
 
 
+def results_dir(workspace) -> Path:
+    """Where every recipient's answers go. Named here so a caller that only
+    composes the path (a spawner, a launcher) does not re-spell the layout."""
+    return _root(workspace) / "results"
+
+
 def result_path(workspace: Path, task_id: str) -> Path:
-    return _root(workspace) / "results" / f"{task_id}.txt"
+    return results_dir(workspace) / f"{task_id}.txt"
 
 
 def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
@@ -264,12 +270,32 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue"))
+    ap.add_argument("command",
+                    choices=("sweep", "pending", "watch", "residue", "payload"))
     ap.add_argument("--task-id")
+    ap.add_argument("--sentinel", help="a sentinel filename, for `payload`")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
+    if a.command == "payload":
+        # A sentinel names a payload and holds none. Callers outside python ask
+        # here rather than re-spelling the name grammar or the tasks/ layout.
+        task_id = a.task_id
+        if not task_id:
+            if not a.sentinel:
+                ap.error("--sentinel or --task-id is required for payload")
+            got = parse_sentinel(a.sentinel)
+            if got is None:
+                print(f"pool_delivery: not a sentinel name: {a.sentinel}", file=sys.stderr)
+                return 1
+            task_id = got[0]
+        p = payload_path(ws, task_id)
+        if not p.is_file():
+            print(f"pool_delivery: no payload for {task_id} at {p}", file=sys.stderr)
+            return 1
+        print(p)
+        return 0
     if a.command == "residue":
         if not a.task_id:
             ap.error("--task-id is required for residue")

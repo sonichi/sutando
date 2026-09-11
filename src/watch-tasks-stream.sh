@@ -65,6 +65,10 @@ __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 # into its env). Single resolution path = no divergence.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
+elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+  # A pool worker's session carries its delivery folder in env, so the same
+  # `/startup` that serves the core serves a worker with no argument change.
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
 elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
   __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
   TASKS_DIR="$__WS/tasks"
@@ -79,7 +83,9 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
-WORKSPACE_DIR="$(dirname "$TASKS_DIR_ABS")"
+# A worker watches <ws>/deliveries/<id>, so the inbox's parent is not its
+# workspace; the spawner names the workspace explicitly.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # Optional task handlers are injected by runtime adapters. Two provider workers

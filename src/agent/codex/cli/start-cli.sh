@@ -147,6 +147,13 @@ WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
+# The session's own scripts resolve the workspace the same way the notifier does,
+# so a worker session that is not told it writes its answers under deliveries/.
+[ -n "${SUTANDO_INSTANCE_ID:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+[ -n "${SUTANDO_TASKS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
+[ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+[ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+[ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 # tmux's server environment can predate the product-mode override, so forward
 # the self-development policy explicitly into the persistent core session.
@@ -174,6 +181,28 @@ apply_tmux_defaults() {
   tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 }
 
+# What the notifier is launched with. Its own unit so the suite can read the
+# assembled set without a tmux server, and so there is only ever one of it.
+notifier_env_args() {
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$1")
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
+  [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
+  [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
+  if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
+    NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+  fi
+  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
+  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  # Without these the notifier derives state/ and results/ from the inbox's
+  # parent — deliveries/results for a worker, which no bridge ever drains.
+  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  [ -n "${SUTANDO_INBOX_KIND:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+  return 0   # the last test is a filter, not this function's verdict
+}
+
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
@@ -197,20 +226,22 @@ ensure_task_notifier() {
     fi
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   fi
-  NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
-  [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
-  [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
-  [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
-  if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
-    NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
-  fi
-  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
-  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  notifier_env_args "$expected_version"
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
+
+# Test probes: dump what is forwarded to the core session and to the notifier,
+# so the suite reads the REAL arrays without tmux. No production caller passes.
+if [ "${1:-}" = "--print-core-env" ]; then
+  printf '%s\n' ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"}
+  exit 0
+fi
+if [ "${1:-}" = "--print-notifier-env" ]; then
+  notifier_env_args probe
+  printf '%s\n' ${NOTIFIER_ENV_ARGS[@]+"${NOTIFIER_ENV_ARGS[@]}"}
+  exit 0
+fi
 
 # Keep the same core-supervisor signal available for both runtimes. The
 # monitor's liveness derivation is tmux/session based; its prompt classifier is
