@@ -187,6 +187,55 @@ class TestBodyCannotSelectTheRecipient(Base):
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]),
                          h.TAKE)
 
+
+class TestOneRosterPerRun(Base):
+    """kewei's P1 on #4110: classify() and _deliver() each loaded the roster,
+    so one run could decide against two versions."""
+
+    def rosters(self, *versions):
+        """A loader that hands out a different roster on each call."""
+        seq = iter(versions)
+        last = [None]
+
+        def loader(_ws):
+            try:
+                last[0] = next(seq)
+            except StopIteration:
+                pass
+            return last[0]
+        return unittest.mock.patch.object(h.pr, "load_roster", side_effect=loader)
+
+    def test_a_roster_swapped_mid_run_does_not_change_the_delivery_set(self):
+        bound = {"version": 1, "workers": {W: {"state": "live"}}, "bindings": {"!room:x": W}}
+        unbound = {"version": 2, "workers": {W: {"state": "live"}}, "bindings": {}}
+        t = self.task_file("task-1", channel_id="!room:x")
+        with self.rosters(bound, unbound):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
+        self.assertFalse((self.ws / "deliveries" / "core" / "task-1.txt").exists())
+
+    def test_the_run_loads_the_roster_exactly_once(self):
+        bound = {"version": 7, "workers": {W: {"state": "live"}}, "bindings": {"!room:x": W}}
+        t = self.task_file("task-1", channel_id="!room:x")
+        with self.rosters(bound) as loader:
+            h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertEqual(loader.call_count, 1)
+
+    def test_a_real_run_without_a_roster_defers_instead_of_delivering(self):
+        """An unreadable roster picks no recipient: the run marks the task and
+        exits 0, so the watcher does not hand a worker's task to the core."""
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "state" / "pool-route-retry" / "task-1").exists())
+        self.assertIn("refused: roster is absent or unreadable", (self.ws / "logs" / "pool-route-handler.log").read_text())
+
+    def test_the_run_line_names_the_version_it_decided_against(self):
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertIn("roster=v1", (self.ws / "logs" / "pool-route-handler.log").read_text())
+
+
 class TestFailureAfterTheProbe(Base):
     def log(self):
         p = self.ws / "logs" / "pool-route-handler.log"
