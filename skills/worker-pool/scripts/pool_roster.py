@@ -85,6 +85,11 @@ def load_bindings(workspace) -> dict:
     return bindings
 
 
+def save_bindings(workspace, bindings: dict) -> None:
+    """Persist the owner's declaration in the shape `load_bindings` reads."""
+    _write_atomic(bindings_path(workspace), {"bindings": dict(bindings)})
+
+
 def load_roster(workspace):
     """`None` when absent or unreadable. The router must refuse the pass on
     None rather than default to the core — a silent default routes every task

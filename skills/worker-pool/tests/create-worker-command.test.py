@@ -27,6 +27,7 @@ import pool_roster as pr  # noqa: E402
 import spawn_worker as sw  # noqa: E402
 
 ROOM = "!abc:ag2.space"
+ROOM2 = "!def:ag2.space"
 
 
 class Base(unittest.TestCase):
@@ -83,6 +84,18 @@ class TestTheRosterCannotGoStale(Base):
     def test_without_a_room_nothing_is_bound(self):
         self.run_cli()
         self.assertEqual(pr.load_roster(self.ws)["bindings"], {})
+
+    def test_a_second_create_keeps_the_first_rooms_binding(self):
+        # The next call reloads bindings.json, not the roster, so a binding
+        # that lived only in the compiled roster vanished on the second create.
+        self.assertEqual(self.run_cli("--room", ROOM), 0)
+        self.assertEqual(self.run_cli("--room", ROOM2), 0)
+        roster = pr.load_roster(self.ws)
+        want = {ROOM: self.spawned[0], ROOM2: self.spawned[1]}
+        self.assertEqual(roster["bindings"], want)
+        self.assertEqual(pr.load_bindings(self.ws), want)
+        self.assertEqual(pr.targets_for(roster, ROOM), [self.spawned[0]])
+        self.assertEqual(pr.targets_for(roster, ROOM2), [self.spawned[1]])
 
 
 class TestItRefusesBeforeCreating(Base):

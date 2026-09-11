@@ -87,6 +87,9 @@ def compile_with(workspace, worker_id: str, label: str, room) -> dict:
     bindings = dict(pr.load_bindings(workspace))
     if room:
         bindings[room] = worker_id
+        # The next create reloads bindings.json, not the roster: a binding
+        # held only in the compiled roster is discarded by the next command.
+        pr.save_bindings(workspace, bindings)
     return pr.compile_roster(workspace, workers, bindings)
 
 

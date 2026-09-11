@@ -210,6 +210,14 @@ class TestCorruptDeclarations(Base):
             with self.assertRaises(pr.RosterError, msg=bad):
                 pr.load_bindings(self.ws)
 
+    def test_a_saved_declaration_reloads_and_compiles(self):
+        pr.save_bindings(self.ws, {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_bindings(self.ws), {"!x:ag2.space": W1})
+        self.assertEqual(json.loads(pr.bindings_path(self.ws).read_text()),
+                         {"bindings": {"!x:ag2.space": W1}})
+        r = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(pr.targets_for(r, "!x:ag2.space"), [W1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)
