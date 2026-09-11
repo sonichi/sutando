@@ -83,20 +83,21 @@ actions.
 
 ## What this proposes
 
-A surface on the owner's screen that other parts of Sutando can render into, so
-an answer or a decision arrives where the work already is. The surface sits at
-the top of the display near the notch, is placed out of the way of whatever the
-owner is using, and stays until dismissed.
+Two components.
 
-Six components. Three of them already exist and are reused as they are.
+### 1. The notch
 
-### 1. The notch app — new
+One surface that shows external context on top of whatever the owner is doing.
+It is not specific to any one source: a web page, a file or a directory, earlier
+messages in a channel, a triage item — anything the current task needs and the
+current window does not contain is rendered in the same panel.
 
-A Swift binary (`skills/notch/`) that watches one JSON file and renders whatever
-card is in it. It owns two behaviours the figures depend on:
+![The panel in the lower right, clear of the message it is
+about.](design-voice-navigation-and-triage-placement.png)
 
-**Placement.** The card must not cover the thing it is about. On each show, and
-again whenever the owner switches app, candidate positions are scored:
+**It chooses where to sit.** The owner never positions it. On every show, and
+again whenever they switch app, it scores candidate slots against the live screen
+and takes the emptiest one:
 
 ```
 score(slot) = overlapFractionWithFocusedApp(slot) * 10000
@@ -104,74 +105,44 @@ score(slot) = overlapFractionWithFocusedApp(slot) * 10000
 ```
 
 Covering the app in use is categorically worse than covering idle text, so the
-focus term is weighted past the 0–255 text scale rather than added to it. Text
-density is the mean horizontal gradient of a downscaled grayscale screen grab:
-glyph strokes produce dense vertical edges, wallpaper produces almost none. A
-card the owner has dragged is never repositioned again.
+focus term outweighs the 0–255 text scale rather than adding to it. Text density
+is the mean horizontal gradient of a downscaled grayscale screen grab: glyph
+strokes make dense vertical edges, wallpaper almost none. A panel the owner has
+dragged is never moved again.
 
-![The panel sitting in the lower right, clear of the message it is about.](design-voice-navigation-and-triage-placement.png)
+![Mockup: a triage item rendered on the same panel — proposition, source, a
+freshness line, and Approve / Reject / Reply / Next /
+Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
 
-**Persistence.** The card stays until the owner dismisses it. Nothing retracts it
-on a timer, because a decision surface that disappears mid-read has to be fetched
-and re-read.
+A triage item is not a special case; it is one more kind of external context, in
+the same panel, in the same place. (That figure is drawn, not captured — post
+verdicts are not routed into triage today.)
 
-### 2. What a card can show — new
+**It stays until dismissed.** Nothing retracts it on a timer.
 
-The watched file carries a typed envelope, so adding a kind is a new case in one
-renderer rather than a new mechanism. Three tools write it today:
+**It should appear whenever context needs bridging, not only when asked.** Today
+it renders when something invokes it. The decisions in the Problem section are
+identifiable in advance — a message asking for a verdict on a link the owner
+cannot see is a bridgeable gap whether or not they think to ask. That inference
+is the part not yet built.
 
-| Tool | Renders |
-|---|---|
-| `show_web` | a URL, loaded in place — figure 2 |
-| `show_card` | structured rows: a title and labelled lines — the shape a triage item needs |
-| `fold_notch` | dismisses the current card |
+### 2. The voice panel
 
-A triage card is `show_card` with the fields the queue already supplies:
-proposition, reason, the freshness line, and the five actions.
-
-### 3. Resolving what "this" means — exists, and is why figure 2 works
-
-![The URL selected in the Discord message, blue highlight over the
-link.](design-voice-navigation-and-triage-highlight.png)
-
-The owner does not read a URL aloud. They highlight it and say *"open this"*.
-Turning that into an absolute URL is its own problem, and the answer is a
-fallback chain rather than one lookup:
-
-1. If the selection is in Discord, `read_selected_discord_text` resolves it and
-   returns the `href` — necessary because the visible label and the real target
-   often differ.
-2. If that resolver finds nothing, a vision query reads the highlighted text off
-   the screen.
-3. The clipboard is used only when the owner says they copied something.
-
-The ordering is the design. Asking the owner to copy a link they have already
-highlighted would hand the work back to them, which is the trip this is meant to
-remove.
-
-### 4. In-channel navigation — exists, gains an output
-
-`skills/discord-voice-overlay/` already tracks the visible Discord channel, the
-hovered message, and the current selection, behind four tools
-(`summarize_current_discord_channel`, `search_current_discord_channel`,
-`inspect_hovered_discord_message`, `read_selected_discord_text`). They answer by
-speech and nowhere else. Each gains an optional path that also writes a card.
-
-### 5. The triage client — new, thin
-
-sutando-life already serves the queue over HTTP (`GET /api/triage`,
-`/api/triage/freshness`, `POST /api/triage/action`). The notch is a client of
-those endpoints: read the current item, render it as a triage card, post the
-owner's answer back. No new ranking, no new queue, no new protocol — and the card
-must not cache a queue position, because `next_item` recomputes from the live
-reaction log on every call by design.
-
-### 6. Voice — exists, unchanged
+How the notch is reached, and already running: a small floating web client of its
+own on port 8081, beside the main one on 8080, toggled with **Ctrl+F** at any
+time and closed the same way.
 
 ![The voice panel: "Can you open this highlighted URL in the notch?" answered by
 "Okay, I've opened that URL in the notch."](design-voice-navigation-and-triage-voice.png)
 
-Voice is already the input half; the surface is the output half that was missing.
-The owner speaks the request and speaks the answer, and what the card adds is that
-the evidence was visible when they spoke. That is what makes a spoken `approve`
-verifiable rather than merely fast.
+Speaking is what makes the notch cheap enough to use mid-task. The owner does not
+type a path or read a URL aloud — they highlight it and say *"open this"*, and
+the reference is resolved on their behalf.
+
+![The URL selected in the Discord message.](design-voice-navigation-and-triage-highlight.png)
+
+Resolving *this* runs a fallback chain: a Discord selection read first, since the
+visible label and the real href often differ; a vision read of the highlighted
+text if that finds nothing; the clipboard only when the owner says they copied
+something. Asking them to copy a link they have already highlighted would hand
+the work back.
