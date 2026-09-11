@@ -83,14 +83,13 @@ actions.
 
 ## What this proposes
 
-Two components.
+One surface, and the parts that decide what goes on it.
 
-### 1. The notch
+### 1. The notch — the surface
 
-One surface that shows external context on top of whatever the owner is doing.
-It is not specific to any one source: a web page, a file or a directory, earlier
-messages in a channel, a triage item — anything the current task needs and the
-current window does not contain is rendered in the same panel.
+A panel that shows external context on top of whatever the owner is doing. It is
+not specific to any source: anything the current task needs and the current
+window does not contain is rendered in the same place.
 
 ![The panel in the lower right, clear of the message it is
 about.](design-voice-navigation-and-triage-placement.png)
@@ -110,39 +109,67 @@ is the mean horizontal gradient of a downscaled grayscale screen grab: glyph
 strokes make dense vertical edges, wallpaper almost none. A panel the owner has
 dragged is never moved again.
 
-![Mockup: a triage item rendered on the same panel — proposition, source, a
-freshness line, and Approve / Reject / Reply / Next /
-Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
-
-A triage item is not a special case; it is one more kind of external context, in
-the same panel, in the same place. (That figure is drawn, not captured — post
-verdicts are not routed into triage today.)
-
 **It stays until dismissed.** Nothing retracts it on a timer.
 
-**It should appear whenever context needs bridging, not only when asked.** Today
-it renders when something invokes it. The decisions in the Problem section are
+**It should appear when context needs bridging, not only when asked.** Today it
+renders when something invokes it. The gaps in the Problem section are
 identifiable in advance — a message asking for a verdict on a link the owner
 cannot see is a bridgeable gap whether or not they think to ask. That inference
 is the part not yet built.
 
-### 2. The voice panel
+#### What it shows
 
-How the notch is reached, and already running: a small floating web client of its
-own on port 8081, beside the main one on 8080, toggled with **Ctrl+F** at any
-time and closed the same way.
+Three categories, one panel:
+
+| Category | Examples | Answers |
+|---|---|---|
+| **A reference the current window names but does not contain** | a URL, a file, a directory | "what is this thing it is pointing at?" |
+| **Context that already exists but is out of view** | earlier messages in this channel, a search across its history, the message under the pointer | "what was already said here?" |
+| **A decision waiting on the owner** | a triage item: proposition, reason, freshness, five actions | "what should I do next?" |
+
+The first two are the *within a task* half of the Problem section, the third is
+*across tasks*. They are the same panel because they are the same gap.
+
+![Mockup: a triage item rendered on the panel — proposition, source, a freshness
+line, and Approve / Reject / Reply / Next /
+Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
+
+A triage item is not a special case; it is the third row of that table. (This
+figure is drawn, not captured — post verdicts are not routed into triage today.)
+
+### 2. The voice panel — how the notch is reached
+
+Already running: its own small floating web client on port 8081, beside the main
+one on 8080, toggled with **Ctrl+F** at any time and closed the same way.
 
 ![The voice panel: "Can you open this highlighted URL in the notch?" answered by
 "Okay, I've opened that URL in the notch."](design-voice-navigation-and-triage-voice.png)
 
-Speaking is what makes the notch cheap enough to use mid-task. The owner does not
-type a path or read a URL aloud — they highlight it and say *"open this"*, and
-the reference is resolved on their behalf.
+Speaking is what makes the notch cheap enough to use mid-task: a request costs a
+sentence rather than a detour.
+
+### 3. Highlight resolution — what "this" refers to
+
+The owner does not read a URL aloud or type a path. They highlight something and
+say *"open this"*, which has to be turned into an absolute reference.
 
 ![The URL selected in the Discord message.](design-voice-navigation-and-triage-highlight.png)
 
-Resolving *this* runs a fallback chain: a Discord selection read first, since the
-visible label and the real href often differ; a vision read of the highlighted
-text if that finds nothing; the clipboard only when the owner says they copied
-something. Asking them to copy a link they have already highlighted would hand
-the work back.
+A fallback chain, in order: a Discord selection read first, since the visible
+label and the real `href` often differ; a vision read of the highlighted text if
+that finds nothing; the clipboard only when the owner says they copied something.
+Asking them to copy a link they have already highlighted would hand the work
+back, which is the trip this exists to remove.
+
+### 4. In-channel navigation — what is already in this channel
+
+An Accessibility watcher tracks the visible Discord channel, the message under
+the pointer, and the current selection, behind four tools:
+`summarize_current_discord_channel`, `search_current_discord_channel`,
+`inspect_hovered_discord_message`, `read_selected_discord_text`. They fill the
+second row of the table above.
+
+All four exist and all four answer by speech alone, which is why this row has no
+figure. A summary of forty messages cannot be spoken usefully and is gone from
+the voice agent's context in ten minutes; the same summary as a card is
+skimmable and stays. Each tool gains an optional path that also writes a card.
