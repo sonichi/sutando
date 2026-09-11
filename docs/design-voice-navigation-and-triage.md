@@ -83,145 +83,63 @@ actions.
 
 ## What this proposes
 
-Add a **notch** to `sonichi/sutando`: a small surface that places itself out of
-the owner's way on the screen they are already on. It closes the gap by moving
-the destination instead of the owner.
+A surface on the owner's screen that other parts of Sutando can render into, so
+an answer or a decision arrives where the work already is. The surface sits at
+the top of the display near the notch, is placed out of the way of whatever the
+owner is using, and stays until dismissed.
 
-| Gap | What the surface does |
-|---|---|
-| Getting there | The answer appears where you are looking; nothing is abandoned. |
-| Understanding | One thing at a time, sized to be read at a glance. |
-| Trusting | Evidence sits beside the claim, checkable without leaving it. |
+Five components, three of which already exist and are reused unchanged.
 
-Its first two consumers are the two ends of a task: **navigation** while working,
-**triage** between. Neither gets a new model — `#4003` defines the queue's action
-set and ordering and this RFC assumes them. **A second place, not a second
-model.**
+### 1. The notch app — new
 
-## Model
+A Swift binary (`skills/notch/`) that watches one JSON file and renders whatever
+card is in it. It owns two behaviours the figures depend on:
 
-### Placement
-
-The vendored `DynamicNotchKit` gets one hook and no policy:
-
-```swift
-public var placementProvider: ((NSScreen, NSSize) -> NSPoint)?
-```
-
-The app supplies the policy in `Sources/notch/Placement.swift`:
+**Placement.** The card must not cover the thing it is about. On each show, and
+again whenever the owner switches app, candidate positions are scored:
 
 ```
 score(slot) = overlapFractionWithFocusedApp(slot) * 10000
             + meanTextDensity(slot)
 ```
 
-The weight is not a tuning constant: covering the app in use is categorically
-worse than covering idle text, so the focus term is lifted clear of the 0–255
-gradient scale rather than summed into it. Text density is the mean horizontal
-gradient of a 1/8-scale grayscale grab — glyph strokes make dense vertical edges,
-wallpaper makes almost none.
+Covering the app in use is categorically worse than covering idle text, so the
+focus term is weighted past the 0–255 text scale rather than added to it. Text
+density is the mean horizontal gradient of a downscaled grayscale screen grab:
+glyph strokes produce dense vertical edges, wallpaper produces almost none. A
+card the owner has dragged is never repositioned again.
 
-It recomputes on `NSWorkspace.didActivateApplicationNotification`, 250 ms late
-because the new app's windows are not on screen at the instant it fires. **A
-panel the owner has dragged is never moved again for that card**, and a card is
-never retracted on a timer — only the owner dismisses it.
+**Persistence.** The card stays until the owner dismisses it. Nothing retracts it
+on a timer, because a decision surface that disappears mid-read has to be fetched
+and re-read.
 
-Two properties of the sensors, each learned the hard way:
+### 2. Card kinds — new
 
-- **Fail loudly when blind.** `CGWindowListCreateImage` without a Screen
-  Recording grant returns the wallpaper and the caller's own windows — no error,
-  no empty result — so the score is computed over a desktop photo and looks
-  fine. `CGPreflightScreenCaptureAccess()` is checked at startup and warns.
-- **Sign with a stable identity.** Ad-hoc signing makes the binary's identity a
-  hash of its own contents, so every rebuild silently drops that grant.
-  `build.sh` reads `NOTCH_SIGN_IDENTITY` / `NOTCH_SIGN_KEYCHAIN`; unset falls
-  back to ad-hoc with the consequence documented rather than rediscovered.
+The watched file carries a typed envelope, so a new kind is a new case in one
+renderer rather than a new mechanism. Two kinds cover the figures above: a **web
+card** (a URL, rendered in place — figure 2) and a **triage card** (proposition,
+reason, freshness line, five actions — figure 3).
 
-### The triage card
+### 3. In-channel navigation — exists, gains an output
 
-A `kind: "triage"` case in the existing card renderer, carrying what the record
-carries and nothing invented:
+`skills/discord-voice-overlay/` already tracks the visible Discord channel, the
+hovered message, and the current selection, behind four tools
+(`summarize_current_discord_channel`, `search_current_discord_channel`,
+`inspect_hovered_discord_message`, `read_selected_discord_text`). They answer by
+speech and nowhere else. Each gains an optional path that also writes a card.
 
-| Card | Source |
-|---|---|
-| the proposition | `proposal.proposition` |
-| the reason | `proposal.why` |
-| **freshness evidence** | `triage_freshness`'s structured `freshness` field |
-| the response | the actions the reaction log already accepts |
+### 4. The triage client — new, thin
 
-Freshness is what earns the surface. On a page it is appended to the detail; on
-a card it sits beside the proposition, so *"this names five PRs, one merged six
-days ago"* is read at the same moment as the claim. That is the trust gap closed,
-and it is the one speech cannot close at all.
+sutando-life already serves the queue over HTTP (`GET /api/triage`,
+`/api/triage/freshness`, `POST /api/triage/action`). The notch is a client of
+those endpoints: read the current item, render it as a triage card, post the
+owner's answer back. No new ranking, no new queue, no new protocol — and the card
+must not cache a queue position, because `next_item` recomputes from the live
+reaction log on every call by design.
 
-**The card must not cache a queue position.** `next_item` recomputes from the
-live reaction log on every call by design; a surface that advances itself
-reintroduces the precomputed ordering that design avoids.
+### 5. Voice — exists, unchanged
 
-Transport already exists — sutando-life serves `GET /api/triage`,
-`/api/triage/freshness`, and `POST /api/triage/action`. The node is a client.
-
-### In-channel navigation
-
-The four existing tools — `summarize_current_discord_channel`,
-`search_current_discord_channel`, `inspect_hovered_discord_message`,
-`read_selected_discord_text` — each gain an optional render path to the same
-`hud-card.json`.
-
-This is not a second feature. A surface that only ever appears to demand a
-decision is an interruption; one that answers what you just asked, where you are
-already looking, is a place you already look. A summary of forty messages cannot
-be spoken usefully, and reading them is the trip the card removes.
-
-### Per-owner, not per-fleet
-
-Deck §3 (slides 21–22): six lanes, not one machine — Chi's MacBook (2026-03-25),
-Susan's MacBook (03-28), Sutando-Mini (04-11), Susan's Studio (04-22), Qingyun's
-Mac (05-05), others from 05-15. The surface is per-owner and per-display; the
-work it describes moves between all six.
-
-- Each node renders its own owner's queue, resolved from `SUTANDO_STAND_NAME`.
-- The fleet reaches this owner through **evidence, not notification** — when
-  someone else merges a named PR, that arrives as freshness on the card.
-- **No node may put a card on another node's screen.** That is an interruption
-  primitive and nothing here needs one.
-
-## What it reuses (not a rewrite)
-
-| Existing | Change |
-|---|---|
-| `#4003` / `src/pending_questions_triage.py` — queue model and action set | none; a second surface, not a second model |
-| `sutando-life` triage pipeline, `triage_freshness`, `triage_actions` | none; displayed and appended to, never recomputed |
-| `DynamicNotchKit` (vendored) | one `placementProvider` hook + a focus observer; no policy |
-| `skills/notch/` renderer | placement policy, no self-dismiss, drag-movable, `kind: "triage"` |
-| `skills/discord-voice-overlay/` | optional render-to-card path per tool |
-
-No new ranking, queue, protocol, or daemon.
-
-**Out of scope:** `liususan091219/prtriage` is a separate PR-ranking board with
-its own UI. Nothing here reads from it.
-
-## Settled (owner, 2026-09-11)
-
-- **Voice may approve directly** — no click gate. The card's job is that the
-  evidence was visible when the owner spoke, not that the answer travelled back
-  the same way.
-- **Transport is HTTP** to sutando-life's existing triage endpoints.
-
-## Open questions (for owner)
-
-1. **Does a triage card wait forever**, or yield to a navigation card and return?
-2. **Polling cadence**, and whether to stop asking while one is unanswered.
-3. **Multi-display** — follow the focused app, or stay on `screens[0]`?
-4. **Window drags** do not trigger re-placement; covering them needs
-   Accessibility observers or a grab per tick. Worth it?
-5. **One model, two servers** — should the card read `pending_questions_triage`
-   (as `#4003` establishes) or sutando-life's `/api/triage`?
-6. **Repo boundary** — the notch ships in `sonichi/sutando`, triage stays in the
-   private `sonichi/sutando-life`. What happens on a machine without it?
-
-## Next steps (on owner confirm)
-
-1. Land placement as its own PR — self-contained, implemented, verified.
-2. Render-to-card for one navigation tool, evaluate, then the other three.
-3. The triage card last: read path, then the reaction path.
+Voice is already the input half; the surface is the output half that was missing.
+The owner speaks the request and speaks the answer, and what the card adds is that
+the evidence was visible when they spoke. That is what makes a spoken `approve`
+verifiable rather than merely fast.
