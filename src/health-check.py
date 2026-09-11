@@ -62,7 +62,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
@@ -8582,6 +8582,45 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
     return None
 
 
+def _proc_argv_vector(pid: int) -> "list[str] | None":
+    """Real argv of `pid` as a LIST, or None when no authoritative read exists.
+
+    A flattened argv cannot separate an operand containing a space from two
+    operands, so the executed script is not recoverable from it by any rule.
+    """
+    try:  # linux: NUL-delimited, authoritative
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
+    except Exception:  # noqa: BLE001 -- not linux, or gone
+        pass
+    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(262144)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        data = buf.raw[:size.value]
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        parts = data[4:].split(b"\0")
+        i = 0
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        i += 1                                   # the exec path
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        out = []
+        while i < len(parts) and len(out) < argc:
+            out.append(parts[i].decode("utf8", "replace"))
+            i += 1
+        return out or None
+    except Exception:  # noqa: BLE001 -- probe failure must not fail the check
+        return None
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -8678,14 +8717,201 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
 _WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
 
 
-def _is_watcher_argv(argv: str) -> bool:
-    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
+# and a mention inside a longer word cannot match.
+_WATCHER_SCRIPT_NAME = "watch-tasks-stream.sh"
+_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
+
+
+def _as_pid(tok: str) -> "int | None":
+    try:
+        return int(tok)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
+    """True/False from the EXECUTED script; None when nothing can prove it.
+
+    Callers disagree on what None should mean, which is why this is tri-state:
+    over-counting a watcher costs delayed tasks, publishing a wrong pid costs a
+    killed stranger.
+    """
+    vec = _proc_argv_vector(pid) if pid is not None else None
+    if vec is not None and len(vec) >= 2:
+        if vec[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
+            return False
+        if vec[1].startswith("-"):
+            return False
+        return os.path.basename(vec[1]) == _WATCHER_SCRIPT_NAME
     parts = argv.split()
-    if len(parts) != 2:
+    if len(parts) < 2:
         return False
-    exe, script = parts
-    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
-            and script.endswith("watch-tasks-stream.sh"))
+    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
+        return False
+    if parts[1].startswith("-"):
+        return False
+    # Authoritative only when argv ends at parts[1]: with more tokens the real
+    # pathname may continue past a space and end in a different name.
+    if _WATCHER_SCRIPT.search(parts[1]) is not None:
+        return True if len(parts) == 2 else None
+    if len(parts) == 2:
+        return False
+    # Only a later token matches, and a spaced script path is the same string as a
+    # script plus arguments -- nothing here can decide between them.
+    return None if _WATCHER_SCRIPT.search(argv) else False
+
+
+# Read from the module that defines the precedence; a copy here is how this
+# reader and `rundir.agent_id` come to disagree about the same process.
+
+
+def _pid_env_first(pid: str, names):
+    """First of `names` set in THAT process's environment, "" if it states none.
+
+    Tri-state on purpose: None is "cannot read", never "default" -- naming a
+    sentinel from THIS process's env is how a named watcher gets the canonical file.
+    """
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:  # noqa: BLE001  -- not linux, or not permitted
+        try:
+            out = subprocess.run(["ps", "-Eww", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        # `ps` concatenates argv and env with spaces, so a value containing one is
+        # UNRECOVERABLE: `worker 7` reads back as `worker`, a different sentinel.
+        toks = out.stdout.split()
+        printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
+        if not printed_env:
+            return None
+        if any(k.startswith(f"{name}=") for name in names for k in toks):
+            return None                               # present but not recoverable
+        return ""                                     # printed, and states none
+    seen = {}
+    for raw in environ.split(b"\0"):
+        for name in names:
+            prefix = name.encode() + b"="
+            if raw.startswith(prefix):
+                seen.setdefault(name, raw.split(b"=", 1)[1].decode("utf-8", "replace"))
+    for name in names:
+        if seen.get(name):
+            return seen[name]
+    return ""
+
+
+def _pid_instance_id(pid: str):
+    """The instance half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, ("SUTANDO_INSTANCE_ID",))
+
+
+def _pid_actor_id(pid: str):
+    """The actor half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, actor_env_names())
+
+
+def _watcher_sentinel_target(state_dir, pid):
+    """The sentinel path for the watcher at `pid`, or None when its identity is
+    not authoritative. A guess here is published as a repair target."""
+    inst = _pid_instance_id(pid)
+    actor = _pid_actor_id(pid)
+    if inst is None or actor is None:
+        return None
+    try:
+        # BOTH halves explicitly. None means "resolve from the caller", and the
+        # caller here is health-check -- a different actor than the watcher.
+        defaults = stated_default_identity(state_dir)
+        if defaults is None:
+            return None
+        return watcher_sentinel_path(state_dir, instance=(inst or defaults[0]),
+                                     agent=(actor or defaults[1]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _peer_multiplicity_parts(groups, tracked_targets, ps_out):
+    """Peer targets carrying more than one root, ownership deciding which stays.
+
+    Computed on EVERY path, never only when no tracked-target duplicate exists:
+    a duplicate on one target must not hide a duplicate on another.
+    """
+    peer = {t: rs for t, rs in groups.items()
+            if t not in tracked_targets and len(rs) > 1}
+    if not peer:
+        return []
+    own_x, sup_x = _split_roots_by_owner(
+        [r for rs in peer.values() for r in rs], ps_out)
+    parts = []
+    for tgt, rs in peer.items():
+        _s = [r for r in rs if r in sup_x]
+        _o = [r for r in rs if r in own_x]
+        if _s and _o:
+            parts.append(f"{', '.join(rs)} share one instance — keep the supervised "
+                         f"{', '.join(_s)} and stop the ownerless {', '.join(_o)}")
+        elif _s:
+            parts.append(f"{', '.join(rs)} share one instance and are ALL supervised — "
+                         f"reduce through the launcher that owns them, do NOT stop them")
+        else:
+            parts.append(f"{', '.join(rs)} share one instance — keep ONE and stop "
+                         f"the rest")
+    return parts
+
+
+def _group_roots_by_target(state_dir, roots):
+    """(target -> [pids], unresolvable pids). The ONE identity policy both the
+    sentinel-present and no-sentinel branches classify with."""
+    groups, unknown = {}, []
+    for r in roots:
+        target = _watcher_sentinel_target(state_dir, r)
+        if target is None:
+            unknown.append(r)
+        else:
+            groups.setdefault(str(target), []).append(r)
+    return groups, unknown
+
+
+def _ps_watcher_index(ps_output: str) -> tuple:
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
+
+    Both the tree walk and the ownership split need this; two parses could
+    disagree about a process that exited between them.
+    """
+    me = str(os.getpid())
+    parent: dict = {}
+    live: set = set()
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        live.add(parts[0])
+        if parts[0] == me:
+            continue
+        # None is UNKNOWN: count it, because a missed watcher starts a second
+        # one and every task is then processed twice.
+        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
+            continue
+        parent[parts[0]] = parts[1]
+    return parent, live
+
+
+def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
+    """(ownerless, supervised) for the roots GIVEN, by each root's own parent.
+
+    A known parent that is not init still owns the process; advice that does not
+    separate the two tells an operator to stop somebody's live child.
+    """
+    own, sup = [], []
+    for r in roots:
+        r = str(r)
+        pp = _pid_parent(r, ps_output)
+        if pp and pp not in ("1", "0"):
+            sup.append(r)
+        else:
+            own.append(r)
+    return own, sup
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
@@ -8708,15 +8934,7 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
                                        timeout=5).stdout
         except Exception:  # noqa: BLE001
             return {}
-    me = str(os.getpid())
-    parent = {}
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or parts[0] == me:
-            continue
-        if not _is_watcher_argv(parts[2]):
-            continue
-        parent[parts[0]] = parts[1]
+    parent, _live = _ps_watcher_index(ps_output)
     trees: dict = {}
     for pid in parent:
         root, seen = pid, set()
@@ -8725,6 +8943,12 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
             root = parent[root]
         trees.setdefault(root, set()).add(pid)
     return trees
+
+
+def extras_present(trees, live) -> bool:
+    """Any watcher tree not claimed by a live sentinel."""
+    tracked = {str(x) for x in live}
+    return any(not (members & tracked) for members in trees.values())
 
 
 def check_task_watcher() -> dict:
@@ -8749,7 +8973,10 @@ def check_task_watcher() -> dict:
     as one that is always green.
     """
     name = "task-watcher"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # EVERY instance's sentinel: on a pool host each watcher writes its own, so
+    # a probe that reads one file classifies the other N-1 as untracked.
+    sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
+    pid_file = sentinels[0] if sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
     # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
     # so take the snapshot here: None is unavailable, "" is genuinely empty.
     ps_out = _ps_snapshot()
@@ -8774,54 +9001,289 @@ def check_task_watcher() -> dict:
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
-            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            ownerless, supervised = _split_roots_by_owner(roots, ps_out)
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
                 # `--fix` re-stamps the sentinel instead: the pid is a live watcher,
                 # so naming it restores Stop-hook cleanup without the restart.
+                # The target comes from the WATCHER's identity, never this process's:
+                # the canonical path claims the wrong instance for a named watcher.
+                target = _watcher_sentinel_target(WORKSPACE_DIR / "state", roots[0])
+                if target is None:
+                    return {"name": name, "status": "warn",
+                            "_sentinel_restamp_pid": roots[0],
+                            "detail": f"watcher pid {roots[0]} runs under a live session "
+                                      f"(ppid {parents[roots[0]]}) but wrote no PID sentinel, "
+                                      "and its own SUTANDO_INSTANCE_ID is unreadable from here, "
+                                      "so the repair target cannot be named without guessing "
+                                      "which instance owns it. Do NOT stop it — it IS draining "
+                                      "tasks/. Restart it cleanly when tasks/ is empty."}
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
+                        "_sentinel_restamp_path": str(target),
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            # ONE identity snapshot for every derivation below: three separate
+            # resolver reads can disagree if a process's identity changes between.
+            _snap = {r: _watcher_sentinel_target(WORKSPACE_DIR / "state", r) for r in roots}
+            _tgt = lambda rs: ({str(_snap[r]) for r in rs if _snap[r] is not None},
+                               [r for r in rs if _snap[r] is None])
+            _all_t, _unknown = _tgt(roots)
+            _sup_t, _su = _tgt(supervised)
+            _own_t, _ou = _tgt(ownerless)
+            if _unknown:
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}); {len(_unknown)} "
+                        f"({', '.join(_unknown)}) have no resolvable (agent, instance), so "
+                        f"whether any task is processed twice is UNKNOWN — do not reduce the count")
+            elif len(_all_t) == len(roots) and len(roots) > 1:
+                cost = (f"{len(roots)} watcher(s) with no PID sentinel (pids {', '.join(roots)}) "
+                        f"resolve to {len(_all_t)} DISTINCT instances — not duplicates, and no "
+                        f"task is processed twice; do not reduce the count")
+            else:
+                _n = max((sum(1 for r in roots if _snap[r] is not None
+                              and str(_snap[r]) == x) for x in _all_t), default=len(roots))
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}) — {_n} share one instance target, so its "
+                        f"tasks are processed {_n}x")
+            count = cost
+            _sup_dupe = (not _su) and len(_sup_t) < len(supervised)
+            _reduce = "; reduce those through the launcher that owns them" if _sup_dupe else ""
+            # Per TARGET, not all-or-nothing: covered targets need no restart,
+            # and an unknown SUPERVISED root may alias any of them.
+            _covered = sorted(_own_t & _sup_t)
+            _uncovered = sorted(_own_t - _sup_t)
+            if _ou:
+                _stop = (f"Do NOT stop {', '.join(_ou)} — UNKNOWN identity: it may be the only "
+                         f"watcher for its instance")
+            elif _su:
+                _stop = (f"Do NOT stop {', '.join(ownerless)} — supervised {', '.join(_su)} has "
+                         f"UNKNOWN identity and may serve the same instance: restarting would "
+                         f"duplicate it, and not restarting may leave a gap")
+            elif _uncovered and _covered:
+                # Cardinality alone lets an operator restart the covered one and
+                # leave the uncovered instance absent: name which pid is which.
+                _by = {}
+                for r in ownerless:
+                    _by.setdefault(str(_snap[r]), []).append(r)
+                # ONE representative per uncovered target: restarting every root
+                # on a target recreates the duplicate the stop just removed.
+                _re = [_by[x][0] for x in _uncovered if x in _by]
+                _served = [r for r in ownerless if str(_snap[r]) in _covered]
+                _peer = [r for r in ownerless if r not in _re and r not in _served]
+                _why = "; ".join(filter(None, [
+                    f"{', '.join(_served)} — a supervised watcher already serves that instance"
+                    if _served else "",
+                    f"{', '.join(_peer)} — a peer above already covers that instance"
+                    if _peer else ""]))
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}), then restart "
+                         f"{', '.join(_re)} and NOT {_why}")
+            elif _covered:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
+                         f"a supervised watcher already serves that instance")
+            elif len(_uncovered) > 1:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
+                         f"{len(_uncovered)} cleanly — one per instance, NOT one")
+            else:
+                _stop = f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart one cleanly"
+            if ownerless and supervised:
+                lead = (f"{count}. {_stop}. Do NOT stop {', '.join(supervised)} "
+                        f"— supervised{_reduce}")
+            elif ownerless:
+                lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; {_stop}")
+            else:
+                _r = _reduce.replace("reduce those through", "reduce the count through")
+                lead = f"{count}. Do NOT stop any of them: each is supervised{_r}"
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{lead}. ownerless: {', '.join(ownerless) or 'none'}; "
+                              f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
-    try:
-        pid = int(pid_file.read_text().strip())
-    except Exception as e:  # noqa: BLE001
-        return {"name": name, "status": "warn",
-                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
-    argv = _proc_argv(pid)
-    if not argv:
+    # Classify EVERY sentinel, because each names a different watcher. The
+    # single-sentinel host takes exactly the branches it always did.
+    live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
+    collided = []
+    for sp in sentinels:
+        try:
+            spid = int(sp.read_text().strip())
+        except Exception as e:  # noqa: BLE001
+            unreadable.append((sp, str(e)[:40]))
+            continue
+        sargv = _proc_argv(spid)
+        if not sargv:
+            dead_pids.append((spid, sp))
+        else:
+            # The module's own predicate, not a substring: a stranger carrying
+            # the script name as a DATA argument passes `in` and is counted live.
+            verdict = _is_watcher_argv(sargv, spid)
+            if verdict is False:
+                reused.append((spid, sargv, sp))
+            elif verdict is None:
+                unprovable.append((spid, sargv, sp))
+            else:
+                # A dict keyed by pid DROPS the second file naming one pid, and
+                # two sentinels for one process is a real anomaly, not a tie.
+                if spid in live:
+                    collided.append((spid, live[spid], sp))
+                live[spid] = sp
+
+    if not live:
+        # Aggregate EVERY record class before advising: a per-class early
+        # return turns a dropped UNKNOWN into restart advice.
+        notes = []
+        if unreadable:
+            notes.append(f"unreadable PID sentinel ({unreadable[0][1]})")
+        if unprovable:
+            upid, uargv, _usp = unprovable[0]
+            notes.append(f"UNKNOWN: cannot prove pid {upid} is the watcher from its argv "
+                         f"({uargv[:50]})")
+        if reused:
+            rpid, rargv, _rsp = reused[0]
+            notes.append(f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}")
+        # An identity we cannot prove vetoes BOTH directions: a restart may
+        # duplicate the live watcher behind it, a stop may kill it.
+        veto = bool(unprovable)
+        pid = dead_pids[0][0] if dead_pids else 0
+
         if roots:
-            # The sentinel tracks only the MOST RECENT start, so a dead one does
-            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            # A dead sentinel does NOT mean nothing drains tasks/ — restarting
+            # here is what makes the duplicates.
+            own, sup = _split_roots_by_owner(roots, ps_out)
+            _dg, _du = _group_roots_by_target(WORKSPACE_DIR / "state", own)
+            _sg2, _ = _group_roots_by_target(WORKSPACE_DIR / "state", sup)
+            # Every sentinel here is dead, so an ownerless root is its instance's
+            # ONLY watcher unless a supervised peer serves the same target.
+            _sole = [o for tgt, rs in _dg.items() if tgt not in _sg2 for o in rs]
+            if _du or _sole:
+                own = [o for o in own if o not in _du and o not in _sole]
+            _blind = "".join([
+                f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "",
+                (f"; do NOT stop {', '.join(_sole)} — the only watcher for that instance, "
+                 f"and its sentinel is already dead") if _sole else ""])
+            _lead = ("; ".join(notes) + "; ") if notes else ""
+            _lead += (f"sentinel pid {pid} is dead but " if dead_pids
+                      else "no live sentinel but ")
+            _stop = ("no stop advice while a sentinel identity is unprovable" if veto
+                     else f"ownerless, safe to stop: {', '.join(own) or 'none'}")
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
-                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{_lead}{len(roots)} watcher(s) still "
+                              f"run; tasks/ IS being drained{_blind}. "
+                              f"{_stop}; "
+                              f"supervised, leave alone (a live parent owns them): "
+                              f"{', '.join(sup) or 'none'}"}
+
+        if not notes and dead_pids:
+            return {"name": name, "status": "warn",
+                    "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); "
+                              f"restart it"}
+        if dead_pids:
+            notes.append(f"sentinel pid {pid} is dead (crashed — sentinel left behind)")
+        if veto:
+            advice = ("not restarting and not stopping it; re-check when the process "
+                      "vector is readable")
+        elif unreadable or dead_pids:
+            advice = "restart the watcher"
+        else:
+            advice = ""
         return {"name": name, "status": "warn",
-                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
-    if "watch-tasks-stream" not in argv:
-        # PID reuse: the sentinel outlived the watcher and the OS handed the
-        # number to something else. `kill -0` alone would call this alive.
+                "detail": "; ".join(notes) + (f" — {advice}" if advice else "")}
+
+    faults = []
+    if dead_pids:
+        faults.append("crashed: " + ", ".join(
+            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
+    if reused:
+        faults.append("PID reuse: " + ", ".join(
+            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
+    if unreadable:
+        faults.append("unreadable: " + ", ".join(
+            f"{sp.name} ({err})" for sp, err in unreadable))
+    if unprovable:
+        faults.append("UNKNOWN: " + ", ".join(
+            f"{sp.name} (pid {spid} unprovable from argv)" for spid, _a, sp in unprovable))
+    if collided:
+        faults.append("one pid, two sentinels: " + ", ".join(
+            f"{a.name} and {b.name} both name pid {spid}" for spid, a, b in collided))
+    # A sentinel fault must not be skipped by an earlier remediation return:
+    # UNKNOWN or conflicting records veto destructive advice about extra trees.
+    tracked = {str(p) for p in live}
+    # EVERY classified record, not just the unprovable ones: a dead, reused or
+    # unreadable sentinel vanished just as silently through the extras returns.
+    if faults and extras_present(trees, live):
+        _veto = ("no stop or restart is advised while a sentinel record is unprovable or "
+                 "conflicting — resolve the records first"
+                 if (unprovable or collided) else
+                 "these records name instances whose watcher state is already known-bad; "
+                 "resolve them before acting on the untracked tree(s)")
         return {"name": name, "status": "warn",
-                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
-    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+                "detail": "; ".join(faults) + f". Untracked watcher tree(s) are present too, but "
+                          f"{_veto}"}
+    extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
+        # A root count is not an identity: only a shared sentinel target makes
+        # two roots duplicates, and an unresolvable one authorises nothing.
+        state_dir = WORKSPACE_DIR / "state"
+        tracked_targets = {str(sp) for sp in live.values()}
+        _groups, unknown = _group_roots_by_target(state_dir, extras)
+        dupes = [r for tgt, rs in _groups.items() if tgt in tracked_targets for r in rs]
+        distinct = [r for tgt, rs in _groups.items() if tgt not in tracked_targets for r in rs]
+        if unknown:
+            return {"name": name, "status": "warn",
+                    "detail": f"UNKNOWN: {len(unknown)} untracked watcher tree(s) "
+                              f"({', '.join(unknown)}) whose (agent, instance) identity does not "
+                              f"resolve — NOT stopping and NOT reducing: the same instruction "
+                              f"recreates a duplicate for one instance and removes the only "
+                              f"watcher for another. Resolve identity first"}
+        if distinct and not dupes:
+            _parts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+            if _parts:
+                _act = "; among themselves " + "; ".join(_parts)
+            else:
+                _act = ". Do NOT stop them"
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(distinct)} watcher tree(s) ({', '.join(distinct)}) belong to a "
+                              f"DIFFERENT instance than any tracked sentinel — not duplicates of a "
+                              f"tracked watcher; each is missing its own sentinel record{_act}; "
+                              f"register their sentinels"}
+        keep = ", ".join(str(p) for p in sorted(live))
+        own, sup = _split_roots_by_owner(dupes, ps_out)
+        # The peer analysis runs here too: a tracked-target duplicate must not
+        # make a duplicate on ANOTHER target vanish into "left alone".
+        _pparts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+        if distinct and _pparts:
+            extra_note = (f" ({len(distinct)} further tree(s) are a different instance — not "
+                          f"duplicates of a tracked watcher, but among themselves "
+                          f"{'; '.join(_pparts)})")
+        else:
+            extra_note = ("" if not distinct else
+                          f" ({len(distinct)} further tree(s) are a different instance, left alone)")
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
-                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
-    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+                "detail": f"{len(trees)} watcher trees running — {len(dupes)} share a sentinel "
+                          f"target with a tracked watcher, so those duplicate its work{extra_note}. "
+                          f"Keep the tracked one(s) ({keep}). "
+                          f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
+                          f"supervised, leave alone (a live parent owns them): "
+                          f"{', '.join(sup) or 'none'}"}
+    alive = ", ".join(str(p) for p in sorted(live))
+    # An anomaly belongs to the instance whose sentinel carries it, so a live
+    # PEER is not evidence about a crashed one and must not discard its record.
+    if faults:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(dead_pids) + len(reused) + len(unreadable) + len(unprovable) + len(collided)} "
+                          f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
+                          f"Each is a separate instance's "
+                          "record; a live peer does not clear it"}
+    if len(live) == 1:
+        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
@@ -9110,10 +9572,15 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
         return "no re-stampable watcher pid"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # The CHECK's path, not this process's ambient one: the two resolve from the
+    # environment and a repair that re-derives it can stamp another instance.
+    target = check.get("_sentinel_restamp_path")
+    if not target:
+        return "check named no sentinel path — not re-stamped"
+    pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         return f"pid {pid} is no longer the watcher — not re-stamped"
     try:
         # Separate try: mkdir raises FileExistsError when state/ is a plain
@@ -9132,7 +9599,7 @@ def fix_task_watcher_sentinel(check: dict) -> str:
         return f"could not write {pid_file}: {e}"
     # The probe above was a snapshot taken BEFORE publication; retract our own
     # stamp if it went stale mid-write.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         try:
             # Read-then-unlink, NOT arbitrated the way the write above is:
             # POSIX has no conditional unlink, so a claim landing here is lost.
