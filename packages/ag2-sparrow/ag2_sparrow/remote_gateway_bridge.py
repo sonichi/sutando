@@ -3626,28 +3626,30 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
-# Where a finisher writes its done-flag: pool workers under state/workers/<id>/
-# (src/pool_delivery.done_flag), pre-pool cores under state/cores/<id>/.
-_DONE_FLAG_ROOTS = ("workers", "cores")
+_CLAIMANT_RESOLVER = None
+
+
+def set_claimant_resolver(fn) -> None:
+    """Host-injected `(state_dir, result_stem) -> worker id`, "" when nothing
+    claims the task, raising when the host's state cannot answer definitely.
+    Sparrow never names a host's state layout; the adapter edge does."""
+    global _CLAIMANT_RESOLVER
+    _CLAIMANT_RESOLVER = fn
 
 
 def _worker_of(task_id: str) -> str:
-    """Which worker finished this task, read from its own done-flag.
+    """Which worker finished this task, per the host-injected resolver.
     `task_id` is the result stem, which already carries the `task-` prefix."""
-    hits = []
-    try:
-        for root in _DONE_FLAG_ROOTS:
-            hits.extend((_STATE / root).glob(f"*/done/{task_id}.flag"))
-    except OSError:
+    if _CLAIMANT_RESOLVER is None:
         return ""
-    if len(hits) == 1:
-        return hits[0].parent.parent.name
-    if hits:
-        # Two finishers claim the same task: stamping either one would assert an
-        # attribution the state tree does not support.
-        names = ", ".join(sorted(h.parent.parent.name for h in hits))
-        _log(f"result {task_id}: ambiguous done flags ({names}) — not stamping a worker")
-    return ""
+    try:
+        got = _CLAIMANT_RESOLVER(_STATE, task_id)
+    except Exception as exc:
+        # Abstain, never guess: a wrong id draws another worker's name and
+        # colour on the reply, with the same confidence as a right one.
+        _log(f"result {task_id}: {exc} — not stamping a worker")
+        return ""
+    return got if isinstance(got, str) else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
