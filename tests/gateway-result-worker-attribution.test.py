@@ -79,10 +79,10 @@ class WorkerAttribution(unittest.TestCase):
 
         self.mod._delivery_core = lambda: type("C", (), {"backend": _Backend()})()
 
-    def _worker_flag(self, wid: str, tid: str) -> Path:
+    def _worker_flag(self, wid: str, tid: str, published: bool = True) -> Path:
         # The production writer, not a fixture spelling of it: the reader and the
         # finisher must agree by construction, not by two matching guesses.
-        return pool_delivery.mark_done(self.tmp, wid, tid)
+        return pool_delivery.mark_done(self.tmp, wid, tid, published=published)
 
     def _core_flag(self, core: str, tid: str) -> Path:
         # Named exactly as finish_task writes it: the full result stem, prefix
@@ -157,6 +157,13 @@ class WorkerAttribution(unittest.TestCase):
         hit = self._abstained()
         self.assertEqual(len(hit), 1, f"expected one abstention log, got {self.logs}")
         self.assertIn("not a regular file", hit[0])
+
+    def test_a_pool_workers_pending_record_stamps_that_worker(self):
+        # The stage a worker is in while its handler publishes: the drain can
+        # meet the result before the promote, and must already have the name.
+        tid = "task-4pendingstage000e"
+        self._worker_flag("worker-1", tid, published=False)
+        self.assertEqual(self._doc(tid)["metadata"]["worker_id"], "worker-1")
 
     def test_control_a_malformed_pool_flag_does_not_let_the_legacy_core_win(self):
         # Mixed layout: dropping the malformed one on the floor would leave the

@@ -9,9 +9,10 @@ edge"). `src/remote-gateway-bridge.py` injects `resolve_claimant` into the
 package at load, the same seam `set_task_stamper` already uses.
 
 Two layouts are read, never written. The pool's is not spelled here at all — it
-comes from its own writer, `pool_delivery.mark_done` (which publishes the flag
-BEFORE the result, so a drained result always has its attribution), so a move
-there surfaces as a failure here instead of drifting into silence. The pre-pool per-core layout
+comes from its own writer, `pool_delivery.mark_done` (which lays `.pending`
+BEFORE the result and promotes it to `.flag` after, so a drained result always
+has its attribution — either stage names the worker), so a move there surfaces
+as a failure here instead of drifting into silence. The pre-pool per-core layout
 (`state/cores/<instance>/done/<stem>.flag`, written by `finish_task` in
 `src/pool_follower.py`) is spelled once, below.
 
@@ -43,17 +44,19 @@ class Unattributable(Exception):
     the adapter logs; abstaining is always the answer."""
 
 
-def _pool_flag(state: Path, worker: str, task_id: str) -> Path:
-    rel = pool_delivery.done_flag(_PROBE, worker, task_id).relative_to(_PROBE / "state")
-    return state / rel
+def _pool_flags(state: Path, worker: str, task_id: str) -> tuple[Path, ...]:
+    # Both stages: a worker mid-task owns the reply it is about to publish.
+    return tuple(state / p.relative_to(_PROBE / "state") for p in (
+        pool_delivery.done_flag(_PROBE, worker, task_id),
+        pool_delivery.pending_flag(_PROBE, worker, task_id)))
 
 
-def _legacy_flag(state: Path, worker: str, task_id: str) -> Path:
-    return state / _LEGACY_ROOT / worker / "done" / f"{task_id}.flag"
+def _legacy_flags(state: Path, worker: str, task_id: str) -> tuple[Path, ...]:
+    return (state / _LEGACY_ROOT / worker / "done" / f"{task_id}.flag",)
 
 
-_POOL_ROOT = _pool_flag(Path("/"), "w", "t").relative_to("/").parts[0]
-_LAYOUTS = ((_POOL_ROOT, _pool_flag), (_LEGACY_ROOT, _legacy_flag))
+_POOL_ROOT = _pool_flags(Path("/"), "w", "t")[0].relative_to("/").parts[0]
+_LAYOUTS = ((_POOL_ROOT, _pool_flags), (_LEGACY_ROOT, _legacy_flags))
 
 
 def claimants(state_dir, task_id: str) -> list[str]:
@@ -67,19 +70,19 @@ def claimants(state_dir, task_id: str) -> list[str]:
     """
     state = Path(state_dir)
     found = set()
-    for root, flag_of in _LAYOUTS:
+    for root, flags_of in _LAYOUTS:
         try:
             entries = list(os.scandir(state / root))
         except FileNotFoundError:
             continue  # this layout is simply not in use on this host
         for entry in entries:
-            flag = flag_of(state, entry.name, task_id)
-            # What counts as a flag is the writer's contract, asked not restated:
-            # a reader with its own idea of it disagrees with `residue` silently.
-            if pool_delivery.is_done_flag(flag):
-                found.add(entry.name)
-            elif os.path.lexists(flag):
-                raise Unattributable(f"done flag is not a regular file ({flag})")
+            for flag in flags_of(state, entry.name, task_id):
+                # What counts as a flag is the writer's contract, asked not restated:
+                # a reader with its own idea of it disagrees with `residue` silently.
+                if pool_delivery.is_done_flag(flag):
+                    found.add(entry.name)
+                elif os.path.lexists(flag):
+                    raise Unattributable(f"done flag is not a regular file ({flag})")
     return sorted(found)
 
 

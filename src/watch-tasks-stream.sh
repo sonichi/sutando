@@ -193,15 +193,15 @@ claim_disposition() {
 # 0 = the task is settled (failure published, or a real answer already exists).
 # 1 = NOT settled: another writer may own the destination, so nothing was touched.
 record_worker_done() {
-  # Attribution BEFORE the result: the gateway reads the finisher off this flag
-  # when it drains results/, so a result seen first is delivered with no worker.
-  local filename="$1" task_id="${filename%.txt}"
+  # `pending` before the result, `done` after it: the gateway reads the finisher
+  # off this record when it drains results/; the sweep retires only on `done`.
+  local filename="$1" stage="$2" task_id="${filename%.txt}"
   # The core is not a pool recipient and claims nothing; only a worker flags.
   [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
   [ -n "$SUTANDO_PY_BIN" ] || return 1
   "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
     --workspace "$WORKSPACE_DIR" --recipient "$SUTANDO_INSTANCE_ID" \
-    mark-done --task-id "$task_id" >/dev/null || return 1
+    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
 }
 
 publish_terminal_failure() {
@@ -210,7 +210,7 @@ publish_terminal_failure() {
   # The shared readiness contract, not -f/-s: an empty OR whitespace-only body
   # is the undeliverable placeholder state and must not suppress this failure.
   handler_result_exists "$filename" && return 0
-  if ! record_worker_done "$filename"; then
+  if ! record_worker_done "$filename" pending; then
     echo "watch-tasks-stream: could not record the done flag for $filename; leaving the claim unsettled rather than publishing a result no worker can be attributed for" >&2
     return 1
   fi
@@ -222,6 +222,10 @@ publish_terminal_failure() {
   # Reading then mutating a path a provider can still claim has no safe ordering.
   if ln "$temporary" "$result" 2>/dev/null; then
     rc=0
+    # Promotion is best-effort: the reply is out and attributed; a `.pending`
+    # left here is the state the sweep finishes at the next boot.
+    record_worker_done "$filename" done \
+      || echo "watch-tasks-stream: could not promote the done flag for $filename; the sweep will finish it" >&2
     # The scheduler's FAILED: the task ends here, whatever a provider observed.
     ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$TASKS_DIR/$filename" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
   elif handler_result_exists "$filename"; then

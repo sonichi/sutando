@@ -247,6 +247,66 @@ class TestFlagAfterDrain(Base):
         self.assertIsNone(pd.find(self.root, "core", "task-1"))
 
 
+class TestFlagStages(Base):
+    """`.pending` goes down before the result, `.flag` after it. Only `.flag`
+    retires: a crash between the two must be handed back, and the sweep must
+    never unlink a sentinel whose reply was never published."""
+
+    def test_pending_without_a_result_is_died_mid_work_not_finished(self):
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        pd.mark_done(self.root, "core", "task-1", published=False)
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "died-mid-work")
+
+    def test_sweep_hands_pending_work_back_and_keeps_its_record(self):
+        # The crash-through-sweep case: the label said recoverable; the sweep
+        # used to retire it anyway, and the recovery route went with the sentinel.
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        pd.mark_done(self.root, "core", "task-1", published=False)
+        out = pd.sweep(self.root, "core")
+        self.assertEqual(out["released"], ["task-1"])
+        self.assertEqual(out["retired"], [])
+        self.assertTrue((self.root / "deliveries/core/task-1.txt").exists())
+        self.assertEqual(pd.flag_stage(self.root, "core", "task-1"), "pending")
+
+    def test_pending_beside_a_result_is_finished_and_the_sweep_promotes_it(self):
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("core", "task-1"))
+        self.ws.result("task-1")
+        pd.mark_done(self.root, "core", "task-1", published=False)
+        self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
+        out = pd.sweep(self.root, "core")
+        self.assertEqual(out["retired"], ["task-1"])
+        self.assertEqual(pd.flag_stage(self.root, "core", "task-1"), "done")
+        self.assertFalse(pd.pending_flag(self.root, "core", "task-1").exists())
+        self.assertIsNone(pd.find(self.root, "core", "task-1"))
+
+    def test_promotion_removes_the_pending_record(self):
+        pd.mark_done(self.root, "core", "task-1", published=False)
+        p = pd.mark_done(self.root, "core", "task-1", published=True)
+        self.assertEqual(p, pd.done_flag(self.root, "core", "task-1"))
+        self.assertFalse(pd.pending_flag(self.root, "core", "task-1").exists())
+
+    def test_a_promoted_record_is_never_demoted(self):
+        pd.mark_done(self.root, "core", "task-1", published=True)
+        p = pd.mark_done(self.root, "core", "task-1", published=False)
+        self.assertEqual(p, pd.done_flag(self.root, "core", "task-1"))
+        self.assertEqual(pd.flag_stage(self.root, "core", "task-1"), "done")
+        self.assertFalse(pd.pending_flag(self.root, "core", "task-1").exists())
+
+    def test_done_outranks_a_pending_left_beside_it(self):
+        pd.mark_done(self.root, "core", "task-1", published=True)
+        pd.pending_flag(self.root, "core", "task-1").touch()  # crash after promote
+        self.assertEqual(pd.flag_stage(self.root, "core", "task-1"), "done")
+
+    def test_the_cli_requires_a_stage(self):
+        with self.assertRaises(SystemExit):
+            pd.main(["--workspace", str(self.root), "--recipient", "core",
+                     "mark-done", "--task-id", "task-1"])
+        self.assertIsNone(pd.flag_stage(self.root, "core", "task-1"))
+
+
 class TestSweep(Base):
     def test_releases_work_a_crash_left_accepted(self):
         self.ws.payload("task-1")

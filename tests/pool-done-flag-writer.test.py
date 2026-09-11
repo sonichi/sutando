@@ -5,9 +5,10 @@
 and `src/result_claimant.py`, which the gateway consults to stamp an outbound
 reply with the worker that produced it. The contract this suite pins:
 
-    ordering    flag, THEN result. A result the drain can see always has its
-                attribution beside it; the reverse (flag, no result) is the
-                recoverable state, and `residue` maps it to "finished".
+    ordering    `.pending`, THEN result, THEN `.flag`. A result the drain can
+                see always has its attribution beside it; the reverse
+                (`.pending`, no result) is the recoverable state, and a sweep
+                releases it rather than retiring it.
     atomicity   temp file + rename in the same directory, so a concurrent
                 reader sees the name absent or complete, never half-written.
     isolation   two finishers racing on different tasks do not clobber each
@@ -59,7 +60,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def _finish(args) -> str:
     """One finisher, in its own process — the production writer and nothing else."""
     ws, worker, task_id = args
-    return str(pool_delivery.mark_done(Path(ws), worker, task_id))
+    return str(pool_delivery.mark_done(Path(ws), worker, task_id, published=True))
 
 
 def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
@@ -101,11 +102,12 @@ def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
               seen.get("claimant") == WORKER,
               f"result was visible with claimant={seen.get('claimant')!r}")
         flag = pool_delivery.done_flag(h.ws, WORKER, tid)
-        check("the flag the writer left is a regular file", pool_delivery.is_done_flag(flag))
+        check("the record is promoted to `.flag` once the result is out",
+              wait_for(lambda: pool_delivery.is_done_flag(flag)), str(flag))
         check("and the drain resolves it to this worker after the fact",
               result_claimant.resolve_claimant(h.ws / "state", tid) == WORKER)
         beside = [p.name for p in flag.parent.iterdir()] if flag.parent.is_dir() else []
-        check("no temp file is left in the flag's directory",
+        check("neither a temp file nor the spent `.pending` is left beside it",
               beside == [flag.name], str(beside))
     finally:
         seen["stop"] = True
@@ -145,21 +147,56 @@ def scenario_a_repeated_finish_is_idempotent() -> None:
           result_claimant.claimants(ws / "state", "task-twice") == [WORKER])
     check("and the drain resolves it",
           result_claimant.resolve_claimant(ws / "state", "task-twice") == WORKER)
+    # A retried finisher laying `pending` after the promote must not reopen it.
+    late = pool_delivery.mark_done(ws, WORKER, "task-twice", published=False)
+    check("a late `pending` never demotes a promoted record",
+          late == pool_delivery.done_flag(ws, WORKER, "task-twice")
+          and pool_delivery.flag_stage(ws, WORKER, "task-twice") == "done"
+          and not pool_delivery.pending_flag(ws, WORKER, "task-twice").exists(),
+          f"stage={pool_delivery.flag_stage(ws, WORKER, 'task-twice')!r}")
 
 
-def scenario_a_crash_after_the_flag_is_the_recoverable_half() -> None:
-    """The one asymmetry the ordering buys: a flag without a result is a state
-    the sweep knows how to finish, while a result without a flag is a reply
-    already delivered with nobody's name on it — unrecoverable by then."""
-    print("\nscenario: crash between the flag and the result")
+def scenario_a_crash_after_the_record_is_the_recoverable_half() -> None:
+    """The asymmetry the ordering buys: a record without a result is a state
+    the sweep hands back, while a result without a record is a reply already
+    delivered with nobody's name on it — unrecoverable by then. Run THROUGH the
+    sweep: a label alone proved nothing when the sweep then unlinked the sentinel."""
+    print("\nscenario: crash between the record and the result, through the sweep")
     ws = Path(tempfile.mkdtemp(prefix="mark-done-crash-"))
     (ws / "results").mkdir(parents=True)
+    (ws / "tasks").mkdir()
     tid = "task-crashed"
-    pool_delivery.mark_done(ws, WORKER, tid)
+    (ws / "tasks" / f"{tid}.txt").write_text("task: probe\n")
+    d = pool_delivery.deliveries_dir(ws, WORKER)
+    d.mkdir(parents=True)
+    accepted = pool_delivery.accept(_sentinel(d, tid))
+    pool_delivery.mark_done(ws, WORKER, tid, published=False)   # ...then the crash
     check("no result was published", not pool_delivery.result_path(ws, tid).exists())
-    check("the flag still attributes the task", result_claimant.resolve_claimant(ws / "state", tid) == WORKER)
-    check("and residue calls that state recoverable, not lost",
+    check("the record still attributes the task",
+          result_claimant.resolve_claimant(ws / "state", tid) == WORKER)
+    before = pool_delivery.residue(ws, WORKER, tid)
+    check("residue calls that state died-mid-work, not finished", before == "died-mid-work", before)
+    out = pool_delivery.sweep(ws, WORKER)
+    print(f"  probe: before={before!r} retired={out['retired']} released={out['released']} "
+          f"sentinel_after={pool_delivery.find(ws, WORKER, tid) is not None} "
+          f"result_after={pool_delivery.result_path(ws, tid).exists()}")
+    check("the sweep hands the work back instead of retiring it",
+          out["released"] == [tid] and out["retired"] == [], str(out))
+    check("the sentinel survives the sweep, back under its pending name",
+          (d / f"{tid}.txt").is_file() and not accepted.exists())
+    check("and the record survives with it, so the retry's reply is still attributed",
+          pool_delivery.flag_stage(ws, WORKER, tid) == "pending"
+          and result_claimant.resolve_claimant(ws / "state", tid) == WORKER)
+    # The other half: a `done` record with no result is a DRAINED reply, retired.
+    pool_delivery.mark_done(ws, WORKER, tid, published=True)
+    check("a promoted record with no result reads as finished (drained), not died",
           pool_delivery.residue(ws, WORKER, tid) == "finished")
+
+
+def _sentinel(d: Path, tid: str) -> Path:
+    p = d / f"{tid}{pool_delivery.PENDING_SUFFIX}"
+    p.touch()
+    return p
 
 
 def scenario_the_writer_refuses_a_name_outside_the_pools_grammar() -> None:
@@ -169,13 +206,13 @@ def scenario_the_writer_refuses_a_name_outside_the_pools_grammar() -> None:
     ws = Path(tempfile.mkdtemp(prefix="mark-done-bounds-"))
     for recipient in ("../escape", "Worker-1", ""):
         try:
-            pool_delivery.mark_done(ws, recipient, "task-x")
+            pool_delivery.mark_done(ws, recipient, "task-x", published=False)
             check(f"rejects recipient {recipient!r}", False, "it was accepted")
         except ValueError:
             check(f"rejects recipient {recipient!r}", True)
     for task_id in ("../../escape", "notataskid", "task-a/b"):
         try:
-            pool_delivery.mark_done(ws, WORKER, task_id)
+            pool_delivery.mark_done(ws, WORKER, task_id, published=False)
             check(f"rejects task id {task_id!r}", False, "it was accepted")
         except ValueError:
             check(f"rejects task id {task_id!r}", True)
@@ -192,7 +229,7 @@ def scenario_a_failed_rename_leaves_nothing_behind() -> None:
     blocked.mkdir(parents=True)
     raised = False
     try:
-        pool_delivery.mark_done(ws, WORKER, tid)
+        pool_delivery.mark_done(ws, WORKER, tid, published=True)
     except OSError:
         raised = True
     check("the writer raises rather than reporting a finish", raised)
@@ -213,22 +250,27 @@ def scenario_the_cli_entry_point_writes_the_same_flag() -> None:
     print("\nscenario: pool_delivery.py mark-done")
     ws = Path(tempfile.mkdtemp(prefix="mark-done-cli-"))
     rc = pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER,
-                             "mark-done", "--task-id", "task-viacli"])
+                             "mark-done", "--task-id", "task-viacli", "--stage", "pending"])
     check("the CLI reports success", rc == 0)
-    check("and the drain resolves the flag it wrote",
+    check("and the drain resolves the record it wrote",
           result_claimant.resolve_claimant(ws / "state", "task-viacli") == WORKER)
-    try:
-        pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER, "mark-done"])
-        check("a missing --task-id is rejected, not defaulted", False, "it was accepted")
-    except SystemExit as exc:
-        check("a missing --task-id is rejected, not defaulted", exc.code != 0, str(exc.code))
+    check("which is the pending stage", pool_delivery.flag_stage(ws, WORKER, "task-viacli") == "pending")
+    rc = pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER,
+                             "mark-done", "--task-id", "task-viacli", "--stage", "done"])
+    check("--stage done promotes it", rc == 0 and pool_delivery.flag_stage(ws, WORKER, "task-viacli") == "done")
+    for argv in (["mark-done", "--stage", "pending"], ["mark-done", "--task-id", "task-viacli"]):
+        try:
+            pool_delivery.main(["--workspace", str(ws), "--recipient", WORKER] + argv)
+            check(f"{' '.join(argv)!r} is rejected, not defaulted", False, "it was accepted")
+        except SystemExit as exc:
+            check(f"{' '.join(argv)!r} is rejected, not defaulted", exc.code != 0, str(exc.code))
 
 
 def main() -> int:
     scenario_the_drain_never_sees_a_result_before_its_flag()
     scenario_racing_finishers_do_not_clobber_each_other()
     scenario_a_repeated_finish_is_idempotent()
-    scenario_a_crash_after_the_flag_is_the_recoverable_half()
+    scenario_a_crash_after_the_record_is_the_recoverable_half()
     scenario_the_writer_refuses_a_name_outside_the_pools_grammar()
     scenario_a_failed_rename_leaves_nothing_behind()
     scenario_the_cli_entry_point_writes_the_same_flag()

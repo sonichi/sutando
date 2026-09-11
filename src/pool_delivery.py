@@ -7,12 +7,15 @@ worker — receives work as *sentinels* in `deliveries/<recipient>/`:
     tasks/<task-id>.txt                      the payload; immutable, never copied
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
-    state/workers/<me>/done/<task-id>.flag   completion evidence; ONE writer,
-                                            `mark_done`, run BEFORE the result
+    state/workers/<me>/done/<task-id>.pending ownership, written BEFORE the result
+    state/workers/<me>/done/<task-id>.flag    the result was published; ONE writer
+                                             for both stages, `mark_done`
 
-That flag has two readers — `residue` here, and `src/result_claimant.py`, which
-the gateway consults to stamp an outbound reply with the worker that produced
-it. Hence the ordering: flag, then result.
+Those records have two readers — `residue` here, and `src/result_claimant.py`,
+which the gateway consults to stamp an outbound reply with the worker that
+produced it. Hence the ordering: pending, then result, then flag. Either record
+attributes; only `.flag` retires — a crash between the two leaves `.pending`,
+which recovery finishes rather than forgets.
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
 records that the ASSIGNED recipient accepted the work — a worker never selects
@@ -109,6 +112,11 @@ def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
     return _root(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
 
 
+def pending_flag(workspace: Path, recipient: str, task_id: str) -> Path:
+    """The first stage of the same record: owned, result not yet published."""
+    return done_flag(workspace, recipient, task_id).with_suffix(".pending")
+
+
 def is_done_flag(path) -> bool:
     """Completion evidence is a REGULAR file and nothing else: a directory at
     the name is malformed state, and reading it as a finish invents a claimant.
@@ -124,22 +132,19 @@ def is_done_flag(path) -> bool:
     return stat.S_ISREG(st.st_mode)
 
 
-def mark_done(workspace, recipient: str, task_id: str) -> Path:
-    """Record that `recipient` finished `task_id`. The ONLY writer of the flag.
+def flag_stage(workspace, recipient: str, task_id: str) -> str | None:
+    """`"done"`, `"pending"`, or None. A finished record outranks a pending one
+    left beside it, which a crash between promote and unlink can do."""
+    if is_done_flag(done_flag(workspace, recipient, task_id)):
+        return "done"
+    if is_done_flag(pending_flag(workspace, recipient, task_id)):
+        return "pending"
+    return None
 
-    Ordering is flag THEN result: the gateway reads attribution off this file
-    when it drains `results/`, so a result published first is delivered with no
-    worker on it. The reverse — a flag with no result — is recoverable, and
-    `residue` maps it to `finished`.
 
-    Write is temp-file + rename inside the same directory, so a concurrent
-    reader sees the name either absent or complete, never half-written.
-    """
-    if not RECIPIENT.match(recipient):
-        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
-    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
-        raise ValueError(f"not a task id: {task_id!r}")
-    dst = done_flag(workspace, recipient, task_id)
+def _publish_record(dst: Path) -> None:
+    # Temp file + rename inside the same directory, so a concurrent reader sees
+    # the name either absent or complete, never half-written.
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
     os.close(fd)
@@ -148,7 +153,33 @@ def mark_done(workspace, recipient: str, task_id: str) -> Path:
     except OSError:
         os.unlink(tmp)
         raise
-    return dst
+
+
+def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Path:
+    """Record `recipient`'s hold on `task_id`. The ONLY writer of either stage.
+
+    `published=False` lays down `.pending` BEFORE the result: the gateway reads
+    attribution off the record when it drains `results/`, so a result published
+    first is delivered with no worker on it. `published=True` promotes it to
+    `.flag` AFTER the result is visible, and that is the only stage `residue`
+    retires on. A promoted record is never demoted, so a late `pending` from a
+    retried finisher cannot reopen work the sweep has already retired.
+    """
+    if not RECIPIENT.match(recipient):
+        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    done = done_flag(workspace, recipient, task_id)
+    pending = pending_flag(workspace, recipient, task_id)
+    if not published:
+        if is_done_flag(done):
+            return done
+        _publish_record(pending)
+        return pending
+    _publish_record(done)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pending)
+    return done
 
 
 def pending(workspace: Path, recipient: str) -> list[Path]:
@@ -242,13 +273,13 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # The shared readiness contract, not existence: an empty or whitespace-only
     # file is a placeholder still being written, and must not suppress recovery.
     has_result = read_ready_result(result_path(ws, task_id)) is not None
-    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
+    stage = flag_stage(ws, recipient, task_id)
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
 
-    # The flag is terminal on its own: the bridge drains the result file on
-    # delivery, so after a drain the flag is the only durable evidence left.
-    if has_flag:
+    # `.flag` alone is terminal: the bridge drains the result on delivery.
+    # `.pending` alone is not: nothing was published, so recover it below.
+    if stage == "done" or (stage == "pending" and has_result):
         return "finished"
     if has_result:
         return "completed"
@@ -281,8 +312,9 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "completed":
             actions["completed"].append(task_id)
         elif state == "finished":
-            # Both result and flag exist, so the delivery is spent. Leaving the
-            # sentinel would hand finished work back as ready on the next boot.
+            # Promote a `.pending` BEFORE the sentinel goes: a drain in between
+            # would otherwise leave a record that reads as died-mid-work.
+            mark_done(ws, recipient, task_id, published=True)
             p.unlink()
             actions["retired"].append(task_id)
         elif state == "stale-sentinel":
@@ -325,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
                              "mark-done"))
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel", help="a sentinel filename, for `payload`")
+    ap.add_argument("--stage", choices=("pending", "done"),
+                    help="for `mark-done`: pending = before the result, done = after")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
@@ -348,9 +382,9 @@ def main(argv: list[str] | None = None) -> int:
         print(p)
         return 0
     if a.command == "mark-done":
-        if not a.task_id:
-            ap.error("--task-id is required for mark-done")
-        print(mark_done(ws, a.recipient, a.task_id))
+        if not a.task_id or not a.stage:
+            ap.error("--task-id and --stage are required for mark-done")
+        print(mark_done(ws, a.recipient, a.task_id, published=a.stage == "done"))
         return 0
     if a.command == "residue":
         if not a.task_id:
