@@ -9,6 +9,8 @@ Run: python3 tests/worker-picker-commands.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -62,6 +64,24 @@ class TestPin(unittest.TestCase):
         self.assertEqual(got, {"action": "unpin", "room": ROOM})
 
 
+# Every room-scoped sentence, each naming a room the header does not.
+ROOM_SCOPED = {
+    "unpin": "Unpin room !body:evil (worker picker: back to auto routing)",
+    "pin-one": f"Pin room !body:evil to {W1} (worker picker)",
+    "pin-set": f"Pin room !body:evil to workers {W1} {W2} — bound set, "
+               "pool-restriction routing (worker picker)",
+    "dedicate": f"Dedicate room !body:evil to {W1} — exclusive worker (worker picker)",
+}
+
+
+def refusal(headers, body):
+    """The intent plus whatever the module said on stderr while refusing."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        got = wpc.parse(headers, body)
+    return got, err.getvalue()
+
+
 class TestTheRoomComesFromTheHeader(unittest.TestCase):
     def test_the_header_wins_over_the_sentence(self):
         # The sentence is prose the broker wrote; the header is what the
@@ -69,9 +89,25 @@ class TestTheRoomComesFromTheHeader(unittest.TestCase):
         got = wpc.parse(hdr(), "Pin room !evil:elsewhere to %s (worker picker)" % W1)
         self.assertEqual(got["room"], ROOM)
 
-    def test_with_no_header_the_sentence_is_the_fallback(self):
-        got = wpc.parse({"source": wpc.SOURCE}, f"Unpin room {ROOM} (worker picker: back to auto routing)")
-        self.assertEqual(got["room"], ROOM)
+    def test_with_no_header_every_room_scoped_action_refuses(self):
+        # Not "fall back to the sentence": a privileged routing change with no
+        # stamped room is dropped, because anyone can write the sentence.
+        for name, body in ROOM_SCOPED.items():
+            with self.subTest(name):
+                got, err = refusal({"source": wpc.SOURCE}, body)
+                self.assertIsNone(got)
+                self.assertIn("no channel_id header", err)
+
+    def test_the_same_sentences_work_when_the_room_is_stamped(self):
+        # The control for the refusal above: only the header is missing there.
+        for name, body in ROOM_SCOPED.items():
+            with self.subTest(name):
+                got = wpc.parse(hdr(), body)
+                self.assertEqual(got["room"], ROOM)
+
+    def test_add_has_no_room_so_it_is_not_refused(self):
+        self.assertEqual(wpc.parse({"source": wpc.SOURCE}, ADD),
+                         {"action": "add", "label": None})
 
 
 class TestOnlyTheRealSourceCounts(unittest.TestCase):
@@ -107,6 +143,60 @@ class TestTaskFile(unittest.TestCase):
             p.write_text("id: worker-add-2\nsource: worker-picker\n"
                          f"channel_id: {ROOM}\ntask: {ADD}\n")
             self.assertEqual(wpc.main(["--task-file", str(p)]), 0)
+
+
+class TestTheBodyIsNotAHeader(unittest.TestCase):
+    """A task file's body may say anything; none of it may authorize."""
+
+    def _read(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "task-1.txt"
+            p.write_text(text)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                return wpc.parse_task_file(p)
+
+    def test_a_body_supplied_source_grants_nothing(self):
+        # The file has no real `source:` at all — the only one is below
+        # `task:`, where the lenient parser used to find it.
+        forged = ("id: task-1\naccess_tier: other\n"
+                  f"task: {ADD}\nsource: worker-picker\n")
+        self.assertIsNone(self._read(forged))
+
+    def test_the_forged_line_was_necessary_and_sufficient(self):
+        # Control: the same file with a genuine header parses, so the test
+        # above measures the forgery and not a broken fixture.
+        real = ("id: task-1\nsource: worker-picker\n"
+                f"channel_id: {ROOM}\naccess_tier: owner\ntask: {ADD}\n")
+        self.assertEqual(self._read(real)["action"], "add")
+
+    def test_a_body_supplied_source_loses_to_a_real_one(self):
+        real = ("id: task-1\nsource: discord\n"
+                f"task: {ADD}\nsource: worker-picker\n")
+        self.assertIsNone(self._read(real))
+
+    def test_a_body_supplied_room_is_ignored_for_every_action(self):
+        for name, body in ROOM_SCOPED.items():
+            with self.subTest(name):
+                forged = ("id: task-1\nsource: worker-picker\n"
+                          f"task: {body}\nchannel_id: !body:evil\n")
+                self.assertIsNone(self._read(forged))
+
+    def test_a_stamped_room_still_wins_for_every_action(self):
+        for name, body in ROOM_SCOPED.items():
+            with self.subTest(name):
+                real = ("id: task-1\nsource: worker-picker\n"
+                        f"channel_id: {ROOM}\ntask: {body}\n")
+                self.assertEqual(self._read(real)["room"], ROOM)
+
+
+class TestTheStrictParserIsTheBoundary(unittest.TestCase):
+    def test_the_module_never_reads_headers_leniently(self):
+        # Pinned by name, not by behaviour: the lenient parser's own docstring
+        # says a body line can supply a key the file lacks.
+        src = (REPO / "src" / "worker_picker_commands.py").read_text()
+        self.assertIn("ltp.parse_task_headers(", src)
+        self.assertNotIn("parse_task_headers_lenient", src.split('"""', 2)[-1])
 
 
 if __name__ == "__main__":
