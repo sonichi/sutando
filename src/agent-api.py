@@ -29,8 +29,10 @@ Twilio setup:
   Set webhook URL in Twilio console to https://<your-tunnel>/twilio/voice (calls)
   and https://<your-tunnel>/twilio/sms (messages).
 
-  The tunnel must forward ONLY those paths. A whole-port tunnel publishes every
-  endpoint above, and a proxy that connects from localhost defeats the
+  The tunnel must also forward /twilio/transcription: handle_twilio_voice sets it
+  as the voicemail transcribeCallback, so an allowlist without it records messages
+  whose transcripts never arrive. Forward ONLY those three. A whole-port tunnel
+  publishes every endpoint above, and a proxy that connects from localhost defeats the
   AGENT_API_BIND=127.0.0.1 default that is otherwise the only thing in front of
   POST /task -- check_auth() returns True unconditionally when SUTANDO_API_TOKEN
   is unset, which is the default.
