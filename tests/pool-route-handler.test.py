@@ -395,39 +395,66 @@ class TestRunAndDeferral(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(buf.getvalue())["delivered"], [])
 
-    def _unwritable_marker_run(self):
-        """A real run that defers, with state/pool-route-retry obstructed by a
-        file — kewei's reproduction on the ~161-170 thread."""
+    def _run_with_stores(self, primary_blocked=True, fallback_blocked=False):
+        """A real run that defers, with one or both marker stores obstructed by
+        a file — kewei's reproduction, extended to the second store."""
         import contextlib
         import io
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
              "bindings": {"!room:x": [W, "f" * 32]}}))
-        (self.ws / "state" / "pool-route-retry").write_text("a file where the dir should be")
+        if primary_blocked:
+            h.retry_dir(self.ws).write_text("a file where the dir should be")
+        if fallback_blocked:
+            h.retry_dirs(self.ws)[1].write_text("and one here too")
         t = self.task_file("task-1", channel_id="!room:x")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
         return rc, err.getvalue()
 
-    def test_a_deferral_whose_marker_cannot_be_written_still_exits_zero(self):
-        rc, _err = self._unwritable_marker_run()
+    def test_an_obstructed_primary_store_still_parks_the_task_somewhere(self):
+        """The settled answer means RECOVERABLE. With the primary store a file,
+        the marker lands in the second store and exit 0 remains truthful."""
+        rc, err = self._run_with_stores()
         self.assertEqual(rc, 0)
-        self.assertIn("deferred WITHOUT marker", self.log())
+        self.assertTrue((h.retry_dirs(self.ws)[1] / "task-1").exists())
+        self.assertNotIn("DEFERRED WITHOUT RETRY MARKER", err)
+        self.assertTrue(h.parked(self.ws, "task-1"))
 
-    def test_an_unwritable_marker_says_recovery_is_off_instead_of_nothing(self):
-        """The marker is the only thing retry_pass enumerates, so losing it
-        loses automatic recovery; the exit code cannot say so without handing
-        the task to the core, and the log alone is read after the fact."""
-        rc, err = self._unwritable_marker_run()
-        self.assertEqual(rc, 0)
-        # The literal, not the constant: at the parent commit this must fail on
-        # a silent stderr, not on a name the module does not have yet.
+    def test_a_marker_in_the_second_store_is_redelivered_automatically(self):
+        """kewei's asked regression: marker-write failure -> storage repaired ->
+        the NEXT pass delivers it, with no restart and no core involvement."""
+        self._run_with_stores()
+        self.roster()          # the roster fault is repaired
+        h.retry_dir(self.ws).unlink()   # so is the obstructed store
+        out = h.retry_pass(str(self.ws))
+        self.assertEqual(out["delivered"], ["task-1"])
+        self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
+        self.assertFalse(h.parked(self.ws, "task-1"))
+
+    def test_a_marker_in_the_second_store_survives_a_still_obstructed_primary(self):
+        """The control on the case above: the pass reads the second store even
+        while the first is still a file, so recovery needs no repair at all."""
+        self._run_with_stores()
+        self.roster()
+        out = h.retry_pass(str(self.ws))
+        self.assertEqual(out["delivered"], ["task-1"])
+        self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_no_store_at_all_is_unsettled_rather_than_settled_or_fallback(self):
+        """With nowhere durable to record ownership, 0 would settle work no pass
+        can find and any other non-zero would hand it to the core."""
+        rc, err = self._run_with_stores(fallback_blocked=True)
+        self.assertEqual(rc, h.UNSETTLED)
+        self.assertNotEqual(h.UNSETTLED, 0)
         self.assertIn("DEFERRED WITHOUT RETRY MARKER", err)
         self.assertIn(h.UNMARKED_NOTICE, err)
         self.assertIn("task-1", err)
-        self.assertIn(str(h.retry_dir(self.ws)), err)
-        self.assertIn("automatic retry is OFF", err)
+        for d in h.retry_dirs(self.ws):
+            self.assertIn(str(d), err)
+        self.assertIn("keeps its claim", err)
+        self.assertFalse((self.ws / "deliveries" / W / "task-1.txt").exists())
 
     def test_a_deferral_that_keeps_its_marker_says_nothing_on_stderr(self):
         """The control: the notice names a real loss, not every deferral."""
@@ -437,8 +464,72 @@ class TestRunAndDeferral(Base):
         t = self.task_file("task-1", channel_id="!room:x")
         with contextlib.redirect_stderr(err):
             self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
-        self.assertTrue((self.ws / "state" / "pool-route-retry" / "task-1").exists())
+        self.assertTrue((h.retry_dir(self.ws) / "task-1").exists())
+        self.assertFalse(h.retry_dirs(self.ws)[1].exists())
         self.assertNotIn("DEFERRED WITHOUT RETRY MARKER", err.getvalue())
+
+    def test_a_delivered_task_leaves_no_marker_in_either_store(self):
+        self.roster()
+        for d in h.retry_dirs(self.ws):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "task-1").write_text("refused: earlier\n")
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertFalse(h.parked(self.ws, "task-1"))
+
+
+class TestParkedQuestion(Base):
+    """The Stop hook's exemption question. It must never read "I could not
+    tell" as "nobody parked it" — that is what tells the core to answer a
+    worker's task while it waits for a pass."""
+
+    def test_a_marker_in_either_store_answers_parked(self):
+        for d in h.retry_dirs(self.ws):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "task-1").write_text("x\n")
+            self.assertEqual(h.main(["--workspace", str(self.ws), "--parked", "task-1"]), 0)
+            (d / "task-1").unlink()
+
+    def test_no_marker_anywhere_answers_not_parked(self):
+        self.assertEqual(h.main(["--workspace", str(self.ws), "--parked", "task-1"]), 1)
+
+    def test_a_store_obstructed_by_a_file_is_a_negative_not_an_unknown(self):
+        """Nothing can be stored under a file, so this store provably holds no
+        marker; calling it unknown would switch the Stop hook off for every task."""
+        h.retry_dir(self.ws).write_text("a file where the dir should be")
+        self.assertEqual(h.main(["--workspace", str(self.ws), "--parked", "task-1"]), 1)
+
+    def test_an_unreadable_store_is_unknown_not_a_denial(self):
+        import os
+        d = h.retry_dir(self.ws)
+        d.mkdir(parents=True)
+        os.chmod(d, 0o000)
+        self.addCleanup(os.chmod, d, 0o755)
+        if os.access(d, os.R_OK):
+            self.skipTest("the mode did not take effect (running as root?)")
+        self.assertEqual(h.main(["--workspace", str(self.ws), "--parked", "task-1"]),
+                         h.PARKED_UNKNOWN)
+        self.assertGreater(h.PARKED_UNKNOWN, 1)
+
+    def test_a_found_marker_answers_even_when_another_store_is_blind(self):
+        """Unknown is only for a question that cannot be answered; a marker in a
+        readable store is an answer whatever the other store is doing."""
+        import os
+        blind = h.retry_dir(self.ws)
+        blind.mkdir(parents=True)
+        os.chmod(blind, 0o000)
+        self.addCleanup(os.chmod, blind, 0o755)
+        d = h.retry_dirs(self.ws)[1]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "task-1").write_text("x\n")
+        self.assertEqual(h.main(["--workspace", str(self.ws), "--parked", "task-1"]), 0)
+
+    def test_the_parked_question_writes_no_run_line(self):
+        """Asked once per task on every Stop; a log line each would bury the
+        routing history the log exists for."""
+        h.run(["--workspace", str(self.ws), "--parked", "task-1"])
+        p = self.ws / "logs" / "pool-route-handler.log"
+        self.assertNotIn("run returning", p.read_text() if p.exists() else "")
 
 
 if __name__ == "__main__":
