@@ -140,6 +140,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
+- **`record_lock.py`** — One writer at a time for a shared record, via a sidecar lock file.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.

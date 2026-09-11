@@ -22,8 +22,6 @@ is recorded at start or it is lost.
 """
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
 import os
 import re
@@ -34,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from record_lock import record_lock  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 RELATION_NEW = "new"
@@ -95,21 +94,15 @@ def _write(path: Path, payload) -> None:
     os.replace(tmp, path)
 
 
-@contextlib.contextmanager
 def _appending(path: Path):
     """Read-modify-write under an exclusive lock, so no row is lost.
 
     `_write` alone protects the reader; it does not serialise two writers, and a
-    lost lineage row is unrecoverable — it is recorded at start or never.
+    lost lineage row is unrecoverable — it is recorded at start or never. The
+    lock itself is `record_lock`: every record with a read-decide-write section
+    takes the same sidecar, so there is one implementation to reason about.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.with_name(path.name + ".lock")
-    with open(lock, "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    return record_lock(path)
 
 
 def sessions_path(workspace, worker_id): return worker_dir(workspace, worker_id) / "sessions.json"
