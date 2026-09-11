@@ -6,66 +6,61 @@ Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 
 ### Within a task
 
-Work happens in one place and the thing needed to finish it sits in another. The
-cost is not the reading — it is that reaching the second place costs the first.
+A task is worked in one place. What is needed to finish it is usually in another,
+and retrieving it means leaving the first.
 
 ![A Discord message asking for an approve/reject verdict on a drafted post. Its
 only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
 
-An agent has drafted a social post and is asking the owner to rule on it:
-`approve — this is the post` / `reject — drop it, I take the next item`. The
-draft's claims come from one linked article, and that article is not in the
-message. Judging the draft means opening a browser, reading, and coming back —
-by which point the message being judged is behind a window, and the comparison
-the decision needs has to be held in memory instead of seen.
+An agent has drafted a social post and is asking the owner to approve or reject
+it. The draft's claims come from the linked article, which is not in the message.
+To judge the draft the owner opens that link in a browser, reads it, and comes
+back. While reading, the draft is behind another window.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
 that URL in the notch."](design-voice-navigation-and-triage-context-closed.png)
 
-Here the owner asked for the article by voice and it opened in a panel beside the
-message. Draft and source are on screen together, so the judgment is a comparison
-rather than a recollection, and Discord was never left.
+Here the owner asked for the article by voice and it opened in a panel next to
+the message. The draft and its source are visible at the same time, and Discord
+was not left.
 
 ### Across tasks
 
-Between finishing one task and starting the next there is a question — *what
-should I be doing?* — that is itself work, and doing it badly is expensive in a
-way that does not show up anywhere.
+After one task finishes, deciding what to do next takes effort of its own.
 
-`sonichi/sutando-life` answers it. It collects everything that needs the owner
-across every source, ranks it, and serves **one item at a time**. Each item is a
-proposal the agent commits to carrying out, with a `why`, so approving or
-rejecting it means something specific. Before an item is shown, `triage_freshness`
-re-checks the pull requests it names, because a question's body ages while the
-work it describes moves on.
+`sonichi/sutando-life` does that deciding. It collects the items that need the
+owner from every source, ranks them, and shows one at a time. Each item is a
+proposal the agent commits to carrying out, with a stated reason, so approving or
+rejecting it answers something specific. Before an item is shown,
+`triage_freshness` re-checks the pull requests it names, because an item's text
+ages while the work it describes changes.
 
-That queue renders on a page of its own, `static/triage.html` — forty items deep
-on this host, shown one card at a time with five actions and no list to scan:
+The queue renders at `static/triage.html`. On this host it holds forty items and
+shows one card with five actions:
 
 > Everything that needs your call, from every source, one at a time in rank
 > order. Approve, reject, or reply, then move on. Your decisions are recorded for
 > the agent to act on; nothing here reorders itself by what you pick.
 
-It is a well-made page, and it is a page: answering any item means going to it
-and leaving whatever was in front of you. Because the queue is deliberately
-one-at-a-time, that trip is not paid once per session — **it is paid once per
-item.**
+To answer an item the owner opens that page and leaves the current work. Because
+the queue shows one item at a time, that happens once per item rather than once
+per sitting.
 
-The verdict in the figures above never reaches this queue at all. Pending
-questions go to sutando-life's page, drafted-post verdicts go to Discord, and
-`#4003` is adding a third destination in the web client. Same decision shape,
-three producers, no shared queue.
+The verdict in the figures above is not in this queue. Pending questions go to
+the sutando-life page, drafted-post verdicts go to Discord, and `#4003` is adding
+a third destination in the web client. The three have separate producers and no
+shared queue.
 
 ![Mockup: the same Discord channel, with a triage card for the post verdict
 rendered as a notch panel — proposition, source, a freshness line, and Approve /
 Reject / Reply / Next / Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
 
-This last figure is drawn, not captured — the item in it exists in no queue
-today, since post verdicts are not routed into triage. It is the triage page's
-own card markup placed over the real Discord screenshot, to show what changes:
-the item arrives where the work already is, carrying the freshness line that
-makes it checkable, answered by the same five actions.
+This figure is drawn, not captured: post verdicts are not routed into triage, so
+the item in it does not exist today. It places the triage page's own card markup
+over the real Discord screenshot to show what would change — the item appears
+where the work already is, carries the freshness line, and takes the same five
+actions.
 
 ## What this proposes
 
