@@ -91,6 +91,13 @@ function holder(afterMs, c, known = true) {
   const nan  = (() => { const c = clock(); return waitForProfileExit(stuck, Number('abc'), c.sleep, c.now); })();
   const neg  = (() => { const c = clock(); return waitForProfileExit(stuck, -5, c.sleep, c.now); })();
   ck('a NaN grace waits the DEFAULT, not zero', nan.waitedMs === DEFAULT_GRACE_MS);
+  // `10s` is the realistic typo for a *_MS var — `abc` is not what anyone writes.
+  // `Infinity` is non-finite the other way and must fall back too, or it hangs.
+  for (const raw of ['10s', 'Infinity']) {
+    const c2 = clock();
+    const r2 = waitForProfileExit(stuck, Number(raw), c2.sleep, c2.now);
+    ck(`X_PROFILE_GRACE_MS=${raw} falls back to the DEFAULT`, r2.waitedMs === DEFAULT_GRACE_MS);
+  }
   ck('a negative grace waits the DEFAULT too', neg.waitedMs === DEFAULT_GRACE_MS);
   ck('garbage is indistinguishable from a sane default, not from 0',
      nan.waitedMs === sane.waitedMs);
