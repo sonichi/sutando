@@ -184,5 +184,22 @@ class AdvertisementFile(unittest.TestCase):
         self.assertFalse((empty / "state" / "pool-advertisement.json").exists())
 
 
+class BindingsInTheSnapshot(unittest.TestCase):
+    def test_each_bound_room_is_a_pinned_row_for_its_worker(self):
+        ws = Path(tempfile.mkdtemp())
+        pr.compile_roster(ws, {"w1": {"label": "alpha", "state": "live"}},
+                          {"!a:x": "w1"}, version=1)
+        snap = pa.snapshot(pr.load_roster(ws), now=1)
+        self.assertEqual(snap["bindings"],
+                         {"!a:x": {"instance": "w1", "instances": ["w1"], "pinned": True}})
+        # A binding with no worker (a cleared pin) is not a row.
+        self.assertEqual(pa.bindings({"bindings": {"!b:x": ""}}), {})
+
+    def test_no_bindings_is_an_empty_map_not_a_missing_key(self):
+        ws = Path(tempfile.mkdtemp())
+        pr.compile_roster(ws, {"w1": {"label": "alpha", "state": "live"}}, {}, version=1)
+        self.assertEqual(pa.snapshot(pr.load_roster(ws), now=1)["bindings"], {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

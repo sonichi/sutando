@@ -39,6 +39,16 @@ def _rows(roster: dict) -> dict:
     return workers if isinstance(workers, dict) else {}
 
 
+def bindings(roster: dict) -> dict:
+    """The roster's room -> worker bindings in the broker's row shape, so a
+    picker can show which worker a room is pinned to."""
+    out = {}
+    for room, wid in (roster.get("bindings") or {}).items():
+        if isinstance(wid, str) and wid:
+            out[str(room)] = {"instance": wid, "instances": [wid], "pinned": True}
+    return out
+
+
 def snapshot(roster: dict, now=None) -> dict:
     """The `POST /v1/workers` body: which workers are running.
 
@@ -55,6 +65,7 @@ def snapshot(roster: dict, now=None) -> dict:
             dead.append(wid)
     return {"ts": int(now if now is not None else time.time()),
             "live_cores": live, "dead_cores": dead,
+            "bindings": bindings(roster),
             "roster_version": roster.get("version")}
 
 
