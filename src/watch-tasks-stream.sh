@@ -66,8 +66,8 @@ __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
 elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
-  # A pool worker's session carries its delivery folder in env, so the same
-  # `/startup` that serves the core serves a worker with no argument change.
+  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
+  # same `/startup` serves it with no argument change.
   TASKS_DIR="$SUTANDO_TASKS_DIR"
 elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
   __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
@@ -83,8 +83,8 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
-# A worker watches <ws>/deliveries/<id>, so the inbox's parent is not its
-# workspace; the spawner names the workspace explicitly.
+# A watcher on <ws>/deliveries/<id> must not infer the workspace from its
+# inbox; whoever named that inbox names the workspace too.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # What KIND of inbox this is, named by whoever named it: a watcher that inferred
