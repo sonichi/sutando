@@ -78,6 +78,26 @@ case "$out" in
   *) bad "trailing slash + comment normalise" "got: $out" ;;
 esac
 
-total=$((9))
+# --- port is part of the endpoint (qingyun-wu on #4187): 443/8443/10000 are all
+# --- valid Funnel ports, so a hostname-only compare calls :443 and :8443 equal.
+out="$(run_case "TWILIO_WEBHOOK_URL=$PRO" "$(mk_ts "$PRO:8443")")"
+case "$out" in
+  *"DIFFERENT host"*) ok "configured :443 vs live :8443 -> warns, no false agreement" ;;
+  *) bad "configured :443 vs live :8443 -> warns" "got: $out" ;;
+esac
+
+out="$(run_case "TWILIO_WEBHOOK_URL=$PRO:8443" "$(mk_ts "$PRO:8443")")"
+case "$out" in
+  *"matches TWILIO_WEBHOOK_URL"*) ok "a ported configured URL still enters funnel mode and matches" ;;
+  *) bad "ported configured URL enters funnel mode" "got: $out" ;;
+esac
+
+out="$(run_case "TWILIO_WEBHOOK_URL=$PRO:443" "$(mk_ts "$PRO")")"
+case "$out" in
+  *"matches TWILIO_WEBHOOK_URL"*) ok "explicit :443 normalises to the default" ;;
+  *) bad "explicit :443 normalises" "got: $out" ;;
+esac
+
+total=$((12))
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ]
