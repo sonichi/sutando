@@ -73,32 +73,44 @@ class TestLauncherGate(unittest.TestCase):
 
 def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
     """Run a private copy of the watcher for a moment; report which folder it
-    created: (the workspace's tasks/, the override)."""
+    created: (the workspace's tasks/, the override).
+
+    The watcher is a process GROUP (bash, fswatch, a sleep loop); killing the
+    leader alone leaves children writing into the tree while it is removed."""
+    import signal
     root = td / "repo"
     shutil.copytree(REPO / "src", root / "src", symlinks=True)
     shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     ws = td / "ws"; ws.mkdir()
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
     env = {**os.environ, "SUTANDO_RESULTS_DIR": str(ws / "results"), **extra_env}
-    env.pop("SUTANDO_TASKS_DIR", None) if "SUTANDO_TASKS_DIR" not in extra_env else None
+    if "SUTANDO_TASKS_DIR" not in extra_env:
+        env.pop("SUTANDO_TASKS_DIR", None)
     p = subprocess.Popen(["bash", str(root / "src" / "watch-tasks-stream.sh")], cwd=str(root), env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + 6
-    while time.time() < deadline and not ((ws / "tasks").is_dir() or (td / "deliveries").is_dir()) and p.poll() is None:
-        time.sleep(0.1)
-    p.kill(); p.wait()
-    return (ws / "tasks").is_dir(), (td / "deliveries").is_dir()
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        deadline = time.time() + 6
+        while time.time() < deadline and not ((ws / "tasks").is_dir() or (td / "deliveries").is_dir()) and p.poll() is None:
+            time.sleep(0.1)
+        return (ws / "tasks").is_dir(), (td / "deliveries").is_dir()
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+        time.sleep(0.2)
 
 
 class TestWatcherGate(unittest.TestCase):
     def test_unset_the_core_watches_its_workspace_tasks_folder(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             core, override = _watched_dir({}, Path(td))
         self.assertTrue(core, "the core's tasks/ was not the watched folder")
         self.assertFalse(override)
 
     def test_set_a_worker_watches_its_delivery_folder_only(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             core, override = _watched_dir({"SUTANDO_TASKS_DIR": str(Path(td) / "deliveries")}, Path(td))
         self.assertTrue(override, "the delivery folder was not the watched folder")
         self.assertFalse(core, "the worker must not create or watch the core's tasks/")
