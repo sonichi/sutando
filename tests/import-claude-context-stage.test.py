@@ -1053,6 +1053,120 @@ class TestStagedPeopleMatchTheDigest(Base):
         self.assertIn("Role: CTO", published_ada["doc"])
         self.assertNotIn("VP Engineering", published_ada["doc"])
 
+    def _known(self, entries):
+        path = self.tmp / "known-people.json"
+        path.write_text(json.dumps(entries))
+        return str(path)
+
+    def test_a_subset_commit_cuts_a_shown_person_to_the_landed_citations(self):
+        # Ada 2×Alpha + 1×Beta (in the store), Only Alpha 2×Alpha, 27 "Person NN" 1×Alpha + 1×Beta
+        self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        shown = [p["name"] for p in json.loads((self.staged / "people.json").read_text())]
+        self.assertEqual(len(shown), 26)                                    # Ada (existing) + 25 new
+        rc, c, _ = self._run("--commit", "--projects", "alpha")            # "bring in alpha"
+        export = self._export()
+        self.assertEqual([p["name"] for p in export], ["Ada Lovelace", "Only Alpha"])   # the staged order
+        self.assertLessEqual({p["name"] for p in export}, set(shown))
+        ada = export[0]
+        self.assertEqual((ada["existing"]["id"], ada["slug"]), ("k1", "ada-lovelace"))     # still the UPDATE payload
+        self.assertNotIn("doc", ada)
+        self.assertIn(U1[:8], ada["doc_append"])
+        self.assertNotIn(U3[:8], json.dumps(export))                       # Beta's citation waits for Beta
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertEqual([p["name"] for p in payloads], ["Ada Lovelace", "Only Alpha"])
+        # the "Person NN"s fell under the floor inside Alpha: Beta's re-staged digest shows them again
+        self.assertIn("Person 00", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(c["people"], 26)
+
+
+U4 = "b4b4b4b4-0000-4000-8000-000000000004"
+AAA = [f"Aaa Person {i:02d}" for i in range(25)]     # 25 Alpha-only people whose names sort first;
+ZED = "Zed Hidden"                                   # the one Beta-only person the cap pushes out
+
+
+class TestSubsetCommitStaysInsideTheDigest(Base):
+    """PR #4127 review, `finalize.py` `commit()` `--projects` branch: a subset commit
+    recomputed the capped top-25 over the narrowed projects, so with 25 Alpha-only
+    people and one Beta-only person (two citations each; the Alpha names sort ahead)
+    a full stage showed only the 25 Alpha names, yet `--commit --projects beta`
+    published the Beta-only person nobody had seen. Now a subset publishes only the
+    people staged/people.json lists, cut to the landed projects' citations; the
+    project-only view needs `--stage --projects <slug>` and that digest's yes."""
+
+    def setUp(self):
+        super().setUp()
+        p = self.data / "index.json"
+        index = json.loads(p.read_text())
+        index["projects"][SLUG_B]["sessions"].append(
+            {"uuid": U4, "title": "Beta retro", "first_ts": "2026-07-21T08:00:00Z", "last_ts": "2026-07-21T09:00:00Z"})
+        index["projects"][SLUG_B]["session_count"] = 2
+        p.write_text(json.dumps(index))
+        (self.data / "summaries" / SLUG_B / f"{U4}.json").write_text(
+            json.dumps({"session": U4, "project": SLUG_B, "title": "t", "summary": "s"}))
+        p = self.data / "projects" / f"{SLUG_B}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U3, U4]
+        p.write_text(json.dumps(doc))
+        people = [{"name": n, "relationship": "contact", "citations": [_cite(SLUG_A, U1), _cite(SLUG_A, U2)]}
+                  for n in AAA]
+        people.append({"name": ZED, "relationship": "advisor", "citations": [_cite(SLUG_B, U3), _cite(SLUG_B, U4)]})
+        (self.data / "entities.json").write_text(json.dumps(
+            {"people": people, "companies": [], "deals": [], "decisions": [], "open_threads": []}))
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def _staged_names(self):
+        return [p["name"] for p in json.loads((self.staged / "people.json").read_text())]
+
+    def test_bring_in_beta_publishes_nobody_the_full_digest_did_not_list(self):
+        rc, c, _ = self._run("--stage")                                   # Alpha + Beta
+        self.assertEqual((c["people"], self._staged_names()), (25, AAA))  # the cap: Zed is not shown
+        self.assertNotIn(ZED, (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit", "--projects", "beta")            # "bring in beta"
+        self.assertEqual((rc, c["committed"], c["staged_remaining"], c["people"]), (0, 1, 1, 0))
+        self.assertEqual(self._export(), [])                               # nobody shown has a Beta citation
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                    # a landed project's payloads: never one the export lacks
+        # Alpha is re-staged: the cap still hides Zed behind the 25 names, so the next commit cannot land them
+        self.assertEqual(self._manifest()["projects"], [SLUG_A])
+        self.assertEqual(self._staged_names(), AAA)
+        self.assertNotIn(ZED, (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual([p["name"] for p in self._export()], AAA)
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])
+
+    def test_staging_beta_alone_shows_the_hidden_person_and_then_publishes_them(self):
+        rc, c, _ = self._run("--stage", "--projects", "beta")             # the control: a project-only digest
+        self.assertEqual((c["people"], self._staged_names()), (1, [ZED]))
+        self.assertIn(f"- {ZED} — advisor (2 citations)", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit", "--projects", "beta")
+        self.assertEqual((c["people"], [p["name"] for p in self._export()]), (1, [ZED]))
+        zed = self._export()[0]
+        self.assertIn(U3[:8], zed["doc"])
+        self.assertIn(U4[:8], zed["doc"])
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual([p["name"] for p in payloads], [ZED])
+
+    def test_within_reviewed_matches_by_email_then_name_in_the_reviewed_order(self):
+        within = self.m.within_reviewed
+        a = {"name": "Ada Lovelace", "email": "ada@example.com", "doc": "a"}
+        a2 = {"name": "A. Lovelace", "identifiers": {"emails": ["ADA@example.com"]}, "doc": "a2"}   # same email
+        b = {"name": "Grace Hopper", "doc": "b"}
+        b2 = {"name": "grace  hopper", "doc": "b2"}                                                 # same name
+        c = {"name": "Grace Hopper", "email": "other@example.com", "doc": "c"}
+        c2 = {"name": "Grace Hopper", "email": "third@example.com", "doc": "c2"}                     # emails never meet
+        self.assertEqual(within([b, a, "junk", {"name": "Nobody"}], [a2, b2, 7]), [b2, a2])
+        self.assertEqual(within([c], [c2]), [])
+        self.assertEqual(within([c], [b2]), [b2])                          # one side without an email: by name
+        self.assertEqual(within([], [a]), [])
+        self.assertEqual(self.m._payload_person({"name": "X", "identifiers": "junk"}),
+                         {"name": "X", "email": None, "identifiers": {}})
+
 
 class HeldBase(Base):
     def _mark_personal(self, slug, uuid, reason="family matter", drop_from_rollup=True):

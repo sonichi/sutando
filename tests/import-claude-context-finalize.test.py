@@ -748,6 +748,66 @@ class TestPublishedPeopleMatchTheDigest(Base):
         self.assertIn("Role: Principal Engineer", published_ada["doc"])
         self.assertNotIn("Role: CTO", published_ada["doc"])
 
+    def _set_ada_role(self, role):
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = role                          # people[0] is Ada in the fixture
+        (self.data / "entities.json").write_text(json.dumps(ents))
+
+    def test_same_prefix_role_change_is_shown_and_published(self):
+        # PR #4127 review (P2): two roles sharing a 60-char prefix previewed alike, so the digest
+        # showed no update row while the published 80-char role carried the changed suffix.
+        prefix = "Senior director of international engineering and operations, "
+        self._set_ada_role(prefix + "APPROVED")
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        self.assertIn(f"Role: {prefix}APPROVED", next(p for p in self._export() if p["name"] == "Ada Lovelace")["doc"])
+        self._set_ada_role(prefix + "UNREVIEWED")
+        self._run("--stage", "--projects", "beta")
+        staged = self.data / "staged"
+        review = (staged / "review.md").read_text()
+        self.assertIn("Updates to people already in your export (1)", review)
+        self.assertIn(f"- Ada Lovelace — role: {prefix}APPROVED → {prefix}UNREVIEWED (now 3 citations)", review)
+        staged_ada = next(p for p in json.loads((staged / "people.json").read_text()) if p["name"] == "Ada Lovelace")
+        self.assertIn(f"Role: {prefix}UNREVIEWED", staged_ada["doc"])
+        self._run("--commit")
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertEqual(published_ada["doc"], staged_ada["doc"])
+        self.assertIn(f"Role: {prefix}UNREVIEWED", published_ada["doc"])
+        self.assertNotIn("APPROVED", published_ada["doc"])
+
+    def test_field_diffs_compare_the_published_values_and_render_an_observable_delta(self):
+        m = self.m
+        self.assertEqual(m.field_delta("CTO", "Principal"), "CTO → Principal")
+        self.assertEqual(m.field_delta("", "CTO"), "— → CTO")
+        self.assertEqual(m.field_delta("CTO", None), "CTO → —")
+        long = "Head of platform engineering for the northern, western and central regions of the group, "
+        self.assertGreater(len(long + "reporting to the board, APPROVED"), m.DIFF_FULL_VALUE)
+        # a long shared prefix is elided to the last word start; both tails stay visible
+        self.assertEqual(m.field_delta(long + "reporting to the board, APPROVED", long + "reporting to the board, UNREVIEWED"),
+                         "…APPROVED → …UNREVIEWED")
+        # one value extends the other: the shared last word is kept so neither tail is empty
+        self.assertEqual(m.field_delta(long + "reporting to the board", long + "reporting to the board (interim)"),
+                         "…board → …board (interim)")
+        # nothing shared before the first space: both values whole, however long
+        self.assertEqual(m.field_delta("A" * 130, "B" * 130), "A" * 130 + " → " + "B" * 130)
+        self.assertEqual(m.field_delta("x " + "A" * 130, "x " + "B" * 130), "…" + "A" * 130 + " → …" + "B" * 130)
+        # published_field_diffs compares what the dossier prints: role/company at 80, relationship at 200
+        role80 = "R" * 78 + " tail"                                     # 83 chars: cut at 80 in the dossier
+        self.assertEqual(m.published_field({"role": role80}, "role"), "R" * 78 + "…")
+        published = [({"name": "Ada Lovelace", "email": "ada@example.com", "role": role80 + " changed"}, [1, 2], None),
+                     ({"name": "Grace Hopper", "email": "g@h.example", "relationship": "x" * 150 + " new"}, [1, 2], None)]
+        prev = {"people": [{"name": "Ada Lovelace", "email": "ada@example.com", "role": role80},
+                           {"name": "Grace Hopper", "email": "g@h.example", "relationship": "x" * 150 + " old"}]}
+        rows = m.published_field_diffs(published, prev)
+        self.assertEqual(rows, [("Grace Hopper", ["relationship: …old → …new"], 2)])   # Ada: same published role
+        # the section never suppresses a row: two values that only differ past a preview cut still get one
+        published = [({"name": "Ada Lovelace", "email": "ada@example.com", "role": "S" * 60 + " UNREVIEWED"}, [1, 2, 3], None)]
+        prev = {"people": [{"name": "Ada Lovelace", "email": "ada@example.com", "role": "S" * 60 + " APPROVED"}]}
+        rows = m.published_field_diffs(published, prev)
+        self.assertEqual(rows, [("Ada Lovelace", ["role: " + "S" * 60 + " APPROVED → " + "S" * 60 + " UNREVIEWED"], 3)])
+        self.assertIn("- Ada Lovelace — role: " + "S" * 60 + " APPROVED → " + "S" * 60 + " UNREVIEWED (now 3 citations)\n",
+                      m._people_diff_section(rows))
+
 
 if __name__ == "__main__":
     result = unittest.main(exit=False).result

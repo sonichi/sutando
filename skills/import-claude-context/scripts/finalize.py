@@ -50,7 +50,11 @@ finalize runs in two steps:
     Refused (exit 1) when nothing is staged, or when the summaries, roll-ups or
     entities changed since staging (stale: stage and review again). `--projects`
     takes an exact slug or a unique part of one, commits that subset and
-    re-stages the rest.
+    re-stages the rest; its People export is the staged/people.json set cut to
+    the landed projects' citations — never a recompute over the narrowed
+    projects, which could publish a person the digest's cap had hidden (PR
+    #4127 review). A project-only view (the people another project's names
+    pushed past the cap) needs `--stage --projects <slug>` and that digest's yes.
 
   --discard [--projects a,b]
                     drop the staged set (or a subset); the sinks are untouched
@@ -124,7 +128,12 @@ people-inputs.json carries a per-project fingerprint of the people it approved
 (`people_hashes`); a landed project whose live entities no longer match it is
 named in review.md's People section as "changed since approval — bring in
 <slug> to refresh", and `--people-json --projects <slug>` prints a landed
-project's payloads from the approved inputs.
+project's payloads from the approved inputs — only people the export
+(<data-dir>/people.json) published, never one those inputs cite but no digest
+showed. The digest's "Updates to people already in your export" rows compare
+the values the dossier publishes (role/company at 80 chars, relationship at
+200), never a shorter preview, and show a long value's shared prefix elided
+with both tails, so a changed suffix is always visible.
 
 `--forget` takes a known slug (or a unique part of one) — never a path: `../x`,
 `/abs`, `a/b`, `..`, `~`, an empty or an unknown value is refused — and every
@@ -166,6 +175,8 @@ NOTES_SUBDIR = ("notes", "claude-import")
 OVERVIEW = "overview.md"
 PEOPLE_CAP = 25
 PEOPLE_MIN_CITATIONS = 2
+PUBLISHED_FIELD_LIMITS = {"role": 80, "company": 80, "relationship": 200}   # as the dossier prints them
+DIFF_FULL_VALUE = 120      # a field diff shows both values whole up to this; longer: prefix elided
 BUDGET_SCRIPT = REPO / "skills" / "proactive-loop" / "scripts" / "memory-index-budget.py"
 ENTITY_LISTS = ("people", "companies", "deals", "decisions", "open_threads")
 
@@ -1056,7 +1067,8 @@ def people_candidates(entities: dict, cap: int = PEOPLE_CAP, min_citations: int 
                       projects=None, known=None) -> tuple:
     """([(person, citations, existing)], below_floor, [(person, citations, matches)]).
     The named people with >= min_citations citations, most-cited first: every
-    one the store already has (`existing`), then at most `cap` NEW ones; a
+    one the store already has (`existing`), then at most `cap` NEW ones (`None`:
+    every one — for a re-cut of an already reviewed set, never for a digest); a
     person whose name two store entries share is returned separately as
     ambiguous and never as a candidate. `projects` restricts the citations that
     count, and that a payload may quote, to those slugs: people are approved
@@ -1100,18 +1112,27 @@ def _citation_lines(dated) -> list:
     return out
 
 
+def published_field(p: dict, label: str) -> str:
+    """A person's `label` exactly as the dossier publishes it — the one-line
+    value cut at PUBLISHED_FIELD_LIMITS. The digest's field diff compares these
+    same values: a 60-character preview once hid a role whose suffix changed
+    from "APPROVED" to "UNREVIEWED" while the 80-character published role
+    carried it (PR #4127 review)."""
+    return _one_line(p.get(label), PUBLISHED_FIELD_LIMITS[label])
+
+
 def render_person_doc(p: dict, dated) -> str:
     """The full dossier of a NEW person (Sutando's preferred section order)."""
     name = _one_line(p["name"], 80)
     emails = _emails_of(p)
-    company = _one_line(p.get("company"), 80)
-    role = _one_line(p.get("role"), 80)
+    company = published_field(p, "company")
+    role = published_field(p, "role")
     doc = [f"# {name}", "", "## Contact",
            f"- Email: {emails[0] if emails else 'unknown'}",
            f"- Company: {company or 'unknown'} · Role: {role or 'unknown'}",
            "", "## Who they are",
            " · ".join(x for x in (role, company) if x) or "(from Claude Code sessions only)",
-           "", "## Your relationship", _one_line(p.get("relationship"), 200) or "(not stated)",
+           "", "## Your relationship", published_field(p, "relationship") or "(not stated)",
            "", "## Recent interactions", *_interaction_lines(dated),
            "", "## Claims and citations", *_citation_lines(dated),
            "", "_Imported by import-claude-context from the owner's Claude Code history._"]
@@ -1122,8 +1143,8 @@ def render_import_section(p: dict, dated) -> str:
     """What an EXISTING person's dossier gains: one dated section, replaceable
     by heading, so a re-import of the same day never stacks up."""
     lines = [f"{IMPORT_SECTION_HEADING} ({today()})", ""]
-    context = " · ".join(x for x in (_one_line(p.get("role"), 80), _one_line(p.get("company"), 80)) if x)
-    relationship = _one_line(p.get("relationship"), 200)
+    context = " · ".join(x for x in (published_field(p, "role"), published_field(p, "company")) if x)
+    relationship = published_field(p, "relationship")
     if context or relationship:
         lines += ["; ".join(x for x in (relationship, context) if x), ""]
     lines += ["Recent interactions:", *_interaction_lines(dated), "", "Claims and citations:", *_citation_lines(dated)]
@@ -1185,6 +1206,43 @@ def people_payloads(entities: dict, index_doc: dict, cap: int = PEOPLE_CAP,
                 payload["identifiers"] = {"emails": emails}
         payloads.append(payload)
     return payloads
+
+
+def _payload_person(payload: dict) -> dict:
+    """A payload as `_same_person` compares it: its name and every email it carries."""
+    return {"name": payload.get("name"), "email": payload.get("email"),
+            "identifiers": payload.get("identifiers") if isinstance(payload.get("identifiers"), dict) else {}}
+
+
+def within_reviewed(reviewed, payloads) -> list:
+    """The payloads of `payloads` that are people of `reviewed` (the same person
+    by email, else by name), in `reviewed`'s order — a re-cut of a reviewed set
+    never adds a person and never re-ranks one. A commit of a `--projects`
+    subset used to recompute the capped top-25 over the narrowed projects and
+    could publish a person the cap had hidden from the digest (PR #4127
+    review: 25 A-only names sort ahead of one B-only person; "bring in B"
+    published them unseen)."""
+    pool = [(_payload_person(q), q) for q in payloads if isinstance(q, dict)]
+    out = []
+    for r in reviewed:
+        if not isinstance(r, dict):
+            continue
+        me = _payload_person(r)
+        hit = next((q for person, q in pool if _same_person(me, person)), None)
+        if hit is not None:
+            out.append(hit)
+    return out
+
+
+def reviewed_subset_payloads(reviewed, entities: dict, index_doc: dict, projects, known) -> list:
+    """What a `--commit --projects` subset publishes: each person of `reviewed`
+    (staged/people.json, the set the digest showed) re-rendered from
+    `entities` with the citations of `projects` only — the landed ones — and
+    kept only while those citations still clear the export's floor. Nobody the
+    digest did not list is added, nobody is re-ranked; a person the narrowing
+    leaves under the floor waits for the digest that shows them again."""
+    everyone = people_payloads(entities, index_doc, cap=None, projects=projects, known=known)
+    return within_reviewed(reviewed, everyone)
 
 
 def load_people_inputs(data_dir: Path) -> dict:
@@ -1479,6 +1537,22 @@ def _changed_section(changed, approved: dict, index_doc: dict, kept: str) -> str
     return text + "\n"
 
 
+def field_delta(old: str, new: str, full: int = DIFF_FULL_VALUE) -> str:
+    """`old → new`, always observable: both values whole when each fits in
+    `full` characters; otherwise the prefix they share is elided to `…` (backed
+    up to a word start, so a tail is never empty when one value extends the
+    other) and both tails are shown. Never returns two identical sides for two
+    different values."""
+    old, new = old or "—", new or "—"
+    if len(old) <= full and len(new) <= full:
+        return f"{old} → {new}"
+    shared = len(os.path.commonprefix([old, new]))
+    cut = old.rfind(" ", 0, shared) + 1
+    if cut == 0:
+        return f"{old} → {new}"
+    return f"…{old[cut:]} → …{new[cut:]}"
+
+
 def published_field_diffs(published, approved_entities) -> list:
     """[(name, [diff, …], citations)] for each person in the post-union PUBLISHED
     set whose reviewable fields (role, company, relationship, name, or a wider
@@ -1486,7 +1560,10 @@ def published_field_diffs(published, approved_entities) -> list:
     (`approved/people-inputs.json`, matched by `_same_person`). A person with no
     approved counterpart is new — the "New" list already carries them; one whose
     fields equal the approved entry has nothing to review and is left out. This
-    is what makes the commit's change to `people.json` visible in the digest."""
+    is what makes the commit's change to `people.json` visible in the digest.
+    The comparison is on the values the dossier publishes (`published_field`),
+    never on a shorter preview: a row is never dropped because two different
+    values would preview alike (PR #4127 review)."""
     prev = [q for q in (approved_entities or {}).get("people") or [] if isinstance(q, dict)]
     rows = []
     for p, cites, _existing in published:
@@ -1494,10 +1571,10 @@ def published_field_diffs(published, approved_entities) -> list:
         if match is None:
             continue
         diffs = []
-        for label in ("role", "company", "relationship"):
-            old, new = _one_line(match.get(label), 60), _one_line(p.get(label), 60)
+        for label in PUBLISHED_FIELD_LIMITS:
+            old, new = published_field(match, label), published_field(p, label)
             if old != new:
-                diffs.append(f"{label}: {old or '—'} → {new or '—'}")
+                diffs.append(f"{label}: {field_delta(old, new)}")
         old_name, new_name = _norm_name(match.get("name")), _norm_name(p.get("name"))
         if store_name_key(old_name) != store_name_key(new_name):
             diffs.append(f"name: {old_name} → {new_name}")
@@ -1796,13 +1873,14 @@ def commit(*, data_dir: Path, ws: Path, memory_dir: Path, projects=None) -> dict
     (memory_dir / MEMORY_FILE).write_text(memory_text, encoding="utf-8")
     row_written, row_reason = guard_memory_row(memory_dir, memory_row(len(committed)))
     print(f"import-claude-context: MEMORY.md row — {row_reason}", file=sys.stderr)
-    # people.json publishes exactly the reviewed set: verbatim from staged/people.json on a
-    # full commit (fingerprint-guarded), else a subset re-derives its slice the way --stage did.
+    # people.json publishes exactly the reviewed set: staged/people.json verbatim on a full commit
+    # (fingerprint-guarded); a subset keeps to that file's people, cut to the landed projects (reviewed_subset_payloads).
     approved_entities = approved_entities_after(data_dir, entities, chosen, committed)
+    reviewed = _common.load_json(staged_dir(data_dir) / STAGED_PEOPLE, [])
     if set(chosen) == set(pending):
-        people = _common.load_json(staged_dir(data_dir) / STAGED_PEOPLE, [])
+        people = reviewed
     else:
-        people = people_payloads(approved_entities, index_doc, projects=set(committed), known=known)
+        people = reviewed_subset_payloads(reviewed, approved_entities, index_doc, set(committed), known)
     save_people_export(data_dir, people, approved_entities, set(committed), known)
     _common.save_state(data_dir, state)
 
@@ -2174,6 +2252,8 @@ def main(argv=None) -> int:
             entities = approved_people_entities(data_dir, only)
             payloads = people_payloads(inp["entities"] if entities is None else entities, inp["index"],
                                        projects=only, known=known)
+            if entities is not None:      # landed projects: never a person the export never published
+                payloads = within_reviewed(_common.load_json(approved, []), payloads)
         print(json.dumps(payloads, ensure_ascii=False, indent=2))
         return 0
     if a.purge_dumps and not (a.forget or a.stage or a.commit or a.discard):
