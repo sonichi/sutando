@@ -43,11 +43,123 @@ sentinel_pid_in() {
   "$py" "$here/util_paths.py" sentinel-pid "$pid_file" 2>/dev/null
 }
 
+# One identity claim from lines 2+, through the SAME reader. Empty + rc 1 when
+# the field is absent, so a pid-only sentinel yields nothing for every key.
+sentinel_field_in() {
+  local pid_file="$1" key="$2" here py
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "read the watcher sentinel")" || return 1
+  "$py" "$here/util_paths.py" sentinel-field "$pid_file" "$key" 2>/dev/null
+}
+
 # The marker a live watcher exposes its incarnation through, beside its own
 # sentinel: <stem>[-<instance>].pid -> <stem>[-<instance>].incarnation.
 sentinel_incarnation_path() {
   local pid_file="$1"
   printf '%s' "${pid_file%.pid}.incarnation"
+}
+
+# The instance key ENCODED IN A RESOLVED SENTINEL PATH, never a raw id: that
+# suffix is the canonical form the writer and every signaller both derive.
+sentinel_instance_from_path() {
+  local key
+  key="$(basename "$1")"
+  key="${key#"$WATCHER_SENTINEL_STEM"}"
+  key="${key%.pid}"
+  printf '%s' "${key#-}"
+}
+
+# --- the writer --------------------------------------------------------------
+
+# Start and cleanup mutate two files that must agree, so they serialise on one
+# mkdir lock — the repo's portable test-and-set, `flock(1)` being Linux-only.
+sentinel_lock_path() {
+  printf '%s' "${1%.pid}.lock"
+}
+
+# Abandoned = untouched for a full minute (`find -mmin`, whose unit is minutes)
+# — a DIFFERENT number from the ${2:-10}s a caller waits to acquire, below.
+sentinel_lock_abandoned() {
+  find "$1" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .
+}
+
+# A holder killed mid-section would wedge every later start, so an ABANDONED
+# lock is removed under a SECOND lock, which only one stealer can hold.
+sentinel_lock_acquire() {
+  local lock steal deadline
+  lock="$(sentinel_lock_path "$1")"
+  steal="${lock}.steal"
+  deadline=$(( $(date +%s) + ${2:-10} ))
+  while ! mkdir "$lock" 2>/dev/null; do
+    if sentinel_lock_abandoned "$lock"; then
+      if mkdir "$steal" 2>/dev/null; then
+        # RE-probe under the steal lock. `$lock` is never renamed away, so a
+        # winner that took it since the probe above is still there to be seen.
+        if sentinel_lock_abandoned "$lock"; then
+          rm -rf "$lock"
+        fi
+        rmdir "$steal" 2>/dev/null || true
+        continue
+      fi
+      # A stealer killed between those two lines wedges the steal, not the lock.
+      if sentinel_lock_abandoned "$steal"; then
+        rm -rf "$steal"
+      fi
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 0.05
+  done
+  return 0
+}
+
+sentinel_lock_release() {
+  rmdir "$(sentinel_lock_path "$1")" 2>/dev/null || true
+}
+
+# Temp+rename both files, marker first: a reader must never find a record whose
+# code_path or marker has not landed, and would refuse a watcher that IS ours.
+sentinel_write_record() {   # <pid_file> <pid> <instance> <inc> <code> <ver> <ws>
+  local pid_file="$1" inc_file tmp inc_tmp
+  inc_file="$(sentinel_incarnation_path "$pid_file")"
+  tmp="$(mktemp "${pid_file}.new.XXXXXX")" || return 1
+  inc_tmp="$(mktemp "${inc_file}.new.XXXXXX")" || { rm -f "$tmp"; return 1; }
+  {
+    printf '%s\n' "$2"
+    printf 'instance=%s\n' "$3"
+    printf 'incarnation=%s\n' "$4"
+    printf 'code_path=%s\n' "$5"
+    printf 'version=%s\n' "$6"
+    printf 'started_at=%s\n' "$(date +%s)"
+    printf 'workspace=%s\n' "$7"
+  } > "$tmp" || { rm -f "$tmp" "$inc_tmp"; return 1; }
+  printf '%s\n' "$4" > "$inc_tmp" || { rm -f "$tmp" "$inc_tmp"; return 1; }
+  mv -f "$inc_tmp" "$inc_file" || { rm -f "$tmp" "$inc_tmp"; return 1; }
+  mv -f "$tmp" "$pid_file" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# cleanup()'s release, under the lock a start takes. The marker holds no pid, so
+# only its own content says whether a live successor wrote it. rc 1 = it did.
+sentinel_release_incarnation() {
+  local pid_file="$1" pid="$2" inc="$3" marker recorded live rc=0
+  marker="$(sentinel_incarnation_path "$pid_file")"
+  sentinel_lock_acquire "$pid_file" || return 1
+  recorded="$(sentinel_field_in "$pid_file" incarnation 2>/dev/null || true)"
+  if [ -n "$inc" ] && [ -f "$pid_file" ] && [ "$recorded" != "$inc" ]; then
+    sentinel_lock_release "$pid_file"
+    return 1
+  fi
+  sentinel_release_if_owner "$pid_file" "$pid"
+  live="$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$inc" ] || [ "$live" = "$inc" ]; then
+    rm -f "$marker"
+  else
+    rc=1
+  fi
+  sentinel_lock_release "$pid_file"
+  return "$rc"
 }
 
 # --- naming ------------------------------------------------------------------
@@ -107,9 +219,8 @@ sentinel_pid_elapsed() {
   }'
 }
 
-# PRECONDITION: the owning process creates the sentinel IN PLACE. A writer that
-# builds it elsewhere and moves it in preserves the old mtime, and this stops
-# reaping anything.
+# PRECONDITION: the published mtime IS the stamp time. sentinel_write_record
+# renames a temp made moments earlier; a file staged long before reaps nothing.
 #
 # True when <pid> could have written <pid_file>: it must have been alive when the
 # file was stamped. A process younger than the file is a REISSUED pid — a
