@@ -195,6 +195,12 @@ fi
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# The router is the watcher's task-event handler; a core booted without the
+# variable routes nothing and every worker goes silent. Repo copy is the default.
+if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$REPO/src/pool_route_handler.py" ]; then
+  SUTANDO_TASK_EVENT_HANDLER="$REPO/src/pool_route_handler.py"
+fi
+[ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL CORE_ENV_ARGS under
