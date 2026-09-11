@@ -395,14 +395,50 @@ class TestRunAndDeferral(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(buf.getvalue())["delivered"], [])
 
-    def test_a_deferral_whose_marker_cannot_be_written_still_exits_zero(self):
+    def _unwritable_marker_run(self):
+        """A real run that defers, with state/pool-route-retry obstructed by a
+        file — kewei's reproduction on the ~161-170 thread."""
+        import contextlib
+        import io
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
              "bindings": {"!room:x": [W, "f" * 32]}}))
         (self.ws / "state" / "pool-route-retry").write_text("a file where the dir should be")
         t = self.task_file("task-1", channel_id="!room:x")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
+        return rc, err.getvalue()
+
+    def test_a_deferral_whose_marker_cannot_be_written_still_exits_zero(self):
+        rc, _err = self._unwritable_marker_run()
+        self.assertEqual(rc, 0)
         self.assertIn("deferred WITHOUT marker", self.log())
+
+    def test_an_unwritable_marker_says_recovery_is_off_instead_of_nothing(self):
+        """The marker is the only thing retry_pass enumerates, so losing it
+        loses automatic recovery; the exit code cannot say so without handing
+        the task to the core, and the log alone is read after the fact."""
+        rc, err = self._unwritable_marker_run()
+        self.assertEqual(rc, 0)
+        # The literal, not the constant: at the parent commit this must fail on
+        # a silent stderr, not on a name the module does not have yet.
+        self.assertIn("DEFERRED WITHOUT RETRY MARKER", err)
+        self.assertIn(h.UNMARKED_NOTICE, err)
+        self.assertIn("task-1", err)
+        self.assertIn(str(h.retry_dir(self.ws)), err)
+        self.assertIn("automatic retry is OFF", err)
+
+    def test_a_deferral_that_keeps_its_marker_says_nothing_on_stderr(self):
+        """The control: the notice names a real loss, not every deferral."""
+        import contextlib
+        import io
+        err = io.StringIO()
+        t = self.task_file("task-1", channel_id="!room:x")
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "state" / "pool-route-retry" / "task-1").exists())
+        self.assertNotIn("DEFERRED WITHOUT RETRY MARKER", err.getvalue())
 
 
 if __name__ == "__main__":

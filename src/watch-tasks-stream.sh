@@ -414,6 +414,11 @@ dispatch_task() {
     fi
   elif [ "$rc" -eq 3 ]; then
     emit_dispatch_task_file "$filename"
+    # A declined task gets no real run, so nothing else would drive whatever the
+    # handler deferred; a host seeing only declines would park that work forever.
+    "$SUTANDO_TASK_EVENT_HANDLER" \
+      --workspace "$WORKSPACE_DIR" \
+      --retry-pass >/dev/null 2>&1 || true
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
     emit_dispatch_task_file "$filename"
