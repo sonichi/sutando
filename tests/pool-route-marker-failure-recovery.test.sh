@@ -121,9 +121,29 @@ case "$ERR" in
   *) bad "the loss is named on stderr" "stderr was: $ERR" ;;
 esac
 
-# finish_handler_task, lifted verbatim from the production watcher.
-run_finish() {   # $1 = rc the handler returned
-  BODY="$(awk '/^finish_handler_task\(\) \{/,/^\}/' "$REPO/src/watch-tasks-stream.sh")"
+# finish_handler_task, lifted with any watcher-local function it transitively
+# calls (e.g. settle_handler_outcome), so a refactor can't leave the lift stale.
+STUB_COLLABORATORS=" claim_is_ours claim_disposition release_task_claim emit_fallback_task_file publish_terminal_failure drain_dispatch_queue "
+ERRFILE="$WS/dispatch/finish.stderr"
+run_finish() {   # $1 = rc the handler returned; stderr lands in $ERRFILE
+  local all_fns queue seen name body
+  all_fns="$(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$REPO/src/watch-tasks-stream.sh" | sed 's/() {//')"
+  queue="finish_handler_task"; seen=""; BODY=""
+  while [ -n "$queue" ]; do
+    name="${queue%% *}"
+    case "$queue" in *" "*) queue="${queue#* }" ;; *) queue="" ;; esac
+    case " $seen " in *" $name "*) continue ;; esac
+    seen="$seen $name"
+    body="$(awk -v name="$name" '$0 == name "() {" {p=1} p {print} p && /^\}/ {p=0}' "$REPO/src/watch-tasks-stream.sh")"
+    [ -n "$body" ] || continue
+    BODY="$BODY
+$body"
+    for cand in $all_fns; do
+      case "$STUB_COLLABORATORS" in *" $cand "*) continue ;; esac
+      case " $seen $queue " in *" $cand "*) continue ;; esac
+      printf '%s\n' "$body" | grep -v '^[[:space:]]*#' | grep -qw "$cand" && queue="$queue $cand"
+    done
+  done
   mkdir -p "$WS/dispatch/settled" "$WS/dispatch/workers" "$WS/fallbacks"
   printf '%s\n' "$WS/tasks/task-nowhere.txt" > "$WS/dispatch/running-marker"
   HANDLER_UNSETTLED_RC="$UNSETTLED" DISPATCH_DIR="$WS/dispatch" FALLBACKS_DIR="$WS/fallbacks" \
@@ -137,19 +157,33 @@ run_finish() {   # $1 = rc the handler returned
     drain_dispatch_queue()   { :; }
     eval "$BODY"
     finish_handler_task "$1" "$2" "$3"
-  ' _ "$WS/dispatch/running-marker" "$WS/tasks/task-nowhere.txt" "$1" 2>/dev/null
+  ' _ "$WS/dispatch/running-marker" "$WS/tasks/task-nowhere.txt" "$1" 2>"$ERRFILE"
 }
+# A dropped callee fails as "command not found" on stderr — capture it (a
+# command substitution subshell can't leak a var back, so read $ERRFILE after).
 OUT="$(run_finish "$UNSETTLED")"
-case "$OUT" in
-  *CORE_EVENT*|*RELEASED*) bad "an unsettled run keeps the claim and tells no core" "watcher printed: $OUT" ;;
-  *) ok "an unsettled run keeps the claim and tells no core" ;;
-esac
+FINISH_ERR="$(cat "$ERRFILE" 2>/dev/null)"
+MSG="an unsettled run keeps the claim and tells no core"
+if printf '%s' "$FINISH_ERR" | grep -qF "command not found"; then
+  bad "$MSG" "lifted watcher body hit an undefined command: $FINISH_ERR"
+elif ! printf '%s' "$FINISH_ERR" | grep -qF "keeping the claim"; then
+  bad "$MSG" "no positive marker from the UNSETTLED branch; stderr was: $FINISH_ERR"
+elif printf '%s' "$OUT" | grep -qE 'CORE_EVENT|RELEASED'; then
+  bad "$MSG" "watcher printed: $OUT"
+else
+  ok "$MSG"
+fi
 # CONTROL — an ordinary handler failure is unchanged: fall back, release.
 OUT="$(run_finish 1)"
-case "$OUT" in
-  *CORE_EVENT*) ok "an ordinary handler failure still falls back to the core" ;;
-  *) bad "an ordinary handler failure still falls back to the core" "watcher printed: $OUT" ;;
-esac
+FINISH_ERR="$(cat "$ERRFILE" 2>/dev/null)"
+MSG="an ordinary handler failure still falls back to the core"
+if printf '%s' "$FINISH_ERR" | grep -qF "command not found"; then
+  bad "$MSG" "lifted watcher body hit an undefined command: $FINISH_ERR"
+elif printf '%s' "$OUT" | grep -qF "CORE_EVENT"; then
+  ok "$MSG"
+else
+  bad "$MSG" "watcher printed: $OUT"
+fi
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
