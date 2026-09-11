@@ -33,6 +33,16 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
+  # Another instance owns any task with a sentinel in its delivery folder. This
+  # one declined it and must not touch it, so it is not this one's to answer.
+  TASK_ID="${BASENAME%.txt}"
+  HELD_ELSEWHERE=0
+  for _d in "$WORKSPACE"/deliveries/*/; do
+    [ -d "$_d" ] || continue
+    [ "$(basename "$_d")" = core ] && continue   # the core's own inbox is not another instance's
+    if [ -e "$_d$TASK_ID.txt" ] || [ -e "$_d$TASK_ID.accepted" ]; then HELD_ELSEWHERE=1; break; fi
+  done
+  if [ "$HELD_ELSEWHERE" = 1 ]; then continue; fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
   # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then
