@@ -497,6 +497,17 @@ def main() -> int:
     mem = (rtc.TASKS_DIR / "task-MEMBERS.txt").read_text()
     check("room_members: @a:x, @b:x (+3 more)" in mem and "room_member_count: 5" in mem,
           "room_members + room_member_count serialize when the gateway sends them")
+    check("room_config:" not in mem, "room_config absent -> no room_config line")
+    _rc = '{"folder":{"init_git":true,"name":"proj","path":"/tmp/proj"}}'
+    rtc._write_task({**TASK, "id": "task-ROOMCFG", "room_config": _rc})
+    rcs = (rtc.TASKS_DIR / "task-ROOMCFG.txt").read_text()
+    check(f"room_config: {_rc}" in rcs,
+          "room_config string serializes as one header line when the gateway sends it")
+    rtc._write_task({**TASK, "id": "task-ROOMCFGD",
+                     "room_config": {"folder": {"path": "/tmp/proj", "name": "proj", "init_git": True}}})
+    rcd = (rtc.TASKS_DIR / "task-ROOMCFGD.txt").read_text()
+    check(f"room_config: {_rc}" in rcd,
+          "room_config dict re-serializes as compact sorted JSON, not a Python repr")
     # ===SKILL INSTRUCTIONS=== rides OWNER-tier tasks only (non-owner tiers carry
     # the SUTANDO SYSTEM INSTRUCTIONS block and must not get a competing one).
     check("===SKILL INSTRUCTIONS" not in ctx,

@@ -176,6 +176,24 @@ dup = AG2SPACE.replace("attempts: 2", "access_tier: other\nattempts: 2")
 h = ltp.parse_task_headers_trusted(dup)
 check("trusted parser: LAST access_tier wins", h.get("access_tier") == "owner")
 
+# 5b. room_config rides the gateway's task-mid shape as a one-line JSON header:
+# the lenient parser promotes it verbatim and keeps it out of the body.
+ROOM_CFG = '{"folder":{"init_git":true,"name":"proj","path":"/tmp/proj"}}'
+ROOMCFG = f"""id: task-1700000000009
+timestamp: 2026-07-01T00:00:00Z
+task: [AG2Space @owner:hs] set up the project
+source: ag2space
+channel_id: !room:hs
+room_name: proj
+room_config: {ROOM_CFG}
+access_tier: owner
+"""
+h = ltp.parse_task_headers_lenient(ROOMCFG)
+check("room_config promoted verbatim by the lenient parser",
+      h.get("room_config") == ROOM_CFG)
+check("room_config excluded from the lenient body",
+      "room_config" not in h.body and h.body == "[AG2Space @owner:hs] set up the project")
+
 # 6. voice / chat / phone-legacy / health shapes.
 check("voice: urgent + local-voice",
       ltp.parse_task_headers(VOICE).get("channel_id") == "local-voice")

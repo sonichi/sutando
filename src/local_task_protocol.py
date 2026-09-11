@@ -191,6 +191,9 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # The room's declared config (one-line JSON from the room state event), carried
+    # so the agent knows the owner's intention. Informational only: nothing enforces it.
+    "room_config",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
