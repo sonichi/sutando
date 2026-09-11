@@ -3,7 +3,8 @@
 
 The Discord instruction named a reader whose default is ONE page of ten, and
 said nothing about going deeper. Measured: a fact buried under nine or more
-messages was reported as absent, every run, 475 commits apart. The depth
+messages was reported as absent, every run, 475 commits apart; the deepest
+burial the report tried was 38 (MEASURED_MISS_DEPTH below). The depth
 policy belongs to the instruction, not to a CLI default the instruction never
 mentions, so this pins three things the bridge text must carry and ties each
 to the mechanism the reader actually offers:
