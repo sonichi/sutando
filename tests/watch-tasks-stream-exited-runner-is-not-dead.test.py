@@ -38,6 +38,14 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
+def drop_redelivery(h, *names):
+    """The harness feeds a task twice — the startup sweep AND the fswatch line —
+    so a late duplicate re-claims a task the reap has already released. The
+    watcher's own `[ -f "$path" ]` filter drops it once the file is gone."""
+    for name in names:
+        (h.ws / "tasks" / name).unlink(missing_ok=True)
+
+
 def scenario_receipt_outranks_missing_result():
     """The state the race leaves behind, built by hand so timing cannot hide it:
     a running marker, a worker pid that is gone, NO result — and the rc receipt
@@ -132,11 +140,162 @@ def scenario_a_dead_runner_is_still_reaped():
         h.deliver("task-dead1.txt")
         if not reap.wait_for(lambda: h.dispatch() and "task-dead1.txt" in reap.names(h.dispatch() / "running")):
             check("dead-runner control: task dispatched", False); return
+        drop_redelivery(h, "task-dead1.txt")
         pids = h.kill_workers(expect=1)
         check("dead-runner control: one runner killed", len(pids) == 1, f"pids={pids}")
         h.deliver("task-nudge.txt")  # arrival drains
         got = reap.wait_for(lambda: (h.ws / "results" / "task-dead1.txt").exists(), timeout=30)
         check("dead-runner control: a runner killed before any receipt is still published as failed", got)
+        check("dead-runner control: and its claim is released",
+              reap.wait_for(lambda: not (h.ws / "state" / "task-event-handler-claims"
+                                         / "task-dead1.txt").exists(), timeout=15))
+    finally:
+        h.stop()
+
+
+def scenario_an_interrupted_receipt_write_leaves_no_receipt():
+    """The producer half of the strand: a kill landing between the redirection
+    opening the receipt and printf writing it used to publish a zero-byte file
+    that the drain read as a complete exit code. The write goes to a same-dir
+    temp now, so the path the drain reads never exists half-written."""
+    with tempfile.TemporaryDirectory(prefix="runner-pause-") as tmp:
+        root = Path(tmp)
+        ws = root / "ws"
+        (ws / "logs").mkdir(parents=True)
+        (ws / "results").mkdir()
+        dispatch = root / "dispatch"
+        for sub in ("pending", "running", "settled", "workers"):
+            (dispatch / sub).mkdir(parents=True)
+        handler = root / "handler.sh"
+        handler.write_text("#!/bin/sh\nexit 7\n")
+        handler.chmod(0o755)
+        task = ws / "task-pause.txt"
+        task.write_text("task: demo\n")
+        fifo = root / "events"
+        os.mkfifo(fifo)
+        rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        paused = root / "paused"
+        # The redirection is applied to the CALL, so bash opens the target before
+        # this body runs: entering it IS the open-but-unwritten boundary.
+        bash_env = root / "pause.sh"
+        bash_env.write_text(
+            'printf() {\n'
+            '  if [ "$1" = \'%s\\n\' ]; then\n'
+            f'    : > "{paused}"\n'
+            '    sleep 120\n'
+            '  fi\n'
+            '  builtin printf "$@"\n'
+            '}\n')
+        env = dict(os.environ)
+        env.update(SUTANDO_TASKS_DIR=str(ws / "tasks"), SUTANDO_WORKSPACE_DIR=str(ws),
+                   SUTANDO_WORKSPACE=str(ws), BASH_ENV=str(bash_env))
+        proc = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), "--handler-runner",
+             str(handler), "claude", str(ws), str(task), str(ws / "results"), str(REPO),
+             str(fifo), "task-pause.txt", str(dispatch)],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        receipt = dispatch / "settled" / "task-pause.txt.rc"
+        try:
+            reached = reap.wait_for(paused.exists, timeout=30, step=0.1)
+            check("interrupted write: the producer reached the open-before-write boundary", reached)
+            temps = [q for q in (dispatch / "settled").iterdir() if q.name.startswith(".")]
+            check("interrupted write: the opened path is a same-dir temp, not the receipt",
+                  len(temps) == 1 and temps[0].stat().st_size == 0,
+                  f"settled={[q.name for q in (dispatch / 'settled').iterdir()]}")
+            check("interrupted write: no receipt exists while the write is unfinished",
+                  not receipt.exists())
+        finally:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait(timeout=10)
+        check("interrupted write: the killed producer left no receipt behind", not receipt.exists(),
+              repr(receipt.read_text()) if receipt.exists() else "")
+        os.close(rfd)
+
+
+def scenario_an_incomplete_receipt_is_not_an_exit_code():
+    """The consumer half: the bytes that interruption used to leave must take the
+    missing-receipt recovery — a terminal failure and a RELEASED claim — instead
+    of passing rc="" through both numeric branches and stranding the task."""
+    h = reap.Harness()
+    h.start()
+    try:
+        for name in ("task-empty.txt", "task-garbage.txt"):
+            h.deliver(name)
+        if not reap.wait_for(lambda: len(reap.names(h.dispatch() and h.dispatch() / "running")) >= 2):
+            check("incomplete receipt: both tasks dispatched", False); return
+        d = h.dispatch()
+        drop_redelivery(h, "task-empty.txt", "task-garbage.txt")
+        (d / "settled" / "task-empty.txt.rc").write_text("")        # opened, never written
+        (d / "settled" / "task-garbage.txt.rc").write_text("x\n")   # present, not an exit code
+        claims = h.ws / "state" / "task-event-handler-claims"
+        held = {n: (claims / n).is_file() for n in ("task-empty.txt", "task-garbage.txt")}
+        h.kill_workers(expect=2)
+        h.deliver("task-nudge-inc.txt")
+        for name, label in (("task-empty.txt", "a zero-byte"), ("task-garbage.txt", "a non-numeric")):
+            res = h.ws / "results" / name
+            got = reap.wait_for(
+                lambda res=res: res.is_file() and reap.FAILURE_TEXT in res.read_text(),
+                timeout=30, nudge=lambda i, n=name: h.deliver(f"task-nudge-{n[5:-4]}-{i}.txt"))
+            check(f"{label} receipt publishes the terminal failure", got,
+                  f"exists={res.exists()}")
+            # held_before is the discriminator: a claim that never existed would
+            # make "released" trivially true and assert nothing about the fix.
+            released = reap.wait_for(lambda name=name: not (claims / name).exists(), timeout=15)
+            check(f"{label} receipt releases the claim rather than stranding the task",
+                  held[name] and released,
+                  f"held_before={held[name]} still_held={(claims / name).exists()}")
+    finally:
+        h.stop()
+
+
+def scenario_shutdown_settles_a_completed_receipt():
+    """A runner that returned 0 and was killed before its fifo notification has
+    already succeeded. Graceful shutdown used to publish an owner-facing
+    "interrupted" failure over it and leave the receipt in the dispatch dir."""
+    h = reap.Harness()
+    h.start()
+    try:
+        h.deliver("task-cleanup.txt")
+        if not reap.wait_for(lambda: h.dispatch() and "task-cleanup.txt" in reap.names(h.dispatch() / "running")):
+            check("shutdown receipt: task dispatched", False); return
+        d = h.dispatch()
+        drop_redelivery(h, "task-cleanup.txt")
+        claims = h.ws / "state" / "task-event-handler-claims"
+        check("shutdown receipt: the claim is held before shutdown",
+              (claims / "task-cleanup.txt").is_file())
+        (d / "settled" / "task-cleanup.txt.rc").write_text("0\n")  # written before the fifo write
+        h.stop(graceful=True)
+        check("shutdown receipt: an exit-0 receipt is NOT published as interrupted",
+              not (h.ws / "results" / "task-cleanup.txt").exists(),
+              (h.ws / "results" / "task-cleanup.txt").read_text()[:60]
+              if (h.ws / "results" / "task-cleanup.txt").exists() else "")
+        check("shutdown receipt: the claim is released",
+              not (claims / "task-cleanup.txt").exists())
+        check("shutdown receipt: the settled receipt does not leak",
+              not (d / "settled" / "task-cleanup.txt.rc").exists())
+    finally:
+        h.stop()
+
+
+def scenario_shutdown_control_a_receiptless_marker_is_interrupted():
+    """The control that keeps the fix from being "shutdown publishes nothing":
+    the same shutdown with no receipt must still report the interruption."""
+    h = reap.Harness()
+    h.start()
+    try:
+        h.deliver("task-interrupted.txt")
+        if not reap.wait_for(lambda: h.dispatch() and "task-interrupted.txt" in reap.names(h.dispatch() / "running")):
+            check("shutdown control: task dispatched", False); return
+        drop_redelivery(h, "task-interrupted.txt")
+        h.stop(graceful=True)
+        res = h.ws / "results" / "task-interrupted.txt"
+        check("shutdown control: a receipt-less marker is still published as interrupted",
+              res.is_file() and reap.FAILURE_TEXT in res.read_text(),
+              f"exists={res.exists()}")
     finally:
         h.stop()
 
@@ -144,6 +303,10 @@ def scenario_a_dead_runner_is_still_reaped():
 if __name__ == "__main__":
     scenario_receipt_outranks_missing_result()
     scenario_the_runner_writes_the_receipt()
+    scenario_an_interrupted_receipt_write_leaves_no_receipt()
+    scenario_an_incomplete_receipt_is_not_an_exit_code()
+    scenario_shutdown_settles_a_completed_receipt()
+    scenario_shutdown_control_a_receiptless_marker_is_interrupted()
     scenario_a_dead_runner_is_still_reaped()
     print(f"{len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
