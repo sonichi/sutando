@@ -201,8 +201,10 @@ def run(argv=None) -> int:
     except BaseException:
         _log(_workspace_arg(argv), "unhandled:\n" + traceback.format_exc())
         raise
-    if rc != 0 and "--probe" not in (sys.argv[1:] if argv is None else argv):
-        _log(_workspace_arg(argv), f"run exited {rc}")
+    if "--probe" not in (sys.argv[1:] if argv is None else argv):
+        # Logged AFTER main returns so a process exit that disagrees with this
+        # line is provably outside the handler's own code.
+        _log(_workspace_arg(argv), f"run returning rc={rc}")
     return rc
 
 
