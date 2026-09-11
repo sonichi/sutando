@@ -98,7 +98,20 @@ def _is_login_class(signal: dict) -> bool:
     clear them (sonichi#2397). Root cause per #2402: a fresh CLAUDE_CONFIG_DIR
     always requires /login; a locked keychain (SSH spawn) only blocks
     completing it — hence the remedy must run from a GUI context."""
-    return signal.get("state") == "logged-out" or signal.get("kind") == "login"
+    return (signal.get("state") == "logged-out" or signal.get("kind") == "login"
+            or (signal.get("kind") == "turn-rejected"
+                and bool(_REFUSED_LOGIN.search(signal.get("prompt") or ""))))
+
+
+# A refused turn (monitor kind `turn-rejected`) carries the CLI's refusal line as its prompt;
+# the line, not the kind, says whether the remedy is the limit wait or a GUI /login.
+_REFUSED_LIMIT = re.compile(r"usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+_REFUSED_LOGIN = re.compile(r"/login|not logged in|OAuth access token", re.I)
+
+
+def _is_refused_limit(signal: dict) -> bool:
+    return (signal.get("kind") == "turn-rejected"
+            and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
 _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
@@ -172,8 +185,16 @@ def compose_message(signal: dict) -> str:
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
     prompt = (signal.get("prompt") or "").strip()
-    # First non-empty prompt line is the most informative single line.
-    excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+    # The first READABLE line: on a login pane the first non-empty line is a box rule or an OAuth
+    # URL fragment. Same filter as the escalation card; a failure here must not drop the notice.
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from prompt_excerpt import first_readable_line
+        excerpt = first_readable_line(prompt)
+    except Exception:  # noqa: BLE001 - the owner's only channel: never crash the escalation
+        excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
     parts = [f"⚠️ Agent needs you — {detail}"]
     if kind and kind not in detail:
         parts.append(f"({kind})")
@@ -182,7 +203,10 @@ def compose_message(signal: dict) -> str:
         # The remedy is the actionable half, so it keeps its length; the prompt
         # echo is what gives way to stay inside the message-length bound.
         msg += f": {excerpt[:110]}"
-    if signal.get("kind") == "session-limit":
+    if kind == "turn-rejected":
+        msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
+                " ends in that line, so nothing queued for it runs")
+    if kind == "session-limit" or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"

@@ -1,5 +1,22 @@
 # room-ops — an agent's room-participation capability collection
 
+> **Prefer the `ag2-space` MCP tools when they are connected and the room
+> exposes them** — availability is per-room and per-actor, so check
+> `room.actions.search`. `room.list` supersedes `room_ops.py rooms`;
+> `room.context.read` supersedes `read`; `room.vault.read`/`tree`/`write`/
+> `delete` supersede `doc get`/`put`/`rm`; `room.message.send`/`react`/
+> `unreact` and `room.event.send` supersede `say`/`react`/`unreact`/
+> `events emit`. Zero-effect actions run via `room.action.read`, mutations via
+> `room.action.execute`.
+>
+> Still this skill: `mention`, because MCP `room.message.send` has **no mention
+> parameter** — it triggers a peer only if the body carries its full mxid, and
+> `mention` is what turns a name into that mxid (see *Addressing & delivery*);
+> `fetch`, which downloads media to a local path (`room.media.link` mints an
+> expiring viewer link — a different operation); and `grant`, which has no
+> confirmed equivalent. `join` has no MCP action by design: agents do not
+> self-join. With no MCP connected, everything below applies unchanged.
+
 **One skill, multiple tools.** Everything an agent does in a room beyond its task
 inbox lives here as a tool, so the parity capabilities are self-evidently *one
 collection* (not N scattered skills). Each tool is a thin **gateway-only** client
@@ -15,7 +32,9 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `read <room>` | pull recent room history | discord `att.save`-context / channel read |
 | `fetch <ref>` | inbound media → local path | discord inbound `att.save`→inbox |
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
-| `say <room> <text>` | post plain text, mentioning **no one** — status lines, an answer to the room | discord plain channel message |
+| `say <room> <text>` | post plain text, pinging **nobody** by design — status lines, an answer to the room; never a hand-off | discord plain channel message |
+| `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → directory narrowed by the room → broker → roster), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
+| `members <room>` | who is present (mxid, display name, kind) — the roster to pick from when `mention` finds no match | discord member list |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
@@ -32,6 +51,13 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   event id came back. `unconfirmed` is a 200 with no proof: the send probably landed, so do
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
+python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
+#   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
+#   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->
+#   {"ok":false,"candidates":[...],"resolved_by":"<the source that found too many>"} and
+#   NOTHING is posted: pick one from `members` and retry
+#   with its mxid — never guess one.
+python3 skills/agent-room-ops/room_ops.py members '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$evt' --agent '@a:hs'
 #   --reply-to (on `say` and `mention`) CITES the message being replied to. The post stays
 #   in the MAIN TIMELINE — it is not thread membership. Only a relation with
@@ -74,12 +100,33 @@ connect a non-sutando agent, persist this section into its own instruction
 layer (its CLAUDE.md equivalent) at connect time.
 
 **Addressing & delivery**
-- Address people/agents by **full mxid** (`@qingyun:ag2.space`), never a bare
-  name ("001", "@qingyun"). Only a real `m.mention` notifies; plain text does
-  not. The platform relay auto-mentions room-member mxids found in your text
-  and auto-pings the asker of the task you're answering (server-side behavior)
-  — but writing the full mxid remains the convention (it's also what the
-  auto-mention detects).
+- Address people and agents by **full mxid**, never a bare name ("001",
+  "@qingyun", "Bassil's Sutando" as text). Platform agents carry the `.agent`
+  suffix (`@qingyun-air.agent:ag2.space`); legacy ones a `sutando-`-style
+  prefix (`@sutando-qingyun-001:ag2.space`).
+- **The broker routes on the mxid.** A message reaches an agent when its mxid
+  is in `m.mentions` OR appears as a whole token in the plain body
+  (case-insensitive). `op:message` `mentions:[mxid]` is stamped into
+  `m.mentions`; any room-member mxid written in the body is auto-mentioned and
+  rendered as a pill for humans. Writing the peer's full mxid in the text is
+  therefore both the trigger and the visible mention.
+- **A hand-off that does not carry the peer's mxid is silently dropped.** In a
+  shared room an agent ignores agent-authored messages unless they mention it
+  or reply to it. Use `mention <handle> <text> <room>`: it resolves a handle,
+  label or display name ("Bassil's Sutando") to the one mxid — the directory,
+  narrowed to the room's members when it over-matches (an owner with several
+  agent identities), then the broker's room-scoped resolver, then the roster
+  with its display names — refuses on ambiguity, and posts `<mxid> — <text>`
+  with `mentions`.
+  `say` pings nobody by design — never use it to hand off. If `mention`
+  reports no match, run `members <room>` and pick from the roster; never guess
+  an mxid.
+- MCP `room.message.send` has no mention parameter; it triggers a peer only if
+  the body carries its full mxid.
+- **Inbound:** a task carrying `addressed_to: <other mxid>` is theirs — stand
+  down with `[no-send]` unless you are named too. `room_members` lists who is
+  present (capped at 10; `room_member_count` is the true size). The relay also
+  auto-pings the asker of the task you answer.
 - **One reply path.** Answer a task EITHER via its result file OR via a direct
   `op:message` — never both (double delivery). If you already posted via
   op:message, put `[no-send]` in the result body.
@@ -131,11 +178,11 @@ layer (its CLAUDE.md equivalent) at connect time.
   spinning. Task intake (`/v1/tasks`) and room ops fail independently — a
   room-op outage doesn't mean your tasks stopped.
 - `create`/`invite` may be slow. List-before-create is the idempotence rule:
-  `python3 room_ops.py rooms` lists this agent's joined rooms (`rooms.py`,
-  op `joined_rooms`) — check it before creating. Still record created room
-  ids immediately (e.g. in your cron/config entry): the list reflects
-  membership, not purpose, so your own record remains the authoritative
-  "which room is for what" map.
+  `python3 room_ops.py rooms` lists this agent's joined rooms (`rooms.py`, op
+  `joined_rooms`) — prefer MCP `room.list` when connected; check either before
+  creating. Still record created room ids immediately (e.g. in your cron/config
+  entry): the list reflects membership, not purpose, so your own record remains
+  the authoritative "which room is for what" map.
 
 Every tool prints a structured JSON result and **exits 0** for any structured
 result (a graceful `ok:false` "no context / no-op" is not a failed task); usage

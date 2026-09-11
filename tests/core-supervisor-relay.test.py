@@ -43,6 +43,12 @@ _LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
           "kind": "session-limit"}
 _LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
                "prompt": None, "kind": None}
+# The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
+# it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
+_REFUSED_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+                 "or /model to switch models.")
+_REFUSED = {"state": "blocked-human", "detail": "awaiting user: turn-rejected",
+            "prompt": _REFUSED_LINE, "kind": "turn-rejected"}
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
@@ -181,6 +187,37 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("Login", m)  # first prompt line
         self.assertIn("resolve", m)
 
+    def test_login_pane_excerpt_is_the_prompt_not_the_chrome(self):
+        # The pane's first non-empty line is a box rule and the next an OAuth URL fragment; the
+        # one-line notice must quote the prompt (same filter as the escalation card).
+        pane = ("╭──────────────── sutando-core ─╮\n"
+                "https://claude.ai/oauth/authorize?code=true&code_challenge=ncifI5jOgzI138TpX&state=uv\n"
+                "Browser didn't open? Use the url below to sign in:\n"
+                "Paste code here if prompted >\n")
+        m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("Use the url below to sign in", m)
+        for noise in ("╭", "───", "https://", "code_challenge"):
+            self.assertNotIn(noise, m)
+
+    def test_the_excerpt_falls_back_to_the_first_line_when_the_filter_cannot_load(self):
+        # The notice is the owner's only channel: a missing filter module must not drop it.
+        pane = "╭─ rule ─╮\nBrowser didn't open? Use the url below to sign in:\n"
+        with patch.dict(sys.modules, {"prompt_excerpt": None}):
+            m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("╭─ rule ─╮", m)  # the old first-non-empty line, degraded but delivered
+
+    def test_the_filter_is_found_from_the_relays_own_directory(self):
+        # Run as a script, sys.path[0] is not src/: the relay must add its own directory.
+        src_dir = os.path.dirname(_SRC)
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(src_dir)]
+            sys.modules.pop("prompt_excerpt", None)
+            m = compose_message(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
+        finally:
+            sys.path[:] = saved
+        self.assertIn("Use the url below to sign in", m)
+
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
         self.assertIn("not authenticated", m)
@@ -216,6 +253,34 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(sig)
         self.assertIn("when the limit window resets", m)
         self.assertNotIn("/login", m)
+
+    def test_turn_rejected_escalates(self):
+        self.assertTrue(should_escalate(_REFUSED, None)[0])
+
+    def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
+        m = compose_message(_REFUSED)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("out of usage credits", m)
+        # A credit line gets the limit remedy, never the login one.
+        self.assertIn("/usage-credits", m)
+        self.assertIn("not a login problem", m)
+        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_turn_rejected_login_line_names_gui_login_remedy(self):
+        sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
+        m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("OAuth access token has expired", m)
+        self.assertIn("GUI /login", m)
+        self.assertNotIn("usage limit", m)
+
+    def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
+        sig = dict(_REFUSED, prompt="Something else the CLI refused with")
+        with _no_backend():
+            m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("where the core is running", m)
 
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply

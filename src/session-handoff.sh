@@ -57,9 +57,21 @@ TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
 # NOTE (rebase over #2077): the pre-rebase branch also set
 # STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
 # derived from the resolved workspace below, per the workspace contract.
-if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
-  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+# Resolution is shared with archive-transcript.sh via src/hook_transcript_path.sh
+# (#4001 review): two readers of one payload drift, and the copy nobody
+# remembers is the one that ships the bug. Empty stays non-fatal HERE — the
+# extraction site below falls through to --latest, which is the pre-existing
+# behaviour on a stock hook config and must not change in a refactor.
+__TP_HELPER="$REPO/src/hook_transcript_path.sh"
+[ -f "$__TP_HELPER" ] || __TP_HELPER="$(cd "$(dirname "$0")" && pwd)/hook_transcript_path.sh"
+if [ -f "$__TP_HELPER" ]; then
+  # shellcheck source=hook_transcript_path.sh
+  source "$__TP_HELPER"
+  TRANSCRIPT="$(resolve_hook_transcript_path "$TRANSCRIPT")"
+else
+  echo "session-handoff: hook_transcript_path.sh not found; transcript unresolved, falling through to --latest" >&2
 fi
+unset __TP_HELPER
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
 # Exports $WORKSPACE on success; exits non-zero with a diagnostic on failure

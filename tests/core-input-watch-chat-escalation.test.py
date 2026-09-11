@@ -50,6 +50,57 @@ class TestMessage(unittest.TestCase):
         self.assertIn("signed out",
                       M.escalation_message("logged-out", "d", None, None))
 
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile+user%3A\n"
+        "s%3Aclaude_code+user%3Amcp_servers&code_challenge=ncifI5jOgzI138TpX&state=uvUrUTS4WTI2FL\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n"
+    )
+
+    def test_the_excerpt_is_the_prompt_not_the_chrome_around_it(self):
+        """The owner saw a card whose 'terminal' was the tail of an OAuth URL plus a rule line
+        that ran past the card (2026-09-06): the pane's last six lines are not the prompt."""
+        b = M.escalation_message("blocked-human", "awaiting user: login", "login", self.LOGIN_PANE)
+        self.assertIn("Paste code here if prompted", b)
+        self.assertIn("Esc to cancel", b)
+        self.assertIn("Use the url below to sign in", b)
+        for noise in ("code_challenge", "%3A", "https://", "───", "bypass permissions", "2:monitor"):
+            self.assertNotIn(noise, b, noise)
+
+    def test_the_excerpt_is_plain_lines_not_a_code_fence(self):
+        """The room card renders text, so a markdown fence arrives as literal backticks."""
+        b = M.escalation_message("blocked-human", "d", "selection", "Pick one:\n> a\n  b")
+        self.assertNotIn("```", b)
+        self.assertIn("  Pick one:", b)
+
+    def test_an_all_chrome_pane_falls_back_to_the_raw_tail(self):
+        """Over-filtering and 'nothing was there' look the same from inside the filter, and this
+        card is the only thing that reaches the owner: fail noisy, never silent."""
+        b = M.escalation_message("blocked-human", "d", "unknown",
+                                 "──────── x ────────\nhttps://example.test/a?b=1\n")
+        self.assertIn("What the terminal is showing", b)
+        self.assertIn("https://example.test/a?b=1", b)
+
+    def test_blank_lines_and_long_unbroken_tokens_are_dropped(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("keep me\n\nkeep me too"), ["keep me", "keep me too"])
+        self.assertEqual(pe("keep me\n" + "a1b2c3" * 16 + "\nkeep me too"), ["keep me", "keep me too"])
+
+    def test_a_prompt_that_mentions_the_footer_words_is_kept(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("Bypass permissions for this tool? (y/n)"), ["Bypass permissions for this tool? (y/n)"])
+        self.assertEqual(pe("Enable MCP for agents? [y/N]"), ["Enable MCP for agents? [y/N]"])
+        self.assertEqual(pe("  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\nreal"), ["real"])
+
+    def test_a_short_boxed_option_survives_the_rule_filter(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("╭──────╮\n│ Yes │\n╰──────╯"), ["Yes"])
+        self.assertEqual(pe("──── sutando-core ─\n❯ 1. Yes"), ["❯ 1. Yes"])
+
 
 class TestEscalate(unittest.TestCase):
     def test_it_raises_one_requirement_with_an_actionable_card(self):

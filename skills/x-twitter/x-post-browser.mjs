@@ -38,13 +38,15 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
+import { waitForProfileExit } from './profile-lock-wait.mjs';
+import { readLanding, landingExit } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -83,6 +85,34 @@ function resolveChromium() {
 const cmd = process.argv[2];
 const arg = process.argv[3];
 const dryRun = process.argv.includes('--dry-run');
+
+/** `--media <path>`: refuse a missing file HERE, before a browser is launched
+ *  and before any text is typed into a live composer. */
+const MEDIA = (() => {
+  const i = process.argv.indexOf('--media');
+  if (i === -1) return null;
+  const p = process.argv[i + 1];
+  if (!p || p.startsWith('--')) {
+    console.error('--media needs a file path');
+    process.exit(2);
+  }
+  // A readable REGULAR file, not merely something that exists: existsSync is
+  // true for a directory, which then reached the launch that evicts a login.
+  let st;
+  try { st = statSync(p); } catch {
+    console.error(`--media: no such file: ${p}`);
+    process.exit(2);
+  }
+  if (!st.isFile()) {
+    console.error(`--media: not a regular file: ${p}`);
+    process.exit(2);
+  }
+  try { accessSync(p, constants.R_OK); } catch {
+    console.error(`--media: not readable: ${p}`);
+    process.exit(2);
+  }
+  return resolve(p);
+})();
 
 /** Repo root, so the canonical workspace resolver can be invoked from here. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -133,7 +163,8 @@ mkdirSync(PROFILE_DIR, { recursive: true });
 mkdirSync(SHOT_DIR, { recursive: true });
 
 if (!cmd || !['login', 'check', 'post'].includes(cmd)) {
-  console.error('Usage: node x-post-browser.mjs <login|check|post> [text] [--dry-run]');
+  console.error('Usage: node x-post-browser.mjs <login|check|post> [text] '
+                + '[--media <path>] [--dry-run]');
   process.exit(1);
 }
 if (cmd === 'post' && !arg) {
@@ -194,14 +225,32 @@ function pidsForProfile() {
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
+  const signalled = [];
   try {
     for (const pid of pidsForProfile().pids) {
-      try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
+      try { process.kill(parseInt(pid, 10), 'SIGTERM'); signalled.push(pid); } catch {}
     }
   } catch {}
-  try { execFileSync('sleep', ['1']); } catch {}
+  // WAIT for the SIGTERM to be honoured instead of killing on a fixed 1s. Chrome
+  // writes its cookie jar lazily and flushes on clean shutdown; a SIGKILL before
+  // that flush drops every cookie set since the last write — which is exactly the
+  // auth cookies from a sign-in that just happened.
+  const graceMs = Number(setting('X_PROFILE_GRACE_MS', '10000'));
+  const { remaining, waitedMs, exitedCleanly } = waitForProfileExit(
+    pidsForProfile,
+    graceMs,
+    (ms) => { try { execFileSync('sleep', [String(ms / 1000)]); } catch {} },
+  );
+  // Say what happened, so a surviving session is evidence the grace ENGAGED rather
+  // than an absence anyone can read either way: which pids were signalled, whether
+  // they exited on their own, and how long it took.
+  console.error(
+    `profile-lock: SIGTERM->[${signalled.join(',') || 'none'}] ` +
+    `exited_cleanly=${exitedCleanly} waited_ms=${waitedMs} ` +
+    `sigkilled=[${remaining.join(',') || 'none'}]`,
+  );
   try {
-    for (const pid of pidsForProfile().pids) {
+    for (const pid of remaining) {
       try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch {}
     }
   } catch {}
@@ -332,13 +381,23 @@ try {
     await box.click();
     await page.keyboard.type(arg, { delay: 15 });
     await page.waitForTimeout(800);
+    if (MEDIA) {
+      // setInputFiles on the HIDDEN input: clicking the image button opens a
+      // native picker that no automation can drive.
+      const input = await page.waitForSelector('input[type="file"][accept*="image"]',
+                                               { state: 'attached', timeout: 15000 });
+      await input.setInputFiles(MEDIA);
+      // Attached, not merely requested: posting before the upload lands drops the
+      // image silently. `attachments` is measured to appear only once it has.
+      await page.waitForSelector('[data-testid="attachments"]', { timeout: 60000 });
+    }
     const typedDry = await readComposer(page);
     if (!composerMatches(arg, typedDry)) failComposerMismatch(arg, typedDry);
     if (dryRun) {
       const shot = `${SHOT_DIR}/x-dryrun-${Date.now()}.png`;
       await page.screenshot({ path: shot });
       // report what the composer ACTUALLY holds, not what we asked for
-      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, verified: true, screenshot: shot }));
+      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, composer_matched: true, screenshot: shot }));
       process.exit(0);
     }
     // Publish: inline compose button (tweetButtonInline) or modal (tweetButton).
@@ -351,9 +410,16 @@ try {
     const finalText = await readComposer(page);
     if (!composerMatches(arg, finalText)) failComposerMismatch(arg, finalText);
     await btn.click();
-    await page.waitForTimeout(3000);
-    console.log(JSON.stringify({ posted: true, text: finalText, verified: true }));
-    process.exit(0);
+    // A click is not a post. The landing decision lives in readLanding so it can
+    // run against a stub page (tests/x-post-landing-check.test.mjs); here we only
+    // map its decision to output + exit code.
+    const decision = await readLanding(page, { timeout: 15000, shotDir: SHOT_DIR });
+    if (!decision.posted) {
+      console.log(JSON.stringify({ ...decision, composer_matched: true }));
+    } else {
+      console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
+    }
+    process.exit(landingExit(decision));
   }
 } catch (err) {
   console.error(`Error: ${err.message}`);
