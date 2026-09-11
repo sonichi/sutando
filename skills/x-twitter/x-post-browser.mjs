@@ -236,7 +236,7 @@ function releaseProfileLock() {
   // that flush drops every cookie set since the last write — which is exactly the
   // auth cookies from a sign-in that just happened.
   const graceMs = Number(process.env.X_PROFILE_GRACE_MS || 10000);
-  const { remaining, waitedMs } = waitForProfileExit(
+  const { remaining, waitedMs, exitedCleanly } = waitForProfileExit(
     pidsForProfile,
     graceMs,
     (ms) => { try { execFileSync('sleep', [String(ms / 1000)]); } catch {} },
@@ -246,7 +246,7 @@ function releaseProfileLock() {
   // they exited on their own, and how long it took.
   console.error(
     `profile-lock: SIGTERM->[${signalled.join(',') || 'none'}] ` +
-    `exited_cleanly=${remaining.length === 0} waited_ms=${waitedMs} ` +
+    `exited_cleanly=${exitedCleanly} waited_ms=${waitedMs} ` +
     `sigkilled=[${remaining.join(',') || 'none'}]`,
   );
   try {

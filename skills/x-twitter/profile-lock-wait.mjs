@@ -17,7 +17,10 @@
  */
 export function waitForProfileExit(probe, graceMs, sleep, now = Date.now) {
   const start = now();
-  const deadline = start + graceMs;
+  // A non-finite grace makes every `now() >= start + graceMs` false and the loop
+  // never exits — `Number('abc')` is NaN, and an env var is the usual source.
+  const grace = Number.isFinite(graceMs) && graceMs >= 0 ? graceMs : 0;
+  const deadline = start + grace;
   for (;;) {
     const p = probe();
     const remaining = p.known ? p.pids : [];

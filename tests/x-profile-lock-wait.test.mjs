@@ -57,5 +57,27 @@ function holder(afterMs, c, known = true) {
   ck('CONTROL: the old fixed-1s path kills the 3s holder', r.remaining.length === 1 && !r.exitedCleanly);
 }
 
+// 6. A non-finite grace must not hang. `Number('abc')` is NaN and an env var is
+//    the usual source; `now() >= start + NaN` is never true, so the loop runs forever.
+{
+  const c = clock();
+  let iters = 0;
+  const counting = () => { iters++; if (iters > 1000) throw new Error('did not terminate'); return { known: true, pids: ['7'] }; };
+  let threw = null;
+  try { waitForProfileExit(counting, Number('abc'), c.sleep, c.now); } catch (e) { threw = e; }
+  ck('a NaN grace terminates instead of spinning', threw === null);
+  ck('and it does not silently wait forever', iters <= 2);
+}
+// 7. exitedCleanly and remaining DISAGREE under an unknown probe — that disagreement
+//    is the flag's whole purpose, so anything recomputing it from `remaining` is wrong.
+{
+  const c = clock();
+  const r = waitForProfileExit(() => ({ known: false, pids: [] }), 1000, c.sleep, c.now);
+  ck('unknown probe: remaining is empty', r.remaining.length === 0);
+  ck('unknown probe: exitedCleanly is FALSE despite that', r.exitedCleanly === false);
+  ck('so remaining.length===0 is NOT a substitute for exitedCleanly',
+     (r.remaining.length === 0) !== r.exitedCleanly);
+}
+
 console.log(fails === 0 ? '\nall ok' : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
