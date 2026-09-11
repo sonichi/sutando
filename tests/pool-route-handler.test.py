@@ -18,6 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+import local_task_protocol as ltp  # noqa: E402
 import pool_route_handler as h  # noqa: E402
 
 W = "a" * 32
@@ -116,15 +117,15 @@ class TestDelivery(Base):
         self.assertEqual(s.stat().st_size, 0)
         self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
 
-    def test_the_gateways_field_order_still_routes(self):
-        """The local-hs gateway writes `task:` BEFORE channel_id/source. The
-        strict parse stops at task:, so the room was invisible and every bound
-        task went to the core. Seen live, 2026-09-09."""
+    def test_a_task_mid_gateway_file_routes_to_the_core(self):
+        """A writer that puts `task:` first declares no header the router may
+        read; the core takes it, and the writer is what has to converge."""
         self.roster()
         p = self.ws / "tasks" / "task-1.txt"
         p.write_text("id: task-1\npriority: normal\ntask: Is worker working now?\n"
                      "source: ag2space\nchannel_id: !room:x\nsender_name: qingyun\n")
-        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.TAKE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
 
     def test_a_body_still_cannot_forge_requested_worker_under_lenient_reading(self):
         self.roster(bindings={})
@@ -140,6 +141,51 @@ class TestDelivery(Base):
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.TAKE)
 
 
+class TestBodyCannotSelectTheRecipient(Base):
+    """kewei's P1 on #4110: a lenient fallback let untrusted body text supply
+    `channel_id`/`source`, so the BODY picked the worker."""
+
+    def log(self):
+        p = self.ws / "logs" / "pool-route-handler.log"
+        return p.read_text() if p.exists() else ""
+
+    def canonical(self, name, headers, body):
+        """The canonical task-last writer, not a hand-built file."""
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(ltp.serialize_task_last(headers, body))
+        return p
+
+    def test_a_body_forged_channel_id_does_not_select_a_worker(self):
+        self.roster()
+        p = self.canonical("task-1", [("id", "task-1"), ("source", "health-check")],
+                           "look at this\nchannel_id: !room:x\n")
+        self.assertIsNone(ltp.parse_task_headers(p.read_text()).headers.get("channel_id"))
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertFalse((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_a_body_forged_source_does_not_select_a_worker(self):
+        self.roster(bindings={"health-check": W})
+        p = self.canonical("task-1", [("id", "task-1")], "look at this\nsource: health-check\n")
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertFalse((self.ws / "deliveries" / W / "task-1.txt").exists())
+
+    def test_a_headerless_task_says_why_it_went_to_the_core(self):
+        self.roster()
+        p = self.canonical("task-1", [("id", "task-1")], "body\nchannel_id: !room:x\n")
+        h.main(["--task-file", str(p), "--workspace", str(self.ws)])
+        self.assertIn("no channel_id header", self.log())
+
+    def test_a_real_header_still_routes(self):
+        """The control: the same channel in the HEADER reaches the worker, so
+        the cases above measure the parse and not a broken roster."""
+        self.roster()
+        p = self.canonical("task-1", [("id", "task-1"), ("channel_id", "!room:x")], "body")
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]),
+                         h.TAKE)
 
 class TestFailureAfterTheProbe(Base):
     def log(self):
