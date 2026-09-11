@@ -191,6 +191,13 @@ class RecoveryMetrics(unittest.TestCase):
         self.assertEqual(sorted(detected), sorted(recovered))
         self.assertNotIn('private-', json.dumps(self.issue_events))
 
+    def test_unimportable_issue_tracker_cannot_prevent_core_restart(self):
+        import sys
+        with patch.dict(sys.modules, {'recovery_issues': None}):
+            self.restart()
+        self.assertEqual([e[0] for e in self.events],
+                         ['core_recovery_attempted', 'core_restart_result'])
+
     def test_opt_out_and_short_lived_delivery(self):
         self.mock.stop()
         import telemetry

@@ -61,3 +61,9 @@ committed before sending; offline delivery or a crash between commit and capture
 can lose an event. UUID grouping removes retry inflation, not telemetry loss.
 No new configuration or dependency is needed. Rollback leaves unused issue-state
 files and does not change recovery behavior or existing dashboard queries.
+
+Locking is supported on macOS/Linux; without `fcntl` this stream is disabled.
+A contended writer skips that tick rather than delaying repairs. The next explicit
+OK can still close the original issue; an entire episode inside contention may
+be missed. A renamed or removed check stays unmatched until explicitly migrated
+or observed OK; do not treat those orphaned records as confirmed failures.

@@ -13,7 +13,7 @@ except ImportError:
 
 
 def _update(path, change, emit):
-    """Serialize observations and publish state before best-effort telemetry."""
+    """Publish observations best effort; skip a tick if another writer holds the lock."""
     if fcntl is None:
         return
     try:
