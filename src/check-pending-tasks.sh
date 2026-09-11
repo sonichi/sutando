@@ -33,15 +33,14 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
-  # A pool worker owns any task with a sentinel in its delivery folder. The core
-  # declined it and must not touch it, so it is not the core's to answer.
+  # A pool worker owns any task with a sentinel in its delivery folder. Which
+  # names count is pool_delivery's to say; a second spelling here would drift.
   TASK_ID="${BASENAME%.txt}"
   HELD_BY_WORKER=0
-  for _d in "$WORKSPACE"/deliveries/*/; do
-    [ -d "$_d" ] || continue
-    [ "$(basename "$_d")" = core ] && continue   # the core's own inbox is not a worker's
-    if [ -e "$_d$TASK_ID.txt" ] || [ -e "$_d$TASK_ID.accepted" ]; then HELD_BY_WORKER=1; break; fi
-  done
+  if [ -n "$PYBIN" ] && "$PYBIN" "$REPO_DIR/src/pool_delivery.py" \
+       --workspace "$WORKSPACE" --held "$TASK_ID" >/dev/null 2>&1; then
+    HELD_BY_WORKER=1
+  fi
   if [ "$HELD_BY_WORKER" = 1 ] || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
     continue
   fi
