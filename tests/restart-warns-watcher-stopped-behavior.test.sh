@@ -57,7 +57,16 @@ assert_warning_behaviour() {     # assert_warning_behaviour <output>
   [ -n "$kill_n" ] && [ -n "$warn_n" ] && [ "$warn_n" -gt "$kill_n" ]
 }
 
-REPO_PY="$(command -v python3 || echo /usr/bin/python3)"
+# The repo's own resolver, not an invented fallback: restart.sh itself sources this
+# helper at :14-18, and a bare `|| echo /usr/bin/python3` reaches the CLT stub it exists
+# to avoid. No runnable interpreter means the perturbation cannot be built, which must
+# fail loudly rather than silently skip the control.
+REPO_PY=""
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  REPO_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
+fi
+[ -n "$REPO_PY" ]; ck "a runnable python3 resolved via scripts/python-binary.sh" $?
 SB_ROOT="$(mktemp -d)"; trap 'rm -rf "$SB_ROOT"' EXIT
 
 # --- arm 1: the script runs to completion under stubs (harness is sound) ------
@@ -67,6 +76,16 @@ grep -q "STUB-PKILL .*watch-tasks" <<<"$out_head"; ck "it really does stop the w
 
 # --- arm 2: at this head, the warning behaviour holds -------------------------
 assert_warning_behaviour "$out_head"; ck "warning is EMITTED, names the re-arm, and follows the kill" $?
+
+# --- arm 2b: the warning's own claim, tested on the file under test ------------
+# "nothing here re-arms it" is a claim about restart.sh, and this run reaches
+# startup.sh (arm 1), so an absence here is a completed observation rather than a
+# partial one. The stub pkill announces every kill; a re-arm would have to exec the
+# watcher, and nothing in the captured stream does.
+grep -q "watch-tasks-stream.sh" <<<"$out_head"
+ck "the warning names the re-arm command" $?
+! grep -qE "^STUB-(PKILL )?.*exec.*watch-tasks-stream" <<<"$out_head"
+ck "restart.sh itself starts no watcher (its own claim, on its own output)" $?
 
 # --- arm 3: THE CONTROL — disable the warning, the assertion must FAIL --------
 # The perturbation must APPLY. Without this check the arm below passes for the

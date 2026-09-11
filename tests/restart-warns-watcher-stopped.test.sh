@@ -29,8 +29,13 @@ warn_line=$(grep -n 'task watcher STOPPED' "$RS" | head -1 | cut -d: -f1)
 
 grep -q 'watch-tasks-stream.sh' "$RS"; ck "the warning names the command that re-arms it" $?
 
-# The claim the warning rests on: startup.sh genuinely cannot restore it.
-! grep -q "watch-tasks" "$REPO/src/startup.sh"; ck "startup.sh still has no watch-tasks path (premise holds)" $?
+# REMOVED: `! grep -q "watch-tasks" startup.sh`. It asserted a SUBSTRING, not the
+# premise. Measured both directions: inlining startup.sh's sentinel path (a no-op
+# refactor, and the form a shipped engine build carries) made it FAIL, while a real
+# re-arm written as `__w="watch-""tasks-stream.sh"` left it passing. It fired on no
+# change and stayed silent on the regression it guarded. A sound replacement must run
+# startup.sh, which `set -e` plus ~82 env dependencies make a partial run — and a
+# partial run's silence is not evidence. Tracked rather than replaced by a second proxy.
 
 bash -n "$RS"; ck "restart.sh parses" $?
 
