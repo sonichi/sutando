@@ -31,12 +31,28 @@ Same screen, same message, nothing abandoned. The owner asked by voice and the
 evidence arrived where the question was — **no switching back and forth.**
 
 **Between tasks, the next one is unknown.** "What should I do next" is itself
-work, and it is the work `sonichi/sutando-life` triage exists to remove: one
-proposal at a time, each an authored commitment with a `why`, its premise
-re-verified at scan time by `triage_freshness` against the pull requests it
-names.
+work — and the figure above was already an answer to it. That message is a triage
+item, and it has the shape `sonichi/sutando-life` produces:
 
-Both are the same gap, and it costs three things:
+| In the figure | The record |
+|---|---|
+| the drafted post | `proposition` — what the agent commits to doing |
+| "Proposed by the content loop, not yet written up" | `why` |
+| "News published: 09-11 11:21 ET" | `source` |
+| `approve` / `reject` | the actions the reaction log accepts |
+| "Recommend: diagram. Say another, or no image, to override." | a default, so deciding is confirm-or-overrule rather than choose-from-blank |
+
+That is the work triage removes: one proposal at a time, each an authored
+commitment rather than a raw question, its premise re-verified at scan time by
+`triage_freshness` against the pull requests it names. It is the strongest
+decision unit in the system.
+
+**And it is currently scattered across three places** — sutando-life's own page,
+`#4003`'s web client, and Discord messages like the one above. One model, three
+destinations, each of which you go to. Every property that makes the unit good
+widens the gap: one-at-a-time means the trip is paid *per item*.
+
+Both halves are the same gap, and it costs three things:
 
 | | The gap |
 |---|---|
@@ -49,10 +65,7 @@ current channel and about what needs deciding. Speech does not close it. Speech
 cannot be skimmed, cannot put evidence beside a claim, and is gone from the
 agent's context in about ten minutes.
 
-Triage is the sharpest instance because every property that makes it good widens
-the gap: one-at-a-time means the trip is paid *per item*, and `#4003` brings the
-same queue into the web client — still a page you navigate to. In-channel
-navigation is the same gap from the other side:
+In-channel navigation is the same gap from the other side:
 `skills/discord-voice-overlay/` already resolves the visible channel, the hovered
 message and the selection, and can only answer by speaking.
 
