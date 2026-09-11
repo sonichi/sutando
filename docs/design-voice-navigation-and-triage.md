@@ -69,7 +69,22 @@ per item.** Every property that makes the unit good widens the gap.
 
 **The same unit is currently scattered across three destinations** — that page,
 `#4003`'s web client, and Discord messages like the one above. One model, three
-places, each of which you go to.
+places, each of which you go to. They are not even one queue: the pending
+questions that reach the triage page and the post verdicts that reach Discord
+have separate producers, so the figure at the top of this section appears in
+neither of the other two.
+
+On the surface, it is the same card as everything else:
+
+![Mockup: the same Discord channel, with a triage card for the post verdict
+rendered as a notch panel — proposition, source, a freshness line, and Approve /
+Reject / Reply / Next / Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
+
+**That figure is a mockup, not a capture** — the item in it does not exist in any
+queue today; social-post verdicts are not routed into triage. It is drawn with
+the triage page's own markup over a real screenshot to show the shape: the
+decision arrives where the work is, with its evidence attached, and the same five
+actions answer it.
 
 Both halves are the same gap, and it costs three things:
 
