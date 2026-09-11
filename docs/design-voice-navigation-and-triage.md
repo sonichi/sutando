@@ -2,113 +2,48 @@
 
 Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 
-## Problem
+## Problem: the context gap
 
-Finishing a task quickly requires understanding its context. Sutando slows the
-owner down at both ends of a task, in the same way and for the same reason.
+### Within a task
 
-### Mid-task: the context is elsewhere
+The thing you need is never where you are.
 
-What did this channel already decide?
-What does this message refer to? The answer is in a scrollback, a page, another
-tab — and going to get it abandons the context the task is in.
+![A Discord message asking for an approve/reject verdict on a drafted post. Its
+only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
 
-![A Discord message asking for an approve/reject verdict on a drafted post. The
-draft's only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
-
-The screenshot is the gap in one frame. A decision is being asked for —
-`approve — this is the post` / `reject — drop it, I take the next item` — and it
-cannot be made on the page that asks for it. Ruling on the draft means reading
-the article it is built from, which means leaving Discord for a browser. By the
-time the answer is known, the message that asked is somewhere behind a window.
-**The place a decision is requested is not a place a decision can be made.**
-
-With a surface, the article comes to the message instead:
+A decision is asked for here and cannot be made here. Ruling on the draft means
+reading the article it is built from, which means leaving.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
 that URL in the notch."](design-voice-navigation-and-triage-context-closed.png)
 
-Same screen, same message, nothing abandoned. The owner asked by voice and the
-evidence arrived where the question was — **no switching back and forth.**
+Asked by voice, the article arrived beside the message. Nothing abandoned.
 
-### Between tasks: the next one is unknown
+### Task triage
 
-"What should I do next" is itself
-work — and the figure above was already an answer to it. That message is a triage
-item, and it has the shape `sonichi/sutando-life` produces:
+"What should I do next" is itself work. `sonichi/sutando-life` removes it: one
+proposal at a time, each an authored commitment with a `why`, its premise
+re-verified at scan time by `triage_freshness` against the pull requests it names.
 
-| In the figure | The record |
-|---|---|
-| the drafted post | `proposition` — what the agent commits to doing |
-| "Proposed by the content loop, not yet written up" | `why` |
-| "News published: 09-11 11:21 ET" | `source` |
-| `approve` / `reject` | the actions the reaction log accepts |
-| "Recommend: diagram. Say another, or no image, to override." | a default, so deciding is confirm-or-overrule rather than choose-from-blank |
-
-That is the work triage removes: one proposal at a time, each an authored
-commitment rather than a raw question, its premise re-verified at scan time by
-`triage_freshness` against the pull requests it names. It is the strongest
-decision unit in the system.
-
-### Where triage renders today
-
-sutando-life gives it a page of its own — `static/triage.html`, whose own
-description is the design in one sentence:
+It renders on a page of its own, `static/triage.html` — one card out of forty on
+this host, five actions, no board:
 
 > Everything that needs your call, from every source, one at a time in rank
 > order. Approve, reject, or reply, then move on. Your decisions are recorded for
 > the agent to act on; nothing here reorders itself by what you pick.
 
-One card at a time out of a queue that is forty deep on this host: a waiting
-label, the proposition, the detail, and five actions — approve, reject, reply,
-next, dismiss. No board, no backlog to scan. It refreshes on its own every
-fifteen minutes as a standalone job, and a ↻ appears only when something new has
-actually arrived.
+A good page, and a page. One-at-a-time means **the trip is paid per item.**
 
-Which is a good page — and a page. To answer one item the owner leaves whatever
-they were doing, and the queue is one-at-a-time by design, so **the trip is paid
-per item.** Every property that makes the unit good widens the gap.
-
-**The same unit is currently scattered across three destinations** — that page,
-`#4003`'s web client, and Discord messages like the one above. One model, three
-places, each of which you go to. They are not even one queue: the pending
-questions that reach the triage page and the post verdicts that reach Discord
-have separate producers, so the verdict in the first figure appears in neither
-of the other two.
-
-### Where it would render instead
-
-On the surface, it is the same card as everything else:
+And not one queue: pending questions reach that page, post verdicts reach
+Discord, `#4003` adds the web client. The verdict above is in none of the others.
 
 ![Mockup: the same Discord channel, with a triage card for the post verdict
 rendered as a notch panel — proposition, source, a freshness line, and Approve /
 Reject / Reply / Next / Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
 
-**That figure is a mockup, not a capture** — the item in it does not exist in any
-queue today; social-post verdicts are not routed into triage. It is drawn with
-the triage page's own markup over a real screenshot to show the shape: the
-decision arrives where the work is, with its evidence attached, and the same five
-actions answer it.
-
-### What the gap costs
-
-Both halves are the same gap, and it costs three things:
-
-| | The gap |
-|---|---|
-| **Getting there** | The answer is somewhere else. Going to it abandons where you are. |
-| **Understanding it** | What arrives is a list, a board, a scrollback. It must be scanned before it can be used. |
-| **Trusting it** | It was written earlier. Nothing says which parts are still true. |
-
-Sutando can already *speak* across this gap — the voice agent answers about the
-current channel and about what needs deciding. Speech does not close it. Speech
-cannot be skimmed, cannot put evidence beside a claim, and is gone from the
-agent's context in about ten minutes.
-
-In-channel navigation is the same gap from the other side:
-`skills/discord-voice-overlay/` already resolves the visible channel, the hovered
-message and the selection, and can only answer by speaking.
+Mockup, not a capture — that item is in no queue today. Same card, where the work
+already is.
 
 ## What this proposes
 
