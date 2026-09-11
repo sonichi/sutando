@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Worker-pool modules the core does not need: the owner-authored bindings plus compiled roster the router reads, and a worker's durable identity records (worker / session / incarnation). Optional - the core boots and delivers with this skill absent.",
+  "description": "Worker-pool modules the core does not need: the owner-authored bindings plus compiled roster the router reads, a worker's durable identity records (worker / session / incarnation), the spawner that creates a worker, and the per-instance watcher gate its session boots through. Optional - the core boots and delivers with this skill absent.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

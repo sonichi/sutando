@@ -9,7 +9,7 @@ tmux is injected, so these run with no tmux server and never touch a real
 socket. That is the point — the launcher's ORDERING and REFUSALS are the
 behaviour under test, not tmux itself.
 
-Run: python3 tests/spawn-worker-launcher.test.py
+Run: python3 skills/worker-pool/tests/spawn-worker-launcher.test.py
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import spawn_worker as sw  # noqa: E402
 import worker_identity as wi  # noqa: E402
@@ -334,6 +334,36 @@ class TestWorkerIsolation(Base):
         p = sw.plan(self.ws, REPO, worker_id="a" * 32)
         self.assertEqual(p["worker_id"], "a" * 32)
         self.assertTrue(p["delivery_dir"].endswith("a" * 32))
+
+
+class TestBootstrapSeam(Base):
+    """The gate `/startup --worker` runs lives in THIS skill, so the core reaches
+    it through env the spawner sets — never by naming a skill path."""
+
+    def test_the_plan_names_this_skills_gate(self):
+        gate = Path(sw.plan(self.ws, REPO)["env"]["SUTANDO_WORKER_BOOTSTRAP"])
+        self.assertTrue(gate.is_file(), gate)
+        self.assertEqual(gate.parent, Path(sw.__file__).resolve().parent)
+
+    def test_the_named_gate_runs_and_decides(self):
+        """Named, not just spelled: run what the plan points at and require a
+        decision, so a rename that leaves a stale string is a failure."""
+        gate = sw.plan(self.ws, REPO)["env"]["SUTANDO_WORKER_BOOTSTRAP"]
+        r = subprocess.run([sys.executable, gate, "--instance", "", "--inbox", ""],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual((r.stdout or "").splitlines()[0], "unknown")
+
+    def test_the_core_startup_skill_names_the_env_not_a_path(self):
+        """The core boots with this skill absent, so its own `/startup` carries
+        no path into it. Prose may name the skill; a runnable path may not."""
+        skill = (REPO / "skills" / "startup" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("$SUTANDO_WORKER_BOOTSTRAP", skill)
+        self.assertNotIn("skills/worker-pool", skill)
+        # The scan is live: the core launcher's own suite reaches this skill by
+        # path on purpose, and the same needle finds it there.
+        control = REPO / "tests" / "start-cli-worker-env-forwarded.test.sh"
+        self.assertIn("skills/worker-pool", control.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

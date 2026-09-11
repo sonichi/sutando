@@ -8,7 +8,7 @@ gate reads the sentinel THIS instance stamps, resolved by the watcher's own
 owner (`util_paths.watcher_sentinel_path`), and liveness arrives as a callable
 so neither polarity needs a process.
 
-Run: python3 tests/startup-worker-bootstrap-decision.test.py
+Run: python3 skills/worker-pool/tests/worker-bootstrap-decision.test.py
 """
 from __future__ import annotations
 
@@ -20,8 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-GATE = REPO / "skills" / "startup" / "scripts" / "worker-bootstrap.py"
+GATE = Path(__file__).resolve().parents[1] / "scripts" / "worker_bootstrap.py"
 
 # As a caller outside src/ loads it: its own sys.path bootstrap is part of
 # the module, and pre-inserting src/ would leave that unrun.

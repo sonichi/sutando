@@ -22,9 +22,13 @@ import tempfile
 import uuid
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parent
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+_SCRIPTS = Path(__file__).resolve().parent
+_REPO = _SCRIPTS.parents[2]
+# Sibling skill scripts, then the core's src/ for the delivery-record grammar
+# (repo root is parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
+for _p in (str(_SCRIPTS), str(_REPO / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import pool_delivery as pd  # noqa: E402
 
@@ -130,7 +134,10 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # Named, not derived: every runtime writes its answers where the
                 # bridges drain them, which is the workspace's own results/.
                 "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
-                "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo)},
+                "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
+                # The worker's own gate, named by the skill that owns it: the
+                # core's `/startup --worker` runs what it is handed, not a path.
+                "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py")},
     }
 
 
@@ -178,7 +185,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="create a worker")
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--repo", default=str(_SRC.parent))
+    ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
     ap.add_argument("--runtime", default="", help="default: the core's configured runtime")

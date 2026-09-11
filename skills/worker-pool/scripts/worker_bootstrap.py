@@ -10,7 +10,10 @@ else: the file `util_paths.watcher_sentinel_path` names for this identity.
 Decision on stdout: `start`, `skip`, or `unknown`.
 Exit 0 when decided, 2 when it cannot be (an unknown is never a `start`).
 
-Run: python3 skills/startup/scripts/worker-bootstrap.py
+Owned by the pool skill; the core's `/startup --worker` runs whatever
+$SUTANDO_WORKER_BOOTSTRAP names, which the spawner sets to this file.
+
+Run: python3 skills/worker-pool/scripts/worker_bootstrap.py
 """
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ import os
 import sys
 from pathlib import Path
 
+# Skill script: reach the core's util_paths/workspace resolvers in src/ (repo
+# root is parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
 REPO = Path(__file__).resolve().parents[3]
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))

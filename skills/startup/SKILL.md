@@ -19,8 +19,10 @@ A pool worker is an instance, not the canonical core. It shares the host's works
 1. Ask whether this instance's own watcher is already live. **The core's step 1.5 gate is the wrong question here** — it is satisfied by *any* watcher tree on the host, and the core's own always satisfies it, so a worker that consults it never starts the watcher it exists to run:
 
    ```bash
-   python3 skills/startup/scripts/worker-bootstrap.py
+   python3 "$SUTANDO_WORKER_BOOTSTRAP"
    ```
+
+   The gate belongs to the optional `worker-pool` skill, not to this one, so it is **named by the spawner in the session's env** and never spelled as a path here — a core install without that skill must still boot. If `$SUTANDO_WORKER_BOOTSTRAP` is unset or names no file, treat it as `unknown`: say so and start nothing.
 
    It answers about THIS instance's sentinel (`util_paths.watcher_sentinel_path`, the same file the watcher stamps) and prints one word: `start`, `skip`, or `unknown`.
 

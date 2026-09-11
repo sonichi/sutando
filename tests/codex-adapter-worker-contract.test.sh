@@ -49,7 +49,9 @@ check $? "a core inbox still resolves results/ beside tasks/ (old behaviour inta
 PLAN_ENV="$TMP/plan-env"
 python3 - "$REPO" "$WS" "$WID" > "$PLAN_ENV" <<'PY'
 import sys
-sys.path.insert(0, sys.argv[1] + "/src")
+# The spawner lives in the optional worker-pool skill; this core-launcher test
+# names it, because it is the caller whose env contract is under test.
+sys.path.insert(0, sys.argv[1] + "/skills/worker-pool/scripts")
 import spawn_worker
 p = spawn_worker.plan(sys.argv[2], sys.argv[1], runtime="codex",
                       socket="/tmp/sutando-test.sock", worker_id=sys.argv[3])

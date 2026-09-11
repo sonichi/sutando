@@ -24,7 +24,9 @@ mkdir -p "$INBOX"
 # The plan the spawner would hand the launcher, as KEY=VALUE lines.
 python3 - "$REPO" "$WS" "$WID" > "$TMP/plan-env" <<'PY'
 import sys
-sys.path.insert(0, sys.argv[1] + "/src")
+# The spawner lives in the optional worker-pool skill; this core-launcher test
+# names it, because it is the caller whose env contract is under test.
+sys.path.insert(0, sys.argv[1] + "/skills/worker-pool/scripts")
 import spawn_worker
 p = spawn_worker.plan(sys.argv[2], sys.argv[1], runtime="claude",
                       socket="/tmp/sutando-test.sock", worker_id=sys.argv[3])
@@ -60,6 +62,18 @@ check $? "every var the spawner sets and the watcher reads is forwarded${missing
 grep -qx -- "SUTANDO_WORKSPACE_DIR=$WS" "$TMP/fwd"
 check $? "SUTANDO_WORKSPACE_DIR=$WS reaches the session"
 
+# The worker gate is the pool skill's file; `/startup --worker` runs whatever
+# this names, so the launcher must carry it without ever knowing the path.
+BOOT="$(grep -m1 '^SUTANDO_WORKER_BOOTSTRAP=' "$TMP/plan-env" | cut -d= -f2-)"
+[ -n "$BOOT" ] && grep -qx -- "SUTANDO_WORKER_BOOTSTRAP=$BOOT" "$TMP/fwd"
+check $? "the worker gate the spawner names reaches the session"
+# A negative needs a live instrument: the same pattern IS in this file, which
+# reaches the spawner by path because it is the caller under test.
+grep -q "skills/worker-pool" "${BASH_SOURCE[0]}"
+check $? "control: the pool-path scan finds a real occurrence"
+! grep -q "skills/worker-pool" "$STARTCLI"
+check $? "the core's launcher names no pool path (it arrives in env)"
+
 # Behaviour, not spelling: run the watcher's own resolution under the forwarded
 # env and assert results/ lands in the shared workspace, not under deliveries/.
 # shellcheck disable=SC2046
@@ -77,8 +91,7 @@ check $? "the worker's results/ is not under deliveries/"
 
 # Backward compatibility: with no worker env the forwarded set is unchanged.
 env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI" --print-core-env > "$TMP/fwd-bare" 2>/dev/null
-grep -q "SUTANDO_WORKSPACE_DIR" "$TMP/fwd-bare"
-[ $? -ne 0 ]
+! grep -q "SUTANDO_WORKSPACE_DIR\|SUTANDO_WORKER_BOOTSTRAP" "$TMP/fwd-bare"
 check $? "an install that sets no workspace env forwards none (old behaviour intact)"
 
 echo

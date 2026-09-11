@@ -12,7 +12,7 @@ watcher_sentinel_path`. A checkout that resolves one shared sentinel passes
 that, and its second watcher erases the core's liveness stamp. It now asks the
 resolver what it RESOLVES, under two identities.
 
-Run: python3 tests/spawn-worker-runtime-and-sentinel.test.py
+Run: python3 skills/worker-pool/tests/spawn-worker-runtime-and-sentinel.test.py
 """
 from __future__ import annotations
 
@@ -23,11 +23,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 # From its path, not off sys.path: the module bootstraps src/ itself for
 # exactly this caller, and pre-inserting it would leave that unrun.
-_spec = importlib.util.spec_from_file_location("spawn_worker", REPO / "src" / "spawn_worker.py")
+_spec = importlib.util.spec_from_file_location("spawn_worker", SCRIPTS / "spawn_worker.py")
 sw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sw)
 
