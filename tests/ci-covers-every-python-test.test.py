@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Every test-looking Python file must actually be executed by CI.
 
-CI discovers Python tests with `find tests -name '*.test.py'`. Anything outside
-that root or suffix runs only if ci.yml names it explicitly. A fixed list is
+CI discovers Python tests with `find tests skills -name '*.test.py'`. Anything
+outside those roots or suffix runs only if ci.yml names it explicitly. A fixed list is
 maintenance the next author will not know they owe: a test added under
 packages/*/tests/ is silently never run, and reads as coverage anyway.
 
@@ -20,8 +20,14 @@ CI = REPO / ".github" / "workflows" / "ci.yml"
 
 
 def discovered_by_find():
-    """What `find tests -name '*.test.py'` reaches."""
-    return {str(Path(p)) for p in glob.glob("tests/**/*.test.py", recursive=True)}
+    """What `find tests skills -name '*.test.py'` reaches.
+
+    Both roots: a skill owns its own tests/ dir, so a suite that moves out of
+    tests/ into skills/<name>/tests/ stays discovered rather than going silent."""
+    found = set()
+    for root in ("tests", "skills"):
+        found |= {str(Path(p)) for p in glob.glob(f"{root}/**/*.test.py", recursive=True)}
+    return {p for p in found if "node_modules" not in p}
 
 
 def named_in_workflows():
@@ -94,6 +100,16 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])
+
+    def test_a_skill_owned_test_dir_is_discovered(self):
+        """The skills root must be reached by discovery, not just by the glob's
+        shape — a real committed skill test is the only proof of that."""
+        import os
+        os.chdir(REPO)
+        found = discovered_by_find()
+        self.assertTrue(
+            any(f.startswith("skills/") and f.endswith(".test.py") for f in found),
+            "no skills/**/*.test.py discovered — the skills root is not being walked")
 
 
 if __name__ == "__main__":

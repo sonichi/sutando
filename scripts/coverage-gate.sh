@@ -122,7 +122,8 @@ else
 fi
 export RECDIR COVGATE_TIMEOUT
 
-find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+# `skills` too: a skill owns its own tests/, and the gate must measure them.
+find tests skills -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
 # Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
 # tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
 _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"

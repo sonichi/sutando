@@ -1,0 +1,11 @@
+{
+  "name": "worker-pool",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Worker-pool modules the core does not need: the owner-authored bindings plus compiled roster the router reads, and a worker's durable identity records (worker / session / incarnation). Optional - the core boots and delivers with this skill absent.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

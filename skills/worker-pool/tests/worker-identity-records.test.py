@@ -10,7 +10,7 @@ The rules under test, each of which loses information if collapsed:
     done-flags resolved to three different sessions), so none of this is
     derivable afterwards.
 
-Run: python3 tests/worker-identity-records.test.py
+Run: python3 skills/worker-pool/tests/worker-identity-records.test.py
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ import threading
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 
 import worker_identity as wi  # noqa: E402
 
@@ -254,7 +254,7 @@ class TestConcurrentWriters(Base):
     records it at start or never. Found in review of this PR."""
 
     def _spawn_processes(self, wid, n=24):
-        prog = (f"import sys; sys.path.insert(0, {str(REPO / 'src')!r})\n"
+        prog = (f"import sys; sys.path.insert(0, {str(SCRIPTS)!r})\n"
                 "import worker_identity as wi\n"
                 f"wi.record_session({str(self.ws)!r}, {wid!r}, 'p-' + sys.argv[1],"
                 " runtime='claude', relation='new')\n")
