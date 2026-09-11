@@ -11,8 +11,10 @@ what makes a pass testable by replay: same roster, same task, same deliveries,
 with no clock, no directory listing and no liveness probe in the decision.
 
 The one thing it may NOT do is substitute one WORKER for another. A target not on
-the roster goes to the core, which is a recipient rather than a fallback.
-recipient is how a task reaches someone the owner never addressed.
+the roster goes to the core, which is a recipient rather than a fallback, and the
+name it was addressed to is reported in `redirected` rather than dropped.
+Re-aiming work at a reachable WORKER is how a task reaches someone the owner
+never addressed.
 """
 from __future__ import annotations
 
