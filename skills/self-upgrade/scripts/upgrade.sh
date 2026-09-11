@@ -127,9 +127,17 @@ if [ "$GATE_VAULT" = "true" ]; then
   # Stamp before the sync so this host's own records travel WITH the claim that
   # peers can see them; a stamp pushed without its records is a false claim.
   [ -n "$GATE_HOST" ] && "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" publish --host "$GATE_HOST" >/dev/null 2>&1 || true
-  # Full tick, not --pull-only: pulling alone never publishes this host, so a
-  # fleet of pull-only updaters ages every stamp out and then refuses forever.
-  bash "$REPO/scripts/sync-workspace.sh" || { echo "self-upgrade: ABORT — vault sync failed, so the fleet's witness-owed records cannot be called fresh" >&2; exit 4; }
+  # --pull-strict, not the default tick: the default returns the PUSH's rc and
+  # its zero says nothing about whether peer records arrived (exit 3 = pull leg).
+  GATE_SYNC_RC=0
+  bash "$REPO/scripts/sync-workspace.sh" --pull-strict || GATE_SYNC_RC=$?
+  if [ "$GATE_SYNC_RC" = "3" ]; then
+    echo "self-upgrade: ABORT — vault sync's PULL leg failed, so this host's view of the fleet's witness-owed records is not current" >&2
+    exit 4
+  elif [ "$GATE_SYNC_RC" != "0" ]; then
+    echo "self-upgrade: ABORT — vault sync failed (exit $GATE_SYNC_RC, push leg), so the fleet's witness-owed records cannot be called fresh" >&2
+    exit 4
+  fi
 elif [ -d "$GATE_WS/hosts" ] && [ -n "$GATE_HOST" ] && find "$GATE_WS/hosts" -mindepth 2 -maxdepth 2 -name witness-owed -not -path "$GATE_WS/hosts/$GATE_HOST/*" | grep -q .; then
   echo "self-upgrade: ABORT — foreign host witness-owed subtrees exist but the vault is disabled, so they cannot be refreshed" >&2
   echo "  Enable the vault, or re-stamp this host's view once its records are current:" >&2

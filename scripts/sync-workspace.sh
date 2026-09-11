@@ -49,6 +49,7 @@
 #
 # Usage:
 #   bash scripts/sync-workspace.sh                # default: pull + push (one tick)
+#   bash scripts/sync-workspace.sh --pull-strict  # same tick; a failed PULL is a failed run (exit 3)
 #   bash scripts/sync-workspace.sh --pull-only    # fetch + merge peers, no push
 #   bash scripts/sync-workspace.sh --push-only    # commit + push to own host branch
 #   bash scripts/sync-workspace.sh --init         # one-time init: git init + setup vault remote
@@ -1564,7 +1565,14 @@ _push_only_impl() {
 
 # Default: pull peers first (so own commits build on latest peer state), then push.
 
-cmd_default_bidirectional() {
+cmd_default_bidirectional() { _bidirectional_tick default; }
+
+# Same legs, strict reading: the caller is asking whether its view of peer state
+# is CURRENT, so a refused pull is this run's failure (exit 3), not the push's.
+cmd_pull_strict_bidirectional() { _bidirectional_tick strict; }
+
+_bidirectional_tick() {
+    local _mode="$1"
     # Cross-machine sync is opt-in — enabled only when a vault URL is configured
     # (--vault-url, sutando.config vault.remote_url, or the legacy
     # SUTANDO_MEMORY_REPO). When none is set, sync is INTENTIONALLY disabled, and
@@ -1575,19 +1583,32 @@ cmd_default_bidirectional() {
     # explicit subcommands (--init / --pull-only / --push-only) keep their loud
     # "run --init first" feedback because the operator asked for them directly.
     if [ -z "$VAULT_URL" ]; then
-        log "cmd_default_bidirectional: no vault URL configured — cross-machine sync disabled; skipping."
+        # Strict callers asked whether the pull ran; a skipped one never did.
+        if [ "$_mode" = "strict" ]; then
+            log "_bidirectional_tick: strict — no vault URL configured, so no pull ran."
+            echo "sync-workspace: STRICT FAILURE — pull leg: cross-machine sync is disabled (no vault URL configured), so peer state was never fetched." >&2
+            return 3
+        fi
+        log "_bidirectional_tick: no vault URL configured — cross-machine sync disabled; skipping."
         echo "sync-workspace: cross-machine sync disabled (no vault URL configured) — skipping." >&2
         return 0
     fi
     acquire_lock
-    _pull_only_impl || true   # pull failures shouldn't block push
     # `|| _rc=$?`, NOT a bare call then `$?`: under `set -e` a non-zero
-    # `_push_only_impl` would exit before the reporter below ever runs.
+    # leg would exit before the reporter below ever runs.
+    local _pull_rc=0
+    _pull_only_impl || _pull_rc=$?
     local _rc=0
     _push_only_impl || _rc=$?
     # Report rather than auto-merge: a union merge loses no line but resurrects
     # an in-place retraction beneath its own correction, where it reads as current.
     _report_unmerged_conflicts || true   # fail-open: never change sync's outcome
+    # Default keeps push semantics: a refused pull must not block a push (a host
+    # whose peer is broken still has to publish its own state).
+    if [ "$_mode" = "strict" ] && [ "$_pull_rc" != "0" ]; then
+        echo "sync-workspace: STRICT FAILURE — pull leg exited $_pull_rc; this view of peer state is NOT current (push leg exited $_rc)." >&2
+        return 3
+    fi
     return "$_rc"
 }
 
@@ -1936,6 +1957,7 @@ case "$cmd" in
     --status|status)                   cmd_status ;;
     --migrate-from-legacy)             cmd_migrate_from_legacy ;;
     --help|-h|help)                    cmd_help ;;
+    --pull-strict|pull-strict)         cmd_pull_strict_bidirectional ;;
     --default|default|'')              cmd_default_bidirectional ;;
     *)
         echo "sync-workspace: unknown subcommand '$cmd'. Try --help." >&2
