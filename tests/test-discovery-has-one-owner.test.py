@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines  # noqa: E402
+from active_code import active_lines, invokes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
@@ -25,6 +25,20 @@ RUNNERS = [REPO / ".github" / "workflows" / "ci.yml",
            REPO / "scripts" / "coverage-gate.sh",
            REPO / "package.json"]
 INLINE_FIND = re.compile(r"\bfind\b.*-name\s+'\*\.test\.py'")
+
+
+
+def _shell_text(runner: Path) -> str:
+    """The SHELL the runner actually executes.
+
+    package.json embeds its script inside a JSON string, so reading the file as
+    text puts the whole pipeline on one JSON line and no command position is
+    visible. Ask each format for its shell rather than pattern-matching bytes.
+    """
+    if runner.name == "package.json":
+        import json
+        return "\n".join(json.loads(runner.read_text()).get("scripts", {}).values())
+    return runner.read_text()
 
 
 class TestDiscoveryHasOneOwner(unittest.TestCase):
@@ -36,19 +50,18 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
         """A substring assertion passes on a COMMENT naming the helper while the
         runner writes an empty file list and exits green — measured, not feared."""
         for r in RUNNERS:
-            active = [ln for ln in active_lines(r.read_text())
+            active = [ln for ln in active_lines(_shell_text(r))
                       if DISCOVER.name in ln]
             self.assertTrue(active,
                             f"{r.name} names {DISCOVER.name} only in a comment (or not at all) — "
                             "a named-but-uncalled helper leaves the runner discovering nothing")
-            self.assertTrue(any(re.search(re.escape(DISCOVER.name) + r".*>", ln)
-                                for ln in active),
+            self.assertTrue(any(invokes(ln, DISCOVER.name) for ln in active),
                             f"{r.name} mentions {DISCOVER.name} outside a comment but never "
-                            f"executes it into an output: {active}")
+                            f"runs it in command position: {active}")
 
     def test_no_runner_reimplements_discovery(self):
         for r in RUNNERS:
-            offenders = [ln.strip() for ln in active_lines(r.read_text())
+            offenders = [ln.strip() for ln in active_lines(_shell_text(r))
                          if INLINE_FIND.search(ln)]
             self.assertEqual(offenders, [],
                              f"{r.name} has its own test-discovery find: {offenders}. "
