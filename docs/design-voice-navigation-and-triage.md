@@ -81,6 +81,32 @@ over the real Discord screenshot to show what would change — the item appears
 where the work already is, carries the freshness line, and takes the same five
 actions.
 
+## Prior art
+
+Three existing things this builds on. None of them is being reimplemented.
+
+**Clicky / HeyClicky** — <https://www.heyclicky.com/>, open-source v1 at
+<https://github.com/farzaa/clicky>. Press a key, say what you are looking for, and
+a marker flies across the screen to it while the app talks you through. Sutando's
+`point_at` is that gesture, and [ADR-0001](adr/0001-pointer-teacher-brain.md)
+records where it deliberately differs: Clicky resolves targets by vision, Sutando
+queries the Accessibility tree first and falls back to vision only when the tree
+is empty, and it asks the vision model for coordinates in the model's own native
+normalized format rather than Clicky's raw-pixel prompt, which measured 23–69 px
+off against 1–3 px.
+
+**VoiceOS** — <https://www.voiceos.com/>, integration docs at
+<https://docs.voiceos.com/integrations>. A voice assistant that lives in the Mac
+notch: the user talks, the agent acts, and results come back as cards rendered in
+the notch. That is the surface shape this proposal adopts, and the demo it was
+drawn from is cited in `skills/notch/SKILL.md`.
+
+**DynamicNotchKit** — <https://github.com/MrKai77/DynamicNotchKit>, by Kai Azim.
+The Swift package that does the notch drawing: custom window, content insets,
+safe areas, and a floating style for Macs without a notch. It is vendored under
+`skills/notch/notch/Vendor/`, and the only change to it is one hook where the host
+app supplies a placement, so upstream holds no policy of ours.
+
 ## What this proposes
 
 One surface, and the parts that decide what goes on it.
