@@ -174,8 +174,6 @@ chain — a Discord selection read first, since the visible label and the real
 `href` often differ; a vision read of the highlighted text if that finds nothing;
 the clipboard only when the owner says they copied something.
 
-![The URL selected in the Discord message.](design-voice-navigation-and-triage-highlight.png)
-
 Asking the owner to copy a link they have already highlighted would hand the work
 back, which is the trip this exists to remove.
 
