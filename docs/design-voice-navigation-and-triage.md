@@ -6,44 +6,66 @@ Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 
 ### Within a task
 
-The thing you need is never where you are.
+Work happens in one place and the thing needed to finish it sits in another. The
+cost is not the reading — it is that reaching the second place costs the first.
 
 ![A Discord message asking for an approve/reject verdict on a drafted post. Its
 only evidence is a link to an outside article.](design-voice-navigation-and-triage-context-gap.png)
 
-A decision is asked for here and cannot be made here. Ruling on the draft means
-reading the article it is built from, which means leaving.
+An agent has drafted a social post and is asking the owner to rule on it:
+`approve — this is the post` / `reject — drop it, I take the next item`. The
+draft's claims come from one linked article, and that article is not in the
+message. Judging the draft means opening a browser, reading, and coming back —
+by which point the message being judged is behind a window, and the comparison
+the decision needs has to be held in memory instead of seen.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
 that URL in the notch."](design-voice-navigation-and-triage-context-closed.png)
 
-Asked by voice, the article arrived beside the message. Nothing abandoned.
+Here the owner asked for the article by voice and it opened in a panel beside the
+message. Draft and source are on screen together, so the judgment is a comparison
+rather than a recollection, and Discord was never left.
 
-### Task triage
+### Across tasks
 
-"What should I do next" is itself work. `sonichi/sutando-life` removes it: one
-proposal at a time, each an authored commitment with a `why`, its premise
-re-verified at scan time by `triage_freshness` against the pull requests it names.
+Between finishing one task and starting the next there is a question — *what
+should I be doing?* — that is itself work, and doing it badly is expensive in a
+way that does not show up anywhere.
 
-It renders on a page of its own, `static/triage.html` — one card out of forty on
-this host, five actions, no board:
+`sonichi/sutando-life` answers it. It collects everything that needs the owner
+across every source, ranks it, and serves **one item at a time**. Each item is a
+proposal the agent commits to carrying out, with a `why`, so approving or
+rejecting it means something specific. Before an item is shown, `triage_freshness`
+re-checks the pull requests it names, because a question's body ages while the
+work it describes moves on.
+
+That queue renders on a page of its own, `static/triage.html` — forty items deep
+on this host, shown one card at a time with five actions and no list to scan:
 
 > Everything that needs your call, from every source, one at a time in rank
 > order. Approve, reject, or reply, then move on. Your decisions are recorded for
 > the agent to act on; nothing here reorders itself by what you pick.
 
-A good page, and a page. One-at-a-time means **the trip is paid per item.**
+It is a well-made page, and it is a page: answering any item means going to it
+and leaving whatever was in front of you. Because the queue is deliberately
+one-at-a-time, that trip is not paid once per session — **it is paid once per
+item.**
 
-And not one queue: pending questions reach that page, post verdicts reach
-Discord, `#4003` adds the web client. The verdict above is in none of the others.
+The verdict in the figures above never reaches this queue at all. Pending
+questions go to sutando-life's page, drafted-post verdicts go to Discord, and
+`#4003` is adding a third destination in the web client. Same decision shape,
+three producers, no shared queue.
 
 ![Mockup: the same Discord channel, with a triage card for the post verdict
 rendered as a notch panel — proposition, source, a freshness line, and Approve /
 Reject / Reply / Next / Dismiss.](design-voice-navigation-and-triage-triage-on-notch.png)
 
-Mockup, not a capture — that item is in no queue today. Same card, where the work
-already is.
+This last figure is drawn, not captured — the item in it exists in no queue
+today, since post verdicts are not routed into triage. It is the triage page's
+own card markup placed over the real Discord screenshot, to show what changes:
+the item arrives where the work already is, carrying the freshness line that
+makes it checkable, answered by the same five actions.
 
 ## What this proposes
 
