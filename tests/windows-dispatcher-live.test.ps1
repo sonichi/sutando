@@ -1,12 +1,13 @@
 #!/usr/bin/env pwsh
-# Real Windows integration path with a deterministic Claude shim:
-# FileSystemWatcher -> atomic claim -> owner result -> archive -> tier refusal.
+# Real Windows integration path with deterministic Claude and Codex shims:
+# FileSystemWatcher -> atomic claim -> owner result -> archive -> sandbox routing.
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$workspace = Join-Path $env:TEMP "sutando-dispatcher-live-$PID"
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+$workspace = Join-Path $tempRoot ('sutando-dispatcher-live-' + [guid]::NewGuid().ToString('N'))
 $shimDir = Join-Path $workspace 'bin'
 $errorModeFile = Join-Path $workspace 'fake-error-mode'
 $staleModeFile = Join-Path $workspace 'fake-stale-once'
@@ -15,6 +16,7 @@ $dispatcherPid = 0
 $oldPath = $env:PATH
 $oldTestMode = $env:SUTANDO_TEST_MODE
 $oldWorkspace = $env:SUTANDO_WORKSPACE
+$oldConfigRoot = $env:CLAUDE_CONFIG_DIR
 
 function Stop-ProcessTree([int]$rootPid) {
     $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
@@ -102,6 +104,8 @@ exit 0
     $env:PATH = "$shimDir;$pwshDir;$pythonDir;$env:SystemRoot\System32"
     $env:SUTANDO_TEST_MODE = '1'
     $env:SUTANDO_WORKSPACE = $workspace
+    $env:CLAUDE_CONFIG_DIR = Join-Path $workspace 'config'
+    New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
     $env:SUTANDO_FAKE_ERROR_FILE = $errorModeFile
     $env:SUTANDO_FAKE_STALE_FILE = $staleModeFile
     $env:SUTANDO_FAKE_CODEX_FILE = $codexModeFile
@@ -159,13 +163,13 @@ exit 0
     }
     Remove-Item $codexModeFile
 
-    $collaboratorId = "task-windows-collaborator-$PID"
-    Write-Task $collaboratorId 'Return the collaborator integration marker.' 'team' -Collaborator
+    $collaboratorId = "task-windows-unsigned-collaborator-$PID"
+    Write-Task $collaboratorId 'Return the unsigned collaborator integration marker.' 'team' -Collaborator
     $collaboratorResult = Join-Path $workspace "results\$collaboratorId.txt"
     Wait-ForPath $collaboratorResult
     $collaboratorBody = (Get-Content $collaboratorResult -Raw).Trim()
     if ($collaboratorBody -ne 'WINDOWS_SANDBOX_OK') {
-        throw "collaborator did not use the sandbox path: $collaboratorBody"
+        throw "unsigned collaborator did not use the sandbox path: $collaboratorBody"
     }
 
     New-Item -ItemType File -Path $errorModeFile | Out-Null
@@ -189,7 +193,7 @@ exit 0
         non_owner_result = $nonOwnerBody
         non_owner_archived = (Test-Path $nonOwnerArchive)
         sandbox_failure = $sandboxFailureBody
-        collaborator_result = $collaboratorBody
+        unsigned_collaborator_result = $collaboratorBody
         structured_error = $errorBody
         error_archived = (Test-Path $errorArchive)
     } | ConvertTo-Json -Compress
@@ -200,14 +204,20 @@ exit 0
     $env:PATH = $oldPath
     $env:SUTANDO_TEST_MODE = $oldTestMode
     $env:SUTANDO_WORKSPACE = $oldWorkspace
+    $env:CLAUDE_CONFIG_DIR = $oldConfigRoot
     Remove-Item Env:SUTANDO_FAKE_ERROR_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_STALE_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_CODEX_FILE -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
-    if (Test-Path $workspace) {
+    if (Test-Path -LiteralPath $workspace) {
+        $resolved = (Resolve-Path -LiteralPath $workspace).Path
+        if (-not $resolved.StartsWith($tempRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $resolved.Equals([IO.Path]::GetFullPath($workspace), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing cleanup outside the exact test workspace under TEMP.'
+        }
         for ($attempt = 0; $attempt -lt 10; $attempt++) {
             try {
-                Remove-Item -Recurse -Force $workspace -ErrorAction Stop
+                Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
                 break
             } catch {
                 if ($attempt -eq 9) { throw }

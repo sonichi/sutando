@@ -2,7 +2,7 @@ name: Windows runtime
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
+    branches: [main, staging-interaction-planes, support-windows-11]
   push:
     branches: [main, staging-interaction-planes]
 
@@ -133,6 +133,16 @@ jobs:
       - name: Run dispatcher owner/non-owner live integration
         shell: pwsh
         run: pwsh -NoProfile -File tests/windows-dispatcher-live.test.ps1
+
+      - name: Verify Discord collaborator dispatch and authorization
+        shell: pwsh
+        run: |
+          python tests/discord-access.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'discord-access.test.py failed' }
+          pwsh -NoProfile -File tests/windows-discord-python.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-discord-python.test.ps1 failed' }
+          pwsh -NoProfile -File tests/windows-dispatcher-collaborator.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-dispatcher-collaborator.test.ps1 failed' }
 
       - name: Run Windows process and lock regressions
         shell: pwsh

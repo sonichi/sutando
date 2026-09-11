@@ -66,6 +66,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
+- **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
 - **`discord_context_policy.py`** — Alias of `policy.context.discord` (phase-1a restructure); one transition window.
