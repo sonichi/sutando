@@ -85,12 +85,23 @@ class TestOrphanCheckExemption(unittest.TestCase):
     def test_step_3a_rules_are_stated(self):
         self.assertIn("Step 3a", self.text)
         for needle in ("channel_id: onboarding-wizard", "data/claude-import/status.json",
-                       "IMPORT-RESUME", "1800 s", "never archive it"):
+                       "IMPORT-RESUME", "IMPORT-STALLED", "1800 s", "3600 s", "never archive it",
+                       "`/import-claude-context` as a standalone token",
+                       "A path or a bare skill-name mention is **not** an intent",
+                       "`done`, `staged`, `discarded`, `forgot`"):
             self.assertIn(needle, self.text, needle)
+        for sentence in ("import my Claude history", "import my Claude Code history",
+                         "read my Claude Code sessions", "bring my Claude context along"):
+            self.assertIn(f'"{sentence}"', self.text, sentence)
 
-    def test_summary_counts_the_new_verdict(self):
+    def test_never_orphan_window_is_named(self):
+        self.assertIn("here is the window", self.text)
+        self.assertIn("`indexed` write onward", self.text)
+
+    def test_summary_counts_the_new_verdicts(self):
         self.assertIn("import-resume): I", self.text)
-        self.assertIn("M+K+I+J", self.text)
+        self.assertIn("import-stalled): S", self.text)
+        self.assertIn("M+K+I+S+J", self.text)
 
 
 if __name__ == "__main__":

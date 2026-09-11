@@ -15,14 +15,31 @@ step 3 (archive moves, the aggregated DM) from the verdicts printed here.
 Verdicts (first match wins):
   done            a completion marker exists — results/<id>.txt (live or
                   archived) or results/proactive-<id>.txt[.sending];
-                  for an import task, also status.json phase `done` from a
-                  run that started after the task was queued.
-  import-resume   an import task whose run has started (status.json newer
-                  than the task) but has not finished: left in tasks/ for the
-                  watcher's sweep, never archived, whatever its age.
+                  for an import task, also status.json at a TERMINAL phase
+                  (`done`, `staged`, `discarded`, `forgot`) from a run that
+                  started after the task was queued — the run reached its
+                  end; a staged digest waits on an owner reply, which
+                  arrives as a new task.
+  import-stalled  an import task whose run has started (status.json newer
+                  than the task), is at a resumable phase, but whose
+                  status.json has not moved for IMPORT_STALL_S (3600 s):
+                  left in tasks/ (the watcher's sweep still resumes it) but
+                  reported, so step 3 lists it in the recovery DM.
+  import-resume   an import task whose run has started, is at a resumable
+                  phase and moved within the stall bound: left in tasks/
+                  for the watcher's sweep, never archived, whatever its age.
   fresh           younger than the age line — 300 s for any task, 1800 s for
                   an import task that has not started yet.
   orphan          no marker and past the age line: step 3 applies.
+
+An *import task* is an owner-tier task that carries a run INTENT: the legacy
+desktop header `channel_id: onboarding-wizard`, the slash command
+`/import-claude-context` as a standalone token, or one of the documented
+trigger sentences ("import my Claude history", "import my Claude Code
+history", "read my Claude Code sessions", "bring my Claude context along",
+case-insensitive). A path or a bare skill-name mention ("… touches
+skills/import-claude-context/SKILL.md") is NOT one — review 4177: the bare
+substring parked unrelated owner tasks forever.
 
 Age comes from the immutable `timestamp:` header, then the epoch-ms in the
 id, and only then the file mtime (mtime resets on rsync / checkout / sync).
@@ -52,9 +69,28 @@ import local_task_protocol as ltp  # noqa: E402
 
 FRESH_AGE_S = 300
 IMPORT_FRESH_AGE_S = 1800
+# A started import whose status.json has not moved for this long is reported
+# as stalled (precedent: schedule-crons `active_stale_minutes`, default 60).
+IMPORT_STALL_S = 3600
 IMPORT_CHANNEL = "onboarding-wizard"
-IMPORT_SKILL = "import-claude-context"
 IMPORT_STATUS = ("data", "claude-import", "status.json")
+# Every phase skills/import-claude-context/scripts write_status() with; the test pins the
+# union against those scripts, so a new writer phase fails until it is placed on a side.
+IMPORT_TERMINAL_PHASES = frozenset({"done", "staged", "discarded", "forgot"})
+IMPORT_RESUMABLE_PHASES = frozenset({"indexed", "extracted", "summarizing", "rolling-up"})
+# skills/import-claude-context/SKILL.md's trigger sentences (case-insensitive, any whitespace
+# between words) and the slash command as a standalone token (never inside a path).
+IMPORT_TRIGGER_SENTENCES = (
+    "import my Claude history",
+    "import my Claude Code history",
+    "read my Claude Code sessions",
+    "bring my Claude context along",
+)
+_IMPORT_INTENT_RE = re.compile(
+    "|".join([r"(?<![\w/.\-])/import-claude-context(?![\w/\-])"]
+             + [r"\s+".join(re.escape(w) for w in s.split()) for s in IMPORT_TRIGGER_SENTENCES]),
+    re.IGNORECASE,
+)
 _EPOCH_MS_RE = re.compile(r"(\d{13})$")
 
 
@@ -89,16 +125,21 @@ def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]
         return 0.0, "mtime"
 
 
-def is_import_task(headers: dict, body: str) -> bool:
-    """The legacy desktop writer names the wizard channel; a hand-queued owner
-    task names the skill. Only owner-tier tasks qualify — the import is an
-    owner-only skill, so a non-owner body naming it earns no exemption."""
+def import_intent(headers: dict, body: str) -> str:
+    """The run intent this task carries, or '' when it is not an import task:
+    'channel' for the legacy desktop writer's `channel_id: onboarding-wizard`,
+    else the matched slash command / trigger sentence. Only owner-tier tasks
+    qualify — the import is an owner-only skill, so a non-owner body carrying
+    the sentence earns no exemption. A path or bare skill-name mention is not
+    an intent: an owner review task quoting `skills/import-claude-context/…`
+    must classify like any other task (orphan at 5 min), not be parked."""
     tier = ltp.canonical_access_tier(headers.get("access_tier") or "owner")
     if tier != "owner":
-        return False
+        return ""
     if (headers.get("channel_id") or "").strip() == IMPORT_CHANNEL:
-        return True
-    return IMPORT_SKILL in body
+        return "channel"
+    m = _IMPORT_INTENT_RE.search(body)
+    return " ".join(m.group(0).split()) if m else ""
 
 
 def import_status(workspace: Path) -> tuple[str, float | None]:
@@ -164,19 +205,33 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
         return row
 
-    if is_import_task(headers, parsed.body):
+    intent = import_intent(headers, parsed.body)
+    if intent:
         row["import"] = True
+        row["import_intent"] = intent
         phase, updated = import_status(workspace)
         started = updated is not None and updated >= queued_at
-        if started and phase == "done":
+        if started:
+            idle_s = max(0, int(now - updated))
+            row["import_phase"] = phase or "unknown"
+            row["import_idle_s"] = idle_s
+        if started and phase in IMPORT_TERMINAL_PHASES:
             row.update(verdict="done",
-                       reason="import landed: data/claude-import/status.json phase done, "
-                              "written after this task was queued")
+                       reason=f"import run ended: data/claude-import/status.json phase {phase} "
+                              "(terminal), written after this task was queued")
+            return row
+        if started and idle_s >= IMPORT_STALL_S:
+            row.update(verdict="import-stalled",
+                       reason=f"consented import started but stalled at phase {phase or 'unknown'}: "
+                              f"status.json last moved {idle_s}s ago (>= {IMPORT_STALL_S}s); "
+                              "left in tasks/ so the watcher's sweep can resume it, never archived — "
+                              "list it in the recovery DM")
             return row
         if started:
             row.update(verdict="import-resume",
-                       reason=f"consented import already started (phase {phase or 'unknown'}); "
-                              "resumable — left in tasks/ for the watcher's sweep, never archived")
+                       reason=f"consented import already started (phase {phase or 'unknown'}, "
+                              f"moved {idle_s}s ago); resumable — left in tasks/ for the "
+                              "watcher's sweep, never archived")
             return row
         if age_s < IMPORT_FRESH_AGE_S:
             row.update(verdict="fresh",
