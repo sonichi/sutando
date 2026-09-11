@@ -18,7 +18,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
 RUNNERS = [REPO / ".github" / "workflows" / "ci.yml",
-           REPO / "scripts" / "coverage-gate.sh"]
+           REPO / "scripts" / "coverage-gate.sh",
+           REPO / "package.json"]
 INLINE_FIND = re.compile(r"^[^#]*\bfind\b[^#\n]*-name\s+'\*\.test\.py'")
 
 
@@ -87,6 +88,27 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
         body = DISCOVER.read_text()
         self.assertNotIn("grep", body.split("find")[0],
                          "the helper should RUN find, not derive roots from text")
+
+
+class TestAdjacentGuardDefects(unittest.TestCase):
+    """Two false-greens keweichen measured in the guard itself, as fixtures."""
+
+    def test_a_commented_invocation_is_not_an_active_caller(self):
+        import importlib.util as _i
+        s = _i.spec_from_file_location("g", REPO / "tests" / "ci-covers-every-python-test.test.py")
+        m = _i.module_from_spec(s)
+        try:
+            s.loader.exec_module(m)
+        except SystemExit:
+            pass
+        got = m._uncommented("      # python3 packages/x/test_dead.py\n      - run: python3 real/thing.py\n")
+        self.assertNotIn("test_dead", got, "a commented-out invocation still reads as a caller")
+        self.assertIn("real/thing.py", got, "the active invocation was stripped too")
+
+    def test_a_path_with_a_space_is_one_path(self):
+        out = "tests/space name.test.py\ntests/ok.test.py\n"
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertEqual(len(out.split()), 3, "whitespace splitting makes 3 fake paths from 2 real ones")
 
 
 if __name__ == "__main__":
