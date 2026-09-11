@@ -3626,14 +3626,28 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
+# Where a finisher writes its done-flag: pool workers under state/workers/<id>/
+# (src/pool_delivery.done_flag), pre-pool cores under state/cores/<id>/.
+_DONE_FLAG_ROOTS = ("workers", "cores")
+
+
 def _worker_of(task_id: str) -> str:
-    """Which pool worker finished this task, read from the per-core done-flag.
+    """Which worker finished this task, read from its own done-flag.
     `task_id` is the result stem, which already carries the `task-` prefix."""
+    hits = []
     try:
-        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
+        for root in _DONE_FLAG_ROOTS:
+            hits.extend((_STATE / root).glob(f"*/done/{task_id}.flag"))
     except OSError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    if len(hits) == 1:
+        return hits[0].parent.parent.name
+    if hits:
+        # Two finishers claim the same task: stamping either one would assert an
+        # attribution the state tree does not support.
+        names = ", ".join(sorted(h.parent.parent.name for h in hits))
+        _log(f"result {task_id}: ambiguous done flags ({names}) — not stamping a worker")
+    return ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
