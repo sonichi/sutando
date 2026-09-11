@@ -204,6 +204,81 @@ def test_a_non_dict_workers_value_is_ignored():
         print("PASS test_a_non_dict_workers_value_is_ignored")
 
 
+class _ReadRaises:
+    """A stand-in for the advertisement path whose read fails the way a
+    parser does: the exception the loop must survive is not an OSError."""
+    name = "pool-advertisement.json"
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def stat(self):
+        return os.stat_result((0o100644, 0, 0, 1, 0, 0, 64, 0, 0, 0))
+
+    def read_text(self):
+        raise self._exc
+
+
+def test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll():
+    """The reviewer's input: a record carrying both maps plus an unknown
+    1,000-deep array. Older json decoders raise RecursionError on it, and the
+    read runs in the loop BEFORE the task poll, where an escaping exception
+    backs off and retries the same file forever. Whether or not this
+    interpreter's decoder is the recursive one, the read must not raise and
+    the unknown key must change nothing; the injected RecursionError then pins
+    the UNAVAILABLE path on every interpreter."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        calls = _capture(m)
+        rec = _record(1)
+        deep = json.dumps(rec)[:-1] + ', "junk": ' + "[" * 1000 + "]" * 1000 + "}"
+        _write_raw(m, deep)
+        _, ad = m._read_pool_advertisement()  # must not raise
+        pushed = m._maybe_push_workers_snapshot()
+        assert m._maybe_push_agent_profile() is pushed
+        if ad is None:
+            assert calls == [], "UNAVAILABLE pushes nothing"
+        else:
+            assert calls[0][2] == rec["workers"], "the unknown key ships nothing"
+        n = len(calls)
+
+        real_path = m._POOL_ADVERTISEMENT_FILE
+        m._POOL_ADVERTISEMENT_FILE = _ReadRaises(RecursionError("maximum recursion depth exceeded"))
+        assert m._read_pool_advertisement() == (0.0, None), "the UNAVAILABLE sentinel"
+        assert m._maybe_push_workers_snapshot() is False
+        assert m._maybe_push_agent_profile() is False
+        assert len(calls) == n, "a parser failure issues no request"
+
+        m._POOL_ADVERTISEMENT_FILE = real_path
+        rec = _record(2)
+        rec["profile_workers"][W1]["label"] = "after"
+        _advertise(m, rec, age=5)
+        assert m._maybe_push_workers_snapshot() is True, "positive control"
+        assert m._maybe_push_agent_profile() is True
+        assert calls[-1][2]["workers"][W1]["label"] == "after"
+        print("PASS test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll")
+
+
+def test_an_oversized_record_is_unavailable_before_it_is_parsed():
+    """The record is bounded by size before the parse: a runaway file is
+    UNAVAILABLE at the stat, not a full read-and-decode on every loop pass."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        calls = _capture(m)
+        rec = _record(1)
+        rec["pad"] = "x" * m._POOL_ADVERTISEMENT_MAX_BYTES
+        _advertise(m, rec)
+        assert m._read_pool_advertisement() == (0.0, None)
+        assert m._maybe_push_workers_snapshot() is False
+        assert m._maybe_push_agent_profile() is False
+        assert calls == [], "an oversized record pushes nothing"
+
+        _advertise(m, _record(2), age=5)
+        assert m._maybe_push_workers_snapshot() is True, "positive control"
+        assert m._maybe_push_agent_profile() is True
+        print("PASS test_an_oversized_record_is_unavailable_before_it_is_parsed")
+
+
 def test_a_later_mtime_repushes_both():
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
@@ -328,6 +403,8 @@ if __name__ == "__main__":
     test_a_valid_empty_map_is_an_intentional_clear_and_ships()
     test_a_file_without_the_keys_pushes_nothing_extra()
     test_a_non_dict_workers_value_is_ignored()
+    test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll()
+    test_an_oversized_record_is_unavailable_before_it_is_parsed()
     test_a_later_mtime_repushes_both()
     test_mtime_alone_repushes_the_card()
     test_a_server_error_takes_the_short_retry_not_the_hour()

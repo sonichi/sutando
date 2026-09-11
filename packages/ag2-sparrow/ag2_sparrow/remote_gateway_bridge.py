@@ -2423,6 +2423,9 @@ def _read_core_status() -> tuple[str | None, str | None]:
 
 
 _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
+# A roster row is ~100 bytes, so this is >10k workers; past it the loop would
+# re-read and re-parse a runaway file every pass before it can poll for tasks.
+_POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_push_mtime = 0.0
 _workers_push_retry_at = 0.0
 _advertisement_unavailable_logged = False
@@ -2444,12 +2447,19 @@ def _read_pool_advertisement() -> "tuple[float, dict | None]":
     with no `workers`, and the broker REPLACES that document.
 
     Both halves are validated from this one read so a one-sided record cannot
-    POST a status map whose labels never ship. This runs in the task loop and
-    may never raise."""
+    POST a status map whose labels never ship. This runs in the task loop
+    BEFORE the /v1/tasks poll and may never raise: the outer handler backs off
+    and retries the same file, so any exception here — a RecursionError from a
+    deeply nested value, not only OSError/ValueError — would stall intake for
+    as long as that file stays. The size is bounded before the parse so a
+    runaway file cannot cost the loop a full read per pass either."""
     try:
-        mtime = _POOL_ADVERTISEMENT_FILE.stat().st_mtime
+        st = _POOL_ADVERTISEMENT_FILE.stat()
+        if st.st_size > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return (0.0, None)
+        mtime = st.st_mtime
         rec = json.loads(_POOL_ADVERTISEMENT_FILE.read_text())
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
         return (0.0, None)
     if not isinstance(rec, dict):
         return (0.0, None)
