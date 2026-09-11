@@ -13,8 +13,12 @@ guard -- had never run in CI.
 import glob
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from active_code import active_lines, active_text, unquoted  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
@@ -34,15 +38,47 @@ def discovered_by_find():
                          capture_output=True, text=True)
     if out.returncode != 0:
         raise AssertionError(f"{DISCOVER.name} failed rc={out.returncode}: {out.stderr.strip()}")
-    return {p for p in out.stdout.split() if p and "node_modules" not in p}
+    # splitlines, not split: a path containing a space becomes two fake paths
+    # under whitespace splitting, and both then read as undiscovered.
+    return {p for p in out.stdout.splitlines() if p and "node_modules" not in p}
+
+
+def _uncommented(text: str) -> str:
+    """Lines with comments removed. A commented-out invocation is not a caller."""
+    return active_text(text)
+
+
+def _run_bodies(text: str) -> list[str]:
+    """Lines inside a workflow `run:` value — the only place a command executes.
+
+    A path under `name:` or `if:` is data; scanning the whole file counts it."""
+    out, indent = [], None
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        m = re.match(r"-?\s*run:\s*\|?-?\s*(.*)$", stripped)
+        if m and re.search(r"(^|\s)run:", stripped):
+            indent = len(ln) - len(ln.lstrip())
+            if m.group(1):
+                out.append(m.group(1))
+            continue
+        if indent is not None:
+            if stripped and (len(ln) - len(ln.lstrip())) <= indent:
+                indent = None
+            else:
+                out.append(ln)
+    return out
 
 
 def named_in_workflows():
-    """Files any workflow invokes explicitly, e.g. `python3 path/to/x.py`."""
+    """Files any workflow ACTIVELY invokes, e.g. `python3 path/to/x.py`.
+
+    Quoted text is blanked first: `echo 'python3 x.py'` names x.py without
+    running it, and counting it masks a genuinely orphaned test."""
     named = set()
     for wf in (REPO / ".github" / "workflows").glob("*.yml"):
-        for m in re.finditer(r"python3?\s+(\S+\.py)", wf.read_text()):
-            named.add(m.group(1))
+        for ln in active_lines("\n".join(_run_bodies(wf.read_text()))):
+            for m in re.finditer(r"python3?\s+(\S+\.py)", unquoted(ln)):
+                named.add(m.group(1))
     return named
 
 
