@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import local_task_protocol as ltp  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
 
@@ -80,10 +81,14 @@ def classify(workspace, task: dict) -> tuple[int, list]:
     return TAKE, targets
 
 
+def _ws(workspace) -> Path:
+    return Path(workspace) if workspace is not None else resolve_workspace()
+
+
 def _log(workspace, line: str) -> None:
     """The watcher keeps only the exit code; the reason has to be kept here."""
     try:
-        d = pr._root(workspace) / "logs"
+        d = _ws(workspace) / "logs"
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "pool-route-handler.log", "a", encoding="utf-8") as fh:
             fh.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + line.rstrip() + "\n")
@@ -124,7 +129,7 @@ def main(argv=None) -> int:
 
 
 def retry_dir(workspace) -> Path:
-    return pr._root(workspace) / "state" / "pool-route-retry"
+    return _ws(workspace) / "state" / "pool-route-retry"
 
 
 def _defer(ws, task_id: str, reason: str) -> int:
@@ -165,7 +170,7 @@ def retry_pass(ws) -> dict:
     outcome = {"delivered": [], "still_deferred": [], "gone": []}
     d = retry_dir(ws)
     for marker in sorted(d.iterdir()) if d.is_dir() else []:
-        payload = pr._root(ws) / "tasks" / f"{marker.name}.txt"
+        payload = _ws(ws) / "tasks" / f"{marker.name}.txt"
         if not payload.is_file():
             marker.unlink()
             outcome["gone"].append(marker.name)
