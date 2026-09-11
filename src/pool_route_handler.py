@@ -39,27 +39,23 @@ import pool_router as rt  # noqa: E402
 DECLINE = 3
 TAKE = 0
 
+# Every one of these selects a recipient, so every one is header-only.
+ROUTING_KEYS = ("id", "channel_id", "source", "access_tier", "requested_worker")
+
 
 def read_task(task_file: str) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
-    `requested_worker` is read only from ABOVE `task:`, so a body cannot forge
-    it. `channel_id`/`source` are read leniently: the gateway stamps them
-    below `task:`, where the strict parse never looks.
+    Every field here selects a recipient, so every field comes from the STRICT
+    parse: `task:` is the last header and nothing below it is a header.
     """
     text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    headers = ltp.parse_task_headers(text).headers
     task: dict = {"id": Path(task_file).stem}
-    for line in text.splitlines():
-        if line.startswith("task:"):
-            break
-        key, _, value = line.partition(":")
-        if _ and key.strip() in ("id", "channel_id", "source", "requested_worker"):
-            task[key.strip()] = value.strip()
-    if not task.get("channel_id") or not task.get("source"):
-        lenient = ltp.parse_task_headers_lenient(text).headers
-        for k in ("channel_id", "source"):
-            if not task.get(k) and lenient.get(k):
-                task[k] = str(lenient.get(k)).strip()
+    for key in ROUTING_KEYS:
+        value = headers.get(key)
+        if value:
+            task[key] = str(value).strip()
     return task
 
 
@@ -123,6 +119,9 @@ def main(argv=None) -> int:
         return code
     _log(ws, f"{task.get('id')}: run classify={code} targets={_targets}")
     if code == DECLINE:
+        if not task.get("channel_id"):
+            _log(ws, f"{task.get('id')}: no channel_id header — the core takes it; "
+                     "routing metadata is never read from a task body")
         return DECLINE
 
     return _deliver(ws, task)
