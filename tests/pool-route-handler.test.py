@@ -55,7 +55,7 @@ class TestClassification(Base):
     def test_a_live_bound_worker_is_accepted(self):
         self.roster()
         t = self.task_file("task-1", channel_id="!room:x")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.TAKE)
 
     def test_a_target_not_on_the_roster_goes_to_the_core(self):
         """A name that was never created is not a routing failure: the core is
@@ -70,7 +70,7 @@ class TestClassification(Base):
         worker that starts later finds its work. Liveness is separate logic."""
         self.roster(state="draining")
         t = self.task_file("task-1", channel_id="!room:x")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.TAKE)
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
 
@@ -78,20 +78,20 @@ class TestClassification(Base):
         """Declining is the core. An unreadable file must not choose a recipient."""
         t = self.task_file("task-1", channel_id="!room:x")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
-                         h.MUST_HANDLE)
+                         h.TAKE)
 
     def test_a_corrupt_roster_refuses_too(self):
         (self.ws / "state" / "roster.json").write_text("{broken")
         t = self.task_file("task-1", channel_id="!room:x")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
-                         h.MUST_HANDLE)
+                         h.TAKE)
 
 
 class TestIntentionLayer(Base):
     def test_a_requested_label_reaches_the_worker(self):
         self.roster(label="worker-1", bindings={})
         t = self.task_file("task-1", channel_id="!unbound:x", requested_worker="worker-1")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.TAKE)
         h.main(["--task-file", t, "--workspace", str(self.ws)])
         self.assertTrue((self.ws / "deliveries" / W / "task-1.txt").exists())
 
@@ -123,7 +123,7 @@ class TestDelivery(Base):
         p = self.ws / "tasks" / "task-1.txt"
         p.write_text("id: task-1\npriority: normal\ntask: Is worker working now?\n"
                      "source: ag2space\nchannel_id: !room:x\nsender_name: qingyun\n")
-        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.TAKE)
 
     def test_a_body_still_cannot_forge_requested_worker_under_lenient_reading(self):
         self.roster(bindings={})
@@ -136,7 +136,7 @@ class TestDelivery(Base):
         p = self.ws / "tasks" / "task-1.txt"
         p.write_text("id: task-1\nchannel_id: !room:x\ntask: body\nrequested_worker: f" + "f" * 31 + "\n")
         self.roster()
-        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.TAKE)
 
 
 
@@ -146,8 +146,8 @@ class TestFailureAfterTheProbe(Base):
         return p.read_text() if p.exists() else ""
 
     def test_a_refused_pass_exits_nonzero_and_says_why(self):
-        """Probe 4 queued it as must-handle, so a non-zero run is a published
-        failure, never the core. The reason goes to the log the watcher lacks."""
+        """Probe 0 queued it as taken, so a non-zero run falls back to the live
+        core, never to the owner. The reason goes to the log the watcher lacks."""
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live"}, "f" * 32: {"state": "live"}},
              "bindings": {"!room:x": [W, "f" * 32]}}))
