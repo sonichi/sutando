@@ -11,8 +11,8 @@ Two tools, invoked by path; neither is a boot dependency of the core.
 **Why the preflight exists, and why it is a script rather than a reminder.** Consulting the review
 criteria used to rely on memory, so it was skipped exactly where it felt safe to skip -- small diffs
 -- and a readiness verdict with the criteria unread is an over-claim rather than a fast review. The
-owner caught that same miss more than once (2026-07-24 "did you use the review skill?"; earlier on
-\#2177/\#2180 "did you follow the reviewer's guide?"). Successive "be more careful" fixes did not hold,
+owner caught that same miss more than once and asked directly whether the review skill had been
+used. Successive "be more careful" fixes did not hold,
 because the failure is not inattention: a reviewer who believes the diff is small has no prompt to
 re-read anything. Printing the criteria and the PR's live gate state is what makes the step
 unskippable, so the guarantee is structural rather than disciplinary.
