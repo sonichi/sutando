@@ -86,23 +86,6 @@ Its first two consumers are the two ends of a task: **navigation** while working
 set and ordering and this RFC assumes them. **A second place, not a second
 model.**
 
-## Motivating failures (observed 2026-09-11)
-
-From building the surface. Each names an invariant it now holds.
-
-| # | What happened | Invariant |
-|---|---|---|
-| 1 | Placement chose the densest text on screen. `CGWindowListCreateImage` without a Screen Recording grant returns the wallpaper and the caller's own windows — no error, no empty result. It scored a photo of a lake. | Fail loudly when blind. |
-| 2 | That grant reset on every rebuild: ad-hoc signing makes the binary's identity a hash of its own contents. The setting showed enabled while the process saw `false`. | Sign with a stable identity. |
-| 3 | The panel was half the screen and captured mouse events across all of it. "Find an empty spot" is unanswerable for a box that size. | The surface is the size of its content. |
-| 4 | The card dismissed itself mid-read on a 5 s timer. | Never retract what the owner did not dismiss. |
-| 5 | Placement was computed once at window-build time, stale by the first app switch. | Keep asking where attention is. |
-
-Failure 1 is checkable: replaying the same scoring offline against a screenshot
-of that moment ranks `bottom-right 2.51` best and `top-left 8.13` worst, and it
-chose top-left live. The algorithm was right; the input was wrong. Failures 1
-and 2 are one shape — **a silent fallback that looks like a working answer.**
-
 ## Model
 
 ### Placement
@@ -128,7 +111,19 @@ wallpaper makes almost none.
 
 It recomputes on `NSWorkspace.didActivateApplicationNotification`, 250 ms late
 because the new app's windows are not on screen at the instant it fires. **A
-panel the owner has dragged is never moved again for that card.**
+panel the owner has dragged is never moved again for that card**, and a card is
+never retracted on a timer — only the owner dismisses it.
+
+Two properties of the sensors, each learned the hard way:
+
+- **Fail loudly when blind.** `CGWindowListCreateImage` without a Screen
+  Recording grant returns the wallpaper and the caller's own windows — no error,
+  no empty result — so the score is computed over a desktop photo and looks
+  fine. `CGPreflightScreenCaptureAccess()` is checked at startup and warns.
+- **Sign with a stable identity.** Ad-hoc signing makes the binary's identity a
+  hash of its own contents, so every rebuild silently drops that grant.
+  `build.sh` reads `NOTCH_SIGN_IDENTITY` / `NOTCH_SIGN_KEYCHAIN`; unset falls
+  back to ad-hoc with the consequence documented rather than rediscovered.
 
 ### The triage card
 
