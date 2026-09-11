@@ -16,6 +16,7 @@ Run: python3 tests/spawn-worker-runtime-and-sentinel.test.py
 """
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -23,8 +24,12 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
-import spawn_worker as sw  # noqa: E402
+
+# From its path, not off sys.path: the module bootstraps src/ itself for
+# exactly this caller, and pre-inserting it would leave that unrun.
+_spec = importlib.util.spec_from_file_location("spawn_worker", REPO / "src" / "spawn_worker.py")
+sw = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sw)
 
 
 class Runner:

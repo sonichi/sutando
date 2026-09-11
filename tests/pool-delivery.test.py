@@ -567,6 +567,11 @@ class TestPayloadVerb(Base):
     def test_a_name_that_is_not_a_sentinel_is_refused(self):
         self.assertEqual(self.run_main("payload", "--sentinel", "task-7")[0], 1)
 
+    def test_payload_with_neither_selector_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_main("payload")
+        self.assertEqual(e.exception.code, 2)
+
     def test_a_sentinel_with_no_payload_is_refused_not_invented(self):
         self.assertEqual(self.run_main("payload", "--sentinel", "task-9.txt")[0], 1)
 

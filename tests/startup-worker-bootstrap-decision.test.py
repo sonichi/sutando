@@ -12,6 +12,8 @@ Run: python3 tests/startup-worker-bootstrap-decision.test.py
 """
 from __future__ import annotations
 
+import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,10 +22,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 GATE = REPO / "skills" / "startup" / "scripts" / "worker-bootstrap.py"
-sys.path.insert(0, str(GATE.parent))
-sys.path.insert(0, str(REPO / "src"))
-import importlib.util  # noqa: E402
 
+# As a caller outside src/ loads it: its own sys.path bootstrap is part of
+# the module, and pre-inserting src/ would leave that unrun.
 _spec = importlib.util.spec_from_file_location("worker_bootstrap", GATE)
 wb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wb)
@@ -75,6 +76,35 @@ class TestInstanceScoped(Base):
         self.assertNotEqual(self.sentinel(WORKER), self.sentinel(None))
 
 
+class TestPidLiveness(Base):
+    """The real `_pid_alive`, not the injected one: every other test hands
+    `decide` a fake, so the shipped liveness check would go unexercised."""
+    def test_this_process_is_alive(self):
+        self.assertTrue(wb._pid_alive(os.getpid()))
+
+    def test_a_reaped_child_is_not(self):
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertFalse(wb._pid_alive(p.pid))
+
+    def test_a_pid_this_user_cannot_signal_still_exists(self):
+        """PermissionError means "it is there and not mine" — the opposite of
+        gone. Injected: a host where pid 1 IS signalable would prove nothing."""
+        self.assertTrue(self._kill_raising(PermissionError))
+
+    def test_any_other_os_error_is_not_alive(self):
+        self.assertFalse(self._kill_raising(OSError("bad pid")))
+
+    def _kill_raising(self, exc):
+        def boom(pid, sig):
+            raise exc
+        real, wb.os.kill = wb.os.kill, boom
+        try:
+            return wb._pid_alive(4242)
+        finally:
+            wb.os.kill = real
+
+
 class TestRefusals(Base):
     def test_a_session_with_no_instance_is_not_a_worker(self):
         self.assertEqual(self.ask(instance="")[0], "unknown")
@@ -82,6 +112,27 @@ class TestRefusals(Base):
     def test_no_inbox_is_unknown_not_start(self):
         d, _ = wb.decide(instance=WORKER, inbox="", workspace=str(self.ws))
         self.assertEqual(d, "unknown")
+
+    def test_no_workspace_is_unknown_not_start(self):
+        d, why = wb.decide(instance=WORKER, inbox=self.inbox, workspace="")
+        self.assertEqual(d, "unknown")
+        self.assertIn("workspace", why)
+
+    def test_an_unreadable_sentinel_is_unknown_not_start(self):
+        """A directory where the file should be: readable-as-absent would read
+        a broken stamp as "no watcher" and start a second one."""
+        self.sentinel(WORKER).mkdir(parents=True)
+        d, why = self.ask()
+        self.assertEqual(d, "unknown")
+        self.assertIn("unreadable", why)
+
+    def test_a_sentinel_holding_no_pid_means_start(self):
+        for content in ("not-a-pid\n", "   \n"):
+            with self.subTest(content=content):
+                self.sentinel(WORKER).write_text(content)
+                d, why = self.ask()
+                self.assertEqual(d, "start")
+                self.assertIn("no pid", why)
 
     def test_an_unresolvable_sentinel_is_unknown_not_start(self):
         """A duplicate watcher on one folder processes every delivery twice, so
@@ -114,6 +165,25 @@ class TestMain(Base):
     def test_an_unknown_exits_two(self):
         rc, out = self.run_main("--instance", "", "--inbox", self.inbox,
                                 "--workspace", str(self.ws))
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_a_loader_that_cannot_answer_leaves_the_gate_unknown(self):
+        """Not `start`: a gate that cannot find the workspace cannot know
+        whether this instance already has a watcher."""
+        import types
+        stub = types.ModuleType("workspace_default")
+        def boom():
+            raise RuntimeError("no workspace here")
+        stub.resolve_workspace = boom
+        real = sys.modules.get("workspace_default")
+        sys.modules["workspace_default"] = stub
+        try:
+            rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+        finally:
+            if real is None:
+                del sys.modules["workspace_default"]
+            else:
+                sys.modules["workspace_default"] = real
         self.assertEqual((rc, out[0]), (2, "unknown"))
 
     def test_no_workspace_given_falls_back_to_the_loader(self):
