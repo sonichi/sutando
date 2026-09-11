@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""The 5-minute poll ceiling must clear its interval and say so.
+"""The chat-reply poll ceiling must stop the timer and say so.
 
-`/result` answers `pending` for a torn or empty body, so without the deadline
-the poll runs forever and the owner is never told. Runs the EXACT `sendText`
-source under a fake clock; a mutation disabling the deadline must fail this.
+`/result` answers `pending` for a torn or empty body, so without the ceiling the
+poll runs forever and the owner is never told. Runs the EXACT `pollChatReply`
+source under a fake clock; a mutation disabling the ceiling must fail this.
+
+The ceiling used to sit inline in `sendText` as a `deadline`; it now lives in
+`pollChatReply` behind `CHAT_POLL_MAX_MS`, which also survives a page reload.
+The property is unchanged — only where it is asserted moved with it.
 """
 
 from __future__ import annotations
@@ -17,69 +21,74 @@ REPO = Path(__file__).resolve().parent.parent
 SOURCE = (REPO / "src" / "web-client.ts").read_text()
 
 
-def _send_text_source() -> str:
-    marker = "function sendText()"
-    assert marker in SOURCE, "web-client has no sendText()"
+def _poll_source() -> str:
+    marker = "function pollChatReply("
+    assert marker in SOURCE, "web-client has no pollChatReply()"
     start = SOURCE.index(marker)
     end = SOURCE.index("\n}", start) + 2
     body = SOURCE[start:end]
-    assert "deadline" in body, "extracted sendText has no deadline — wrong span"
+    assert "CHAT_POLL_MAX_MS" in body, "extracted pollChatReply has no ceiling — wrong span"
     return body
 
 
 HARNESS = r"""
 let now = 1_000_000;
-const Real = Date;
 Date.now = () => now;
-let timer = null, cleared = false, nextId = 1;
-function setInterval(fn, ms) { timer = {fn, ms, id: nextId++}; return timer.id; }
-function clearInterval(id) { if (timer && timer.id === id) cleared = true; }
-const appended = [];
-function mkEl() { return {className:'', textContent:'', innerHTML:'',
-                          appendChild(){}, }; }
-const document = { createElement: () => mkEl() };
-const transcript = { appendChild: (e) => appended.push(e) };
-const input = { value: 'hello', trim: () => 'hello' };
-function $(id) { return id === 'textInput' ? input : transcript; }
-function dbg() {} function scrollTranscript() {} function addCopyBtn() {}
-let currentUserEl = null;
-const voice = null;
+let timer = null, stopped = false, nextId = 1;
+function setTimeout(fn, ms) { timer = {fn, ms, id: nextId++}; return timer.id; }
+function clearTimeout(id) { if (timer && timer.id === id) stopped = true; }
+const CHAT_POLL_FAST_MS = 2 * 1000;
+const CHAT_POLL_SLOW_MS = 15 * 1000;
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;
+const placeholder = {
+  className: 't-entry t-assistant t-working',
+  textContent: 'working…',
+  classList: {
+    contains(c) { return placeholder.className.includes(c); },
+    remove(c) { placeholder.className = placeholder.className.replace(c, '').trim(); },
+  },
+};
+let rendered = null;
+let removedPending = false;
+function renderChatReply(el, text) { rendered = text; }
+function removePendingChatSend() { removedPending = true; }
+function scrollTranscript() {}
 const location = { hostname: 'localhost' };
-const window = {};
 let resultStatus = 'pending';
 function fetch(url) {
-  if (url.endsWith('/task')) return Promise.resolve({json: () => Promise.resolve({ok:true, task_id:'T1'})});
   return Promise.resolve({json: () => Promise.resolve(
       resultStatus === 'completed' ? {status:'completed', result:'THE ANSWER'} : {status:'pending'})});
 }
 const flush = () => new Promise(r => setImmediate(r));
-__SEND_TEXT__
+__POLL_CHAT_REPLY__
 (async () => {
-  sendText();
+  pollChatReply('T1', placeholder);
   await flush(); await flush(); await flush();
   if (!timer) { console.log(JSON.stringify({error:'poll never armed'})); return; }
   __SCENARIO__
   console.log(JSON.stringify({
-    cleared,
-    timedOut: appended.some(e => (e.textContent||'').includes('timed out after 5 minutes')),
-    answered: appended.some(e => (e.textContent||'') === 'THE ANSWER'),
+    stopped,
+    timedOut: (placeholder.textContent || '').includes('Still working'),
+    answered: rendered === 'THE ANSWER',
   }));
 })();
 """
 
 SCENARIOS = {
-    "timeout": "now += 300001; timer.fn(); await flush();",
+    # past the 30-minute ceiling
+    "timeout": "now += 30 * 60 * 1000 + 1; timer.fn(); await flush();",
     "completion": "resultStatus = 'completed'; now += 2000; timer.fn(); await flush(); await flush();",
 }
 
 
-def run(scenario: str, disable_deadline: bool = False) -> dict:
-    src = _send_text_source()
-    if disable_deadline:
-        old = "if (Date.now() > deadline) {"
-        assert src.count(old) == 1, "deadline guard not found — mutation would be a no-op"
+def run(scenario: str, disable_ceiling: bool = False) -> dict:
+    src = _poll_source()
+    if disable_ceiling:
+        old = "if (elapsed > CHAT_POLL_MAX_MS) {"
+        assert src.count(old) == 1, "ceiling guard not found — mutation would be a no-op"
         src = src.replace(old, "if (false) {", 1)
-    probe = (HARNESS.replace("__SEND_TEXT__", src)
+    probe = (HARNESS.replace("__POLL_CHAT_REPLY__", src)
                     .replace("__SCENARIO__", SCENARIOS[scenario]))
     out = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
@@ -96,18 +105,18 @@ def check(ok: bool, msg: str) -> None:
 
 
 r = run("timeout")
-check(r.get("cleared") is True, f"past the deadline the interval is cleared, got {r!r}")
-check(r.get("timedOut") is True, f"...and the owner is told it timed out, got {r!r}")
+check(r.get("stopped") is True, f"past the ceiling the timer is stopped, got {r!r}")
+check(r.get("timedOut") is True, f"...and the owner is told it is still working, got {r!r}")
 
 r = run("completion")
-check(r.get("cleared") is True, f"a pre-deadline completion clears the interval, got {r!r}")
+check(r.get("stopped") is True, f"a pre-ceiling completion stops the timer, got {r!r}")
 check(r.get("answered") is True and not r.get("timedOut"),
-      f"...and renders the answer without a timeout notice, got {r!r}")
+      f"...and renders the answer without the still-working notice, got {r!r}")
 
-# Control: disabling the deadline must break the first pair and nothing else.
-r = run("timeout", disable_deadline=True)
-check(r.get("cleared") is False and r.get("timedOut") is False,
-      f"CONTROL: with the deadline disabled the poll never stops, got {r!r}")
+# Control: disabling the ceiling must break the first pair and nothing else.
+r = run("timeout", disable_ceiling=True)
+check(r.get("stopped") is False and r.get("timedOut") is False,
+      f"CONTROL: with the ceiling disabled the poll never stops, got {r!r}")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
