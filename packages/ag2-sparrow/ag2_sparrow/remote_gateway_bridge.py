@@ -1965,9 +1965,21 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (None, None)
 
 
-_WORKERS_SNAPSHOT_FILE = _STATE / "pool-status.json"
+_POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _workers_push_mtime = 0.0
 _workers_push_retry_at = 0.0
+
+
+def _read_pool_advertisement() -> "tuple[float, dict]":
+    """The pool's roster-derived advertisement -> (mtime, record). Absent,
+    mid-write or malformed reads as (0.0, {}), which every caller treats as
+    "no pool" — this runs in the task loop and may never raise."""
+    try:
+        mtime = _POOL_ADVERTISEMENT_FILE.stat().st_mtime
+        rec = json.loads(_POOL_ADVERTISEMENT_FILE.read_text())
+    except (OSError, ValueError):
+        return (0.0, {})
+    return (mtime, rec) if isinstance(rec, dict) else (0.0, {})
 
 
 def _maybe_push_workers_snapshot() -> bool:
@@ -1979,18 +1991,12 @@ def _maybe_push_workers_snapshot() -> bool:
     now = time.time()
     if now < _workers_push_retry_at:
         return False
-    try:
-        mtime = _WORKERS_SNAPSHOT_FILE.stat().st_mtime
-    except OSError:
-        return False
+    mtime, ad = _read_pool_advertisement()
     if mtime <= _workers_push_mtime:
         return False
-    try:
-        snap = json.loads(_WORKERS_SNAPSHOT_FILE.read_text())
-    except (OSError, ValueError):
-        return False  # mid-write or malformed: the next change retries
+    snap = ad.get("workers")
     if not isinstance(snap, dict):
-        return False
+        return False  # nothing to advertise yet; the next write retries
     try:
         _req("POST", "/v1/workers", snap, timeout=15)
     except urllib.error.HTTPError as e:
@@ -2020,8 +2026,14 @@ def _build_agent_profile() -> "dict | None":
         host_id = socket.gethostname().split(".")[0]
     except OSError:
         host_id = "unknown-host"
-    return {"display": {"name": name},
+    card = {"display": {"name": name},
             "host": {"host_id": host_id, "kind": "local"}}
+    # The broker REPLACES the profile document, so an omitted workers map
+    # deletes the pool the picker was drawing.
+    workers = _read_pool_advertisement()[1].get("profile_workers")
+    if isinstance(workers, dict):
+        card["workers"] = workers
+    return card
 
 
 def _maybe_push_agent_profile() -> bool:
@@ -2036,7 +2048,10 @@ def _maybe_push_agent_profile() -> bool:
     if not mxid:
         return False  # identity may appear mid-episode; recheck next loop
     card = _build_agent_profile()
-    key = mxid + json.dumps(card, sort_keys=True)
+    # The advertisement's mtime is in the key so a roster rewrite re-puts the
+    # card even when the workers map serialises identically.
+    key = (f"{mxid}\n{_read_pool_advertisement()[0]}\n"
+           + json.dumps(card, sort_keys=True))
     if key == _profile_push_key:
         return False
     try:

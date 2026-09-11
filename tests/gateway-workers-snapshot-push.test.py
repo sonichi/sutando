@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Gateway workers-snapshot push: on-change relay of state/pool-status.json
-to POST /v1/workers — no file is a no-op, unchanged content never re-posts,
-a change re-posts, and a 404 broker backs off instead of hammering.
+"""Gateway workers-snapshot push: on-change relay of the `workers` half of
+state/pool-advertisement.json to POST /v1/workers — no file is a no-op,
+unchanged content never re-posts, a change re-posts, and a 404 broker backs
+off instead of hammering.
 
 Run: python3 tests/gateway-workers-snapshot-push.test.py   (stdlib only)
 """
@@ -13,6 +14,8 @@ import tempfile
 import time
 import urllib.error
 from pathlib import Path
+
+W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 
 FAILS = []
 
@@ -49,12 +52,10 @@ def main() -> int:
     check(rtc._maybe_push_workers_snapshot() is False and not calls,
           "no snapshot file: no-op, no request")
 
-    snap_path = Path(tmp) / "state" / "pool-status.json"
+    snap_path = Path(tmp) / "state" / "pool-advertisement.json"
     snap_path.parent.mkdir(parents=True, exist_ok=True)
-    blob = {"ts": 1, "writer": "pool-lead", "live_cores": ["core-1"],
-            "bindings": {"!r:x": {"instance": "core-1", "pinned": True,
-                                  "dedicated": False}}}
-    snap_path.write_text(json.dumps(blob))
+    blob = {"ts": 1, "live_cores": [W1], "dead_cores": []}
+    snap_path.write_text(json.dumps({"ts": 1, "workers": blob}))
     check(rtc._maybe_push_workers_snapshot() is True,
           "new snapshot pushes")
     check(calls == [("POST", "/v1/workers", blob)],
@@ -63,7 +64,7 @@ def main() -> int:
           "unchanged snapshot never re-posts")
 
     blob["ts"] = 2
-    snap_path.write_text(json.dumps(blob))
+    snap_path.write_text(json.dumps({"ts": 2, "workers": blob}))
     os.utime(snap_path, (time.time() + 2, time.time() + 2))
     check(rtc._maybe_push_workers_snapshot() is True and len(calls) == 2,
           "changed snapshot pushes again")
@@ -74,7 +75,7 @@ def main() -> int:
 
     rtc._req = req_404
     blob["ts"] = 3
-    snap_path.write_text(json.dumps(blob))
+    snap_path.write_text(json.dumps({"ts": 3, "workers": blob}))
     os.utime(snap_path, (time.time() + 4, time.time() + 4))
     check(rtc._maybe_push_workers_snapshot() is False and len(calls) == 3,
           "404 broker: push attempted once, reported deferred")
