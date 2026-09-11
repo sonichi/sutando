@@ -1,13 +1,67 @@
 #!/bin/bash
-# Sutando restart — stops all background services, then restarts via startup.sh.
+# Sutando restart — stops the services in the declared SCOPE, then restarts via startup.sh.
 # Does NOT touch the Claude Code CLI (core agent) — that's managed separately.
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
 #   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
+#                  (implies --scope all: the binary cannot be replaced under the running app)
+#   --scope core          (default) this instance's own session and the components it owns
+#   --scope worker <id>   that worker's watcher and tmux session, nothing else
+#   --scope all           adds the host-wide components every instance shares
+#
+# Scope exists because a host runs more than one Sutando: a core plus pool
+# workers, or two cores. Anything outside the declared scope belongs to another
+# instance's lifecycle, and stopping it is the outage this file must not cause.
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Every process this script touches goes through pops_* — one seam a test can
+# replace wholesale, instead of hoping a PATH stub shadows the right binary.
+# shellcheck source=process-ops.sh
+. "$REPO/src/process-ops.sh" || { echo "restart.sh: src/process-ops.sh unreadable — refusing to touch any process" >&2; exit 1; }
+
+# Distinct rc: "I could not prove that watcher is mine" is not "stopped", and
+# "I signalled it and it is still there" is neither.
+RC_WATCHER_UNCONFIRMED=3
+RC_WATCHER_NOT_STOPPED=4
+
+SCOPE="core"
+WORKER_ID=""
+WORKER_SESSION="${SUTANDO_WORKER_TMUX_SESSION:-}"
+WORKER_SOCKET="${SUTANDO_WORKER_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-}}"
 REBUILD_APP=0
-[ "${1:-}" = "--rebuild-app" ] && REBUILD_APP=1
+STOP_ONLY=0
+ARGS_GIVEN="$*"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rebuild-app)     REBUILD_APP=1 ;;
+        --stop-only)       STOP_ONLY=1 ;;
+        --scope)           SCOPE="${2:-}"; shift ;;
+        --scope=*)         SCOPE="${1#--scope=}" ;;
+        --worker-session)  WORKER_SESSION="${2:-}"; shift ;;
+        --worker-socket)   WORKER_SOCKET="${2:-}"; shift ;;
+        *)
+            # `--scope worker <id>` is the one two-word value; an id may not
+            # follow anything else, or a typo would silently become a scope.
+            if [ "$SCOPE" = "worker" ] && [ -z "$WORKER_ID" ]; then
+                WORKER_ID="$1"
+            else
+                echo "restart.sh: unknown argument: $1" >&2; exit 2
+            fi ;;
+    esac
+    shift
+done
+# A rebuild replaces the app BINARY, so it is an app-wide lifecycle by
+# definition: under core scope it built over a running app and relaunched none.
+if [ "$REBUILD_APP" -eq 1 ] && [ "$SCOPE" = "core" ]; then
+    SCOPE="all"
+    echo "restart.sh: --rebuild-app implies --scope all (the app must be stopped to be replaced)"
+fi
+case "$SCOPE" in
+    core|all) ;;
+    worker) [ -n "$WORKER_ID" ] || { echo "restart.sh: --scope worker needs an instance id: --scope worker <id>" >&2; exit 2; } ;;
+    *) echo "restart.sh: unknown scope: $SCOPE (core|worker <id>|all)" >&2; exit 2 ;;
+esac
 
 # The sentinel IS the clean-exit signal, so a failed write must be visible: a
 # stub interpreter here would let a stop look successful while nothing changed.
@@ -27,10 +81,146 @@ _shutdown_state() {
   }
 }
 
-echo "Stopping Sutando services..."
+# `kill -0` (pops_alive) proves a pid EXISTS, never that it is OURS: a dead
+# watcher's number is reissued and the next holder answers identically. The
+# policy that decides ownership is src/watcher_identity.py, shared with
+# health-check.py; this function is only its process I/O.
+#
+# Sets WATCHER_OWNER_PID on success, WATCHER_OWNER_REASON on refusal. NOT via
+# stdout: `$( )` is a subshell and the reason would die with it.
+_confirm_watcher_owner() {
+    local sentinel="$1" want_instance="${2:-}" want_workspace="${3:-}"
+    local owner pid code_path argv inc_file wrote_rc=0
+    WATCHER_OWNER_REASON=""; WATCHER_OWNER_PID=""
+    if [ -z "${PY_BIN:-}" ]; then
+        WATCHER_OWNER_REASON="no runnable python3 — the ownership policy cannot be asked, so nothing is ours to signal"
+        return 1
+    fi
+    inc_file="$(sentinel_incarnation_path "$sentinel")"
+    # The record half: a COMPLETE identity naming this install, this instance and
+    # the incarnation the live marker exposes. A missing field is a refusal.
+    if ! owner="$("$PY_BIN" "$REPO/src/watcher_identity.py" owner-pid \
+                    --sentinel "$sentinel" --instance "$want_instance" \
+                    --workspace "$want_workspace" --incarnation-file "$inc_file" 2>&1)"; then
+        WATCHER_OWNER_REASON="$owner"
+        return 1
+    fi
+    IFS=$'\t' read -r pid code_path <<< "$owner"
+    if ! pops_alive "$pid"; then
+        WATCHER_OWNER_REASON="pid $pid is not alive"
+        return 1
+    fi
+    # The process half: the EXECUTED script, never containment. `python3 -c pass
+    # /x/watch-tasks-stream.sh` carries that path as data and must not confirm.
+    argv="$(pops_argv "$pid")"
+    if ! WATCHER_OWNER_REASON="$("$PY_BIN" "$REPO/src/watcher_identity.py" runs-watcher \
+                    --pid "$pid" --argv "$argv" --code-path "$code_path" 2>&1)"; then
+        return 1
+    fi
+    # The shared age policy the startup reaper also asks; errexit-safe, since a
+    # bare call would abort the caller on its rc 1 (reissued) or 2 (unknown).
+    sentinel_pid_wrote_file "$pid" "$sentinel" || wrote_rc=$?
+    if [ "$wrote_rc" -eq 1 ]; then
+        WATCHER_OWNER_REASON="stale sentinel: pid $pid started AFTER $sentinel was stamped — a reissued pid, not its owner"
+        return 1
+    fi
+    if [ "$wrote_rc" -ne 0 ]; then
+        WATCHER_OWNER_REASON="stale sentinel: whether pid $pid wrote $sentinel is UNMEASURABLE — an unprovable owner is a refusal"
+        return 1
+    fi
+    WATCHER_OWNER_REASON=""
+    WATCHER_OWNER_PID="$pid"
+}
+
+# Stop the ONE watcher a sentinel names, and only once it is proven ours.
+# A pattern kill is never the fallback here: `pkill -f watch-tasks` matched every
+# watcher on the host, which is the outage this whole path exists to prevent.
+_stop_watcher_at() {            # <sentinel> [expected-instance] [expected-workspace]
+    local sentinel="$1" pid
+    if [ ! -f "$sentinel" ]; then
+        echo "  watcher stop: no sentinel at $sentinel — nothing of ours to stop"
+        return 0
+    fi
+    if ! _confirm_watcher_owner "$sentinel" "${2:-}" "${3:-}"; then
+        echo "  watcher stop: OWNERSHIP NOT CONFIRMED — $WATCHER_OWNER_REASON"
+        echo "  watcher stop: nothing signalled, $sentinel left in place"
+        return "$RC_WATCHER_UNCONFIRMED"
+    fi
+    pid="$WATCHER_OWNER_PID"
+    echo "  watcher stop: signalling this core's watcher (pid $pid)"
+    # The sentinel is the only record of a watcher that is still running, so it
+    # is released after the stop is CONFIRMED and never before.
+    if ! pops_signal "$pid" TERM; then
+        echo "  watcher stop: SIGNAL FAILED for pid $pid — $sentinel left in place so a retry can still name it"
+        return "$RC_WATCHER_NOT_STOPPED"
+    fi
+    local tries="${SUTANDO_WATCHER_STOP_TICKS:-30}" i=0
+    while [ "$i" -lt "$tries" ]; do
+        pops_alive "$pid" || break
+        pops_grace_tick
+        i=$((i+1))
+    done
+    if pops_alive "$pid"; then
+        echo "  watcher stop: pid $pid is STILL ALIVE after TERM and $tries ticks of grace — $sentinel left in place"
+        return "$RC_WATCHER_NOT_STOPPED"
+    fi
+    sentinel_release_if_owner "$sentinel" "$pid"
+    return 0
+}
+
+# Resolve the sentinel for one instance and stop the watcher it names.
+# $1 = state dir, $2 = instance id ('' = this process's own identity).
+_stop_own_task_watcher() {
+    local state_dir="$1" instance="${2:-}" sentinel expect_instance
+    if [ -z "$state_dir" ]; then
+        echo "  watcher stop: no workspace resolved — cannot name this core's watcher; every watcher left alone"
+        return "$RC_WATCHER_UNCONFIRMED"
+    fi
+    # shellcheck source=watcher_sentinel.sh
+    if ! . "$REPO/src/watcher_sentinel.sh" 2>/dev/null; then
+        echo "  watcher stop: src/watcher_sentinel.sh unreadable — every watcher left alone"
+        return "$RC_WATCHER_UNCONFIRMED"
+    fi
+    if ! sentinel="$(sentinel_path_for "$state_dir" "$instance")" || [ -z "$sentinel" ]; then
+        echo "  watcher stop: could not resolve the sentinel for instance \"${instance:-<this process>}\" — every watcher left alone"
+        return "$RC_WATCHER_UNCONFIRMED"
+    fi
+    # The key ENCODED IN THE RESOLVED PATH, never the raw id: that suffix is the
+    # canonical form this scope and the watcher's own writer both derive.
+    expect_instance="$(basename "$sentinel")"
+    expect_instance="${expect_instance#"$WATCHER_SENTINEL_STEM"}"
+    expect_instance="${expect_instance%.pid}"
+    expect_instance="${expect_instance#-}"
+    _stop_watcher_at "$sentinel" "$expect_instance" "${state_dir%/state}"
+}
+
+WATCHER_STOP_RC=0
+
+_resolve_workspace() {
+    _WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+}
+
+# ---------------------------------------------------------------- worker scope
+if [ "$SCOPE" = "worker" ]; then
+    echo "Stopping Sutando worker $WORKER_ID..."
+    _resolve_workspace
+    _stop_own_task_watcher "${_WS:+$_WS/state}" "$WORKER_ID" || WATCHER_STOP_RC=$?
+    if [ -n "$WORKER_SESSION" ] && [ -n "$WORKER_SOCKET" ]; then
+        # Exact-match selector: a similarly-prefixed session is another instance.
+        echo "  worker $WORKER_ID: killing tmux session $WORKER_SESSION on $WORKER_SOCKET"
+        pops_tmux -S "$WORKER_SOCKET" kill-session -t "=$WORKER_SESSION" 2>/dev/null || true
+    else
+        echo "  worker $WORKER_ID: no tmux session named (--worker-session/--worker-socket, or SUTANDO_WORKER_TMUX_SESSION/_SOCKET) — no session touched"
+    fi
+    echo "  worker $WORKER_ID stopped (nothing outside this worker was touched)"
+    [ "$WATCHER_STOP_RC" -ne 0 ] && echo "restart.sh: watcher stop rc=$WATCHER_STOP_RC — ownership unconfirmed, see above"
+    exit "$WATCHER_STOP_RC"
+fi
+
+echo "Stopping Sutando services (scope: $SCOPE)..."
 # Marked before killing so the intake gate holds new tasks while services stop.
 # --stop-only leaves it set: that IS the core's clean-exit signal.
-_shutdown_state mark "restart.sh${1:+ $1}" || true
+_shutdown_state mark "restart.sh${ARGS_GIVEN:+ $ARGS_GIVEN}" || true
 # Voice-agent stop goes through the GUARDED lock takeover, never a broad
 # `pkill -f voice-agent` (voice-reliability plan amendment U2): the old blind
 # pkill could kill an unvalidated process and leave a live lock behind (or
@@ -57,7 +247,7 @@ else
 fi
 # Deliberate restart: the launchd bridge wrappers treat an exit inside this
 # window as ours, not a crash, so the owner is not alerted for every restart.
-_WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null)"
+_resolve_workspace
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 # The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
 # startup.sh only starts one when none is running, and an old writer keeps its old schema.
@@ -67,58 +257,73 @@ if [ -n "${PY_BIN:-}" ]; then
 else
     echo "  WARN no runnable python3 for the heartbeat handoff — old writer left running (startup will not replace it)"
 fi
-pkill -f "web-client.ts" 2>/dev/null
-pkill -f "dashboard.py" 2>/dev/null
-pkill -f "agent-api.py" 2>/dev/null
-pkill -f "screen-capture-server" 2>/dev/null
-pkill -f "telegram-bridge" 2>/dev/null
-pkill -f "discord-bridge" 2>/dev/null
-pkill -f "slack-bridge" 2>/dev/null
-pkill -f "remote-gateway-bridge" 2>/dev/null
+pops_pattern_kill "dashboard.py"
+pops_pattern_kill "agent-api.py"
+pops_pattern_kill "screen-capture-server"
+pops_pattern_kill "telegram-bridge"
+pops_pattern_kill "discord-bridge"
+pops_pattern_kill "slack-bridge"
+pops_pattern_kill "remote-gateway-bridge"
 # The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
 # IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
 # `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
 # host 2026-08-03, a stub-launched instance had been up 39 DAYS, survived every
 # restart, and kept stamping tasks from 39-day-old code. Kill both names.
-pkill -f "remote-relay-bridge" 2>/dev/null
-pkill -f "observability/boot" 2>/dev/null
-pkill -f "watch-tasks" 2>/dev/null
+pops_pattern_kill "remote-relay-bridge"
+pops_pattern_kill "observability/boot"
+_stop_own_task_watcher "${_WS:+$_WS/state}" || WATCHER_STOP_RC=$?
 # Every other stopped service is relaunched below or by startup.sh. This one
 # cannot be: the watcher is armed by the AGENT via the Monitor tool, so a
 # shell cannot restore it and the caller is the only thing that can.
-echo "  ⚠ task watcher STOPPED — nothing here re-arms it; the agent must:"
-echo "      Monitor  bash src/watch-tasks-stream.sh  (persistent)"
-echo "      until then tasks/ is not drained."
-pkill -f "conversation-server" 2>/dev/null
-pkill -f "ngrok" 2>/dev/null
-# Credential proxy: handle the launchd-supervised job explicitly. pkill alone
-# only bounces the worker — launchd's KeepAlive respawns it on its own throttle,
-# so restart.sh wouldn't actually control the cycle. For a restart, kickstart -k;
-# for --stop-only, bootout so KeepAlive doesn't resurrect it (startup.sh
-# re-bootstraps it next start). Legacy bare-& launch (no job) falls back to pkill.
-_PROXY_LABEL="com.sutando.credential-proxy"
-_PROXY_SERVICE="gui/$(id -u)/$_PROXY_LABEL"
-if launchctl print "$_PROXY_SERVICE" >/dev/null 2>&1; then
-    if [ "$1" = "--stop-only" ]; then
-        echo "  Stopping launchd-supervised credential proxy..."
-        launchctl bootout "$_PROXY_SERVICE" 2>/dev/null || true
-    else
-        echo "  Restarting launchd-supervised credential proxy..."
-        launchctl kickstart -k "$_PROXY_SERVICE" 2>/dev/null
-        # Wait for an actual LISTENer, not just any socket on 7846 — a bare
-        # `lsof -i :7846` also matches transient client connections and would
-        # break out before the proxy has rebound.
-        for _ in $(seq 1 20); do lsof -nP -iTCP:7846 -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.25; done
-    fi
+if [ "$WATCHER_STOP_RC" -eq 0 ]; then
+    echo "  ⚠ task watcher STOPPED — nothing here re-arms it; the agent must:"
+    echo "      Monitor  bash src/watch-tasks-stream.sh  (persistent)"
+    echo "      until then tasks/ is not drained."
 else
-    pkill -f "credential-proxy" 2>/dev/null
+    echo "  ⚠ task watcher NOT stopped — ownership unconfirmed (rc $WATCHER_STOP_RC); the old"
+    echo "      watcher may still be draining tasks/. Nothing here re-arms one either:"
+    echo "      Monitor  bash src/watch-tasks-stream.sh  (persistent)"
 fi
-pkill -f "src/Sutando/Sutando" 2>/dev/null
-echo "  All services stopped"
+pops_pattern_kill "conversation-server"
+pops_pattern_kill "ngrok"
 
-if [ "$1" = "--stop-only" ]; then
+# --- app-wide: every instance on this host shares these ----------------------
+# The web-client listener, the launchd proxy every session authenticates
+# through, and the desktop app. Stopping one takes it from the other instances.
+if [ "$SCOPE" = "all" ]; then
+    pops_pattern_kill "web-client.ts"
+    # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
+    # only bounces the worker — launchd's KeepAlive respawns it on its own throttle,
+    # so restart.sh wouldn't actually control the cycle. For a restart, kickstart -k;
+    # for --stop-only, bootout so KeepAlive doesn't resurrect it (startup.sh
+    # re-bootstraps it next start). Legacy bare-& launch (no job) falls back to pkill.
+    _PROXY_LABEL="com.sutando.credential-proxy"
+    _PROXY_SERVICE="gui/$(id -u)/$_PROXY_LABEL"
+    if pops_launchctl print "$_PROXY_SERVICE" >/dev/null 2>&1; then
+        if [ "$STOP_ONLY" -eq 1 ]; then
+            echo "  Stopping launchd-supervised credential proxy..."
+            pops_launchctl bootout "$_PROXY_SERVICE" 2>/dev/null || true
+        else
+            echo "  Restarting launchd-supervised credential proxy..."
+            pops_launchctl kickstart -k "$_PROXY_SERVICE" 2>/dev/null
+            # Wait for an actual LISTENer, not just any socket on 7846 — a bare
+            # `lsof -i :7846` also matches transient client connections and would
+            # break out before the proxy has rebound.
+            for _ in $(seq 1 20); do pops_port_listening 7846 && break; sleep 0.25; done
+        fi
+    else
+        pops_pattern_kill "credential-proxy"
+    fi
+    pops_pattern_kill "src/Sutando/Sutando"
+else
+    echo "  ⊘ host-wide components (web-client, credential proxy, Sutando.app) left running — scope is $SCOPE"
+fi
+echo "  All services stopped"
+[ "$WATCHER_STOP_RC" -ne 0 ] && echo "restart.sh: watcher stop rc=$WATCHER_STOP_RC — ownership unconfirmed, see above"
+
+if [ "$STOP_ONLY" -eq 1 ]; then
     echo "Done. Run 'bash src/startup.sh' to start again."
-    exit 0
+    exit "$WATCHER_STOP_RC"
 fi
 
 # Wait for shutdown to drain before exec-ing startup.sh. Fixed `sleep 1`
@@ -128,15 +333,19 @@ fi
 # See feedback_pkill_then_open_race.md and PR #499 for the same class on
 # startup.sh's recompile-replace path.
 STOP_PATTERNS=(
-    "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
+    "voice-agent" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
-    "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
+    "conversation-server" "ngrok" "$REPO/src/core_heartbeat.py"
 )
+# Waited on only under --scope all: a peer instance's web-client or desktop app
+# is not ours to outlast, and draining on it would block on a live service.
+APP_STOP_PATTERNS=( "web-client.ts" "src/Sutando/Sutando" )
+[ "$SCOPE" = "all" ] && STOP_PATTERNS+=( "${APP_STOP_PATTERNS[@]}" )
 for _ in $(seq 1 30); do
     still=0
     for pat in "${STOP_PATTERNS[@]}"; do
-        if pgrep -f "$pat" >/dev/null 2>&1; then still=1; break; fi
+        if pops_pattern_running "$pat"; then still=1; break; fi
     done
     [ $still -eq 0 ] && break
     sleep 0.1
@@ -158,10 +367,13 @@ if [ "$REBUILD_APP" -eq 1 ]; then
     fi
 fi
 
-# Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
-# is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
+# Relaunch what the app-wide stop killed — startup.sh is guarded headless and
+# owns no desktop UI. Scope-gated WITH the kill: relaunching an app this scope
+# never stopped would adopt another instance's component.
 APP_BIN="$REPO/src/Sutando/Sutando"
-if pgrep -x Sutando > /dev/null 2>&1; then
+if [ "$SCOPE" != "all" ]; then
+    echo "  ⊘ Sutando.app not relaunched — scope is $SCOPE and it was never stopped"
+elif pops_name_running Sutando; then
     echo "  ✓ Sutando.app (already running)"
 elif [ -x "$APP_BIN" ]; then
     # The app is the OUT-of-session restart path: a core-session marker inherited
@@ -170,7 +382,7 @@ elif [ -x "$APP_BIN" ]; then
     sleep 1
     # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
     # a launch that did not happen. The ✓ stays inside the verified branch.
-    if pgrep -x Sutando > /dev/null 2>&1; then
+    if pops_name_running Sutando; then
         echo "  ✓ Sutando.app relaunched"
     else
         echo "  ✗ Sutando.app — launched but not running; see /tmp/sutando-app.log"

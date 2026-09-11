@@ -149,22 +149,29 @@ def probe_watcher_sentinels(state_dir: Path, pid_alive
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
-    """A `<name>.pid` file holding a single PID: running if `pid_alive(pid)`.
-    Missing/empty file → offline. Malformed → unknown. `pid_alive` is injected
-    (real: os.kill(pid, 0)) so the branch logic is testable without a process."""
+    """A `<name>.pid` sentinel: running if `pid_alive(pid)`. Missing/empty file →
+    offline. Malformed → unknown. `pid_alive` is injected (real: os.kill(pid, 0))
+    so the branch logic is testable without a process.
+
+    The pid comes from the shared reader, never a private `int()` of the file:
+    the watcher sentinel is a RECORD whose pid is line 1, and a whole-file
+    `int()` read every recorded watcher as `unknown` (0 and negatives too — they
+    name a process GROUP to os.kill, which succeeds and reads falsely running).
+    """
+    from util_paths import read_sentinel_record
     try:
         if not path.exists():
             return ("offline", "no pidfile", None)
-        raw = path.read_text().strip()
-        if not raw:
+        if not path.read_text().strip():
             return ("offline", "empty pidfile", None)
-        pid = int(raw)
-    except (OSError, ValueError) as e:
+    except OSError as e:
         return ("unknown", f"unreadable pidfile: {e}", None)
-    if pid <= 0:
-        # os.kill(0, 0) / negative pids signal the process GROUP, which succeeds
-        # and would read as falsely "running" — a 0/negative pidfile is corrupt.
-        return ("unknown", f"non-positive pid {pid} in pidfile", None)
+    rec = read_sentinel_record(path)
+    pid, head = rec.get("pid"), rec.get("pid_line", "")
+    if pid is None:
+        if head.isascii() and (head.isdigit() or (head[:1] == "-" and head[1:].isdigit())):
+            return ("unknown", f"non-positive pid {head} in pidfile", None)
+        return ("unknown", f"unreadable pidfile: no pid on line 1 ({head[:40]!r})", None)
     if pid_alive(pid):
         return ("running", f"pid {pid}", None)
     return ("offline", f"pid {pid} dead", None)
