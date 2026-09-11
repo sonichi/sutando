@@ -179,15 +179,29 @@ the clipboard only when the owner says they copied something.
 Asking the owner to copy a link they have already highlighted would hand the work
 back, which is the trip this exists to remove.
 
-### 4. In-channel navigation — what is already in this channel
+### 4. In-channel navigation — moving through long context
 
-An Accessibility watcher tracks the visible Discord channel, the message under
-the pointer, and the current selection, behind four tools:
+A channel accumulates more than fits on screen or in memory. The questions the
+owner actually has about it are relational rather than keyword-shaped:
+
+- *"What was the last message from X?"*
+- *"Which message did X send that mentioned Y?"*
+- *"What was already decided here, and what led to it?"*
+
+Scrolling answers these badly. It is a linear scan of something that is not
+ordered by the thing being looked for, and it requires already knowing roughly
+where the answer is — which is the part the owner does not have. Understanding
+why a draft says what it says, or what a reply is replying to, means
+reconstructing a chain across messages that may be far apart.
+
+An Accessibility watcher tracks the visible channel, the message under the
+pointer, and the current selection, behind four tools:
 `summarize_current_discord_channel`, `search_current_discord_channel`,
-`inspect_hovered_discord_message`, `read_selected_discord_text`. They fill the
-second row of the table above.
+`inspect_hovered_discord_message`, `read_selected_discord_text`. The full history
+is cached outside the model and only bounded matches are passed in, so a question
+about a long channel does not cost the whole channel.
 
-All four exist and all four answer by speech alone, which is why this row has no
+All four exist and all four answer by speech alone, which is why this part has no
 figure. A summary of forty messages cannot be spoken usefully and is gone from
-the voice agent's context in ten minutes; the same summary as a card is
-skimmable and stays. Each tool gains an optional path that also writes a card.
+the voice agent's context in ten minutes; the same summary as a card is skimmable
+and stays. Each tool gains an optional path that also writes a card.
