@@ -36,9 +36,13 @@ for f in "$TASKS_DIR"/*.txt; do
   # A pool worker owns any task with a sentinel in its delivery folder. The core
   # declined it and must not touch it, so it is not the core's to answer.
   TASK_ID="${BASENAME%.txt}"
-  if compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.txt" > /dev/null 2>&1 \
-     || compgen -G "$WORKSPACE/deliveries/*/$TASK_ID.accepted" > /dev/null 2>&1 \
-     || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
+  HELD_BY_WORKER=0
+  for _d in "$WORKSPACE"/deliveries/*/; do
+    [ -d "$_d" ] || continue
+    [ "$(basename "$_d")" = core ] && continue   # the core's own inbox is not a worker's
+    if [ -e "$_d$TASK_ID.txt" ] || [ -e "$_d$TASK_ID.accepted" ]; then HELD_BY_WORKER=1; break; fi
+  done
+  if [ "$HELD_BY_WORKER" = 1 ] || [ -f "$WORKSPACE/state/pool-route-retry/$TASK_ID" ]; then
     continue
   fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery

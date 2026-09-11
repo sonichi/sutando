@@ -135,9 +135,15 @@ def retry_dir(workspace) -> Path:
 def _defer(ws, task_id: str, reason: str) -> int:
     """A failed delivery keeps the task the worker's: mark it for the retry
     pass and exit 0 so the watcher never hands it to the core."""
-    d = retry_dir(ws)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / task_id).write_text(time.strftime("%Y-%m-%dT%H:%M:%S ") + reason + "\n")
+    try:
+        d = retry_dir(ws)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / task_id).write_text(time.strftime("%Y-%m-%dT%H:%M:%S ") + reason + "\n")
+    except OSError as e:
+        # The marker is a convenience for the retry pass; its absence must not
+        # turn into a non-zero exit that hands the task to the core.
+        _log(ws, f"{task_id}: deferred WITHOUT marker ({e}): {reason}")
+        return 0
     _log(ws, f"{task_id}: deferred for retry: {reason}")
     return 0
 
