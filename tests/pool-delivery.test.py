@@ -421,6 +421,52 @@ class TestHeldByOtherInstance(Base):
         self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
 
 
+class TestHeldDispatch(Base):
+    """The caller is a shell hook, so the exit code IS the contract: 0 held,
+    1 not held, HELD_UNKNOWN when the lookup could not answer."""
+
+    def _main(self, *args, env=None):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.dict(os.environ, env or {}):
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = pd.main(["--workspace", str(self.root), *args])
+        return rc, out.getvalue().strip(), err.getvalue()
+
+    def test_held_exits_zero_and_names_the_holder(self):
+        self.ws.deliver("w1", "task-1")
+        self.assertEqual(self._main("--held", "task-1")[:2], (0, "w1"))
+
+    def test_not_held_exits_one_and_names_nobody(self):
+        self.assertEqual(self._main("--held", "task-1")[:2], (1, ""))
+
+    def test_the_env_instance_decides_whose_folder_is_own(self):
+        """The same tree, the same query, read as the holder: not a hold."""
+        self.ws.deliver("w1", "task-1")
+        self.assertEqual(self._main("--held", "task-1")[0], 0)
+        self.assertEqual(
+            self._main("--held", "task-1", env={"SUTANDO_INSTANCE_ID": "w1"})[0], 1)
+
+    def test_an_unreadable_tree_is_unknown_not_free(self):
+        """Exit 1 here would read as "nobody holds it" and hand the task over."""
+        if os.getuid() == 0:
+            self.skipTest("root reads an unreadable directory")
+        self.ws.deliver("w1", "task-1")
+        d = self.root / "deliveries"
+        d.chmod(0o000)
+        try:
+            rc, out, err = self._main("--held", "task-1")
+        finally:
+            d.chmod(0o755)
+        self.assertEqual((rc, out), (pd.HELD_UNKNOWN, ""))
+        self.assertIn("PermissionError", err)
+
+    def test_a_command_is_still_required_without_held(self):
+        with self.assertRaises(SystemExit):
+            self._main()
+
+
 class TestHeldCli(Base):
     """The caller is a shell hook, so the exit code IS the contract: 0 held,
     1 not held, HELD_UNKNOWN when the lookup could not answer."""
@@ -431,32 +477,14 @@ class TestHeldCli(Base):
              "--workspace", str(self.root), *args],
             capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
 
-    def test_held_exits_zero_and_names_the_holder(self):
+    def test_the_hook_sees_the_same_three_answers_across_a_real_process(self):
+        """What the shell actually reads: `$?`, not a return value."""
         self.ws.deliver("w1", "task-1")
         r = self.run_cli("--held", "task-1")
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "w1"), r.stderr)
-
-    def test_not_held_exits_one(self):
-        self.assertEqual(self.run_cli("--held", "task-1").returncode, 1)
-
-    def test_the_env_instance_decides_whose_folder_is_own(self):
-        self.ws.deliver("w1", "task-1")
+        self.assertEqual(self.run_cli("--held", "task-2").returncode, 1)
         self.assertEqual(self.run_cli("--held", "task-1",
                                       env={"SUTANDO_INSTANCE_ID": "w1"}).returncode, 1)
-
-    def test_an_unreadable_tree_is_unknown_not_free(self):
-        """Exit 1 here would read as "nobody holds it" and hand the task over."""
-        if os.getuid() == 0:
-            self.skipTest("root reads an unreadable directory")
-        self.ws.deliver("w1", "task-1")
-        d = self.root / "deliveries"
-        d.chmod(0o000)
-        try:
-            r = self.run_cli("--held", "task-1")
-        finally:
-            d.chmod(0o755)
-        self.assertEqual(r.returncode, pd.HELD_UNKNOWN, r.stdout)
-        self.assertIn("PermissionError", r.stderr)
 
     def test_a_command_is_still_required_without_held(self):
         self.assertEqual(self.run_cli().returncode, 2)
