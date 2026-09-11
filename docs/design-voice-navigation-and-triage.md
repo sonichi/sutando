@@ -21,6 +21,15 @@ the article it is built from, which means leaving Discord for a browser. By the
 time the answer is known, the message that asked is somewhere behind a window.
 **The place a decision is requested is not a place a decision can be made.**
 
+With a surface, the article comes to the message instead:
+
+![The same message, with the linked article open in a notch panel beside it. The
+voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
+that URL in the notch."](design-voice-navigation-and-triage-context-closed.png)
+
+Same screen, same message, nothing abandoned. The owner asked by voice and the
+evidence arrived where the question was — **no switching back and forth.**
+
 **Between tasks, the next one is unknown.** "What should I do next" is itself
 work, and it is the work `sonichi/sutando-life` triage exists to remove: one
 proposal at a time, each an authored commitment with a `why`, its premise
