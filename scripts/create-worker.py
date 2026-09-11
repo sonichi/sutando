@@ -24,6 +24,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(_REPO / "src"))
 
+import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import spawn_worker as sw  # noqa: E402
@@ -75,10 +76,12 @@ def preflight(workspace, repo, room: str) -> None:
                       "stamp — see #3875")
 
 
-def compile_with(workspace, worker_id: str, label: str, room) -> dict:
+def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> dict:
     """Add this worker to the roster, and its room to the bindings."""
     workers = existing_workers(workspace)
     workers[worker_id] = {"state": "live", "label": label or worker_id}
+    if runtime:
+        workers[worker_id]["runtime"] = str(runtime)
     bindings = dict(pr.load_bindings(workspace))
     if room:
         bindings[room] = worker_id
@@ -146,13 +149,27 @@ def main(argv=None) -> int:
         return REFUSED
 
     try:
-        roster = compile_with(workspace, made["worker_id"], a.label, a.room)
+        roster = compile_with(workspace, made["worker_id"], a.label, a.room,
+                              runtime=made.get("runtime"))
     except (pr.RosterError, OSError) as e:
         # The worker exists and the roster does not know it: say so loudly with
         # the repair, or it becomes the silent stale-roster case again.
         print(f"create-worker: worker {made['worker_id']} was created, but the "
               f"roster could not be compiled: {e}\n"
               f"  it will receive nothing until the roster names it.",
+              file=sys.stderr)
+        return 1
+
+    try:
+        # The picker follows the roster only through this file (the bridge
+        # sends it); a compile without it leaves the picker one worker behind.
+        pa.write_advertisement(workspace)
+    except OSError as e:
+        print(f"create-worker: worker {made['worker_id']} is routable (roster "
+              f"v{roster['version']}), but the advertisement could not be "
+              f"written: {e}\n"
+              f"  the picker will not show it until this succeeds: "
+              f"python3 src/pool_advertise.py --workspace {workspace} --write",
               file=sys.stderr)
         return 1
 

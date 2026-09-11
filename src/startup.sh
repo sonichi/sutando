@@ -635,6 +635,10 @@ bash "$REPO/skills/install.sh" 2>/dev/null || true
 # paths. health-check + dashboard already read from $WORKSPACE/logs.
 if [ -f "$REPO/scripts/sutando-config.sh" ]; then
   WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+  # A roster compiled while nothing ran to advertise it reaches the broker at
+  # boot; the bridge reads an absent advertisement as "no pool".
+  "$PY" "$REPO/src/pool_advertise.py" --workspace "$WORKSPACE" --ensure 2>/dev/null \
+    || echo "⚠ pool advertisement not written; the picker follows the roster only through it" >&2
 else
   WORKSPACE="$REPO/workspace"
 fi
