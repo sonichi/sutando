@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+SRC = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC))
 import pool_delivery as pd
 
 
@@ -419,6 +420,42 @@ class TestHeldByWorker(Base):
         bad.mkdir(parents=True, exist_ok=True)
         (bad / "task-1.txt").touch()
         self.assertIsNone(pd.held_by_worker(self.root, "task-1"))
+
+    def test_a_lookup_that_crashes_is_unknown_not_a_denial(self):
+        """john-the-dev on #4110: the Stop hook reads exit != 0 as "no worker
+        holds it", so a traceback made a worker's task look free. UNKNOWN is a
+        third code the caller can branch on, with the reason on stderr."""
+        import io
+        import unittest.mock
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with unittest.mock.patch.object(pd, "held_by_worker",
+                                        side_effect=PermissionError(13, "denied")):
+            with redirect_stderr(err):
+                rc = pd.main(["--workspace", str(self.root), "--held", "task-1"])
+        # Literal codes, so the parent commit fails on the answer it gives and
+        # not on a constant that does not exist there yet.
+        self.assertNotIn(rc, (0, 1))
+        self.assertEqual(rc, 2)
+        self.assertEqual(rc, pd.HELD_UNKNOWN)
+        self.assertIn("task-1", err.getvalue())
+        self.assertIn("PermissionError", err.getvalue())
+
+    def test_an_unreadable_deliveries_tree_is_unknown_through_the_cli(self):
+        """The same answer from the real process, so the hook's `$?` branch is
+        pinned against an exit code and not against a patched function."""
+        import os
+        import subprocess
+        d = self.root / "deliveries"
+        os.chmod(d, 0o000)
+        self.addCleanup(os.chmod, d, 0o755)
+        if os.access(d, os.R_OK):
+            self.skipTest("the mode did not take effect (running as root?)")
+        r = subprocess.run([sys.executable, str(SRC / "pool_delivery.py"),
+                            "--workspace", str(self.root), "--held", "task-1"],
+                           capture_output=True, text=True)
+        self.assertNotIn(r.returncode, (0, 1))
+        self.assertEqual(r.returncode, 2)
 
     def test_a_command_is_still_required_without_held(self):
         with self.assertRaises(SystemExit):

@@ -137,6 +137,11 @@ def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     return None
 
 
+# Third answer for --held, kept out of the 0/1 pair so an unreadable delivery
+# tree cannot be read as "nobody holds this".
+HELD_UNKNOWN = 2
+
+
 def held_by_worker(workspace, task_id: str) -> str | None:
     """The worker holding `task_id` under ANY sentinel name, or None.
 
@@ -294,13 +299,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel", help="a sentinel filename, for `payload`")
     ap.add_argument("--held", metavar="TASK_ID",
-                    help="exit 0 if a worker holds this task, 1 if none does")
+                    help="exit 0 if a worker holds this task, 1 if none does, "
+                         f"{HELD_UNKNOWN} if that could not be determined")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
     if a.held:
-        holder = held_by_worker(ws, a.held)
+        try:
+            holder = held_by_worker(ws, a.held)
+        except Exception as e:
+            # A crash and "no worker holds it" are different answers; a caller
+            # that cannot tell them apart reads a broken lookup as a free task.
+            print(f"pool_delivery: --held {a.held}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return HELD_UNKNOWN
         if holder:
             print(holder)
         return 0 if holder else 1
