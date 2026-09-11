@@ -9084,10 +9084,8 @@ def check_task_watcher() -> dict:
                 live[spid] = sp
 
     if not live:
-        # ONE aggregate over EVERY record class, built before any advice. A
-        # per-class early return drops the classes below it, and a dropped
-        # UNKNOWN becomes restart advice for the very watcher it could not
-        # identify.
+        # Aggregate EVERY record class before advising: a per-class early
+        # return turns a dropped UNKNOWN into restart advice.
         notes = []
         if unreadable:
             notes.append(f"unreadable PID sentinel ({unreadable[0][1]})")

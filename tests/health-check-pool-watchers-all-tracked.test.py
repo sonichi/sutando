@@ -296,8 +296,7 @@ class NoLiveFaultsAggregateBeforeAnyAdvice(unittest.TestCase):
         sentinel must suppress that too -- same veto, other direction."""
         r = run(dict(self.UNREADABLE, **{"watch-tasks-stream-b.pid": "100\n"}),
                 {"200": {"200"}}, verdicts={"100": None}, targets={})
-        # Assert it REACHES the aggregate first: unfixed, this returned early
-        # with restart advice and never reached the roots branch, so a bare
+        # Assert it REACHES the aggregate: unfixed it returned early, so a bare
         # assertNotIn("safe to stop") passed for the wrong reason.
         self.assertIn("watcher(s) still run", r["detail"],
             "must reach the roots aggregate, not return on the first fault")
