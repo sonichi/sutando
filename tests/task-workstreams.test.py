@@ -296,9 +296,8 @@ def test_history_derives_every_id_through_the_shared_path_to_id_owner() -> None:
 
 
 def test_result_resolution_survives_unreadable_roots() -> None:
-    # The property `_result_index` used to carry, asserted where it now lives:
-    # history resolves each row through the readiness owner, so a missing
-    # results dir or an archive walk that raises must not take the scan down.
+    # The property `_result_index` carried, asserted where it now lives: a
+    # missing results dir or a raising archive walk must not take the scan down.
     workspace = Path(tempfile.mkdtemp(prefix="sutando-result-index-"))
     try:
         owner = workstreams.local_task_protocol
