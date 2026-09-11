@@ -9,10 +9,10 @@ The watcher's handler protocol carries the design's recipient rules exactly:
 
     probe 3   decline      not a roster hit -- unbound, or a name never created.
                             The core takes it; it is a recipient, not a fallback.
-    probe 4   must-handle  every target is on the roster, OR the roster cannot be
+    probe 0   taken        every target is on the roster, OR the roster cannot be
                             read. The real run delivers; if it fails, the watcher
-                            publishes a failure -- the core never sees the task,
-                            because an addressed task must not change recipient.
+                            hands the task to the live core, which answers as the
+                            owner's agent -- a delivery fault is never owner noise.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -34,7 +34,7 @@ import pool_roster as pr  # noqa: E402
 import pool_router as rt  # noqa: E402
 
 DECLINE = 3
-MUST_HANDLE = 4
+TAKE = 0
 
 
 def read_task(task_file: str) -> dict:
@@ -64,9 +64,9 @@ def classify(workspace, task: dict) -> tuple[int, list]:
     """(exit code, targets) without delivering anything."""
     roster = pr.load_roster(workspace)
     if roster is None:
-        # Refuse, never decline: a decline is the core, and an unreadable file
-        # must not pick a recipient.
-        return MUST_HANDLE, []
+        # Take, never decline: the run refuses and the core answers by fallback,
+        # so an unreadable file never picks a worker.
+        return TAKE, []
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
                              task.get("requested_worker"))
     # One question only: is every target on the roster? Anything else -- no
@@ -75,7 +75,7 @@ def classify(workspace, task: dict) -> tuple[int, list]:
         return DECLINE, targets
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
-    return MUST_HANDLE, targets
+    return TAKE, targets
 
 
 def _log(workspace, line: str) -> None:
