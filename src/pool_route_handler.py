@@ -15,8 +15,11 @@ The watcher's handler protocol carries the design's recipient rules exactly:
                             run still exits 0 -- the core repairs delivery, it never
                             answers a worker's task (owner rule). Every real run
                             re-delivers marked tasks (oldest first, bounded) BEFORE
-                            its own, so the next event is the retry driver;
-                            `--retry-pass` is the same pass, run by hand.
+                            its own, so the next event is the retry driver.
+
+A declined event queues no real run, so the watcher drives the same pass over
+`--retry-pass` on that branch too: a host whose traffic is all unbound would
+otherwise never re-deliver deferred work. The probe itself stays read-only.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -49,6 +52,10 @@ ROUTING_KEYS = ("id", "channel_id", "source", "access_tier", "requested_worker")
 RETRY_LIMIT = 20
 
 _UNSET = object()
+
+# Said on stderr, which the watcher's own log keeps: a deferral with no marker
+# is a deferral no retry pass can find, and silence there reads as recovered.
+UNMARKED_NOTICE = "pool-route-handler: DEFERRED WITHOUT RETRY MARKER"
 
 
 def read_task(task_file: str) -> dict:
@@ -161,9 +168,13 @@ def _defer(ws, task_id: str, reason: str) -> int:
         d.mkdir(parents=True, exist_ok=True)
         (d / task_id).write_text(time.strftime("%Y-%m-%dT%H:%M:%S ") + reason + "\n")
     except OSError as e:
-        # The marker is a convenience for the retry pass; its absence must not
-        # turn into a non-zero exit that hands the task to the core.
+        # A non-zero exit here would hand the task to the core, so the exit stays
+        # 0 and the lost recovery is announced instead of being inferred later.
         _log(ws, f"{task_id}: deferred WITHOUT marker ({e}): {reason}")
+        print(f"{UNMARKED_NOTICE} {task_id}: no retry marker under "
+              f"{retry_dir(ws)} ({e}); automatic retry is OFF for this task "
+              "until that path is writable and the watcher re-sweeps tasks/",
+              file=sys.stderr)
         return 0
     _log(ws, f"{task_id}: deferred for retry: {reason}")
     return 0
