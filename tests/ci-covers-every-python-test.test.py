@@ -20,27 +20,50 @@ CI = REPO / ".github" / "workflows" / "ci.yml"
 COVGATE = REPO / "scripts" / "coverage-gate.sh"
 
 
-def ci_find_roots():
-    """The roots CI actually passes to `find`, read from the wiring itself.
+def _find_roots_in(wiring: Path):
+    """The roots the `find ... -name '*.test.py'` in ONE file actually passes.
 
-    Hardcoding them here restates the contract instead of checking it: the
-    binding below was assigned and never read, so dropping a root from CI left
-    this guard green."""
+    Parses the CONSUMER, not the declaration. An earlier version unioned every
+    `roots=(...)` assignment across both files, which was false-green three ways:
+    either file could drop a root and the other masked it, and leaving a dead
+    `roots+=(skills)` beside a hardcoded `find tests` passed while nothing
+    reached skills. A binding that is assigned but not consumed is exactly the
+    defect this guard exists to catch."""
+    text = wiring.read_text()
+    # Skip comments: both files DISCUSS `find tests -name '*.test.py'` in prose
+    # above the real command, and a whole-text search matches the prose first.
+    cmd = [ln for ln in text.splitlines()
+           if not ln.lstrip().startswith("#") and re.search(r"find\s+.+-name\s+'\*\.test\.py'", ln)]
+    if not cmd:
+        raise AssertionError(f"no `find ... -name '*.test.py'` COMMAND in {wiring.name} — "
+                             "the guard cannot assert a discovery it never found")
+    if len(cmd) > 1:
+        raise AssertionError(f"{wiring.name} has {len(cmd)} test-discovery finds; "
+                             "this guard assumes one and would check only part of it")
+    m = re.search(r"find\s+(.+?)\s+-name\s+'\*\.test\.py'", cmd[0])
+    args = m.group(1).strip()
+    var = re.fullmatch(r'"\$\{(\w+)\[@\]\}"', args)
+    if not var:
+        return {a.strip('"\'') for a in args.split() if not a.startswith("-")}
+    name = var.group(1)
     roots = set()
-    for wiring in (CI, COVGATE):
-        text = wiring.read_text()
-        for m in re.finditer(r"(?:^|\s)_?\w*roots\+?=\(([^)]*)\)", text):
-            roots |= {t for t in m.group(1).split() if t and not t.startswith("$")}
+    for a in re.finditer(rf"{re.escape(name)}\+?=\(([^)]*)\)", text):
+        roots |= {t for t in a.group(1).split() if t and not t.startswith("$")}
     return roots
 
 
+def ci_find_roots():
+    """Per-file root sets, keyed by wiring file. Never unioned: each runner must
+    independently reach every required root."""
+    return {w.name: _find_roots_in(w) for w in (CI, COVGATE)}
+
+
 def discovered_by_find():
-    """What CI's own find roots reach."""
-    roots = ci_find_roots()
-    if not roots:
-        raise AssertionError(
-            "could not read any find root out of %s or %s — the guard cannot "
-            "assert coverage it never parsed" % (CI.name, COVGATE.name))
+    """What EVERY runner's find roots reach (intersection is the honest floor)."""
+    per_file = ci_find_roots()
+    if not per_file or not all(per_file.values()):
+        raise AssertionError(f"a wiring file passes no find roots: {per_file}")
+    roots = set.intersection(*per_file.values())
     found = set()
     for root in sorted(roots):
         found |= {str(Path(p)) for p in glob.glob(f"{root}/**/*.test.py", recursive=True)}
