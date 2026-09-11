@@ -131,18 +131,47 @@ def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     return None
 
 
-# Absent SUTANDO_INSTANCE_ID this process IS the core — the single-instance
-# contract every other runtime resource already reads (runtime-api/rundir.py).
 CORE_RECIPIENT = "core"
+
+
+def _runtime_default_instance() -> str:
+    """The runtime's spelling of the single-instance world, read from the module
+    that owns it (rundir.instance_id() returns it for an unset variable).
+
+    src/runtime-api is not a package, so it is loaded by path; a second copy of
+    the literal here is how the two spellings would drift apart.
+    """
+    import importlib.util
+    src = Path(__file__).resolve().parent / "runtime-api" / "instance_key.py"
+    spec = importlib.util.spec_from_file_location("_pool_delivery_instance_key", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.DEFAULT_INSTANCE
+
+
+DEFAULT_INSTANCE = _runtime_default_instance()
 
 # Third answer for --held, kept out of the 0/1 pair so an unreadable delivery
 # tree cannot be read as "nobody holds this".
 HELD_UNKNOWN = 2
 
 
+def recipient_for_instance(instance_id: str | None) -> str:
+    """The delivery folder a runtime instance id names — the ONE mapping between
+    the two vocabularies.
+
+    The canonical instance arrives two ways: absent, or the explicit default the
+    runtime exports (instance_registry sets SUTANDO_INSTANCE_ID=default). Both are
+    the core, whose inbox the router addresses as `core`. Every other id is its own.
+    """
+    if not instance_id or instance_id == DEFAULT_INSTANCE:
+        return CORE_RECIPIENT
+    return instance_id
+
+
 def self_recipient(self_id: str | None = None) -> str:
     """The delivery folder this process owns."""
-    return self_id or os.environ.get("SUTANDO_INSTANCE_ID") or CORE_RECIPIENT
+    return recipient_for_instance(self_id or os.environ.get("SUTANDO_INSTANCE_ID"))
 
 
 def held_by_other_instance(workspace, task_id: str,

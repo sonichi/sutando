@@ -13,6 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pool_delivery as pd
 
 
+def _runtime_instance_key():
+    """src/runtime-api is not a package; load its identity module by path so the
+    test reads the runtime's spelling of the canonical instance, not a copy."""
+    import importlib.util
+    src = Path(__file__).resolve().parents[1] / "src" / "runtime-api" / "instance_key.py"
+    spec = importlib.util.spec_from_file_location("_test_instance_key", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class Workspace:
     def __init__(self, root):
         self.root = Path(root)
@@ -412,6 +423,29 @@ class TestHeldByOtherInstance(Base):
             self.assertEqual(pd.self_recipient(), pd.CORE_RECIPIENT)
             self.assertIsNone(pd.held_by_other_instance(self.root, "task-1"))
 
+    def test_the_runtimes_explicit_default_instance_is_the_core(self):
+        """rundir.instance_id() spells the single-instance world "default" and
+        instance_registry exports it; delivery spells the same instance "core".
+        Both name THIS process's inbox — read as a peer, the core stops with its
+        own work unfinished while a real peer's hold still counts."""
+        self._claim("core", "task-1", ".accepted")
+        self._claim("w1", "task-2", ".accepted")
+        with unittest.mock.patch.dict(os.environ, {"SUTANDO_INSTANCE_ID": "default"}):
+            self.assertEqual(pd.self_recipient(), pd.CORE_RECIPIENT)
+            self.assertIsNone(pd.held_by_other_instance(self.root, "task-1"))
+            self.assertEqual(pd.held_by_other_instance(self.root, "task-2"), "w1")
+        self.assertEqual(pd.self_recipient("default"), pd.CORE_RECIPIENT)
+        self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "default"))
+
+    def test_the_default_spelling_is_the_runtimes_not_a_restated_literal(self):
+        """One mapping from runtime instance id to delivery recipient, keyed on
+        the runtime's own constant: a literal would pass today and drift silently."""
+        ik = _runtime_instance_key()
+        self.assertEqual(pd.recipient_for_instance(ik.DEFAULT_INSTANCE), pd.CORE_RECIPIENT)
+        self.assertEqual(pd.recipient_for_instance(None), pd.CORE_RECIPIENT)
+        self.assertEqual(pd.recipient_for_instance(""), pd.CORE_RECIPIENT)
+        self.assertEqual(pd.recipient_for_instance("w1"), "w1")
+
     def test_a_folder_no_recipient_may_be_named_holds_nothing(self):
         self._claim("NOT_A_RECIPIENT", "task-1", ".accepted")
         self.assertIsNone(pd.held_by_other_instance(self.root, "task-1", "core"))
@@ -485,6 +519,16 @@ class TestHeldCli(Base):
         self.assertEqual(self.run_cli("--held", "task-2").returncode, 1)
         self.assertEqual(self.run_cli("--held", "task-1",
                                       env={"SUTANDO_INSTANCE_ID": "w1"}).returncode, 1)
+
+    def test_the_explicit_default_identity_is_the_cores_across_a_real_process(self):
+        """A canonical install exports SUTANDO_INSTANCE_ID=default, not unset."""
+        self.ws.deliver("core", "task-1")
+        self.ws.deliver("w1", "task-2")
+        env = {"SUTANDO_INSTANCE_ID": "default"}
+        r = self.run_cli("--held", "task-1", env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, ""), r.stderr)
+        r = self.run_cli("--held", "task-2", env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "w1"), r.stderr)
 
     def test_a_command_is_still_required_without_held(self):
         self.assertEqual(self.run_cli().returncode, 2)

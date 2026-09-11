@@ -10,8 +10,9 @@
 # WHOSE INBOX IS "OWN" IS PER-INSTANCE. `deliveries/<SUTANDO_INSTANCE_ID>/` is
 # this instance's own inbox, so a sentinel there is NOT a peer holding the task:
 # honoring it would turn the hook off for every task this instance accepted.
-# Unset, the instance IS the core (runtime-api/rundir.py), so the core's folder
-# is its own and a worker's is a peer's — and running as a worker that reverses.
+# Unset — or set to the runtime's explicit `default` (runtime-api/rundir.py) —
+# the instance IS the core, so the core's folder is its own and a worker's is a
+# peer's; running as a worker reverses that.
 # A fix that hardcodes `core` passes every core case and inverts every worker one,
 # so both perspectives are run against the same three folders.
 #
@@ -112,6 +113,34 @@ OUT="$(bash "$HOOK" 2>&1)"
 case "$OUT" in
   *'"decision":"block"'*) ok "a deliveries/core/ <id>.accepted does not exempt" ;;
   *) bad "a deliveries/core/ <id>.accepted does not exempt" "got: ${OUT:0:120}" ;;
+esac
+
+# 5b-5d. THE CANONICAL IDENTITY, SPELLED OUT. rundir.instance_id() and
+# instance_registry export the single-instance world as SUTANDO_INSTANCE_ID=default;
+# delivery spells that instance `core`. Either spelling is the core's OWN inbox —
+# read as a different instance, the core stops with its own work unfinished.
+reset_queue
+: > "$WS/deliveries/core/$TASK_ID.accepted"
+OUT="$(SUTANDO_INSTANCE_ID=default bash "$HOOK" 2>&1)"
+case "$OUT" in
+  *'"decision":"block"'*) ok "SUTANDO_INSTANCE_ID=default: a deliveries/core/ <id>.accepted does not exempt" ;;
+  *) bad "SUTANDO_INSTANCE_ID=default: a deliveries/core/ <id>.accepted does not exempt" "got: ${OUT:0:120}" ;;
+esac
+
+reset_queue
+: > "$WS/deliveries/core/$TASK_ID.accepted"
+OUT="$(SUTANDO_INSTANCE_ID=core bash "$HOOK" 2>&1)"
+case "$OUT" in
+  *'"decision":"block"'*) ok "SUTANDO_INSTANCE_ID=core: a deliveries/core/ <id>.accepted does not exempt" ;;
+  *) bad "SUTANDO_INSTANCE_ID=core: a deliveries/core/ <id>.accepted does not exempt" "got: ${OUT:0:120}" ;;
+esac
+
+reset_queue
+: > "$WS/deliveries/$PEER/$TASK_ID.accepted"
+OUT="$(SUTANDO_INSTANCE_ID=default bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "SUTANDO_INSTANCE_ID=default: a peer's <id>.accepted still exempts" ;;
+  *) bad "SUTANDO_INSTANCE_ID=default: a peer's <id>.accepted still exempts" "still blocks: ${OUT:0:120}" ;;
 esac
 
 # 6. A sentinel for a DIFFERENT id is not this task's — the match must be on the
