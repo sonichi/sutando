@@ -24,6 +24,20 @@ exec 9>&1
 
 set -u
 
+# Defined above the runner because the runner is the one place a worker can
+# still put its name down BEFORE a handler publishes the result it attributes.
+record_worker_done() {
+  # `pending` before the result, `done` after it: the gateway reads the finisher
+  # off this record when it drains results/; the sweep retires only on `done`.
+  local filename="$1" stage="$2" task_id="${filename%.txt}"
+  # The core is not a pool recipient and claims nothing; only a worker flags.
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
+  [ -n "$SUTANDO_PY_BIN" ] || return 1
+  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
+    --workspace "$WORKSPACE_DIR" --recipient "$SUTANDO_INSTANCE_ID" \
+    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
+}
+
 if [ "${1:-}" = "--handler-runner" ]; then
   handler="$2"
   runtime="$3"
@@ -33,7 +47,15 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
-  if "$handler" \
+  WORKSPACE_DIR="$workspace"
+  __REPO_ROOT="$repo"
+  SUTANDO_PY_BIN="${10}"
+  # A handler that runs unattributed publishes a reply the drain cannot name:
+  # a failed record fails the task instead, on the same path a failed handler takes.
+  if ! record_worker_done "$filename" pending; then
+    echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
+    handler_rc=1
+  elif "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
       --task-file "$task_path" \
@@ -192,18 +214,6 @@ claim_disposition() {
 
 # 0 = the task is settled (failure published, or a real answer already exists).
 # 1 = NOT settled: another writer may own the destination, so nothing was touched.
-record_worker_done() {
-  # `pending` before the result, `done` after it: the gateway reads the finisher
-  # off this record when it drains results/; the sweep retires only on `done`.
-  local filename="$1" stage="$2" task_id="${filename%.txt}"
-  # The core is not a pool recipient and claims nothing; only a worker flags.
-  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
-  [ -n "$SUTANDO_PY_BIN" ] || return 1
-  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_delivery.py" \
-    --workspace "$WORKSPACE_DIR" --recipient "$SUTANDO_INSTANCE_ID" \
-    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
-}
-
 publish_terminal_failure() {
   local filename="$1" reason="$2" result temporary rc
   result="$RESULTS_DIR/$filename"
@@ -295,6 +305,9 @@ finish_handler_task() {
       esac
       [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
     elif [ "$rc" -eq 0 ]; then
+      # The handler's result is visible; `done` is what lets a sweep retire it.
+      record_worker_done "$filename" done \
+        || echo "watch-tasks-stream: could not promote the done flag for $filename; the sweep will finish it" >&2
       release_task_claim "$filename" || true
     fi
     rm -f "$settled"
@@ -373,7 +386,8 @@ drain_dispatch_queue() {
       "$RESULTS_DIR" \
       "$__REPO_ROOT" \
       "$WATCH_RUNTIME_DIR/events" \
-      "$(basename "$marker")" &
+      "$(basename "$marker")" \
+      "$SUTANDO_PY_BIN" &
     printf '%s\n' "$!" > "$worker_receipt"
     activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
     running_count=$((running_count + 1))

@@ -6,9 +6,10 @@ and `src/result_claimant.py`, which the gateway consults to stamp an outbound
 reply with the worker that produced it. The contract this suite pins:
 
     ordering    `.pending`, THEN result, THEN `.flag`. A result the drain can
-                see always has its attribution beside it; the reverse
-                (`.pending`, no result) is the recoverable state, and a sweep
-                releases it rather than retiring it.
+                see always has its attribution beside it — on the handler's
+                success path as much as on the reaper's failure path; the
+                reverse (`.pending`, no result) is the recoverable state, and
+                a sweep releases it rather than retiring it.
     atomicity   temp file + rename in the same directory, so a concurrent
                 reader sees the name absent or complete, never half-written.
     isolation   two finishers racing on different tasks do not clobber each
@@ -16,9 +17,9 @@ reply with the worker that produced it. The contract this suite pins:
     bounds      a recipient or task id outside the pool's own grammar is
                 rejected, so no caller can write outside its own claim tree.
 
-Ordering is asserted through the SHIPPED watcher (`src/watch-tasks-stream.sh`,
-whose `publish_terminal_failure` is the worker-side path that publishes a result
-into `results/`) and the SHIPPED drain resolver — not a re-enactment of either.
+Ordering is asserted through the SHIPPED watcher (`src/watch-tasks-stream.sh`:
+its handler runner and `finish_handler_task` on success, `publish_terminal_failure`
+on failure) and the SHIPPED drain resolver — not a re-enactment of either.
 
 Run: python3 tests/pool-done-flag-writer.test.py
 """
@@ -109,6 +110,62 @@ def scenario_the_drain_never_sees_a_result_before_its_flag() -> None:
         beside = [p.name for p in flag.parent.iterdir()] if flag.parent.is_dir() else []
         check("neither a temp file nor the spent `.pending` is left beside it",
               beside == [flag.name], str(beside))
+    finally:
+        seen["stop"] = True
+        h.stop()
+
+
+def scenario_a_successful_handler_is_attributed_before_its_result_is_visible() -> None:
+    """The handler, not the watcher, publishes a successful result — so the
+    watcher's finisher runs only after the drain could already have seen it.
+    The name must be down before the handler is even started, and the record
+    must be promoted once the finisher runs."""
+    print("\nscenario: handler success path, through the shipped watcher and drain")
+    h = Harness()
+    h.extra_env["SUTANDO_INSTANCE_ID"] = WORKER
+    # A handler that answers: the probe says must-handle, the run publishes.
+    h.handler.write_text(
+        '#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && exit 4; done\n'
+        'while [ $# -gt 0 ]; do case "$1" in --task-file) tf="$2"; shift;;'
+        ' --results-dir) rd="$2"; shift;; esac; shift; done\n'
+        'n="$(basename "$tf")"\nsleep 0.3\n'
+        'printf "answered\\n" > "$rd/.$n.tmp" && mv "$rd/.$n.tmp" "$rd/$n"\n')
+    tid = "task-success"
+    result = h.ws / "results" / f"{tid}.txt"
+    seen: dict = {}
+
+    def observe() -> None:
+        while not seen.get("stop"):
+            if result.exists():
+                seen["claimant"] = result_claimant.resolve_claimant(h.ws / "state", tid)
+                seen["stage"] = pool_delivery.flag_stage(h.ws, WORKER, tid)
+                return
+            time.sleep(0.001)
+
+    watcher = threading.Thread(target=observe, daemon=True)
+    try:
+        h.deliver(f"{tid}.txt")
+        h.start()
+        watcher.start()
+        published = wait_for(lambda: result.is_file() and result.stat().st_size > 0)
+        check("the handler published a result", published)
+        seen["stop"] = True
+        watcher.join(10.0)
+        # The reviewer's probe, printed so a control run shows what it measured.
+        print(f"  probe: result_ready={published} stage_at_visibility={seen.get('stage')!r} "
+              f"claimant={seen.get('claimant')!r}")
+        check("the observer caught the result appearing", "claimant" in seen, str(result))
+        check("and this worker's name was ALREADY on it when it did",
+              seen.get("claimant") == WORKER,
+              f"result was visible with claimant={seen.get('claimant')!r}")
+        done = pool_delivery.done_flag(h.ws, WORKER, tid)
+        check("the finisher then promotes the record to `.flag`",
+              wait_for(lambda: pool_delivery.is_done_flag(done)), str(done))
+        check("and nothing but the flag is left in the record's directory",
+              [p.name for p in done.parent.iterdir()] == [done.name],
+              str([p.name for p in done.parent.iterdir()]))
+        check("a drain after the fact still names this worker",
+              result_claimant.resolve_claimant(h.ws / "state", tid) == WORKER)
     finally:
         seen["stop"] = True
         h.stop()
@@ -268,6 +325,7 @@ def scenario_the_cli_entry_point_writes_the_same_flag() -> None:
 
 def main() -> int:
     scenario_the_drain_never_sees_a_result_before_its_flag()
+    scenario_a_successful_handler_is_attributed_before_its_result_is_visible()
     scenario_racing_finishers_do_not_clobber_each_other()
     scenario_a_repeated_finish_is_idempotent()
     scenario_a_crash_after_the_record_is_the_recoverable_half()
