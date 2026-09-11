@@ -5,12 +5,25 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def _stage(td) -> None:
+    """The synthetic tree must carry the production discovery helper.
+
+    `test:py` delegates discovery, so a tree without scripts/ makes it exit 127
+    and every assertion below measures the missing file, not the runner."""
+    dst = Path(td) / "scripts"
+    dst.mkdir(exist_ok=True)
+    shutil.copy2(REPO / "scripts" / "discover-python-tests.sh",
+                 dst / "discover-python-tests.sh")
+
 
 PASSING = 'print("ok")\n'
 STDIN_EATER = 'import sys\nsys.stdin.read()\nprint("ate stdin")\n'
@@ -27,6 +40,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
     def _run(self, files: dict[str, str]) -> subprocess.CompletedProcess:
         """Execute the SHIPPED runner in a temp tree holding `files`."""
         with tempfile.TemporaryDirectory() as td:
+            _stage(td)
             tests = Path(td) / "tests"
             tests.mkdir()
             for name, body in files.items():
@@ -78,8 +92,12 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0,
                             "a run that discovered zero test files exited 0 — "
                             "'ran nothing' must not report as 'all passed'")
-        self.assertIn("0 test files discovered", r.stdout,
-                      "the zero case must say so, not just fail")
+        self.assertNotIn("all passed", r.stdout,
+                         "a run that discovered nothing claimed a green run")
+        # Two layers refuse the zero case: the helper (exit 3) and the runner's
+        # own n==0 branch. Pin the property, not whichever layer got there first.
+        self.assertRegex(r.stdout, r"0 test files discovered|DISCOVERY exited",
+                         "the zero case must say WHY it refused, not just fail")
 
     def test_zero_discovery_is_distinguishable_from_a_real_failure(self) -> None:
         """Both exit nonzero, so the exit code alone cannot separate them."""
@@ -106,6 +124,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         """A `find` that prints some paths then exits nonzero (unreadable subdir) must
         not yield a green run — a false-complete result carrying a reassuring count."""
         with tempfile.TemporaryDirectory() as td:
+            _stage(td)
             (Path(td) / "tests").mkdir()
             (Path(td) / "tests" / "a.test.py").write_text(PASSING)
             bin_ = Path(td) / "bin"
@@ -142,6 +161,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         """A `sort` that prints some paths then exits nonzero must not yield a green run —
         the same false-complete hole as partial discovery, one pipeline stage later."""
         with tempfile.TemporaryDirectory() as td:
+            _stage(td)
             (Path(td) / "tests").mkdir()
             for i in range(3):
                 (Path(td) / "tests" / f"z{i}.test.py").write_text(PASSING)
@@ -166,6 +186,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
     def test_node_modules_is_excluded(self) -> None:
         """A vendored *.test.py must not be executed by the local runner."""
         with tempfile.TemporaryDirectory() as td:
+            _stage(td)
             tests = Path(td) / "tests"
             (tests / "node_modules" / "pkg").mkdir(parents=True)
             (tests / "a.test.py").write_text(PASSING)
@@ -188,6 +209,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         """And the skills root is really searched: a failing suite under a
         skill must be run and must fail the run, not be silently skipped."""
         with tempfile.TemporaryDirectory() as td:
+            _stage(td)
             tests = Path(td) / "tests"
             tests.mkdir()
             (tests / "a.test.py").write_text(PASSING)

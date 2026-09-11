@@ -13,8 +13,12 @@ guard -- had never run in CI.
 import glob
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from active_code import active_text  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
@@ -41,12 +45,7 @@ def discovered_by_find():
 
 def _uncommented(text: str) -> str:
     """Lines with comments removed. A commented-out invocation is not a caller."""
-    out = []
-    for ln in text.splitlines():
-        if ln.lstrip().startswith("#"):
-            continue
-        out.append(ln.split(" #", 1)[0])
-    return "\n".join(out)
+    return active_text(text)
 
 
 def named_in_workflows():
