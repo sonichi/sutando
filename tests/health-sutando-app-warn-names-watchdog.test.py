@@ -55,10 +55,22 @@ SWIFT = REPO / "src" / "Sutando" / "main.swift"
 ck("the app source exists", SWIFT.exists())
 sw = SWIFT.read_text() if SWIFT.exists() else ""
 ck("checkWatcher() is defined there", "func checkWatcher()" in sw)
+
+# Scope the premise checks to checkWatcher's OWN body. File-wide substring
+# presence would stay green if the guard moved to another function entirely.
+_start = sw.find("func checkWatcher()")
+_next = re.search(r"\n    func ", sw[_start + 1:]) if _start != -1 else None
+body = sw[_start:_start + 1 + (_next.start() if _next else len(sw))] if _start != -1 else ""
+ck("its body is isolatable (not the whole file)",
+   0 < len(body) < len(sw) * 0.5)
+
 ck("and it really pgreps for the watcher",
-   re.search(r'"-f",\s*"watch-tasks"', sw) is not None)
-ck("cliIsWorking() gates the poke, so the message's scoping is true",
-   "if cliIsWorking()" in sw)
+   re.search(r'"-f",\s*"watch-tasks"', body) is not None)
+ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in the file",
+   "if cliIsWorking()" in body)
+# A guard whose body was emptied would still match the line above.
+ck("and that guard actually returns early",
+   re.search(r"if cliIsWorking\(\)\s*\{[^}]*\breturn\b", body, re.S) is not None)
 
 print("\nall ok" if fails == 0 else f"\n{fails} FAILED")
 sys.exit(0 if fails == 0 else 1)
