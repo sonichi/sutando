@@ -23,6 +23,9 @@ build() {                       # build <sandbox> [perturbation]
   # Stubs FIRST. A perturbation that aborts below used to return with bin/ empty,
   # and run()'s PATH fell through to the real pkill — killing the host's watchers.
   printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$sb/src/startup.sh"
+  # Executing this is the ONLY way the marker appears, so its absence is evidence
+  # rather than a regex that can never match. qingyun-wu proved the old one vacuous.
+  printf '#!/bin/sh\necho "STUB-WATCHER-EXECUTED"\n' > "$sb/src/watch-tasks-stream.sh"
   printf '#!/bin/sh\necho "STUB-PKILL $*"\nexit 0\n'  > "$sb/bin/pkill"
   for c in pgrep launchctl ngrok lsof id open killall osascript tmux nohup; do
     printf '#!/bin/sh\nexit 1\n' > "$sb/bin/$c"
@@ -36,7 +39,7 @@ build() {                       # build <sandbox> [perturbation]
     [ -x "/bin/$c" ] && ln -sf "/bin/$c" "$sb/bin/$c"
     [ -x "/usr/bin/$c" ] && ln -sf "/usr/bin/$c" "$sb/bin/$c"
   done
-  chmod +x "$sb/src/startup.sh" "$sb/bin/"*
+  chmod +x "$sb/src/startup.sh" "$sb/src/watch-tasks-stream.sh" "$sb/bin/"*
   case "$perturb" in
     disable-warning)
       "$REPO_PY" - "$sb/src/restart.sh" <<'PY' || return 1
@@ -103,8 +106,8 @@ assert_warning_behaviour "$out_head"; ck "warning is EMITTED, names the re-arm, 
 # watcher, and nothing in the captured stream does.
 grep -q "watch-tasks-stream.sh" <<<"$out_head"
 ck "the warning names the re-arm command" $?
-! grep -qE "^STUB-(PKILL )?.*exec.*watch-tasks-stream" <<<"$out_head"
-ck "restart.sh itself starts no watcher (its own claim, on its own output)" $?
+! grep -q "STUB-WATCHER-EXECUTED" <<<"$out_head"
+ck "restart.sh itself starts no watcher (the stub would announce itself)" $?
 
 # --- arm 3: THE CONTROL — disable the warning, the assertion must FAIL --------
 # The perturbation must APPLY. Without this check the arm below passes for the
