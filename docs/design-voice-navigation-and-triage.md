@@ -148,17 +148,35 @@ one on 8080, toggled with **Ctrl+F** at any time and closed the same way.
 Speaking is what makes the notch cheap enough to use mid-task: a request costs a
 sentence rather than a detour.
 
-### 3. Highlight resolution — what "this" refers to
+### 3. Pointing — anchoring to a place on the screen
 
-The owner does not read a URL aloud or type a path. They highlight something and
-say *"open this"*, which has to be turned into an absolute reference.
+Some context is not a separate thing to fetch; it is *this part, here*. Marking
+which part, on the owner's own screen, is its own capability and runs in both
+directions.
+
+![A drafted post with one sentence circled on screen and a callout attached to
+it.](design-voice-navigation-and-triage-pointing.png)
+
+**Outward.** `point_at` takes a plain-words query — "the commit button", "where
+do I run the app", or a sentence in a draft — captures the display, locates the
+target, and flies a marker to it with a label. The resolution is the Accessibility
+tree first and a vision model only when the tree is empty or sparse
+([ADR-0001](adr/0001-pointer-teacher-brain.md)). The command reaches the overlay
+as `state/pointer-cmd.json` (`{nx, ny, label, say, ts}`); a monotonic `ts` decides
+which of two overlapping commands wins. Above, one sentence in the draft is
+circled and annotated with what makes it the conclusion — a remark about a span,
+attached to that span, rather than a paragraph the owner has to map back onto the
+text themselves.
+
+**Inward.** The same anchoring in reverse: the owner highlights something and
+says *"open this"* rather than reading a URL aloud. Resolving it runs a fallback
+chain — a Discord selection read first, since the visible label and the real
+`href` often differ; a vision read of the highlighted text if that finds nothing;
+the clipboard only when the owner says they copied something.
 
 ![The URL selected in the Discord message.](design-voice-navigation-and-triage-highlight.png)
 
-A fallback chain, in order: a Discord selection read first, since the visible
-label and the real `href` often differ; a vision read of the highlighted text if
-that finds nothing; the clipboard only when the owner says they copied something.
-Asking them to copy a link they have already highlighted would hand the work
+Asking the owner to copy a link they have already highlighted would hand the work
 back, which is the trip this exists to remove.
 
 ### 4. In-channel navigation — what is already in this channel
