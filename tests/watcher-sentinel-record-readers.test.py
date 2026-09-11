@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Every reader agrees on one sentinel contract — BEFORE a writer emits it.
+"""Every reader agrees with the WRITER on one sentinel contract.
 
 WHY THIS EXISTS. The ownership confirmation in src/restart.sh needs the sentinel
-to be an identity RECORD: a pid on line 1, then `key=value` claims. The writer
-that emits one ships separately (#4174), and readers must land first — a reader
-that `int()`s the whole file turns every recorded watcher into `unknown`
+to be an identity RECORD: a pid on line 1, then `key=value` claims. A reader that
+`int()`s the whole file turns every recorded watcher into `unknown`
 (services_status) and `warn (unreadable PID sentinel ...)` with restart advice
-(health-check). That is a silent, always-on break of the liveness signal, and it
-would begin the moment the writer landed, not when this file did.
+(health-check) — a silent, always-on break of the liveness signal, and it begins
+the moment a writer emits a record.
 
-WHAT IT PINS. Records are published into a scratch state dir in the grammar
-src/watcher_sentinel.sh documents, and the PRODUCTION python readers are then
-called on them. Nothing here re-implements a reader, so a divergence between
-them is what fails.
+WHAT IT PINS. The PRODUCTION shell writer publishes into a scratch state dir and
+the PRODUCTION python readers are then called on that file. Nothing here
+re-implements either side, so a divergence between them is what fails.
 
   A) util_paths.read_sentinel_record / read_sentinel_pid on a real record
   B) ...on the LEGACY pid-only sentinel, which is what a not-yet-restarted
@@ -37,7 +35,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import tempfile
 from pathlib import Path
 
@@ -64,16 +61,13 @@ def _load(mod_name: str, rel: str):
 def write_record(pid_file: Path, pid: int, *, instance: str = "", inc: str = "inc-1",
                  code: str = "/x/src/watch-tasks-stream.sh", ver: str = "abc1234",
                  ws: str = "/x/ws") -> subprocess.CompletedProcess:
-    """Publish a record in the grammar src/watcher_sentinel.sh documents.
-
-    The shell WRITER lands with #4174; until it does, the bytes are composed here
-    from that header's stated shape (pid on line 1, `key=value` from line 2) and
-    the assertions below are what the writer must then satisfy.
-    """
-    pid_file.write_text(
-        f"{pid}\ninstance={instance}\nincarnation={inc}\ncode_path={code}\n"
-        f"version={ver}\nstarted_at={int(time.time())}\nworkspace={ws}\n")
-    return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    """Publish through the PRODUCTION writer — never a python re-spelling of it."""
+    return subprocess.run(
+        ["bash", "-c",
+         f'. "{SENTINEL_SH}"\n'
+         f'sentinel_write_record "{pid_file}" "{pid}" "{instance}" "{inc}" '
+         f'"{code}" "{ver}" "{ws}"'],
+        capture_output=True, text=True)
 
 
 # --- A/B/C: the shared reader ------------------------------------------------
@@ -83,7 +77,7 @@ def case_reader(state: Path) -> None:
 
     pf = state / "watch-tasks-stream.pid"
     r = write_record(pf, 4242, inc="inc-A", ver="deadbee", ws=str(state))
-    check("a record sentinel was published", r.returncode == 0 and pf.exists(),
+    check("the production shell writer published a record", r.returncode == 0 and pf.exists(),
           f"rc={r.returncode} stderr={r.stderr[:120]!r}")
     if not pf.exists():
         return

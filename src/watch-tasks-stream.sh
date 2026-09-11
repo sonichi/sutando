@@ -436,6 +436,12 @@ WATCHER_INCARNATION="$(date +%s)-$$-${RANDOM:-0}${RANDOM:-0}"
 WATCHER_CODE_PATH="$__SCRIPT_DIR/$(basename "$0")"
 WATCHER_VERSION="$(git -C "$__REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
 [ -n "$WATCHER_VERSION" ] || WATCHER_VERSION="unknown"
+# BEFORE the record is published: the record is what every readiness gate waits
+# on, and a start that died mid-publish is exactly what this log is read for.
+mkdir -p "$WORKSPACE_DIR/logs" 2>/dev/null || true
+printf '%s %s %s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "${WATCHER_INSTANCE:--}" "$WATCHER_INCARNATION" "$$" "$WATCHER_CODE_PATH" \
+  "$WATCHER_VERSION" "$PID_FILE" >> "$WORKSPACE_DIR/logs/watcher-starts.log" 2>/dev/null || true
 # Under the lock so a peer's cleanup cannot claim this record mid-publish. A
 # failed write is fatal: an unrecorded watcher is one no signaller may stop.
 if ! sentinel_lock_acquire "$PID_FILE"; then
@@ -449,11 +455,6 @@ if ! sentinel_write_record "$PID_FILE" "$$" "$WATCHER_INSTANCE" "$WATCHER_INCARN
   exit 1
 fi
 sentinel_lock_release "$PID_FILE"
-# One line per start, so "which code is this pid running" is a read, not a hunt.
-mkdir -p "$WORKSPACE_DIR/logs" 2>/dev/null || true
-printf '%s %s %s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  "${WATCHER_INSTANCE:--}" "$WATCHER_INCARNATION" "$$" "$WATCHER_CODE_PATH" \
-  "$WATCHER_VERSION" "$PID_FILE" >> "$WORKSPACE_DIR/logs/watcher-starts.log" 2>/dev/null || true
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
