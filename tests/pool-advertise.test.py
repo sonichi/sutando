@@ -151,6 +151,32 @@ class AdvertisementFile(unittest.TestCase):
         self.assertNotIn(True, [n.startswith(".pool-advertisement.") for n in names])
         self.assertIn("pool-advertisement.json", names)
 
+    def test_the_cli_write_flag_writes_and_prints_the_path(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pa.main(["--workspace", str(self.ws), "--write"])
+        self.assertEqual(rc, 0)
+        self.assertIn("pool-advertisement.json", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["profile_patch"]["workers"]["w1"]["label"], "alpha")
+        self.assertTrue((self.ws / "state" / "pool-advertisement.json").exists())
+
+    def test_a_failed_replace_leaves_neither_file_nor_temp(self):
+        import os
+        real = os.replace
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        pa.os.replace = boom
+        try:
+            with self.assertRaises(OSError):
+                pa.write_advertisement(self.ws)
+        finally:
+            pa.os.replace = real
+        names = [p.name for p in (self.ws / "state").iterdir()]
+        self.assertNotIn("pool-advertisement.json", names)
+        self.assertFalse(any(n.startswith(".pool-advertisement.") for n in names))
+
     def test_no_roster_means_no_file(self):
         empty = Path(tempfile.mkdtemp())
         with self.assertRaises(FileNotFoundError):
