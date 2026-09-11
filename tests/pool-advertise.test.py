@@ -47,11 +47,11 @@ class TestStatusComesFromState(Base):
         self.assertEqual(snap["dead_cores"], [W2])
         self.assertEqual(snap["ts"], 1000)
 
-    def test_recovering_is_neither_so_the_broker_reads_it_available(self):
+    def test_recovering_is_not_answering_never_available(self):
         r = self.roster({W1: {"state": "recovering"}})
         snap = pa.snapshot(r, now=1)
         self.assertEqual(snap["live_cores"], [])
-        self.assertEqual(snap["dead_cores"], [])
+        self.assertEqual(snap["dead_cores"], [W1])  # not answering now; never "available"
 
     def test_the_roster_version_rides_along(self):
         r = self.roster({W1: {"state": "live"}})
@@ -243,6 +243,49 @@ class EnsureAtBoot(unittest.TestCase):
     def test_boot_calls_ensure(self):
         boot = (Path(__file__).resolve().parent.parent / "src" / "startup.sh").read_text()
         self.assertIn('pool_advertise.py" --workspace "$WORKSPACE" --ensure', boot)
+
+
+class TheReportedLeg(unittest.TestCase):
+    ROSTER = {"version": 7, "config_version": 3,
+              "workers": {"w1": {"label": "Mars", "state": "live", "runtime": "claude"},
+                          "w2": {"label": "Beta", "state": "recovering"},
+                          "w3": {"label": "Old", "state": "retired"}},
+              "bindings": {"!a:x": "w1"}}
+
+    def test_facts_verbatim_and_applied_config_apart(self):
+        rep = pa.report(self.ROSTER, now=5)
+        self.assertEqual(rep["ts"], 5)
+        self.assertEqual(rep["roster_version"], 7)
+        self.assertEqual(rep["workers"], [{"id": "w1", "state": "live", "runtime": "claude"},
+                                          {"id": "w2", "state": "recovering"},
+                                          {"id": "w3", "state": "retired"}])
+        self.assertEqual(rep["applied"], {"config_version": 3,
+                                          "labels": {"w1": "Mars", "w2": "Beta"},
+                                          "bindings": {"!a:x": {"instance": "w1", "instances": ["w1"], "pinned": True}}})
+
+    def test_a_roster_without_a_config_version_reports_none(self):
+        self.assertIsNone(pa.report({"version": 1, "workers": {}, "bindings": {}}, now=1)["applied"]["config_version"])
+
+    def test_recovering_is_not_answering_in_the_compat_view(self):
+        snap = pa.snapshot(self.ROSTER, now=5)
+        self.assertEqual(snap["live_cores"], ["w1"])
+        self.assertEqual(snap["dead_cores"], ["w2"])  # never "available"
+
+    def test_the_compat_bodies_are_projections_of_the_report(self):
+        rep = pa.report(self.ROSTER, now=5)
+        snap = pa.snapshot(self.ROSTER, now=5)
+        self.assertEqual(snap["bindings"], rep["applied"]["bindings"])
+        self.assertEqual(snap["roster_version"], rep["roster_version"])
+        self.assertEqual(pa.profile_workers(self.ROSTER),
+                         {"w1": {"label": "Mars", "runtime": "claude"}, "w2": {"label": "Beta"}})
+
+    def test_the_file_carries_the_report_beside_the_compat_bodies(self):
+        ws = Path(tempfile.mkdtemp())
+        pr.compile_roster(ws, {"w1": {"label": "alpha", "state": "recovering"}}, {}, version=2)
+        got = json.loads(pa.write_advertisement(ws, now=9).read_text())
+        self.assertEqual(sorted(got), ["profile_workers", "report", "ts", "workers"])
+        self.assertEqual(got["report"]["workers"], [{"id": "w1", "state": "recovering"}])
+        self.assertEqual(got["workers"]["dead_cores"], ["w1"])
 
 
 if __name__ == "__main__":

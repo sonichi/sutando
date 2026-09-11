@@ -31,7 +31,8 @@ import pool_roster as pr  # noqa: E402
 # The broker's field names are the affinity era's; the roster is this design's.
 # Translating here keeps that vocabulary out of everything else.
 ACTIVE_STATES = ("live",)
-DEAD_STATES = ("abandoned",)
+# Not answering now: a recovering worker is shown as such, never as "available".
+DEAD_STATES = ("abandoned", "recovering")
 
 
 def _rows(roster: dict) -> dict:
@@ -49,41 +50,58 @@ def bindings(roster: dict) -> dict:
     return out
 
 
-def snapshot(roster: dict, now=None) -> dict:
-    """The `POST /v1/workers` body: which workers are running.
-
-    `recovering` is deliberately neither active nor dead — the broker renders
-    an unlisted worker as "available", which is what a restarting worker is.
-    """
-    rows = _rows(roster)
-    live, dead = [], []
-    for wid, row in sorted(rows.items()):
-        state = (row or {}).get("state")
-        if state in ACTIVE_STATES:
-            live.append(wid)
-        elif state in DEAD_STATES:
-            dead.append(wid)
-    return {"ts": int(now if now is not None else time.time()),
-            "live_cores": live, "dead_cores": dead,
-            "bindings": bindings(roster),
-            "roster_version": roster.get("version")}
-
-
-def profile_workers(roster: dict) -> dict:
-    """The profile's `workers` map: what each worker is CALLED.
-
-    Retired workers are omitted from both bodies — the broker treats any id it
-    has metadata for as at least "available", so leaving one here would keep a
-    deleted worker on the picker forever.
-    """
+def _labels(roster: dict) -> dict:
+    """What each non-retired worker is called here, as applied by this runtime."""
     out = {}
     for wid, row in sorted(_rows(roster).items()):
         row = row or {}
         if row.get("state") == "retired":
             continue
-        meta = {"label": str(row.get("label") or wid)}
+        out[wid] = str(row.get("label") or wid)
+    return out
+
+
+def report(roster: dict, now=None) -> dict:
+    """The reported leg: runtime facts, plus how far this runtime has applied
+    the user's configuration. Never a source of names or bindings — the broker
+    files `applied` as last-reported and keeps the user's intent apart from it."""
+    workers = []
+    for wid, row in sorted(_rows(roster).items()):
+        row = row or {}
+        w = {"id": wid, "state": str(row.get("state"))}
         if row.get("runtime"):
-            meta["runtime"] = str(row["runtime"])
+            w["runtime"] = str(row["runtime"])
+        workers.append(w)
+    return {"ts": int(now if now is not None else time.time()),
+            "roster_version": roster.get("version"),
+            "workers": workers,
+            "applied": {"config_version": roster.get("config_version"),
+                        "labels": _labels(roster),
+                        "bindings": bindings(roster)}}
+
+
+def snapshot(roster: dict, now=None) -> dict:
+    """The `POST /v1/workers` body today's broker accepts, projected from the
+    report: live ids, ids not answering (abandoned or recovering), bindings."""
+    rep = report(roster, now)
+    live = [w["id"] for w in rep["workers"] if w["state"] in ACTIVE_STATES]
+    dead = [w["id"] for w in rep["workers"] if w["state"] in DEAD_STATES]
+    return {"ts": rep["ts"], "live_cores": live, "dead_cores": dead,
+            "bindings": rep["applied"]["bindings"],
+            "roster_version": rep["roster_version"]}
+
+
+def profile_workers(roster: dict) -> dict:
+    """The profile card's `workers` map today's broker accepts, projected from
+    the report's applied labels. Retired workers are omitted — the broker treats
+    any id it has metadata for as at least "available"."""
+    rep = report(roster)
+    runtime = {w["id"]: w.get("runtime") for w in rep["workers"]}
+    out = {}
+    for wid, label in rep["applied"]["labels"].items():
+        meta = {"label": label}
+        if runtime.get(wid):
+            meta["runtime"] = runtime[wid]
         out[wid] = meta
     return out
 
@@ -93,7 +111,8 @@ def advertisement(workspace, now=None) -> dict:
     roster = pr.load_roster(workspace)
     if roster is None:
         raise FileNotFoundError("no roster to advertise")
-    return {"workers_snapshot": snapshot(roster, now),
+    return {"report": report(roster, now),
+            "workers_snapshot": snapshot(roster, now),
             "profile_patch": {"workers": profile_workers(roster)}}
 
 
@@ -113,6 +132,7 @@ def write_advertisement(workspace, now=None) -> Path:
     path = advertisement_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps({"ts": ad["workers_snapshot"]["ts"],
+                       "report": ad["report"],
                        "workers": ad["workers_snapshot"],
                        "profile_workers": ad["profile_patch"]["workers"]},
                       indent=2, sort_keys=True)
