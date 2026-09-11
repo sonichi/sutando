@@ -75,6 +75,23 @@ class TestResolvedCredentialService(unittest.TestCase):
         with mock.patch.object(ks, "keychain_service_exists", return_value=False):
             self.assertIsNone(ks.resolved_credential_service("/z/.claude-sutando"))
 
+    def test_another_hosts_scoped_item_never_counts_as_this_hosts(self):
+        # Pro's control (2026-09-11): a fleet keychain can carry OTHER hosts'
+        # scoped items (a shared login keychain, or several config dirs tried
+        # on one machine) -- their mere presence must never make THIS config
+        # dir look configured. resolved_credential_service only ever checks
+        # the ONE name it computes from the given config_dir, by construction,
+        # but the point is worth pinning: a keychain full of unrelated scoped
+        # items, with neither this config dir's own item nor the vanilla one
+        # present, must still refuse.
+        config_dir = "/this/hosts/own/.claude-sutando"
+        this_digest = ks.scoped_keychain_service(config_dir)
+        unrelated = {"Claude Code-credentials-b0888206", "Claude Code-credentials-b23ac34d",
+                    "Claude Code-credentials-f0daa6b6"}
+        assert this_digest not in unrelated  # sanity: the fixture must actually be unrelated
+        with mock.patch.object(ks, "keychain_service_exists", side_effect=lambda s: s in unrelated):
+            self.assertIsNone(ks.resolved_credential_service(config_dir))
+
 
 if __name__ == "__main__":
     unittest.main()
