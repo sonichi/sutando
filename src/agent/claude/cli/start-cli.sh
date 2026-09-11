@@ -821,14 +821,16 @@ if ! command -v tmux > /dev/null 2>&1; then
   # The only shape whose exec IS the core, so it cannot verify first; pair the
   # publish with the same failure path the sentinel already uses.
   if stash_active_runtime; then publish_active_runtime; fi
-  # errexit would exit on the failed exec before the restore below is reached;
-  # drop it just around the exec and re-raise the exec's own status.
+  # A failed exec ENDS a non-interactive bash; `set +e` does not change that, so
+  # without execfail every line below is dead and the marker stays published.
+  shopt -s execfail
   set +e
   exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/startup"
   _exec_rc=$?
   set -e
+  shopt -u execfail
   restore_shutdown_sentinel
   restore_active_runtime
   echo "  ⚠ claude failed to exec — shutdown sentinel restored, no core is live." >&2

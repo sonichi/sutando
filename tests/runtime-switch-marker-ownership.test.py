@@ -284,6 +284,50 @@ class MarkerOwnership(unittest.TestCase):
                     self.assertIsNone(got, f"{name} published on a FAILED start — the "
                                            f"optimistic-write defect")
 
+    def test_the_bare_rollback_survives_a_REAL_failed_exec(self):
+        """qingyun-wu at e923f0bfc: the test above concatenates the publish and
+        restore slices and omits the exec between them, so it cannot see that a
+        failed exec ENDS a non-interactive bash and every line after it is dead.
+        `set +e` does not change that; only `shopt -s execfail` does.
+
+        This drives ONE contiguous region containing the exec, with a `claude`
+        that passes `command -v` and fails to exec (bad interpreter) — the exact
+        shape the reviewer used.
+        """
+        src = CLAUDE.read_text(encoding="utf-8")
+        start = src.index("  stash_shutdown_sentinel")
+        end = src.index('exit "$_exec_rc"', start) + len('exit "$_exec_rc"')
+        region = src[start:end]
+        self.assertIn("exec claude", region,
+                      "the slice must CONTAIN the exec — omitting it is the defect")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "claude").write_text("#!/nonexistent/interp\n")
+            (d / "claude").chmod(0o755)
+            marker = d / "marker"
+            marker.write_text("PUBLISHED")
+            script = (
+                "#!/bin/bash\nset -e\n"
+                f'export PATH="{d}:$PATH"\n'
+                'SESSION=x; SETTINGS_ARGS=()\n'
+                'stash_shutdown_sentinel() { :; }; clear_shutdown_sentinel() { :; }\n'
+                'restore_shutdown_sentinel() { :; }\n'
+                'stash_active_runtime() { return 0; }\n'
+                'publish_active_runtime() { :; }\n'
+                f'restore_active_runtime() {{ rm -f "{marker}"; }}\n'
+                + region + "\n"
+            )
+            sp = d / "bare.sh"
+            sp.write_text(script)
+            r = subprocess.run(["bash", str(sp)], capture_output=True, text=True)
+            # Read INSIDE the with-block: TemporaryDirectory deletes the tree on
+            # exit, so a marker.exists() after it is False no matter what ran.
+            survived = marker.exists()
+        self.assertFalse(survived,
+                         f"the rollback never ran, so the marker stayed published "
+                         f"after a failed exec (rc={r.returncode}, "
+                         f"stderr={r.stderr.strip()[:160]!r})")
+
     def test_the_bare_path_publishes_on_success_and_restores_on_failure(self):
         """Its exec IS the core, so it cannot verify first; the pairing is the proof.
         absent != cleared for a marker, so the failure arm must UNLINK."""
