@@ -20,23 +20,28 @@ CI = REPO / ".github" / "workflows" / "ci.yml"
 COVGATE = REPO / "scripts" / "coverage-gate.sh"
 
 
+def _uncommented(text: str) -> str:
+    """Shell/YAML lines with comments removed. Applied to BOTH halves: an earlier
+    cut stripped comments only while locating the `find`, then scanned the raw
+    text for assignments, so `# roots+=(skills)` still counted."""
+    out = []
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        out.append(ln.split(" #", 1)[0])
+    return "\n".join(out)
+
+
 def _find_roots_in(wiring: Path):
     """The roots the `find ... -name '*.test.py'` in ONE file actually passes.
 
-    Parses the CONSUMER, not the declaration. An earlier version unioned every
-    `roots=(...)` assignment across both files, which was false-green three ways:
-    either file could drop a root and the other masked it, and leaving a dead
-    `roots+=(skills)` beside a hardcoded `find tests` passed while nothing
-    reached skills. A binding that is assigned but not consumed is exactly the
-    defect this guard exists to catch."""
-    text = wiring.read_text()
-    # Skip comments: both files DISCUSS `find tests -name '*.test.py'` in prose
-    # above the real command, and a whole-text search matches the prose first.
+    Parses the CONSUMER, not the declaration, and honours assignment ORDER: a
+    later `roots=(...)` resets what earlier `+=` appended."""
+    text = _uncommented(wiring.read_text())
     cmd = [ln for ln in text.splitlines()
-           if not ln.lstrip().startswith("#") and re.search(r"find\s+.+-name\s+'\*\.test\.py'", ln)]
+           if re.search(r"find\s+.+-name\s+'\*\.test\.py'", ln)]
     if not cmd:
-        raise AssertionError(f"no `find ... -name '*.test.py'` COMMAND in {wiring.name} — "
-                             "the guard cannot assert a discovery it never found")
+        raise AssertionError(f"no `find ... -name '*.test.py'` COMMAND in {wiring.name}")
     if len(cmd) > 1:
         raise AssertionError(f"{wiring.name} has {len(cmd)} test-discovery finds; "
                              "this guard assumes one and would check only part of it")
@@ -47,8 +52,11 @@ def _find_roots_in(wiring: Path):
         return {a.strip('"\'') for a in args.split() if not a.startswith("-")}
     name = var.group(1)
     roots = set()
-    for a in re.finditer(rf"{re.escape(name)}\+?=\(([^)]*)\)", text):
-        roots |= {t for t in a.group(1).split() if t and not t.startswith("$")}
+    # ANCHORED on the exact variable (a bare \w* also matched `oldroots`), and
+    # applied in source order so a reset after an append is not silently unioned.
+    for a in re.finditer(rf"(?:^|[;\s]){re.escape(name)}(\+?=)\(([^)]*)\)", text, re.M):
+        vals = {t for t in a.group(2).split() if t and not t.startswith("$")}
+        roots = (roots | vals) if a.group(1) == "+=" else set(vals)
     return roots
 
 
