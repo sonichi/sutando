@@ -27,6 +27,44 @@ _shutdown_state() {
   }
 }
 
+# Stop ONLY the watcher this core owns. `pkill -f "watch-tasks"` matched EVERY
+# watcher on the host, so a core restart silenced the pool workers' drains too.
+_stop_own_task_watcher() {
+    local state_dir="$1" sentinel pid argv
+    if [ -z "$state_dir" ]; then
+        echo "  watcher stop: no workspace resolved — cannot name this core's watcher; every watcher left alone"
+        return 0
+    fi
+    # shellcheck source=watcher_sentinel.sh
+    if ! . "$REPO/src/watcher_sentinel.sh" 2>/dev/null; then
+        echo "  watcher stop: src/watcher_sentinel.sh unreadable — every watcher left alone"
+        return 0
+    fi
+    if ! sentinel="$(sentinel_path_for "$state_dir")" || [ -z "$sentinel" ]; then
+        echo "  watcher stop: could not resolve this core's sentinel — every watcher left alone"
+        return 0
+    fi
+    if [ ! -f "$sentinel" ]; then
+        echo "  watcher stop: no sentinel at $sentinel — nothing of ours to stop"
+        return 0
+    fi
+    pid="$(head -n1 "$sentinel" 2>/dev/null | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*)
+        echo "  watcher stop: $sentinel names no pid — left alone"
+        return 0 ;;
+    esac
+    # A dead watcher's number is reissued, so the pid alone names nothing: signal
+    # it only when the process wearing it is itself a watcher.
+    argv="$(ps -p "$pid" -o args= 2>/dev/null)"
+    if ! printf '%s' "$argv" | grep -q "$WATCHER_SENTINEL_STEM"; then
+        echo "  watcher stop: sentinel pid $pid is not a live $WATCHER_SENTINEL_STEM — not signalling it"
+        return 0
+    fi
+    echo "  watcher stop: signalling this core's watcher (pid $pid)"
+    kill "$pid" 2>/dev/null
+    sentinel_release_if_owner "$sentinel" "$pid"
+}
+
 echo "Stopping Sutando services..."
 # Marked before killing so the intake gate holds new tasks while services stop.
 # --stop-only leaves it set: that IS the core's clean-exit signal.
@@ -82,7 +120,7 @@ pkill -f "remote-gateway-bridge" 2>/dev/null
 # restart, and kept stamping tasks from 39-day-old code. Kill both names.
 pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
-pkill -f "watch-tasks" 2>/dev/null
+_stop_own_task_watcher "${_WS:+$_WS/state}"
 # Every other stopped service is relaunched below or by startup.sh. This one
 # cannot be: the watcher is armed by the AGENT via the Monitor tool, so a
 # shell cannot restore it and the caller is the only thing that can.
@@ -130,7 +168,7 @@ fi
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
 for _ in $(seq 1 30); do

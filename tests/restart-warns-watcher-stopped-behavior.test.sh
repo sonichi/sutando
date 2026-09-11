@@ -71,10 +71,10 @@ assert_warning_behaviour() {     # assert_warning_behaviour <output>
   local out="$1"
   grep -q "task watcher STOPPED" <<<"$out" || return 1
   grep -q "watch-tasks-stream.sh" <<<"$out" || return 1
-  # ORDER, as executed: the kill must be announced before the warning. Printed
+  # ORDER, as executed: the stop must be announced before the warning. Printed
   # first, the warning would describe a watcher that is still running.
   local kill_n warn_n
-  kill_n=$(grep -n "STUB-PKILL .*watch-tasks" <<<"$out" | head -1 | cut -d: -f1)
+  kill_n=$(grep -n "watcher stop:" <<<"$out" | head -1 | cut -d: -f1)
   warn_n=$(grep -n "task watcher STOPPED"      <<<"$out" | head -1 | cut -d: -f1)
   [ -n "$kill_n" ] && [ -n "$warn_n" ] && [ "$warn_n" -gt "$kill_n" ]
 }
@@ -94,7 +94,7 @@ SB_ROOT="$(mktemp -d)"; trap 'rm -rf "$SB_ROOT"' EXIT
 # --- arm 1: the script runs to completion under stubs (harness is sound) ------
 sb="$SB_ROOT/head"; build "$sb"; out_head="$(run "$sb")"
 grep -q "STUB-STARTUP-REACHED" <<<"$out_head"; ck "restart.sh reaches startup.sh under stubs" $?
-grep -q "STUB-PKILL .*watch-tasks" <<<"$out_head"; ck "it really does stop the watcher (guards the rest)" $?
+grep -q "watcher stop:" <<<"$out_head"; ck "it really does reach the watcher stop (guards the rest)" $?
 
 # --- arm 2: at this head, the warning behaviour holds -------------------------
 assert_warning_behaviour "$out_head"; ck "warning is EMITTED, names the re-arm, and follows the kill" $?
