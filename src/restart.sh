@@ -185,12 +185,9 @@ _stop_own_task_watcher() {
         echo "  watcher stop: could not resolve the sentinel for instance \"${instance:-<this process>}\" — every watcher left alone"
         return "$RC_WATCHER_UNCONFIRMED"
     fi
-    # The key ENCODED IN THE RESOLVED PATH, never the raw id: that suffix is the
-    # canonical form this scope and the watcher's own writer both derive.
-    expect_instance="$(basename "$sentinel")"
-    expect_instance="${expect_instance#"$WATCHER_SENTINEL_STEM"}"
-    expect_instance="${expect_instance%.pid}"
-    expect_instance="${expect_instance#-}"
+    # The key ENCODED IN THE RESOLVED PATH, never the raw id. Derived by the
+    # shared reader so the reaper cannot drift from this scope's answer.
+    expect_instance="$(sentinel_instance_from_path "$sentinel")"
     _stop_watcher_at "$sentinel" "$expect_instance" "${state_dir%/state}"
 }
 

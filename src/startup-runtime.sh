@@ -336,8 +336,8 @@ reap_wedged_voice_agent() {
 # A pid alone cannot say WHICH watcher it names: the OS reissues the numbers of
 # exited processes, so a live watcher can wear a dead predecessor's pid and match
 # both the value in the sentinel and the `ps` argv check. Ownership is resolved by
-# src/watcher_sentinel.sh, which asks the OS whether the process is old enough to
-# have written the file. Nothing here decides ownership locally.
+# src/watcher_identity.py (the record and the executed script) and the age policy
+# in src/watcher_sentinel.sh. Nothing here decides ownership locally.
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid
   [ -f "$pid_file" ] || return 0
@@ -363,6 +363,35 @@ reap_stale_task_watcher() {
   rm -f "$ps_err"
 
   if [ -n "$stale_pid" ] && printf '%s' "$ps_out" | grep -q "watch-tasks-stream"; then
+    # A LIVE watcher is only ours if the record says so; restart.sh and
+    # health-check.py ask the same watcher_identity policy, so no parse here.
+    local _rp _wpy _owner _opid _code
+    _rp="$(sutando_repo_root)"
+    # shellcheck source=../scripts/python-binary.sh
+    . "$_rp/scripts/python-binary.sh" 2>/dev/null || true
+    _wpy="$(resolve_python "$_rp" 2>/dev/null || true)"
+    if [ -z "$_wpy" ]; then
+      echo "  ⚠ no runnable python3 — the watcher ownership policy cannot be asked; leaving both alone"
+      return 0
+    fi
+    # The record half. The sentinel sits at <workspace>/state/, the derivation
+    # restart.sh makes, and the marker beside it holds the live incarnation.
+    local _state_dir="${pid_file%/*}"
+    if ! _owner="$("$_wpy" "$_rp/src/watcher_identity.py" owner-pid \
+            --sentinel "$pid_file" \
+            --instance "$(sentinel_instance_from_path "$pid_file")" \
+            --workspace "${_state_dir%/state}" \
+            --incarnation-file "$(sentinel_incarnation_path "$pid_file")" 2>&1)"; then
+      echo "  ⚠ $_owner; leaving both alone"
+      return 0
+    fi
+    IFS=$'\t' read -r _opid _code <<< "$_owner"
+    # The BASENAME, not the full path: the documented start is `bash
+    # src/watch-tasks-stream.sh`, whose argv carries no absolute path at all.
+    case "$ps_out" in *"$(basename "$_code")"*) ;; *)
+      echo "  ⚠ pid $stale_pid does not run $_code — leaving both alone"
+      return 0 ;;
+    esac
     # A watcher younger than the sentinel did not write it, so it is a NEW
     # watcher on a reissued pid — signalling it would kill a live drain.
     # errexit-safe: a bare call here terminates startup.sh (set -e) on rc 1/2

@@ -427,9 +427,33 @@ mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
 PID_FILE="$(sentinel_path_for "$STATE_DIR")"
-# In place, never write-elsewhere-then-mv: mv preserves mtime, and
-# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
+# The record a signaller checks this process against. A bare pid proves nothing:
+# a dead watcher's number is reissued and the next holder answers identically.
+WATCHER_INSTANCE="$(sentinel_instance_from_path "$PID_FILE")"
+# Opaque and per START, not per pid: two starts of one instance may not be
+# distinguishable by pid alone during the handover, and this always is.
+WATCHER_INCARNATION="$(date +%s)-$$-${RANDOM:-0}${RANDOM:-0}"
+WATCHER_CODE_PATH="$__SCRIPT_DIR/$(basename "$0")"
+WATCHER_VERSION="$(git -C "$__REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+[ -n "$WATCHER_VERSION" ] || WATCHER_VERSION="unknown"
+# Under the lock so a peer's cleanup cannot claim this record mid-publish. A
+# failed write is fatal: an unrecorded watcher is one no signaller may stop.
+if ! sentinel_lock_acquire "$PID_FILE"; then
+  echo "watch-tasks-stream: could not take $(sentinel_lock_path "$PID_FILE"); refusing to start unrecorded" >&2
+  exit 1
+fi
+if ! sentinel_write_record "$PID_FILE" "$$" "$WATCHER_INSTANCE" "$WATCHER_INCARNATION" \
+       "$WATCHER_CODE_PATH" "$WATCHER_VERSION" "$WORKSPACE_DIR"; then
+  sentinel_lock_release "$PID_FILE"
+  echo "watch-tasks-stream: could not write the sentinel record at $PID_FILE" >&2
+  exit 1
+fi
+sentinel_lock_release "$PID_FILE"
+# One line per start, so "which code is this pid running" is a read, not a hunt.
+mkdir -p "$WORKSPACE_DIR/logs" 2>/dev/null || true
+printf '%s %s %s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "${WATCHER_INSTANCE:--}" "$WATCHER_INCARNATION" "$$" "$WATCHER_CODE_PATH" \
+  "$WATCHER_VERSION" "$PID_FILE" >> "$WORKSPACE_DIR/logs/watcher-starts.log" 2>/dev/null || true
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -621,7 +645,9 @@ cleanup() {
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
-  sentinel_release_if_owner "$PID_FILE" "$$"
+  # The incarnation is what protects the MARKER: it holds no pid, so without it
+  # a dying duplicate erases the proof a live successor is stoppable.
+  sentinel_release_incarnation "$PID_FILE" "$$" "${WATCHER_INCARNATION:-}" || true
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi

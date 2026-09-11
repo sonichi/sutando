@@ -54,6 +54,14 @@ spawn_fake_watcher() {
   printf '%s' "$pid"
 }
 
+# The identity record the watcher-side writer publishes. A fixture without one
+# now measures only the g-series refusal, not the branch its case is named for.
+stamp_record() {                # stamp_record <pid_file> <pid> <code_path> [instance]
+  printf '%s\ninstance=%s\nincarnation=inc-%s\ncode_path=%s\nversion=test\nstarted_at=%s\nworkspace=%s\n' \
+    "$2" "${4:-}" "$2" "$3" "$(date +%s)" "$(dirname "$1")" > "$1"
+  printf 'inc-%s\n' "$2" > "${1%.pid}.incarnation"
+}
+
 echo "watcher-sentinel ownership:"
 
 # ---------------------------------------------------------------- elapsed parse
@@ -65,8 +73,8 @@ check "$([ "$E" = "62" ] && echo 0 || echo 1)" "e1) MM:SS parses to seconds"
 # process. Baseline deleted it (and signalled the process); it must now survive.
 D1="$TMP/aba"; mkdir -p "$D1"
 PID1="$(spawn_fake_watcher "$D1")"
-PF1="$D1/watch.pid"
-printf '%s\n' "$PID1" > "$PF1"
+PF1="$D1/watch-tasks-stream.pid"
+stamp_record "$PF1" "$PID1" "$D1/watch-tasks-stream.sh"
 touch -t 202601010000 "$PF1"          # sentinel far older than the process
 
 reap_stale_task_watcher "$PF1" >"$TMP/out1" 2>&1
@@ -81,8 +89,8 @@ check "$(grep -q 'reissued pid' "$TMP/out1" && echo 0 || echo 1)" \
 # Without this the case above proves only that the reaper stopped working.
 D2="$TMP/stale"; mkdir -p "$D2"
 PID2="$(spawn_fake_watcher "$D2")"
-PF2="$D2/watch.pid"
-printf '%s\n' "$PID2" > "$PF2"        # fresh sentinel: process is old enough to own it
+PF2="$D2/watch-tasks-stream.pid"
+stamp_record "$PF2" "$PID2" "$D2/watch-tasks-stream.sh"   # fresh: old enough to own it
 
 reap_stale_task_watcher "$PF2" >"$TMP/out2" 2>&1
 check "$([ -f "$PF2" ] && echo 1 || echo 0)" \
@@ -164,10 +172,11 @@ check "$(grep -qi 'unbound variable' "$TMP/sout" && echo 1 || echo 0)" \
 # what a moved-in sentinel does to the verdict.
 D5="$TMP/movedin"; mkdir -p "$D5"
 PID5="$(spawn_fake_watcher "$D5")"
-PF5="$D5/watch.pid"
-printf '%s\n' "$PID5" > "$TMP/staged.pid"
+PF5="$D5/watch-tasks-stream.pid"
+stamp_record "$TMP/staged.pid" "$PID5" "$D5/watch-tasks-stream.sh"
 touch -t 202601010000 "$TMP/staged.pid"     # built earlier, elsewhere
 mv "$TMP/staged.pid" "$PF5"                 # mv preserves that old mtime
+mv "$TMP/staged.incarnation" "${PF5%.pid}.incarnation"
 if sentinel_pid_wrote_file "$PID5" "$PF5"; then owned=0; else owned=1; fi
 check "$([ "$owned" -eq 1 ] && echo 0 || echo 1)" \
       "p1) a moved-in sentinel reads as NOT written by its owner"
@@ -175,10 +184,19 @@ reap_stale_task_watcher "$PF5" >"$TMP/out5" 2>&1
 check "$([ -f "$PF5" ] && echo 0 || echo 1)" \
       "p2) so the reaper stops cleaning it — reaping degrades to never"
 
-# Shape half: only the WRITER decides how the file comes to exist, so no
-# behavioural test can catch a future refactor to write-then-mv.
-check "$(grep -qE '^echo "\$\$" > "\$PID_FILE"' "$REPO/src/watch-tasks-stream.sh" && echo 0 || echo 1)" \
-      "p3) watch-tasks-stream.sh still stamps the sentinel in place"
+# The writer publishes by rename now, so "in place" is no longer the shape to
+# assert; the PROPERTY it stood for is that the published mtime is stamp time.
+D6="$TMP/atomic"; mkdir -p "$D6"; PF6="$D6/watch-tasks-stream.pid"
+sentinel_write_record "$PF6" "$$" "" "inc-p3" "$D6/watch-tasks-stream.sh" "v-test" "$D6"
+sentinel_pid_wrote_file "$$" "$PF6"; p3_rc=$?
+check "$([ "$p3_rc" -eq 0 ] && echo 0 || echo 1)" \
+      "p3) a freshly published record reads as written by its own writer (rc $p3_rc)"
+check "$(ls "$PF6".new.* >/dev/null 2>&1 && echo 1 || echo 0)" \
+      "p3b) the publish leaves no temp behind"
+check "$([ "$(cat "${PF6%.pid}.incarnation")" = "inc-p3" ] && echo 0 || echo 1)" \
+      "p3c) the marker carries the incarnation the record claims"
+check "$([ "$(sentinel_field_in "$PF6" code_path)" = "$D6/watch-tasks-stream.sh" ] && echo 0 || echo 1)" \
+      "p3d) every field the signaller reads survives the rename"
 
 # ------------------------------------------------------------ unmeasurable ownership
 # rc 0 = wrote it, rc 1 = demonstrably did not, rc 2 = UNKNOWN. The old assertion
@@ -194,7 +212,7 @@ check "$([ "$f1_rc" -eq 2 ] && echo 0 || echo 1)" \
 DIR_U="$TMP/unknown"; mkdir -p "$DIR_U"
 U_PID="$(spawn_fake_watcher "$DIR_U")"
 PF_U="$DIR_U/watch-tasks-stream.pid"
-echo "$U_PID" > "$PF_U"
+stamp_record "$PF_U" "$U_PID" "$DIR_U/watch-tasks-stream.sh"
 _real_elapsed="$(declare -f sentinel_pid_elapsed)"
 sentinel_pid_elapsed() { return 1; }          # ownership becomes unmeasurable
 reap_stale_task_watcher "$PF_U" >"$TMP/outU" 2>&1
@@ -218,7 +236,11 @@ sentinel_pid_wrote_file() { return $_rc; }
 ps() { echo "bash watch-tasks-stream.sh"; }
 sentinel_release_if_owner() { :; }
 kill() { :; }
-PF="\$(mktemp)"; echo 99999 > "\$PF"
+D="\$(mktemp -d)"; PF="\$D/watch-tasks-stream.pid"
+# A COMPLETE record + marker: an incomplete one is refused before the helper,
+# and f4 would then pass without ever reaching the branch it is named for.
+printf '99999\ninstance=\nincarnation=i\ncode_path=/x/watch-tasks-stream.sh\nworkspace=%s\n' "\$D" > "\$PF"
+printf 'i\n' > "\$D/watch-tasks-stream.incarnation"
 reap_stale_task_watcher "\$PF"
 echo REACHED
 EOF
@@ -243,6 +265,30 @@ EOF
 _ps="$(bash "$TMP/psfail.sh" 2>/dev/null)"
 check "$(printf '%s' "$_ps" | grep -q 'REL=0' && echo 0 || echo 1)" \
       "f5) an unanswerable ps does NOT release the sentinel (got: $_ps)"
+
+# ------------------------------- g) the reaper refuses what it cannot confirm
+
+# b1/b2 above is this block's control: the SAME fixture, differing only in what
+# the sentinel records, is reaped. Each case here removes exactly one field.
+g_case() {                      # g_case <label> <writer> <expect-substring>
+  local dir pid pf out
+  dir="$TMP/g-$1"; mkdir -p "$dir"
+  pid="$(spawn_fake_watcher "$dir")"
+  pf="$dir/watch-tasks-stream.pid"
+  "$2" "$pf" "$pid" "$dir"
+  out="$(reap_stale_task_watcher "$pf" 2>&1)"
+  check "$(kill -0 "$pid" 2>/dev/null && echo 0 || echo 1)" "g-$1) the live watcher is NOT signalled"
+  check "$([ -f "$pf" ] && echo 0 || echo 1)" "g-$1) ...and its sentinel is left in place"
+  check "$(printf '%s' "$out" | grep -q "$3" && echo 0 || echo 1)" "g-$1) ...and the refusal says why (got: $out)"
+}
+
+w_pid_only()  { printf '%s\n' "$2" > "$1"; }
+w_foreign()   { stamp_record "$1" "$2" "$3/watch-tasks-stream.sh" "peer+w2"; }
+w_other_code(){ stamp_record "$1" "$2" "$3/some-other-daemon.sh"; }
+
+g_case "pidonly" w_pid_only  "records a pid only"
+g_case "foreign" w_foreign   'instance: '
+g_case "code"    w_other_code "does not run"
 
 echo
 echo "passed $PASS, failed $FAIL"

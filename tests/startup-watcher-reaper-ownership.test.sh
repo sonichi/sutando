@@ -65,8 +65,13 @@ SH
 chmod +x "$TMP/fakebin/watch-tasks-stream.sh"
 bash "$TMP/fakebin/watch-tasks-stream.sh" &
 live=$!
-f="$TMP/case2.pid"
-echo "$live" > "$f"
+# A record, not a bare pid: since #4168 the reaper refuses a pid-only sentinel
+# outright (case 5 below), so a bare pid here would measure that, not the reap.
+mkdir -p "$TMP/case2"
+f="$TMP/case2/watch-tasks-stream.pid"
+printf '%s\ninstance=\nincarnation=inc2\ncode_path=%s\nversion=test\nworkspace=%s\n' \
+  "$live" "$TMP/fakebin/watch-tasks-stream.sh" "$TMP/case2" > "$f"
+printf 'inc2\n' > "$TMP/case2/watch-tasks-stream.incarnation"
 # Give the child a moment to appear in the process table.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   ps -p "$live" -o args= 2>/dev/null | grep -q watch-tasks-stream && break
@@ -116,6 +121,28 @@ else
     "content='$(cat "$f" 2>/dev/null)'"
 fi
 
+# --- case 5: a pid-only sentinel names a LIVE watcher -> refuse ---------------
+# Case 2 is the control: the SAME fixture carrying a record IS reaped.
+bash "$TMP/fakebin/watch-tasks-stream.sh" &
+legacy=$!
+mkdir -p "$TMP/case5"
+f5="$TMP/case5/watch-tasks-stream.pid"
+echo "$legacy" > "$f5"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps -p "$legacy" -o args= 2>/dev/null | grep -q watch-tasks-stream && break
+  sleep 0.1
+done
+out5="$(reap_stale_task_watcher "$f5" 2>&1)"
+if kill -0 "$legacy" 2>/dev/null && [ -f "$f5" ]; then
+  ok "pid-only sentinel: live watcher untouched, sentinel left in place"
+else
+  bad "pid-only sentinel: live watcher untouched" "killed or unlinked ($out5)"
+fi
+case "$out5" in *"records a pid only"*) ok "pid-only sentinel: the refusal is reported" ;;
+  *) bad "pid-only sentinel: the refusal is reported" "got: $out5" ;;
+esac
+kill "$legacy" 2>/dev/null
+
 # --- case 4: no sentinel -> no-op, success ------------------------------------
 if reap_stale_task_watcher "$TMP/absent.pid" > /dev/null 2>&1; then
   ok "absent sentinel: no-op, rc 0"
@@ -151,8 +178,13 @@ if [ -n "${have_fn:-}" ] && command -v sentinel_path_for >/dev/null 2>&1; then
   bash "$_pt/src/watch-tasks-stream.sh" & _a=$!
   bash "$_pt/src/watch-tasks-stream.sh" & _b=$!
   sleep 2
-  echo "$_a" > "$_pt/state/watch-tasks-stream.pid"
-  echo "$_b" > "$_pt/state/watch-tasks-stream-peer-b+w2.pid"
+  _rec() {   # <sentinel> <pid> <instance>
+    printf '%s\ninstance=%s\nincarnation=inc-%s\ncode_path=%s\nversion=test\nworkspace=%s\n' \
+      "$2" "$3" "$2" "$_pt/src/watch-tasks-stream.sh" "$_pt" > "$1"
+    printf 'inc-%s\n' "$2" > "${1%.pid}.incarnation"
+  }
+  _rec "$_pt/state/watch-tasks-stream.pid" "$_a" ""
+  _rec "$_pt/state/watch-tasks-stream-peer-b+w2.pid" "$_b" "peer-b+w2"
   if kill -0 "$_a" 2>/dev/null && kill -0 "$_b" 2>/dev/null; then
     if _s="$(sentinel_path_for "$_pt/state")" && [ -n "$_s" ]; then
       reap_stale_task_watcher "$_s" >/dev/null 2>&1
