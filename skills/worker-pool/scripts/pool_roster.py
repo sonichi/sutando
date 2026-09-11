@@ -194,7 +194,7 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
     return roster
 
 
-def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
+def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
 
@@ -206,6 +206,8 @@ def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
     with _locked(workspace):
         workers = dict((load_roster(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
+        if runtime:
+            workers[worker_id]["runtime"] = str(runtime)
         bindings = dict(load_bindings(workspace))
         if room:
             bindings[room] = worker_id
