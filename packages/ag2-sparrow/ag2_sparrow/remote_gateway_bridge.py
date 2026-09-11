@@ -1723,7 +1723,13 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # A card click already recorded in the HITL store, passed on for the turn it
                 # causes: the core answers [no-send] and lets its Stop hook do the work.
                 "hitl_click",
-                "task", "source", "channel_id",
+                # Which worker-picker button was pressed. Above "task" for the same
+                # reason: worker_picker_commands reads it with the safe parser.
+                "picker_command", "picker_args",
+                # Also above "task": these carry the picker's authorization, and a
+                # task-last reader cannot see a field written below the body.
+                "source", "channel_id",
+                "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
@@ -2923,6 +2929,14 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "picker_args":
+            # The reader parses this with json.loads, so an object must be
+            # re-serialized as JSON — _one_line would emit a Python repr.
+            pa = task.get(f)
+            if isinstance(pa, (dict, list)):
+                lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
+            elif pa not in (None, ""):
+                lines.append(f"picker_args: {_one_line(pa)}")
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never

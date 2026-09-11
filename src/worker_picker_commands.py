@@ -37,6 +37,12 @@ import local_task_protocol as ltp  # noqa: E402
 
 SOURCE = "worker-picker"
 
+# A header the broker may stamp instead of relying on the sentence. In
+# KNOWN_HEADER_KEYS, so the strict parser reads it ABOVE `task:` only.
+COMMAND_HEADER = "picker_command"
+COMMAND_ARGS_HEADER = "picker_args"
+COMMANDS = ("add", "pin", "unpin")
+
 _ADD = re.compile(r"^Add a new worker to the pool\b", re.I)
 _LABEL = re.compile(r"Preferred label for the new worker:\s*(.+?)\.?\s*$", re.I)
 _UNPIN = re.compile(r"^Unpin room\s+(\S+)", re.I)
@@ -56,19 +62,100 @@ def _refuse_no_room(action: str) -> None:
           file=sys.stderr)
 
 
+def _bad(name: str, reason: str) -> dict:
+    """Refuse a stamped command and say which rule it broke — an unnamed
+    refusal is indistinguishable from 'the sentence did not match'."""
+    print(f"worker-picker: refusing {name!r} — {reason}", file=sys.stderr)
+    return {"action": "malformed", "command": name, "reason": reason}
+
+
+def _worker_names(args: dict) -> "list | None":
+    """The pin target as a list of names, or None if it is not one.
+
+    A bare string is REJECTED, not accepted as a one-element list: iterating
+    one yields its characters, which is how `"w1"` became six workers.
+    """
+    if "workers" in args:
+        got = args["workers"]
+        if not isinstance(got, list):
+            return None
+    elif "worker" in args:
+        got = [args["worker"]]
+    else:
+        return None
+    if not got or not all(isinstance(w, str) and w.strip() for w in got):
+        return None
+    return [w.strip() for w in got]
+
+
+def _structured(headers: dict, room: str) -> "dict | None":
+    """The intent from a stamped command, or None when none was stamped.
+
+    Only an ABSENT `picker_command` returns None and lets the sentence decide.
+    Present-but-unusable — empty, an unknown verb, args that are not an object
+    or do not fit the verb's schema — is an explicit refusal: a broker that
+    stamped something we cannot honour must not be answered by guessing from a
+    sentence written for a different command.
+    """
+    if COMMAND_HEADER not in headers:
+        return None
+    name = (headers.get(COMMAND_HEADER) or "").strip()
+    if not name:
+        return _bad(name, "empty picker_command")
+    if name not in COMMANDS:
+        return {"action": "unsupported", "command": name}
+
+    args: dict = {}
+    raw = (headers.get(COMMAND_ARGS_HEADER) or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return _bad(name, "picker_args is not JSON")
+        if not isinstance(parsed, dict):
+            return _bad(name, "picker_args is not a JSON object")
+        args = parsed
+
+    if name == "add":
+        label = args.get("label")
+        if label is not None and not isinstance(label, str):
+            return _bad(name, "label must be a string")
+        return {"action": "add", "label": label.strip() if label and label.strip() else None}
+
+    # Every remaining command is room-scoped, and the room is the header's
+    # alone — `picker_args` may name one, and it is never read.
+    if not room:
+        return _bad(name, "no channel_id header")
+    if name == "unpin":
+        return {"action": "unpin", "room": room}
+    workers = _worker_names(args)
+    if workers is None:
+        return _bad(name, "workers must be a non-empty list of names")
+    dedicated = args.get("dedicated", False)
+    if not isinstance(dedicated, bool):
+        return _bad(name, "dedicated must be a boolean")
+    return {"action": "pin", "room": room,
+            "workers": workers, "dedicated": dedicated}
+
+
 def parse(headers: dict, body: str) -> "dict | None":
     """The intent behind one task, or None when it is not the picker's.
 
     `headers` must come from the strict parser (see module docstring): every
     key read below is an authorization field, and a lenient scan would let the
-    body supply one. An unrecognised sentence from a genuine picker task
-    returns None rather than a guess: a wrong intent creates or re-routes a
-    worker. So does a room-scoped sentence with no stamped room.
+    body supply one. A stamped command wins over the sentence; the sentence is
+    the fallback for a broker that stamps none. An unrecognised sentence
+    returns None rather than a guess, and so does a room-scoped sentence with
+    no stamped room: a wrong intent creates or re-routes a worker.
     """
     if (headers.get("source") or "").strip() != SOURCE:
         return None
     text = " ".join((body or "").split())
     room = (headers.get("channel_id") or "").strip()
+
+    structured = _structured(headers, room)
+    if structured is not None:
+        return structured
 
     if _ADD.search(text):
         m = _LABEL.search(text)
