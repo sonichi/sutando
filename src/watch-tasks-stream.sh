@@ -33,16 +33,21 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
+  # The watcher keeps only the exit code; a handler that died outside its own
+  # logging left no trace, so its stderr and the code land in one file.
+  runner_log="$workspace/logs/task-event-handler-runner.log"
+  mkdir -p "$workspace/logs" 2>/dev/null || true
   if "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
       --task-file "$task_path" \
       --results-dir "$results" \
-      --repo "$repo" >/dev/null; then
+      --repo "$repo" >/dev/null 2>>"$runner_log"; then
     handler_rc=0
   else
     handler_rc=$?
   fi
+  printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >> "$runner_log" 2>/dev/null || true
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
 fi
