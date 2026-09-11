@@ -40,6 +40,23 @@ class CommandPosition(unittest.TestCase):
                      f"scripts/{NAME} > f"):
             self.assertTrue(invokes(line, NAME), line)
 
+    def test_an_assignment_is_not_an_invocation(self):
+        """`T=x.sh` binds a name; the shell runs nothing and the file list is empty."""
+        self.assertFalse(invokes(f"TARGET=scripts/{NAME}", NAME))
+
+    def test_an_escaped_separator_does_not_start_a_command(self):
+        r"""`echo a\; bash x.sh` is ONE echo -- the `;` is an argument."""
+        self.assertFalse(invokes(rf"echo inert\; bash scripts/{NAME}", NAME))
+
+    def test_a_longer_basename_is_not_this_command(self):
+        """`not-x.sh` ends with `x.sh`; endswith accepted it, a basename does not."""
+        self.assertFalse(invokes(f"bash scripts/not-{NAME}", NAME))
+
+    def test_assignment_and_env_prefixes_still_find_the_real_call(self):
+        """The peel must not reject a genuine call that carries prefixes."""
+        self.assertTrue(invokes(f"VAR=1 bash scripts/{NAME}", NAME))
+        self.assertTrue(invokes(f"env FOO=1 scripts/{NAME}", NAME))
+
     def test_an_echoed_quoted_call_is_not_an_invocation(self):
         """The defect: `echo "bash x.sh > f"` satisfied a substring+`>` check."""
         for line in (f'echo "bash scripts/{NAME} > files"', f"echo 'scripts/{NAME}'"):

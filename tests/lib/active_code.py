@@ -73,10 +73,8 @@ def active_text(text: str) -> str:
 def invokes(line: str, name: str) -> bool:
     """True when `name` runs in COMMAND position on this line.
 
-    Position, not presence: `echo "x.sh > f"` has the name as echo's ARGUMENT,
-    while `bash "$(dirname ...)/x.sh"` has it as bash's, quoted and still a call.
-    Quote-blanking cannot tell those apart; the command word can.
-    """
+    Position, not presence: `echo "x.sh"` has the name as an ARGUMENT, an
+    assignment `T=x.sh` runs nothing, and `not-x.sh` merely ends with it."""
     import shlex
     code = _strip_comment(line)
     for seg in _segments(code):
@@ -84,28 +82,33 @@ def invokes(line: str, name: str) -> bool:
             toks = shlex.split(seg)
         except ValueError:
             toks = seg.split()
-        if not toks:
-            continue
-        if toks[0] in ("bash", "sh", "source", ".") and len(toks) > 1:
+        changed = True
+        while changed and toks:      # env and VAR=x interleave; peel until neither
+            changed = False
+            if ("=" in toks[0]) and not toks[0].startswith("="):
+                toks = toks[1:]; changed = True
+            elif toks[0] == "env" and len(toks) > 1:
+                toks = toks[1:]; changed = True
+        if toks and toks[0] in ("bash", "sh", "source", ".") and len(toks) > 1:
             toks = toks[1:]
-        word = toks[0]
-        if word.endswith(name) or word.split("/")[-1] == name:
+        if toks and toks[0].split("/")[-1] == name:
             return True
     return False
 
 
 def _segments(line: str):
-    """Split on unquoted command separators, so `a && b` is two commands."""
+    """Split on UNESCAPED command separators, so `echo a\\; b` is one command."""
     out, cur, quote, i = [], [], None, 0
     while i < len(line):
         ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            cur.append(ch); cur.append(line[i + 1]); i += 2; continue
         if quote:
             cur.append(ch)
             if ch == quote:
                 quote = None
         elif ch in "'\"":
-            quote = ch
-            cur.append(ch)
+            quote = ch; cur.append(ch)
         elif ch in ";|&":
             out.append("".join(cur)); cur = []
         else:
