@@ -80,11 +80,9 @@ class WorkerAttribution(unittest.TestCase):
         self.mod._delivery_core = lambda: type("C", (), {"backend": _Backend()})()
 
     def _worker_flag(self, wid: str, tid: str) -> Path:
-        # `self.tmp` is the workspace; done_flag appends state/workers/<wid>/done.
-        p = pool_delivery.done_flag(self.tmp, wid, tid)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("")
-        return p
+        # The production writer, not a fixture spelling of it: the reader and the
+        # finisher must agree by construction, not by two matching guesses.
+        return pool_delivery.mark_done(self.tmp, wid, tid)
 
     def _core_flag(self, core: str, tid: str) -> Path:
         # Named exactly as finish_task writes it: the full result stem, prefix
@@ -147,6 +145,29 @@ class WorkerAttribution(unittest.TestCase):
         self.assertIn("ambiguous done flags", hit[0])
         self.assertIn("worker-1", hit[0])
         self.assertIn("core-2", hit[0])
+
+    def test_control_a_directory_at_the_flag_path_is_not_a_finish(self):
+        # A non-regular object at the flag's own name is malformed state. The
+        # reader used to stat it and take any hit, emitting a confident id.
+        tid = "task-1notafile000000f"
+        d = pool_delivery.done_flag(self.tmp, "worker-1", tid)
+        d.mkdir(parents=True)
+        self.assertFalse(pool_delivery.is_done_flag(d), "the pool contract must reject it")
+        self.assertNotIn("metadata", self._doc(tid))
+        hit = self._abstained()
+        self.assertEqual(len(hit), 1, f"expected one abstention log, got {self.logs}")
+        self.assertIn("not a regular file", hit[0])
+
+    def test_control_a_malformed_pool_flag_does_not_let_the_legacy_core_win(self):
+        # Mixed layout: dropping the malformed one on the floor would leave the
+        # `cores` flag as the single hit, and stamp core-2 with full confidence.
+        tid = "task-0mixedlayout0001a"
+        pool_delivery.done_flag(self.tmp, "worker-1", tid).mkdir(parents=True)
+        self._core_flag("core-2", tid)
+        doc = self._doc(tid)
+        self.assertNotIn("metadata", doc)
+        self.assertEqual(self.mod._worker_of(tid), "")
+        self.assertIn("not a regular file", self._abstained()[0])
 
     def test_control_two_pool_workers_claiming_one_task_is_ambiguous(self):
         tid = "task-7twoworkers00000b"

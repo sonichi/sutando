@@ -8,9 +8,10 @@ state shape (CLAUDE.md, "Optional capability discovery stays at the adapter
 edge"). `src/remote-gateway-bridge.py` injects `resolve_claimant` into the
 package at load, the same seam `set_task_stamper` already uses.
 
-Two layouts are read. The pool's is not spelled here at all — it comes from its
-own writer, `pool_delivery.done_flag`, so a move there surfaces as a failure
-here instead of drifting into silence. The pre-pool per-core layout
+Two layouts are read, never written. The pool's is not spelled here at all — it
+comes from its own writer, `pool_delivery.mark_done` (which publishes the flag
+BEFORE the result, so a drained result always has its attribution), so a move
+there surfaces as a failure here instead of drifting into silence. The pre-pool per-core layout
 (`state/cores/<instance>/done/<stem>.flag`, written by `finish_task` in
 `src/pool_follower.py`) is spelled once, below.
 
@@ -61,6 +62,8 @@ def claimants(state_dir, task_id: str) -> list[str]:
     `task_id` is the result stem, `task-` prefix included. Raises OSError when a
     root exists but cannot be fully enumerated: `Path.glob` reports that as an
     absence, and an absence here reads as "some other worker finished it".
+    Raises Unattributable when something that is not a regular file sits at a
+    flag's own name — malformed state, which is not evidence of anything.
     """
     state = Path(state_dir)
     found = set()
@@ -70,11 +73,13 @@ def claimants(state_dir, task_id: str) -> list[str]:
         except FileNotFoundError:
             continue  # this layout is simply not in use on this host
         for entry in entries:
-            try:
-                os.stat(flag_of(state, entry.name, task_id))
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-            found.add(entry.name)
+            flag = flag_of(state, entry.name, task_id)
+            # What counts as a flag is the writer's contract, asked not restated:
+            # a reader with its own idea of it disagrees with `residue` silently.
+            if pool_delivery.is_done_flag(flag):
+                found.add(entry.name)
+            elif os.path.lexists(flag):
+                raise Unattributable(f"done flag is not a regular file ({flag})")
     return sorted(found)
 
 
