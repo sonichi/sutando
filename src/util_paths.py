@@ -592,6 +592,46 @@ def watcher_sentinel_paths(state_dir) -> "list[Path]":
     return found + rest
 
 
+def read_sentinel_record(path) -> dict:
+    """The watcher sentinel `src/watcher_sentinel.sh:sentinel_write_record` wrote.
+
+    ONE reader for both on-disk shapes, because both are live during any
+    rolling upgrade: the legacy file is a bare pid, and the record adds
+    `key=value` identity claims (instance, incarnation, code_path, version,
+    started_at, workspace) from line 2 on. A consumer that `int()`s the whole
+    file reads every recorded watcher as unreadable, which is how a healthy
+    watcher came to report `unknown` / `warn — restart the watcher`.
+
+    `{}` when the file is absent or unreadable, and no `pid` key when line 1 is
+    not a usable pid: an unknown must not render as a value (REVIEW.md 13).
+    `pid_line` carries line 1 verbatim whenever the file has one, so a consumer
+    can say WHY a sentinel is unusable without re-deriving line 1 for itself.
+    Never raises — a probe is not the place to learn the file is corrupt.
+    """
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except (OSError, ValueError):
+        return {}
+    out: dict = {}
+    if lines:
+        head = lines[0].strip()
+        out["pid_line"] = head
+        # 0/negatives name a process GROUP to os.kill/ps, so they are corruption
+        # here; `isascii` too, since "²".isdigit() is True and int("²") raises.
+        if head.isascii() and head.isdigit() and int(head) > 0:
+            out["pid"] = int(head)
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            out.setdefault(key.strip(), value)
+    return out
+
+
+def read_sentinel_pid(path) -> "int | None":
+    """The pid a watcher sentinel names, or None when it names none."""
+    return read_sentinel_record(path).get("pid")
+
+
 if __name__ == "__main__":
     # Path resolution for shell callers, so there is no second implementation
     # of the identity encoding to keep in step with this one.
@@ -600,10 +640,17 @@ if __name__ == "__main__":
         # identity is resolved from this process's own environment as before.
         print(watcher_sentinel_path(sys.argv[2],
                                     instance=(sys.argv[3] if len(sys.argv) > 3 else None)))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "sentinel-pid":
+        # The shell bridge to the ONE record reader: a shell caller that reads
+        # line 1 itself is the second parser this function exists to prevent.
+        _pid = read_sentinel_pid(sys.argv[2])
+        if _pid is None:
+            raise SystemExit(1)
+        print(_pid)
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
     else:
         print("usage: util_paths.py {watcher-sentinel <state-dir> [instance]"
-              "|handler-fallbacks-dir <state-dir>}",
+              "|sentinel-pid <sentinel>|handler-fallbacks-dir <state-dir>}",
               file=sys.stderr)
         raise SystemExit(2)

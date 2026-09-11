@@ -20,28 +20,27 @@
 # Elapsed time (`ps -o etime=`) is used rather than an absolute start time
 # because `date -j -f` is BSD-only and CI runs ubuntu.
 #
-# LINE 1 is a bare pid, and stays that way: three readers int() the first line
-# (health-check.py, services_status.py, and the tests). Lines 2+ are optional
-# `key=value` identity claims — instance, incarnation, code_path, version,
-# started_at, workspace — which a signaller reads to establish that the process
-# wearing that pid is the watcher THIS install started. A record carrying no
-# such lines is a pre-identity sentinel and proves nothing beyond the number.
+# LINE 1 is a bare pid, and stays that way: every reader takes the pid from it
+# (health-check.py, services_status.py, the startup reaper, the tests). Lines 2+
+# are optional `key=value` identity claims — instance, incarnation, code_path,
+# version, started_at, workspace — which a signaller reads to establish that the
+# process wearing that pid is the watcher THIS install started. A record carrying
+# no such lines is a pre-identity sentinel and proves nothing beyond the number.
 
 # --- the identity record -----------------------------------------------------
-# One `key=value` claim from lines 2+, empty when absent. Line 1 is the pid and
-# is never a field, so a pid-only sentinel yields nothing for every key.
-sentinel_record_field() {
-  local pid_file="$1" key="$2"
-  [ -f "$pid_file" ] || return 0
-  tail -n +2 "$pid_file" 2>/dev/null \
-    | awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
-}
+# READ in one place only: src/util_paths.py:read_sentinel_record, which
+# src/watcher_identity.py turns into the ownership verdict. A shell copy of that
+# grammar is the second parser this contract exists to prevent.
 
-# True when the sentinel carries any identity claim at all.
-sentinel_has_record() {
-  local pid_file="$1"
-  [ -f "$pid_file" ] || return 1
-  tail -n +2 "$pid_file" 2>/dev/null | grep -q '^[a-z_][a-z_]*='
+# The pid on line 1, through that reader. Empty + rc 1 when the file names none:
+# `cat` fed whole records to `ps -p`, which answers "Invalid process id".
+sentinel_pid_in() {
+  local pid_file="$1" here py
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "read the watcher sentinel")" || return 1
+  "$py" "$here/util_paths.py" sentinel-pid "$pid_file" 2>/dev/null
 }
 
 # The marker a live watcher exposes its incarnation through, beside its own
@@ -92,7 +91,13 @@ sentinel_paths_in() {
 # `etime` is [[DD-]HH:]MM:SS on both BSD and GNU ps.
 sentinel_pid_elapsed() {
   local pid="$1" raw
-  raw="$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')" || return 1
+  # Through the process-ops seam when a caller has loaded one (restart.sh), so a
+  # test's injected fake reaches this read too; the direct `ps` is the default.
+  if command -v pops_elapsed >/dev/null 2>&1; then
+    raw="$(pops_elapsed "$pid" | tr -d ' ')"
+  else
+    raw="$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')" || return 1
+  fi
   [ -n "$raw" ] || return 1
   printf '%s' "$raw" | awk -F'[-:]' '{
     if (NF == 4)      print ($1*86400) + ($2*3600) + ($3*60) + $4

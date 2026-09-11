@@ -62,8 +62,9 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
+from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, read_sentinel_record, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import watcher_identity  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
@@ -8698,22 +8699,6 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
-# The argv must BE the script invocation, not merely mention it. A substring
-# test counts the observer: any shell whose command line contains the name —
-# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
-# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
-# match reported 3 trees where 2 were real, the phantom being the shell that
-# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
-# fix is to anchor on the whole command rather than search inside it.
-_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
-
-
-# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
-# and a mention inside a longer word cannot match.
-_WATCHER_SCRIPT_NAME = "watch-tasks-stream.sh"
-_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
-
-
 def _as_pid(tok: str) -> "int | None":
     try:
         return int(tok)
@@ -8724,33 +8709,12 @@ def _as_pid(tok: str) -> "int | None":
 def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     """True/False from the EXECUTED script; None when nothing can prove it.
 
-    Callers disagree on what None should mean, which is why this is tri-state:
-    over-counting a watcher costs delayed tasks, publishing a wrong pid costs a
-    killed stranger.
+    The policy itself lives in src/watcher_identity.py, which restart.sh also
+    asks before it signals anything: one answer to "is that process our
+    watcher", so a reporter and a signaller cannot disagree about one pid.
     """
-    vec = _proc_argv_vector(pid) if pid is not None else None
-    if vec is not None and len(vec) >= 2:
-        if vec[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-            return False
-        if vec[1].startswith("-"):
-            return False
-        return os.path.basename(vec[1]) == _WATCHER_SCRIPT_NAME
-    parts = argv.split()
-    if len(parts) < 2:
-        return False
-    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-        return False
-    if parts[1].startswith("-"):
-        return False
-    # Authoritative only when argv ends at parts[1]: with more tokens the real
-    # pathname may continue past a space and end in a different name.
-    if _WATCHER_SCRIPT.search(parts[1]) is not None:
-        return True if len(parts) == 2 else None
-    if len(parts) == 2:
-        return False
-    # Only a later token matches, and a spaced script path is the same string as a
-    # script plus arguments -- nothing here can decide between them.
-    return None if _WATCHER_SCRIPT.search(argv) else False
+    return watcher_identity.is_watcher_argv(
+        argv, _proc_argv_vector(pid) if pid is not None else None)
 
 
 # Read from the module that defines the precedence; a copy here is how this
@@ -9101,10 +9065,12 @@ def check_task_watcher() -> dict:
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
     collided = []
     for sp in sentinels:
-        try:
-            spid = int(sp.read_text().strip())
-        except Exception as e:  # noqa: BLE001
-            unreadable.append((sp, str(e)[:40]))
+        # The shared reader, never a private int() of the file: the sentinel is
+        # a RECORD whose pid is line 1 (src/watcher_sentinel.sh writes it).
+        rec = read_sentinel_record(sp)
+        spid = rec.get("pid")
+        if spid is None:
+            unreadable.append((sp, f"no pid on line 1: {rec.get('pid_line', '')[:28]!r}"))
             continue
         sargv = _proc_argv(spid)
         if not sargv:
