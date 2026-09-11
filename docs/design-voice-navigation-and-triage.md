@@ -7,12 +7,6 @@ Status: draft (RFC) · Owner-requested 2026-09-11 · Author: lucy-sutando
 Finishing a task quickly requires understanding its context. Sutando slows the
 owner down at both ends of a task, in the same way and for the same reason.
 
-| | The gap |
-|---|---|
-| **Getting there** | The answer is somewhere else. Going to it abandons where you are. |
-| **Understanding it** | What arrives is a list, a board, a scrollback. It must be scanned before it can be used. |
-| **Trusting it** | It was written earlier. Nothing says which parts are still true. |
-
 Sutando can already *speak* across this gap — the voice agent answers about the
 current channel and about what needs deciding. Speech does not close it. Speech
 cannot be skimmed, cannot put evidence beside a claim, and is gone from the
@@ -40,8 +34,7 @@ each trip costs the place it came from, because coming back means finding the
 message again.
 
 The reading was never the expensive part. The expensive part is that the two
-halves of a comparison cannot be on screen together — the first row of the table
-above, paid once per trip.
+halves of a comparison cannot be on screen together.
 
 ![The same message, with the linked article open in a notch panel beside it. The
 voice transcript reads "Can you open this URL in the notch?" — "Okay, I've opened
