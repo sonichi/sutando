@@ -1665,6 +1665,41 @@ class TheStageGateCarriesThisLayersObligations(unittest.TestCase):
             "step 2 publishes results; the selector that refuses a revoked late "
             "writer does not exist yet and must gate it")
 
+    def test_the_selection_postclaim_authority_split_is_gated_on_step_2(self):
+        """Selection orders `requested_worker` above the pin table (:778-790);
+        the post-claim re-read authorizes on membership alone (:1136-1139). A
+        pool command addressed to `core` in a pinned room wins then releases."""
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "selection/post-claim authority split" in row2[0],
+            "step 2 IS the claim path that would have to pick one authority; "
+            "the split must gate it, not be canonized as settled")
+
+    def test_the_dedicated_own_room_source_is_gated_on_step_2(self):
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "dedicated own-room source" in row2[0],
+            "rule 2 routes a no-field task to a dedicated worker's own room, but "
+            "no artifact proves that relationship; unsourced, it is the unbound "
+            "fallback wearing another name")
+
+    def test_the_addressing_row_does_not_assert_the_shipped_contract(self):
+        """The shipped contract says the opposite of rule 1 -- the header is
+        intent, not placement, and no claim path reads it. The row may propose
+        the ordering; it may not state it as what the system does."""
+        row = [l for l in open(DOC).read().split("\n")
+               if l.startswith("| what does THIS task address")]
+        self.assertEqual(len(row), 1, "expected exactly one addressing row")
+        self.assertIn("NOT as the shipped contract behaves", row[0],
+            "an unqualified ORDERED claim here contradicts "
+            "tests/requested-worker-header.test.py")
+
+    def test_the_execute_row_names_its_disagreement_with_selection(self):
+        row = [l for l in open(DOC).read().split("\n")
+               if l.startswith("| may that holder EXECUTE for this room")]
+        self.assertEqual(len(row), 1, "expected exactly one EXECUTE row")
+        self.assertIn("MEMBERSHIP ONLY", row[0],
+            "the post-claim re-read does not apply the addressing order; a row "
+            "silent on that lets an implementer assume one authority")
+
     def test_the_gate_requires_BOTH_late_writer_orders_pinned(self):
         """keweichen: `assertIn("late-writer order")` also matches "one late-writer
         order", so the one-word mutant passed 114/114. The normative phrase is the

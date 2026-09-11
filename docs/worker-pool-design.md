@@ -1712,11 +1712,11 @@ remembers is the one a sweep reads.
 | question | sole source |
 |---|---|
 | who exclusively holds this task's claim | the hard-link claim `state/task-event-handler-claims/<canonical task id>` |
-| may that holder EXECUTE for this room | DERIVED, not sourced: the claim AND the post-claim `bindings.json` re-read (`:1094-1139`). The claim proves exclusive ownership, never execution authorization — first-pin is unfenced, so a claim can still name an instance the room no longer binds. |
+| may that holder EXECUTE for this room | DERIVED, not sourced: the claim AND the post-claim `bindings.json` re-read (`:1094-1139`). The claim proves exclusive ownership, never execution authorization — first-pin is unfenced, so a claim can still name an instance the room no longer binds. **This derivation reads MEMBERSHIP ONLY and does not apply the addressing order the row below states, so selection and execution can disagree: a `requested_worker` that outranks the pin wins the claim and then fails this check.** That disagreement is inherited from the parent (`:778-796` versus `:1136-1139`), is NOT resolved here, and is gated on step 2 below. |
 | was the offer TAKEN, and by which executor | the accept record `state/task-event-handler-accepts/<canonical task id>` |
 | which instances serve this room | `state/pool/bindings.json` |
 | is that instance OPERATIONALLY able to claim, ignoring what the task addresses | DERIVED, not sourced: a conjunction over separately owned inputs — `eligibility` in `state/pool-status.json`, the probation directory `state/pool/probation/`, the instance's `.alive`, and the quiesce exclusion at `:1899`. No single one answers it, and this conjunction is deliberately BLIND to the task — it is the same for two tasks addressed differently. |
-| what does THIS task address | DERIVED, not sourced, and ORDERED: the authoritative `requested_worker` on the task envelope OUTRANKS the room's entry in the pin table (`state/pool/bindings.json`), per rule 1 at `:778-790`. With the field present the pin table does not answer — a task naming `worker-2` in a room pinned to `worker-3` addresses `worker-2`, and `worker-3` suppresses. With no field, the pin table answers, or a dedicated worker's own room does (`:104-115`); a task with no field is still addressed either way. So `bindings.json` remains the sole source of room MEMBERSHIP only — this row derives over that source and is never a second authority for it. |
+| what does THIS task address | DERIVED, not sourced, and ORDERED **as this design proposes, NOT as the shipped contract behaves — see the gate on step 2**: the authoritative `requested_worker` on the task envelope OUTRANKS the room's entry in the pin table (`state/pool/bindings.json`), per rule 1 at `:778-790`. With the field present the pin table does not answer — a task naming `worker-2` in a room pinned to `worker-3` addresses `worker-2`, and `worker-3` suppresses. With no field, the pin table answers, or a dedicated worker's own room does (`:104-115`); a task with no field is still addressed either way. So `bindings.json` remains the sole source of room MEMBERSHIP only — this row derives over that source and is never a second authority for it. **The dedicated own-room route named here has no durable source in this document**: no artifact proves the own-room relationship, so that branch is presently indistinguishable from the unbound fallback. Gated on step 2. |
 | may this instance claim THIS task | DERIVED, not sourced, and ORDERED over the WHOLE contract at `:778-796`, all three routes: rule 1 reads `requested_worker` first and can suppress an operationally-able instance; with no field, rule 2 decides from the pin table OR a dedicated worker's own room; with no field and an UNBOUND room, rule 3 has the core claim and workers suppress. A derivation citing only `:778-790` stops before rule 3 and cannot answer the unbound case. The operational conjunction above is a GATE on the winner, never the chooser. |
 | is that instance's process up | its own `.alive` |
 | has that instance run out of credit | `state/pool/quiesced/<instance>.json` |
@@ -2031,12 +2031,12 @@ production-path tests; the staged list below marks which those are.
 >
 > | blocked step | obligation that blocks it | why that step cannot be written yet |
 > |---|---|---|
-> | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance; **untaken-offer expiry**; **durable late-result selector** | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is; it also publishes results and consumes offers, and neither the expiry on a live-watcher untaken offer nor the selector that refuses a revoked late writer exists yet |
+> | 2 — worker event handler | gate-is-a-read; two-claims-per-allowance; **untaken-offer expiry**; **durable late-result selector**; **selection/post-claim authority split**; **dedicated own-room source** | the handler IS the read-then-claim the gate cannot fence; its admission bound is undefined until the fence is; it also publishes results and consumes offers, and neither the expiry on a live-watcher untaken offer nor the selector that refuses a revoked late writer exists yet |
 > | 3 — core sweep, pin writer | gate-is-a-read; two-claims-per-allowance; probation clock; retirement crash-completeness; **untaken-offer expiry** | the sweep publishes the request, runs the rollback, computes the probation deadline, and performs the retirement rename — every site |
 > | membership prerequisite (lands BEFORE step 2) | last-worker removal order | it adds the arm/disarm signal under commit-then-notify — that IS the disputed ordering, so it can ship the unsettled rule ahead of the step the order nominally gates |
 > | 4 — installer and plists | last-worker removal order; retirement crash-completeness | two incompatible orders are specified, and neither is crash-recoverable against a racing admission; an installer must pick one to be written at all |
 >
-> **Two of these obligations are added by this layer, not inherited**, and the gate is the
+> **Four of these obligations are added by this layer, not inherited**, and the gate is the
 > operative rule for them too. `claim live, no accept -> leave it` has no exit while the
 > publishing watcher LIVES — this document says no v1 mechanism ends that state and owes the
 > implementing PR an expiry. And result publication is the stated EXCEPTION to one-caller-wins:
@@ -2044,6 +2044,24 @@ production-path tests; the staged list below marks which those are.
 > would is named here as unresolved, with BOTH late-writer orders owed a pin. Raised by
 > `keweichen`, whose scan of the merged document found each named once in the prose and zero
 > times in the gate — so the gate could have lifted step 2 with both still open.
+>
+> The other two are routing-contract disagreements this layer CANONIZES rather than creates, and
+> the gate is why naming them is not the same as settling them. **Selection and post-claim
+> authorization use different authorities**: rule 1 lets `requested_worker` outrank the pin table
+> (`:778-790`), while the post-claim re-read authorizes on MEMBERSHIP alone (`:1136-1139`). A pool
+> command addressed `requested_worker: core` in a pinned room (`:1242-1247`) therefore wins the
+> claim and then releases, and no other instance may take it — rule 1 suppressed them. **The
+> dedicated own-room route** (`:104-115`, rule 2) names no artifact proving the own-room
+> relationship, leaving it indistinguishable from the unbound fallback.
+>
+> Neither is resolved here, and the reason is a scope boundary rather than effort: the SHIPPED
+> contract says the opposite of rule 1. `tests/requested-worker-header.test.py` states the field
+> is *"INTENT, not placement: the pool's binding table decides where a task runs, and no claim
+> path reads this header"*, and that is measurable, not merely asserted — `requested_worker`
+> occurs in exactly two files under `src/` (`local_task_protocol.py`, `task-bridge.ts`), both as
+> header-key declarations, with no claim path reading it. Resolving the split would mean deciding
+> that the pool overrides a shipped contract; that is a design decision above a documentation
+> change, so this layer gates it and leaves the choice to the step that implements it.
 >
 > Step 5's create/remove-worker control inherits step 4's gate for the same reason. Step 1 (this
 > document) is not gated — naming an open obligation is what it is for.
