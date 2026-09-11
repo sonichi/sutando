@@ -77,7 +77,10 @@ def load_bindings(workspace) -> dict:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise RosterError(f"bindings unreadable, keeping the last roster: {p}: {e}")
-    bindings = raw.get("bindings", {}) if isinstance(raw, dict) else None
+    # A bare {source: worker} map carries no 'bindings' key; `.get(..., {})` read
+    # it as an empty declaration and re-aimed every bound source at the core.
+    has_key = isinstance(raw, dict) and "bindings" in raw
+    bindings = raw["bindings"] if has_key else None
     if not isinstance(bindings, dict):
         raise RosterError(f"bindings must be an object under 'bindings': {p}")
     return bindings
@@ -128,9 +131,14 @@ def unknown_targets(roster: dict, targets) -> list:
     return [t for t in targets if t not in known]
 
 
-def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
+def compile_roster(workspace, workers: dict, bindings=None, version=None,
+                   allow_unbind=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
-    rather than emitting a roster that routes somewhere unintended."""
+    rather than emitting a roster that routes somewhere unintended.
+
+    A source that loses its binding is re-aimed at the core, so a compile whose
+    bindings SHRINK is refused unless `allow_unbind` names the sources released.
+    """
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
     for wid, row in (workers or {}).items():
         if wid != CORE and not WORKER_ID_RE.match(wid):
@@ -156,6 +164,12 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
                 "a binding to a nonexistent target fails every task from that source")
 
     prev = load_roster(workspace) or {}
+    dropped = sorted(set(prev.get("bindings") or {}) - set(bindings) - set(allow_unbind or ()))
+    if dropped:
+        raise RosterError(
+            f"compile would drop {len(dropped)} binding(s) {dropped} — those sources "
+            "would silently re-aim at the core; name them in allow_unbind to release them")
+
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}

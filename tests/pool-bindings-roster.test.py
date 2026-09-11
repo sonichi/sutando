@@ -210,6 +210,59 @@ class TestCorruptDeclarations(Base):
             with self.assertRaises(pr.RosterError, msg=bad):
                 pr.load_bindings(self.ws)
 
+    def test_a_bare_map_without_the_bindings_key_is_refused(self):
+        """Measured 2026-09-11: a hand-written {source: worker} map loaded as {}
+        and the next compile emitted 1 binding where the owner had declared 6."""
+        self.declare(json.dumps({"!x:ag2.space": W1, "!y:ag2.space": W1}))
+        with self.assertRaises(pr.RosterError):
+            pr.load_bindings(self.ws)
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W1))
+
+    def test_the_bindings_key_is_what_is_missing_not_the_file(self):
+        """The refusal must not swallow the still-valid empty declarations."""
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        self.declare(json.dumps({"bindings": {}}))
+        self.assertEqual(pr.load_bindings(self.ws), {})
+
+
+class TestBindingLoss(Base):
+    """A source whose binding vanishes is re-aimed at the core with no error,
+    which is the same silent misroute a corrupt declaration produced."""
+
+    def test_a_shrink_without_allow_unbind_is_refused_by_name(self):
+        pr.compile_roster(self.ws, live(W1), {"!x:ag2.space": W1, "!y:ag2.space": W1})
+        with self.assertRaises(pr.RosterError) as e:
+            pr.compile_roster(self.ws, live(W1), {"!x:ag2.space": W1})
+        self.assertIn("!y:ag2.space", str(e.exception))
+        self.assertNotIn("!x:ag2.space", str(e.exception))
+
+    def test_a_refused_shrink_leaves_the_previous_roster_intact(self):
+        first = pr.compile_roster(self.ws, live(W1), {"!y:ag2.space": W1})
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W1), {})
+        kept = pr.load_roster(self.ws)
+        self.assertEqual(kept["version"], first["version"])
+        self.assertEqual(pr.targets_for(kept, "!y:ag2.space"), [W1])
+
+    def test_a_shrink_the_caller_names_compiles(self):
+        pr.compile_roster(self.ws, live(W1), {"!x:ag2.space": W1, "!y:ag2.space": W1})
+        got = pr.compile_roster(self.ws, live(W1), {"!x:ag2.space": W1},
+                                allow_unbind=["!y:ag2.space"])
+        self.assertEqual(got["bindings"], {"!x:ag2.space": W1})
+        self.assertEqual(pr.targets_for(got, "!y:ag2.space"), [pr.CORE])
+
+    def test_growth_needs_no_permission(self):
+        pr.compile_roster(self.ws, live(W1), {"!x:ag2.space": W1})
+        got = pr.compile_roster(self.ws, live(W1, W2),
+                                {"!x:ag2.space": W1, "!y:ag2.space": W2})
+        self.assertEqual(pr.targets_for(got, "!y:ag2.space"), [W2])
+
+    def test_retargeting_a_source_is_not_a_shrink(self):
+        pr.compile_roster(self.ws, live(W1, W2), {"!x:ag2.space": W1})
+        got = pr.compile_roster(self.ws, live(W1, W2), {"!x:ag2.space": W2})
+        self.assertEqual(pr.targets_for(got, "!x:ag2.space"), [W2])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)
