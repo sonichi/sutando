@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -2426,7 +2427,7 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 # A roster row is ~100 bytes, so this is >10k workers; past it the loop would
 # re-read and re-parse a runaway file every pass before it can poll for tasks.
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
-_workers_push_mtime = 0.0
+_workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
 _advertisement_unavailable_logged = False
 
@@ -2435,10 +2436,15 @@ _advertisement_unavailable_logged = False
 _UNSUPPORTED_ENDPOINT_STATUS = frozenset({404, 405, 501})
 
 
-def _read_pool_advertisement() -> "tuple[float, dict | None]":
-    """The pool's roster-derived advertisement -> (mtime, record), or
-    (0.0, None) when the record is UNAVAILABLE — absent, unreadable, mid-write,
+def _read_pool_advertisement() -> "tuple[str, dict | None]":
+    """The pool's roster-derived advertisement -> (identity, record), or
+    ("", None) when the record is UNAVAILABLE — absent, unreadable, mid-write,
     malformed, or carrying only one of its two halves.
+
+    The identity is a digest of the record's canonical content and is the ONE
+    change signal both publications key on. mtime is not: a restore that lands
+    below the prior file's mtime is new content the picker must see, and the
+    two halves keyed on different signals disagreed on exactly that record.
 
     Availability is a tri-state, and None is the only "cannot read it" value: a
     record whose maps are empty is AVAILABLE and means "the pool is empty", an
@@ -2454,27 +2460,26 @@ def _read_pool_advertisement() -> "tuple[float, dict | None]":
     as long as that file stays. The size is bounded before the parse so a
     runaway file cannot cost the loop a full read per pass either."""
     try:
-        st = _POOL_ADVERTISEMENT_FILE.stat()
-        if st.st_size > _POOL_ADVERTISEMENT_MAX_BYTES:
-            return (0.0, None)
-        mtime = st.st_mtime
+        if _POOL_ADVERTISEMENT_FILE.stat().st_size > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return ("", None)
         rec = json.loads(_POOL_ADVERTISEMENT_FILE.read_text())
+        canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"))
     except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
-        return (0.0, None)
+        return ("", None)
     if not isinstance(rec, dict):
-        return (0.0, None)
+        return ("", None)
     if not isinstance(rec.get("workers"), dict):
-        return (0.0, None)
+        return ("", None)
     if not isinstance(rec.get("profile_workers"), dict):
-        return (0.0, None)
-    return (mtime, rec)
+        return ("", None)
+    return (hashlib.sha256(canonical.encode()).hexdigest(), rec)
 
 
-def _advertisement_or_none() -> "tuple[float, dict | None]":
+def _advertisement_or_none() -> "tuple[str, dict | None]":
     """_read_pool_advertisement, logging the availability edge once per edge so
     an absent producer cannot fill the log at the loop's cadence."""
     global _advertisement_unavailable_logged
-    mtime, rec = _read_pool_advertisement()
+    identity, rec = _read_pool_advertisement()
     if rec is None:
         if not _advertisement_unavailable_logged:
             _advertisement_unavailable_logged = True
@@ -2483,7 +2488,7 @@ def _advertisement_or_none() -> "tuple[float, dict | None]":
     elif _advertisement_unavailable_logged:
         _advertisement_unavailable_logged = False
         _log("pool advertisement readable again")
-    return (mtime, rec)
+    return (identity, rec)
 
 
 def _defer_push(what: str, e: "urllib.error.HTTPError", now: float) -> float:
@@ -2501,14 +2506,14 @@ def _maybe_push_workers_snapshot() -> bool:
     leaves the broker holding the last snapshot we sent; an unsupported
     endpoint backs the push off an hour and any other HTTP status 5m;
     nothing here may ever break the task loop."""
-    global _workers_push_mtime, _workers_push_retry_at
+    global _workers_pushed_identity, _workers_push_retry_at
     now = time.time()
     if now < _workers_push_retry_at:
         return False
-    mtime, ad = _advertisement_or_none()
+    identity, ad = _advertisement_or_none()
     if ad is None:
         return False
-    if mtime <= _workers_push_mtime:
+    if identity == _workers_pushed_identity:
         return False
     try:
         _req("POST", "/v1/workers", ad["workers"], timeout=15)
@@ -2519,12 +2524,12 @@ def _maybe_push_workers_snapshot() -> bool:
         _workers_push_retry_at = now + 300
         _log(f"workers-snapshot push failed, retrying in 5m: {e}")
         return False
-    _workers_push_mtime = mtime
+    _workers_pushed_identity = identity
     _log("workers-snapshot pushed")
     return True
 
 
-_profile_push_key = ""
+_profile_pushed_identity = ""
 _profile_push_retry_at = 0.0
 
 
@@ -2552,22 +2557,22 @@ def _maybe_push_agent_profile() -> bool:
     picker draws and the broker REPLACES the document, so a card built from
     a record we could not read would erase the pool. Same retry taxonomy as
     the workers-snapshot push; nothing here may break the task loop."""
-    global _profile_push_key, _profile_push_retry_at
+    global _profile_pushed_identity, _profile_push_retry_at
     now = time.time()
     if now < _profile_push_retry_at:
         return False
     mxid = _reenroll_identity()
     if not mxid:
         return False  # identity may appear mid-episode; recheck next loop
-    mtime, ad = _advertisement_or_none()
+    identity, ad = _advertisement_or_none()
     if ad is None:
         return False
-    card = _build_agent_profile(ad["profile_workers"])
-    # The advertisement's mtime is in the key so a roster rewrite re-puts the
-    # card even when the workers map serialises identically.
-    key = f"{mxid}\n{mtime}\n" + json.dumps(card, sort_keys=True)
-    if key == _profile_push_key:
+    # The same record identity the workers push keys on, so the two halves
+    # can never disagree on whether a record is new; mxid may change mid-run.
+    key = f"{mxid}\n{identity}"
+    if key == _profile_pushed_identity:
         return False
+    card = _build_agent_profile(ad["profile_workers"])
     try:
         _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid)}/profile",
              card, timeout=15)
@@ -2578,7 +2583,7 @@ def _maybe_push_agent_profile() -> bool:
         _profile_push_retry_at = now + 300
         _log(f"agent-profile push failed, retrying in 5m: {e}")
         return False
-    _profile_push_key = key
+    _profile_pushed_identity = key
     _log(f"agent-profile pushed for {mxid}")
     return True
 

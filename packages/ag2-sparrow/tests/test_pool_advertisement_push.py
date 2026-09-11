@@ -115,14 +115,14 @@ def test_malformed_json_pushes_nothing_and_keeps_the_prior_snapshot():
         _advertise(m, _record(1))
         assert m._maybe_push_workers_snapshot() is True
         assert m._maybe_push_agent_profile() is True
-        good_key, good_mtime = m._profile_push_key, m._workers_push_mtime
+        good_key, good_id = m._profile_pushed_identity, m._workers_pushed_identity
 
         _write_raw(m, '{"workers": {"ts": 2}, "profile_wor', age=5)
         assert m._maybe_push_workers_snapshot() is False
         assert m._maybe_push_agent_profile() is False
         assert len(calls) == 2, "a corrupt read issues no request"
-        assert m._profile_push_key == good_key, "prior card is still the live one"
-        assert m._workers_push_mtime == good_mtime, "prior snapshot is still live"
+        assert m._profile_pushed_identity == good_key, "prior card is still the live one"
+        assert m._workers_pushed_identity == good_id, "prior snapshot is still live"
 
         _advertise(m, _record(3), age=10)
         assert m._maybe_push_workers_snapshot() is True
@@ -244,7 +244,7 @@ def test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll():
 
         real_path = m._POOL_ADVERTISEMENT_FILE
         m._POOL_ADVERTISEMENT_FILE = _ReadRaises(RecursionError("maximum recursion depth exceeded"))
-        assert m._read_pool_advertisement() == (0.0, None), "the UNAVAILABLE sentinel"
+        assert m._read_pool_advertisement() == ("", None), "the UNAVAILABLE sentinel"
         assert m._maybe_push_workers_snapshot() is False
         assert m._maybe_push_agent_profile() is False
         assert len(calls) == n, "a parser failure issues no request"
@@ -268,7 +268,7 @@ def test_an_oversized_record_is_unavailable_before_it_is_parsed():
         rec = _record(1)
         rec["pad"] = "x" * m._POOL_ADVERTISEMENT_MAX_BYTES
         _advertise(m, rec)
-        assert m._read_pool_advertisement() == (0.0, None)
+        assert m._read_pool_advertisement() == ("", None)
         assert m._maybe_push_workers_snapshot() is False
         assert m._maybe_push_agent_profile() is False
         assert calls == [], "an oversized record pushes nothing"
@@ -300,17 +300,56 @@ def test_a_later_mtime_repushes_both():
         print("PASS test_a_later_mtime_repushes_both")
 
 
-def test_mtime_alone_repushes_the_card():
-    """The roster is the authority; an identical serialisation still re-puts."""
+def test_a_bumped_mtime_with_unchanged_content_repushes_neither():
+    """Content, not mtime, is the change identity — for BOTH halves."""
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
         calls = _capture(m)
         _advertise(m, _record(1))
+        assert m._maybe_push_workers_snapshot() is True
         assert m._maybe_push_agent_profile() is True
         _advertise(m, _record(1), age=5)
-        assert m._maybe_push_agent_profile() is True, "mtime is part of the key"
+        assert m._maybe_push_workers_snapshot() is False, "same content: no re-post"
+        assert m._maybe_push_agent_profile() is False, "same content: no re-put"
         assert len(calls) == 2
-        print("PASS test_mtime_alone_repushes_the_card")
+        print("PASS test_a_bumped_mtime_with_unchanged_content_repushes_neither")
+
+
+def test_a_restore_at_or_below_the_prior_mtime_repushes_both():
+    """valid -> missing -> restored with a LOWER, then an EQUAL, mtime. Keyed
+    on mtime as a high-water mark the workers POST skipped the restore while
+    the profile (keyed on content) advanced, so /v1/workers sat on revision 1
+    under a card already labelling revision 2 until a later mtime arrived."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        calls = _capture(m)
+        _advertise(m, _record(1))
+        first_mtime = m._POOL_ADVERTISEMENT_FILE.stat().st_mtime
+        assert m._maybe_push_workers_snapshot() is True
+        assert m._maybe_push_agent_profile() is True
+
+        m._POOL_ADVERTISEMENT_FILE.unlink()
+        assert m._maybe_push_workers_snapshot() is False
+        assert m._maybe_push_agent_profile() is False
+
+        rec = _record(2)
+        rec["profile_workers"][W1]["label"] = "restored"
+        _advertise(m, rec, age=-10)
+        assert m._POOL_ADVERTISEMENT_FILE.stat().st_mtime < first_mtime
+        assert m._maybe_push_workers_snapshot() is True, "lower mtime, new content"
+        assert m._maybe_push_agent_profile() is True
+        assert [c[2]["ts"] for c in calls if c[0] == "POST"] == [1, 2]
+        assert [c[2]["workers"][W1]["label"] for c in calls if c[0] == "PUT"] == [
+            "reviewer", "restored"]
+
+        rec = _record(3)
+        rec["profile_workers"][W1]["label"] = "again"
+        p = _advertise(m, rec)
+        os.utime(p, (first_mtime, first_mtime))
+        assert m._maybe_push_workers_snapshot() is True, "equal mtime, new content"
+        assert m._maybe_push_agent_profile() is True
+        assert calls[-2][2]["ts"] == 3 and calls[-1][2]["workers"][W1]["label"] == "again"
+        print("PASS test_a_restore_at_or_below_the_prior_mtime_repushes_both")
 
 
 def test_a_server_error_takes_the_short_retry_not_the_hour():
@@ -406,7 +445,8 @@ if __name__ == "__main__":
     test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll()
     test_an_oversized_record_is_unavailable_before_it_is_parsed()
     test_a_later_mtime_repushes_both()
-    test_mtime_alone_repushes_the_card()
+    test_a_bumped_mtime_with_unchanged_content_repushes_neither()
+    test_a_restore_at_or_below_the_prior_mtime_repushes_both()
     test_a_server_error_takes_the_short_retry_not_the_hour()
     test_an_auth_error_takes_the_short_retry_not_the_hour()
     test_only_an_unsupported_endpoint_earns_the_hour_backoff()
