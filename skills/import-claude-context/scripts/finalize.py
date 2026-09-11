@@ -1235,12 +1235,14 @@ def within_reviewed(reviewed, payloads) -> list:
 
 
 def reviewed_subset_payloads(reviewed, entities: dict, index_doc: dict, projects, known) -> list:
-    """What a `--commit --projects` subset publishes: each person of `reviewed`
-    (staged/people.json, the set the digest showed) re-rendered from
-    `entities` with the citations of `projects` only — the landed ones — and
-    kept only while those citations still clear the export's floor. Nobody the
-    digest did not list is added, nobody is re-ranked; a person the narrowing
-    leaves under the floor waits for the digest that shows them again."""
+    """A re-cut of an approved set: each person of `reviewed` (staged/people.json
+    for a `--commit --projects` subset — the set the digest showed; people.json
+    for a revocation — the set already published) re-rendered from `entities`
+    with the citations of `projects` only and kept only while those citations
+    still clear the export's floor. Nobody outside `reviewed` is added, nobody
+    is re-ranked, the cap is never recomputed (`cap=None`: the cap already
+    applied when `reviewed` was cut); a person left under the floor waits for
+    the digest that shows them again."""
     everyone = people_payloads(entities, index_doc, cap=None, projects=projects, known=known)
     return within_reviewed(reviewed, everyone)
 
@@ -1388,11 +1390,20 @@ def refresh_people_export(data_dir: Path) -> int:
     keeps only the citations still approved — a landed project, a summary still
     on disk, not held — and loses the people that fall under the floor. It only
     ever shrinks (a re-grown export needs a commit); an export whose inputs are
-    gone is retired. Returns how many payloads went; 0 when nothing was exported."""
+    gone is retired. Returns how many payloads went; 0 when nothing was exported.
+
+    The shrink starts from people.json — the published set — never from a
+    re-ranking of approved/people-inputs.json: that file holds every approved
+    person, the cap included the ones the digest showed, and re-cutting it once
+    the revoked citations were gone let a person the cap had hidden take the
+    freed slot (PR #4127 review: 25 Alpha names published, `--forget-session`
+    of the first Alpha session exported the one Beta-only person nobody had
+    seen). A removal request never adds a person or a citation."""
     path = data_dir / APPROVED_PEOPLE
     if not path.is_file():
         return 0
-    before = len(_common.load_json(path, []) or [])
+    published = [q for q in _common.load_json(path, []) or [] if isinstance(q, dict)]
+    before = len(published)
     src = approved_dir(data_dir) / APPROVED_PEOPLE_INPUTS
     doc = load_people_inputs(data_dir)
     index_doc, all_summaries, _r, _e, state = load_inputs(data_dir)
@@ -1410,7 +1421,7 @@ def refresh_people_export(data_dir: Path) -> int:
 
     entities = strip_citations(_entity_lists(doc.get("entities")), gone)[0]
     known = doc.get("known_people")
-    people = people_payloads(entities, index_doc, projects=approved, known=load_known_people(known))
+    people = reviewed_subset_payloads(published, entities, index_doc, approved, load_known_people(known))
     save_people_export(data_dir, people, entities, approved, known)
     return before - len(people)
 

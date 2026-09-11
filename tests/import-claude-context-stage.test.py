@@ -1152,6 +1152,70 @@ class TestSubsetCommitStaysInsideTheDigest(Base):
         rc, payloads, _ = self._run("--people-json", "--projects", "beta")
         self.assertEqual([p["name"] for p in payloads], [ZED])
 
+    # Revocation (--forget-session / --forget / --hold) shrinks the published set and adds nobody: the
+    # three tests below fail on 9c437622, where the shrink re-ranked people-inputs.json and surfaced Zed.
+
+    def _publish_the_capped_set(self, sticky=5):
+        """Stage + commit Alpha and Beta; the first `sticky` Aaa people carry a second Alpha-U2 citation,
+        so they survive the loss of U1 while the other Aaa people fall to one citation.
+
+        PR #4127 review, `refresh_people_export`: after the full commit published the 25 Aaa names,
+        revoking the first Alpha session re-cut approved/people-inputs.json from scratch — every approved
+        person, the cap included — so the freed slots went to Zed, whom no digest had ever shown, and the
+        export became [Zed] with `people_revoked=24`. A revocation now starts from people.json, drops the
+        revoked citations and whoever falls under the floor, and never adds a person or a citation."""
+        p = self.data / "entities.json"
+        ents = json.loads(p.read_text())
+        for person in ents["people"][:sticky]:
+            person["citations"].append(_cite(SLUG_A, U2, "a second polish thread"))
+        p.write_text(json.dumps(ents))
+        self._run("--stage")
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], [q["name"] for q in self._export()]), (25, AAA))
+        return AAA[:sticky]
+
+    def assertRevokedWithin(self, before, r, expect):
+        """The export after a revocation: exactly `expect` (an order-preserving subset of `before`),
+        `people_revoked` the removals, and --people-json printing that export verbatim."""
+        after = [q["name"] for q in self._export()]
+        self.assertEqual(after, expect)
+        self.assertEqual([n for n in before if n in after], after)       # a subset, in the published order
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        self.assertEqual(r["people_revoked"], len(before) - len(expect))
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, self._export())
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                                   # Beta never published anyone
+
+    def test_forget_session_never_surfaces_a_person_the_cap_hid(self):
+        sticky = self._publish_the_capped_set()
+        rc, r, _ = self._run("--forget-session", U1)                      # the first Alpha session
+        self.assertEqual((rc, r["landed"], r["entities_dropped"]), (0, True, 0))
+        self.assertRevokedWithin(AAA, r, sticky)
+        for q in self._export():                                          # the revoked citation is gone from every dossier
+            self.assertNotIn(U1[:8], q["doc"])
+            self.assertIn(U2[:8], q["doc"])
+        rc, r, _ = self._run("--forget-session", U2)                      # now everyone shown is under the floor
+        self.assertRevokedWithin(sticky, r, [])
+
+    def test_forget_a_project_never_surfaces_a_person_the_cap_hid(self):
+        self._publish_the_capped_set()
+        rc, r, _ = self._run("--forget", "alpha")                         # Beta stays landed; Zed stays unseen
+        self.assertEqual((rc, r["approved"]), (0, 1))
+        self.assertRevokedWithin(AAA, r, [])
+        self.assertEqual(json.loads((self.data / "approved" / "people-inputs.json").read_text())["projects"], [SLUG_B])
+
+    def test_hold_never_surfaces_a_person_the_cap_hid(self):
+        sticky = self._publish_the_capped_set()
+        # a re-extraction rewrote U1's state record without its summarized_at, so a hold is not refused as "landed"
+        p = self.data / "state.json"
+        state = json.loads(p.read_text())
+        state["sessions"][f"{SLUG_A}/{U1}"] = {"extracted_at": "2026-09-02T00:00:00Z"}
+        p.write_text(json.dumps(state))
+        rc, r, _ = self._run("--hold", U1)
+        self.assertEqual((rc, r["held"]), (0, 1))
+        self.assertRevokedWithin(AAA, r, sticky)
+
     def test_within_reviewed_matches_by_email_then_name_in_the_reviewed_order(self):
         within = self.m.within_reviewed
         a = {"name": "Ada Lovelace", "email": "ada@example.com", "doc": "a"}
