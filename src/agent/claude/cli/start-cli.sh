@@ -664,8 +664,10 @@ ensure_core_monitor() {
     # loop forever — so any caller capturing start-cli.sh's output never saw
     # EOF (desktop core_restart: 120 s timeout on every fresh boot). This form
     # also makes $! the loop's own pid, so the pidfile can actually stop it.
+    # Loop only while the interpreter and script exist, and stop if sleep fails:
+    # with them gone (engine dir removed) `while true` would spin at full CPU.
     if [ -n "$PY" ]; then
-      bash -c 'while true; do "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30; done' \
+      bash -c 'while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
         relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" \
         >> /tmp/core-supervisor-relay.log 2>&1 < /dev/null &
       echo $! > "$relay_pid_file"
