@@ -17,6 +17,8 @@ before any task exists.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -52,6 +54,28 @@ def bindings_path(workspace) -> Path:
 
 def roster_path(workspace) -> Path:
     return _root(workspace) / "state" / "roster.json"
+
+
+def _lock_path(workspace) -> Path:
+    p = roster_path(workspace)
+    return p.with_name(p.name + ".lock")
+
+
+@contextlib.contextmanager
+def _locked(workspace):
+    """Exclusive lock over one read-merge-write transaction on the roster.
+
+    Two `register_worker` calls that each read before either writes end with
+    only the later write surviving; the lock closes that window.
+    """
+    path = _lock_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def _read(path: Path, default):
@@ -168,3 +192,24 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
               "workers": dict(workers or {}), "bindings": bindings}
     _write_atomic(roster_path(workspace), roster)
     return roster
+
+
+def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
+    """Add a worker to the roster and, if given, bind its room — the one
+    production writer for this transaction.
+
+    Read-merge-write (existing workers, then bindings, then both durable
+    publications) runs under `_locked` so two callers registering different
+    workers at once cannot each read before either writes, which is what
+    drops one of them from the result.
+    """
+    with _locked(workspace):
+        workers = dict((load_roster(workspace) or {}).get("workers") or {})
+        workers[worker_id] = {"state": "live", "label": label or worker_id}
+        bindings = dict(load_bindings(workspace))
+        if room:
+            bindings[room] = worker_id
+            # The next registration reloads bindings.json, not the roster: a
+            # binding held only in the compiled roster is discarded by it.
+            save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)

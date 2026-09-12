@@ -81,16 +81,12 @@ def preflight(workspace, repo, room: str) -> None:
 
 
 def compile_with(workspace, worker_id: str, label: str, room) -> dict:
-    """Add this worker to the roster, and its room to the bindings."""
-    workers = existing_workers(workspace)
-    workers[worker_id] = {"state": "live", "label": label or worker_id}
-    bindings = dict(pr.load_bindings(workspace))
-    if room:
-        bindings[room] = worker_id
-        # The next create reloads bindings.json, not the roster: a binding
-        # held only in the compiled roster is discarded by the next command.
-        pr.save_bindings(workspace, bindings)
-    return pr.compile_roster(workspace, workers, bindings)
+    """Add this worker to the roster, and its room to the bindings.
+
+    Delegates to the one locked registration writer: two `create_worker` runs
+    against the same workspace must not race each other's read-merge-write.
+    """
+    return pr.register_worker(workspace, worker_id, label, room)
 
 
 def report(made: dict, roster: dict, room, orphans: list) -> str:
