@@ -94,8 +94,13 @@ class DrainShape(_Base):
         self.assertEqual(len(self.posted), 1)
         method, path, payload = self.posted[0]
         self.assertEqual((method, path), ("POST", "/v1/results"))
-        self.assertEqual(payload["body"], "the reply",
-                         "body is posted verbatim — no wrapper, no label")
+        body = payload["body"]
+        # The readiness boundary stamps an ID before the drain sees the body; the
+        # drain still adds nothing of its own — stamp, blank line, content, end.
+        self.assertRegex(body, r"^\[task \d{8}-\d{3}\]\n\n",
+                         "the delivery boundary stamps an id ahead of the body")
+        self.assertEqual(body.split("\n\n", 1)[1], "the reply",
+                         "and past that stamp the body is verbatim — no wrapper, no label")
         self.assertNotIn(TID, inflight, "delivered tid leaves the ledger")
         self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists(),
                          "the result file is consumed, not left behind")
