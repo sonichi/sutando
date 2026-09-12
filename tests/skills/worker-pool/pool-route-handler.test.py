@@ -186,5 +186,37 @@ class TestACorruptRosterFailsClosed(unittest.TestCase):
         (self.ws / "state" / "roster.json").write_text('{"version": 3}')
         self.assertEqual(self._probe(), h.MUST_HANDLE)
 
+
+class TestOneRosterSnapshot(Base):
+    """The run routes against the roster classify() admitted, not a reload."""
+
+    def _unbind_after_classify(self):
+        real = h.classify
+
+        def classify_then_unbind(workspace, task):
+            got = real(workspace, task)
+            self.roster(bindings={})            # atomic replace of roster.json
+            return got
+        h.classify = classify_then_unbind
+        self.addCleanup(lambda: setattr(h, "classify", real))
+
+    def test_a_binding_removed_after_admission_cannot_turn_success_into_a_core_delivery(self):
+        self.roster()
+        t = self.task_file("task-race", channel_id="!room:x")
+        self._unbind_after_classify()
+        rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.ws / "deliveries" / "core" / "task-race.txt").exists(),
+                         "rc 0 with a core sentinel: nothing reads deliveries/core")
+        self.assertTrue((self.ws / "deliveries" / W / "task-race.txt").exists())
+
+    def test_the_stable_case_is_unchanged(self):
+        self.roster()
+        t = self.task_file("task-stable", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-stable.txt").exists())
+        self.assertFalse((self.ws / "deliveries" / "core").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
