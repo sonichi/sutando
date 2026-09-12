@@ -3207,8 +3207,19 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
     if not head:
         return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
-    if running == head:
-        return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
+    # Two writers, two spellings: the driver stamps its own prefix and `--short`
+    # grows to stay unambiguous, so equal commits compare unequal as strings.
+    try:
+        rp = subprocess.run(git_argv("-C", str(skills), "rev-parse", f"{running}^{{commit}}", "HEAD^{commit}"),
+                            capture_output=True, text=True, timeout=10)
+        full = rp.stdout.split() if rp.returncode == 0 else []
+    except Exception:
+        full = []
+    # String equality stays as the fallback for when rev-parse cannot answer.
+    same = running == head or (len(full) == 2 and full[0] == full[1])
+    if same:
+        return {"name": name, "status": "ok",
+                "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
     return {"name": name, "status": "warn",
             "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
                        f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "

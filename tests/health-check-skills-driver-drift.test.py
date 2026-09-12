@@ -21,7 +21,7 @@ Covers:
   j) real-Git control: the probe's git argv is never a bare "git"
   j2) absent-CLT control: no runnable git -> ok degrade
   h) POSITIVE CONTROL + MUTATION: the equality test is exercised, not just
-     read. Inverting `running == head` in the source must break arm (a) —
+     read. Inverting the `same` predicate in the source must break arm (a) —
      without this, deleting the comparison passes every other arm.
 
 Run: python3 tests/health-check-skills-driver-drift.test.py
@@ -85,6 +85,37 @@ def main() -> int:
         r = hc.check_skills_driver_code_drift(ws)
         check(r["status"] == "ok" and head in r["detail"],
               f"a) stamp matches skills HEAD -> ok naming it, got {r}")
+
+    # a2) one commit, two abbreviation lengths: the driver writes its own prefix
+    #     and `--short` grows, so `==` called this drift and demanded a re-arm.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        stamped = _git(sk, "rev-parse", "--short=9", "HEAD")
+        # The stamp must differ in LENGTH from `--short HEAD`, or the string
+        # compare already agrees and this arm passes against the unfixed probe.
+        check(stamped != head and stamped.startswith(head),
+              f"a2) fixture precondition: stamp is a longer spelling of head, got {stamped!r} vs {head!r}")
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{stamped}] driver started\n")
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "ok",
+              f"a2) another spelling of HEAD is NOT drift, got {r}")
+        check(stamped in r["detail"],
+              f"a2) the ok still names what the driver stamped, got {r['detail']}")
+
+    # a3) control for a2: a real other commit at the SAME short length must
+    #     still warn, so a2 cannot be satisfied by never warning.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        (sk / "f.txt").write_text("y\n")
+        _git(sk, "add", "f.txt")
+        _git(sk, "commit", "-q", "-m", "second")
+        stale = _git(sk, "rev-parse", "--short=7", "HEAD~1")
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{stale}] driver started\n")
+        r = hc.check_skills_driver_code_drift(ws)
+        check(r["status"] == "warn",
+              f"a3) a genuinely older commit still warns, got {r}")
 
     # b) the case the probe exists for.
     with tempfile.TemporaryDirectory() as td:
@@ -198,12 +229,12 @@ def main() -> int:
     # h) POSITIVE CONTROL + MUTATION. Arm (a) must depend on the equality test.
     #    Invert it in the source, load THAT, and prove the healthy case breaks.
     src = HC_SRC.read_text()
-    target = "    if running == head:"
+    target = "    if same:"
     check(src.count(target) == 1,
           "h) the mutated predicate is present exactly once (update the arm if it moved)")
     if src.count(target) == 1:
         with tempfile.TemporaryDirectory() as td:
-            mutated = src.replace(target, "    if running != head:", 1)
+            mutated = src.replace(target, "    if not same:", 1)
             mpath = Path(td) / "hc_mutant.py"
             mpath.write_text(mutated)
             mspec = importlib.util.spec_from_file_location("hc_mut", mpath)
@@ -213,7 +244,7 @@ def main() -> int:
             (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] x\n")
             rm = mhc.check_skills_driver_code_drift(ws)
             check(rm["status"] != "ok",
-                  "h) inverting `running == head` breaks the healthy case "
+                  "h) inverting the `same` predicate breaks the healthy case "
                   f"(the comparison is exercised, not merely present), got {rm}")
 
     print()
