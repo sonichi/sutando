@@ -924,7 +924,9 @@ class OneComponentBelongsToOneStage(unittest.TestCase):
     def test_the_two_components_are_told_apart_by_question_and_file(self):
         f = self._flat()
         self.assertIn("which instance is this room pinned to", f)
-        self.assertIn("may that instance claim right now", f)
+        # Was "may that instance claim right now" until keweichen showed that
+        # phrasing claimed the per-task decision it cannot make (#4041).
+        self.assertIn("is that instance operationally able to claim", f)
 
     def test_only_step_three_owns_the_eligibility_reader(self):
         """Exactly one surviving 'eligibility reader' mention, and it is step 3's."""
@@ -1603,6 +1605,119 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
                       "two incompatible normative orders"):
             self.assertIn(claim, f, f"open obligation not named: {claim}")
 
+    def test_the_duplicate_result_is_not_called_harmless(self):
+        # The done flag fences the EFFECT; it does not pick the authoritative
+        # writer, and find_result reads the live path before the archive.
+        self.assertNotIn("it is made harmless", self._flat())
+
+    def test_the_result_selector_is_named_as_an_open_obligation(self):
+        f = self._flat()
+        self.assertIn("unresolved implementation obligation", f)
+        self.assertIn("durable selector", f)
+
+    def test_the_neverclobber_invariant_does_NOT_claim_to_cover_every_publication(self):
+        """keweichen's block: the universal form contradicts the result section 90 lines
+        later, and the existing pins pass either way because none of them mention it."""
+        f = self._flat()
+        self.assertNotIn("every publication lands on a name", f,
+            "the never-clobber claim must be scoped to the publications it enumerates")
+
+    def test_result_publication_is_named_as_the_exception_to_neverclobber(self):
+        f = self._flat()
+        self.assertIn("Result publication is the EXCEPTION", f)
+        self.assertIn("this invariant does not cover it", f)
+
+    def test_a_first_writer_only_primitive_is_called_insufficient(self):
+        self.assertIn("NOT solved by a first-writer-only primitive", self._flat())
+
+class TheStageGateCarriesThisLayersObligations(unittest.TestCase):
+    """keweichen at 740b171c: the gate repair had no discriminating pin — removing
+    the mappings and the child-obligations paragraph recreated the exact omission
+    while both suites stayed green. These assertions are gate-SCOPED: they read the
+    blockquote, not the document, because the defect was prose present and gate
+    silent."""
+
+    def _gate(self):
+        raw = open(DOC).read()
+        start = raw.index("### STAGE GATE")
+        out = []
+        for line in raw[start:].split("\n"):
+            if line.startswith(">") or (not line.strip() and out):
+                if not line.strip() and out and not out[-1].startswith(">"):
+                    break
+                out.append(line)
+            elif out:
+                break
+        return "\n".join(out)
+
+    def test_untaken_offer_expiry_is_gated_on_steps_2_and_3(self):
+        g = self._gate()
+        row2 = [l for l in g.split("\n") if l.startswith("> | 2 ")]
+        row3 = [l for l in g.split("\n") if l.startswith("> | 3 ")]
+        self.assertTrue(row2 and "untaken-offer expiry" in row2[0],
+            "step 2 consumes offers; its row must gate the expiry")
+        self.assertTrue(row3 and "untaken-offer expiry" in row3[0],
+            "step 3 recovers offers; its row must gate the expiry")
+
+    def test_the_durable_late_result_selector_is_gated_on_step_2(self):
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "durable late-result selector" in row2[0],
+            "step 2 publishes results; the selector that refuses a revoked late "
+            "writer does not exist yet and must gate it")
+
+    def test_the_selection_postclaim_authority_split_is_gated_on_step_2(self):
+        """Selection orders `requested_worker` above the pin table (:778-790);
+        the post-claim re-read authorizes on membership alone (:1136-1139). A
+        pool command addressed to `core` in a pinned room wins then releases."""
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "selection/post-claim authority split" in row2[0],
+            "step 2 IS the claim path that would have to pick one authority; "
+            "the split must gate it, not be canonized as settled")
+
+    def test_the_dedicated_own_room_source_is_gated_on_step_2(self):
+        row2 = [l for l in self._gate().split("\n") if l.startswith("> | 2 ")]
+        self.assertTrue(row2 and "dedicated own-room source" in row2[0],
+            "rule 2 routes a no-field task to a dedicated worker's own room, but "
+            "no artifact proves that relationship; unsourced, it is the unbound "
+            "fallback wearing another name")
+
+    def test_the_addressing_row_does_not_assert_the_shipped_contract(self):
+        """The shipped contract says the opposite of rule 1 -- the header is
+        intent, not placement, and no claim path reads it. The row may propose
+        the ordering; it may not state it as what the system does."""
+        row = [l for l in open(DOC).read().split("\n")
+               if l.startswith("| what does THIS task address")]
+        self.assertEqual(len(row), 1, "expected exactly one addressing row")
+        self.assertIn("NOT as the shipped contract behaves", row[0],
+            "an unqualified ORDERED claim here contradicts "
+            "tests/requested-worker-header.test.py")
+
+    def test_the_execute_row_names_its_disagreement_with_selection(self):
+        row = [l for l in open(DOC).read().split("\n")
+               if l.startswith("| may that holder EXECUTE for this room")]
+        self.assertEqual(len(row), 1, "expected exactly one EXECUTE row")
+        self.assertIn("MEMBERSHIP ONLY", row[0],
+            "the post-claim re-read does not apply the addressing order; a row "
+            "silent on that lets an implementer assume one authority")
+
+    def test_the_gate_requires_BOTH_late_writer_orders_pinned(self):
+        """keweichen: `assertIn("late-writer order")` also matches "one late-writer
+        order", so the one-word mutant passed 114/114. The normative phrase is the
+        assertion; full-paragraph removal is not the adjacent alternative."""
+        g = self._gate()
+        self.assertIn("BOTH late-writer orders", g,
+            "one order pinned is not the obligation; the gate must say BOTH")
+        self.assertNotIn("one late-writer order", g,
+            "the singular form states a weaker requirement than the obligation")
+
+    def test_the_gate_names_these_as_added_by_this_layer(self):
+        """Without this the two could be read as inherited, and a future parent
+        merge would silently drop them the way the first merge did."""
+        g = self._gate()
+        self.assertIn("added by this layer", g)
+
+
+
 class TheParentGateCarriesItsOwnAdditions(unittest.TestCase):
     """keweichen at bb4578d6: deleting the fifth obligation, its Step 3/4 mappings,
     or the membership-prerequisite row left all 105 parent tests green. I added
@@ -2103,6 +2218,171 @@ class EverySensitiveSiteIsOneTable(unittest.TestCase):
             if s["next"]:
                 self.assertEqual(nxt, s["next"],
                     f"{s['key']}: the unit AFTER it changed or it was relocated")
+
+
+
+class AuthoritativeSourceRowsSeparateFactFromDerivation(unittest.TestCase):
+    """A `sole source` table must not assign a DERIVED decision to one partial input.
+
+    Two rows did. The claim row named the hard link as the sole source for "may this
+    task be executed", contradicting the unfenced-first-pin contract that requires a
+    post-claim bindings re-read; the result row named the file's presence as proof of
+    completion, contradicting `read_ready_result`. Deleting either row left every other
+    test green, which is why these exist.
+    """
+
+    def _rows(self):
+        text = DOC.read_text(encoding="utf-8")
+        return [l for l in text.split("\n") if l.startswith("| ") and l.count("|") >= 3]
+
+    def test_no_row_makes_the_claim_the_sole_source_of_execution(self):
+        for row in self._rows():
+            head = row.split("|")[1].strip().lower()
+            if "execute" in head and "hold" not in head:
+                self.assertIn("DERIVED", row,
+                    "an execution-authorization row must be marked DERIVED, not sourced: " + row[:120])
+                self.assertIn("bindings", row,
+                    "an execution row must name the post-claim bindings re-read: " + row[:120])
+
+    def test_the_execution_row_EXISTS(self):
+        """Presence assertion. Without it the suite constrains only rows that happen to
+        exist, so DELETING the derived-execution row passes — measured: mutation M4
+        returned rc=0 against the first version of this class."""
+        rows = self._rows()
+        exec_rows = [r for r in rows if "EXECUTE" in r.split("|")[1]]
+        self.assertEqual(len(exec_rows), 1,
+            "exactly one derived-execution row must exist; deleting it would otherwise "
+            "silently restore the claim-proves-execution error")
+
+    def test_the_claim_row_claims_only_ownership(self):
+        claim = [r for r in self._rows() if "hard-link claim" in r]
+        self.assertTrue(claim, "the hard-link claim row vanished")
+        for row in claim:
+            head = row.split("|")[1].strip().lower()
+            self.assertNotIn("execute", head,
+                "the hard link proves exclusive ownership, never execution authorization: " + row[:120])
+
+    def test_completion_is_the_ready_predicate_not_file_presence(self):
+        finish = [r for r in self._rows() if r.split("|")[1].strip().lower().startswith("did the work finish")]
+        self.assertTrue(finish, "the completion row vanished")
+        for row in finish:
+            self.assertIn("read_ready_result", row,
+                "completion must name the ready-result predicate: " + row[:120])
+            self.assertNotIn("| the result file under", row,
+                "file presence is not completion: " + row[:120])
+
+    def test_the_crash_predicate_does_not_say_mere_presence(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertNotIn("a result's presence", text,
+            "the crash-predicate list still treats presence as completion")
+
+
+class TheClaimDecisionCarriesTheTaskAddress(unittest.TestCase):
+    """Reported by keweichen on #4041 at head 1625feca.
+
+    The single `may that instance claim right now` row derived the decision from
+    instance state alone. Rule 1 (`:778-790`) reads `requested_worker` FIRST, so
+    two tasks differing only in that field decide differently on identical
+    instance state -- the listed conjunction cannot answer what it claimed to.
+    Their control: deleting the whole row left ran=133 failures=0, so nothing
+    here could see it. Each test below fails when its own sentence is removed.
+    """
+
+    def _rows(self):
+        text = DOC.read_text(encoding="utf-8")
+        return [ln for ln in text.splitlines() if ln.startswith("| ")]
+
+    def _row_named(self, needle):
+        hits = [r for r in self._rows() if needle in r]
+        self.assertEqual(len(hits), 1,
+            f"expected exactly one authoritative-source row matching {needle!r}, got {len(hits)}")
+        return hits[0]
+
+    def test_a_row_answers_the_per_task_claim_decision(self):
+        # keweichen's delete-the-row mutation is exactly this assertion failing.
+        self._row_named("may this instance claim THIS task")
+
+    def test_that_row_names_requested_worker_as_an_input(self):
+        row = self._row_named("may this instance claim THIS task")
+        self.assertIn("requested_worker", row,
+            "the per-task claim decision omits the task address rule 1 reads first")
+
+    def test_that_row_is_ordered_not_a_bare_conjunction(self):
+        row = self._row_named("may this instance claim THIS task")
+        self.assertIn("ORDERED", row,
+            "rule 1 precedes the pin table; an unordered conjunction loses that")
+        # Pin the WHOLE contract, not a prefix: ":778-790" is also satisfied by the
+        # row's own warning against citing that shorter range, i.e. by its negation.
+        self.assertIn(":778-796", row,
+            "the ordered derivation must cite the whole routing contract, rule 3 included")
+
+    def test_that_row_covers_all_three_routes(self):
+        row = self._row_named("may this instance claim THIS task")
+        for token in ("rule 1", "rule 2", "rule 3", "UNBOUND"):
+            self.assertIn(token, row,
+                f"the claim decision omits {token}; a derivation that stops before rule 3 "
+                "cannot answer the unbound-room case")
+
+    def test_the_address_row_names_BOTH_forms_of_addressing(self):
+        row = self._row_named("what does THIS task address")
+        self.assertIn("requested_worker", row)
+        self.assertIn("bindings.json", row,
+            "the pin table is addressing too (:104-115); naming only the envelope field "
+            "contradicts the routing contract")
+
+    def test_the_address_row_ORDERS_the_two_forms_field_over_pin(self):
+        """Naming both inputs is not stating which wins.
+
+        Measured: reversing this row's stated precedence left both suites green,
+        so the row was documentation no test could distinguish from its opposite.
+        The direction is the claim -- rule 1 at :778-790 selects on the envelope
+        field first -- so the pin must not be the one described as outranking.
+        """
+        row = self._row_named("what does THIS task address")
+        field_first = row.index("requested_worker") < row.index("bindings.json")
+        self.assertTrue(field_first,
+            "the envelope field must be named before the pin table; order on the page "
+            "is the only cue a reader has to which input wins")
+        self.assertRegex(row, r"requested_worker`?[^|]*\bOUTRANKS\b",
+            "the row names both inputs without saying which wins; a reader hitting "
+            "requested_worker=worker-2 in a room pinned to worker-3 cannot resolve it")
+        self.assertNotRegex(row, r"pin table\*{0,2}\s+OUTRANKS",
+            "reversed precedence: the pin table cannot outrank the envelope field "
+            "while rule 1 at :778-790 selects on the field")
+
+    def test_the_address_row_is_marked_DERIVED_not_a_second_source(self):
+        """bindings.json is the sole source of room MEMBERSHIP one row above.
+
+        Reusing it here as a co-equal answer makes one artifact answer two
+        questions, which the table's own preamble forbids.
+        """
+        row = self._row_named("what does THIS task address")
+        self.assertIn("DERIVED", row,
+            "every other multi-input row says DERIVED, not sourced; unmarked, this row "
+            "reads as a second authority over bindings.json")
+
+    def test_the_operational_row_declares_itself_blind_to_the_task(self):
+        row = self._row_named("OPERATIONALLY able to claim")
+        self.assertIn("BLIND", row,
+            "the instance-state conjunction must say it cannot see the task, "
+            "or it reads as answering the per-task question again")
+        self.assertNotIn("`bindings.json`", row,
+            "room membership is its own fact; folding it into the operational "
+            "conjunction is what made one row look sufficient")
+
+    def test_the_eligibility_reader_no_longer_claims_the_per_task_question(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertNotIn("the eligibility reader asks *may that instance claim right now*", text,
+            "two decompositions of one question stood at once (:2128-2137 vs the table)")
+
+    def test_the_two_questions_are_not_the_same_string(self):
+        rows = self._rows()
+        op = [r for r in rows if "OPERATIONALLY able to claim" in r]
+        per = [r for r in rows if "may this instance claim THIS task" in r]
+        self.assertTrue(op and per)
+        self.assertNotEqual(op[0].split("|")[1].strip(), per[0].split("|")[1].strip(),
+            "the operational gate and the per-task decision must not share a question")
+
 
 
 if __name__ == "__main__":
