@@ -133,7 +133,13 @@ restore_shutdown_sentinel() {
 }
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude)
-[ -n "$WORKER_INSTANCE" ] || CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=1)
+# A server born from a core launch carries the marker in its global env and
+# every new session inherits it; omitting -e is not an override, an empty is.
+if [ -n "$WORKER_INSTANCE" ]; then
+  CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=)
+else
+  CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=1)
+fi
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 [ -n "$WORKER_INSTANCE" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$WORKER_INSTANCE")

@@ -26,11 +26,15 @@ REPO = Path(__file__).resolve().parent.parent
 TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 
 
-def _boot(extra_env: dict) -> dict:
+def _boot(extra_env: dict, server_env: "dict | None" = None) -> dict:
     """One launcher run against a COPIED repo whose sutando-config.sh names a
     scratch workspace — the real one must never be a test's write target.
 
-    Returns the pane argv, the session's tmux env, and the workspace rows."""
+    `server_env` starts the tmux server FIRST, from a process carrying that env:
+    what a core launch does, since it exports its marker before it touches tmux.
+
+    Returns the pane argv and env, the session's and server's tmux env, the
+    workspace rows, and what the SessionStart hint says to that pane."""
     if not TMUX:
         raise unittest.SkipTest("tmux not found")
     td = Path(tempfile.mkdtemp())
@@ -54,7 +58,7 @@ def _boot(extra_env: dict) -> dict:
         bind = td / "bin"
         bind.mkdir()
         (td / "home").mkdir()
-        for stub, body in (("claude", "sleep 120\n"), ("pgrep", "exit 0\n"),
+        for stub, body in (("claude", 'env > "$HOME/claude.env"\nsleep 120\n'), ("pgrep", "exit 0\n"),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body)
             (bind / stub).chmod(0o755)
@@ -68,20 +72,43 @@ def _boot(extra_env: dict) -> dict:
             return subprocess.run([TMUX, "-S", str(sock), *a],
                                   capture_output=True, text=True)
         try:
+            if server_env:
+                subprocess.run([TMUX, "-S", str(sock), "new-session", "-d", "-s", "seed", "sleep 120"],
+                               env={**env, **server_env}, capture_output=True, check=True)
             subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
                            env=env, capture_output=True, text=True, timeout=90)
             argv = []
             for pid in tm("list-panes", "-s", "-a", "-F", "#{pane_pid}").stdout.split():
                 argv += subprocess.run(["ps", "-o", "args=", "-p", pid],
                                        capture_output=True, text=True).stdout.split()
+            pane_env = _wait_text(td / "home" / "claude.env")
+            hint = subprocess.run(["/bin/bash", str(root / "src" / "schedule-crons-session-hint.sh")],
+                                  env=_parse_env(pane_env), capture_output=True, text=True).stdout
             log = ws / "state" / "session-starts.log"
-            return {"argv": argv,
+            return {"argv": argv, "pane_env": pane_env, "hint": hint,
                     "session_env": tm("show-environment", "-t", "=" + session).stdout,
+                    "global_env": tm("show-environment", "-g").stdout,
                     "session_starts": log.read_text().splitlines() if log.is_file() else []}
         finally:
             tm("kill-server")
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def _wait_text(path: Path, seconds: float = 5.0) -> str:
+    """The pane's shell writes this right after it starts; poll rather than
+    read a file the launcher's own session poll may have outrun."""
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.is_file() and path.read_text():
+            return path.read_text()
+        time.sleep(0.05)
+    return ""
+
+
+def _parse_env(dump: str) -> dict:
+    return dict(line.split("=", 1) for line in dump.splitlines() if "=" in line)
 
 
 class TestCorePolarityUnchanged(unittest.TestCase):
@@ -119,6 +146,32 @@ class TestWorkerWritesNoCoreRows(unittest.TestCase):
     def test_the_worker_does_not_retire_the_cores_launch_boundary(self):
         self.assertEqual(self.got["session_starts"], [],
                          "a worker boot was appended to the core's session log")
+
+
+class TestWorkerOnAServerBornFromACoreLaunch(unittest.TestCase):
+    """A tmux server takes its global env from whoever starts it, and a core
+    launch exports the marker before its first tmux call; every later session
+    on that socket inherits it. The spawner reuses the core's socket, so the
+    worker's own session must override the marker — omitting -e does not."""
+    def setUp(self):
+        wid = "d" * 32
+        self.got = _boot({"SUTANDO_INSTANCE_ID": wid,
+                          "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
+                          "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
+                          "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+                         server_env={"SUTANDO_CORE_SESSION": "1"})
+
+    def test_control_the_server_carries_the_core_marker(self):
+        self.assertIn("SUTANDO_CORE_SESSION=1", self.got["global_env"])
+
+    def test_the_worker_pane_does_not_inherit_it(self):
+        self.assertIn("SUTANDO_INSTANCE_ID=", self.got["pane_env"], "no pane env was captured")
+        self.assertNotIn("SUTANDO_CORE_SESSION=1", self.got["pane_env"],
+                         "the worker's shell carries the core marker")
+
+    def test_the_session_hint_stays_silent_for_the_worker(self):
+        self.assertEqual(self.got["hint"], "",
+                         "the worker was told to run the canonical core's /startup")
 
 
 if __name__ == "__main__":
