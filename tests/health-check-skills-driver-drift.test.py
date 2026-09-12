@@ -328,6 +328,26 @@ def main() -> int:
             check("Re-arm" not in r["detail"],
                   f"m) and it does not advise a re-arm, got {r['detail']}")
 
+    # n) HEAD that ABBREVIATES but will not RESOLVE: `--short` reads the ref,
+    #    `--verify` needs the object, so an unreadable one separates the two.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        full = _git(sk, "rev-parse", "HEAD")
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] driver started\n")
+        loose = sk / ".git" / "objects" / full[:2] / full[2:]
+        check(loose.is_file(), "n) fixture precondition: HEAD's commit is a loose object")
+        if loose.is_file():
+            loose.chmod(0o000)
+            try:
+                r = hc.check_skills_driver_code_drift(ws)
+            finally:
+                loose.chmod(0o444)
+            check(r["status"] == "ok" and "HEAD in the skills checkout is" in r["detail"],
+                  f"n) an unresolvable HEAD is unanswerable, not drift, got {r}")
+            check("Re-arm" not in r["detail"],
+                  f"n) and it advises no re-arm, got {r['detail']}")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED")
