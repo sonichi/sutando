@@ -51,7 +51,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import host_rosters, roster_login, roster_union
+from roster_union import declared, host_rosters, roster_login, roster_union
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
@@ -123,9 +123,9 @@ def stated_reason(entry: dict) -> str:
     entry knows which, and a refusal that omits it invites the repair that
     overrides it (#3468)."""
     for key in ("refusal_basis", "note"):
-        v = entry.get(key)
-        if isinstance(v, str) and v.strip():
-            return " ".join(v.split())
+        reason = declared(entry.get(key))
+        if reason:
+            return " ".join(reason.split())
     return ""
 
 

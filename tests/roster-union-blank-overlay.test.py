@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""A blank local field must not erase what a peer row STATED.
+
+`roster_union._usable` and `notify_reviewers.stated_reason` both read a blank or
+whitespace `refusal_basis`/`note` as ABSENT, and roster-union's identity reader
+reads a blank `gh`/`github` the same way. The promotion overlay disagreed: it
+copied every non-`None` local value onto the promoted peer row, so a local
+placeholder carrying `refusal_basis: ""` blanked a peer's `"DO NOT ROUTE"` and
+the reviewer was then routed.
+
+Measured at three points, because "fixed" and "not a regression" are different
+claims and only the first group is a regression:
+
+  REGRESSED    the two refusal arms FAIL at the promoting head and PASS at
+               origin/main, which withholds correctly. A blank erasing a stated
+               refusal is behaviour that got WORSE, not merely unfinished.
+  INCOMPLETE   the reason-reaches-the-operator and identity arms fail at BOTH,
+               each for its own reason: origin/main never promotes, so the peer
+               row it preserves is only reachable under a suffix.
+  MUST-WORK    a real local value MUST still overlay and `False` is a value, so
+               "never overlay" and "overlay only what is truthy" both fail here.
+               These exercise promotion itself and so do not apply to
+               origin/main, which has none.
+
+Run: python3 tests/roster-union-blank-overlay.test.py   (stdlib only)
+"""
+import contextlib
+import importlib.util
+import io
+import json
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPTS = (Path(__file__).resolve().parents[1] / "skills"
+           / "collaboration-intelligence" / "scripts")
+
+PEER_REFUSAL = "DO NOT ROUTE"
+PEER_ROUTE = {"stand": "@peer:x", "room": "!peer:x"}
+BLANKS = ("", "   ", "\t\n")
+
+
+def _load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / filename)
+    mod = importlib.util.module_from_spec(spec)
+    # Registered before exec: notify_reviewers imports roster_union by name, and
+    # an unregistered module would be re-executed as a second, unpatched object.
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class BlankOverlay(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        self.ru = _load("roster_union", "roster_union.py")
+        self.nr = _load("notify_reviewers", "notify_reviewers.py")
+        self.dir = Path(tempfile.mkdtemp())
+
+    def union(self, *rosters):
+        """(host, {key: row}) pairs, nearest first -> the merged roster."""
+        paths = []
+        for host, data in rosters:
+            p = self.dir / (host + ".json")
+            p.write_text(json.dumps(data))
+            paths.append((host, p))
+        return self.ru.roster_union(paths)
+
+    def resolve(self, merged, name="reviewer"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            targets, rc = self.nr.resolve([name], merged)
+        return targets, rc, err.getvalue()
+
+    def three_rosters(self, local_basis):
+        """The reviewer's measured case: blank local, peer refusal, routable legacy."""
+        return self.union(
+            ("local", {"reviewer": {"stand": "", "room": "",
+                                    "refusal_basis": local_basis}}),
+            ("PEER_REFUSAL", {"reviewer": {"stand": "", "room": "",
+                                           "refusal_basis": PEER_REFUSAL}}),
+            ("LEGACY", {"reviewer": dict(PEER_ROUTE)}),
+        )
+
+    # --- arms 1-3: the refusal must survive a blank local field ----------
+    def test_a_blank_local_basis_does_not_route_a_refused_reviewer(self):
+        for blank in BLANKS:
+            with self.subTest(local_basis=blank):
+                targets, rc, _ = self.resolve(self.three_rosters(blank))
+                self.assertEqual(
+                    (len(targets), rc), (0, 3),
+                    "a peer stated DO NOT ROUTE and a blank local "
+                    f"{blank!r} erased it — the reviewer gets routed")
+
+    def test_the_stated_refusal_is_still_readable_in_the_union(self):
+        for blank in BLANKS:
+            with self.subTest(local_basis=blank):
+                merged = self.three_rosters(blank)
+                self.assertIn(PEER_REFUSAL, json.dumps(merged),
+                              f"refusal lost entirely; keys: {sorted(merged)}")
+
+    def test_the_refusal_reason_reaches_the_operator(self):
+        """Withholding silently reads as a data gap, and the obvious repair is to
+        fill the fields in — which converts the refusal into a route (#3468)."""
+        _, _, err = self.resolve(self.three_rosters(""))
+        self.assertIn(PEER_REFUSAL, err)
+
+    # --- arms 4-6: a real value MUST still overlay -----------------------
+    def test_a_real_local_value_still_overlays_onto_the_promoted_row(self):
+        """Blanket "never overlay" would pass arms 1-3 and fail here.
+
+        A caveat, not a note: `note` is itself a refusal, so a row carrying one
+        is never promoted over and would measure the wrong thing.
+        """
+        merged = self.union(
+            ("local", {"reviewer": {"stand": "", "room": "",
+                                    "room_caveat": "local knows this"}}),
+            ("peer", {"reviewer": dict(PEER_ROUTE)}),
+        )
+        row = merged["reviewer"]
+        self.assertEqual(row.get("room_caveat"), "local knows this")
+        self.assertEqual(row.get("stand"), PEER_ROUTE["stand"],
+                         "peer routing must still win the promotion")
+        _, _, err = self.resolve(merged)
+        self.assertIn("local knows this", err, "the overlaid caveat is not printed")
+
+    def test_allowlisted_false_still_overlays(self):
+        """`False` is a stated refusal, not an absence: a truthiness test loses it."""
+        merged = self.union(
+            ("local", {"reviewer": {"stand": "", "room": "", "allowlisted": False}}),
+            ("peer", {"reviewer": dict(PEER_ROUTE)}),
+        )
+        self.assertIs(merged["reviewer"].get("allowlisted"), False)
+        _, rc, _ = self.resolve(merged)
+        self.assertEqual(rc, 4, "off-allowlist must still be refused")
+
+    # --- arms 7-9: the same overlay, on identity -------------------------
+    def _resolved_login(self, merged, name="reviewer"):
+        self.nr._is_github_user = lambda login: True
+        return self.nr._github_login(name, merged)[0]
+
+    def test_a_blank_local_alias_does_not_erase_a_peer_identity(self):
+        for field in ("gh", "github"):
+            for blank in BLANKS:
+                with self.subTest(field=field, local=blank):
+                    merged = self.union(
+                        ("local", {"reviewer": {"stand": "", "room": "",
+                                                field: blank}}),
+                        ("peer", dict(reviewer=dict(PEER_ROUTE,
+                                                    **{field: "peer-owner"}))),
+                    )
+                    self.assertEqual(self._resolved_login(merged), "peer-owner",
+                                     "a blank alias resolved to the roster KEY; "
+                                     "capability checks then run on a collision")
+
+    def test_a_blank_local_same_actor_as_does_not_erase_the_peer_one(self):
+        for blank in BLANKS:
+            with self.subTest(local=blank):
+                merged = self.union(
+                    ("local", {"reviewer": {"stand": "", "room": "",
+                                            "same_actor_as": blank}}),
+                    ("peer", {"reviewer": dict(PEER_ROUTE,
+                                               same_actor_as="peer-owner")}),
+                )
+                self.assertEqual(self._resolved_login(merged), "peer-owner")
+
+    def test_CONTROL_a_real_local_alias_still_wins(self):
+        """The local roster is still nearest: a stated local alias must overlay."""
+        merged = self.union(
+            ("local", {"reviewer": {"stand": "", "room": "", "gh": "local-owner"}}),
+            ("peer", {"reviewer": dict(PEER_ROUTE, gh="peer-owner")}),
+        )
+        self.assertEqual(self._resolved_login(merged), "local-owner")
+
+
+class SharedPresencePredicate(unittest.TestCase):
+    """The one predicate the three sites now share, pinned directly.
+
+    Unit-level and therefore new-API-only: origin/main has no such helper, so
+    only the behavioural class above is measurable against it.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        self.ru = _load("roster_union", "roster_union.py")
+
+    def test_declared_reads_blank_whitespace_and_non_string_as_nothing(self):
+        for value in ("", "   ", "\t\n", None, False, 0, ["x"], {"a": 1}):
+            with self.subTest(value=value):
+                self.assertEqual(self.ru.declared(value), "")
+
+    def test_declared_strips_the_text_it_returns(self):
+        self.assertEqual(self.ru.declared("  DO NOT ROUTE  "), "DO NOT ROUTE")
+
+    def test_is_declared_keeps_non_strings_that_state_something(self):
+        for value in (False, 0, ["x"], {"a": 1}, "x"):
+            with self.subTest(value=value):
+                self.assertTrue(self.ru.is_declared(value))
+
+    def test_is_declared_rejects_none_and_blank_strings(self):
+        for value in (None, "", "   ", "\t\n"):
+            with self.subTest(value=value):
+                self.assertFalse(self.ru.is_declared(value))
+
+    def test_the_readers_answer_through_the_same_predicate(self):
+        """Divergence here is the defect: one site's absence is another's data."""
+        nr = _load("notify_reviewers", "notify_reviewers.py")
+        # Non-strings included: a list-valued basis made the union call a row a
+        # refusal while the notifier printed no reason for it.
+        for value in BLANKS + (None, False, 0, ["x"], {"a": 1}):
+            with self.subTest(value=value):
+                row = {"stand": "", "room": "", "refusal_basis": value}
+                self.assertEqual(nr.stated_reason(row), "")
+                self.assertFalse(self.ru._usable(row),
+                                 "the union calls this a refusal that never prints")
+                self.assertEqual(self.ru.roster_login({"gh": value}), ("", ""))
+
+    def test_the_rule_is_spelled_exactly_once(self):
+        """`stated_reason` folds whitespace away, so a re-spelling there cannot
+        change an observable — only a source guard keeps the fourth copy out."""
+        source = (SCRIPTS / "roster_union.py").read_text()
+        spellings = re.findall(r'or ""\)\.strip\(\)|isinstance\([^)]*, str\)'
+                               r'\s+and\s+\w+\.strip\(\)|\.strip\(\) if isinstance',
+                               source)
+        self.assertEqual(len(spellings), 1,
+                         f"blank-is-absent is spelled {len(spellings)}x, not once "
+                         f"(only `declared` may spell it): {spellings}")
+
+    def test_notify_reviewers_imports_the_predicate_rather_than_restating_it(self):
+        source = (SCRIPTS / "notify_reviewers.py").read_text()
+        self.assertRegex(source, r"from roster_union import [^\n]*\bdeclared\b")
+        self.assertIn("declared(entry.get(key))", source)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

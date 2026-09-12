@@ -17,6 +17,25 @@ ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.jso
 IDENTITY_FIELDS = ("gh", "github")
 
 
+def declared(value) -> str:
+    """The text a roster field STATES: stripped, or "" when it states nothing.
+
+    The single spelling of blank-is-absent. Every reader of a row and the union's
+    own overlay must answer it identically, or a blank local field reads as data
+    to one and as silence to the next — and erases a peer's explicit refusal.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
+def is_declared(value) -> bool:
+    """`declared` widened past text, for callers that overlay whole values.
+
+    Same rule for strings; a non-string states itself, so `allowlisted: false`
+    survives while `None` and a blank string remain the absence readers assume.
+    """
+    return bool(declared(value)) if isinstance(value, str) else value is not None
+
+
 def roster_login(row) -> "tuple[str, str]":
     """(GitHub login this row declares, the field it came from); ("", "") if none.
 
@@ -27,9 +46,9 @@ def roster_login(row) -> "tuple[str, str]":
     if not isinstance(row, dict):
         return "", ""
     for field in IDENTITY_FIELDS:
-        value = row.get(field)
-        if isinstance(value, str) and value.strip():
-            return value.strip(), field
+        login = declared(row.get(field))
+        if login:
+            return login, field
     return "", ""
 
 
@@ -55,7 +74,7 @@ def _usable(row) -> bool:
     `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
     if not isinstance(row, dict):
         return False
-    if any(str(row.get(k) or "").strip() for k in ("refusal_basis", "note")):
+    if any(declared(row.get(k)) for k in ("refusal_basis", "note")):
         return True
     # Only a route both consumers can actually deliver on counts. A discord id
     # is not one here: resolve() builds Matrix targets from stand+room alone.
@@ -75,7 +94,7 @@ def _is_routing_placeholder(row) -> bool:
     """
     if not isinstance(row, dict):
         return True
-    return not any(str(row.get(k) or "").strip() for k in _ROUTING)
+    return not any(declared(row.get(k)) for k in _ROUTING)
 
 
 def _promote(winner: dict, local: dict) -> dict:
@@ -86,11 +105,13 @@ def _promote(winner: dict, local: dict) -> dict:
     loc = local if isinstance(local, dict) else {}
     # Identity is preserved semantically: roster_login ranks `gh` over `github`,
     # so a surviving peer alias outranks the local spelling.
-    if roster_login(loc)[0] or str(loc.get("same_actor_as") or "").strip():
+    if roster_login(loc)[0] or declared(loc.get("same_actor_as")):
         for alias in IDENTITY_FIELDS + ("same_actor_as",):
             out.pop(alias, None)
+    # `is_declared`, never `is not None`: a blank local field is ABSENT to every
+    # reader, so overlaying it erases the refusal or identity the peer stated.
     for field, value in loc.items():
-        if field not in _ROUTING and value is not None:
+        if field not in _ROUTING and is_declared(value):
             out[field] = value
     return out
 
