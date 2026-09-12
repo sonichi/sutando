@@ -265,6 +265,72 @@ class BlankOverlay(unittest.TestCase):
 
 
 
+class GateLoginAfterPromotion(unittest.TestCase):
+    """Which login the CAPABILITY GATE ends up probing, end to end.
+
+    resolve() can hand back the right target while `_github_login()` probes the
+    wrong account: a malformed local `gh` that overlays the promoted row leaves
+    the roster KEY as the login, so the ask is gated against a colliding account
+    rather than the peer-declared one. Only asserting the gate login sees it.
+    """
+
+    IDENTITY = ("gh", "github", "same_actor_as")
+    MALFORMED = NON_STRINGS + ([], {})
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        self.ru = _load("roster_union", "roster_union.py")
+        self.nr = _load("notify_reviewers", "notify_reviewers.py")
+        self.dir = Path(tempfile.mkdtemp())
+
+    def gate_login(self, field, local, omit=False):
+        row = {"stand": None, "room": None}
+        if not omit:
+            row[field] = local
+        peer = {"stand": "@peer:x", "room": "!peer:x", field: "peer-owner"}
+        paths = []
+        for host, data in (("local", row), ("peer", peer)):
+            p = self.dir / f"{host}{abs(hash((field, str(local), omit)))}.json"
+            p.write_text(json.dumps({"reviewer": data}))
+            paths.append((host, p))
+        merged = self.ru.roster_union(paths)
+        # Controlled: the real probe is a network call, and collapsing
+        # "no such user" with "probe failed" is a separate documented hazard.
+        original = self.nr._is_github_user
+        self.nr._is_github_user = lambda login: True
+        try:
+            login, _ = self.nr._github_login("reviewer", merged)
+        finally:
+            self.nr._is_github_user = original
+        return login, merged
+
+    def test_a_MALFORMED_local_identity_does_not_redirect_the_gate(self):
+        for field in self.IDENTITY:
+            for value in self.MALFORMED:
+                with self.subTest(field=field, local=value):
+                    login, merged = self.gate_login(field, value)
+                    self.assertEqual(
+                        login, "peer-owner",
+                        f"a local {value!r} in {field} sent the capability gate to "
+                        f"{login!r} — the peer-declared account was erased")
+                    self.assertTrue(
+                        any(r.get(field) == "peer-owner"
+                            for r in merged.values() if isinstance(r, dict)),
+                        "the peer identity vanished from the union entirely")
+
+    def test_CONTROL_an_absent_local_identity_gates_on_the_peer(self):
+        for field in self.IDENTITY:
+            with self.subTest(field=field):
+                self.assertEqual(self.gate_login(field, None, omit=True)[0], "peer-owner")
+
+    def test_CONTROL_a_VALID_local_identity_still_wins(self):
+        """Without this the fix could pass by ignoring local identity entirely."""
+        for field in self.IDENTITY:
+            with self.subTest(field=field):
+                self.assertEqual(self.gate_login(field, "mine")[0], "mine")
+
+
 class CaveatFamily(unittest.TestCase):
     """`resolve()` prints EVERY `*_caveat`; a named spelling in the text policy
     leaves the rest value-typed, so a malformed local one overlays and the peer's
