@@ -5735,10 +5735,7 @@ def _quota_windows(headers: dict) -> dict:
     return out
 
 
-# Mirror of credential-proxy.ts `scopedKeychainService`, centralized in
-# keychain_service.py because auth_preflight.py needs the identical
-# resolution (a copy that drifted between the two is what let a genuinely
-# authenticated, scoped-keychain install read as logged-out — 2026-09-11).
+# Centralized: auth_preflight.py needs this exact resolution too.
 from keychain_service import (  # noqa: E402
     scoped_keychain_service as _scoped_keychain_service,
     keychain_service_exists as _keychain_service_exists,

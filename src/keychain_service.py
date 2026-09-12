@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""keychain_service.py — shared macOS Keychain resolution for Claude Code CLI credentials.
+"""Shared macOS Keychain resolution for Claude Code CLI credentials.
 
 Mirrors credential-proxy.ts's `scopedKeychainService`: a per-CLAUDE_CONFIG_DIR
 Keychain item name (`Claude Code-credentials-<sha256(config_dir)[:8]>`), with a

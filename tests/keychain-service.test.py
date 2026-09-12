@@ -49,21 +49,16 @@ class TestResolvedCredentialService(unittest.TestCase):
             self.assertEqual(ks.resolved_credential_service(config_dir), scoped)
 
     def test_vanilla_only_host_still_resolves_via_fallback(self):
-        # Pro's host: a non-default CLAUDE_CONFIG_DIR, stored under the vanilla
-        # name, no scoped item at all. The fix must not invert the bug onto this
-        # population -- vanilla must still be found.
+        # A non-default CLAUDE_CONFIG_DIR with only the vanilla item stored: the
+        # fix must not invert the bug onto this population -- vanilla must still resolve.
         config_dir = "/some/nondefault/.claude-sutando"
         with mock.patch.object(ks, "keychain_service_exists",
                                side_effect=lambda s: s == ks.VANILLA_SERVICE):
             self.assertEqual(ks.resolved_credential_service(config_dir), ks.VANILLA_SERVICE)
 
     def test_both_present_prefers_the_scoped_item(self):
-        # Mini's host: carries the vanilla item AND its own scoped item (plus
-        # others from other config dirs). The old vanilla-only check passed
-        # here by coincidence of the extra item, not because the scoped path
-        # was correct -- pruning the vanilla item would have broken it. The
-        # fix must resolve to the scoped item for THIS config dir, not just
-        # "any item exists".
+        # Both the vanilla item and this config dir's scoped item exist: must
+        # resolve to the scoped item for THIS config dir, not just "any item exists".
         config_dir = "/y/.claude-sutando"
         scoped = ks.scoped_keychain_service(config_dir)
         present = {scoped, ks.VANILLA_SERVICE, "Claude Code-credentials-b0888206",
@@ -76,14 +71,8 @@ class TestResolvedCredentialService(unittest.TestCase):
             self.assertIsNone(ks.resolved_credential_service("/z/.claude-sutando"))
 
     def test_another_hosts_scoped_item_never_counts_as_this_hosts(self):
-        # Pro's control (2026-09-11): a fleet keychain can carry OTHER hosts'
-        # scoped items (a shared login keychain, or several config dirs tried
-        # on one machine) -- their mere presence must never make THIS config
-        # dir look configured. resolved_credential_service only ever checks
-        # the ONE name it computes from the given config_dir, by construction,
-        # but the point is worth pinning: a keychain full of unrelated scoped
-        # items, with neither this config dir's own item nor the vanilla one
-        # present, must still refuse.
+        # A keychain full of OTHER config dirs' scoped items must never make
+        # this config dir look configured -- only its own exact name counts.
         config_dir = "/this/hosts/own/.claude-sutando"
         this_digest = ks.scoped_keychain_service(config_dir)
         unrelated = {"Claude Code-credentials-b0888206", "Claude Code-credentials-b23ac34d",
