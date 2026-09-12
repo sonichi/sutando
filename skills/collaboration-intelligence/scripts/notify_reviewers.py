@@ -553,6 +553,11 @@ def _norm_ts(ts: str) -> "str | None":
     except (ValueError, OverflowError, OSError):
         return None
 
+#: The ledger field a raw stream key came from, in the `who` precedence below,
+#: and the `component_resolver` axis that field belongs to.
+_KEY_AXES = (("endpoint", "endpoint"), ("actor", "actor"), ("reviewer", "name"))
+
+
 #: Accepted row schema. A field of the wrong type is a malformed ROW, not a
 #: reason to crash a reader or to misattribute the stream it belongs to.
 def _row(d) -> "tuple | None":
@@ -775,12 +780,16 @@ def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
     definite failure settles only its own reservation.
     """
     canon = canonical or (lambda w: w)
+    # Keyed on the axis the row recorded: a raw key cannot separate one person's
+    # endpoint from another's roster key, and the ask is attributed to both.
+    on_axis = getattr(canon, "on_axis", None)
     out = {}
     for (repo, num, who), st in streams.items():
         v = per_stream(st)
         if v is None:
             continue
-        k = (repo, num, canon(who))
+        k = (repo, num,
+             on_axis(who, st.get("identity")) if on_axis else canon(who))
         out[k] = combine(out[k], v) if k in out else v
     return out
 
@@ -1262,6 +1271,19 @@ def component_resolver(roster):
             if w in axes[axis]:
                 return axes[axis][w]
         return w
+
+    def on_axis(w, identity=None):
+        """`w` on the axis that RECORDED it, and on that axis ALONE.
+
+        A bare spelling has only the fixed order above, which hands one person's
+        persisted endpoint to the reviewer whose roster key is that same text.
+        """
+        for field, axis in _KEY_AXES:
+            if (identity or {}).get(field) == w:
+                return axes[axis].get(w, w)
+        return canon(w)
+
+    canon.on_axis = on_axis
     return canon
 
 
@@ -1323,6 +1345,12 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     # The SAME identity owner routing and park admission use. `_actor_map` links
     # only rows that DECLARE same_actor_as, so a shared discord id was two people.
     person_of = component_resolver(roster)
+
+    def ep_of(endpoint):
+        """A spelling we KNOW is an endpoint. Resolved name-first it lands on
+        whoever's roster key is that same text, aliasing two people together."""
+        return person_of.on_axis(endpoint, {"endpoint": endpoint})
+
     prior, earliest = set(), None
     try:
         asked = _first_ask(ledger, canonical=person_of)
@@ -1348,12 +1376,12 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         # From the ROSTER too: a caller may pass a bare {"name": ...} target,
         # and deriving from the dict alone left those on the name axis only.
         actor = person_of(t["name"])
-        got = {actor, t["name"], t.get("endpoint")}
-        got |= durable_endpoints((roster or {}).get(t["name"]) or {})
-        got |= by_actor.get(actor, set())
+        eps = {t.get("endpoint")}
+        eps |= durable_endpoints((roster or {}).get(t["name"]) or {})
+        eps |= by_actor.get(actor, set())
         # Every axis lands on the person key, or two spellings of one human
         # intersect nothing and the subset test answers about names again.
-        return {person_of(i) for i in got if i}
+        return {actor} | {ep_of(e) for e in eps if e}
 
     tids = [_ids(x) for x in targets]
     if not tids or not all(s & prior for s in tids):
@@ -1385,8 +1413,8 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         actor = person_of(k)
         # The SAME component-wide set the verdict uses: this row's own endpoint
         # alone offered an already-asked person under an earlier-sorting alias.
-        ids = {person_of(i) for i in ({actor, k} | durable_endpoints(v)
-                                      | by_actor.get(actor, set()))}
+        ids = {actor} | {ep_of(e) for e in (durable_endpoints(v)
+                                            | by_actor.get(actor, set())) if e}
         # keweichen is deliberately never offered as a widen target; the
         # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
         if (ids & prior) or k == "keweichen":

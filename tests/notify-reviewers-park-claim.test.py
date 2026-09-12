@@ -745,7 +745,8 @@ class TypedIdentityMembership(unittest.TestCase):
     # A roster key shaped like an mxid, and a second person whose stand is that
     # same string: both shapes are accepted by resolve(), so both must survive.
     COLLIDING = {"@shared:x": {"stand": "@a-stand:x", "room": "!r"},
-                 "bob": {"stand": "@shared:x", "room": "!r"}}
+                 "bob": {"stand": "@shared:x", "room": "!r"},
+                 "carol": {"stand": "@carol:x", "room": "!r"}}
 
     def test_every_written_tag_survives_its_own_reader(self):
         nr = _nr()
@@ -816,6 +817,105 @@ class TypedIdentityMembership(unittest.TestCase):
             nr.unknown_parked(MSG, "carol", "carol", canonical=canon,
                               endpoint="@carol:x"),
             "control: an unrelated third party must never be parked")
+
+    def _isolated_ledger(self) -> pathlib.Path:
+        """A private ledger for this test. record_asks() writes through
+        SUTANDO_REVIEW_ASKS_LEDGER, so leaving it unset appends to the real one."""
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        led = pathlib.Path(td) / "ledger.jsonl"
+        prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(led)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("SUTANDO_REVIEW_ASKS_LEDGER", prev)
+            if prev is not None
+            else os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None))
+        return led
+
+    def _aged_ask(self, nr, led, name, endpoint=None, membership=True):
+        """ONE ask to `name`, on an endpoint, through the PRODUCTION writer and
+        aged past the 30-min window. Only `ts` is rewritten, so the row still
+        has to survive the reader's own validator."""
+        nr.record_asks(
+            MSG, name, "unknown", actor=name,
+            endpoint=endpoint or nr.durable_endpoint(self.COLLIDING[name]),
+            membership=nr.component_tags(self.COLLIDING, name) if membership else None)
+        rows = [json.loads(x) for x in led.read_text().splitlines()]
+        self.assertEqual(len(rows), 1, rows)
+        rows[0]["ts"] = "2020-01-01T00:00:00Z"
+        led.write_text(json.dumps(rows[0]) + "\n")
+
+    def _stale(self, nr, name):
+        return nr._stale_repeat_ask(MSG, [{"name": name}], self.COLLIDING)[0]
+
+    def test_a_persisted_endpoint_does_not_stale_the_person_it_is_named_after(self):
+        """The stale-repeat twin of the park test above -- the READER side.
+
+        `_first_ask` folds each stream onto the RAW key, and an endpoint-addressed
+        row's raw key IS that endpoint. Resolved name-first, bob's ask lands on
+        the reviewer whose roster key is that same text, so ONE ask makes TWO
+        people read as already-asked.
+        """
+        nr = _nr()
+        led = self._isolated_ledger()
+        self._aged_ask(nr, led, "bob")
+        self.assertIs(self._stale(nr, "bob"), True,
+                      "bob's own aged ask must still refuse a repeat to bob")
+        self.assertIs(self._stale(nr, "@shared:x"), False,
+                      "an ask to bob read as an ask to the unrelated reviewer "
+                      "whose roster key equals bob's persisted endpoint")
+        self.assertIs(self._stale(nr, "carol"), False,
+                      "control: an unrelated third party must never read as asked")
+
+    def test_a_reviewer_named_after_an_endpoint_does_not_stale_its_holder(self):
+        """The MIRROR, which the reader fold alone does not reach.
+
+        Here the ask already lands on the right person; the TARGET side aliases,
+        by resolving bob's OWN persisted endpoint on the name axis.
+        """
+        nr = _nr()
+        led = self._isolated_ledger()
+        self._aged_ask(nr, led, "@shared:x")
+        self.assertIs(self._stale(nr, "@shared:x"), True,
+                      "@shared:x's own aged ask must still refuse a repeat")
+        self.assertIs(self._stale(nr, "bob"), False,
+                      "an ask to @shared:x read as an ask to bob, whose "
+                      "persisted endpoint is that same text")
+        self.assertIs(self._stale(nr, "carol"), False,
+                      "control: an unrelated third party must never read as asked")
+
+    def test_an_unknown_endpoint_is_not_claimed_by_a_matching_roster_key(self):
+        """A recorded endpoint the roster does not hold folds to ITSELF.
+
+        Handing the miss back to the fixed order gives the row to whoever's
+        roster key spells the same, and that person reads as asked though the
+        ask never went near them.
+        """
+        nr = _nr()
+        led = self._isolated_ledger()
+        self._aged_ask(nr, led, "gone", endpoint="carol", membership=False)
+        canon = nr.component_resolver(self.COLLIDING)
+        who = next(iter(nr._first_ask(led, canonical=canon)))[2]
+        self.assertNotEqual(who, canon("carol"),
+                            "an unknown endpoint was resolved on the NAME axis")
+        self.assertIs(self._stale(nr, "carol"), False,
+                      "carol read as asked because a stranger's endpoint "
+                      "spells the same as her roster key")
+
+    def test_one_ask_is_attributed_to_exactly_one_identity(self):
+        """The axis itself, under the projection `_stale_repeat_ask` consumes."""
+        nr = _nr()
+        led = self._isolated_ledger()
+        nr.record_asks(MSG, "bob", "unknown", actor="bob",
+                       endpoint=nr.durable_endpoint(self.COLLIDING["bob"]))
+        canon = nr.component_resolver(self.COLLIDING)
+        asked = nr._first_ask(led, canonical=canon)
+        self.assertEqual(len(asked), 1, asked)
+        who = next(iter(asked))[2]
+        self.assertEqual(who, canon("bob"),
+                         "the ask was folded onto the person named by bob's "
+                         "endpoint spelling, not onto bob")
+        self.assertNotEqual(who, canon("@shared:x"))
 
     def test_a_legacy_row_still_overlaps_a_freshly_encoded_one(self):
         # The encoding is a two-sided change: rows written before it must
