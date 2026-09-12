@@ -47,6 +47,11 @@ fi
 # Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
 bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
 
+# Owned project hooks (handoff, pending-tasks, skill-declared) re-registered BEFORE the core
+# spawns: an engine update replaces .claude/settings.json. Unattended, so no ~/Desktop archiver.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -111,6 +116,9 @@ export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
+# The interpreter resolve_python validated above, carried across the tmux boundary: a window
+# spawned on an existing server inherits the SERVER's env, which may predate SUTANDO_PY.
+[ -n "$PY" ] && CORE_ENV_ARGS+=(-e "SUTANDO_PY=$PY")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -234,11 +242,12 @@ core_claude_running() {
 # hang at the trust prompt. Expand a leading ~, create the dir (fail loud with a
 # scoped message if we can't — better than chdir'ing into the wrong place under
 # set -e's raw error), then resolve via `cd … && pwd -P`.
+# The resolver is shared with the settings installers (scripts/core-working-dir.sh), so the
+# dir the core launches from is the dir the hooks were written to — or the launch refuses.
 CWD_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+  . "$REPO/scripts/core-working-dir.sh"
+  SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
   export SUTANDO_CLAUDE_WORKING_DIR
   CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
   echo "  ✓ core working dir: $SUTANDO_CLAUDE_WORKING_DIR"

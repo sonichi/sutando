@@ -12,9 +12,11 @@ Run: python3 tests/health-check-claude-hook-registration.test.py
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -40,6 +42,12 @@ HOOKS=(
 class TestHookRegistration(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
+        # The core session exports the launch-dir override; the probe honours it, so an
+        # inherited value would point every fixture probe at the live tree.
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+        self.addCleanup(self._env.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         (self.repo / "src").mkdir(parents=True)
@@ -129,6 +137,75 @@ class TestHookRegistration(unittest.TestCase):
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "warn")
         self.assertIn("never run", out["detail"])
+
+    def test_launch_dir_override_is_where_the_probe_reads(self):
+        """The installer targets SUTANDO_CLAUDE_WORKING_DIR when set; a probe still reading the
+        engine tree would report the wrong file — 'never run' with every hook registered."""
+        (self.repo / "src" / "install-claude-hooks.sh").write_text(
+            INSTALLER.replace('SETTINGS="$REPO_DIR/.claude/settings.json"',
+                              'SETTINGS="$TARGET_DIR/.claude/settings.json"'))
+        cwd = self.repo / "core cwd"
+        (cwd / ".claude").mkdir(parents=True)
+        (cwd / ".claude" / "settings.json").write_text(json.dumps({"hooks": self._all_registered()}))
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(cwd)}):
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+        # Without the override the same installer template resolves $TARGET_DIR to the repo,
+        # where nothing is registered.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("never run", out["detail"])
+
+    def test_override_contract_matches_the_installer(self):
+        """Absolute or `~/…` only, on both sides: the installer refuses a `~user` or relative form
+        (its shell expansion would mangle it) and installs nothing, so the probe reads it as
+        REFUSED (None) — never as "no override", which would certify a repo file from an earlier
+        launch. tests/core-working-dir.test.sh runs both implementations over the same table."""
+        home = self.repo / "home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~/core home"}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), (home / "core home").resolve())
+        with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~root/core"}):
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": "relative/dir"}):
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "abs")}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), (self.repo / "abs").resolve())
+
+    def test_a_refused_override_warns_even_when_the_repo_file_is_green(self):
+        """The green-probe-nothing-installed case: the repo holds every hook from an earlier
+        launch, but this launch's override was refused, so the installer wrote nothing. The
+        probe must say so, not certify the stale file."""
+        self._settings(self._all_registered())
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": "~someone/dir"}):
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn("refuses it", out["detail"])
+        self.assertIn("~someone/dir", out["detail"])
+        self.assertIn("target unknown", out["detail"])
+
+    def test_an_unresolvable_override_is_reported_not_silently_the_repo(self):
+        """An override the OS cannot resolve must not abort the probe, and must not read the
+        repo's file as if it were the launch dir's. Two real shapes: a symlink LOOP — which
+        Path.resolve raises as RuntimeError before 3.13, not OSError, so the first guard let it
+        propagate — and a component the OS refuses (OSError)."""
+        self._settings(self._all_registered())
+        loop = self.repo / "loop"
+        os.symlink("loop", loop)  # points at itself
+        with self.assertRaises((OSError, RuntimeError)):
+            loop.resolve()  # the fixture really does raise; a silent resolve would test nothing
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(loop)}):
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn("target unknown", out["detail"])
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "denied")}), \
+             mock.patch.object(Path, "resolve", side_effect=OSError("EACCES")):
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
 
     def test_malformed_settings_warns_never_raises(self):
         (self.repo / ".claude" / "settings.json").write_text("{not json")
@@ -332,6 +409,12 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
 
     def setUp(self):
         self.hc = _load()
+        # Same guard as TestHookRegistration: the probe honours the launch-dir override, so
+        # an inherited value points these fixture probes at another tree's settings.json.
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+        self.addCleanup(self._env.stop)
         self.installer_src = (REPO / "src" / "install-claude-hooks.sh").read_text()
         self._tmp = tempfile.TemporaryDirectory()
 
@@ -357,13 +440,25 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         }}))
         return r
 
+    def _assert_probe_read_the_fixture(self, r: Path):
+        # An `ok` names no path, so pin the one the probe read: its target must be the
+        # fixture, and removing the fixture's file must be what turns the verdict.
+        settings = r / ".claude" / "settings.json"
+        self.assertEqual(self.hc._hook_settings_target(r), r)
+        settings.unlink()
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn(str(settings), out["detail"])
+
     def test_the_installers_real_shq_command_reads_as_registered(self):
         # Over-trigger control, and the one that matters most: failing closed is only
         # correct if the genuine production shape still passes. If this breaks, the
         # probe warns on every healthy host.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        r = self._repo("bash {p}")
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
         self.assertIn("4", out["detail"])
+        self._assert_probe_read_the_fixture(r)
 
     def test_decoys_are_rejected_on_the_REAL_installer_shape(self):
         for label, cmd in {
@@ -446,8 +541,10 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
     def test_the_genuine_archive_command_still_registers(self):
         # Over-trigger control. The real command interpolates $HOME, so this must not
         # become a shape-pinning test that warns on healthy hosts.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        r = self._repo("bash {p}")
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
+        self._assert_probe_read_the_fixture(r)
 
     def test_an_unreducible_template_fails_CLOSED(self):
         # The fallback used to accept the path anywhere in the first two tokens. A

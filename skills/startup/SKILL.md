@@ -106,6 +106,7 @@ This skill is intentionally a thin orchestrator. Logic lives in the sub-skills:
 
 - **Orphan recovery**: `skills/task-orphan-check/` (separate PR, optional)
 - **Cron registration + watcher start**: `skills/schedule-crons/`
+- **Claude Code hook registration**: `src/agent/claude/cli/start-cli.sh` re-runs `src/install-claude-hooks.sh` before the core spawns — NOT `/startup`. An engine update replaces `<engine>/.claude/settings.json`; the launcher re-registers on every launch, so the hooks are in place deterministically at session start rather than depending on health-check `--fix` landing late on its timer (issue #3221). `health-check.py`'s `claude-hooks` probe is the witness: `all N owned hooks registered` on the first pass after a launch.
 
 If you find yourself wanting to put logic IN `/startup`, ask whether it belongs in one of the sub-skills (or a new sub-skill) first. `/startup` is the order, not the work.
 

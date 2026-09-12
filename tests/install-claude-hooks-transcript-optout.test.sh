@@ -3,6 +3,8 @@
 # nothing else. Three arms, because "did not install it" alone would also pass if
 # the installer wrote no PreCompact hooks at all.
 set -uo pipefail
+# The installer targets the core's launch dir when this is set (the core session exports it).
+unset SUTANDO_CLAUDE_WORKING_DIR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"

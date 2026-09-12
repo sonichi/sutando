@@ -22,13 +22,9 @@ fi
 # is where Claude Code reads project-scoped `.claude/settings.json`. Same
 # resolution as install-session-start-hook.sh: SUTANDO_CLAUDE_WORKING_DIR when
 # set (expanded + physically resolved the way start-cli.sh does), else $REPO.
-if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  TARGET_DIR="$(cd "$_cwd_exp" && pwd -P)"
-else
-  TARGET_DIR="$REPO"
-fi
+# shellcheck disable=SC1091
+. "$REPO/scripts/core-working-dir.sh"
+TARGET_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — hook not installed" >&2; exit 1; }
 
 SETTINGS="$TARGET_DIR/.claude/settings.json"
 # The hint script itself always lives in this checkout ($REPO) — the working
