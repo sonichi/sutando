@@ -97,6 +97,9 @@ HOOKS=(
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
+  # Without this the Stop gate spends its one reminder and never re-arms:
+  # begin_turn is the only reset and nothing else in the lifecycle calls it.
+  "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
 
 # The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
