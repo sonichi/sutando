@@ -407,6 +407,15 @@ const HTML = /* html */ `<!DOCTYPE html>
     border-top: 1px solid var(--ui-line);
     padding: 8px 16px 12px;
   }
+  #bottom-panel.collapsed #transcript { display: none; }
+  .bottom-panel-controls {
+    display: flex; justify-content: flex-end; margin-bottom: 6px;
+  }
+  .btn-panel-toggle {
+    background: transparent; color: #888; border: 1px solid #2a2a40;
+    font-size: 11px; padding: 4px 8px; border-radius: 5px; cursor: pointer;
+  }
+  .btn-panel-toggle:hover { color: #fff; border-color: #4ecca3; }
   .input-bar {
     display: flex; gap: 8px;
   }
@@ -720,7 +729,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 <div class="header">
   <div class="avatar-wrap s-idle" id="avatar-wrap">
     <canvas id="speak-canvas" width="60" height="60"></canvas>
-    <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+    <img class="avatar" id="stand-avatar">
     <div id="avatar-svg-wrap">
       <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -791,9 +800,11 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     if(t) t.textContent=s.nameOrigin.split(' — ')[1]||s.nameOrigin;
   }
   if(s.avatarGenerated){
-    document.getElementById('stand-avatar').style.display='block';
+    var headerAvatar=document.getElementById('stand-avatar');
+    headerAvatar.src='http://localhost:7844/avatar';
+    headerAvatar.style.display='block';
     var ha=document.getElementById('hero-avatar');
-    if(ha){ha.style.display='block';ha.style.opacity='0';}
+    if(ha){ha.src='http://localhost:7844/avatar';ha.style.display='block';ha.style.opacity='0';}
   } else {
     // No custom avatar — show the inline-SVG default in both places.
     // PR #443 shipped the SVG assets in docs/avatar-default.html; this
@@ -819,7 +830,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </script>
 
 <div class="hero s-idle" id="hero">
-  <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  <img class="avatar-hero" id="hero-avatar">
   <div class="hero-svg-wrap" id="hero-svg-wrap">
     <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
       <!-- Hero reuses header's #visorSweep gradient (single definition). -->
@@ -877,6 +888,9 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 
 <div class="toast-container" id="toast-container"></div>
 <div id="bottom-panel">
+<div class="bottom-panel-controls">
+  <button class="btn-panel-toggle" id="btn-panel-toggle" type="button" aria-expanded="true" onclick="toggleBottomPanel()">Hide transcript</button>
+</div>
 <div id="transcript">
   <div class="t-entry t-system">Ask Sutando anything.</div>
 </div>
@@ -989,7 +1003,8 @@ window.addEventListener('DOMContentLoaded', () => {
 // processing. On visibility change (tab returns to foreground), reconnect
 // the EventSource so ⌃V/⌃M hotkeys work immediately after tab wake-up.
 let _sseSource = null;
-function initRemoteToggle() {
+function initRemoteToggle(force = false) {
+  if (_sseSource && !force) return;
   if (_sseSource) { try { _sseSource.close(); } catch {} }
   _sseSource = new EventSource('/sse');
   _sseSource.addEventListener('toggle-voice', () => toggle());
@@ -1029,11 +1044,14 @@ function initRemoteToggle() {
   _sseSource.addEventListener('tool-cue', function(e) {
     try { playToolCue(String(e.data || '').trim()); } catch {}
   });
-  _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
+  // EventSource reconnects automatically after a transient stream failure.
+  // Closing and replacing it here turns that normal retry into an incomplete
+  // chunked response and can create overlapping reconnect timers.
+  _sseSource.onerror = () => {};
 }
 initRemoteToggle();
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') initRemoteToggle();
+  if (document.visibilityState === 'visible') initRemoteToggle(true);
 });
 
 // ─── State ────────────────────────────────────────────────
@@ -1097,6 +1115,23 @@ let recognition = null;
 
 const debugLog = [];
 const $ = (id) => document.getElementById(id);
+
+const PERSIST_KEY_BOTTOM_PANEL = 'sutando-bottom-panel-collapsed-v1';
+function setBottomPanelCollapsed(collapsed) {
+  const panel = $('bottom-panel');
+  const button = $('btn-panel-toggle');
+  if (!panel || !button) return;
+  panel.classList.toggle('collapsed', collapsed);
+  button.setAttribute('aria-expanded', String(!collapsed));
+  button.textContent = collapsed ? 'Show transcript' : 'Hide transcript';
+  try { localStorage.setItem(PERSIST_KEY_BOTTOM_PANEL, collapsed ? '1' : '0'); } catch {}
+  if (!collapsed) requestAnimationFrame(() => scrollTranscript(true));
+}
+function toggleBottomPanel() {
+  const panel = $('bottom-panel');
+  setBottomPanelCollapsed(panel ? !panel.classList.contains('collapsed') : false);
+}
+try { setBottomPanelCollapsed(localStorage.getItem(PERSIST_KEY_BOTTOM_PANEL) === '1'); } catch {}
 
 // ─── Chrome STT (real-time interim display) ───────────────
 function initChromeStt() {
@@ -1433,7 +1468,7 @@ function rememberTaskWorkstreams(workstreams) {
 function taskTimeFromRow(row, existing) {
   if (row.time instanceof Date && !Number.isNaN(row.time.getTime())) return row.time;
   if (typeof row.time === 'number') {
-    const date = new Date(row.time * 1000);
+    const date = new Date(row.time < 1e12 ? row.time * 1000 : row.time);
     if (!Number.isNaN(date.getTime())) return date;
   } else if (row.time) {
     const date = new Date(row.time);
@@ -1444,6 +1479,18 @@ function taskTimeFromRow(row, existing) {
     if (!Number.isNaN(date.getTime())) return date;
   }
   return new Date();
+}
+
+function formatTaskAge(time) {
+  const timestamp = time instanceof Date ? time.getTime() : new Date(time).getTime();
+  if (!Number.isFinite(timestamp)) return 'now';
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (ageSeconds < 60) return ageSeconds + 's ago';
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) return ageMinutes + 'm ago';
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) return ageHours + 'h ago';
+  return Math.floor(ageHours / 24) + 'd ago';
 }
 
 function mergeTaskRow(existing, row) {
@@ -1490,6 +1537,30 @@ function updateTask(taskId, status, text, result) {
 const expandedTasks = window.expandedTasks = loadPersistedExpanded();
 const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
+let lastTaskRenderSignature = null;
+let lastDynamicTaskRenderSignature = null;
+function taskRenderSignature() {
+  const tasks = Object.keys(taskMap).sort().map(id => {
+    const task = taskMap[id] || {};
+    const time = task.time instanceof Date ? task.time.getTime() : task.time;
+    return [id, task.status, task.text, time, task.result, task.source,
+      task.workstream_id, task.workstream_name, expandedTasks.has(id)];
+  });
+  return JSON.stringify([
+    showDone,
+    Array.from(collapsedTaskWorkstreams).sort(),
+    Object.keys(taskWorkstreamNames).sort().map(id => [id, taskWorkstreamNames[id]]),
+    tasks,
+  ]);
+}
+function refreshTaskTimes(root) {
+  const scope = root || document;
+  scope.querySelectorAll('.task-item[data-taskid]').forEach(item => {
+    const time = item.querySelector('.task-time');
+    const task = taskMap[item.dataset.taskid];
+    if (time && task) time.textContent = formatTaskAge(task.time);
+  });
+}
 // Listen for external collapse/expand commands (from inline tools via AppleScript).
 // Action is 'collapse' / 'expand' for all-tasks, or 'collapse:N' / 'expand:N' (1-based) for one.
 new MutationObserver(() => {
@@ -1646,7 +1717,10 @@ function groupedTaskDisplay(entries, limit) {
     byWorkstream.get(workstreamId).entries.push(entry);
   });
 
-  const groups = Array.from(byWorkstream.values());
+  const groups = Array.from(byWorkstream.values()).sort(function(a, b) {
+    const byName = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    return byName || a.id.localeCompare(b.id);
+  });
   return {
     grouped: hasInferredWorkstream,
     groups,
@@ -1688,6 +1762,12 @@ function renderTaskWorkstreamGroups(display, renderEntry) {
 
 function renderTasks() {
   const container = $('tasks');
+  const signature = taskRenderSignature();
+  if (signature === lastTaskRenderSignature) {
+    refreshTaskTimes(container);
+    return;
+  }
+  lastTaskRenderSignature = signature;
   const entries = Object.entries(taskMap).filter(function(entry) {
     return isOwnerVisibleTask(entry[0], entry[1]);
   });
@@ -1723,8 +1803,7 @@ function renderTasks() {
   const display = groupedTaskDisplay(visible, 30);
   container.innerHTML = renderTaskWorkstreamGroups(display, ([id, t], i) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
-    const ago = Math.round((Date.now() - t.time) / 1000);
-    const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
+    const timeStr = formatTaskAge(t.time);
     // Show the result if it exists, regardless of status. The agent's task
     // bookkeeping sometimes leaves tasks in 'working' even after the result
     // file is written — gating render on status === 'done' meant those
@@ -3248,6 +3327,7 @@ window._drTaskCount = 0;
 window._drTabsRendered = false;
 
 function switchDRTab(tab) {
+  if (window._drActiveTab !== tab) lastDynamicTaskRenderSignature = null;
   window._drActiveTab = tab;
   window._drLocalContent = true; // prevent poll from clearing content
   updateTabHighlights();
@@ -3326,6 +3406,12 @@ function renderTabContent() {
     // template (summarizeTaskText / userExpanded / hover / 18px). Previous
     // inline-styled path was dead-code that bypassed all CSS work — see
     // Maddy's 2026-04-19 16:07 ET root-cause writeup.
+    var signature = taskRenderSignature();
+    if (signature === lastDynamicTaskRenderSignature) {
+      refreshTaskTimes(container);
+      return;
+    }
+    lastDynamicTaskRenderSignature = signature;
     var entries = Object.entries(taskMap);
     if (entries.length === 0) {
       container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';
@@ -3334,8 +3420,7 @@ function renderTabContent() {
       var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
       container.innerHTML = renderTaskWorkstreamGroups(display, function(entry, i) {
         var id = entry[0], t = entry[1];
-        var ago = Math.round((Date.now() - t.time) / 1000);
-        var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
+        var timeStr = formatTaskAge(t.time);
         // Render results whenever they exist — agent's task bookkeeping
         // sometimes leaves tasks in 'working' state even after the result
         // file is written. Same fix as the main renderTasks path above.

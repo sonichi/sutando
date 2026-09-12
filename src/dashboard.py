@@ -42,6 +42,10 @@ import dashboard_schedules  # noqa: E402
 import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
+NOTES_CORS_ORIGINS = frozenset({
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+})
 
 
 def _resolve_note_path(raw_slug: str):
@@ -899,13 +903,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args): pass
 
-    # No wildcard CORS. The dashboard UI is same-origin (served from this same
-    # loopback origin), so it needs no Access-Control-Allow-Origin. Sending
-    # `*` on every response — while advertising POST/DELETE — let a cross-origin
-    # browser tab mutate loopback schedules in browsers without Private Network
-    # Access enforcement (CR #2164, qingyun-wu). Omitting the header makes the
-    # browser block any cross-origin read or state-changing request; same-origin
-    # calls are unaffected.
+    def _send_local_ui_cors(self):
+        origin = self.headers.get("Origin", "").strip().lower()
+        if origin in NOTES_CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    # The local development UI may be served from port 8080 while this API stays
+    # on port 7844. Allow only those read-only UI origins; never advertise
+    # wildcard access or POST/DELETE methods for loopback state.
     def do_OPTIONS(self):  # pragma: no cover — HTTP preflight; no cross-origin grant
         # Same-origin requests never preflight; answer without granting cross-
         # origin access (no Access-Control-Allow-Origin → browser denies).
@@ -968,6 +974,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Cache-Control", "public, max-age=86400")
+                self._send_local_ui_cors()
                 self.end_headers()
                 self.wfile.write(avatar_file.read_bytes())
             else:
@@ -978,6 +985,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self._send_local_ui_cors()
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
         elif urlparse(self.path).path == "/api/quota-chart":
@@ -1064,6 +1072,7 @@ load()
                 notes.append({"slug": f.stem, "title": title, "modified": f.stat().st_mtime})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self._send_local_ui_cors()
             self.end_headers()
             self.wfile.write(json.dumps(notes).encode())
         elif urlparse(self.path).path.startswith("/notes/"):
@@ -1076,6 +1085,7 @@ load()
             if note_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self._send_local_ui_cors()
                 self.end_headers()
                 self.wfile.write(note_file.read_text().encode())
             else:
