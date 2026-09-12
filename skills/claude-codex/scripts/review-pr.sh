@@ -80,7 +80,7 @@ if [[ -x "$CHECKS_SH" ]]; then
     MECH="$(printf '%s' "$DIFF" | bash "$CHECKS_SH" 2>&1 || true)"
 fi
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
-    codex exec --sandbox read-only -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
+    codex exec --sandbox read-only --disable=apps -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
 
 $DIFF" < /dev/null
 rc=$?
