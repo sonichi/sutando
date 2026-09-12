@@ -35,17 +35,17 @@ class ASCIIOnlySnowflakes(unittest.TestCase):
                         "fixture must satisfy the pattern being replaced")
 
     def test_ascii_still_resolves(self):
-        self.assertTrue(ri._is_snowflake_str(ASCII))
+        self.assertTrue(ri.is_snowflake(ASCII))
         self.assertEqual(mri._SNOWFLAKE.findall(ASCII), [ASCII])
 
     def test_a_unicode_digit_string_is_not_an_id(self):
-        self.assertFalse(ri._is_snowflake_str(ARABIC))
+        self.assertFalse(ri.is_snowflake(ARABIC))
 
     def test_a_mixed_run_is_rejected_WHOLE_not_trimmed_to_its_ascii_tail(self):
         # Boundaries stay `\\d` on purpose: an ASCII tail adjacent to a Unicode
         # digit must not be extracted as an authoritative id.
         self.assertEqual(mri._SNOWFLAKE.findall("١" + ASCII), [])
-        self.assertFalse(ri._is_snowflake_str("١" + ASCII[1:]))
+        self.assertFalse(ri.is_snowflake("١" + ASCII[1:]))
 
     def test_the_plural_accessor_drops_a_unicode_member(self):
         e = {"_schema": "reviewer-identity/2", "human_discord_id": ASCII,

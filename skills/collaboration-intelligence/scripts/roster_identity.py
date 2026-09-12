@@ -15,6 +15,8 @@ answer it approximately.
 """
 from __future__ import annotations
 
+import re as _re
+
 SCHEMA_NAME = "reviewer-identity"
 SCHEMA_VERSION = 2
 SCHEMA_KEY = "_schema"
@@ -69,8 +71,15 @@ def path_split(path) -> list:
     return out
 
 
+def writer_owned_segments(segments) -> bool:
+    """Is this path INSIDE a slot this writer owns? Ownership is the TOP-LEVEL
+    key, so a schema spelling nested under a source object is that source's."""
+    segs = list(segments)
+    return bool(segs) and segs[0] in WRITER_OWNED
+
+
 def writer_owned_path(path) -> bool:
-    return isinstance(path, str) and path_split(path)[0] in WRITER_OWNED
+    return isinstance(path, str) and writer_owned_segments(path_split(path))
 
 
 def path_referent(path):
@@ -91,13 +100,16 @@ def path_referent(path):
 _REFERENTS = ("human", "stand")
 
 
-def _is_snowflake_str(v) -> bool:
+#: The ONE snowflake grammar. `[0-9]`, not `\d`: `\d` matches every Unicode
+#: decimal digit, so a 19-char Arabic-Indic string travelled as an id.
+SNOWFLAKE_PATTERN = r"[0-9]{17,20}"
+_SNOWFLAKE_RE = _re.compile(SNOWFLAKE_PATTERN)
+
+
+def is_snowflake(v) -> bool:
     """A snowflake is a STRING of digits. A JSON number is not one, and
     `str(v)` at a call site turns that check into a formatting step."""
-    import re as _re
-    # `[0-9]`, not `\d`: `\d` matches every Unicode decimal digit, so a
-    # 19-char Arabic-Indic string satisfied this and travelled as an id.
-    return isinstance(v, str) and bool(_re.fullmatch(r"[0-9]{17,20}", v))
+    return isinstance(v, str) and bool(_SNOWFLAKE_RE.fullmatch(v))
 
 
 def _snowflake_list(value) -> list:
@@ -105,9 +117,7 @@ def _snowflake_list(value) -> list:
     one fake id per character into `unresolved_discord_ids`."""
     if not isinstance(value, (list, tuple)):
         return []
-    import re as _re
-    return [v for v in value
-            if isinstance(v, str) and _re.fullmatch(r"[0-9]{17,20}", v)]
+    return [v for v in value if is_snowflake(v)]
 
 
 def canonical_shape_failure(rec) -> "dict | None":
@@ -244,7 +254,7 @@ def _unresolved_records(entry: dict):
         return [], False
     for rec in raw:
         rid = rec.get("id") if isinstance(rec, dict) else rec
-        if not _is_snowflake_str(rid):
+        if not is_snowflake(rid):
             return list(raw), False
     return list(raw), True
 
@@ -255,7 +265,7 @@ def _unresolved_id_set(entry: dict) -> set:
     out = set()
     for rec in recs:
         rid = rec.get("id") if isinstance(rec, dict) else rec
-        if _is_snowflake_str(rid):
+        if is_snowflake(rid):
             out.add(rid)
     return out
 
@@ -279,9 +289,9 @@ def entry_is_coherent(entry: dict) -> bool:
     # A present canonical scalar is absent/None or a whole-string snowflake.
     # Filtering a malformed one out of the collision test below HIDES a collision.
     for role in (human, stand):
-        if role is not None and not _is_snowflake_str(role):
+        if role is not None and not is_snowflake(role):
             return False
-    if _is_snowflake_str(human) and human == stand:
+    if is_snowflake(human) and human == stand:
         return False
     # The container fails CLOSED on shape: skipping the loop for a non-list let
     # a mapping or bare string read as "nothing contested".
@@ -293,7 +303,7 @@ def entry_is_coherent(entry: dict) -> bool:
             # Validated like the canonical scalars: the same id spelled `int` or
             # padded skipped the collision test below and read as a non-match.
             eid = extra.get("id") if isinstance(extra, dict) else extra
-            if not _is_snowflake_str(eid):
+            if not is_snowflake(eid):
                 return False
             if eid == human:
                 return False
@@ -308,7 +318,7 @@ def _canonical_id(entry: dict, field: str):
     if not entry_is_coherent(entry):
         return None
     v = (entry or {}).get(field)
-    if not _is_snowflake_str(v) or v in _unresolved_id_set(entry):
+    if not is_snowflake(v) or v in _unresolved_id_set(entry):
         return None
     return v
 
@@ -342,7 +352,7 @@ def stand_discord_ids(entry: dict) -> list:
     unresolved = _unresolved_id_set(entry)
     for extra in extras:
         eid = extra.get("id") if isinstance(extra, dict) else extra
-        if _is_snowflake_str(eid) and eid not in out and eid not in unresolved:
+        if is_snowflake(eid) and eid not in out and eid not in unresolved:
             out.append(eid)
     return out
 

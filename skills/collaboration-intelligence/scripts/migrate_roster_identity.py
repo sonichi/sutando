@@ -53,9 +53,9 @@ HUMAN, STAND = "human", "stand"
 # The writer overwrites the malformed slot; this key carries the finding on.
 SHAPE_FIELD = ri.SHAPE_FIELD    # owned by the schema module
 
-# Core `[0-9]`, boundaries `\d`: a run touching ANY Unicode digit is
-# rejected whole rather than yielding its ASCII tail as an authoritative id.
-_SNOWFLAKE = re.compile(r"(?<!\d)[0-9]{17,20}(?!\d)")
+# Boundaries `\d` around the SCHEMA'S grammar: a run touching ANY Unicode digit
+# is rejected whole rather than yielding its ASCII tail as an authoritative id.
+_SNOWFLAKE = re.compile(r"(?<!\d)" + ri.SNOWFLAKE_PATTERN + r"(?!\d)")
 
 
 # A Matrix id is `@localpart:server`; a numeric localpart is not a snowflake.
@@ -68,7 +68,9 @@ def _snowflakes(text: str) -> list:
 
 
 def _is_snowflake(v) -> bool:
-    return isinstance(v, str) and bool(_SNOWFLAKE.fullmatch(v))
+    """Whole-value validity is the schema's, read through it at every call so a
+    replacement there cannot leave this caller answering the old grammar."""
+    return ri.is_snowflake(v)
 
 
 def _structured_snowflakes(value) -> list:
@@ -347,9 +349,9 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
         return False
     if str(key).strip().lower() in _HANDLE_KEYS:
         return False
-    # This schema's own slot names Discord; a SOURCE-declared provider names
-    # that source's namespace and cannot rename what this writer published.
-    if str(key) in ri.WRITER_OWNED:
+    # Ownership is the PATH, not the leaf's spelling: everything under a
+    # top-level slot is ours, and that spelling nested elsewhere is not.
+    if ri.writer_owned_segments([str(a) for a in ancestors] + [str(key)]):
         return True
     if provider is not None:
         return provider == "discord"

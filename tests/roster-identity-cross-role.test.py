@@ -70,7 +70,7 @@ class Unit(unittest.TestCase):
 
 
 class Production(unittest.TestCase):
-    """keweichen's control, through main(): rc must be nonzero and no file written."""
+    """The production boundary: rc must be nonzero and no file written."""
 
     def test_main_refuses_and_writes_NOTHING(self):
         d = pathlib.Path(tempfile.mkdtemp())
