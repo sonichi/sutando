@@ -3217,13 +3217,13 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
     except OSError as exc:
         return {"name": name, "status": "ok",
                 "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
-    # Retired entries were ruled on; counting them re-raises a settled question.
+    # Retired was ruled on. The writer keys each copy `<batch>/<rel>@<digest>`;
+    # one (batch, rel) has one digest, so the prefix is exact and needs no re-hash.
     try:
-        retired = set(json.loads((root / ".retired.json").read_text()))
+        retired = {str(k).rsplit("@", 1)[0] for k in json.loads((root / ".retired.json").read_text())}
     except Exception:
         retired = set()
-    live = [f for f in files if f"{f.parent.parent.name}/{f.name}" not in retired
-            and str(f.relative_to(root)) not in retired]
+    live = [f for f in files if str(f.relative_to(root)) not in retired]
     if not live:
         return {"name": name, "status": "ok",
                 "detail": "no preserved peer files outstanding — all retired or none kept"}

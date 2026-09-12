@@ -117,12 +117,26 @@ class SyncConflictsUnmerged(unittest.TestCase):
         self.assertIn("OSError", r["detail"])
 
     def test_a_retired_entry_is_not_counted_again(self):
-        # `--retire` is a ruling. Counting it re-raises a settled question.
+        """The ledger is written by the REPORTER, so the fixture runs it.
+
+        An earlier version fabricated a list of bare paths; the real writer
+        stores a dict keyed `<batch>/<rel>@<digest>`, so the test agreed with
+        the probe's wrong assumption instead of with the producer.
+        """
         with tempfile.TemporaryDirectory() as td:
             ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
-            root = ws / ".git" / "sutando-sync-conflicts"
-            (root / ".retired.json").write_text(
-                json.dumps(["20260802T000000Z-origin_host_A/memory/x.md"]))
+            reporter = REPO / "scripts" / "sync-conflicts-report.py"
+            before = hc.check_sync_conflicts_unmerged(ws)
+            self.assertEqual(before["status"], "warn", before)
+            rc = subprocess.run(
+                [sys.executable, str(reporter), str(ws), "--retire",
+                 "20260802T000000Z-origin_host_A/memory/x.md"],
+                capture_output=True, text=True)
+            ledger = ws / ".git" / "sutando-sync-conflicts" / ".retired.json"
+            self.assertTrue(ledger.is_file(), f"reporter wrote no ledger: {rc.stdout}{rc.stderr}")
+            keys = list(json.loads(ledger.read_text()))
+            self.assertTrue(any("@" in k for k in keys),
+                            f"fixture precondition: the real key carries a digest, got {keys}")
             r = hc.check_sync_conflicts_unmerged(ws)
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("retired", r["detail"])
