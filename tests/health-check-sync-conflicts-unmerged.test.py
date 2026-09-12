@@ -9,6 +9,7 @@ arm on real data was its subprocess timeout, and the suite could not see it.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -114,6 +115,38 @@ class SyncConflictsUnmerged(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("not asserting a count", r["detail"])
         self.assertIn("OSError", r["detail"])
+
+    def test_a_retired_entry_is_not_counted_again(self):
+        # `--retire` is a ruling. Counting it re-raises a settled question.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
+            root = ws / ".git" / "sutando-sync-conflicts"
+            (root / ".retired.json").write_text(
+                json.dumps(["20260802T000000Z-origin_host_A/memory/x.md"]))
+            r = hc.check_sync_conflicts_unmerged(ws)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("retired", r["detail"])
+
+    def test_a_non_git_child_does_not_answer_about_its_ancestor(self):
+        # `rev-parse` searches ancestors: a child dir under a real vault would
+        # otherwise be reported on using the ANCESTOR's backups.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
+            child = ws / "not-a-repo"
+            child.mkdir()
+            r = hc.check_sync_conflicts_unmerged(child)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("not a git top level", r["detail"])
+
+    def test_the_warn_does_not_claim_the_files_are_absent_from_the_live_copy(self):
+        # The cheap count cannot know reconciliation; saying so would be a
+        # stronger claim than the probe measured.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
+            r = hc.check_sync_conflicts_unmerged(ws)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertNotIn("none merged back", r["detail"])
+        self.assertIn("not retired", r["detail"])
 
     def test_the_probe_is_registered_in_the_run(self):
         src = (REPO / "src" / "health-check.py").read_text()

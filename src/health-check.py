@@ -3191,14 +3191,20 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
     name = "sync-conflicts-unmerged"
     ws = Path(workspace) if workspace else resolve_workspace()
     try:
-        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--git-dir"),
+        # `rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+        # its parent; require the toplevel to BE the workspace, as the reporter does.
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--show-toplevel", "--git-dir"),
                            capture_output=True, text=True, timeout=10)
-        if r.returncode != 0 or not r.stdout.strip():
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or len(lines) < 2:
             return {"name": name, "status": "ok",
                     "detail": f"{ws} is not a git checkout — no conflict backups to read"}
-        gitdir = Path(r.stdout.strip())
+        if Path(lines[0]).resolve() != Path(ws).resolve():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git top level (git resolved {lines[0]}) — not asserting a count"}
+        gitdir = Path(lines[1])
         if not gitdir.is_absolute():
-            gitdir = ws / gitdir
+            gitdir = Path(ws) / gitdir
     except Exception as exc:
         return {"name": name, "status": "ok",
                 "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
@@ -3211,13 +3217,21 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
     except OSError as exc:
         return {"name": name, "status": "ok",
                 "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
-    if not files:
-        return {"name": name, "status": "ok", "detail": "no preserved peer files awaiting a merge"}
+    # Retired entries were ruled on; counting them re-raises a settled question.
+    try:
+        retired = set(json.loads((root / ".retired.json").read_text()))
+    except Exception:
+        retired = set()
+    live = [f for f in files if f"{f.parent.parent.name}/{f.name}" not in retired
+            and str(f.relative_to(root)) not in retired]
+    if not live:
+        return {"name": name, "status": "ok",
+                "detail": "no preserved peer files outstanding — all retired or none kept"}
     oldest = batches[0].name if batches else "?"
     return {"name": name, "status": "warn",
-            "detail": (f"{len(files)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
-                       f"oldest {oldest}, none merged back — some hold content absent from the live copy; "
-                       f"`python3 scripts/sync-conflicts-report.py \"{ws}\"` says which")}
+            "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, not retired — whether each is still absent from the live copy "
+                       f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
 
 
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
