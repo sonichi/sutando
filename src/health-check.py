@@ -3174,6 +3174,54 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
+                                  repo_root: "Path | None" = None,
+                                  run=None) -> dict:
+    """Peer content the sync preserved and nobody merged back.
+
+    `_resolve_conflicts_keep_ours` keeps OUR side and banks THEIRS under the
+    git dir, then reports the total. That report rides `sync-workspace.sh`'s
+    stdout at exit 0, and the cron that runs it is told to speak only on
+    failure -- so a true count lands where nothing reads it. Measured
+    2026-09-12: two hosts, 18 and 21 files, both agents read past the line in
+    the same hour while quoting other rows from the same output.
+
+    A count is not a sync failure, so this never fails: it warns, on a surface
+    that is read every pass. Same trade as `comm-sweep.sh stamp`, which warns
+    rather than refusing because refusing turns a quiet record problem into a
+    loud false one.
+    """
+    name = "sync-conflicts-unmerged"
+    ws = workspace or resolve_workspace()
+    repo = Path(repo_root) if repo_root else REPO_DIR
+    script = Path(repo) / "scripts" / "sync-conflicts-report.py"
+    if not script.is_file():
+        return {"name": name, "status": "ok",
+                "detail": "no sync-conflicts-report.py in this checkout — nothing to read"}
+    runner = run or subprocess.run
+    try:
+        r = runner([sys.executable, str(script), str(ws)],
+                   capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not run the conflicts report ({type(exc).__name__}) — not asserting a count"}
+    out = (r.stdout or "") + (r.stderr or "")
+    if "no unmerged peer content" in out:
+        return {"name": name, "status": "ok", "detail": "no preserved peer content awaiting a merge"}
+    m = re.search(r"(\d+) file\(s\) hold peer content not in the live copy", out)
+    if not m:
+        # A shape this probe cannot parse is unobserved, never zero.
+        return {"name": name, "status": "ok",
+                "detail": "conflicts report produced no count this probe recognises — not asserting a count"}
+    n = int(m.group(1))
+    if n == 0:
+        return {"name": name, "status": "ok", "detail": "no preserved peer content awaiting a merge"}
+    return {"name": name, "status": "warn",
+            "detail": (f"{n} file(s) hold peer content the sync preserved and nothing merged back — "
+                       f"`python3 scripts/sync-conflicts-report.py \"{ws}\"` lists them with their "
+                       f"backup batch; keep-ours banked them at exit 0 and the sync cron reports only failures")}
+
+
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     """Warn when a long-running skills process is executing code older than disk.
 
@@ -12516,6 +12564,7 @@ def run_all_checks() -> list[dict]:
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
     checks.append(check_skills_driver_code_drift())
+    checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
