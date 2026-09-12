@@ -3174,6 +3174,101 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
+                                  repo_root: "Path | None" = None) -> dict:
+    """Peer content the sync preserved and nobody merged back.
+
+    `_resolve_conflicts_keep_ours` keeps OUR side on a conflict and banks THEIRS
+    under the git dir. That happens at exit 0, and the sync cron is told to speak
+    only on failure, so the fact lands where nothing reads it. Measured on two
+    hosts the same hour: both agents read past the line while quoting other rows.
+
+    Counts the preserved files; it does NOT diff them against the live copy.
+    That diff is what `scripts/sync-conflicts-report.py` does and it costs 24s
+    over 892 MB here and over 120s on a peer -- a per-pass probe cannot run it,
+    and a probe whose only reachable arm is its timeout prints a tick forever.
+    """
+    name = "sync-conflicts-unmerged"
+    ws = Path(workspace) if workspace else resolve_workspace()
+    try:
+        # `rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+        # its parent; require the toplevel to BE the workspace, as the reporter does.
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--show-toplevel", "--git-dir"),
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or len(lines) < 2:
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git checkout — no conflict backups to read"}
+        if Path(lines[0]).resolve() != Path(ws).resolve():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git top level (git resolved {lines[0]}) — not asserting a count"}
+        gitdir = Path(lines[1])
+        if not gitdir.is_absolute():
+            gitdir = Path(ws) / gitdir
+    except Exception as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
+    root = gitdir / "sutando-sync-conflicts"
+    if not root.is_dir():
+        return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
+    try:
+        batches = sorted(d for d in root.iterdir() if d.is_dir())
+        files = [f for d in batches for f in d.rglob("*") if f.is_file()]
+    except OSError as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    # The digest is IN the writer's key so retiring one copy cannot silence a
+    # later, DIFFERENT one at the same path; the reporter owns that identity.
+    try:
+        retired = set(json.loads((root / ".retired.json").read_text()))
+    except Exception:
+        retired = set()
+    entry_key = _sync_conflicts_entry_key()
+    if entry_key is None:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(files)} peer file(s) preserved across {len(batches)} keep-ours "
+                           "batch(es); the reporter's retirement key could not be loaded, so "
+                           "retirement is UNOBSERVED here rather than assumed — run "
+                           f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
+    live, unobserved = [], []
+    for batch in batches:
+        for f in sorted(x for x in batch.rglob("*") if x.is_file()):
+            try:
+                # errors="replace" matches the writer: a different decode is a
+                # different digest, and every copy would then read un-retired.
+                key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+            except OSError:
+                unobserved.append(f)
+                continue
+            if key not in retired:
+                live.append(f)
+    if not live and not unobserved:
+        return {"name": name, "status": "ok",
+                "detail": "no preserved peer files outstanding — all retired or none kept"}
+    if not live:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unobserved)} preserved peer file(s) could not be read, so their "
+                           "retirement is UNOBSERVED — not asserting they are retired")}
+    oldest = batches[0].name if batches else "?"
+    return {"name": name, "status": "warn",
+            "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, not retired — whether each is still absent from the live copy "
+                       f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_entry_key():
+    """The reporter OWNS retirement identity; a second spelling here would drift."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync-conflicts-report.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_sync_conflicts_report", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._entry_key
+    except Exception:
+        return None
+
+
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     """Warn when a long-running skills process is executing code older than disk.
 
@@ -12516,6 +12611,7 @@ def run_all_checks() -> list[dict]:
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
     checks.append(check_skills_driver_code_drift())
+    checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
