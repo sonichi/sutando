@@ -37,6 +37,49 @@ class SkillBudget(unittest.TestCase):
         self.assertGreater(SKILL.stat().st_size, 1024)
         self.assertLess(CAP, 70_000)
 
+    def test_every_gate_is_chained_to_its_consumer(self):
+        """A gate bound by prose is a gate you can run one action late.
+
+        Per BULLET, not per line: the script and its exit codes sit on separate
+        lines, so a per-line filter matches neither and passes vacuously.
+        """
+        text = SKILL.read_text()
+        NOT_GATING = {
+            "tool-suites-check.py": "reports suite health; withholds no action",
+            "codex-quota-gate.py": "Codex-only tier read, informational",
+        }
+        bullets = re.split(r"\n(?=\d+(?:\.\d+)?\. )", text)
+        checked = []
+        for b in bullets:
+            if "cannot answer" not in b:
+                continue
+            for script in set(re.findall(r"scripts/([a-z-]+\.py)", b)):
+                if script in NOT_GATING:
+                    continue
+                checked.append(script)
+                with self.subTest(script=script):
+                    self.assertIn("&&", b,
+                                  f"{script} declares a refusal but is not bound to its consumer")
+        # Non-vacuity: a loop that examined nothing passes silently, which is the
+        # failure this arm exists to prevent, turned on the arm itself.
+        self.assertGreaterEqual(len(checked), 4,
+                                f"only examined {checked} — the enumerator matched too little")
+
+    def test_the_dedup_gate_is_staged_under_its_final_name(self):
+        """`check-dedup-targets` reads the source task id from the BASENAME.
+
+        Staging under a generic temp name leaves it no sender/room metadata, so
+        it skips both comparisons and returns clean — a gate that publishes what
+        the unstaged invocation refused.
+        """
+        text = SKILL.read_text()
+        bullet = next(b for b in re.split(r"\n(?=\d+(?:\.\d+)?\. )", text)
+                      if "check-dedup-targets.py" in b)
+        self.assertNotRegex(bullet, r'check-dedup-targets\.py "\$tmp"',
+                            "staged under a generic temp name: the checker loses the task identity")
+        self.assertIn("dedup-staging/<file>", bullet,
+                      "the staged path must carry the FINAL basename")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
