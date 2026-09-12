@@ -52,10 +52,11 @@ caps this file and refuses date stamps in it).
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
-3.4. **Zero-result rule.** Before reporting any empty result or telling the owner how the system behaves:
-   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>"`
-   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). Name what a
-   non-zero would look like, run the positive control, suspect scope then shape, never verify in zsh.
+3.4. **Zero-result rule**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>" && <the send>`
+   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). A negative
+   states its population inline — "0 of N matching X" — or nobody, including its author, can falsify it.
+   Name what a non-zero looks like, run the positive control, suspect scope then shape, never in zsh.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
    (0 no candidate · 1 do not file, candidates named · 2 cannot answer).
