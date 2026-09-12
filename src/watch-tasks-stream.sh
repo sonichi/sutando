@@ -218,6 +218,26 @@ publish_terminal_failure() {
   return "$rc"
 }
 
+# A watcher without the routing handler answers every bound room from this
+# core, silently; refuse unless the declaration is empty or the operator opts in.
+if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+  if [ "${SUTANDO_ALLOW_UNROUTED_BINDINGS:-}" != "1" ]; then
+    if ! reason="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_bindings_declared.py" "$WORKSPACE_DIR/state")"; then
+      if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+        why="SUTANDO_TASK_EVENT_HANDLER is set but not executable: $SUTANDO_TASK_EVENT_HANDLER"
+      else
+        why="SUTANDO_TASK_EVENT_HANDLER is unset"
+      fi
+      echo "watch-tasks-stream: REFUSING to start: $reason; $why." >&2
+      echo "  Bound rooms would be answered by this core instead of their workers." >&2
+      echo "  Fix: export SUTANDO_TASK_EVENT_HANDLER=<checkout>/skills/worker-pool/scripts/pool_route_handler.py" >&2
+      echo "  (the checkout that carries the pool) and start the watcher again; or set" >&2
+      echo "  SUTANDO_ALLOW_UNROUTED_BINDINGS=1 to run without routing on purpose." >&2
+      exit 78
+    fi
+  fi
+fi
+
 if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
