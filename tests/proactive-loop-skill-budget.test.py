@@ -65,6 +65,21 @@ class SkillBudget(unittest.TestCase):
         self.assertGreaterEqual(len(checked), 4,
                                 f"only examined {checked} — the enumerator matched too little")
 
+    def test_the_dedup_gate_is_staged_under_its_final_name(self):
+        """`check-dedup-targets` reads the source task id from the BASENAME.
+
+        Staging under a generic temp name leaves it no sender/room metadata, so
+        it skips both comparisons and returns clean — a gate that publishes what
+        the unstaged invocation refused.
+        """
+        text = SKILL.read_text()
+        bullet = next(b for b in re.split(r"\n(?=\d+(?:\.\d+)?\. )", text)
+                      if "check-dedup-targets.py" in b)
+        self.assertNotRegex(bullet, r'check-dedup-targets\.py "\$tmp"',
+                            "staged under a generic temp name: the checker loses the task identity")
+        self.assertIn("dedup-staging/<file>", bullet,
+                      "the staged path must carry the FINAL basename")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

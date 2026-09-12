@@ -41,9 +41,11 @@ caps this file and refuses date stamps in it).
    (`python3 src/discord-read.py <channel> --serving <channel>` when serving a task, `--operator` otherwise),
    pending questions, relay, build log. Trust the record over recall; maintain `current-track.md`.
 1. **Tasks.** Process every file in `$WORKSPACE/tasks/`; `access_tier: team|other` → the sandboxed path.
-   Group a thread with `[deduped: task-<latest>]`, written to a TEMP path and gated into place —
-   a file in `results/` is claimed by a poller in under a second, so a check after the write
-   checks nothing: `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$tmp" && mv -f "$tmp" "$WORKSPACE/results/<file>"`
+   Group a thread with `[deduped: task-<latest>]`, staged under its FINAL name and gated into
+   place — `results/` is claimed by a poller in under a second, and the checker reads the source
+   id from the BASENAME, so a generic temp name makes it pass everything:
+   `S="$WORKSPACE/state/dedup-staging/<file>"` then
+   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$S" && mv -f "$S" "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
    Bind idle to it too: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
