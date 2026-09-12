@@ -3175,51 +3175,49 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
 
 
 def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
-                                  repo_root: "Path | None" = None,
-                                  run=None) -> dict:
+                                  repo_root: "Path | None" = None) -> dict:
     """Peer content the sync preserved and nobody merged back.
 
-    `_resolve_conflicts_keep_ours` keeps OUR side and banks THEIRS under the
-    git dir, then reports the total. That report rides `sync-workspace.sh`'s
-    stdout at exit 0, and the cron that runs it is told to speak only on
-    failure -- so a true count lands where nothing reads it. Measured
-    2026-09-12: two hosts, 18 and 21 files, both agents read past the line in
-    the same hour while quoting other rows from the same output.
+    `_resolve_conflicts_keep_ours` keeps OUR side on a conflict and banks THEIRS
+    under the git dir. That happens at exit 0, and the sync cron is told to speak
+    only on failure, so the fact lands where nothing reads it. Measured on two
+    hosts the same hour: both agents read past the line while quoting other rows.
 
-    A count is not a sync failure, so this never fails: it warns, on a surface
-    that is read every pass. Same trade as `comm-sweep.sh stamp`, which warns
-    rather than refusing because refusing turns a quiet record problem into a
-    loud false one.
+    Counts the preserved files; it does NOT diff them against the live copy.
+    That diff is what `scripts/sync-conflicts-report.py` does and it costs 24s
+    over 892 MB here and over 120s on a peer -- a per-pass probe cannot run it,
+    and a probe whose only reachable arm is its timeout prints a tick forever.
     """
     name = "sync-conflicts-unmerged"
-    ws = workspace or resolve_workspace()
-    repo = Path(repo_root) if repo_root else REPO_DIR
-    script = Path(repo) / "scripts" / "sync-conflicts-report.py"
-    if not script.is_file():
-        return {"name": name, "status": "ok",
-                "detail": "no sync-conflicts-report.py in this checkout — nothing to read"}
-    runner = run or subprocess.run
+    ws = Path(workspace) if workspace else resolve_workspace()
     try:
-        r = runner([sys.executable, str(script), str(ws)],
-                   capture_output=True, text=True, timeout=60)
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--git-dir"),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git checkout — no conflict backups to read"}
+        gitdir = Path(r.stdout.strip())
+        if not gitdir.is_absolute():
+            gitdir = ws / gitdir
     except Exception as exc:
         return {"name": name, "status": "ok",
-                "detail": f"could not run the conflicts report ({type(exc).__name__}) — not asserting a count"}
-    out = (r.stdout or "") + (r.stderr or "")
-    if "no unmerged peer content" in out:
-        return {"name": name, "status": "ok", "detail": "no preserved peer content awaiting a merge"}
-    m = re.search(r"(\d+) file\(s\) hold peer content not in the live copy", out)
-    if not m:
-        # A shape this probe cannot parse is unobserved, never zero.
+                "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
+    root = gitdir / "sutando-sync-conflicts"
+    if not root.is_dir():
+        return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
+    try:
+        batches = sorted(d for d in root.iterdir() if d.is_dir())
+        files = [f for d in batches for f in d.rglob("*") if f.is_file()]
+    except OSError as exc:
         return {"name": name, "status": "ok",
-                "detail": "conflicts report produced no count this probe recognises — not asserting a count"}
-    n = int(m.group(1))
-    if n == 0:
-        return {"name": name, "status": "ok", "detail": "no preserved peer content awaiting a merge"}
+                "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    if not files:
+        return {"name": name, "status": "ok", "detail": "no preserved peer files awaiting a merge"}
+    oldest = batches[0].name if batches else "?"
     return {"name": name, "status": "warn",
-            "detail": (f"{n} file(s) hold peer content the sync preserved and nothing merged back — "
-                       f"`python3 scripts/sync-conflicts-report.py \"{ws}\"` lists them with their "
-                       f"backup batch; keep-ours banked them at exit 0 and the sync cron reports only failures")}
+            "detail": (f"{len(files)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, none merged back — some hold content absent from the live copy; "
+                       f"`python3 scripts/sync-conflicts-report.py \"{ws}\"` says which")}
 
 
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
