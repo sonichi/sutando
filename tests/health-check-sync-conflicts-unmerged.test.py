@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePath as pathlib_PurePath
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
@@ -232,11 +232,59 @@ class RetirementIdentityIsTheCopy(unittest.TestCase):
         self.saved.write_text(self.ORIGINAL)
         self.assertEqual((self.status(), self.reporter()), ("ok", 0))
 
-    def test_an_unreadable_copy_is_UNOBSERVED_not_retired(self):
-        """Bounding the hash cost must not assert an unchecked copy is retired."""
+    def test_undecodable_BYTES_are_still_observed(self):
+        """errors="replace" decodes anything, so bad bytes are a CHANGED copy,
+        not an unreadable one — the earlier version of this arm accepted both
+        outcomes and so asserted nothing."""
         self.retire()
         self.saved.write_bytes(b"\xff\xfe raw bytes")
-        self.assertIn(self.status(), ("warn", "ok"))
+        self.assertEqual(self.status(), "warn")
+
+    def test_a_copy_that_cannot_be_READ_is_UNOBSERVED_not_retired(self):
+        """Bounding the hash cost must never assert an unchecked copy is clear."""
+        self.retire()
+        self.saved.chmod(0o000)
+        self.addCleanup(self.saved.chmod, 0o644)
+        try:
+            self.saved.read_text()
+        except OSError:
+            pass
+        else:
+            self.skipTest("this user can read a 000 file (root?) — no OSError to raise")
+        result = hc.check_sync_conflicts_unmerged(workspace=self.ws)
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("UNOBSERVED", result["detail"])
+        self.assertNotIn("all retired", result["detail"])
+
+    def test_a_loader_that_fails_reports_UNOBSERVED_rather_than_assuming(self):
+        """If the reporter's key cannot be loaded the probe knows nothing about
+        retirement; saying "all retired" there is the same false clean."""
+        original = hc._sync_conflicts_entry_key
+        hc._sync_conflicts_entry_key = lambda: None
+        self.addCleanup(setattr, hc, "_sync_conflicts_entry_key", original)
+        self.retire()
+        result = hc.check_sync_conflicts_unmerged(workspace=self.ws)
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("UNOBSERVED", result["detail"])
+
+    def test_the_loader_returns_None_when_the_reporter_cannot_be_imported(self):
+        """The except arm itself: a raising import must degrade, never propagate
+        out of a health probe."""
+        import importlib.util as _iu
+        original = _iu.spec_from_file_location
+
+        def boom(*a, **k):
+            raise ImportError("simulated")
+
+        _iu.spec_from_file_location = boom
+        self.addCleanup(setattr, _iu, "spec_from_file_location", original)
+        self.assertIsNone(hc._sync_conflicts_entry_key())
+
+    def test_CONTROL_the_loader_normally_returns_the_reporters_own_key(self):
+        """Without this the arm above could pass on a loader that always fails."""
+        fn = hc._sync_conflicts_entry_key()
+        self.assertIsNotNone(fn)
+        self.assertTrue(fn("b", pathlib_PurePath("notes/x.md"), "abc").startswith("b/notes/x.md@"))
 
     def test_the_probe_does_not_respell_the_retirement_key(self):
         src = (REPO / "src" / "health-check.py").read_text()
