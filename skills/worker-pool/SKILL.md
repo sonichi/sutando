@@ -22,8 +22,14 @@ tests/skills/worker-pool/pool-delivery.test.py
 tests/skills/worker-pool/worker-identity-records.test.py
 ```
 
-Their design is `docs/worker-pool-design.md`. Their suites are at
-`tests/skills/worker-pool/`, under the mandatory root every runner already globs.
+Their suites are at `tests/skills/worker-pool/`, under the mandatory root every
+runner already globs.
+
+The design document these modules implement is **not on `main`** — it lands via
+sonichi/sutando#4041. `pool_delivery.py`'s header cites `docs/worker-pool-design.md`
+by path; that reference is inherited from before this move and is dead until #4041
+merges. Until then the modules' own headers and their three suites are the
+authoritative description.
 
 Describing what each module owns is deliberately left to the PR that wires the pool
 into the core, where the descriptions can be checked against a caller.
