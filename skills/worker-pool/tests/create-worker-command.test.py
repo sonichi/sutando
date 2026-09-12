@@ -57,6 +57,9 @@ class Base(unittest.TestCase):
         cw.sw = sw
         self.addCleanup(lambda: setattr(sw, "per_instance_sentinel_supported",
                                         self._real_gate))
+        self._real_core_runtime = sw.core_runtime
+        sw.core_runtime = lambda repo, runner=None: "claude"
+        self.addCleanup(lambda: setattr(sw, "core_runtime", self._real_core_runtime))
 
     def run_cli(self, *args):
         return cw.main(["--workspace", str(self.ws), "--repo", str(REPO), *args])
@@ -177,6 +180,108 @@ class TestUnrosteredRecordsAreReportedNotAdopted(Base):
         self.run_cli()
         kept = pr.load_roster(self.ws)["workers"]["a" * 32]
         self.assertEqual(kept["state"], "recovering")
+
+
+class TestARefusalNamesTheRetainedWorker(Base):
+    """A launcher failure must not claim a clean refusal while a record and a
+    delivery dir it just minted stay on disk, unrostered and unnamed."""
+
+    def test_a_launcher_failure_leaves_no_record_or_delivery_dir(self):
+        def fake_spawn(workspace, repo, **kw):
+            raise sw.SpawnRefused("the runtime launcher failed: did not come up")
+        sw.spawn = fake_spawn
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli()
+        self.assertEqual(rc, cw.REFUSED)
+        self.assertIn("the runtime launcher failed", err.getvalue())
+        self.assertEqual(self.spawned, [])
+        self.assertFalse((self.ws / "state" / "workers").exists())
+        self.assertFalse((self.ws / "deliveries").exists())
+
+
+class TestDryRunPredictsTheSameRuntimeAsTheRealRun(Base):
+    """Two different runtimes for one command is a prediction the real run is
+    free to break; dry-run and the real spawn must resolve it identically."""
+
+    def test_omitted_runtime_with_a_supported_core_matches(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--dry-run"), 0)
+        planned = json.loads(out.getvalue())["runtime"]
+        self.assertEqual(self.run_cli(), 0)
+        self.assertEqual(planned, "claude")
+
+    def test_omitted_runtime_with_an_unsupported_core_refuses_both_ways(self):
+        sw.core_runtime = lambda repo, runner=None: "codex"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            dry_rc = self.run_cli("--dry-run")
+        self.assertEqual(dry_rc, cw.REFUSED)
+        self.assertIn("worker mode", err.getvalue())
+        self.assertEqual(self.spawned, [])
+
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            real_rc = self.run_cli()
+        self.assertEqual(real_rc, cw.REFUSED)
+        self.assertIn("worker mode", err2.getvalue())
+        self.assertEqual(self.spawned, [])
+
+    def test_explicit_supported_runtime_is_honored(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--dry-run", "--runtime", "claude"), 0)
+        self.assertEqual(json.loads(out.getvalue())["runtime"], "claude")
+        self.assertEqual(self.run_cli("--runtime", "claude"), 0)
+
+    def test_explicit_bogus_runtime_refuses_both_ways(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            dry_rc = self.run_cli("--dry-run", "--runtime", "bogus")
+        self.assertEqual(dry_rc, cw.REFUSED)
+        self.assertIn("worker mode", err.getvalue())
+
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            real_rc = self.run_cli("--runtime", "bogus")
+        self.assertEqual(real_rc, cw.REFUSED)
+        self.assertIn("worker mode", err2.getvalue())
+        self.assertEqual(self.spawned, [])
+
+
+class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
+    """The same absent/unreadable/malformed distinction, exercised end-to-end
+    through the command a caller actually runs, not just the writer directly."""
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_an_existing_unreadable_roster_refuses_and_is_untouched(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"version": 7, "workers": {"a" * 32: {
+            "label": "keeper", "state": "idle"}}, "bindings": {}}))
+        before = p.read_bytes()
+        p.chmod(0o000)
+        self.addCleanup(lambda: p.chmod(0o644))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli()
+        self.assertNotEqual(rc, 0)
+        self.assertIn(self.spawned[0], err.getvalue())
+        p.chmod(0o644)
+        self.assertEqual(p.read_bytes(), before)
+
+    def test_an_existing_malformed_roster_refuses_and_is_untouched(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        rc = self.run_cli()
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(p.read_text(), "{not json")
+
+    def test_an_absent_roster_still_succeeds(self):
+        self.assertEqual(self.run_cli(), 0)
+        self.assertEqual(set(pr.load_roster(self.ws)["workers"]), {self.spawned[0]})
 
 
 if __name__ == "__main__":

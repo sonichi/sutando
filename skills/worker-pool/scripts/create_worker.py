@@ -134,8 +134,16 @@ def main(argv=None) -> int:
         print(f"create-worker: {e}", file=sys.stderr)
         return REFUSED
 
+    try:
+        # Resolved once so a dry-run and the real spawn can never predict
+        # two different runtimes for the same command.
+        runtime = sw.resolve_runtime(a.repo, a.runtime or None)
+    except sw.SpawnRefused as e:
+        print(f"create-worker: {e}", file=sys.stderr)
+        return REFUSED
+
     if a.dry_run:
-        plan = sw.plan(workspace, a.repo, runtime=a.runtime or "claude",
+        plan = sw.plan(workspace, a.repo, runtime=runtime,
                        cwd=a.folder, socket=a.socket or None, label=a.label)
         plan["would_bind"] = a.room
         plan["unrostered_records"] = unrostered(workspace, existing_workers(workspace))
@@ -143,7 +151,7 @@ def main(argv=None) -> int:
         return 0
 
     try:
-        made = sw.spawn(workspace, a.repo, runtime=a.runtime, cwd=a.folder,
+        made = sw.spawn(workspace, a.repo, runtime=runtime, cwd=a.folder,
                         socket=a.socket or None, label=a.label)
     except sw.SpawnRefused as e:
         print(f"create-worker: {e}", file=sys.stderr)
