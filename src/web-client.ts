@@ -2920,10 +2920,11 @@ document.addEventListener('keydown', function(e) {
 function answerQuestion(qid, answer) {
   if (!answer || !answer.trim()) return;
   const apiBase = 'http://' + location.hostname + ':7843';
+  // This form means "answer": say so, so the API's default can flip to keep-open (#4066).
   fetch(apiBase + '/answer', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({id: qid, answer: answer.trim()})
+    body: JSON.stringify({id: qid, answer: answer.trim(), resolve: true})
   }).then(r => r.json()).then(d => {
     if (d.ok) {
       // Show answered state on the question briefly before removing
