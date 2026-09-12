@@ -51,7 +51,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import (REFUSAL_FIELDS, TEXT_FIELDS, declared, declared_routes, host_rosters,
+from roster_union import (CAVEAT_SUFFIX, is_caveat, REFUSAL_FIELDS, TEXT_FIELDS, declared, declared_routes, host_rosters,
                           roster_login, roster_union)
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
@@ -158,9 +158,9 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
         why = stated_reason(entry)
         # A caveat nobody prints is a note, not a step. Derived from the entry:
         # a named field list misses the next caveat silently.
-        for field in sorted(k for k in entry if k.endswith("_caveat")):
+        for field in sorted(k for k in entry if is_caveat(k)):
             if entry.get(field):
-                label = field[: -len("_caveat")].upper().replace("_", " ")
+                label = field[: -len(CAVEAT_SUFFIX)].upper().replace("_", " ")
                 print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
         if not routes:
             # a human id alone cannot be a target: person-mentions trigger no Stand

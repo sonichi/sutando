@@ -265,6 +265,92 @@ class BlankOverlay(unittest.TestCase):
 
 
 
+class CaveatFamily(unittest.TestCase):
+    """`resolve()` prints EVERY `*_caveat`; a named spelling in the text policy
+    leaves the rest value-typed, so a malformed local one overlays and the peer's
+    warning vanishes with no route refused and nothing printed."""
+
+    # jurisdiction_/future_ are NOT named anywhere in the source: the unit is the
+    # family, so a caveat nobody has written yet must already be covered.
+    CAVEATS = ("identity_caveat", "room_caveat", "jurisdiction_caveat", "future_caveat")
+    WARN = "SHARED LOGIN: two stands use one account"
+    MALFORMED = NON_STRINGS + ([], {})
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        self.ru = _load("roster_union", "roster_union.py")
+        self.nr = _load("notify_reviewers", "notify_reviewers.py")
+        self.dir = Path(tempfile.mkdtemp())
+
+    def resolve_pair(self, local_row, peer_row):
+        paths = []
+        for host, row in (("local", local_row), ("peer", peer_row)):
+            p = self.dir / (host + str(abs(hash((str(local_row), host)))) + ".json")
+            p.write_text(json.dumps({"reviewer": row}))
+            paths.append((host, p))
+        merged = self.ru.roster_union(paths)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            targets, rc = self.nr.resolve(["reviewer"], merged)
+        return targets, rc, err.getvalue(), merged
+
+    def peer(self, field):
+        return {"stand": "@peer:x", "room": "!peer:x", field: self.WARN}
+
+    def test_a_malformed_local_caveat_does_not_erase_the_peer_warning(self):
+        for field in self.CAVEATS:
+            for value in self.MALFORMED:
+                with self.subTest(field=field, local=value):
+                    t, rc, err, _ = self.resolve_pair(
+                        {"stand": None, "room": None, field: value}, self.peer(field))
+                    self.assertEqual((len(t), rc), (1, 0),
+                                     f"a local {value!r} in {field} withheld the route")
+                    self.assertIn(self.WARN, err,
+                                  f"a local {value!r} in {field} erased the peer warning "
+                                  "— it routes and says nothing")
+
+    def test_an_absent_local_caveat_leaves_the_peer_warning(self):
+        for field in self.CAVEATS:
+            with self.subTest(field=field):
+                t, rc, err, _ = self.resolve_pair(
+                    {"stand": None, "room": None}, self.peer(field))
+                self.assertEqual((len(t), rc), (1, 0))
+                self.assertIn(self.WARN, err)
+
+    def test_CONTROL_a_VALID_local_caveat_still_overrides_the_peer_text(self):
+        """Deliberate: real local text wins. Without this the fix could pass by
+        never letting a local caveat overlay at all."""
+        for field in self.CAVEATS:
+            with self.subTest(field=field):
+                t, rc, err, _ = self.resolve_pair(
+                    {"stand": None, "room": None, field: "LOCAL SAYS SO"}, self.peer(field))
+                self.assertEqual((len(t), rc), (1, 0))
+                self.assertIn("LOCAL SAYS SO", err)
+                self.assertNotIn(self.WARN, err)
+
+    def test_CONTROL_allowlisted_false_still_refuses(self):
+        """The permissive default is what keeps a `False` meaningful; widening
+        the text policy must not reach a non-text field."""
+        t, rc, _, _ = self.resolve_pair(
+            {"stand": None, "room": None, "allowlisted": False},
+            {"stand": "@peer:x", "room": "!peer:x"})
+        self.assertEqual((len(t), rc), (0, 4))
+
+    def test_the_caveat_family_is_spelled_once_and_both_readers_use_it(self):
+        union_src = (SCRIPTS / "roster_union.py").read_text()
+        notify_src = (SCRIPTS / "notify_reviewers.py").read_text()
+        self.assertEqual(
+            len(re.findall(r'endswith\(\s*["\']_caveat["\']\s*\)', union_src + notify_src)), 0,
+            "a second literal `_caveat` suffix test is how the two readers drift")
+        self.assertEqual((union_src + notify_src).count('"_caveat"'), 1,
+                         "the caveat suffix is spelled more than once")
+        self.assertRegex(notify_src, r"from roster_union import [^)]*\bis_caveat\b")
+        for f in self.CAVEATS:
+            self.assertTrue(self.ru.is_text_field(f), f"{f} is not text-typed")
+        self.assertFalse(self.ru.is_text_field("allowlisted"))
+
+
 class SharedPresencePredicate(unittest.TestCase):
     """The one predicate the three sites now share, pinned directly.
 

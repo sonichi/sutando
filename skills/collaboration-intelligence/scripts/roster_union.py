@@ -42,6 +42,23 @@ REFUSAL_FIELDS = ("refusal_basis", "note")
 TEXT_FIELDS = REFUSAL_FIELDS + ("authority_caveat", "same_actor_as") + IDENTITY_FIELDS
 
 
+CAVEAT_SUFFIX = "_caveat"
+
+
+def is_caveat(field) -> bool:
+    """The resolver prints EVERY `*_caveat`, so the family is the unit here."""
+    return str(field).endswith(CAVEAT_SUFFIX)
+
+
+def is_text_field(field) -> bool:
+    """Text-typed: the named list plus the whole caveat family.
+
+    A named spelling misses the next caveat silently, and the consumer already
+    reads the family, so the policy guarding it must read the family too.
+    """
+    return field in TEXT_FIELDS or is_caveat(field)
+
+
 def states_field(field, value) -> bool:
     """Whether a NAMED field states something, by that field's OWN type.
 
@@ -50,7 +67,7 @@ def states_field(field, value) -> bool:
     list or a `False` in one prints as no reason at all, so letting it overlay
     would erase a peer's stated refusal with a value no reader can read.
     """
-    return bool(declared(value)) if field in TEXT_FIELDS else is_declared(value)
+    return bool(declared(value)) if is_text_field(field) else is_declared(value)
 
 
 def roster_login(row) -> "tuple[str, str]":
