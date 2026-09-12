@@ -40,19 +40,30 @@ class SkillBudget(unittest.TestCase):
     def test_every_gate_is_chained_to_its_consumer(self):
         """A gate bound by prose is a gate you can run one action late.
 
-        3.4 said "Before reporting any empty result ..." while 3.45 and 9.5
-        bound theirs with `&&`. The unchained one was run after the post it was
-        meant to gate -- twice, by two agents -- and fired correctly both times,
-        which is indistinguishable from not having it.
+        Per BULLET, not per line: the script and its exit codes sit on separate
+        lines, so a per-line filter matches neither and passes vacuously.
         """
         text = SKILL.read_text()
-        for script in ("warn-already-triaged.py", "gh-duplicate-check.py",
-                       "pr-monologue-check.py"):
-            with self.subTest(script=script):
-                line = next((ln for ln in text.splitlines() if script in ln), "")
-                self.assertTrue(line, f"{script} is not named in SKILL.md")
-                self.assertIn("&&", line,
-                              f"{script} is invoked without `&&` binding it to its consumer")
+        NOT_GATING = {
+            "tool-suites-check.py": "reports suite health; withholds no action",
+            "codex-quota-gate.py": "Codex-only tier read, informational",
+        }
+        bullets = re.split(r"\n(?=\d+(?:\.\d+)?\. )", text)
+        checked = []
+        for b in bullets:
+            if "cannot answer" not in b:
+                continue
+            for script in set(re.findall(r"scripts/([a-z-]+\.py)", b)):
+                if script in NOT_GATING:
+                    continue
+                checked.append(script)
+                with self.subTest(script=script):
+                    self.assertIn("&&", b,
+                                  f"{script} declares a refusal but is not bound to its consumer")
+        # Non-vacuity: a loop that examined nothing passes silently, which is the
+        # failure this arm exists to prevent, turned on the arm itself.
+        self.assertGreaterEqual(len(checked), 4,
+                                f"only examined {checked} — the enumerator matched too little")
 
 
 if __name__ == "__main__":

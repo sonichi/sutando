@@ -41,11 +41,13 @@ caps this file and refuses date stamps in it).
    (`python3 src/discord-read.py <channel> --serving <channel>` when serving a task, `--operator` otherwise),
    pending questions, relay, build log. Trust the record over recall; maintain `current-track.md`.
 1. **Tasks.** Process every file in `$WORKSPACE/tasks/`; `access_tier: team|other` → the sandboxed path.
-   Group a thread with `[deduped: task-<latest>]`, then
-   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>"`
+   Group a thread with `[deduped: task-<latest>]`, written to a TEMP path and gated into place —
+   a file in `results/` is claimed by a poller in under a second, so a check after the write
+   checks nothing: `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$tmp" && mv -f "$tmp" "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
-   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"` (1 = a task got no result).
+   Bind idle to it too: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   (1 = a task got no result, so idle does not run).
 2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
    when voice is connected, plus a macOS notification.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
@@ -92,9 +94,9 @@ caps this file and refuses date stamps in it).
 7. **Build log write.** Append with `O_APPEND` and a random marker; assert `count(MARK) == 1` by reading
    the file back. Never read-modify-replace. Then decide whether a `relay/relay-<ts>.md` note is owed
    (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
-7.5. **Memory index.** Before adding a row to `MEMORY.md`:
-   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>"` (0 safe · 1 refuse,
-   casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+7.5. **Memory index**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
+   (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
 8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
    placed by importance (only the top 5 render anywhere), and assert with the reader:
