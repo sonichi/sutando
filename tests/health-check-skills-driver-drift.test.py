@@ -49,9 +49,10 @@ def check(cond: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    r = subprocess.run(["git", "-C", str(repo), *args], check=check,
+                       capture_output=True, text=True)
+    return (r.stdout + r.stderr).strip() if not check else r.stdout.strip()
 
 
 def _mk_ws(td: str, *, skills: bool = True, log_lines: list[str] | None = None) -> tuple[Path, str]:
@@ -297,6 +298,35 @@ def main() -> int:
               f"l) an unrunnable stamp lookup is INCONCLUSIVE, got {r}")
         check("Re-arm" not in r["detail"],
               f"l) and it does not advise a re-arm, got {r['detail']}")
+
+    # m) an UNREADABLE object is present-but-unresolvable, not absent. HEAD is a
+    #    SECOND commit and stays readable, so only the stamp lookup fails.
+    with tempfile.TemporaryDirectory() as td:
+        ws, _h = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        stamp_full = _git(sk, "rev-parse", "HEAD")
+        (sk / "f.txt").write_text("second\n")
+        _git(sk, "add", "f.txt"); _git(sk, "commit", "-q", "-m", "second")
+        (ws / "state" / "content-driver.log").write_text(
+            f"[v=e1e1f151715f@{stamp_full[:7]}] driver started\n")
+        loose = sk / ".git" / "objects" / stamp_full[:2] / stamp_full[2:]
+        check(loose.is_file(), "m) fixture precondition: the stamped commit is a loose object")
+        if loose.is_file():
+            r_before = hc.check_skills_driver_code_drift(ws)
+            check(r_before["status"] == "warn",
+                  f"m) control: a readable OLDER commit does warn, got {r_before}")
+            loose.chmod(0o000)
+            try:
+                probe = _git(sk, "rev-parse", "--verify", f"{stamp_full[:7]}^{{commit}}", check=False)
+                check("Permission denied" in probe,
+                      f"m) fixture precondition: git cannot read it, got {probe[:60]!r}")
+                r = hc.check_skills_driver_code_drift(ws)
+            finally:
+                loose.chmod(0o444)
+            check(r["status"] == "ok" and "INCONCLUSIVE" in r["detail"],
+                  f"m) an unreadable stamp is INCONCLUSIVE, not drift, got {r}")
+            check("Re-arm" not in r["detail"],
+                  f"m) and it does not advise a re-arm, got {r['detail']}")
 
     print()
     if FAILS:
