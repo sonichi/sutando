@@ -3207,16 +3207,22 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
     if not head:
         return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
-    # Two writers, two spellings: the driver stamps its own prefix and `--short`
-    # grows to stay unambiguous, so equal commits compare unequal as strings.
-    try:
-        rp = subprocess.run(git_argv("-C", str(skills), "rev-parse", f"{running}^{{commit}}", "HEAD^{commit}"),
-                            capture_output=True, text=True, timeout=10)
-        full = rp.stdout.split() if rp.returncode == 0 else []
-    except Exception:
-        full = []
-    # String equality stays as the fallback for when rev-parse cannot answer.
-    same = running == head or (len(full) == 2 and full[0] == full[1])
+    # Never compare two abbreviations: each writer picks its own length, so they
+    # agree until a colliding object lands and `--short` grows. Resolve both.
+    def _oid(rev):
+        try:
+            r = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"),
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+    head_oid = _oid("HEAD")
+    if not head_oid:
+        return {"name": name, "status": "ok",
+                "detail": "could not resolve HEAD in the skills checkout — not asserting drift"}
+    # An unresolvable STAMP is a finding, not an unanswerable: the driver is on
+    # code this checkout does not have. Only an unreadable HEAD is unanswerable.
+    same = _oid(running) == head_oid
     if same:
         return {"name": name, "status": "ok",
                 "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
