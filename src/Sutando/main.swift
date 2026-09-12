@@ -2,6 +2,7 @@ import Cocoa
 import Carbon
 import UserNotifications
 import ApplicationServices
+import WebKit
 
 // MARK: - Sutando Drop Menu Bar App
 // Replaces Automator Quick Action for context drops.
@@ -208,6 +209,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func isVoiceConnected() -> Bool {
+        let statePath = workspace + "/state/voice-state.json"
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: statePath)),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let connected = json["connected"] as? Bool {
+            return connected
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/lsof")
         proc.arguments = ["-i", ":9900", "-sTCP:ESTABLISHED"]
@@ -285,6 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "drop_video_clip": ("Drop Video Clip", #selector(dropVideoClip)),
             "toggle_voice":    ("Toggle Voice",    #selector(toggleVoice)),
             "toggle_mute":     ("Toggle Mute",     #selector(toggleMute)),
+            "toggle_panel":    ("Voice Panel",     #selector(togglePanel)),
         ]
         for hk in hotkeys {
             guard let (label, sel) = actionToSelector[hk.action] else { continue }
@@ -1102,6 +1110,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ("drop_video_clip",  "R", ["control", "shift"]),
         ("toggle_voice",     "V", ["control"]),
         ("toggle_mute",      "M", ["control"]),
+        ("toggle_panel",     "F", ["control"]),
     ]
 
     private func loadHotkeyConfig() -> [(action: String, key: String, modifiers: [String])] {
@@ -1226,6 +1235,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case "drop_video_clip": appDelegate.dropVideoClip()
             case "toggle_voice":    appDelegate.toggleVoice()
             case "toggle_mute":     appDelegate.toggleMute()
+            case "toggle_panel":    appDelegate.togglePanel()
             default: break
             }
             return noErr
@@ -1740,9 +1750,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleVoice() {
         NSLog("Sutando: toggleVoice called")
-        // NativeMic path is parked — see NativeMic.swift header. Echo cancellation
-        // via voice-processing IO unit fails to initialize the output node on
-        // this hardware (-10875). Re-enable once that's resolved.
+        // Ctrl+V toggles the voice session ONLY. The floating panel has its own
+        // key (Ctrl+F) — owner asked to keep the two unbound from each other.
         httpToggle(endpoint: "toggle")
     }
 
@@ -1772,41 +1781,183 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openWebUI() {
         NSLog("Sutando: openWebUI called")
-        // Switch to existing localhost:8080 tab or open new one
-        let script = NSAppleScript(source: """
-        tell application "Google Chrome"
-            activate
-            set found to false
-            repeat with w in windows
-                set tabList to tabs of w
-                repeat with i from 1 to count of tabList
-                    if URL of item i of tabList contains "localhost:8080" then
-                        set active tab index of w to i
-                        set index of w to 1
-                        set found to true
-                        exit repeat
-                    end if
-                end repeat
-                if found then exit repeat
-            end repeat
-            if not found then
-                open location "http://localhost:8080"
-            end if
-        end tell
-        """)
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
-        if let error = error {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? "unknown error"
-            if msg.contains("not allowed") || msg.contains("permission") {
-                notify("Sutando", "Open Web UI needs: System Settings → Privacy & Security → Automation → allow Sutando to control Chrome")
+        setVoiceWebUIVisible(true)
+    }
+
+    /// The voice UI as a FLOATING panel: a utility window that stays above other
+    /// apps across app switches, not a Chrome window raised to the front.
+    func setVoiceWebUIVisible(_ visible: Bool) {
+        DispatchQueue.main.async {
+            if visible { self.showVoicePanel() } else { self.voicePanel?.orderOut(nil) }
+        }
+    }
+
+    var voicePanel: NSPanel?
+    var voiceWebView: WKWebView?
+
+    /// Panel visibility on its own key. Deliberately does NOT toggle voice:
+    /// that is what lets the panel be opened without dialing a session.
+    @objc func togglePanel() {
+        DispatchQueue.main.async {
+            if let panel = self.voicePanel, panel.isVisible {
+                // Hiding must also END the session. orderOut alone leaves the
+                // webview live and the microphone open, so the panel looks
+                // closed while it is still listening.
+                self.voiceWebView?.load(URLRequest(url: URL(string: "about:blank")!))
+                panel.orderOut(nil)
+                self.logToFile("togglePanel: hidden, webview torn down (mic released)")
             } else {
-                // Fallback: just open the URL directly
-                if let url = URL(string: "http://localhost:8080") {
-                    NSWorkspace.shared.open(url)
-                }
+                self.showVoicePanel()
             }
         }
+    }
+
+    /// Fallback when pixel sampling is unavailable (Sutando lacks a Screen
+    /// Recording grant): contrast against the system appearance instead of
+    /// silently defaulting to dark, which matches no backdrop at all.
+    private func systemIsDark() -> Bool {
+        NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
+
+    var voicePanelLightTheme = false
+
+    /// Sample what the panel will sit on top of so it can take the opposite tone
+    /// (Discord dark -> light panel; ag2.space light -> dark panel). nil = capture
+    /// unavailable (no Screen Recording grant); caller keeps the page's own theme.
+    private func backdropIsDark(_ frame: NSRect) -> Bool? {
+        guard let screen = NSScreen.main else { return nil }
+        // screencapture(1), not CGDisplayCreateImage — the latter is obsoleted in macOS 15.
+        // -R takes top-left origin, so flip out of AppKit's bottom-left coordinates.
+        let x = Int(frame.origin.x)
+        let y = Int(screen.frame.height - frame.origin.y - frame.height)
+        let w = Int(frame.width), h = Int(frame.height)
+        guard w > 0, h > 0 else { return nil }
+        let shot = NSTemporaryDirectory() + "sutando-backdrop.png"
+        let cap = Process()
+        cap.launchPath = "/usr/sbin/screencapture"
+        cap.arguments = ["-x", "-R", "\(x),\(y),\(w),\(h)", shot]
+        cap.standardOutput = Pipe(); cap.standardError = Pipe()
+        do { try cap.run(); cap.waitUntilExit() } catch {
+            logToFile("backdropIsDark: screencapture launch failed: \(error.localizedDescription)")
+            return nil
+        }
+        defer { try? FileManager.default.removeItem(atPath: shot) }
+        guard cap.terminationStatus == 0 else {
+            logToFile("backdropIsDark: screencapture rc=\(cap.terminationStatus) rect=\(x),\(y),\(w),\(h)")
+            return nil
+        }
+        guard let img = NSImage(contentsOfFile: shot),
+              let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let data = rep.bitmapData, rep.samplesPerPixel >= 3 else {
+            logToFile("backdropIsDark: could not decode \(shot)")
+            return nil
+        }
+        let spp = rep.samplesPerPixel, rowBytes = rep.bytesPerRow
+        var total = 0.0, count = 0.0
+        var py = 0
+        while py < rep.pixelsHigh {
+            var px = 0
+            while px < rep.pixelsWide {
+                let o = py * rowBytes + px * spp
+                total += (0.299 * Double(data[o]) + 0.587 * Double(data[o + 1])
+                          + 0.114 * Double(data[o + 2])) / 255.0
+                count += 1
+                px += 8
+            }
+            py += 8
+        }
+        guard count > 0 else { return nil }
+        let mean = total / count
+        logToFile("backdropIsDark: mean luminance \(mean) over \(Int(count)) samples -> dark=\(mean < 0.5)")
+        return mean < 0.5
+    }
+
+    func applyPanelTheme(light: Bool) {
+        let lightCSS = ("html,body{background:#ffffff!important}"
+            + "#bottom-panel{background:#ffffff!important;border-top:1px solid #dddde3!important}"
+            + "#transcript{background:#ffffff!important}"
+            + "#transcript .t-entry{color:#1a1a1a!important}"
+            + "#transcript .t-system{color:#6b6b76!important}"
+            + "input#textInput{background:#f4f4f7!important;color:#111!important;"
+            + "border:1px solid #ccccd4!important}"
+            + ".btn-send{background:#111111!important;color:#ffffff!important}")
+        let css = light ? lightCSS : ""
+        let js = "(function(){var e=document.getElementById('sutando-theme');"
+            + "if(!e){e=document.createElement('style');e.id='sutando-theme';"
+            + "document.documentElement.appendChild(e);}e.textContent='" + css + "';})();"
+        voiceWebView?.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// Fixed top-right (owner 2026-09-11). It used to centre over the frontmost app's
+    /// window, which moved the panel every time she changed app.
+    private func panelOrigin(for size: NSSize) -> NSPoint {
+        if let vf = NSScreen.main?.visibleFrame {
+            return NSPoint(x: vf.maxX - size.width - 24, y: vf.maxY - size.height - 24)
+        }
+        return NSPoint(x: 80, y: 80)
+    }
+
+    private func showVoicePanel() {
+        if let panel = voicePanel {
+            // She wants it over the app she is using, so re-place on every show.
+            panel.setFrameOrigin(panelOrigin(for: panel.frame.size))
+            // Light, always (owner 2026-09-11). Sampling the backdrop made the panel change
+            // colour on its own, and a rebuild that drops the Screen Recording grant
+            // silently fell through to the system appearance — dark on her Mac.
+            voicePanelLightTheme = true
+            applyPanelTheme(light: voicePanelLightTheme)
+            if let url = URL(string: "http://localhost:8081") {
+                voiceWebView?.load(URLRequest(url: url))
+            }
+            panel.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let width: CGFloat = 307
+        let height: CGFloat = 413
+        let origin = panelOrigin(for: NSSize(width: width, height: height))
+        // No .nonactivatingPanel: the UI has a text field, and a panel that never
+        // takes key focus cannot be typed into.
+        let panel = NSPanel(contentRect: NSRect(origin: origin, size: NSSize(width: width, height: height)),
+                            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                            backing: .buffered, defer: false)
+        panel.title = "Sutando Voice"
+        panel.level = .floating
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        // She wants only the middle box (#bottom-panel = transcript + input bar),
+        // not the whole 8080 page. Crop with CSS rather than rebuilding the UI, so
+        // the page's own WebSocket/JS wiring keeps working untouched.
+        let cropCSS = "html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#12121e!important}body>*{display:none!important}body>.main,body>#main-area{display:block!important}#main-area>*{display:none!important}#main-area>#bottom-panel{display:flex!important}#bottom-panel{position:fixed!important;top:0!important;left:0!important;right:0!important;bottom:0!important;max-width:none!important;margin:0!important;border-top:none!important;display:flex!important;flex-direction:column!important}#transcript{flex:1 1 auto!important;overflow-y:auto!important;max-height:none!important;height:auto!important}.input-bar{flex:0 0 auto!important}"
+        let cropJS = "(function(){var s=document.createElement('style');s.id='sutando-crop';"
+            + "s.textContent='" + cropCSS + "';document.documentElement.appendChild(s);})();"
+        let config = WKWebViewConfiguration()
+        config.userContentController.addUserScript(
+            WKUserScript(source: cropJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        let webView = WKWebView(frame: NSRect(origin: .zero, size: NSSize(width: width, height: height)),
+                                configuration: config)
+        webView.autoresizingMask = [.width, .height]
+        webView.uiDelegate = self
+        webView.navigationDelegate = self
+        // Sampled before the panel is ordered in, so we read the backdrop, not ourselves.
+        // Light, always (owner 2026-09-11). Sampling the backdrop made the panel change
+            // colour on its own, and a rebuild that drops the Screen Recording grant
+            // silently fell through to the system appearance — dark on her Mac.
+            voicePanelLightTheme = true
+        if let url = URL(string: "http://localhost:8081") {
+            webView.load(URLRequest(url: url))
+        }
+        panel.contentView = webView
+
+        voiceWebView = webView
+        voicePanel = panel
+        panel.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        logToFile("showVoicePanel: floating voice panel shown")
     }
 
     @objc func openCore() {
@@ -2731,6 +2882,25 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory) // menu bar only, no dock icon
 app.run()
+
+
+extension AppDelegate: WKUIDelegate {
+    /// Screen share from inside the panel: the page calls getDisplayMedia,
+    /// which WKWebView refuses unless the host app answers this.
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        decisionHandler(.grant)
+    }
+}
+
+extension AppDelegate: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        applyPanelTheme(light: voicePanelLightTheme)
+    }
+}
 
 extension AppDelegate: NSMenuDelegate {
     static let modelChoicesManifest = "/skills/model-switch/manifest.json"
