@@ -83,6 +83,38 @@ class SyncConflictsUnmerged(unittest.TestCase):
         self.assertIn("400 peer file(s)", r["detail"])
         self.assertLess(elapsed, 5.0, f"probe took {elapsed:.1f}s on 400 files")
 
+    def test_an_unreadable_backup_root_is_unobserved_never_zero(self):
+        # Real permissions, real OSError: iterdir on a 000 directory.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
+            root = ws / ".git" / "sutando-sync-conflicts"
+            root.chmod(0o000)
+            try:
+                r = hc.check_sync_conflicts_unmerged(ws)
+            finally:
+                root.chmod(0o755)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("not asserting a count", r["detail"])
+
+    def test_a_git_call_that_raises_is_unobserved_never_zero(self):
+        # Real git ERRORS (non-zero) rather than raising, so the only way to
+        # reach this guard is to make the call itself throw.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["memory/x.md"]})
+            real = hc.subprocess.run
+
+            def boom(*a, **k):
+                raise OSError("git exploded")
+
+            hc.subprocess.run = boom
+            try:
+                r = hc.check_sync_conflicts_unmerged(ws)
+            finally:
+                hc.subprocess.run = real
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("not asserting a count", r["detail"])
+        self.assertIn("OSError", r["detail"])
+
     def test_the_probe_is_registered_in_the_run(self):
         src = (REPO / "src" / "health-check.py").read_text()
         self.assertEqual(src.count("checks.append(check_sync_conflicts_unmerged())"), 1)
