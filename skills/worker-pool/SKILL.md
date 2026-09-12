@@ -9,12 +9,17 @@ user-invocable: false
 **Placeholder.** `CONTRIBUTING.md` requires a `SKILL.md` beside `scripts/`; this file
 satisfies that and nothing more.
 
-Three stage-1 modules for the worker pool live in `scripts/`. Nothing in the
-repository calls them yet:
+Three stage-1 modules for the worker pool live in `scripts/`. They have no
+production caller yet — their suites are the only thing that imports them:
 
 ```
 $ grep -rnE 'pool_roster|worker_identity|pool_delivery' src/ scripts/
 (no output)
+
+$ grep -rlE 'pool_roster|worker_identity|pool_delivery' tests/
+tests/skills/worker-pool/pool-bindings-roster.test.py
+tests/skills/worker-pool/pool-delivery.test.py
+tests/skills/worker-pool/worker-identity-records.test.py
 ```
 
 Their design is `docs/worker-pool-design.md`. Their suites are at
