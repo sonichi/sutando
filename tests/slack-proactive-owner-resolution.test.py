@@ -94,6 +94,20 @@ def main():
     assert resolve({"allowFrom": ["team"], "tierMap": {"team": "team"}}) is None
     assert resolve({"allowFrom": []}) is None
 
+    # A PRESENT tierMap is authoritative. `or {}` collapsed all three of these
+    # into the legacy default and elected a deliberately read-only user.
+    assert resolve({"allowFrom": ["U_READ_ONLY"], "tierMap": {}}) is None
+    assert resolve({"allowFrom": ["U_UNMAPPED"], "tierMap": {"other": "owner"}}) is None
+    assert resolve({"allowFrom": ["U"], "tierMap": ["not", "a", "map"]}) is None
+    assert resolve({"allowFrom": ["U"], "tierMap": {"U": ["malformed"]}}) is None
+    assert resolve({"allowFrom": "not-a-list", "tierMap": {}}) is None
+    assert resolve("not-a-dict") is None
+
+    # Mirror controls: without these, a resolver that always returned None
+    # would satisfy every assertion above.
+    assert resolve({"allowFrom": ["U"], "tierMap": {"U": "owner"}}) == "U"
+    assert resolve({"allowFrom": ["a", "b"], "tierMap": {"a": "team", "b": "owner"}}) == "b"
+
     # Exercise the actual proactive watcher wiring under coverage: it reads
     # access.json, resolves Rui, opens the owner DM, and sends once.
     bridge = _load_bridge()
