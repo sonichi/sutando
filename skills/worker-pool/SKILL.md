@@ -52,7 +52,13 @@ The suites are at `tests/skills/worker-pool/`, not inside this directory.
 
 Every runner globs `find tests -name '*.test.py'` — recursive over `tests/`, and it
 does **not** descend into `skills/`. A suite placed at `skills/worker-pool/tests/`
-would stop running with CI still green. Under the mandatory root, no discovery
-change is needed in `package.json`, `.github/workflows/ci.yml` or
-`scripts/coverage-gate.sh`. Coverage still reaches the scripts: `.coveragerc`
-already lists `skills` as a source root.
+would therefore never be executed. CI would go red rather than silently pass:
+`tests/ci-covers-every-python-test.test.py` reads `git ls-files` and fails on a
+tracked `*.test.py` no runner names. Measured — planting one there and tracking it
+turns that suite red; untracked, it does not, because the guard reads the index.
+
+So the cost is a red build and a puzzling failure, not a silent gap. Under the
+mandatory root neither happens, and no discovery change is needed in
+`package.json`, `.github/workflows/ci.yml` or `scripts/coverage-gate.sh`.
+Coverage still reaches the scripts: `.coveragerc` already lists `skills` as a
+source root.
