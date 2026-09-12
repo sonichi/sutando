@@ -524,6 +524,9 @@ def _handle_signal(signum: int, frame) -> None:
 
 # One `core_pid() is None` can mean "cannot tell", not "dead" — see run_forever().
 ABSENT_BEATS_BEFORE_DEATH = 3
+# Unobserved probes keep the beat this long, then let the file age: never unlinked
+# (a flaky tmux must not kill a live core), never fresh forever (a dead socket).
+UNOBSERVED_BEATS_BEFORE_STALE = 20
 def run_forever(interval: float = 30.0, status: str = "running") -> int:
     """Heartbeat loop. Returns the exit code (0 on graceful shutdown)."""
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -547,6 +550,7 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     except Exception:  # pragma: no cover — best-effort
         pass
     absent_streak = 0
+    unobserved_streak = 0
     global _LAST_SESSION_PROBE
     while not _SHUTDOWN_REQUESTED:
         _LAST_SESSION_PROBE = False
@@ -556,8 +560,11 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
         # absence: it neither resets nor advances the streak of observed misses.
         if present:
             absent_streak = 0
+            unobserved_streak = 0
         elif _LAST_SESSION_PROBE is not None:
             absent_streak += 1
+        else:
+            unobserved_streak += 1
         if saw_core and absent_streak >= ABSENT_BEATS_BEFORE_DEATH:
             print("core_heartbeat: core pane is gone — stopping beat and "
                   "removing .alive so readers see it leave", file=sys.stderr, flush=True)
@@ -566,7 +573,11 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
             except Exception:
                 pass
             return 0
-        if saw_core:
+        unobserved_ok = (_LAST_SESSION_PROBE is None
+                         and unobserved_streak <= UNOBSERVED_BEATS_BEFORE_STALE)
+        if saw_core and (present or unobserved_ok):
+            # An observed absence never refreshes; an unobserved run refreshes only
+            # within the cap, so a writer on a dead socket stops reading fresh.
             try:
                 write_beat(status=status)
                 if not _PID_RECORDED:
@@ -574,7 +585,7 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
             except Exception as e:
                 # Don't die on transient FS hiccups — log + retry next tick.
                 print(f"core_heartbeat: write failed: {e}", file=sys.stderr, flush=True)
-        else:
+        elif not saw_core:
             try:
                 _alive_path().unlink(missing_ok=True)
             except Exception:
@@ -647,21 +658,28 @@ def _recorded_writer_pids() -> list[int]:
     return pids
 
 
+_WRITER_SCRIPT_RE = re.compile(r"(?:^|\s)(\S*/src/core_heartbeat\.py)(?=\s|$)")
+
+
 def _is_writer_argv(args: str, script: str) -> bool:
-    """`<python> <this script> [flags]` and nothing else: a `-c` program that mentions the path is not a writer."""
-    i = args.find(script)
-    if i < 0:
+    """`<python> <a core_heartbeat.py> [flags]` and nothing else: a `-c` program that
+    mentions the path is not a writer. Any checkout's copy counts: the writer this
+    checkout's records name may have been started from another checkout (a
+    worktree restart), and it is still the one writer of this host's file."""
+    m = _WRITER_SCRIPT_RE.search(args)
+    if not m:
         return False
+    i = m.start(1)
     prefix = args[:i].rstrip()
-    after = args[i + len(script):]
+    after = args[m.end(1):]
     # Apple's framework interpreter reports itself as `.../Python.app/Contents/MacOS/Python`.
     return (bool(re.search(r"python[0-9.]*$", prefix, re.IGNORECASE)) and " -c" not in f" {prefix}"
             and (after == "" or after[0] == " "))
 
 
 def stop_other_writers(timeout_s: float = 5.0) -> int:
-    """SIGTERM the heartbeat writer(s) this checkout's own records name — after proving each pid is an
-    interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
+    """SIGTERM the heartbeat writer(s) this host's records name — after proving each pid is an
+    interpreter running a core_heartbeat.py — and wait for exit (SIGKILL past the timeout). Nothing
     is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
     me, parent = os.getpid(), os.getppid()
     script = str(Path(__file__).resolve())
