@@ -795,7 +795,7 @@ export const getCoreStatusTool: ToolDefinition = {
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
 			if (!existsSync(corePath)) {
-				return { status: 'idle', description: 'Core agent is not currently running.' };
+				return { status: 'idle', ready: true, description: 'Core agent is idle (no task in flight) — available and ready to accept a delegated task via work.' };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -809,7 +809,7 @@ export const getCoreStatusTool: ToolDefinition = {
 					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).`,
 				};
 			}
-			return { status: 'idle', description: 'Core agent is idle right now.' };
+			return { status: 'idle', ready: true, description: 'Core agent is idle (no task in flight) — available and ready to accept a delegated task via work. "idle" means READY, not unavailable.' };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
