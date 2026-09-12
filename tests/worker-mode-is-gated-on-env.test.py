@@ -190,6 +190,50 @@ def _state_root(extra_env: dict, td: Path):
         time.sleep(0.2)
 
 
+WORKER_KEYS = ("SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR", "SUTANDO_WORKSPACE_DIR",
+               "SUTANDO_INBOX_KIND", "SUTANDO_RESULTS_DIR", "SUTANDO_WORKER_BOOTSTRAP")
+
+
+def _core_env(extra_env: dict, td: Path) -> list[str]:
+    """What the launcher forwards into the core session (its own --print-core-env
+    probe), from a clean environment: no pool variable, no proxy, no repo .env."""
+    root = td / "repo"
+    if not root.exists():
+        shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+    ws = td / "ws"; ws.mkdir(exist_ok=True)
+    (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
+    stub = td / "bin"; stub.mkdir(exist_ok=True)
+    for name, body in (("lsof", "exit 1\n"), ("launchctl", "exit 0\n"), ("sleep", "exit 0\n")):
+        (stub / name).write_text("#!/bin/sh\n" + body); (stub / name).chmod(0o755)
+    env = {"HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **extra_env}
+    out = subprocess.run(["bash", str(root / "src/agent/claude/cli/start-cli.sh"), "--print-core-env"],
+                         cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return [tok for tok in out.stdout.split() if "=" in tok]
+
+
+class TestCoreEnvInvariance(unittest.TestCase):
+    """No pool variable set = the core session's env is the pre-pool env: the
+    marker is 1 and no worker key is forwarded. Set = the opposite, so the
+    first test cannot pass by the probe printing nothing."""
+
+    def test_unset_no_worker_key_reaches_the_core_session(self):
+        with scratch() as td:
+            env = _core_env({}, Path(td))
+        self.assertIn("SUTANDO_CORE_RUNTIME=claude", env, env)   # the probe ran
+        self.assertIn("SUTANDO_CORE_SESSION=1", env, env)
+        keys = {tok.split("=", 1)[0] for tok in env}
+        self.assertFalse(keys & set(WORKER_KEYS), f"worker key forwarded to a core: {keys & set(WORKER_KEYS)}")
+
+    def test_set_the_marker_is_blanked_and_the_instance_named(self):
+        with scratch() as td:
+            env = _core_env({"SUTANDO_INSTANCE_ID": "c" * 32}, Path(td))
+        self.assertIn("SUTANDO_CORE_SESSION=", env, env)
+        self.assertNotIn("SUTANDO_CORE_SESSION=1", env, env)
+        self.assertIn("SUTANDO_INSTANCE_ID=" + "c" * 32, env, env)
+
+
 class TestWatcherGate(unittest.TestCase):
     def test_unset_the_core_watches_its_workspace_tasks_folder(self):
         with scratch() as td:
