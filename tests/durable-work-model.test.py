@@ -107,10 +107,22 @@ class TestVocabularyCoversLiveProducers(unittest.TestCase):
             f"producers stamp access_tier values the model does not name: {unknown} "
             "— add them to ACCESS_TIERS (and update CLAUDE.md) or fix the producer")
 
-    def test_ambient_is_a_named_tier(self):
-        # The 2026-08 drift this suite was born from: the events consumer
-        # stamps ambient; the model must know it.
-        self.assertIn("ambient", ltp.ACCESS_TIERS)
+    def test_collaborator_is_a_named_tier(self):
+        self.assertIn("collaborator", ltp.ACCESS_TIERS)
+
+    def test_ambient_is_a_legacy_spelling_not_a_tier(self):
+        # Provenance left the tier axis: a legacy `ambient` reads as guest
+        # with origin promoted, and no live producer stamps it any more.
+        self.assertNotIn("ambient", ltp.ACCESS_TIERS)
+        self.assertEqual(ltp.canonical_access_tier("ambient"), "guest")
+        self.assertEqual(ltp.task_origin({"access_tier": "ambient"}), "promoted")
+        self.assertNotIn("ambient", _grep_stamped_values("access_tier"))
+
+    def test_the_taskify_writer_stamps_a_named_origin(self):
+        # `origin` is also an ordinary word elsewhere, so only the header-line
+        # stamp is censused: the taskify writer must emit a value the model names.
+        stamped = _grep_stamped_values("origin")
+        self.assertIn("promoted", stamped & set(ltp.ORIGINS))
 
     def test_every_stamped_priority_is_in_the_model(self):
         stamped = _grep_stamped_values("priority")

@@ -20,7 +20,7 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
+   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, collaborator tier (Discord list + AG2 Space opt-in), promoted-task origin",
    "last_verified": "2026-09-04"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {

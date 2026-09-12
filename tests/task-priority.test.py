@@ -46,6 +46,7 @@ class TestEnumAndDefaults(unittest.TestCase):
         self.assertEqual(default_priority_for_source("discord", "owner"), "normal")
         self.assertEqual(default_priority_for_source("discord", "team"), "low")
         self.assertEqual(default_priority_for_source("discord", "guest"), "low")
+        self.assertEqual(default_priority_for_source("discord", "collaborator"), "low")
         self.assertEqual(default_priority_for_source("discord", "other"), "low")
         # Missing access_tier defaults to owner per the helper.
         self.assertEqual(default_priority_for_source("discord", None), "normal")

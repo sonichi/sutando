@@ -36,7 +36,7 @@ class CanonicalAccessTier(unittest.TestCase):
         self.assertEqual(ltp.canonical_access_tier("OWNER"), "owner")
 
     def test_other_named_tiers_pass_through(self):
-        for tier in ("owner", "team", "ambient"):
+        for tier in ("owner", "team", "collaborator"):
             self.assertEqual(ltp.canonical_access_tier(tier), tier)
 
     def test_unknown_values_are_left_to_the_reader(self):

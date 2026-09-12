@@ -71,7 +71,8 @@ check("ordinary prose survives verbatim", PROSE in out_prose, True)
 
 # 5. The surrounding contract still holds: this is an ambient observation, and
 #    the in-band block is what stops it being read as an instruction.
-check("the promoted task is still ambient", "access_tier: ambient" in out, True)
+check("the promoted task is still guest-tier", "access_tier: guest" in out, True)
+check("the promoted task carries origin: promoted", "origin: promoted" in out, True)
 check("the in-band observation block survives", "SUTANDO SYSTEM INSTRUCTIONS" in out, True)
 
 # 6. Empty and missing bodies must not raise — the filter sits on a path that

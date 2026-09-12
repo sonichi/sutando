@@ -371,6 +371,22 @@ class CodexDelegationConsumer(unittest.TestCase):
         self.assertIsNotNone(why)
         self.assertIn("team", why)
 
+    def test_collaborator_task_is_not_a_codex_consumer(self):
+        """A collaborator is engaged in the live core; only sandboxed tiers need codex."""
+        tasks, channels = self._dirs()
+        self._task(tasks, "5", "collaborator")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
+    def test_legacy_ambient_task_still_counts_as_guest_ingress(self):
+        tasks, channels = self._dirs()
+        self._task(tasks, "6", "ambient")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+        self.assertIsNotNone(why)
+        self.assertIn("guest", why)
+
     def test_unreadable_task_alone_yields_no_consumer(self):
         tasks, channels = self._dirs()
         (tasks / "task-unreadable.txt").mkdir()
