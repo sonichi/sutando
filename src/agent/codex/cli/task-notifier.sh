@@ -10,17 +10,14 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-# An inbox is not always <workspace>/tasks: a pool worker watches
-# <workspace>/deliveries/<id>, whose parent is deliveries/, not the workspace.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
-TASK_HANDLER_CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
+TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
-TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
@@ -35,15 +32,8 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 COMPOSER_READY_TIMEOUT="${SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT:-30}"
 # Poll the composer at the caller's cadence; the default is human-scale.
 COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$WORKSPACE_DIR/state/core-status.json}"
+CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
-# Test probe: report the resolved trees, so the suite reads what this script
-# ACTUALLY derives rather than a copy. No production caller passes it.
-if [ "${1:-}" = "--print-paths" ]; then
-  printf 'TASKS_DIR=%s\nWORKSPACE_DIR=%s\nRESULTS_DIR=%s\nTASK_HANDLER_CLAIMS_DIR=%s\nCORE_STATUS_FILE=%s\n' \
-    "$TASKS_DIR" "$WORKSPACE_DIR" "$RESULTS_DIR" "$TASK_HANDLER_CLAIMS_DIR" "$CORE_STATUS_FILE"
-  exit 0
-fi
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -54,7 +44,7 @@ probe_optional_task_handler() {
   [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime codex \
-    --workspace "$WORKSPACE_DIR" \
+    --workspace "$(dirname "$TASKS_DIR")" \
     --task-file "$TASKS_DIR/$filename" \
     --results-dir "$RESULTS_DIR" \
     --repo "$REPO" \
@@ -234,7 +224,7 @@ PY
 # appear. Log to the workspace log dir when it exists, and always to stderr.
 log_notifier() {
   local msg="task-notifier: $*" dir
-  dir="$WORKSPACE_DIR/logs"
+  dir="$(dirname "$TASKS_DIR")/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
 }
