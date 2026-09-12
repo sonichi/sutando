@@ -427,9 +427,22 @@ if ! command -v fswatch >/dev/null 2>&1; then
 fi
 
 apply_tmux_defaults
+
+publish_active_runtime() {
+  # Only callers that have VERIFIED the session may call this: a launch that
+  # never came up must leave the previous runtime's marker truthful.
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/state" 2>/dev/null || true
+  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' \
+    "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json" 2>/dev/null || true
+}
+
+# Append-only launch history, not a claim about what is live, so it is
+# unconditional — unlike the active-runtime marker above.
 if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
   mkdir -p "$ws/state"
-  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json"
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
@@ -445,6 +458,7 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
+    publish_active_runtime
   else
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi
@@ -462,6 +476,7 @@ else
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
+    publish_active_runtime
   else
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi

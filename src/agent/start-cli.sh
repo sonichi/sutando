@@ -28,6 +28,83 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
+# --runtime: this layer writes DESIRED state only; each launcher publishes the
+# active core-runtime.json, so a refused restart leaves the old marker truthful.
+requested_runtime=""
+_passthru=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runtime)
+      requested_runtime="${2:-}"
+      if [ "$#" -lt 2 ]; then
+        echo "start-cli: --runtime needs a value (claude|codex)" >&2; exit 2
+      fi
+      shift 2 ;;
+    --runtime=*)
+      requested_runtime="${1#--runtime=}"; shift ;;
+    *)
+      _passthru+=("$1"); shift ;;
+  esac
+done
+set -- ${_passthru[@]+"${_passthru[@]}"}
+
+if [ -n "$requested_runtime" ]; then
+  case "$requested_runtime" in
+    claude|codex) ;;
+    *) echo "start-cli: unsupported --runtime: $requested_runtime (expected claude|codex)" >&2; exit 2 ;;
+  esac
+  # The shared resolver refuses Apple's Xcode-CLT stub; it reports failure as
+  # EMPTY output with exit 0, so test the string, not the exit code.
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _cfg_py="$(resolve_python "$REPO")"
+  if [ -z "$_cfg_py" ]; then
+    echo "start-cli: no runnable interpreter — refusing to persist core.runtime" >&2
+    exit 1
+  fi
+  # Persist core.runtime into the per-clone local config (atomic merge).
+  "$_cfg_py" - "$REPO" "$requested_runtime" <<'PY'
+import json, os, sys, tempfile
+repo, rt = sys.argv[1], sys.argv[2]
+path = os.path.join(repo, "sutando.config.local.json")
+try:
+    with open(path) as fh:
+        cfg = json.load(fh)
+except FileNotFoundError:
+    cfg = {}
+except (OSError, ValueError) as exc:
+    # This file also holds workspace.path, vault settings and other per-clone
+    # overrides; treating an unreadable one as empty would erase them all.
+    sys.exit(f"start-cli: refusing to rewrite unreadable {path}: {exc}")
+if not isinstance(cfg, dict):
+    sys.exit(f"start-cli: refusing to rewrite {path}: top level is not an object")
+core = cfg.get("core")
+if not isinstance(core, dict):
+    core = {}
+core["runtime"] = rt
+cfg["core"] = core
+fd, tmp = tempfile.mkstemp(dir=repo, prefix=".sutando-cfg-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+PY
+  # config is DESIRED state; the active marker belongs to whichever launcher
+  # actually comes up, so a refused or failed restart cannot forge it.
+  # A runtime switch must restart into the new CLI, even if the caller didn't
+  # pass --restart.
+  case " $* " in
+    *" --restart "*) ;;
+    *) set -- --restart ${1+"$@"} ;;
+  esac
+fi
+
 runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
   echo "start-cli: failed to resolve core runtime" >&2
   exit 1

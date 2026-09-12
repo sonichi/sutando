@@ -524,6 +524,41 @@ release_orchestrator_lock() {
   [ "$(cat "$lock/rid" 2>/dev/null)" = "$GR_RID" ] && rm -rf "$lock"
   return 0
 }
+stash_active_runtime() {
+  # publish CREATES the marker, so absent != cleared: restore must unlink, and a
+  # failed stash must refuse the publish rather than risk forging a claim.
+  _RUNTIME_MARKER=""; _RUNTIME_STASH=""; _RUNTIME_PREV=absent
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
+  [ -n "$ws" ] || return 1
+  _RUNTIME_MARKER="$ws/state/core-runtime.json"
+  if [ -f "$_RUNTIME_MARKER" ]; then
+    _RUNTIME_STASH="$(cat "$_RUNTIME_MARKER" 2>/dev/null)" || return 1
+    _RUNTIME_PREV=present
+  fi
+  return 0
+}
+
+restore_active_runtime() {
+  [ -n "${_RUNTIME_MARKER:-}" ] || return 0
+  case "${_RUNTIME_PREV:-absent}" in
+    present) printf '%s\n' "$_RUNTIME_STASH" > "$_RUNTIME_MARKER" 2>/dev/null || true ;;
+    absent)  rm -f "$_RUNTIME_MARKER" 2>/dev/null || true ;;
+  esac
+}
+
+publish_active_runtime() {
+  # Only callers that have VERIFIED the session may call this; the exec path
+  # cannot, so it publishes optimistically and says so at its call site.
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/state" 2>/dev/null || true
+  printf '{"runtime":"claude","session":"%s","started_at":%s}\n' \
+    "${SESSION:-sutando-core}" "$(date +%s)" \
+    > "$ws/state/core-runtime.json" 2>/dev/null || true
+}
+
 log_restart_attempt() {
   local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
@@ -744,6 +779,9 @@ if tmux_session_exists; then
   done
   if tmux_core_session_running; then
     clear_shutdown_sentinel
+    # A heal starts a real Claude core, so it owns the marker too; both exits
+    # below are past this gate, which is why it publishes here and not at each.
+    publish_active_runtime
   else
     echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi
@@ -787,15 +825,21 @@ if ! command -v tmux > /dev/null 2>&1; then
   fi
   stash_shutdown_sentinel
   clear_shutdown_sentinel
-  # errexit would exit on the failed exec before the restore below is reached;
-  # drop it just around the exec and re-raise the exec's own status.
+  # The only shape whose exec IS the core, so it cannot verify first; pair the
+  # publish with the same failure path the sentinel already uses.
+  if stash_active_runtime; then publish_active_runtime; fi
+  # A failed exec ENDS a non-interactive bash; `set +e` does not change that, so
+  # without execfail every line below is dead and the marker stays published.
+  shopt -s execfail
   set +e
   exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/startup"
   _exec_rc=$?
   set -e
+  shopt -u execfail
   restore_shutdown_sentinel
+  restore_active_runtime
   echo "  ⚠ claude failed to exec — shutdown sentinel restored, no core is live." >&2
   exit "$_exec_rc"
 fi
@@ -842,6 +886,9 @@ if [ -t 1 ]; then
   fi
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  # Same verified state the detached branch publishes from; attaching does not
+  # make the session any more live, so withholding here just loses the switch.
+  publish_active_runtime
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
@@ -867,6 +914,7 @@ else
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  publish_active_runtime   # verified live above; a failed launch exits before here
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal

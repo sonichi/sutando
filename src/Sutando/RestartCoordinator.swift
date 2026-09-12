@@ -137,10 +137,13 @@ enum GracefulRestartInvocation {
     /// Rehearsal skips only the kill — prep still runs for real, sync included.
     /// `--dry-run` must precede `--`: that is where the script stops reading its own
     /// flags, so a trailing one is passed through to start-cli.sh and silently ignored.
-    static func args(script: String, env: [String: String]) -> [String] {
+    static func args(script: String, env: [String: String],
+                     extra: [String] = []) -> [String] {
+        // `extra` rides after `--`, which is how the shell layer forwards flags
+        // (a runtime switch adds --runtime <name>); empty keeps the old vector.
         let rehearse = (env["SUTANDO_RESTART_REHEARSE"] ?? "") == "1"
-        return rehearse ? [script, "--dry-run", "--", "--visible"]
-                        : [script, "--", "--visible"]
+        return rehearse ? [script, "--dry-run", "--"] + extra + ["--visible"]
+                        : [script, "--"] + extra + ["--visible"]
     }
 
     /// The other half of the same contract: what each documented exit status
