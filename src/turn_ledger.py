@@ -39,6 +39,38 @@ pin as quiet. The gate arms at the first send or no-send ever recorded — which
 `room_ops say` writes on the agent's first room message — and the cost is a
 bootstrap window, on a host that has never once spoken, in which the check
 cannot fire.
+
+SESSION SCOPING. The reminder flag, the stop boundary, and the ledger's
+no-send/send evidence were originally one workspace-wide record apiece, with no
+session identity anywhere in the hooks that call this module. Two sessions in
+one workspace could therefore reset or satisfy each other's gate: session B's
+`turn-start` reset session A's already-spent reminder mid-retry (refusing A's
+turn a second time, past the documented one-reminder ceiling), and A's
+`no-send` silently passed B's own silent turn (PR #4028 review,
+qingyun-wu, 2026-09-09). Every public function here now takes an optional
+`session`, defaulting (via `_resolve_session`) to `$CLAUDE_CODE_SESSION_ID` —
+the same established idiom as `scripts/skill-read-receipt.py`'s `_session_id()`.
+Claude Code sets that variable on every subprocess it spawns, hooks AND
+ordinary Bash-tool calls alike, so this reaches `room_ops.py say` and a manual
+`turn_ledger.py no-send` from the agent too, not only the two hook wrappers —
+neither of which needs to parse its own stdin payload as a result. When a
+session is known, the reminder and boundary live in a per-session file
+(`turn-reminder.<session>.json`, `turn-stop.<session>.json`) instead of the
+shared name, and a ledger entry tagged with a *different* session no longer
+counts as this session's own no-send or send. No session anywhere (the env var
+unset — outside Claude Code entirely, e.g. a standalone script or most test
+harnesses) falls back to exactly the original shared-file, unfiltered behavior
+— this must never make an unscoped caller MORE strict than before the fix,
+only session-aware callers gain isolation. An entry with no `session` key
+(written before this change, or by an unscoped caller) still counts for
+everyone, so the fix does not require a flag day.
+
+NOT SCOPED: the result-file evidence surface (`_result_after`). A delivered
+`results/` file carries no session identity anywhere in the result-file
+protocol — it is written by whichever process handles the task and delivered
+by a bridge independent of any session — so there is nothing to filter it by.
+Scoping it would need a broader change to that protocol; out of scope here,
+where the review's finding was specifically the reminder/boundary/ledger.
 """
 from __future__ import annotations
 
@@ -46,6 +78,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -87,6 +120,59 @@ def _workspace(workspace: Path | str | None) -> Path:
 def ledger_path(workspace: Path | str | None = None) -> Path:
     """Absolute path of the ledger. `state/` per the workspace contract."""
     return _workspace(workspace) / "state" / LEDGER_NAME
+
+
+def _scoped_name(base: str, session: str | None) -> str:
+    """`base` unchanged when `session` is falsy; else a per-session sibling name.
+
+    A caller with no session id (an unscoped writer, a hook that could not
+    parse its stdin payload) must land on exactly the pre-fix shared name —
+    isolation is only ever ADDED for a caller that supplies one, never removed
+    from one that does not.
+    """
+    if not session:
+        return base
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session))[:128]
+    stem, dot, ext = base.partition(".")
+    return f"{stem}.{safe}{dot}{ext}"
+
+
+def _session_id() -> str:
+    """This process's own Claude Code session id, or "" — never raises.
+
+    Same idiom as `scripts/skill-read-receipt.py`'s `_session_id()`: Claude
+    Code sets `CLAUDE_CODE_SESSION_ID` on every subprocess it spawns.
+    """
+    return (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+
+
+def _resolve_session(session: str | None) -> str | None:
+    """`session` if the caller supplied one, else this process's own session id.
+
+    Every public function below runs its incoming `session` through this, so a
+    caller that says nothing still gets scoped for free under Claude Code, and
+    a test or standalone script (no such env var) still gets exactly the
+    original shared-file behavior — never a regression, only a missed
+    isolation opportunity outside Claude Code.
+    """
+    if session:
+        return str(session)
+    return _session_id() or None
+
+
+def _entry_matches_session(entry: dict, session: str | None) -> bool:
+    """Whether `entry` counts as evidence for `session`.
+
+    `session=None` (the caller could not determine one) never filters — the
+    original, unscoped behavior. Given a session, an entry tagged with a
+    DIFFERENT one is excluded; an untagged entry (written before this change,
+    or by an unscoped caller) still counts, so old data and mixed-version
+    callers do not need a flag day.
+    """
+    if not session:
+        return True
+    tag = entry.get("session")
+    return tag is None or str(tag) == str(session)
 
 
 @contextlib.contextmanager
@@ -167,14 +253,24 @@ def _trim(path: Path) -> None:
         pass
 
 
-def record_send(kind: str, target: str, workspace: Path | str | None = None) -> None:
+def record_send(kind: str, target: str, workspace: Path | str | None = None,
+                 session: str | None = None) -> None:
     """Record that a message went out — `kind` is the surface, `target` its address."""
-    _append({"ts": time.time(), "kind": str(kind), "target": str(target)}, workspace)
+    session = _resolve_session(session)
+    entry = {"ts": time.time(), "kind": str(kind), "target": str(target)}
+    if session:
+        entry["session"] = session
+    _append(entry, workspace)
 
 
-def record_no_send(reason: str, workspace: Path | str | None = None) -> None:
+def record_no_send(reason: str, workspace: Path | str | None = None,
+                    session: str | None = None) -> None:
     """Record a deliberate decision that this turn ends without a message."""
-    _append({"ts": time.time(), "kind": "no-send", "reason": str(reason)}, workspace)
+    session = _resolve_session(session)
+    entry = {"ts": time.time(), "kind": "no-send", "reason": str(reason)}
+    if session:
+        entry["session"] = session
+    _append(entry, workspace)
 
 
 def read_entries(workspace: Path | str | None = None) -> list[dict]:
@@ -198,9 +294,12 @@ def read_entries(workspace: Path | str | None = None) -> list[dict]:
     return out
 
 
-def last_action_after(ts: float, workspace: Path | str | None = None) -> dict | None:
-    """The most recent ledger entry newer than `ts`, or None."""
-    newer = [e for e in read_entries(workspace) if float(e["ts"]) > ts]
+def last_action_after(ts: float, workspace: Path | str | None = None,
+                       session: str | None = None) -> dict | None:
+    """The most recent ledger entry newer than `ts` that counts for `session`, or None."""
+    session = _resolve_session(session)
+    newer = [e for e in read_entries(workspace)
+             if float(e["ts"]) > ts and _entry_matches_session(e, session)]
     return max(newer, key=lambda e: float(e["ts"])) if newer else None
 
 
@@ -256,94 +355,121 @@ def _result_after(ts: float, workspace: Path | str | None = None) -> dict | None
     return best
 
 
-def delivery_after(ts: float, workspace: Path | str | None = None) -> dict | None:
-    """The turn's newest outbound message since `ts`, over either surface."""
-    candidates = [c for c in (last_action_after(ts, workspace),
+def delivery_after(ts: float, workspace: Path | str | None = None,
+                    session: str | None = None) -> dict | None:
+    """The turn's newest outbound message since `ts`, over either surface.
+
+    Only the ledger side is session-filtered; `_result_after` carries no
+    session identity to filter by (see the module docstring's NOT SCOPED note).
+    """
+    session = _resolve_session(session)
+    candidates = [c for c in (last_action_after(ts, workspace, session),
                               _result_after(ts, workspace)) if c]
     return max(candidates, key=lambda e: float(e["ts"])) if candidates else None
 
 
-def last_stop_ts(workspace: Path | str | None = None) -> float | None:
+def last_stop_ts(workspace: Path | str | None = None, session: str | None = None) -> float | None:
     """When the previous turn was allowed to end, or None if none ever was.
 
-    The boundary lives in its own `state/turn-stop.json` rather than as a ledger
-    entry for two reasons: it is a single mutable value against an append-only
-    log, and `_trim` could otherwise evict the very boundary the gate measures
-    from. `write_status` already makes that one-value write atomic.
+    The boundary lives in its own `state/turn-stop.json` (or, given a session,
+    its per-session sibling) rather than as a ledger entry for two reasons: it
+    is a single mutable value against an append-only log, and `_trim` could
+    otherwise evict the very boundary the gate measures from. `write_status`
+    already makes that one-value write atomic.
     """
+    session = _resolve_session(session)
     try:
-        raw = json.loads(status_read_path(STOP_NAME, _workspace(workspace)).read_text())
+        raw = json.loads(
+            status_read_path(_scoped_name(STOP_NAME, session), _workspace(workspace)).read_text())
     except (OSError, ValueError):
         return None
     ts = raw.get("ts") if isinstance(raw, dict) else None
     return float(ts) if isinstance(ts, (int, float)) else None
 
 
-def mark_stop(workspace: Path | str | None = None) -> float:
+def mark_stop(workspace: Path | str | None = None, session: str | None = None) -> float:
     """Record that a turn ended here; the next turn is measured from it."""
+    session = _resolve_session(session)
     now = time.time()
     try:
-        write_status(STOP_NAME, {"ts": now}, _workspace(workspace))
+        write_status(_scoped_name(STOP_NAME, session), {"ts": now}, _workspace(workspace))
     except OSError:
         pass
     return now
 
 
-def begin_turn(workspace: Path | str | None = None) -> None:
+def begin_turn(workspace: Path | str | None = None, session: str | None = None) -> None:
     """A turn is starting: the reminder is unspent again.
 
     Reset at turn start rather than when a reminder is sent, so one refusal per
-    turn is the ceiling and a turn can never be refused twice.
+    turn is the ceiling and a turn can never be refused twice — a guarantee that
+    only holds per-session now: session B's turn-start must not unspend
+    session A's reminder, which is why this writes the per-session file when a
+    session id is known.
     """
-    write_status(TURN_NAME, {"reminded": False, "ts": time.time()}, _workspace(workspace))
+    session = _resolve_session(session)
+    write_status(_scoped_name(TURN_NAME, session), {"reminded": False, "ts": time.time()},
+                 _workspace(workspace))
 
 
-def reminder_spent(workspace: Path | str | None = None) -> bool:
+def reminder_spent(workspace: Path | str | None = None, session: str | None = None) -> bool:
+    session = _resolve_session(session)
     try:
-        return bool(json.loads(status_read_path(TURN_NAME, _workspace(workspace)).read_text())
+        return bool(json.loads(
+            status_read_path(_scoped_name(TURN_NAME, session), _workspace(workspace)).read_text())
                     .get("reminded"))
     except (OSError, ValueError):
         return False
 
 
-def spend_reminder(workspace: Path | str | None = None) -> None:
-    write_status(TURN_NAME, {"reminded": True, "ts": time.time()}, _workspace(workspace))
+def spend_reminder(workspace: Path | str | None = None, session: str | None = None) -> None:
+    session = _resolve_session(session)
+    write_status(_scoped_name(TURN_NAME, session), {"reminded": True, "ts": time.time()},
+                 _workspace(workspace))
 
 
 # Below this, the message was effectively the last thing the turn did.
 ENDED_ON_A_MESSAGE_S = 20.0
 
 
-def stop_gate(workspace: Path | str | None = None) -> str | None:
+def stop_gate(workspace: Path | str | None = None, session: str | None = None) -> str | None:
     """None when the turn may end; otherwise the reason it must not.
 
     Allowing a stop RECORDS it, so the decision and the next turn's starting
     boundary cannot disagree. A refusal deliberately leaves the boundary alone:
     the turn has not ended, and the message the agent is about to send must still
     count against the boundary it began from.
+
+    `session`, when known (explicitly, or via `$CLAUDE_CODE_SESSION_ID`),
+    scopes the boundary/reminder to a per-session file and the ledger checks to
+    entries tagged for this session (or untagged) — see the module docstring's
+    SESSION SCOPING note. No session anywhere reproduces the original
+    shared-file, unfiltered behavior exactly.
     """
+    session = _resolve_session(session)
     ws = _workspace(workspace)
     # An absent ledger means nothing was ever sent, which is what this gate
     # catches. Only a missing boundary below is genuinely unjudgeable.
-    since = last_stop_ts(ws)
+    since = last_stop_ts(ws, session)
     if since is None:
-        mark_stop(ws)
+        mark_stop(ws, session)
         return None
     # An explicit no-send is a decision ABOUT this turn, so its age cannot make it
     # stale; only a message is judged on whether the turn ended on it.
-    if any(e.get("kind") == "no-send" for e in read_entries(ws) if float(e["ts"]) > since):
-        mark_stop(ws)
+    if any(e.get("kind") == "no-send" and _entry_matches_session(e, session)
+           for e in read_entries(ws) if float(e["ts"]) > since):
+        mark_stop(ws, session)
         return None
-    last = delivery_after(since, ws)
+    last = delivery_after(since, ws, session)
     if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
-        mark_stop(ws)
+        mark_stop(ws, session)
         return None
-    if reminder_spent(ws):
+    if reminder_spent(ws, session):
         # One nudge per turn. A turn that was already reminded ends regardless:
         # refusing twice is how a gate that is wrong becomes a loop.
-        mark_stop(ws)
+        mark_stop(ws, session)
         return None
-    spend_reminder(ws)
+    spend_reminder(ws, session)
     return ("This turn is ending without a message and without an explicit "
             "no-send. Reply — post to the room (`room_ops.py say`) or write the "
             "result file the task expects — or, if silence is right, record it: "
@@ -354,30 +480,38 @@ def stop_gate(workspace: Path | str | None = None) -> str | None:
 def main(argv: list[str]) -> int:
     """`stop-gate` (exit 1 + reason on stdout when the turn must not end),
     `send KIND TARGET`, `no-send REASON`. `--workspace` pins the directory for a
-    caller that already resolved it."""
+    caller that already resolved it. `--session ID` overrides the session used
+    to scope the reminder/boundary/ledger checks — mainly for tests simulating
+    more than one session; ordinary callers need not pass it, since every
+    function here already defaults to `$CLAUDE_CODE_SESSION_ID`."""
     args = list(argv)
     ws = None
+    session = None
     if "--workspace" in args:
         i = args.index("--workspace")
         ws = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
+    if "--session" in args:
+        i = args.index("--session")
+        session = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
     cmd = args[0] if args else ""
     if cmd == "turn-start":
-        begin_turn(ws)
+        begin_turn(ws, session)
         return 0
     if cmd == "stop-gate":
-        reason = stop_gate(ws)
+        reason = stop_gate(ws, session)
         if reason:
             print(reason)
             return 1
         return 0
     if cmd == "send" and len(args) >= 3:
-        record_send(args[1], args[2], ws)
+        record_send(args[1], args[2], ws, session)
         return 0
     if cmd == "no-send" and len(args) >= 2:
-        record_no_send(" ".join(args[1:]), ws)
+        record_no_send(" ".join(args[1:]), ws, session)
         return 0
-    print(f"usage: {Path(__file__).name} [--workspace DIR] "
+    print(f"usage: {Path(__file__).name} [--workspace DIR] [--session ID] "
           "turn-start | stop-gate | send KIND TARGET | no-send REASON",
           file=sys.stderr)
     return 2

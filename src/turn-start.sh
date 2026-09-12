@@ -9,5 +9,10 @@ if ! PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)
    || [ -z "$PYBIN" ] || [ ! -x "$PYBIN" ]; then
   exit 0
 fi
+# No --session here: turn_ledger.py reads $CLAUDE_CODE_SESSION_ID itself (same
+# established idiom as scripts/skill-read-receipt.py's _session_id()), which
+# Claude Code sets on every subprocess it spawns, hooks included — see
+# turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
+# context), behavior is exactly the original shared-file default.
 "$PYBIN" "$REPO_DIR/src/turn_ledger.py" turn-start >/dev/null 2>&1
 exit 0
