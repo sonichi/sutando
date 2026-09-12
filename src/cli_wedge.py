@@ -51,7 +51,6 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("timeout", r"\btimed? ?out\b"),
         # A CLI told to stop by its provider: every turn ends the same way while the clock
         # moves; only text tells this from work — and it must be a limit HIT, not one mentioned.
-        ("quota-limit", r"\b(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|\b(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|\bhit your\b.{0,24}\blimit\b|\busage-credits\b"),
     )
 )
 
@@ -83,7 +82,19 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
     "min_duration_s": 60,
 }
-PROVIDER_LIMIT_PATTERNS = ("quota-limit",)
+ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
+    (name, re.compile(rx, re.IGNORECASE))
+    for name, rx in (
+        ("quota-limit", r"(you('ve| have)? )?(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|(you('ve| have)? )?hit your\b.{0,24}\blimit\b|/?usage-credits\b"),
+        ("out-of-credits", r"(you('re| are)? )?out of (usage )?credits?\b|credit balance (is )?(too )?low\b|insufficient credits?\b"),
+        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
+        ("compacting", r"compact(ing|ion)\b"),
+        ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
+    )
+)
+
+# Kept so an existing reader still sees the provider-limit family by name.
+PROVIDER_LIMIT_PATTERNS = ("quota-limit", "out-of-credits")
 DEFAULT_SESSION = "sutando-core"
 
 def normalize(frame: str) -> str:
@@ -107,6 +118,28 @@ def state_id(frame: str) -> str:
 def raw_state_id(frame: str) -> str:
     """Identity of the frame as displayed — what case 1 compares."""
     return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
+
+
+# Leading decoration a CLI puts before a banner: indent, quote/prompt glyphs,
+# spinner frames, box rules. Stripped so the anchor sees the banner's first word.
+_BANNER_DECOR = re.compile(r"^[\s>\u00b7*\u2022\-\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u28c0-\u28ff]+")
+
+
+def matched_abnormal(frames: list) -> list:
+    """abnormal-family names in `frames` — credits, login, compaction, waiting.
+
+    ANCHORED to the start of a line, not searched anywhere in the text. These
+    panes are agent CLIs whose transcripts are English prose about their own
+    work, so an unanchored search is self-hitting: a session discussing
+    compaction classified itself `abnormal` at high confidence. A banner leads
+    its line; prose buries the phrase mid-sentence.
+    """
+    hits = []
+    lines = [_BANNER_DECOR.sub("", ln) for f in frames for ln in f.splitlines()]
+    for name, rx in ABNORMAL_PATTERNS:
+        if any(rx.match(ln) for ln in lines):
+            hits.append(name)
+    return hits
 
 
 def matched_patterns(frames: list) -> list:
@@ -170,22 +203,32 @@ def pattern_stats(pattern_samples: list, th: dict) -> dict:
             "retry_current": recurrent}
 
 
+def abnormal_stats(abnormal_samples: list, th: dict) -> dict:
+    """The same recurrence test over the abnormal family, kept separate so a
+    abnormal state no longer has to look like a retry to reach a verdict."""
+    st = pattern_stats(abnormal_samples, th)
+    return {"current_abnormal": st["current_patterns"],
+            "consecutive_abnormal_samples": st["consecutive_pattern_samples"],
+            "abnormal_current": st["retry_current"]}
+
+
 def classify(frames: list, work_outstanding: bool, duration_s: float,
              work_detail: str = "", thresholds: Optional[dict] = None,
              raw_static: Optional[bool] = None) -> dict:
     """Advisory verdict over a window of frames. kind ∈ idle | working |
-    clock-only | static-with-work | retry-loop | provider-limit | low-novelty |
+    clock-only | static-with-work | retry-loop | abnormal | provider-limit | low-novelty |
     unknown (or, from the window, cadence-too-sparse); the four before unknown are warnings. `raw_static` is case 1's
     input (frame-for-frame equality); when None it is computed from `frames`."""
     if raw_static is None:
         raw_static = len(frames) >= 2 and len({raw_state_id(f) for f in frames}) == 1
     return classify_ids([state_id(f) for f in frames], raw_static, [matched_patterns([f]) for f in frames],
-                        work_outstanding, duration_s, work_detail, thresholds)
+                        work_outstanding, duration_s, work_detail, thresholds,
+                        abnormal=[matched_abnormal([f]) for f in frames])
 
 
 def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool,
                  duration_s: float, work_detail: str = "", thresholds: Optional[dict] = None,
-                 gaps: Optional[list] = None) -> dict:
+                 gaps: Optional[list] = None, abnormal: Optional[list] = None) -> dict:
     """The verdict from hashes and pattern names alone — what the persisted
     window carries, so no pane text is needed (or stored) to classify. `pats`
     is one list of pattern names per sample (a flat list means every sample)."""
@@ -194,6 +237,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if pats and all(isinstance(x, str) for x in pats):
         pats = [list(pats) for _ in state_ids]
     ps = pattern_stats(list(pats or []), th)
+    abn = abnormal_stats(list(abnormal or []), th)
     clock_only = (not raw_static) and nov.static
     spacing = {}
     if gaps:
@@ -207,6 +251,8 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
         "novel_state_count": nov.novel_state_count,
         "novelty_rate": round(nov.novelty_rate, 3),
         "matched_patterns": sorted({p for s in (pats or []) for p in s}),
+        "matched_abnormal": sorted({p for s in (abnormal or []) for p in s}),
+        **abn,
         **ps,
         **spacing,
         "work_outstanding": work_outstanding,
@@ -218,7 +264,7 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
     if nov.sample_count < 2:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
                 "reason": "fewer than 2 samples in the current observation run — nothing to compare"}
-    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th)
+    verdict = _classify_run(base, nov, raw_static, ps, clock_only, work_outstanding, duration_s, work_detail, th, abn)
     # Two frames a second apart cannot establish a wedge: a WARNING needs the run to have lasted.
     if verdict["warn"] and duration_s < th["min_duration_s"]:
         return {**base, "kind": "unknown", "confidence": "none", "warn": False,
@@ -227,18 +273,29 @@ def classify_ids(state_ids: list, raw_static: bool, pats, work_outstanding: bool
 
 
 def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict, clock_only: bool,
-                  work_outstanding: bool, duration_s: float, work_detail: str, th: dict) -> dict:
+                  work_outstanding: bool, duration_s: float, work_detail: str, th: dict,
+                  abn: dict) -> dict:
     enough = nov.sample_count >= th["min_samples"]
-    # A provider told the CLI to stop: not a retry loop, a blocked state of its own.
+    # A provider told the CLI to stop: not a retry loop, a abnormal state of its own.
     # The pane keeps moving (clock, verb), so only current, recurrent text tells.
-    if ps["retry_current"] and any(p in ps["current_patterns"] for p in PROVIDER_LIMIT_PATTERNS):
-        return {**base, "kind": "provider-limit", "confidence": "high" if ps["consecutive_pattern_samples"] >= 3 else "medium",
-                "warn": True, "reason": f"provider limit text on the last {ps['consecutive_pattern_samples']} sample(s) ({', '.join(ps['current_patterns'])})"}
+    bs = abn
     low_novelty = enough and nov.novelty_rate <= th["low_novelty_rate"]
-    # Retry loop = low novelty AND retry text that is current and recurrent (not a stale residue).
-    if ps["retry_current"] and (raw_static or nov.static or low_novelty):
-        return {**base, "kind": "retry-loop", "confidence": "high" if enough else "medium", "warn": True,
-                "reason": f"{nov.novel_state_count} distinct state(s) over {nov.sample_count} samples; retry text on the last {ps['consecutive_pattern_samples']} ({', '.join(ps['current_patterns'])})"}
+    # Retry is a SHAPE of the abnormal axis, not a sibling (owner): a retrying
+    # pane is `moving + abnormal` — it moves while the work does not proceed.
+    if bs["abnormal_current"] or ps["retry_current"]:
+        names = list(bs["current_abnormal"]) + list(ps["current_patterns"])
+        n = max(bs["consecutive_abnormal_samples"], ps["consecutive_pattern_samples"])
+        # BOTH conditions: enough samples observed AND the text is recurrent.
+        # n>=3 alone called a short window high-confidence; `enough` alone ignored recurrence.
+        conf = "high" if (n >= 3 and enough) else "medium"
+        why = f"abnormal text on the last {n} sample(s) ({', '.join(names)})"
+        # Kinds stay STRING LITERALS: the availability fold's totality test derives
+        # the emittable set by scanning this source, and a variable hides them.
+        if any(p in bs["current_abnormal"] for p in PROVIDER_LIMIT_PATTERNS):
+            return {**base, "kind": "provider-limit", "confidence": conf, "warn": True, "reason": why}
+        if ps["retry_current"] and not bs["abnormal_current"]:
+            return {**base, "kind": "retry-loop", "confidence": conf, "warn": True, "reason": why}
+        return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
     # Case 1 is pure static on the RAW pane (spec): no normalization here.
     if raw_static:
         if work_outstanding:
@@ -496,8 +553,11 @@ def append_window(workspace: Path, frame: str, now: float, keep: int = 20, pane:
         fcntl.flock(fd, fcntl.LOCK_EX)
         entries = load_window(path)
         # Hashes and pattern names only — no pane text is ever persisted here.
+        # Both families, or classify_window sees no abnormal text and the whole
+        # abnormal column is invisible to its one production caller.
         entry = {"ts": now, "state": state_id(frame), "raw_state": raw_state_id(frame),
-                 "patterns": matched_patterns([frame])}
+                 "patterns": matched_patterns([frame]),
+                 "abnormal": matched_abnormal([frame])}
         if pane:
             entry["pane"] = pane
         entries.append(entry)
@@ -565,8 +625,10 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
     ids = [e["state"] for e in run]
     raws = [e.get("raw_state") for e in run]
     pats = [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in run]
+    # Absent on rows written before this key existed: [] reads as no abnormal text.
+    abn = [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in run]
     whole_raw_static = len(run) >= 2 and all(raws) and len(set(raws)) == 1
-    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps)
+    whole = classify_ids(ids, whole_raw_static, pats, work[0], max(0.0, now - run[0]["ts"]), work[1], th, gaps, abn)
     if whole["kind"] in ("retry-loop", "provider-limit", "low-novelty"):
         return {**whole, **meta}
     last = run[-1].get("raw_state")
@@ -580,7 +642,8 @@ def classify_window(entries: list, work: tuple, now: float, thresholds: Optional
         tail_gaps = [b["ts"] - a["ts"] for a, b in zip(tail, tail[1:])]
         trailing = classify_ids([e["state"] for e in tail], True,
                                 [[p for p in e.get("patterns", []) if isinstance(p, str)] for e in tail],
-                                work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps)
+                                work[0], max(0.0, now - tail[0]["ts"]), work[1], th, tail_gaps,
+                                [[a for a in e.get("abnormal", []) if isinstance(a, str)] for e in tail])
         if trailing["kind"] in ("idle", "static-with-work"):
             return {**trailing, **meta, "sample_count": whole["sample_count"], "novel_state_count": whole["novel_state_count"],
                     "novelty_rate": whole["novelty_rate"], "clock_only": whole["clock_only"], "trailing_static_samples": len(tail)}

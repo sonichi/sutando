@@ -39,6 +39,7 @@ WORK_SIGNAL_MAX_AGE_S = 180.0
 # room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown. Total over every kind cli_wedge emits (a test derives the set).
 _WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": "idle",
                          "static-with-work": "wedged", "retry-loop": "wedged", "provider-limit": "wedged",
+                         "abnormal": "wedged",
                          "low-novelty": "wedged", "cadence-too-sparse": "unknown", "unknown": "unknown"}
 
 

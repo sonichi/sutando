@@ -147,6 +147,14 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertIn("idle", c["detail"])
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
+    def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
+        # The abnormal predicate must reach classify_window, which the probe calls.
+        self.frames = ["❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n"] * 12
+        for _ in range(12):
+            c = self.check()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("reads the pane, not the process", c["detail"])
+
     def test_static_pane_with_work_outstanding_warns(self):
         (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": self._t[0] + 60.0}))
         for _ in range(3):

@@ -119,9 +119,9 @@ class Classifier(unittest.TestCase):
                 f"* {verb} for 1s · done 5:{17 + i // 3:02d} PM · 1 monitor still running\n"
             )
         v = w.classify([frame(i) for i in range(12)], True, 300)
-        # A provider-blocked CLI is its own kind (owner review), not forced into "retry loop".
+        # A provider-abnormal CLI is its own kind (owner review), not forced into "retry loop".
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("provider-limit", True, "high"))
-        self.assertIn("quota-limit", v["current_patterns"])
+        self.assertIn("quota-limit", v["current_abnormal"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
 
     def test_codex_idle_banner_is_not_a_provider_limit(self):
@@ -135,7 +135,7 @@ class Classifier(unittest.TestCase):
                 "› \n"
             )
         v = w.classify([frame(i) for i in range(20)], False, 60)
-        self.assertNotIn("quota-limit", v["matched_patterns"], v)
+        self.assertNotIn("quota-limit", v["matched_patterns"] + v.get("matched_abnormal", []), v)
         self.assertNotEqual(v["kind"], "provider-limit", v)
         # Positive controls: the phrasings that DO mean a limit was hit still match.
         for line in ("You've hit your usage limit · resets 6pm",
@@ -143,7 +143,35 @@ class Classifier(unittest.TestCase):
                      "Session limit reached. Try again at 6pm",
                      "usage limit exceeded for this plan",
                      "/usage-credits to finish what you're working on."):
-            self.assertIn("quota-limit", w.matched_patterns([line]), line)
+            self.assertIn("quota-limit", w.matched_abnormal([line]), line)
+
+    def test_an_abnormal_pane_whose_clock_moves_is_not_clock_only(self):
+        """The clock-only exemption ("a live CLI, not a wedge") swallowed every
+        abnormal state whose pane ticked: #4015 sat 70 min refusing each turn."""
+        def moving(msg):
+            return [f"{msg}\n  idle · 5:{17 + i // 3:02d} PM · nothing running\n> "
+                    for i in range(12)]
+        for msg, want in (("You are out of usage credits", "provider-limit"),
+                          ("Please log in to continue", "abnormal"),
+                          ("Compacting conversation", "abnormal")):
+            v = w.classify(moving(msg), False, 4200)
+            self.assertEqual(v["kind"], want, msg)
+            self.assertTrue(v["warn"], msg)
+
+    def test_abnormal_is_reached_without_any_retry_text(self):
+        """Every abnormal verdict used to be gated on retry text, which is why
+        quota-limit had to live in RETRY_PATTERNS to work at all."""
+        v = w.classify(["Please log in to continue"] * 8, True, 600)
+        self.assertEqual(v["matched_patterns"], [])
+        self.assertIn("needs-login", v["matched_abnormal"])
+        self.assertEqual(v["kind"], "abnormal")
+
+    def test_the_two_families_are_disjoint(self):
+        self.assertFalse({n for n, _ in w.RETRY_PATTERNS} & {n for n, _ in w.ABNORMAL_PATTERNS})
+
+    def test_ordinary_work_still_does_not_warn(self):
+        v = w.classify([f"Thinking... step {i}" for i in range(8)], True, 600)
+        self.assertEqual((v["kind"], v["warn"]), ("working", False))
 
     def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
         # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
@@ -829,10 +857,21 @@ class Confidentiality(unittest.TestCase):
     def test_window_entries_carry_hashes_and_patterns_only(self):
         with tempfile.TemporaryDirectory() as d:
             entries = w.append_window(Path(d), retry_frame(1), 1.0)
-            self.assertEqual(sorted(entries[-1]), ["patterns", "raw_state", "state", "ts"])
+            self.assertEqual(sorted(entries[-1]), ["abnormal", "patterns", "raw_state", "state", "ts"])
             text = w.window_path(Path(d)).read_text()
             self.assertNotIn("Retrying", text)
             self.assertNotIn("attempt", text)
+
+    def test_persisted_pattern_fields_hold_NAMES_from_the_known_vocabulary(self):
+        # `abnormal` joined `patterns` in the window; both must stay a closed set of
+        # pattern names, never a snippet of the pane that matched.
+        vocab = {n for n, _ in w.RETRY_PATTERNS} | {n for n, _ in w.ABNORMAL_PATTERNS}
+        with tempfile.TemporaryDirectory() as d:
+            e = w.append_window(Path(d), "❯ \n⏵⏵ please log in to continue · run /login\n", 1.0)
+            self.assertTrue(e[-1]["abnormal"], "the fixture must match, or this proves nothing")
+            for key in ("patterns", "abnormal"):
+                self.assertLessEqual(set(e[-1][key]), vocab, key)
+            self.assertNotIn("/login", w.window_path(Path(d)).read_text())
 
     def test_files_are_owner_only_under_a_permissive_umask(self):
         old = os.umask(0o022)
@@ -879,6 +918,63 @@ class FailureBoundary(unittest.TestCase):
             w.window_path(ws).mkdir(parents=True)
             with self.assertRaises(OSError):
                 w.append_window(ws, IDLE, 1.0)
+
+
+
+class ProseMentioningAStateIsNotThatState(unittest.TestCase):
+    """One negative control per abnormal pattern.
+
+    These panes are agent CLIs whose transcripts are English prose about their
+    own work, so an unanchored substring search is SELF-HITTING: a session
+    discussing compaction classified itself `abnormal` at high confidence
+    (measured on 12 prose-only frames of an idle pane). The matcher anchors to
+    the start of a line after stripping banner decoration — a banner leads its
+    line, prose buries the phrase mid-sentence.
+    """
+
+    PROSE = [
+        ("compacting", "I am compacting the summary of what we discussed"),
+        ("compacting", "reviewing the compacting patterns in cli_wedge"),
+        ("needs-login", "we fixed the bug where it says please log in to continue"),
+        ("needs-login", "a session expired bug we already fixed"),
+        ("awaiting-input", "the draft is waiting for your input before it sends"),
+        ("out-of-credits", "the ticket says the user was out of usage credits last week"),
+        ("quota-limit", "the docs explain what happens when you hit your weekly limit"),
+    ]
+    BANNERS = [
+        ("compacting", "Compacting conversation"),
+        ("compacting", "\u273b Compacting conversation"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired"),
+        ("awaiting-input", "Waiting for your input"),
+        ("out-of-credits", "You are out of usage credits"),
+    ]
+
+    def test_prose_mentioning_a_state_does_not_match(self):
+        for name, line in self.PROSE:
+            self.assertEqual(w.matched_abnormal([line]), [],
+                             f"{name}: prose matched as a banner -> {line!r}")
+
+    def test_real_banners_still_match(self):
+        """The other half. Anchoring alone would drop a true positive --
+        'You are out of usage credits' does not START with the pattern -- so each
+        pattern also carries the banner's leading form. Without this test the
+        anchor could be tightened until nothing fires and every prose case passes."""
+        for name, line in self.BANNERS:
+            self.assertIn(name, w.matched_abnormal([line]),
+                          f"{name}: real banner stopped matching -> {line!r}")
+
+    def test_a_prose_only_idle_pane_does_not_warn(self):
+        frames = [f"I am reviewing the compacting patterns\n  \u00b7 5:{17 + i // 3:02d} PM\n> "
+                  for i in range(12)]
+        v = w.classify(frames, False, 600)
+        self.assertFalse(v["warn"], f"a prose-only idle pane warned: {v}")
+        self.assertNotEqual(v["kind"], "abnormal", v)
+
+    def test_the_internal_marker_does_not_ride_in_the_verdict(self):
+        v = w.classify(["x"], False, 60)
+        self.assertNotIn("_abnormal", v,
+                         "the marker duplicates the flattened abnormal_* keys already spread in")
 
 
 if __name__ == "__main__":
