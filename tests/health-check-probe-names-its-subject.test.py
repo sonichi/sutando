@@ -168,6 +168,46 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         self.assertIn("not running", out["detail"])
 
 
+class WatcherTreesAreThisCheckoutsTest(unittest.TestCase):
+    """`_watcher_trees()` answers "is a watcher serving THIS workspace", so a
+    tree with the right argv but another checkout's cwd is not a match.
+
+    Measured 2026-09-11 on a host running a worker pool from a sibling clone:
+    three watcher trees, all with cwd in that clone, none in this repo; the
+    boot gate read them as "watcher running" and the core booted deaf.
+    """
+
+    PS = ("  100     1 bash src/watch-tasks-stream.sh\n"
+          "  101   100 bash src/watch-tasks-stream.sh\n"
+          "  200     1 bash src/watch-tasks-stream.sh\n"
+          "  201   200 bash src/watch-tasks-stream.sh\n")
+
+    def test_a_tree_from_another_checkout_is_not_this_watcher(self):
+        here, there = "/repo/here", "/repo/there"
+        with patch.object(hc, "_proc_cwd", side_effect=lambda pid: {"100": here, "200": there}[pid]):
+            trees = hc._watcher_trees(self.PS, repo_dir=here)
+        self.assertEqual(set(trees), {"100"}, f"the sibling clone's tree must be dropped: {trees!r}")
+        self.assertEqual(trees["100"], {"100", "101"})
+
+    def test_only_foreign_trees_means_no_watcher(self):
+        with patch.object(hc, "_proc_cwd", return_value="/repo/there"):
+            self.assertEqual(hc._watcher_trees(self.PS, repo_dir="/repo/here"), {},
+                             "argv-shaped trees elsewhere are not a watcher for this checkout")
+
+    def test_an_unreadable_cwd_keeps_the_tree(self):
+        """UNKNOWN is not "elsewhere": a failed probe must not manufacture a
+        missing watcher, which is the duplicate-start the gate exists to stop."""
+        with patch.object(hc, "_proc_cwd", return_value=None):
+            trees = hc._watcher_trees(self.PS, repo_dir="/repo/here")
+        self.assertEqual(set(trees), {"100", "200"})
+
+    def test_the_probe_is_asked_once_per_tree_root(self):
+        asked = []
+        with patch.object(hc, "_proc_cwd", side_effect=lambda pid: asked.append(pid) or "/repo/here"):
+            hc._watcher_trees(self.PS, repo_dir="/repo/here")
+        self.assertEqual(sorted(asked), ["100", "200"], "children inherit the root's cwd; probe roots only")
+
+
 class MemoryIndexSubjectTest(unittest.TestCase):
     """'compact it now' must say which MEMORY.md it means."""
 

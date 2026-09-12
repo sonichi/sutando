@@ -8905,8 +8905,40 @@ def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
     return own, sup
 
 
-def _watcher_trees(ps_output: "str | None" = None) -> dict:
-    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+def _proc_cwd(pid: str) -> "str | None":
+    """The process's working directory, or None when it cannot be read.
+
+    None is UNKNOWN, not "elsewhere": a tree whose cwd could not be probed is
+    kept, since dropping a live watcher is the false "start" that runs every
+    task twice.
+    """
+    linux = f"/proc/{pid}/cwd"
+    if os.path.exists(linux):
+        try:
+            return os.path.realpath(os.readlink(linux))
+        except OSError:
+            return None
+    try:
+        done = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                              capture_output=True, text=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        return None
+    if done.returncode != 0:
+        return None
+    for line in done.stdout.splitlines():
+        if line.startswith("n"):
+            return os.path.realpath(line[1:])
+    return None
+
+
+def _watcher_trees(ps_output: "str | None" = None,
+                   repo_dir: "str | None" = None) -> dict:
+    """Map root PID -> set of PIDs for each distinct watcher TREE running
+    from THIS checkout.
+
+    A watcher from another checkout on the same host (a worker pool's clone)
+    has the same argv shape but serves another workspace, so its tree is
+    dropped by the root's cwd; an unreadable cwd keeps the tree (see _proc_cwd).
 
     Each watcher is several processes (a shell wrapper, the script, a
     subshell), so counting matching lines overcounts. A "root" is a match
@@ -8933,7 +8965,9 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
             seen.add(root)
             root = parent[root]
         trees.setdefault(root, set()).add(pid)
-    return trees
+    here = os.path.realpath(repo_dir if repo_dir is not None else str(REPO_DIR))
+    return {root: pids for root, pids in trees.items()
+            if _proc_cwd(root) in (None, here)}
 
 
 def extras_present(trees, live) -> bool:
