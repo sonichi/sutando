@@ -44,8 +44,11 @@ BLANKS = ("", "   ", "\t\n")
 # no reason for any of them, so neither may overlay a peer's stated refusal.
 NON_STRINGS = (False, 0, ["x"], {"a": 1})
 IDENTITY_FIELDS = ("gh", "github")
-TEXT_FIELDS = ("refusal_basis", "note", "authority_caveat",
-               "same_actor_as") + IDENTITY_FIELDS
+# Spelled independently of the source so the equality arms below can disagree.
+REFUSAL_FIELDS = ("refusal_basis", "note")
+# Text-typed, but metadata: a caveat prints, a login identifies. Neither refuses.
+NON_REFUSAL_TEXT = ("authority_caveat", "same_actor_as") + IDENTITY_FIELDS
+TEXT_FIELDS = REFUSAL_FIELDS + NON_REFUSAL_TEXT
 
 
 def _load(name, filename):
@@ -119,7 +122,7 @@ class BlankOverlay(unittest.TestCase):
         """`is_declared` calls every non-`None` present, which is right for
         `allowlisted` and wrong here: a list states no reason a reader can read,
         so overlaying it leaves a refusal that prints nothing and then routes."""
-        for field in TEXT_FIELDS:
+        for field in REFUSAL_FIELDS:
             for value in NON_STRINGS:
                 with self.subTest(field=field, local=value):
                     merged = self.three_rosters(value, field)
@@ -130,7 +133,7 @@ class BlankOverlay(unittest.TestCase):
                         f"in {field} erased it — {targets} got routed")
 
     def test_a_non_string_local_text_field_leaves_the_reason_readable(self):
-        for field in TEXT_FIELDS:
+        for field in REFUSAL_FIELDS:
             for value in NON_STRINGS:
                 with self.subTest(field=field, local=value):
                     merged = self.three_rosters(value, field)
@@ -229,6 +232,37 @@ class BlankOverlay(unittest.TestCase):
             ("peer", {"reviewer": dict(PEER_ROUTE, gh="peer-owner")}),
         )
         self.assertEqual(self._resolved_login(merged), "local-owner")
+    def test_a_local_metadata_row_still_ROUTES_and_keeps_its_own_field(self):
+        """The measured regression: a local row holding only metadata must not
+        withhold the peer route. Asserts DELIVERY as well as the kept value —
+        refusing the whole row preserves the value too, so the login alone
+        cannot tell the two apart."""
+        for field in NON_REFUSAL_TEXT:
+            with self.subTest(field=field):
+                merged = self.union(
+                    ("local", {"reviewer": {"stand": None, "room": None,
+                                            field: "local-owner"}}),
+                    ("PEER", {"reviewer": dict(PEER_ROUTE)}),
+                )
+                targets, rc, _ = self.resolve(merged)
+                self.assertEqual(
+                    (len(targets), rc), (1, 0),
+                    f"a local {field!r} withheld the peer route entirely")
+                self.assertEqual(targets[0]["stand"], PEER_ROUTE["stand"])
+                kept = [r for k, r in merged.items()
+                        if k == "reviewer" or k.startswith("reviewer@")]
+                self.assertTrue(
+                    any(r.get(field) == "local-owner" for r in kept),
+                    f"the local {field!r} was dropped: {kept}")
+
+    def test_only_the_refusal_fields_can_withhold_a_route(self):
+        """Type is not intent: widening the text list must not widen refusal."""
+        self.assertEqual(self.ru.REFUSAL_FIELDS, REFUSAL_FIELDS)
+        for f in NON_REFUSAL_TEXT:
+            self.assertIn(f, self.ru.TEXT_FIELDS)
+            self.assertNotIn(f, self.ru.REFUSAL_FIELDS)
+
+
 
 
 class SharedPresencePredicate(unittest.TestCase):

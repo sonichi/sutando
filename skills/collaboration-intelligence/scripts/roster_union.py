@@ -36,10 +36,10 @@ def is_declared(value) -> bool:
     return bool(declared(value)) if isinstance(value, str) else value is not None
 
 
-# The ONE statement of which roster fields carry TEXT rather than a value.
-# Identity included: a `False` or a list in one reads as blank to every reader.
-TEXT_FIELDS = ("refusal_basis", "note", "authority_caveat",
-               "same_actor_as") + IDENTITY_FIELDS
+# TYPE is not INTENT: only these two withhold a route.
+REFUSAL_FIELDS = ("refusal_basis", "note")
+# The ONE list of fields carrying TEXT, not a value: a False or list reads blank.
+TEXT_FIELDS = REFUSAL_FIELDS + ("authority_caveat", "same_actor_as") + IDENTITY_FIELDS
 
 
 def states_field(field, value) -> bool:
@@ -164,7 +164,7 @@ def _usable(row, kinds=None) -> bool:
     `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
     if not isinstance(row, dict):
         return False
-    if any(declared(row.get(k)) for k in TEXT_FIELDS):
+    if any(declared(row.get(k)) for k in REFUSAL_FIELDS):
         return True
     return bool(declared_routes(row, kinds))
 
