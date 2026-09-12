@@ -216,7 +216,8 @@ def tmux_session_name(worker_id: str) -> str:
 
 def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
                   session_id=None, resume=False, fork_from=None,
-                  transcript_path: str = "", tmux_socket: str = "") -> dict:
+                  transcript_path: str = "", tmux_socket: str = "",
+                  worker_id=None) -> dict:
     """Mint a worker and open its first run.
 
     `resume` keeps the given session id and its lineage is the caller's to have
@@ -228,7 +229,12 @@ def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
     if (resume or fork_from) and not session_id:
         raise IdentityError("resuming or forking needs the session id to act on")
 
-    worker_id = new_worker_id()
+    # A caller that must check a precondition against this worker's derived
+    # names — its tmux session — has to know the id before the record exists.
+    if worker_id is None:
+        worker_id = new_worker_id()
+    elif worker_dir(workspace, worker_id).exists():
+        raise IdentityError(f"worker {worker_id} already exists")
     sid = session_id or uuid.uuid4().hex
     relation = RELATION_RESUMED if resume else (RELATION_FORKED if fork_from else RELATION_NEW)
     record_session(workspace, worker_id, sid, runtime=runtime, relation=relation,

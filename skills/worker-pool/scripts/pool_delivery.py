@@ -89,6 +89,12 @@ def archived_payload(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
 
 
+def results_dir(workspace) -> Path:
+    """Where every recipient's answers go. Named here so a caller that only
+    composes the path (a spawner, a launcher) does not re-spell the layout."""
+    return _root(workspace) / "results"
+
+
 def result_path(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "results" / f"{task_id}.txt"
 
@@ -266,12 +272,24 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue"))
+    ap.add_argument("command",
+                    choices=("sweep", "pending", "watch", "residue", "payload"))
     ap.add_argument("--task-id")
+    ap.add_argument("--sentinel")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
+    if a.command == "payload":
+        # A sentinel names its payload and holds none; the mapping lives here
+        # so a caller never re-spells tasks/.
+        if not a.sentinel:
+            ap.error("--sentinel is required for payload")
+        parsed = parse_sentinel(a.sentinel)
+        if parsed is None:
+            ap.error(f"not a delivery sentinel: {a.sentinel}")
+        print(payload_path(ws, parsed[0]))
+        return 0
     if a.command == "residue":
         if not a.task_id:
             ap.error("--task-id is required for residue")
