@@ -2601,10 +2601,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func pollRestartIntent() {
         let path = workspace + "/state/core-restart-requested.json"
         guard FileManager.default.fileExists(atPath: path) else { return }
+        // Take the same flock the Python writer/consumer hold: deleting a
+        // pathname we did not read can drop a request installed after our read.
+        let lockFD = open(path + ".lock", O_CREAT | O_WRONLY, 0o644)
+        guard lockFD >= 0 else { return }
+        guard flock(lockFD, LOCK_EX) == 0 else { close(lockFD); return }
+        // Re-check under the lock: a consumer that raced us already took it.
+        guard FileManager.default.fileExists(atPath: path) else {
+            flock(lockFD, LOCK_UN); close(lockFD); return
+        }
         let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        var consumeFailed = false
         do {
             try FileManager.default.removeItem(atPath: path)  // consume FIRST
         } catch {
+            consumeFailed = true
+        }
+        flock(lockFD, LOCK_UN)
+        close(lockFD)
+        if consumeFailed {
             notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
             return
         }
