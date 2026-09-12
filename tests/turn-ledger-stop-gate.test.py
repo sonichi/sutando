@@ -860,11 +860,25 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
 
     Reproduces the exact interleaving from the review: (1) session A is
     reminded once, session B's turn-start must not un-spend A's reminder so
-    A's retry is NOT reminded a second time; (2) A's no-send must not silently
-    pass B's own silent turn. A session's very first stop_gate call is always
-    unjudgeable (no boundary yet — the module's documented ARMING behavior),
-    so each session gets one throwaway call first to establish its own
-    boundary before the actual assertions.
+    A's retry is NOT reminded a second time; (2) A's send/no-send must not
+    silently pass B's own silent turn. A session's very first stop_gate call
+    is always unjudgeable (no boundary yet — the module's documented ARMING
+    behavior), so each session gets one throwaway call first to establish its
+    own boundary before the actual assertions.
+
+    Part 2's ORDERING is load-bearing (qingyun-wu's follow-up review,
+    2026-09-12, on the first version of this test): if B's own boundary is
+    established AFTER A's entry, A's entry is excluded from B's evidence by
+    plain timestamp ordering alone — the `ts > since` check in
+    `last_action_after`/`stop_gate` — regardless of whether session filtering
+    (`_entry_matches_session`) runs at all. A mutation that bypasses both of
+    its call sites (replaces them with `True`) still passed the suite under
+    that ordering. Establishing BOTH boundaries first, before A acts, makes
+    A's entry chronologically newer than B's boundary too, so only the
+    session filter — not mere timestamp exclusion — can be what keeps it from
+    satisfying B's gate. Verified against that exact mutation before landing
+    this version (see the PR discussion); not re-asserted here since a
+    mutation test does not belong in the suite it is mutating.
     """
     turn_start = REPO / "src" / "turn-start.sh"
     stop_hook = REPO / "src" / "check-pending-tasks.sh"
@@ -874,6 +888,13 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
         decision = json.loads(_run_hook_script(stop_hook, ws, session_id).stdout)
         check(f"setup: {session_id or 'unscoped'}'s first-ever stop just arms (unjudgeable)",
               decision == {}, repr(decision))
+
+    def _run_ledger_cli(ws: pathlib.Path, session_id: str, *args: str) -> None:
+        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
+                   CLAUDE_CODE_SESSION_ID=session_id)
+        out = subprocess.run([sys.executable, str(ledger_cli), *args],
+                             capture_output=True, text=True, env=env)
+        check(f"session {session_id}'s {args[0]} CLI call exits 0", out.returncode == 0, out.stderr)
 
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
@@ -896,25 +917,30 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
         check("session B's turn-start does not un-spend session A's reminder",
               decision_a2 == {}, repr(decision_a2))
 
-        # --- Part 2: a no-send must not cross sessions either. ---
-        with tempfile.TemporaryDirectory() as tmp2:
-            ws2 = _workspace(tmp2)
-            _consume_first_call(ws2, "session-A")
-            _run_hook_script(turn_start, ws2, "session-A")
-            env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws2),
-                       CLAUDE_CODE_SESSION_ID="session-A")
-            no_send = subprocess.run([sys.executable, str(ledger_cli), "no-send",
-                                       "checked, nothing to report"],
-                                      capture_output=True, text=True, env=env)
-            check("session A's no-send CLI call exits 0", no_send.returncode == 0,
-                  no_send.stderr)
+        # --- Part 2: neither send nor no-send crosses sessions — both boundaries
+        # precede A's action, so only the filter (never mere timing) explains a block. ---
+        for kind, cli_args in (("no-send", ("no-send", "checked, nothing to report")),
+                                ("send", ("send", "room", "!r:ag2.space"))):
+            with tempfile.TemporaryDirectory() as tmp2:
+                ws2 = _workspace(tmp2)
+                _consume_first_call(ws2, "session-A")
+                _consume_first_call(ws2, "session-B")  # BEFORE A acts — see docstring
 
-            _consume_first_call(ws2, "session-B")
-            _run_hook_script(turn_start, ws2, "session-B")
-            b_stop = _run_hook_script(stop_hook, ws2, "session-B")
-            decision_b = json.loads(b_stop.stdout)
-            check("session A's no-send does not silently pass session B's silent turn",
-                  decision_b.get("decision") == "block", repr(decision_b))
+                a_entry_ts = time.time()
+                _run_hook_script(turn_start, ws2, "session-A")
+                _run_ledger_cli(ws2, "session-A", *cli_args)
+
+                b_since = turn_ledger.last_stop_ts(ws2, "session-B")
+                check(f"setup ({kind}): A's entry is newer than B's own boundary",
+                      b_since is not None and a_entry_ts > b_since,
+                      f"a_entry_ts={a_entry_ts} b_since={b_since}")
+
+                _run_hook_script(turn_start, ws2, "session-B")
+                b_stop = _run_hook_script(stop_hook, ws2, "session-B")
+                decision_b = json.loads(b_stop.stdout)
+                check(f"session A's {kind} does not silently pass session B's silent turn "
+                      "(chronologically eligible — only session filtering can be why)",
+                      decision_b.get("decision") == "block", repr(decision_b))
 
         # --- Control: with no session anywhere, the original shared-file bug reproduces. ---
         with tempfile.TemporaryDirectory() as tmp3:
