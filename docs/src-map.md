@@ -309,6 +309,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel.py`** — Channel ingress/egress observability for the chat bridges.
 - **`config.py`** — Narrow config slice for the observability + metering spine (Python twin).
 - **`config.ts`** — Narrow config slice for the observability + metering spine.
+- **`core-state-map.ts`** — Core supervisor state transitions → obs events (pure map).
+- **`core-state-normalizer.ts`** — Core supervisor state → obs events, as a composable collector Normalizer.
 - **`events.py`** — The universal observability event envelope (Python twin of types.ts).
 - **`events.ts`** — The universal observability event envelope.
 - **`ids.py`** — Id minting for the observability + metering spine.
