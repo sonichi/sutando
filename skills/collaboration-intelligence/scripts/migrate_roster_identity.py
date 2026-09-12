@@ -554,9 +554,10 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
             path, verdict = ri.decoded_path(seed), seed.get("verdict")
             if not path or verdict not in (HUMAN, STAND):
                 continue
-            # Referent-free path, or a verdict contradicting it: either is
-            # unbacked, and the second resolved the id to the WRONG principal.
-            if ri.path_referent(path) != verdict:
+            # Ask the PRODUCER: `path_referent` reads the head only, so a
+            # nested referent was dropped and a re-migration resolved it.
+            if not ri.writer_owned_path(path) or verdict not in {
+                    v for v, _ in _verdicts_from_field(path)}:
                 continue
             # Every source, not just `claims`: peers.json and owner_id are
             # stamped later, and a MALFORMED observation states a referent too.
