@@ -291,10 +291,12 @@ case-insensitively wherever they are joined.
     "other_stand_discord_ids": [{"id": "...", "basis": ["..."]}],
     "unresolved_discord_ids": [{"id": "...", "reason": "...",
                                 "seeded_by": [{"path": "…", "verdict": "human|stand",
-                                               "reason": "…"}]}],
+                                               "reason": "…",
+                                               "path_encoding": "escaped (absent = pre-codec)"}]}],
     "home_channel": "<channel id> | null",
     "id_basis": {"human_discord_id": ["..."], "stand_discord_id": ["..."]},
     "id_shape_failures": [{"path": "…|null", "kind": "…", "reason": "…",
+                           "path_encoding": "escaped (absent = pre-codec)",
                            "arbitrated_ids": ["…"], "arbitrated_states": ["human|stand"]}],
     "...": "every v1 provenance field (verification, verified_at, source, observed_at, stand, evidence) is preserved verbatim"
   }
@@ -352,10 +354,19 @@ Neither of the last two implies the other, and a mismatch is not cosmetic: a
 opposite principal and returned success.
 
 A `path` — in `seeded_by` and in `id_shape_failures` alike — is the evidence
-location dot-joined from its segments, with a dot INSIDE a segment escaped as
-`\.`. A roster key may contain one, and a path that cannot be split back into
-the key the collector walked is unreachable: the revalidation reads "cannot
-re-check", and the refusal latches past every repair of the value it names.
+location dot-joined from its segments. A roster key may contain the separator,
+and a path that cannot be split back into the key the collector walked is
+unreachable: the revalidation reads "cannot re-check", and the refusal latches
+past every repair of the value it names.
+
+Two codecs have written that string, so the RECORD says which. With
+`"path_encoding": "escaped"`, a dot INSIDE a segment is spelled `\.` and a
+literal backslash `\\`. WITHOUT it, the path is the pre-codec raw `.` join and
+every backslash in it is literal — a stored `\.` means a backslash then the
+separator, which is why the string cannot disambiguate itself. The field is
+written only when escaping changes the spelling, so an ordinary path keeps its
+pre-codec bytes and carries no discriminator. `roster_identity.decoded_path`
+is the only reader of the pair; `path_split` reads the escaped spelling alone.
 
 `id_shape_failures` is RESERVED and migration-owned: findings the migration
 could not re-derive from its own output, carried so a refusal survives a

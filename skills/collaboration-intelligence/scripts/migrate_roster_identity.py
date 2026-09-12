@@ -388,7 +388,7 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
     empty, so a v2 doc's own `[]` collections re-migrate untouched.
     """
     def _bad_shape(v):
-        shapes.append({"path": _path_join(path), "kind": type(v).__name__,
+        shapes.append({**ri.path_fields(path), "kind": type(v).__name__,
                        "reason": "a field declaring an id holds a value no id "
                                  "can be read from, so the referent it states "
                                  "is discarded rather than absent"})
@@ -456,7 +456,7 @@ def walk(obj, path, provider, sink, shapes):
             and shapes is not None and not _id_slot(path[-1]):
         # A declared slot is reported by _slot_failures; without this guard
         # a non-string there is reported twice.
-        shapes.append({"path": _path_join(path), "kind": type(obj).__name__,
+        shapes.append({**ri.path_fields(path), "kind": type(obj).__name__,
                        "reason": "typed field holds a non-string value, so "
                                  "its id is unreadable rather than absent"})
 
@@ -510,8 +510,13 @@ def _canonical_seeds(seeds: list) -> list:
         if k in seen:
             continue
         seen.add(k)
-        out.append({"path": s.get("path"), "verdict": s.get("verdict"),
-                    "reason": s.get("reason")})
+        rec = {"path": s.get("path"), "verdict": s.get("verdict"),
+               "reason": s.get("reason")}
+        # Every path arriving here is already in this codec's spelling — fresh
+        # from `_cited_in`, or decoded by `_carried_seeds`.
+        if isinstance(rec["path"], str):
+            rec.update(ri.path_fields(_path_split(rec["path"])))
+        out.append(rec)
     return sorted(out, key=lambda s: (str(s["path"]), str(s["verdict"])))
 
 
@@ -544,7 +549,9 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
         for seed in rec.get("seeded_by") or []:
             if not isinstance(seed, dict):
                 continue
-            path, verdict = seed.get("path"), seed.get("verdict")
+            # Decoded, not read raw: a seed stored before the path codec spells
+            # a backslash literally, and re-parsing one eats it as an escape.
+            path, verdict = ri.decoded_path(seed), seed.get("verdict")
             if not path or verdict not in (HUMAN, STAND):
                 continue
             # Referent-free path, or a verdict contradicting it: either is
@@ -853,6 +860,11 @@ def _canonical_triage(triage_people: dict):
     GitHub logins are case-insensitive, so two spellings are one person; leaving
     both makes the second silently disappear behind the first.
     """
+    if triage_people is not None and not isinstance(triage_people, dict):
+        # BEFORE the `or {}` below: coercing first erased the type, so `[]` and
+        # `''` migrated as if no config were supplied and `[{}]` reached here.
+        raise ValueError("pr-triage `people` is a "
+                         f"{type(triage_people).__name__}, not an object")
     canon, dupes = {}, []
     for k, v in (triage_people or {}).items():
         ck = str(k).casefold()
@@ -1012,8 +1024,6 @@ def main() -> int:
     ap.add_argument("--table", action="store_true")
     a = ap.parse_args()
 
-    doc = json.loads(a.roster.read_text())
-
     def _source(flag, path):
         # An OMITTED source is a choice; a SUPPLIED one that is missing is an
         # error. Treating them alike migrates on evidence nobody knows is absent.
@@ -1022,9 +1032,19 @@ def main() -> int:
         if not path.is_file():
             print(f"{flag} was supplied but does not exist: {path}", file=sys.stderr)
             raise SystemExit(2)
-        return json.loads(path.read_text())
+        doc = json.loads(path.read_text())
+        # A supplied source is a JSON OBJECT. Downstream `or {}` erased the type
+        # of a malformed one, so `[]` and `''` migrated as if it were absent.
+        if not isinstance(doc, dict):
+            print(f"refusing to migrate: {flag} holds a {type(doc).__name__}, "
+                  f"not a JSON object", file=sys.stderr)
+            raise SystemExit(2)
+        return doc
 
-    triage_people = (_source("--triage-config", a.triage_config) or {}).get("people") or {}
+    doc = _source("--roster", a.roster)
+    # NOT `or {}`: the container's own shape is `_canonical_triage`'s to refuse,
+    # and only an ABSENT one means "no triage config was supplied".
+    triage_people = (_source("--triage-config", a.triage_config) or {}).get("people")
     peer_raw = _source("--peers", a.peers) or {}
     owner_raw = (_source("--discord-config", a.discord_config) or {}).get("owner")
     # An external id arrives as a JSON string or not at all: a number may be

@@ -48,10 +48,10 @@ def path_join(segments) -> str:
 
 
 def path_split(path) -> list:
-    """Inverse of `path_join`, and the ONLY reader of a stored path.
+    """Inverse of `path_join`, and the reader of THIS codec's spelling only.
 
-    An UNESCAPED dot still separates, so every path spelled before this codec
-    existed parses into exactly the segments it always did.
+    A path off disk reaches it through `decoded_path`: an unescaped dot still
+    separates, but a pre-codec path's backslash is literal, not an escape.
     """
     out, cur, esc = [], [], False
     for ch in str(path):
@@ -69,6 +69,44 @@ def path_split(path) -> list:
         cur.append("\\")
     out.append("".join(cur))
     return out
+
+
+#: Names the codec that spelled a stored path. ABSENT is the discriminator for
+#: the pre-codec writer: a bare `.` separator, and every backslash literal.
+PATH_ENCODING_FIELD = "path_encoding"
+PATH_ENCODING = "escaped"
+
+
+def path_fields(segments) -> dict:
+    """The fields that spell ONE evidence path: the string, plus the codec that
+    wrote it WHEN escaping changed it.
+
+    `a.b` is byte-identical under both codecs, so an unambiguous path keeps the
+    pre-codec spelling and stays flag-free — the flag marks only the paths that
+    could otherwise be read two ways.
+    """
+    segs = [str(s) for s in segments]
+    enc = path_join(segs)
+    out = {"path": enc}
+    if enc != ".".join(segs):
+        out[PATH_ENCODING_FIELD] = PATH_ENCODING
+    return out
+
+
+def decoded_path(rec):
+    """A stored path in THIS codec's spelling, or None when it states none.
+
+    A stored `\\.` is AMBIGUOUS across the two codecs — a literal backslash then
+    the old separator, or an escaped dot — so the RECORD decides, never the
+    string. Unflagged is re-encoded rather than re-parsed, so a path written
+    before this codec still splits into the segments it always did.
+    """
+    path = rec.get("path") if isinstance(rec, dict) else None
+    if not isinstance(path, str):
+        return None
+    if rec.get(PATH_ENCODING_FIELD) == PATH_ENCODING:
+        return path
+    return path_join(path.split("."))
 
 
 def writer_owned_segments(segments) -> bool:
@@ -132,10 +170,14 @@ def canonical_shape_failure(rec) -> "dict | None":
     reason = rec.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         return None
-    path = rec.get("path")
-    out = {"path": path if isinstance(path, str) else None,
+    # The ingest point for a carried path: every later reader gets THIS codec's
+    # spelling, so no downstream split has to know which writer produced it.
+    path = decoded_path(rec)
+    out = {"path": path,
            "kind": rec.get("kind") if isinstance(rec.get("kind"), str) else "?",
            "reason": reason}
+    if path is not None:
+        out.update(path_fields(path_split(path)))
     ids = _snowflake_list(rec.get("arbitrated_ids"))
     if ids:
         out["arbitrated_ids"] = sorted(set(ids))

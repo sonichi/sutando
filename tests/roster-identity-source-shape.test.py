@@ -107,5 +107,65 @@ class PersonRecordShape(unittest.TestCase):
         self.assertEqual(doc["_note"], "not a person", err)
 
 
+class FalseySourceContainer(unittest.TestCase):
+    """A malformed CONTAINER is refused before `or {}` can erase its type.
+
+    `[]` and `''` are falsey, so the coercion turned a malformed source into an
+    absent one and published a map anyway; `[{}]` is truthy, so it reached
+    `.items()` and crashed. Both are the same defect — the type was normalised
+    before anything validated it.
+    """
+
+    ROSTER = {"alice": {"gh": "alice", "stand_status": "stand id " + T}}
+
+    def test_an_EMPTY_people_object_still_migrates(self):
+        """The valid control the refusals must not swallow."""
+        rc, err, doc = run(self.ROSTER, triage={"people": {}})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(doc["alice"]["stand_discord_id"], T, err)
+
+    def test_a_LIST_people_container_is_refused(self):
+        rc, err, doc = run(self.ROSTER, triage={"people": []})
+        self.assertEqual(rc, 2, err)
+        self.assertIsNone(doc, "a map was published on a malformed `people`")
+
+    def test_a_STRING_people_container_is_refused(self):
+        rc, err, doc = run(self.ROSTER, triage={"people": ""})
+        self.assertEqual(rc, 2, err)
+        self.assertIsNone(doc)
+
+    def test_a_TRUTHY_list_people_container_is_refused_not_crashed(self):
+        rc, err, doc = run(self.ROSTER, triage={"people": [{}]})
+        self.assertEqual(rc, 2, err)
+        self.assertIsNone(doc)
+        self.assertNotIn("Traceback", err, "the CLI crashed instead of refusing")
+
+    def test_every_supplied_SOURCE_DOCUMENT_must_be_an_object(self):
+        """Both shapes per source: the falsey one published, the truthy one
+        crashed, and neither was the controlled rc 2 this layer promises."""
+        for flag, empty, full in (("triage", [], [1]), ("peers", [], [1]),
+                                  ("dcfg", [], [1])):
+            for payload in (empty, full):
+                with self.subTest(source=flag, payload=payload):
+                    rc, err, doc = run(self.ROSTER, **{flag: payload})
+                    self.assertEqual(rc, 2, err)
+                    self.assertIsNone(doc)
+                    self.assertNotIn("Traceback", err)
+
+    def test_a_ROSTER_that_is_not_an_object_is_refused(self):
+        for payload in ([], "x", [{"alice": {}}]):
+            with self.subTest(roster=payload):
+                rc, err, doc = run(payload)
+                self.assertEqual(rc, 2, err)
+                self.assertIsNone(doc)
+                self.assertNotIn("Traceback", err)
+
+    def test_an_OMITTED_source_is_still_a_choice_not_a_refusal(self):
+        """Control: absence must keep migrating, or a blanket refusal passes."""
+        rc, err, doc = run(self.ROSTER)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(doc["alice"]["stand_discord_id"], T, err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
