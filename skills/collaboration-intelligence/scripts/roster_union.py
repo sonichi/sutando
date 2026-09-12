@@ -77,10 +77,23 @@ ROUTE_FIELDS = (
 )
 
 
-def _names_route(value) -> bool:
-    """Whether a routing field NAMES a route. Built on `declared`, not a second
-    spelling of it: `false` and `0` are how a row says "no route", not a route."""
-    return is_declared(value) and bool(value)
+# Discord addresses are numeric on the wire; every other route field is text.
+NUMERIC_ROUTE_FIELDS = frozenset(f for g in dict(ROUTE_FIELDS)["discord"]
+                                 for f in g)
+
+
+def _names_route(field, value) -> bool:
+    """Whether a routing FIELD names a route, by `declared`'s rule — not a
+    second spelling of it.
+
+    Text that states nothing states no route, so a blank, a list and a dict all
+    fail here rather than reaching a consumer that assumes a string. `false` and
+    `0` are still how a row says "no route"; only an id field may be numeric.
+    """
+    if declared(value):
+        return True
+    return (field in NUMERIC_ROUTE_FIELDS and isinstance(value, int)
+            and not isinstance(value, bool) and bool(value))
 
 
 def routing_fields(kinds=None) -> "tuple[str, ...]":
@@ -95,19 +108,25 @@ def routing_fields(kinds=None) -> "tuple[str, ...]":
                                for group in groups for field in group))
 
 
-def declared_routes(row) -> "tuple[str, ...]":
+def declared_routes(row, kinds=None) -> "tuple[str, ...]":
     """The route kinds this row can be delivered on, PREFERRED FIRST.
 
     The union asks whether a row has ANY; the notifier asks WHICH. Reading one
     table is what stops either deciding alone that a declared route does not
     exist -- the union calling a usable Discord row a placeholder let a synced
     peer's Matrix row take over a destination the local row already named.
+
+    `kinds=None` means every route, and a caller that narrows it states which
+    transports it can DRIVE -- the same declaration `states_routing` takes. A
+    consumer answering that question differently is how the two disagreed.
     """
     if not isinstance(row, dict):
         return ()
     return tuple(kind for kind, groups in ROUTE_FIELDS
-                 if all(any(_names_route(row.get(field)) for field in group)
-                        for group in groups))
+                 if (kinds is None or kind in kinds)
+                 and all(any(_names_route(field, row.get(field))
+                             for field in group)
+                         for group in groups))
 
 
 def states_routing(row, kinds=None) -> bool:
@@ -119,17 +138,18 @@ def states_routing(row, kinds=None) -> bool:
     """
     if not isinstance(row, dict):
         return False
-    return any(_names_route(row.get(field)) for field in routing_fields(kinds))
+    return any(_names_route(field, row.get(field))
+               for field in routing_fields(kinds))
 
 
-def _usable(row) -> bool:
-    """Addressable, OR a deliberate refusal. A blank `stand` carrying
+def _usable(row, kinds=None) -> bool:
+    """Addressable ON `kinds`, OR a deliberate refusal. A blank `stand` carrying
     `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
     if not isinstance(row, dict):
         return False
     if any(declared(row.get(k)) for k in ("refusal_basis", "note")):
         return True
-    return bool(declared_routes(row))
+    return bool(declared_routes(row, kinds))
 
 
 def _is_routing_placeholder(row) -> bool:
@@ -167,7 +187,7 @@ def _promote(winner: dict, local: dict) -> dict:
     return out
 
 
-def roster_union(paths) -> dict:
+def roster_union(paths, kinds=None) -> dict:
     """(host, path) pairs, NEAREST FIRST -> merged rows.
 
     LOCAL WINS a key collision; the differing peer row is KEPT under
@@ -175,6 +195,11 @@ def roster_union(paths) -> dict:
     wrote are indistinguishable afterwards. An identical peer row is not
     suffixed — agreement is not a conflict. `_`-prefixed schema notes are
     overwritten rather than suffixed, so they are not duplicated per host.
+
+    `kinds` is the CALLER's declaration of what it can deliver on (default:
+    every route). A caller that cannot drive a transport must say so, or the
+    tie-break hands it a winner it will then refuse, and the reachable row for
+    that person survives only under a suffix its own resolver never reads.
     """
     merged: dict = {}
     for host, p in paths:
@@ -187,7 +212,7 @@ def roster_union(paths) -> dict:
             elif merged[key] != row:
                 # Precedence is by origin EXCEPT when exactly one row is usable:
                 # `stand: null` is a row, so it won a collision like a filled one.
-                if (_usable(row) and not _usable(merged[key])
+                if (_usable(row, kinds) and not _usable(merged[key], kinds)
                         and _is_routing_placeholder(merged[key])):
                     merged[f"{key}@local"] = merged[key]
                     merged[key] = _promote(row, merged[key])
