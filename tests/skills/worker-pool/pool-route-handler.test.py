@@ -243,6 +243,70 @@ class TestOneRosterSnapshot(Base):
         self.assertTrue((self.ws / "deliveries" / W / "task-stable.txt").exists())
         self.assertFalse((self.ws / "deliveries" / "core").exists())
 
+class TestPickerAppliedAtTheEdge(Base):
+    """An owner's pin is bound and advertised by the handler itself, before the
+    core sees the task; the task still goes to the core (DECLINE)."""
+
+    def picker_file(self, name, sentence, tier="owner"):
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(f"id: {name}\nenvelope_hmac: v1:abc\ntask: {sentence}\n"
+                     f"source: ag2space\nwire_source: worker-picker\n"
+                     f"channel_id: !other:x\naccess_tier: {tier}\n")
+        return str(p)
+
+    def bindings(self):
+        p = self.ws / "state" / "bindings.json"
+        return json.loads(p.read_text()).get("bindings") if p.exists() else None
+
+    def test_an_owner_pin_is_applied_and_advertised_then_declined(self):
+        self.roster(bindings={})
+        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertEqual(self.bindings(), {"!other:x": W})
+        ad = self.ws / "state" / "pool-advertisement.json"
+        self.assertTrue(ad.exists())
+        self.assertIn("!other:x", ad.read_text())
+
+    def test_an_unpin_is_applied_too(self):
+        self.roster(bindings={"!other:x": W})
+        (self.ws / "state" / "bindings.json").write_text(json.dumps({"bindings": {"!other:x": W}}))
+        t = self.picker_file("task-1", "Unpin room !other:x (worker picker: back to auto routing)")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertEqual(self.bindings(), {})
+
+    def test_the_probe_applies_it_because_a_declined_task_gets_no_second_call(self):
+        # watch-tasks-stream probes once; rc 3 goes straight to the core.
+        self.roster(bindings={})
+        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
+        self.assertEqual(self.bindings(), {"!other:x": W})
+
+    def test_a_second_delivery_of_the_same_pin_is_harmless(self):
+        self.roster(bindings={})
+        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
+        for _ in range(2):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                             h.DECLINE)
+        self.assertEqual(self.bindings(), {"!other:x": W})
+
+    def test_a_team_pin_is_not_applied(self):
+        self.roster(bindings={})
+        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", tier="team")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertIsNone(self.bindings())
+
+    def test_a_pin_to_an_unknown_worker_is_reported_not_fatal(self):
+        import contextlib
+        import io
+        self.roster(bindings={})
+        t = self.picker_file("task-1", "Pin room !other:x to nobody (worker picker)")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertIn("not applied", err.getvalue())
+        self.assertIsNone(self.bindings())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)

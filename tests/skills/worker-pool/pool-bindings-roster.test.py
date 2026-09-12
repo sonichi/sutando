@@ -272,5 +272,62 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRoster(Base):
         self.assertEqual(p.read_text(), "{not json")
 
 
+class TestBindRoom(Base):
+    """`bind_room`/`unbind_room`: the pin's own writers, locked like register_worker."""
+
+    def setUp(self):
+        super().setUp()
+        pr.compile_roster(self.ws, live(W1, W2))
+
+    def test_a_pin_by_id_lands_in_bindings_and_roster(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W1)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_bindings(self.ws), {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {"!x:ag2.space": W1})
+
+    def test_a_pin_by_unique_label_resolves_to_the_id(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2[:6])
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_an_unknown_name_is_refused_before_anything_is_saved(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "nobody")
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {})
+
+    def test_an_ambiguous_label_is_refused(self):
+        pr.compile_roster(self.ws, {W1: {"label": "same", "state": "live"},
+                                    W2: {"label": "same", "state": "live"}})
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "same")
+
+    def test_a_repin_replaces_the_binding(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_the_version_moves_so_the_advertisement_can_cite_it(self):
+        v0 = pr.load_roster(self.ws)["version"]
+        self.assertEqual(pr.bind_room(self.ws, "!x:ag2.space", W1)["version"], v0 + 1)
+
+    def test_unpin_removes_the_binding_and_keeps_the_others(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        pr.bind_room(self.ws, "!y:ag2.space", W2)
+        r = pr.unbind_room(self.ws, "!x:ag2.space")
+        self.assertEqual(r["bindings"], {"!y:ag2.space": W2})
+        self.assertEqual(pr.load_bindings(self.ws), {"!y:ag2.space": W2})
+
+    def test_unpin_of_an_unbound_room_is_the_state_asked_for(self):
+        r = pr.unbind_room(self.ws, "!never:ag2.space")
+        self.assertEqual(r["bindings"], {})
+
+    def test_no_roster_refuses_both(self):
+        ws = Path(tempfile.mkdtemp())
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(ws, "!x:ag2.space", W1)
+        with self.assertRaises(pr.RosterError):
+            pr.unbind_room(ws, "!x:ag2.space")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
