@@ -53,6 +53,10 @@ ROOM_OPS = REPO / "skills" / "agent-room-ops"
 sys.path.insert(0, str(REPO / "src"))
 import turn_ledger  # noqa: E402
 
+# Isolate from whatever session this process runs under; the two-session test
+# below sets its own per-call session ids explicitly instead.
+os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
 
 def _load_sibling_stub():
     """Reuse `_stub` from the sibling suite rather than copying its pinning.
@@ -413,6 +417,7 @@ def main() -> int:
         test_record_say_contract_in_process,
         test_a_result_older_than_the_boundary_is_not_this_turns,
         test_bookkeeping_never_raises_into_the_send_path,
+        test_two_sessions_do_not_reset_or_satisfy_each_others_gate,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -818,6 +823,102 @@ def test_turn_start_is_reachable_from_the_command_line() -> None:
         rc = turn_ledger.main(["--workspace", str(ws), "turn-start"])
         check("turn-start exits 0", rc == 0, repr(rc))
         check("turn-start clears the mark", not turn_ledger.reminder_spent(ws), "")
+
+
+def _run_hook_script(script: pathlib.Path, ws: pathlib.Path, session_id: str | None,
+                      stdin_text: str = "") -> subprocess.CompletedProcess:
+    """The REAL hook script (not a stub, not turn_ledger.main()), against `ws`
+    pinned via the production `SUTANDO_TEST_MODE` escape hatch — the same
+    mechanism the PR's own before/after demo used, and what `sutando_config.py`
+    documents as test-only. `script` is invoked at its real repo path, so
+    `dirname "$0"/..` resolves REPO_DIR correctly with no path rewriting.
+    `session_id=None` omits the env var entirely, simulating a caller outside
+    Claude Code (or a hook whose session could not be determined).
+    """
+    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if session_id:
+        env["CLAUDE_CODE_SESSION_ID"] = session_id
+    return subprocess.run(["/bin/bash", str(script)], input=stdin_text, capture_output=True,
+                           text=True, env=env)
+
+
+def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
+    """The production-path witness for PR #4028's session-isolation finding
+    (qingyun-wu, 2026-09-09): two REAL sessions, one pinned workspace copy, the
+    actual hook scripts run as subprocesses — not turn_ledger.main() in-process,
+    which cannot exercise the hooks' own session resolution at all.
+
+    Reproduces the exact interleaving from the review: (1) session A is
+    reminded once, session B's turn-start must not un-spend A's reminder so
+    A's retry is NOT reminded a second time; (2) A's no-send must not silently
+    pass B's own silent turn. A session's very first stop_gate call is always
+    unjudgeable (no boundary yet — the module's documented ARMING behavior),
+    so each session gets one throwaway call first to establish its own
+    boundary before the actual assertions.
+    """
+    turn_start = REPO / "src" / "turn-start.sh"
+    stop_hook = REPO / "src" / "check-pending-tasks.sh"
+    ledger_cli = REPO / "src" / "turn_ledger.py"
+
+    def _consume_first_call(ws: pathlib.Path, session_id: str | None) -> None:
+        decision = json.loads(_run_hook_script(stop_hook, ws, session_id).stdout)
+        check(f"setup: {session_id or 'unscoped'}'s first-ever stop just arms (unjudgeable)",
+              decision == {}, repr(decision))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+
+        # --- Part 1: the reminder/boundary must not cross sessions. ---
+        _consume_first_call(ws, "session-A")
+        _run_hook_script(turn_start, ws, "session-A")
+        first = _run_hook_script(stop_hook, ws, "session-A")
+        decision_a1 = json.loads(first.stdout)
+        check("session A's silent stop is reminded",
+              decision_a1.get("decision") == "block", repr(decision_a1))
+
+        # Session B starts a turn on the SAME workspace. Pre-fix, this reset
+        # the one shared turn-reminder.json out from under session A.
+        _run_hook_script(turn_start, ws, "session-B")
+
+        # A retries, still silent: must be allowed (its own reminder was already spent).
+        second = _run_hook_script(stop_hook, ws, "session-A")
+        decision_a2 = json.loads(second.stdout)
+        check("session B's turn-start does not un-spend session A's reminder",
+              decision_a2 == {}, repr(decision_a2))
+
+        # --- Part 2: a no-send must not cross sessions either. ---
+        with tempfile.TemporaryDirectory() as tmp2:
+            ws2 = _workspace(tmp2)
+            _consume_first_call(ws2, "session-A")
+            _run_hook_script(turn_start, ws2, "session-A")
+            env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws2),
+                       CLAUDE_CODE_SESSION_ID="session-A")
+            no_send = subprocess.run([sys.executable, str(ledger_cli), "no-send",
+                                       "checked, nothing to report"],
+                                      capture_output=True, text=True, env=env)
+            check("session A's no-send CLI call exits 0", no_send.returncode == 0,
+                  no_send.stderr)
+
+            _consume_first_call(ws2, "session-B")
+            _run_hook_script(turn_start, ws2, "session-B")
+            b_stop = _run_hook_script(stop_hook, ws2, "session-B")
+            decision_b = json.loads(b_stop.stdout)
+            check("session A's no-send does not silently pass session B's silent turn",
+                  decision_b.get("decision") == "block", repr(decision_b))
+
+        # --- Control: with no session anywhere, the original shared-file bug reproduces. ---
+        with tempfile.TemporaryDirectory() as tmp3:
+            ws3 = _workspace(tmp3)
+            _consume_first_call(ws3, None)
+            _run_hook_script(turn_start, ws3, None)
+            first_u = _run_hook_script(stop_hook, ws3, None)
+            check("control: unscoped silent stop is reminded",
+                  json.loads(first_u.stdout).get("decision") == "block", first_u.stdout)
+            _run_hook_script(turn_start, ws3, None)
+            second_u = _run_hook_script(stop_hook, ws3, None)
+            check("control: without a session, a second silent stop is reminded again",
+                  json.loads(second_u.stdout).get("decision") == "block", second_u.stdout)
 
 
 if __name__ == "__main__":

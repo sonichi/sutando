@@ -63,6 +63,11 @@ fi
 
 # The loop above only sees a turn that ANSWERS A QUEUED TASK. This gate covers the
 # rest: a turn must end in a message or a recorded no-send (src/turn_ledger.py).
+# No --session here: turn_ledger.py reads $CLAUDE_CODE_SESSION_ID itself (same
+# established idiom as scripts/skill-read-receipt.py's _session_id()), which
+# Claude Code sets on every subprocess it spawns, hooks included — see
+# turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
+# context), behavior is exactly the original shared-file default.
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
 STOP_RC=$?
 
