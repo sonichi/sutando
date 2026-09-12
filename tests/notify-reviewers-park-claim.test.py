@@ -983,6 +983,92 @@ class TypedIdentityMembership(unittest.TestCase):
         # Control: a spelling that DOES carry its axis still resolves.
         self.assertEqual(canon.on_axis(ep, {"endpoint": ep}), canon("bob"))
 
+    def _two_axis_pair(self, nr):
+        """(canon, endpoint_of, parked, claim) over the COLLIDING roster."""
+        canon = nr.component_resolver(self.COLLIDING)
+        ep = lambda n: nr.durable_endpoint(self.COLLIDING[n])
+        return (canon, ep,
+                lambda n: nr.unknown_parked(MSG, n, n, canonical=canon,
+                                            endpoint=ep(n)),
+                lambda n: nr.claim_park(MSG, n, n, canonical=canon,
+                                        endpoint=ep(n)))
+
+    def test_an_endpoint_holders_rows_do_not_release_the_named_persons_park(self):
+        """`@shared:x`'s endpointless `unknown` is keyed on her actor; bob's rows
+        are keyed on his endpoint, which is that same text. bob's pending and
+        then definite failure must not settle a post that may have reached her.
+        """
+        nr = _nr()
+        self._isolated_ledger()
+        canon, ep, parked, claim = self._two_axis_pair(nr)
+        nr.record_asks(MSG, "@shared:x", "unknown", actor="@shared:x")
+        self.assertIs(parked("@shared:x"), True,
+                      "her own unknown must park her")
+        self.assertIs(parked("bob"), False,
+                      "control: bob shares only the raw text and is admissible")
+        self.assertEqual(claim("bob"), 1, "bob must stay independently admissible")
+        self.assertIs(parked("@shared:x"), True,
+                      "bob's pending row released her possibly-landed post")
+        nr.record_asks(MSG, "bob", "failed", actor="bob", endpoint=ep("bob"))
+        self.assertIs(parked("@shared:x"), True,
+                      "bob's definite failure settled HER reservation")
+        self.assertIsNone(claim("@shared:x"),
+                          "her repeat claim authorized a second POST")
+        self.assertIs(parked("carol"), False,
+                      "control: an unrelated third party is never parked")
+
+    def test_a_named_persons_rows_do_not_release_the_endpoint_holders_park(self):
+        """The reverse axis: bob's `unknown` is keyed on his ENDPOINT, and the
+        reviewer whose roster key spells the same writes endpointless rows onto
+        it. Her failure must not settle bob's possibly-landed post."""
+        nr = _nr()
+        self._isolated_ledger()
+        canon, ep, parked, claim = self._two_axis_pair(nr)
+        nr.record_asks(MSG, "bob", "unknown", actor="bob", endpoint=ep("bob"))
+        self.assertIs(parked("bob"), True, "bob's own unknown must park bob")
+        self.assertIs(parked("@shared:x"), False,
+                      "control: she shares only the raw text and is admissible")
+        self.assertEqual(claim("@shared:x"), 1,
+                         "she must stay independently admissible")
+        self.assertIs(parked("bob"), True,
+                      "her pending row released bob's possibly-landed post")
+        nr.record_asks(MSG, "@shared:x", "failed", actor="@shared:x")
+        self.assertIs(parked("bob"), True,
+                      "her definite failure settled BOB's reservation")
+        self.assertIsNone(claim("bob"),
+                          "bob's repeat claim authorized a second POST")
+        self.assertIs(parked("carol"), False,
+                      "control: an unrelated third party is never parked")
+
+    def test_a_colliding_parks_survive_compaction(self):
+        """Compaction keeps ONE first-ask and ONE last row per stream, so a park
+        that is neither — hers, between bob's two rows — is dropped from disk
+        outright. The verdict must not change across the rewrite."""
+        nr = _nr()
+        led = self._isolated_ledger()
+        canon, ep, parked, claim = self._two_axis_pair(nr)
+        nr.record_asks(MSG, "@shared:x", "confirmed", actor="@shared:x")
+        nr.record_asks(MSG, "bob", "pending", actor="bob", endpoint=ep("bob"))
+        nr.record_asks(MSG, "@shared:x", "unknown", actor="@shared:x")
+        nr.record_asks(MSG, "bob", "failed", actor="bob", endpoint=ep("bob"))
+        # `_append` omits `actor` when the caller gives none, so this row is
+        # keyed on the NAME axis -- the third axis compaction must round-trip.
+        nr.record_asks(MSG, "carol", "unknown")
+        self.assertIs(parked("@shared:x"), True, "before compaction")
+        keys = sorted(nr._streams(led))
+        nr.compact(led)
+        self.assertEqual(sorted(nr._streams(led)), keys,
+                         "compaction re-typed a stream onto another axis")
+        self.assertIs(parked("@shared:x"), True,
+                      "compaction discarded her possibly-landed post")
+        self.assertIsNone(claim("@shared:x"),
+                          "after compaction her repeat claim authorized a POST")
+        self.assertIs(parked("bob"), False,
+                      "control: bob's own send definitely failed, so he stays "
+                      "admissible across the rewrite")
+        self.assertIs(parked("carol"), True,
+                      "carol's name-axis unknown was lost in the rewrite")
+
 
 class ABoundedUnionRefusesInsteadOfRaising(unittest.TestCase):
     """component_tags bounds ONE component; the UNION of two can exceed the same bound.

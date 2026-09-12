@@ -1708,11 +1708,11 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
 
     def test_malformed_lines_are_skipped_not_fatal(self):
         self._write("not json", self.GOOD)
-        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k")])
+        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k", "name")])
 
     def test_a_valid_json_line_that_is_not_a_record_is_skipped(self):
         self._write('["not","a","record"]', '"bare"', "123", "null", self.GOOD)
-        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k")])
+        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k", "name")])
 
     def test_identity_prefers_actor_and_falls_back_to_reviewer(self):
         self._write(dict(self.GOOD, reviewer="spelling", actor="canon"),
@@ -1741,7 +1741,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
         self._write(dict(self.GOOD, ts="2026-08-29T11:00:01Z", outcome="unknown"),
                     dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="typo"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:01.000000Z")})
+                         {("o/r", "7", ("k", "name")): ("unknown", "2026-08-29T11:00:01.000000Z")})
 
     def test_a_falsy_timestamp_is_not_coerced_into_an_accepted_empty_string(self):
         # `d.get("ts") or ""` turned each of these into "" BEFORE the type
@@ -1764,7 +1764,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
         # in one fixed-width UTC form so the comparisons downstream hold.
         self._write(dict(self.GOOD, ts="2026-08-29T06:00:00-05:00"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("confirmed", "2026-08-29T11:00:00.000000Z")})
+                         {("o/r", "7", ("k", "name")): ("confirmed", "2026-08-29T11:00:00.000000Z")})
 
     def test_a_string_that_is_not_a_timestamp_is_rejected(self):
         # "0000" sorts below every real stamp, lending one actor's age to
@@ -1779,7 +1779,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
                     {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:02Z",
                      "outcome": "unknown"})
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:02.000000Z")})
+                         {("o/r", "7", ("k", "name")): ("unknown", "2026-08-29T11:00:02.000000Z")})
 
     def test_the_reader_streams_the_file_rather_than_materializing_it(self):
         # Peak traced memory, not a code read: restoring read_text().splitlines()
@@ -1800,7 +1800,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
         # anything — the result is per-stream and of fixed size.
         self._write(*[dict(self.GOOD, ts=f"2026-08-29T11:{i//60:02d}:{i%60:02d}Z", outcome="pending")
                       for i in range(500)])
-        st = nr._streams(self.led)[("o/r", "7", "k")]
+        st = nr._streams(self.led)[("o/r", "7", "k", "name")]
         self.assertEqual(st["n"], 500, "the count is kept")
         self.assertNotIn("rows", st)
         sizes = [len(v) for v in st.values() if isinstance(v, (list, tuple, dict))]
@@ -1813,21 +1813,23 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
                     dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="pending"),
                     dict(self.GOOD, ts="2026-08-29T11:00:03Z", outcome="failed"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("failed", "2026-08-29T11:00:03.000000Z")})
-        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "2026-08-29T11:00:01.000000Z"})
+                         {("o/r", "7", ("k", "name")): ("failed", "2026-08-29T11:00:03.000000Z")})
+        self.assertEqual(nr._first_ask(self.led),
+                         {("o/r", "7", ("k", "name")): "2026-08-29T11:00:01.000000Z"})
 
     def test_both_readers_derive_their_output_from_the_one_owner(self):
         # A mutant called `_streams`, discarded it, re-read the file and stayed
         # green. Feed a sentinel the file cannot produce, from a missing path.
-        sentinel = {("S/S", "99", "sent"): {"last": ("unknown", "2026-08-29T11:00:09Z"),
-                                            "first_ask": "2026-08-29T11:00:00Z", "n": 1}}
+        sentinel = {("S/S", "99", "sent", "actor"): {"last": ("unknown", "2026-08-29T11:00:09Z"),
+                                                     "first_ask": "2026-08-29T11:00:00Z", "n": 1}}
         missing = pathlib.Path(self.tmp) / "does-not-exist.jsonl"
         orig = nr._streams
         nr._streams = lambda led: sentinel
         try:
             self.assertEqual(nr._latest_outcomes(missing),
-                             {("S/S", "99", "sent"): ("unknown", "2026-08-29T11:00:09Z")})
-            self.assertEqual(nr._first_ask(missing), {("S/S", "99", "sent"): "2026-08-29T11:00:00Z"})
+                             {("S/S", "99", ("sent", "actor")): ("unknown", "2026-08-29T11:00:09Z")})
+            self.assertEqual(nr._first_ask(missing),
+                             {("S/S", "99", ("sent", "actor")): "2026-08-29T11:00:00Z"})
         finally:
             nr._streams = orig
 

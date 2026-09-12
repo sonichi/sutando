@@ -561,7 +561,12 @@ _KEY_AXES = (("endpoint", "endpoint"), ("actor", "actor"), ("reviewer", "name"))
 #: Accepted row schema. A field of the wrong type is a malformed ROW, not a
 #: reason to crash a reader or to misattribute the stream it belongs to.
 def _row(d) -> "tuple | None":
-    """(repo, pr, identity, outcome, ts) for a well-formed record, else None."""
+    """(repo, pr, identity, outcome, ts, axis) for a well-formed record, else None.
+
+    `axis` names the FIELD that supplied the identity. Two people can spell one
+    raw key — a roster name and another's durable endpoint — so the spelling
+    alone cannot tell their rows apart.
+    """
     if not isinstance(d, dict):
         return None                     # valid JSON, not a record
     repo, pr = d.get("repo"), d.get("pr")
@@ -573,8 +578,14 @@ def _row(d) -> "tuple | None":
         v = d.get(f)
         if v is not None and not (isinstance(v, str) and v):
             return None
-    # The endpoint is durable identity; a roster alias is a renameable spelling.
-    who = d.get("endpoint") or actor or d.get("reviewer")
+    # ONE precedence, shared with `component_resolver.on_axis`: the field that
+    # supplies the key also names the axis this row is attributed on.
+    who = axis = None
+    for field, ax in _KEY_AXES:
+        v = actor if field == "actor" else d.get(field)
+        if isinstance(v, str) and v:
+            who, axis = v, ax
+            break
     outcome, ts = d.get("outcome"), d.get("ts")
     if not isinstance(repo, (str, type(None))) or not isinstance(who, str) or not who:
         return None
@@ -598,11 +609,15 @@ def _row(d) -> "tuple | None":
     # Malformed persisted identity drops the row; a park is never guessed.
     if "membership" in d and valid_tags(d.get("membership")) is None:
         return None
-    return _canon_repo(repo), str(pr), who, outcome, ts or ""
+    return _canon_repo(repo), str(pr), who, outcome, ts or "", axis
 
 
 def _streams(led: Path) -> dict:
-    """(repo, pr, RAW spelling) -> compact state, folded line by line.
+    """(repo, pr, RAW spelling, AXIS) -> compact state, folded line by line.
+
+    The axis is part of the key because the spelling is not unique: one person's
+    roster name can be another's durable endpoint, and a single `last` per
+    spelling lets either one's settlement release the other's parked post.
 
     THE one owner of the ledger's read contract: file access, malformed-line and
     malformed-ROW skipping, identity, key shape, and order. Retaining the rows
@@ -620,8 +635,8 @@ def _streams(led: Path) -> dict:
             row = _row(d)
             if row is None:
                 continue                # one bad row never hides a later good one
-            repo, pr, who, outcome, ts = row
-            st = out.setdefault((repo, pr, who),
+            repo, pr, who, outcome, ts, axis = row
+            st = out.setdefault((repo, pr, who, axis),
                                 {"last": None, "first_ask": None,
                                  "first_ask_outcome": None, "n": 0,
                                  "identity": {}, "first_identity": {},
@@ -734,13 +749,16 @@ def _rewrite(led: Path, streams: dict) -> int:
     """Atomically replace the ledger with the rows these streams imply.
     Caller MUST hold the ledger lock."""
     rows = []
-    for (repo, num, who), st in sorted(
+    for (repo, num, who, axis), st in sorted(
             streams.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
         for outcome, ts, identity in _retained(st):
             # The reader's normalized string: int() renamed "007" to "7".
             row = {"repo": identity.get("spelled_repo") or repo, "pr": num,
                    "ts": ts, "channel": "room", "outcome": outcome}
-            row["actor"] = identity.get("actor") or who
+            # On the axis that keyed the stream: an `actor` synthesized for a
+            # name-only row retypes it, and the rewrite must key identically.
+            row["reviewer" if axis == "name" else "actor"] = \
+                identity.get("actor") or who
             if identity.get("endpoint"):
                 row["endpoint"] = identity["endpoint"]
             # Same rule as the append, plus legacy: a row predating the outcome
@@ -783,6 +801,9 @@ def _fold(streams: dict, per_stream, combine, canonical=None,
     `axis_of` names the identity of the ROW the projection selected. The stream's
     ACCUMULATED identity is not that: a raw key can hold two people's rows, and
     a later row's endpoint then retypes an earlier name-only ask onto its holder.
+
+    With no resolver there is nobody to fold ONTO, so the recorded axis stays in
+    the key: dropping it re-merges the two people `_streams` just kept apart.
     """
     canon = canonical or (lambda w: w)
     # Keyed on the axis the row recorded: a raw key cannot separate one person's
@@ -790,18 +811,21 @@ def _fold(streams: dict, per_stream, combine, canonical=None,
     on_axis = getattr(canon, "on_axis", None)
     ident_of = axis_of or (lambda st: st.get("identity"))
     out = {}
-    for (repo, num, who), st in streams.items():
+    for (repo, num, who, axis), st in streams.items():
         v = per_stream(st)
         if v is None:
             continue
-        k = (repo, num,
-             on_axis(who, ident_of(st)) if on_axis else canon(who))
+        if canonical is None:
+            key = (who, axis)
+        else:
+            key = on_axis(who, ident_of(st)) if on_axis else canon(who)
+        k = (repo, num, key)
         out[k] = combine(out[k], v) if k in out else v
     return out
 
 
 def _latest_outcomes(led: Path) -> dict:
-    """(repo, pr, RAW spelling) -> (outcome, ts) from the LAST row of that stream.
+    """(repo, pr, (RAW spelling, axis)) -> (outcome, ts) from that stream's LAST row.
 
     Raw keys only. Folding this onto a canonical actor is the defect the park
     was fixed for, so the API does not offer it rather than leaving it callable.
@@ -810,7 +834,7 @@ def _latest_outcomes(led: Path) -> dict:
 
 
 def _latest_with_identity(led: Path) -> dict:
-    """(repo, pr, RAW spelling) -> ((outcome, ts), identity-as-written).
+    """(repo, pr, (RAW spelling, axis)) -> ((outcome, ts), identity-as-written).
 
     The identity rides along so a reader can compare on the AXIS the row used.
     A raw spelling alone cannot: one person's endpoint and another's roster key
@@ -878,7 +902,7 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
         return True
     canon = canonical or (lambda w: w)
-    for (repo, num, row_who), ((outcome, _ts), ident) in latest.items():
+    for (repo, num, (row_who, _axis)), ((outcome, _ts), ident) in latest.items():
         # Compare on the axis the ROW recorded: a bare `row_who` is ambiguous,
         # since one person's endpoint can be another's roster key.
         row_endpoint = ident.get("endpoint")
@@ -1059,7 +1083,7 @@ def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
         streams = _streams(led)
     except OSError:
         return None
-    for (repo, pr, _who), st in streams.items():
+    for (repo, pr, _who, _axis), st in streams.items():
         if (repo, pr) not in refs and (None, pr) not in refs:
             continue
         outcome = (st["last"] or (None, None))[0]
