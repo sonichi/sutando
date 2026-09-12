@@ -112,15 +112,24 @@ class GatewaySerializer(unittest.TestCase):
 
 
 class GuardParity(unittest.TestCase):
-    """injection-guard-sweep asserts these three lists agree; assert the new
-    key specifically so a partial addition fails here with a clear name."""
+    """The TS guards must cover this key. They used to carry hand-written
+    copies and these tests read the literals; both now DERIVE from
+    src/header_keys.ts, so the key is asserted in the artifact and the
+    consumers are asserted to use it — the property, not the copy."""
 
-    def test_typescript_task_bridge_mirror(self):
-        self.assertIn(f"'{KEY}'", (ROOT / "src/task-bridge.ts").read_text())
+    def test_the_generated_key_set_carries_it(self):
+        self.assertIn(f"'{KEY}'", (ROOT / "src/header_keys.ts").read_text())
 
-    def test_phone_conversation_server_regex(self):
-        self.assertIn(KEY, (ROOT / "skills/phone-conversation/scripts/"
-                                   "conversation-server.ts").read_text())
+    def test_typescript_task_bridge_derives_the_key_set(self):
+        src = (ROOT / "src/task-bridge.ts").read_text()
+        self.assertIn("from './header_keys.js'", src)
+        self.assertIn("const _HEADER_KEYS = HEADER_KEYS;", src)
+
+    def test_phone_conversation_server_derives_the_key_set(self):
+        src = (ROOT / "skills/phone-conversation/scripts/"
+                      "conversation-server.ts").read_text()
+        self.assertIn("from '../../../src/header_keys.js'", src)
+        self.assertIn("HEADER_KEY_ALTERNATION", src)
 
     def test_vendored_protocol_copy_agrees(self):
         pkg = (ROOT / "packages/ag2-sparrow/ag2_sparrow/"
