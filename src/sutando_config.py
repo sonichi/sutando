@@ -78,6 +78,9 @@ _OBJECT_TOP_LEVEL_KEYS = {
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
+# Ascending order of the CLI's own --effort scale; the tuple order is what the
+# error message prints, so keep it a scale rather than a set.
+_SUPPORTED_CORE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
 
 
@@ -585,6 +588,24 @@ def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
             f"sutando config: unsupported core.runtime={runtime!r}; expected one of: {supported}"
         )
     return runtime
+
+
+def resolve_core_effort(repo_root: Optional[Path] = None) -> str:
+    """Reasoning-effort level for the core, or "" when unset (no --effort passed).
+    ``SUTANDO_CORE_EFFORT`` overrides ``core.effort`` for one invocation."""
+    core = load_config(repo_root).get("core") or {}
+    configured = str(core.get("effort") or "").strip()
+    effort = os.environ.get("SUTANDO_CORE_EFFORT", "").strip() or configured
+    if not effort:
+        return ""
+    if effort not in _SUPPORTED_CORE_EFFORTS:
+        # Ordered, not sorted: the values are a scale, and alphabetical order
+        # would present it as low<max<medium.
+        supported = ", ".join(_SUPPORTED_CORE_EFFORTS)
+        raise ValueError(
+            f"sutando config: unsupported core.effort={effort!r}; expected one of: {supported}"
+        )
+    return effort
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
