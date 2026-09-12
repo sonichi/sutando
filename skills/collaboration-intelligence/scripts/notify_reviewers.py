@@ -255,7 +255,7 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     # so a timeout would discard owner-stated identity for the colliding key.
     if gh:
         return gh, f"roster {field} -> {gh}"
-    sib = entry.get("same_actor_as")
+    sib = declared(entry.get("same_actor_as"))
     if sib:
         return sib, f"via same_actor_as -> {sib}"
     if _is_github_user(name):
@@ -396,7 +396,9 @@ def _actor_map(roster) -> dict:
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         find(k)
-        other = v.get("same_actor_as")
+        # A non-string here is a dict KEY below: a list or dict raises
+        # TypeError and takes the whole notifier down, not just this row.
+        other = declared(v.get("same_actor_as"))
         if other:
             union(k, other)
     return {k: find(k) for k in parent}

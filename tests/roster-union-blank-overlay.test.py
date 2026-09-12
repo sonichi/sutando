@@ -43,7 +43,9 @@ BLANKS = ("", "   ", "\t\n")
 # A text field states nothing when it holds one of these: `stated_reason` prints
 # no reason for any of them, so neither may overlay a peer's stated refusal.
 NON_STRINGS = (False, 0, ["x"], {"a": 1})
-TEXT_FIELDS = ("refusal_basis", "note")
+IDENTITY_FIELDS = ("gh", "github")
+TEXT_FIELDS = ("refusal_basis", "note", "authority_caveat",
+               "same_actor_as") + IDENTITY_FIELDS
 
 
 def _load(name, filename):
@@ -305,9 +307,14 @@ class SharedPresencePredicate(unittest.TestCase):
         self.assertEqual(self.ru.TEXT_FIELDS, TEXT_FIELDS)
         union_src = (SCRIPTS / "roster_union.py").read_text()
         notify_src = (SCRIPTS / "notify_reviewers.py").read_text()
-        literal = re.compile(r'\(\s*"refusal_basis"\s*,\s*"note"\s*,?\s*\)')
+        literal = re.compile(r'"refusal_basis"\s*,\s*"note"')
         self.assertEqual(len(literal.findall(union_src + notify_src)), 1,
                          "the text-field list is spelled more than once")
+        # Identity is text too, and derived from IDENTITY_FIELDS rather than
+        # re-spelled, so widening one cannot leave the other behind.
+        self.assertIn("IDENTITY_FIELDS", union_src.split("TEXT_FIELDS =")[1][:200])
+        for f in ("gh", "github", "same_actor_as", "authority_caveat"):
+            self.assertIn(f, self.ru.TEXT_FIELDS)
         self.assertRegex(notify_src,
                          r"from roster_union import [^\n]*\bTEXT_FIELDS\b")
 

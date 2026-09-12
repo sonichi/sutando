@@ -36,9 +36,10 @@ def is_declared(value) -> bool:
     return bool(declared(value)) if isinstance(value, str) else value is not None
 
 
-# The roster fields schema.md types as STRING, in the precedence the notifier
-# prints them. The ONE statement of which fields carry text rather than a value.
-TEXT_FIELDS = ("refusal_basis", "note")
+# The ONE statement of which roster fields carry TEXT rather than a value.
+# Identity included: a `False` or a list in one reads as blank to every reader.
+TEXT_FIELDS = ("refusal_basis", "note", "authority_caveat",
+               "same_actor_as") + IDENTITY_FIELDS
 
 
 def states_field(field, value) -> bool:
