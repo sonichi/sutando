@@ -51,9 +51,14 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import host_rosters, roster_login, roster_union
+from roster_union import (CAVEAT_SUFFIX, is_caveat, REFUSAL_FIELDS, TEXT_FIELDS, declared, declared_routes, host_rosters,
+                          roster_login, roster_union)
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
+
+# The transports this tool can DRIVE. Stated once: the union tie-break and
+# resolve() must not answer "is this row deliverable?" differently.
+SUPPORTED_ROUTES = ("matrix",)
 
 
 def _host_label() -> str:
@@ -107,13 +112,17 @@ def roster_paths() -> "list[tuple[str, Path]]":
 
 
 def load_roster() -> dict:
-    """Union across hosts; the merge policy is roster_union's, not restated here."""
+    """Union across hosts; the merge policy is roster_union's, not restated here.
+
+    It is told which transports this tool can drive, so a row it could never
+    send on cannot displace one it can and then be refused by resolve().
+    """
     paths = roster_paths()
     if not paths:
         where = os.environ.get("SUTANDO_SCI_ROSTER") or "any host"
         raise SystemExit(f"no roster at {where} — seed it from the map before "
                          "notifying (never guess Stand identities)")
-    return roster_union(paths)
+    return roster_union(paths, SUPPORTED_ROUTES)
 
 
 def stated_reason(entry: dict) -> str:
@@ -122,10 +131,10 @@ def stated_reason(entry: dict) -> str:
     A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
     entry knows which, and a refusal that omits it invites the repair that
     overrides it (#3468)."""
-    for key in ("refusal_basis", "note"):
-        v = entry.get(key)
-        if isinstance(v, str) and v.strip():
-            return " ".join(v.split())
+    for key in REFUSAL_FIELDS:
+        reason = declared(entry.get(key))
+        if reason:
+            return " ".join(reason.split())
     return ""
 
 
@@ -142,18 +151,24 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   "add them from the map, do not guess", file=sys.stderr)
             worst = max(worst, 2)
             continue
-        stand, room = entry.get("stand"), entry.get("room")
+        # Both the ROUTE and its VALUES come from the classifier, so what is sent
+        # is what was validated -- a blank or a list can reach neither.
+        routes = declared_routes(entry, SUPPORTED_ROUTES)
+        stand, room = declared(entry.get("stand")), declared(entry.get("room"))
         why = stated_reason(entry)
         # A caveat nobody prints is a note, not a step. Derived from the entry:
         # a named field list misses the next caveat silently.
-        for field in sorted(k for k in entry if k.endswith("_caveat")):
+        for field in sorted(k for k in entry if is_caveat(k)):
             if entry.get(field):
-                label = field[: -len("_caveat")].upper().replace("_", " ")
+                label = field[: -len(CAVEAT_SUFFIX)].upper().replace("_", " ")
                 print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
-        if not stand or not room:
+        if not routes:
             # a human id alone cannot be a target: person-mentions trigger no Stand
+            other = ", ".join(declared_routes(entry))
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
-                  f"(human-only = not Stand addressing)", file=sys.stderr)
+                  f"(human-only = not Stand addressing)"
+                  + (f" — declares {other}, which this tool cannot send on"
+                     if other else ""), file=sys.stderr)
             # Without this the refusal reads as a data gap, and the obvious
             # repair — populate the fields — silently overrides the refusal.
             if why:
@@ -240,7 +255,7 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     # so a timeout would discard owner-stated identity for the colliding key.
     if gh:
         return gh, f"roster {field} -> {gh}"
-    sib = entry.get("same_actor_as")
+    sib = declared(entry.get("same_actor_as"))
     if sib:
         return sib, f"via same_actor_as -> {sib}"
     if _is_github_user(name):
@@ -381,7 +396,9 @@ def _actor_map(roster) -> dict:
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         find(k)
-        other = v.get("same_actor_as")
+        # A non-string here is a dict KEY below: a list or dict raises
+        # TypeError and takes the whole notifier down, not just this row.
+        other = declared(v.get("same_actor_as"))
         if other:
             union(k, other)
     return {k: find(k) for k in parent}
