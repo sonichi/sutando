@@ -103,6 +103,9 @@ class TestLauncherGate(unittest.TestCase):
         self.assertIn("--chrome", argv)
         self.assertNotIn("--session-id", argv)
         self.assertIn("sutando-core", argv)
+        # ps argv is whitespace-split: the boot prompt is its tail; a core never boots as a worker.
+        self.assertEqual(argv[-1], "/startup")
+        self.assertNotIn("--worker", argv)
 
     def test_set_the_worker_launch_drops_them_and_binds_its_session(self):
         argv = _launch_argv({"SUTANDO_INSTANCE_ID": "a" * 32, "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
@@ -113,6 +116,7 @@ class TestLauncherGate(unittest.TestCase):
         self.assertEqual(argv[argv.index("--session-id") + 1], "11111111-2222-3333-4444-555555555555")
         self.assertEqual(argv[argv.index("--name") + 1], "sutando-worker-" + "a" * 32)
         self.assertNotIn("sutando-core", argv)
+        self.assertEqual(argv[-2:], ["/startup", "--worker"])
 
     def test_control_a_liveness_probe_that_reports_nothing_fails_the_fixture(self):
         """The launcher's poll reads `pgrep -ax claude`; a probe that never names
