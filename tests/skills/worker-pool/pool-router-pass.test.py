@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -257,6 +258,71 @@ class TestPayloadGuard(Base):
         self.assertEqual(out["delivered"], [W1])
         self.assertEqual(out["skipped"], [])
         self.assertIsNotNone(pd.find(self.ws, W1, "task-real"))
+
+
+class TestPublishIsOneTransitionUnderArbitration(Base):
+    """A publisher paused between its check of both names and its O_EXCL create,
+    with a second publisher and the recipient's accept running meanwhile.
+
+    Unlocked, the accept renames the pending name away and the resumed create
+    recreates it beside the accepted one: two sentinels, one task, and the
+    streaming reader announces it again. Under `pd.arbitration` the second
+    publisher and the accept wait, and exactly one sentinel remains.
+    """
+
+    def _race(self, tid="task-race"):
+        self.roster()
+        self.task(tid)
+        paused, resume = threading.Event(), threading.Event()
+        real_find = pd.find
+        first = threading.local()
+
+        def pausing_find(workspace, recipient, task_id):
+            got = real_find(workspace, recipient, task_id)
+            if getattr(first, "publisher", False) and not paused.is_set():
+                paused.set()
+                resume.wait(10)
+            return got
+
+        outcomes = {}
+
+        def publisher_a():
+            first.publisher = True
+            outcomes["a"] = rt.deliver_one(self.ws, W1, tid)
+
+        def publisher_b_then_accept():
+            outcomes["b"] = rt.deliver_one(self.ws, W1, tid)
+            pending = pd.find(self.ws, W1, tid)
+            outcomes["accept"] = pd.accept(pending).name if pending and pending.suffix == ".txt" else None
+
+        rt.pd.find = pausing_find
+        try:
+            a = threading.Thread(target=publisher_a)
+            a.start()
+            self.assertTrue(paused.wait(10), "publisher A never reached its find")
+            b = threading.Thread(target=publisher_b_then_accept)
+            b.start()
+            b.join(0.5)
+            b_blocked = b.is_alive()
+            resume.set()
+            a.join(10); b.join(10)
+        finally:
+            rt.pd.find = real_find
+        return outcomes, b_blocked
+
+    def test_an_accept_during_publish_cannot_leave_two_sentinels(self):
+        outcomes, b_blocked = self._race()
+        names = sorted(p.name for p in (self.ws / "deliveries" / W1).iterdir()
+                       if pd.parse_sentinel(p.name))
+        self.assertEqual(names, ["task-race.accepted"], outcomes)
+        self.assertEqual(outcomes["a"], "delivered")
+        self.assertEqual(outcomes["b"], "already")
+        self.assertEqual(outcomes["accept"], "task-race.accepted")
+
+    def test_the_second_publisher_waits_for_the_first(self):
+        """The control that the lock is held: B is still blocked while A pauses."""
+        _outcomes, b_blocked = self._race("task-control")
+        self.assertTrue(b_blocked)
 
 
 if __name__ == "__main__":

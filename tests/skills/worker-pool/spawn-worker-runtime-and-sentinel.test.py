@@ -47,8 +47,9 @@ class Runner:
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return subprocess.CompletedProcess(argv, 0, "", "")
         if len(argv) > 3 and argv[3] == "has-session":
-            hit = argv[-1].lstrip("=") in self.existing
-            return subprocess.CompletedProcess(argv, 0 if hit else 1, "", "")
+            name = argv[-1].lstrip("=")
+            return (subprocess.CompletedProcess(argv, 0, "", "") if name in self.existing
+                    else subprocess.CompletedProcess(argv, 1, "", f"can't find session: {name}"))
         if argv[0] == "tmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
         return sw._run(argv, **kw)          # the sentinel probe, for real

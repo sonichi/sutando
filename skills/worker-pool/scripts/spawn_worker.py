@@ -33,6 +33,8 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
 
 import pool_delivery as pd  # noqa: E402
 
+import tmux_probe  # noqa: E402
+
 import worker_identity as wi  # noqa: E402
 
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
@@ -104,22 +106,34 @@ def per_instance_sentinel_supported(repo, runner=_run) -> bool:
     return len(seen) == 2
 
 
-def session_state(name: str, socket=None, runner=_run) -> str:
-    """"exists" | "absent" | "unknown". `=name` is exact: without it tmux
-    prefix-matches and a short id resolves to a different worker.
+def session_probe(name: str, socket=None, runner=_run) -> tuple:
+    """("exists" | "absent" | "unknown", detail). `=name` is exact: without it
+    tmux prefix-matches and a short id resolves to a different worker.
 
-    tmux answers 1 for "no such session"; anything else (server unreachable, a
-    failed spawn) is not an answer, and reading it as absent is what lets a
-    rollback delete a worker that may be running.
+    Absence is the shared probe's POSITIVE message match, never the exit code:
+    tmux exits 1 for a refused client too, and reading that as absent is what
+    lets a rollback delete a worker that may be running.
     """
     socket = socket or default_socket()
     try:
         r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
-    except Exception:                                        # noqa: BLE001
-        return "unknown"
-    if r.returncode == 0:
-        return "exists"
-    return "absent" if r.returncode == 1 else "unknown"
+    except Exception as e:                                   # noqa: BLE001
+        return "unknown", f"tmux could not be run: {e}"
+    rc = getattr(r, "returncode", None)
+    err = getattr(r, "stderr", None) or ""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    verdict = tmux_probe.classify(rc, err)
+    if verdict is True:
+        return "exists", ""
+    if verdict is False:
+        return "absent", err.strip()
+    return "unknown", f"tmux exited {rc}: {err.strip() or '(no message)'}"
+
+
+def session_state(name: str, socket=None, runner=_run) -> str:
+    """"exists" | "absent" | "unknown", from `session_probe`."""
+    return session_probe(name, socket, runner)[0]
 
 
 def session_exists(name: str, socket=None, runner=_run) -> bool:
@@ -208,12 +222,12 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket,
              label=label, worker_id=worker_id)
     name = p["tmux"]["session_name"]
-    state = session_state(name, socket, runner)
+    state, detail = session_probe(name, socket, runner)
     if state == "exists":
         raise SpawnRefused(f"tmux session {name!r} already exists")
     if state != "absent":
-        raise SpawnRefused(f"tmux could not say whether session {name!r} exists; "
-                           f"refusing rather than minting a worker over one")
+        raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
+                           f"({detail}); refusing rather than minting a worker over one")
     rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
                            host=os.uname().nodename, session_id=session_id,
                            tmux_socket=socket, worker_id=worker_id)
@@ -225,11 +239,13 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         why = (r.stderr or "").strip()
         # A non-zero launcher may still have started the session (a readiness
         # probe that times out); deleting then would strip a live worker.
-        if session_state(name, socket, runner) != "absent":
+        after, detail = session_probe(name, socket, runner)
+        if after != "absent":
+            fate = ("is alive" if after == "exists"
+                    else f"could not be checked ({detail})")
             raise SpawnRetained(
                 f"the runtime launcher failed ({why}), and tmux session {name!r} "
-                f"is alive or could not be checked, so worker {rec['worker_id']} "
-                f"was KEPT with its records "
+                f"{fate}, so worker {rec['worker_id']} was KEPT with its records "
                 f"and inbox {p['delivery_dir']}. Attach with "
                 f"`tmux -S {socket} attach -t {name}` to finish or stop it, then "
                 f"remove the worker if it is not wanted.",

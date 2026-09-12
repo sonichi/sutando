@@ -49,7 +49,9 @@ class FakeTmux:
         sub = argv[3] if len(argv) > 3 else ""
         if sub == "has-session":
             name = argv[-1].lstrip("=")
-            return subprocess.CompletedProcess(argv, 0 if name in self.existing else 1, "", "")
+            # tmux's own absence message: the probe matches it, not the exit code.
+            return (subprocess.CompletedProcess(argv, 0, "", "") if name in self.existing
+                    else subprocess.CompletedProcess(argv, 1, "", f"can't find session: {name}"))
         if self.fail_on and sub == self.fail_on:
             return subprocess.CompletedProcess(argv, 1, "", f"{sub} exploded")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -69,7 +71,9 @@ class FakeTmuxUnsureAfterLaunch(FakeTmux):
     def __call__(self, argv, **kw):
         if argv[0] == "tmux" and "has-session" in argv:
             self.calls.append(argv)
-            return subprocess.CompletedProcess(argv, 2 if self.launched else 1, "", "")
+            if self.launched:
+                return subprocess.CompletedProcess(argv, 1, "", "error connecting to server")
+            return subprocess.CompletedProcess(argv, 1, "", "can't find session: x")
         if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
             self.launched = True
             self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
@@ -160,6 +164,11 @@ class TestRefusals(Base):
             self.assertIn("already exists", str(e.exception))
         finally:
             _wi.new_worker_id = orig
+        # Detected BEFORE the first durable write: no record, no current.json, no inbox.
+        self.assertFalse(wi.worker_dir(self.ws, probe["worker_id"]).exists())
+        self.assertFalse(wi.current_path(self.ws, probe["worker_id"]).exists())
+        self.assertFalse(Path(probe["delivery_dir"]).exists())
+        self.assertFalse(any(a[0] == "bash" and a[1].endswith("start-cli.sh") for a in t.calls))
 
     def test_a_launcher_failure_surfaces_rather_than_half_creating(self):
         with self.assertRaises(sw.SpawnRefused) as e:
@@ -310,13 +319,20 @@ class TestRuntimeStartFailure(Base):
         self.assertEqual(before, after)
 
     def test_the_probe_reports_three_states(self):
+        """Absence is tmux's MESSAGE, matched by the shared probe; an exit 1
+        with any other message is a client the server refused, not an answer."""
         class R:
-            def __init__(self, rc): self.rc = rc
+            def __init__(self, rc, err=""): self.rc, self.err = rc, err
             def __call__(self, argv, **kw):
-                return subprocess.CompletedProcess(argv, self.rc, "", "")
+                return subprocess.CompletedProcess(argv, self.rc, "", self.err)
         self.assertEqual(sw.session_state("n", "/tmp/s", R(0)), "exists")
-        self.assertEqual(sw.session_state("n", "/tmp/s", R(1)), "absent")
-        self.assertEqual(sw.session_state("n", "/tmp/s", R(2)), "unknown")
+        self.assertEqual(sw.session_state("n", "/tmp/s", R(1, "can't find session: =n")), "absent")
+        self.assertEqual(sw.session_state("n", "/tmp/s", R(1, "no server running on /tmp/s")), "absent")
+        self.assertEqual(sw.session_state("n", "/tmp/s", R(1, "Permission denied")), "unknown")
+        self.assertEqual(sw.session_state("n", "/tmp/s", R(1)), "unknown")
+        self.assertEqual(sw.session_state("n", "/tmp/s", R(2, "server exited unexpectedly")), "unknown")
+        self.assertEqual(sw.session_probe("n", "/tmp/s", R(1, "Permission denied"))[1],
+                         "tmux exited 1: Permission denied")
 
     def test_a_launcher_failure_with_no_session_still_rolls_back(self):
         """The other polarity: a definite absence still cleans up."""
@@ -500,6 +516,87 @@ class TestBootstrapSeam(Base):
         # path on purpose, and the same needle finds it there.
         control = REPO / "tests" / "start-cli-worker-env-forwarded.test.sh"
         self.assertIn("skills/worker-pool", control.read_text(encoding="utf-8"))
+
+
+class FakeTmuxRefusedAfterLaunch(FakeTmux):
+    """tmux exits 1 after the failed launch, but with a message that is NOT
+    absence -- a refused client. Read by exit code alone this is "no session",
+    and the rollback that follows deletes a worker that may be running."""
+    def __init__(self, message, *a, **kw):
+        super().__init__(*a, **kw)
+        self.message, self.launched = message, False
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "tmux" and "has-session" in argv:
+            self.calls.append(argv)
+            if self.launched:
+                return subprocess.CompletedProcess(argv, 1, "", self.message)
+            return subprocess.CompletedProcess(argv, 1, "", "can't find session: x")
+        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+            self.launched = True
+            self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
+            return subprocess.CompletedProcess(argv, 1, "", "did not come up within ~5s")
+        return super().__call__(argv, **kw)
+
+
+class TestRollbackNeedsDefinitiveAbsence(Base):
+    """Rollback of the identity and inbox only on the shared probe's definitive
+    False; an rc 1 the probe does not recognise retains, and says why."""
+
+    def _spawn_with(self, runner, wid):
+        orig, wi.new_worker_id = wi.new_worker_id, lambda: wid
+        try:
+            with self.assertRaises(sw.SpawnRefused) as e:
+                sw.spawn(self.ws, REPO, runner=runner, require_sentinel=False)
+        finally:
+            wi.new_worker_id = orig
+        return e.exception
+
+    def test_rc1_permission_denied_retains_the_worker(self):
+        wid = "1" * 32
+        e = self._spawn_with(FakeTmuxRefusedAfterLaunch("Permission denied"), wid)
+        self.assertIsInstance(e, sw.SpawnRetained)
+        self.assertTrue(wi.worker_dir(self.ws, wid).exists())
+        self.assertTrue(wi.current_path(self.ws, wid).exists())
+        self.assertTrue((self.ws / "deliveries" / wid).exists())
+        self.assertIn("could not be checked", str(e))
+        self.assertIn("Permission denied", str(e))
+
+    def test_rc1_with_no_message_retains_the_worker(self):
+        wid = "2" * 32
+        e = self._spawn_with(FakeTmuxRefusedAfterLaunch(""), wid)
+        self.assertIsInstance(e, sw.SpawnRetained)
+        self.assertTrue(wi.worker_dir(self.ws, wid).exists())
+        self.assertTrue((self.ws / "deliveries" / wid).exists())
+
+    def test_a_genuine_missing_session_answer_rolls_back(self):
+        wid = "3" * 32
+        e = self._spawn_with(FakeTmuxRefusedAfterLaunch("can't find session: x"), wid)
+        self.assertNotIsInstance(e, sw.SpawnRetained)
+        self.assertFalse(wi.worker_dir(self.ws, wid).exists())
+        self.assertFalse((self.ws / "deliveries" / wid).exists())
+
+    def test_a_dead_server_answer_rolls_back(self):
+        wid = "4" * 32
+        e = self._spawn_with(FakeTmuxRefusedAfterLaunch("no server running on /tmp/s"), wid)
+        self.assertNotIsInstance(e, sw.SpawnRetained)
+        self.assertFalse(wi.worker_dir(self.ws, wid).exists())
+        self.assertFalse((self.ws / "deliveries" / wid).exists())
+
+    def test_the_precondition_probe_refuses_on_an_unrecognised_rc1(self):
+        """The same tri-state at the front: rc 1 / Permission denied is not
+        "absent", so nothing is minted over a session that may exist."""
+        class Refused(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "tmux" and "has-session" in argv:
+                    return subprocess.CompletedProcess(argv, 1, "", "Permission denied")
+                return super().__call__(argv, **kw)
+        wid = "5" * 32
+        e = self._spawn_with(Refused(), wid)
+        self.assertIn("could not say whether", str(e))
+        self.assertIn("Permission denied", str(e))
+        self.assertFalse(wi.worker_dir(self.ws, wid).exists())
+        self.assertFalse((self.ws / "deliveries" / wid).exists())
 
 
 if __name__ == "__main__":

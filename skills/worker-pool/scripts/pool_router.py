@@ -56,16 +56,18 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
     finished work, and a sentinel would offer it again.
     """
     d = pd.deliveries_dir(workspace, recipient)
-    if pd.find(workspace, recipient, task_id) is not None:
-        return "already"
-    if not pd.payload_path(Path(workspace), task_id).is_file():
-        return "no-payload"
-    d.mkdir(parents=True, exist_ok=True)
-    try:
-        os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
-                         os.O_CREAT | os.O_EXCL))
-    except FileExistsError:
-        return "already"
+    # Check-of-both-names and create are ONE transition under the folder's lock:
+    # an accept between them renames the pending name away and O_EXCL recreates it.
+    with pd.arbitration(workspace, recipient):
+        if pd.find(workspace, recipient, task_id) is not None:
+            return "already"
+        if not pd.payload_path(Path(workspace), task_id).is_file():
+            return "no-payload"
+        try:
+            os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
+                             os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            return "already"
     return "delivered"
 
 
