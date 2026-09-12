@@ -29,41 +29,44 @@ REPO = Path(__file__).resolve().parents[3]
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
+import watcher_identity as wid  # noqa: E402
 
-WATCHER_SCRIPT = "watch-tasks-stream.sh"
+WATCHER_SCRIPT = wid.WATCHER_SCRIPT_NAME
 
 
-def _watcher_target(pid: int):
+class Unobserved(Exception):
+    """The inspection proved nothing either way: not a verdict, so never `start`."""
+
+
+def _watcher_target(pid: int, run=None, argv_vector=None):
     """What inbox is this pid's watcher watching?
 
-    None  — not a watcher at all (a recycled or unrelated pid).
+    None  — proven not a watcher (a recycled or unrelated pid).
     ""    — a watcher whose inbox argv does not show, so ownership is unknown.
     path  — the inbox it was told to watch.
-
-    Narrow probe: the command column only. `ps eww` would print the process's
-    environment, which on this host carries credentials.
+    Raises Unobserved when `ps` proved nothing or the argv cannot be decided.
     """
-    try:
-        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=10)
-    except Exception:                                        # noqa: BLE001
-        return None
-    if out.returncode != 0:
-        return None
-    return _target_from_argv(out.stdout)
+    got = wid.inspect_pid(pid, run=run if run is not None else subprocess.run,
+                          argv_vector=argv_vector)
+    if not got.observed:
+        raise Unobserved(got.reason)
+    return _target_from_argv(got.argv, pid, argv_vector)
 
 
-def _target_from_argv(command: str):
+def _target_from_argv(command: str, pid=None, argv_vector=None):
     """The inbox a watcher command line names, "" when it names none, None when
-    it is not a watcher at all."""
-    if WATCHER_SCRIPT not in command:
+    it is not a watcher. The shared anchored policy decides which; an argv it
+    cannot decide raises Unobserved rather than disowning a live watcher."""
+    verdict = wid.classify_argv(command, pid, argv_vector)
+    if verdict.watcher is None:
+        raise Unobserved(f"argv {command!r} cannot be decided without the process's "
+                         f"real argv vector")
+    if verdict.watcher is False:
         return None
-    # ps flattens argv, so the path is the whole tail: splitting it would
-    # cut "Application Support" into two words and disown a live watcher.
-    tail = command.split(WATCHER_SCRIPT, 1)[1].strip()
-    while tail.startswith("-"):
-        tail = tail.split(None, 1)[1].strip() if " " in tail else ""
-    return tail
+    for tok in verdict.operands:
+        if not tok.startswith("-"):
+            return tok
+    return ""
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -122,7 +125,12 @@ def decide(*, instance: str, inbox: str, workspace: str,
         return "start", f"sentinel {sentinel} names a dead pid ({pid})"
     # Being SOME watcher is not being THIS worker's: a reused pid belonging to
     # another worker's watcher would suppress this one and strand its inbox.
-    target = watcher_target(int(pid))
+    try:
+        target = watcher_target(int(pid))
+    except Unobserved as e:
+        return "unknown", (f"sentinel {sentinel} names live pid {pid}, and whether it "
+                           f"is a {WATCHER_SCRIPT} could not be observed ({e}); a "
+                           f"duplicate watcher processes every delivery twice")
     if target is None:
         return "start", (f"sentinel {sentinel} names live pid {pid}, which is not "
                          f"a {WATCHER_SCRIPT} — treating the sentinel as stale")

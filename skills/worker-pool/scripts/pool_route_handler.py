@@ -58,33 +58,38 @@ def read_task(task_file: str) -> dict:
     return task
 
 
-def classify(workspace, task: dict) -> tuple[int, list]:
-    """(exit code, targets) without delivering anything."""
+def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
+    """(exit code, targets, the roster they were read from) without delivering.
+
+    The roster is returned so the run routes against the SAME snapshot that
+    admitted the task: reloaded, a binding removed in between sends the task
+    to the core under an exit code that says a worker has it.
+    """
     # A picker command edits the bindings; routing it BY a binding would hand
     # a bound room's unpin to the worker it unpins. The core is the controller.
 
     # Two writer generations: the lane-authority writer stamps wire_source,
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
-        return DECLINE, []
+        return DECLINE, [], None
     try:
         raw = pr._load_existing_roster_strict(workspace)
     except pr.RosterError:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
-        return MUST_HANDLE, []
+        return MUST_HANDLE, [], None
     roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
-        return DECLINE, []
+        return DECLINE, [], None
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
                              task.get("requested_worker"))
     # One question only: is every target on the roster? Anything else -- no
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
-        return DECLINE, targets
+        return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
-    return 0, targets
+    return 0, targets, roster
 
 
 def main(argv=None) -> int:
@@ -98,14 +103,14 @@ def main(argv=None) -> int:
 
     ws = args.workspace
     task = read_task(args.task_file)
-    code, _targets = classify(ws, task)
+    code, _targets, roster = classify(ws, task)
     if args.probe:
         return code
     if code == DECLINE:
         return DECLINE
 
     try:
-        out = rt.route(ws, task, None)
+        out = rt.route(ws, task, roster)
     except rt.RouterRefused as e:
         # The pass refused; the core must not silently inherit the task.
         print(f"pool_route_handler: {e}", file=sys.stderr)
