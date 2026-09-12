@@ -30,8 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 import local_task_protocol as ltp  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
+import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
+import pool_advertise as pa
 
 DECLINE = 3
 MUST_HANDLE = 4
@@ -95,6 +97,24 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
+def apply_picker(workspace, task_file) -> "dict | None":
+    """A pin is live the moment it arrives: applied and published here, at the
+    edge, so the bridge ships the new binding without waiting for another
+    task. Runs on the probe as well: the watcher probes once and, on DECLINE,
+    hands the task straight to the core, so the probe is the only call a
+    picker task gets. Idempotent; a failure is reported, never fatal."""
+    try:
+        cmd = wpc.authorized_command(task_file)
+        out = wpc.apply(workspace, cmd) if cmd else None
+    except (pr.RosterError, OSError, ValueError) as e:
+        print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
+        return None
+    if out:
+        print(f"pool_route_handler: applied {out['action']} for {out['room']} "
+              f"(roster v{out['roster_version']}, advertisement written)", file=sys.stderr)
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--task-file", required=True)
@@ -105,7 +125,15 @@ def main(argv=None) -> int:
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    # An inherited roster has no advertisement until something publishes it;
+    # the edge is here, and a failure to publish must never stop routing.
+    try:
+        pa.ensure_advertisement(ws)
+    except OSError as e:
+        print(f"pool_route_handler: advertisement not ensured: {e}", file=sys.stderr)
     task = read_task(args.task_file)
+    if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
+        apply_picker(ws, args.task_file)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:

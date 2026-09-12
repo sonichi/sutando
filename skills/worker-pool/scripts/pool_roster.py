@@ -210,7 +210,7 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
               "workers": dict(workers or {}), "bindings": bindings}
     _write_atomic(roster_path(workspace), roster)
     return roster
-def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
+def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
 
@@ -222,10 +222,46 @@ def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
     with _locked(workspace):
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
+        if runtime:
+            workers[worker_id]["runtime"] = str(runtime)
         bindings = dict(load_bindings(workspace))
         if room:
             bindings[room] = worker_id
             # The next registration reloads bindings.json, not the roster: a
             # binding held only in the compiled roster is discarded by it.
             save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)
+
+
+def bind_room(workspace, room: str, target: str) -> dict:
+    """Bind one room to one worker, named by id or by a unique label — the one
+    production writer for a pin. Same locked read-merge-write as
+    `register_worker`; an unknown or ambiguous name is refused BEFORE the
+    declaration is saved, so bindings.json never names a target the roster
+    would reject on its next compile."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to bind to")
+        workers = dict(raw.get("workers") or {})
+        wid = resolve_label(raw, target)
+        if wid != CORE and wid not in workers:
+            raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        bindings = dict(load_bindings(workspace))
+        bindings[room] = wid
+        save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)
+
+
+def unbind_room(workspace, room: str) -> dict:
+    """Drop a room's binding; its tasks go to the core again. Absent is not an
+    error: an unpin of an unbound room is the state the owner asked for."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to unbind")
+        workers = dict(raw.get("workers") or {})
+        bindings = dict(load_bindings(workspace))
+        bindings.pop(room, None)
+        save_bindings(workspace, bindings)
         return compile_roster(workspace, workers, bindings)
