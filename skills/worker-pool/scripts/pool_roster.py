@@ -124,6 +124,28 @@ def load_roster(workspace):
     return raw
 
 
+def _load_existing_roster_strict(workspace):
+    """The writer's own read of the roster it is about to replace.
+
+    Absent is a valid starting point. Unreadable or malformed is not — treating
+    either as absent would silently overwrite whatever it is hiding.
+    """
+    p = roster_path(workspace)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise RosterError(f"roster unreadable, refusing to touch it: {p}: {e}") from e
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        raise RosterError(f"roster is not valid JSON, refusing to touch it: {p}: {e}") from e
+    if not isinstance(raw, dict) or "workers" not in raw:
+        raise RosterError(f"roster is missing 'workers', refusing to touch it: {p}")
+    return raw
+
+
 def resolve_label(roster: dict, name: str) -> str:
     """A worker's display label to its id; anything else unchanged.
 
@@ -186,7 +208,7 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
                 f"binding {source!r} names {missing} which are not workers — "
                 "a binding to a nonexistent target fails every task from that source")
 
-    prev = load_roster(workspace) or {}
+    prev = _load_existing_roster_strict(workspace) or {}
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
@@ -204,7 +226,7 @@ def register_worker(workspace, worker_id: str, label: str, room=None) -> dict:
     drops one of them from the result.
     """
     with _locked(workspace):
-        workers = dict((load_roster(workspace) or {}).get("workers") or {})
+        workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
         bindings = dict(load_bindings(workspace))
         if room:

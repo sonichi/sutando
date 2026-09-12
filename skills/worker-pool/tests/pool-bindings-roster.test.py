@@ -17,6 +17,7 @@ Run: python3 skills/worker-pool/tests/pool-bindings-roster.test.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -217,6 +218,58 @@ class TestCorruptDeclarations(Base):
                          {"bindings": {"!x:ag2.space": W1}})
         r = pr.compile_roster(self.ws, live(W1))
         self.assertEqual(pr.targets_for(r, "!x:ag2.space"), [W1])
+
+
+class TestTheWriterRefusesAnUnreadableOrMalformedRoster(Base):
+    """Absent starts empty; unreadable or malformed must not — either would
+    silently discard whatever roster a concurrent writer or a permissions
+    problem is hiding."""
+
+    def unreadable(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"version": 7, "workers": live(W1), "bindings": {}}))
+        p.chmod(0o000)
+        self.addCleanup(lambda: p.chmod(0o644))
+        return p
+
+    def test_an_absent_roster_starts_empty(self):
+        r = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(r["version"], 1)
+        pr.register_worker(self.ws, W2, "w2")
+        self.assertEqual(set(pr.load_roster(self.ws)["workers"]), {W1, W2})
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_compile_roster_refuses_an_unreadable_roster(self):
+        p = self.unreadable()
+        before = p.stat().st_mode
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W2))
+        self.assertEqual(p.stat().st_mode, before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_register_worker_refuses_an_unreadable_roster(self):
+        p = self.unreadable()
+        before = p.stat().st_mode
+        with self.assertRaises(pr.RosterError):
+            pr.register_worker(self.ws, W2, "w2")
+        self.assertEqual(p.stat().st_mode, before)
+
+    def test_compile_roster_refuses_a_malformed_roster(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(p.read_text(), "{not json")
+
+    def test_register_worker_refuses_a_malformed_roster(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        with self.assertRaises(pr.RosterError):
+            pr.register_worker(self.ws, W1, "w1")
+        self.assertEqual(p.read_text(), "{not json")
 
 
 if __name__ == "__main__":
