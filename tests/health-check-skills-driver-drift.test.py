@@ -247,6 +247,57 @@ def main() -> int:
                   "h) inverting the `same` predicate breaks the healthy case "
                   f"(the comparison is exercised, not merely present), got {rm}")
 
+    # k) ambiguity is the property under test, not the prefix length — 4 chars
+    #    needs a few hundred objects and takes the identical code path.
+    with tempfile.TemporaryDirectory() as td:
+        ws, _h = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        seen, prefix = {}, None
+        for i in range(4000):
+            oid = subprocess.run(["git", "-C", str(sk), "hash-object", "-w", "--stdin"],
+                                 input=f"blob{i}\n", capture_output=True, text=True,
+                                 check=True).stdout.strip()
+            if oid[:4] in seen and seen[oid[:4]] != oid:
+                prefix = oid[:4]
+                break
+            seen[oid[:4]] = oid
+        check(prefix is not None, "k) fixture precondition: two real objects share a prefix")
+        if prefix:
+            amb = subprocess.run(["git", "-C", str(sk), "rev-parse", "--verify", f"{prefix}^{{commit}}"],
+                                 capture_output=True, text=True)
+            check(amb.returncode != 0 and "ambiguous" in amb.stderr.lower(),
+                  f"k) fixture precondition: git calls {prefix!r} ambiguous, got {amb.stderr.strip()[:70]!r}")
+            (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{prefix}] driver started\n")
+            r = hc.check_skills_driver_code_drift(ws)
+            check(r["status"] == "ok" and "INCONCLUSIVE" in r["detail"],
+                  f"k) an ambiguous stamp is INCONCLUSIVE, got {r}")
+            check("Re-arm" not in r["detail"],
+                  f"k) and it does not advise a re-arm, got {r['detail']}")
+
+    # l) the stamp is the THIRD git call; killing an earlier one tests the
+    #    HEAD branch instead, which is a different arm.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        (ws / "state" / "content-driver.log").write_text(f"[v=e1e1f151715f@{head}] driver started\n")
+        real_run, calls = subprocess.run, {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            argv = a[0] if a else k.get("args", [])
+            if "--verify" in argv and head in " ".join(argv):
+                raise subprocess.TimeoutExpired(["git"], 10)
+            return real_run(*a, **k)
+
+        hc.subprocess.run = flaky
+        try:
+            r = hc.check_skills_driver_code_drift(ws)
+        finally:
+            hc.subprocess.run = real_run
+        check(r["status"] == "ok" and "INCONCLUSIVE" in r["detail"],
+              f"l) an unrunnable stamp lookup is INCONCLUSIVE, got {r}")
+        check("Re-arm" not in r["detail"],
+              f"l) and it does not advise a re-arm, got {r['detail']}")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED")

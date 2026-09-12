@@ -3210,19 +3210,28 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     # Never compare two abbreviations: each writer picks its own length, so they
     # agree until a colliding object lands and `--short` grows. Resolve both.
     def _oid(rev):
+        """(state, oid) — 'ok' | 'absent' | 'unknown'. Absent is a finding;
+        ambiguous or unrunnable is unobserved, and the two must not merge."""
         try:
-            r = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"),
+            r = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--verify", f"{rev}^{{commit}}"),
                                capture_output=True, text=True, timeout=10)
-            return r.stdout.strip() if r.returncode == 0 else ""
         except Exception:
-            return ""
-    head_oid = _oid("HEAD")
-    if not head_oid:
+            return ("unknown", "")
+        if r.returncode == 0:
+            return ("ok", r.stdout.strip())
+        return ("unknown", "") if "ambiguous" in (r.stderr or "").lower() else ("absent", "")
+    head_state, head_oid = _oid("HEAD")
+    if head_state != "ok":
         return {"name": name, "status": "ok",
-                "detail": "could not resolve HEAD in the skills checkout — not asserting drift"}
-    # An unresolvable STAMP is a finding, not an unanswerable: the driver is on
-    # code this checkout does not have. Only an unreadable HEAD is unanswerable.
-    same = _oid(running) == head_oid
+                "detail": f"HEAD in the skills checkout is {head_state} — not asserting drift"}
+    run_state, run_oid = _oid(running)
+    # Unobserved is not stale. An ambiguous prefix or an unrunnable git says
+    # nothing about the driver; only a resolvable, different commit does.
+    if run_state == "unknown":
+        return {"name": name, "status": "ok",
+                "detail": (f"could not identify the driver stamp {running} (ambiguous prefix or git "
+                           f"unavailable) — INCONCLUSIVE, not asserting drift or a re-arm")}
+    same = run_oid == head_oid
     if same:
         return {"name": name, "status": "ok",
                 "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
