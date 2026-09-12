@@ -459,11 +459,15 @@ def _mention_gate_owner_ids() -> list:
     return [str(u) for u in allow] if isinstance(allow, list) else []
 
 
-def _mention_gate_triggers_ingest(message) -> bool:
+def _mention_gate_triggers_ingest(message, announce: bool = True) -> bool:
     """ON-side gate (skills/mention-gate): while ON, a message @-tagging an
     owner counts as a bot mention. Fail-closed: any error → today's rejection.
     Verdict only — the audit is written by _mention_gate_log_admission AFTER
-    the task file exists, so an unauthorized sender can never inflate it."""
+    the task file exists, so an unauthorized sender can never inflate it.
+
+    `announce=False` asks the same question about a message that is NOT being
+    ingested, so the admission line would name an admission that never happens.
+    """
     try:
         owners = _mention_gate_owner_ids()
         if not owners or str(message.author.id) in owners:
@@ -475,8 +479,9 @@ def _mention_gate_triggers_ingest(message) -> bool:
             return False
         if not mention_gate.owner_tag_triggers_ingest(REPO):
             return False
-        print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
-              f"admitted as a mention (audit deferred to task write)", flush=True)
+        if announce:
+            print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
+                  f"admitted as a mention (audit deferred to task write)", flush=True)
         return True
     except Exception as e:
         print(f"  [mention-gate] check failed ({e}) — ordinary requireMention "
@@ -2966,6 +2971,26 @@ async def on_message(message):
     await _handle_discord_message(message)
 
 
+def _counts_as_mention(message) -> bool:
+    """What the ARRIVAL path treats as addressing this bot. Arrival derives
+    requireMention and consults the gate ONLY inside `if not is_dm`, so both
+    halves of that condition are mirrored here: a DM and a free-listen channel
+    each already ingest on arrival, and consulting the gate for either would
+    queue an edited message a second time.
+
+    Never announces: this is a PRE-decision, and the handler it defers to
+    consults the gate again and announces the admission that actually happens.
+    """
+    if _message_mentions_bot(message):
+        return True
+    if isinstance(getattr(message, "channel", None), discord.DMChannel):
+        return False
+    cfg = load_channel_config(str(getattr(message.channel, "id", "")))
+    require_mention = True if cfg is None else bool(cfg[0])
+    return require_mention and _mention_gate_triggers_ingest(message,
+                                                             announce=False)
+
+
 @client.event
 async def on_message_edit(before, after):
     """Handle edited messages in two cases:
@@ -2976,8 +3001,8 @@ async def on_message_edit(before, after):
         return
     if after.author.bot and client.user not in after.mentions:
         return
-    # Case 1: edit introduced a bot mention
-    if _message_mentions_bot(after) and not _message_mentions_bot(before):
+    # Case 1: the edit introduced whatever the arrival path counts as a mention.
+    if _counts_as_mention(after) and not _counts_as_mention(before):
         print(f"  [edit] mention added to msg {after.id} — reprocessing", flush=True)
         await _handle_discord_message(after, force=True)
         return
