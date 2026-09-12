@@ -13,7 +13,6 @@ fi
 # An inbox is not always <workspace>/tasks: a pool worker watches
 # <workspace>/deliveries/<id>, whose parent is deliveries/, not the workspace.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
-INBOX_KIND="${SUTANDO_INBOX_KIND:-tasks}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 TASK_HANDLER_CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
@@ -56,7 +55,7 @@ probe_optional_task_handler() {
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime codex \
     --workspace "$WORKSPACE_DIR" \
-    --task-file "$(payload_file "$filename")" \
+    --task-file "$TASKS_DIR/$filename" \
     --results-dir "$RESULTS_DIR" \
     --repo "$REPO" \
     --probe >/dev/null
@@ -116,18 +115,6 @@ prepare_workstream_context() {
     echo "task-notifier: workstream context lookup failed for $filename; continuing without context" >&2
     rm -f "$candidate"
   fi
-}
-
-# A sentinel names its payload and holds none; pool_delivery owns that mapping,
-# so the prompt and the handler probe ask it rather than re-spelling tasks/.
-payload_file() {
-  local filename="$1"
-  if [ "$INBOX_KIND" != "deliveries" ]; then
-    printf '%s\n' "$TASKS_DIR/$filename"
-    return 0
-  fi
-  "$NOTIFIER_PY" "${SUTANDO_POOL_DELIVERY_SCRIPT:-$REPO/skills/worker-pool/scripts/pool_delivery.py}" \
-    --workspace "$WORKSPACE_DIR" payload --sentinel "$filename"
 }
 
 has_result() {
@@ -342,7 +329,7 @@ deliver_prompt() {
 }
 
 submit_task() {
-  local filename="$1" wait_for_result="${2:-0}" prompt started payload
+  local filename="$1" wait_for_result="${2:-0}" prompt started
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -350,9 +337,7 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  payload="$(payload_file "$filename")"
-  [ -n "$payload" ] || return 0
-  prompt="Sutando task ready: $filename. Read $payload, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi

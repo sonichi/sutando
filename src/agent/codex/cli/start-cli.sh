@@ -7,6 +7,13 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
+# This runtime has no worker mode: everything below is the canonical core's
+# ceremony, so an instance launch is refused before the first step of it.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  exit 2
+fi
+
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
@@ -147,12 +154,10 @@ WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
-# The session's own scripts resolve the workspace the same way the notifier does,
-# so a worker session that is not told it writes its answers under deliveries/.
-[ -n "${SUTANDO_INSTANCE_ID:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+# The session's own scripts resolve the workspace the same way the notifier
+# does: an inbox that is not <workspace>/tasks needs the workspace named.
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
-[ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 # tmux's server environment can predate the product-mode override, so forward
@@ -195,11 +200,9 @@ notifier_env_args() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-  # Without these the notifier derives state/ and results/ from the inbox's
-  # parent — deliveries/results for a worker, which no bridge ever drains.
+  # Without it the notifier derives state/ and results/ from the inbox's
+  # parent, which is the workspace only when the inbox is <workspace>/tasks.
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
-  [ -n "${SUTANDO_INBOX_KIND:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
-  [ -n "${SUTANDO_INSTANCE_ID:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
   return 0   # the last test is a filter, not this function's verdict
 }
 
