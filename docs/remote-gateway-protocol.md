@@ -67,6 +67,16 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
+`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
+already serialized as a string; the bridge writes it as JSON either way. Both
+are written as trusted pre-body headers, because `worker_picker_commands.py`
+reads them with the parser that stops at `task:`. A command the reader cannot
+honour — an unknown verb, args that are not an object, or arguments that do not
+fit the verb — is refused by name rather than resolved from the sentence, and
+the room always comes from `channel_id`, never from `picker_args`. A broker
+that sends no `picker_command` keeps the prose fallback.
+
 An AG2 Space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for

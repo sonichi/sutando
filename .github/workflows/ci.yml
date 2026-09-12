@@ -162,6 +162,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
