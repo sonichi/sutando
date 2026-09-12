@@ -7,6 +7,13 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
+# This runtime has no worker mode: everything below is the canonical core's
+# ceremony, so an instance launch is refused before the first step of it.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  exit 2
+fi
+
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
