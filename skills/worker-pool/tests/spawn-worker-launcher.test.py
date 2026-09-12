@@ -194,6 +194,20 @@ class TestRuntimeStartFailure(Base):
                      require_sentinel=False)
         self.assertIn("launcher failed", str(e.exception))
 
+    def test_a_failed_launch_leaves_no_record_or_delivery_dir(self):
+        """A refusal that leaves the record and delivery dir behind is not a
+        refusal — it is an undisclosed worker the roster never learns about."""
+        wid = "e" * 32
+        orig, wi.new_worker_id = wi.new_worker_id, lambda: wid
+        try:
+            with self.assertRaises(sw.SpawnRefused):
+                sw.spawn(self.ws, REPO, runner=FakeTmux(fail_on="launcher"),
+                         require_sentinel=False)
+        finally:
+            wi.new_worker_id = orig
+        self.assertFalse((self.ws / "state" / "workers" / wid).exists())
+        self.assertFalse((self.ws / "deliveries" / wid).exists())
+
     def test_the_recorded_session_id_is_the_one_the_runtime_is_told(self):
         """Lineage is only truthful if the id in the record IS the CLI session."""
         t = FakeTmux()

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,18 @@ def core_runtime(repo, runner=_run) -> str:
     return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
 
 
+def resolve_runtime(repo, runtime=None, runner=_run) -> str:
+    """The one runtime decision a dry-run and a real spawn must share — an
+    unsupported value refuses here so both paths refuse identically."""
+    runtime = runtime or core_runtime(repo, runner)
+    if runtime not in WORKER_MODE_RUNTIMES:
+        raise SpawnRefused(
+            f"runtime {runtime!r} has no worker mode — its launcher would run "
+            f"the canonical-core bootstrap; supported: "
+            f"{', '.join(WORKER_MODE_RUNTIMES)}")
+    return runtime
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
          socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
@@ -152,12 +165,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     the only part that starts reading.
     """
     socket = socket or default_socket()
-    runtime = runtime or core_runtime(repo, runner)
-    if runtime not in WORKER_MODE_RUNTIMES:
-        raise SpawnRefused(
-            f"runtime {runtime!r} has no worker mode — its launcher would run "
-            f"the canonical-core bootstrap; supported: "
-            f"{', '.join(WORKER_MODE_RUNTIMES)}")
+    runtime = resolve_runtime(repo, runtime, runner)
     if require_sentinel and not per_instance_sentinel_supported(repo, runner):
         raise SpawnRefused(
             "this checkout writes ONE watcher sentinel for every watcher, so a "
@@ -177,6 +185,10 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     env = {**os.environ, **p["env"], "SUTANDO_CLAUDE_SESSION_ID": session_id}
     r = runner(p["launcher_argv"], env=env)
     if r.returncode != 0:
+        # Roll back only what this call minted — the worker_id is freshly
+        # generated, so nothing else can be pointing at either path yet.
+        shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
+        shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {(r.stderr or '').strip()}")
 
     return {**p, **rec, "runtime_session_id": session_id, "started": True}
