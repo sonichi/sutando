@@ -94,9 +94,14 @@ WORKSPACE_SURFACE_DIRS=(
     # Owner-custom tooling surface (report c8310df7): <workspace>/scripts is
     # DATA. The repo's own scripts/ is code — excluded via SOURCE_A_EXCLUDE.
     "scripts"
-    # Agent config tree (report 9de2a03d): skills, settings, hooks, memory.
-    # Quarantining it silently breaks every configured hook/skill path.
+    # Agent config tree: skills, settings, hooks, memory. Quarantining it
+    # silently breaks every configured hook/skill path.
     ".claude-sutando"
+    # Per-host state tree: crons.json, PERSONAL_CLAUDE.md, pending-questions,
+    # current-track — every reader resolves hosts/<label>/.
+    "hosts"
+    # Session-relay notes: the next session's catchup input.
+    "relay"
 )
 
 # Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
@@ -252,6 +257,8 @@ CLASS_RULES=(
     "agent-inbox/*|structural"
     "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
     ".claude-sutando/*|structural"  # agent config tree: same relpath, never clobber dest
+    "hosts/*|structural"  # per-host identity state; collisions keep both (newer primary + sidecar)
+    "relay/*|structural"
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
     # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
@@ -276,7 +283,9 @@ if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
     echo "sutando-migrate: cannot find $HELPER (expected next to this script)" >&2
     exit 2
 fi
-# Dest resolution deferred to after arg parsing so --respect-env can take effect.
+
+# python-binary.sh's require_python is the single loud-failure owner — never
+# redefine it here. Dest resolution waits for arg parsing, so --respect-env works.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Source detection
@@ -354,7 +363,7 @@ age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    mtime="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
+    mtime="$(_stat %Y %m "$file" 0)"
     age=$((now - mtime))
     [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
 }
@@ -371,7 +380,10 @@ declare -a REPORT_LINES
 # >1 source (cross-source collisions per-source scan misses — e.g. build_log.md
 # in A AND C bound for the same dest path).
 XSRC_INDEX="$(mktemp -t sutando-migrate-xsrc.XXXXXX)"
-trap 'rm -f "$XSRC_INDEX"' EXIT INT TERM
+# Shadow any inherited value before the trap installs, or cleanup rm -f's
+# an arbitrary environment-supplied path this process never created.
+_VERDICTS_TMP=""
+trap 'rm -f "$XSRC_INDEX" "${_VERDICTS_TMP:-}"' EXIT INT TERM
 # Also include dest's existing files (tag "DEST") so we surface dest-collisions
 # uniformly with cross-source collisions.
 
@@ -379,9 +391,9 @@ record_xsrc() {
     # $1=tag, $2=relpath, $3=class, $4=abs-path
     local tag="$1" rel="$2" cls="$3" file="$4"
     local mt sz
-    mt="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
-    sz="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
+    mt="$(_stat %Y %m "$file" 0)"
+    sz="$(_stat %s %z "$file" 0)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" "$file" >> "$XSRC_INDEX"
 }
 
 scan_source() {
@@ -408,7 +420,7 @@ scan_source() {
         REPORT_LINES+=("  prior partial migration sentinels:")
         while IFS= read -r s; do
             local sm
-            sm="$(stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null || stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
+            sm="$(mtime_date "$s")"
             REPORT_LINES+=("    $(basename "$s")  ($sm)")
         done <<<"$sentinels"
     fi
@@ -491,7 +503,7 @@ scan_source() {
         esac
 
         cls="$(classify "$rel")"
-        size="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+        size="$(_stat %s %z "$file" 0)"
         bytes_total=$((bytes_total + size))
 
         # Index for cross-source collision detection (only classes that
@@ -500,7 +512,7 @@ scan_source() {
         # state/<basename>, not the original relpath, so we index under the
         # re-homed path so re-home collisions surface correctly.
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both)
+            structural|append|newest-mtime|collision-keep-both|union-json-array)
                 record_xsrc "$tag" "$rel" "$cls" "$file"
                 ;;
             rehome-state)
@@ -759,17 +771,68 @@ index_dest_for_collisions() {
         local cls
         cls="$(classify "$rel")"
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both|rehome-state)
+            structural|append|newest-mtime|collision-keep-both|union-json-array|rehome-state)
                 record_xsrc "DEST" "$rel" "existing" "$file"
                 ;;
         esac
     done < <(find "${dest_walk[@]}" -type f -print0 2>/dev/null)
 }
 
+# Single owner of content-identity policy for BOTH renderers (human + JSON):
+# per-relpath verdict identical|divergent|unverified over the XSRC index.
+xsrc_identity_verdicts() {
+    local py; py="$(require_python "$REPO_DIR" "hash cross-source collisions")" || exit 2
+    "$py" - "$XSRC_INDEX" <<'PYIDENT'
+import sys, os, json, hashlib
+from collections import defaultdict
+by_rel = defaultdict(list)
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 6:
+                by_rel[parts[0]].append(parts[5])
+except OSError:
+    print("{}"); raise SystemExit
+def sha(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+def ident_key(path):
+    # `byte_identical` is a claim about bytes alone; `mode-divergent` keeps a
+    # bytes-equal/modes-differ row actionable without falsifying it.
+    h = sha(path)
+    if h is None:
+        return None
+    try:
+        return (h, oct(os.stat(path).st_mode & 0o7777))
+    except OSError:
+        return None
+out = {}
+for rel, paths in by_rel.items():
+    if len(paths) < 2:
+        continue
+    ks = [ident_key(p) for p in paths]
+    if None in ks:
+        out[rel] = "unverified"
+    elif len({k[0] for k in ks}) > 1:
+        out[rel] = "divergent"
+    elif len({k[1] for k in ks}) > 1:
+        out[rel] = "mode-divergent"
+    else:
+        out[rel] = "identical"
+json.dump(out, sys.stdout)
+PYIDENT
+}
+
 report_cross_source() {
-    # Post-process XSRC_INDEX (TSV: relpath\ttag\tclass\tmtime\tsize) and print
-    # any relpath that appears in 2+ rows (cross-source / dest collision).
-    # Emits a compact per-class summary + a per-class detail list (capped).
+    # Print every relpath appearing in 2+ XSRC_INDEX rows (cross-source / dest
+    # collision) as a per-class summary + capped per-class detail list.
     local total_xs total_xs_files
     total_xs_files="$(awk -F'\t' '{print $1}' "$XSRC_INDEX" | sort -u | wc -l | tr -d ' ')"
     total_xs="$(awk -F'\t' '
@@ -787,29 +850,19 @@ report_cross_source() {
         return
     fi
 
-    # Identical-content collisions: cross-source rows where ALL entries share
-    # the same mtime AND size for the relpath. High-confidence "same file
-    # mirrored through sync" — commit can pick one source as canonical and
-    # skip the rest (no real conflict). Common case: memory-sync mirroring
-    # notes/ between B and C.
-    local total_identical
-    # Concatenated-key idiom (BSD awk has no array-of-array); detect identical
-    # across all entries of a relpath by counting distinct (mtime,size) pairs.
-    total_identical="$(awk -F'\t' '
-        {
-            n[$1]++
-            key = $1 SUBSEP $4 "|" $5
-            if (!(key in seen)) { seen[key]=1; pairs[$1]++ }
-        }
-        END {
-            ident=0
-            for (k in n) if (n[k]>1 && pairs[k]==1) ident++
-            print ident
-        }
-    ' "$XSRC_INDEX" 2>/dev/null || echo 0)"
+    # Verdicts come from the single identity owner (xsrc_identity_verdicts);
+    # an unreadable entry is UNVERIFIED — never certified, never called divergent.
+    local verdicts total_identical total_unverified count_py
+    verdicts="$(xsrc_identity_verdicts)"
+    count_py="$(require_python "$REPO_DIR" "count identity verdicts")" || exit 2
+    read -r total_identical total_unverified <<<"$("$count_py" -c \
+'import sys,json;v=json.load(sys.stdin);print(sum(1 for x in v.values() if x=="identical"), sum(1 for x in v.values() if x=="unverified"))' <<<"$verdicts")"
 
-    REPORT_LINES+=("  of which identical-content (same mtime + size):  $total_identical (commit will pick one canonical + skip rest)")
-    REPORT_LINES+=("  genuine cross-source conflicts (need strategy):  $((total_xs - total_identical))")
+    REPORT_LINES+=("  of which identical-content (byte-verified):  $total_identical (commit will pick one canonical + skip rest)")
+    if [ "$total_unverified" -gt 0 ]; then
+        REPORT_LINES+=("  unverified (could not hash — fix permissions, re-scan):  $total_unverified")
+    fi
+    REPORT_LINES+=("  genuine cross-source conflicts (need strategy):  $((total_xs - total_identical - total_unverified))")
 
     # Per-class breakdown of cross-source collisions
     REPORT_LINES+=("  by class:")
@@ -951,26 +1004,112 @@ backup_dest() {
 source_sentinel() {
     echo "$DEST_REAL/state/.migrated-from-$1-$BACKUP_ID"
 }
+union_scalar_manifest() {
+    echo "$DEST_REAL/state/.migration-union-scalars-$BACKUP_ID.json"
+}
 any_source_sentinel() {
     # Any sentinel for this source tag (commit may have been run before with a
     # different backup id). Returns 0 if found.
     ls "$DEST_REAL/state/.migrated-from-$1-"* >/dev/null 2>&1
 }
 
-# Atomic per-file copy preserving mtime. Returns 0 on success.
-copy_preserving_mtime() {
-    local src="$1" dst="$2"
-    mkdir -p "$(dirname "$dst")"
-    # Atomic: cp -p to sibling tmp then mv. -p preserves mtime + mode.
-    local tmp="$dst.tmp.$$"
-    cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
+# `cp -p` carries a FILE's mode, but `mkdir -p` parents take umask, so a 0700
+# source dir lands 0755. The dest takes the INTERSECTION — it never widens.
+# Governed parents, outermost first: basename-agreeing ancestors STRICTLY
+# inside the dest root. The writer and the verifier walk this one chain.
+dir_mode_chain() {
+    local s d
+    s="$(dirname "$1")"; d="$(dirname "$2")"
+    local -a sd=() dd=()
+    while [ "$s" != "/" ] && [ "$d" != "/" ] && [ "$(basename "$s")" = "$(basename "$d")" ]; do
+        # Basename agreement alone lets the walk climb past the dest root and
+        # chmod ancestors outside the rollback.
+        [ -n "${DEST_REAL:-}" ] && [ "${d#"$DEST_REAL"/}" != "$d" ] || break
+        sd+=("$s"); dd+=("$d")
+        s="$(dirname "$s")"; d="$(dirname "$d")"
+    done
+    local i
+    for (( i=${#sd[@]}-1; i>=0; i-- )); do printf '%s\t%s\n' "${sd[$i]}" "${dd[$i]}"; done
 }
 
-# Unions top-level arrays; non-array fields follow the newer source.
-# Malformed input returns non-zero — a silent degrade is access loss.
+mirror_dir_modes() {
+    local sdir ddir sm dm want got rc=0
+    while IFS=$'\t' read -r sdir ddir; do
+        [ -d "$sdir" ] && [ -d "$ddir" ] || continue
+        sm="$(mode_of "$sdir")"; dm="$(mode_of "$ddir")"
+        # A failed probe on an EXISTING dir fails closed: committing under an
+        # unknown mode is a confidentiality window certified as success.
+        if [ -z "$sm" ] || [ -z "$dm" ]; then rc=1; continue; fi
+        [ "$sm" = "$dm" ] && continue
+        want="$(printf '%o' $(( 0$sm & 0$dm )))"
+        if ! chmod "$want" "$ddir" 2>/dev/null; then rc=1; continue; fi
+        got="$(mode_of "$ddir")"
+        if [ -z "$got" ] || [ "$(( 0$got ))" -ne "$(( 0$want ))" ]; then rc=1; fi
+    done < <(dir_mode_chain "$1" "$2")
+    return "$rc"
+}
+
+# Read-only twin for phase three: a governed parent wider than its source
+# discloses what the source protected, whatever the leaf's own mode says.
+verify_dir_modes() {
+    local sdir ddir sm dm
+    while IFS=$'\t' read -r sdir ddir; do
+        [ -d "$sdir" ] && [ -d "$ddir" ] || continue
+        sm="$(mode_of "$sdir")"; dm="$(mode_of "$ddir")"
+        [ -n "$sm" ] && [ -n "$dm" ] || return 1
+        [ "$(( 0$dm & ~0$sm ))" -eq 0 ] || return 1
+    done < <(dir_mode_chain "$1" "$2")
+    return 0
+}
+
+# Containment is proven on the RESOLVED path and BEFORE mkdir: a textual
+# prefix test passes a symlinked component that escapes the rollback root.
+ensure_contained_destdir() {
+    local ddir="$1" probe real
+    probe="$ddir"
+    while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
+    real="$(cd "$probe" 2>/dev/null && pwd -P)" || return 1
+    case "$real/" in
+        "$DEST_REAL"/*) ;;
+        *) echo "ERROR: dest path escapes the dest root: $ddir resolves via $real" >&2; return 1 ;;
+    esac
+    mkdir -p "$ddir" 2>/dev/null || return 1
+    real="$(cd "$ddir" 2>/dev/null && pwd -P)" || return 1
+    case "$real/" in
+        "$DEST_REAL"/*) return 0 ;;
+        *) echo "ERROR: dest path escapes the dest root: $ddir resolves to $real" >&2; return 1 ;;
+    esac
+}
+
+# Atomic per-file copy preserving mtime. Any mkdir/containment/mode/copy
+# failure returns non-zero, so commit fails closed instead of certifying it.
+copy_preserving_mtime() {
+    local src="$1" dst="$2"
+    ensure_contained_destdir "$(dirname "$dst")" || return 1
+    mirror_dir_modes "$src" "$dst" || {
+        echo "ERROR: directory-mode enforcement failed for $dst" >&2
+        return 1
+    }
+    # Atomic: cp -p to sibling tmp then mv. -p preserves mtime + mode.
+    local tmp="$dst.tmp.$$"
+    if ! { cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"; }; then
+        rm -f "$tmp" 2>/dev/null
+        echo "ERROR: copy failed: $src -> $dst" >&2
+        return 1
+    fi
+}
+
+# Unions top-level arrays; non-array fields follow the newer source. Malformed
+# input returns non-zero, and containment is commit_one's concern, not this.
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
+    # Parents take the intersection BEFORE the leaf exists in any form: a
+    # failure here leaves the pre-union destination exactly as it was.
+    mirror_dir_modes "$src" "$dst" || {
+        echo "ERROR: directory-mode enforcement failed for $dst" >&2
+        return 1
+    }
     local tmp="$dst.tmp.$$"
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
@@ -1005,7 +1144,14 @@ for key in set(src_doc) | set(dst_doc):
             seen.add(fp)
             out.append(entry)
     merged[key] = out
-with open(tmp, "w", encoding="utf-8") as fh:
+# The temp is born at the intersection and narrowed again before its first
+# byte: a fresh 0644 temp holding merged grants is readable until then.
+import stat as _stat
+_s = _stat.S_IMODE(os.stat(src).st_mode)
+_d = _stat.S_IMODE(os.stat(dst).st_mode)
+_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _s & _d)
+os.fchmod(_fd, _s & _d)
+with os.fdopen(_fd, "w", encoding="utf-8") as fh:
     json.dump(merged, fh, indent=2, sort_keys=True)
     fh.write("\n")
 # The union rewrites dst, so the result must carry the winner's mtime; otherwise
@@ -1019,6 +1165,129 @@ PY
     fi
     rm -f "$tmp"
     return 1
+}
+
+# Records the union's non-array fields so verification can check the scalar
+# winner even when the PRE-UNION DEST won; last union for a rel wins.
+record_union_scalars() {
+    local dst="$1" rel="$2" manifest="$3"
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    "$py" - "$dst" "$rel" "$manifest" <<'PY'
+import json, os, stat, sys
+
+MODES_KEY = "__union_modes__"
+
+dst, rel, manifest = sys.argv[1:4]
+with open(dst, encoding="utf-8") as fh:
+    d = json.load(fh)
+scalars = {k: v for k, v in d.items() if not isinstance(v, list)}
+if os.path.exists(manifest):
+    # An existing-but-invalid manifest is damage; silently replacing it would
+    # erase every prior rel's expectation. Fail so the commit fails closed.
+    with open(manifest, encoding="utf-8") as fh:
+        m = json.load(fh)
+    if not isinstance(m, dict):
+        sys.exit(1)
+else:
+    m = {}
+if rel == MODES_KEY:
+    # A rel can never be this key, but if one ever were, its scalars would be
+    # read back as the mode table. Refuse rather than corrupt the manifest.
+    sys.exit(1)
+m[rel] = scalars
+union_mode = stat.S_IMODE(os.stat(dst).st_mode)
+modes = m.get(MODES_KEY)
+m[MODES_KEY] = ({} if not isinstance(modes, dict) else modes)
+m[MODES_KEY][rel] = oct(union_mode)
+# No wider than the most restrictive file it describes: a 0600 source's
+# scalars in a 0644 manifest disclose the same bytes. Create 0600, then narrow.
+want_mode = union_mode
+if os.path.exists(manifest):
+    want_mode &= stat.S_IMODE(os.stat(manifest).st_mode)
+tmp = manifest + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(m, fh, indent=1, sort_keys=True)
+os.chmod(tmp, want_mode)
+os.replace(tmp, manifest)
+PY
+}
+
+# Semantic companion to union_json_arrays_into, same sorted-key fingerprint:
+# the invariant is containment of every source element, not byte identity.
+union_contains() {
+    local src="$1" dst="$2" manifest="${3:-}" rel="${4:-}"
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    "$py" - "$src" "$dst" "$manifest" "$rel" "${DEST_REAL:-}" <<'PY'
+import json, os, stat, sys
+
+src, dst, manifest, rel, dest_root = sys.argv[1:6]
+# A 0644 leaf under a 0755 parent discloses what a 0700 source parent protected;
+# only parents strictly inside the dest root are governed (the root is never narrowed).
+try:
+    sdir = os.path.dirname(os.path.realpath(src))
+    ddir = os.path.dirname(os.path.realpath(dst))
+    root = os.path.realpath(dest_root) if dest_root else None
+    if root and ddir != root and ddir.startswith(root + os.sep):
+        sp = stat.S_IMODE(os.stat(sdir).st_mode)
+        dp = stat.S_IMODE(os.stat(ddir).st_mode)
+        if dp & ~sp:
+            sys.exit(1)
+except OSError:
+    sys.exit(1)
+try:
+    with open(src, encoding="utf-8") as fh:
+        s = json.load(fh)
+    with open(dst, encoding="utf-8") as fh:
+        d = json.load(fh)
+    src_mt = os.path.getmtime(src)
+    dst_mt = os.path.getmtime(dst)
+except Exception:
+    sys.exit(1)
+if not isinstance(s, dict) or not isinstance(d, dict):
+    sys.exit(1)
+# Scalars, strongest evidence first: the commit-time manifest, else the
+# union's WINNER-mtime invariant, else arrays alone.
+expected = None
+if manifest and rel and os.path.exists(manifest):
+    # A present manifest is AUTHORITATIVE: parse/type failure or a missing rel
+    # is damage and must FAIL, or damaging it would buy the weaker fallback.
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            m = json.load(fh)
+    except Exception:
+        sys.exit(1)
+    if not isinstance(m, dict) or rel not in m or not isinstance(m[rel], dict):
+        sys.exit(1)
+    expected = m[rel]
+    # record_union_scalars writes the mode beside every rel it records, so a
+    # missing table or rel is damage; certifying an unknown mode is the leak.
+    modes = m.get("__union_modes__")
+    if not isinstance(modes, dict) or rel not in modes:
+        sys.exit(1)
+    if oct(stat.S_IMODE(os.stat(dst).st_mode)) != modes[rel]:
+        sys.exit(1)
+if expected is not None:
+    have = {k: v for k, v in d.items() if not isinstance(v, list)}
+    if have != expected:
+        sys.exit(1)
+# The manifest already proved the scalars above; re-deriving a winner from
+# mtime there rejects a valid destination-winner union when the two tie.
+scalar_winner = expected is None and src_mt == dst_mt
+for key, val in s.items():
+    if isinstance(val, list):
+        dv = d.get(key)
+        if not isinstance(dv, list):
+            sys.exit(1)
+        have = {json.dumps(e, sort_keys=True) for e in dv}
+        if any(json.dumps(e, sort_keys=True) not in have for e in val):
+            sys.exit(1)
+    elif scalar_winner and (key not in d or d[key] != val):
+        sys.exit(1)
+sys.exit(0)
+PY
 }
 
 # Human-readable byte size: 1234 → "1.2 KB", 5242880 → "5.0 MB", etc.
@@ -1121,6 +1390,62 @@ preflight_summary() {
     echo "$_total_files"
 }
 
+# _stat <gnu-fmt> <bsd-fmt> <file> [fallback]. GNU FIRST is load-bearing:
+# there `stat -f` is --file-system — it prints a block AND exits non-zero.
+_stat() {
+    stat -c "$1" "$3" 2>/dev/null || stat -f "$2" "$3" 2>/dev/null || printf '%s' "${4-}"
+}
+
+# Keep multi-line: the identity-mode test extracts helpers by `sed` range and
+# needs a lone closing brace; a one-liner silently yields an empty mode.
+mode_of() {
+    _stat %a %Lp "$1"
+}
+
+# BSD needs -t for a formatted date and GNU needs a cut, so this cannot use
+# _stat's two-format shape; each probe is guarded so failure reaches the next.
+mtime_date() {
+    local d=""
+    d="$(stat -c %y "$1" 2>/dev/null | cut -d' ' -f1)" || d=""
+    [ -n "$d" ] || d="$(stat -f %Sm -t %Y-%m-%d "$1" 2>/dev/null)" || d=""
+    printf '%s' "$d"
+}
+
+# Identity is bytes AND mode, at every decision site: dropping a 0755 source
+# against a byte-equal 0644 dest silently loses the exec bit, unrecoverably.
+identity_match() {
+    # Fail closed on an unreadable mode: both probes failing would
+    # blank-compare "" = "" and certify identity with mode unknown.
+    local ma mb
+    ma="$(mode_of "$1")" || return 1
+    mb="$(mode_of "$2")" || return 1
+    [ -n "$ma" ] && [ -n "$mb" ] || return 1
+    sha_match "$1" "$2" && [ "$ma" = "$mb" ]
+}
+
+# An identical drop keeps the destination bytes but must carry the newer
+# source's mtime, or a later OLDER source outranks it and its scalars win.
+identity_drop_keeping_newest() {
+    # A drop writes no leaf, but its parents are still published: an older or
+    # equal source must narrow them exactly as a copied one would.
+    mirror_dir_modes "$1" "$2" || {
+        echo "ERROR: directory-mode enforcement failed for $2" >&2
+        return 1
+    }
+    [ "$1" -nt "$2" ] || return 0
+    # Never mutate the existing inode: a hard link (or a symlink touch follows)
+    # can alias a file outside DEST_REAL. Materialize a contained inode instead.
+    copy_preserving_mtime "$1" "$2"
+}
+
+# A destination leaf that is a symlink resolves to a file the rollback root does
+# not own; reading or replacing it acts outside DEST_REAL. Refuse before either.
+refuse_leaf_symlink() {
+    [ -L "$1" ] || return 0
+    echo "ERROR: $2 — destination leaf is a symlink ($1); refusing to read or replace it" >&2
+    return 1
+}
+
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
 sha_match() {
     local a="$1" b="$2"
@@ -1144,12 +1469,22 @@ commit_one() {
     case "$cls" in
         union-json-array)
             dst_path="$DEST_REAL/$rel"
+            ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ ! -e "$dst_path" ]; then
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
+                # Verify's mode check runs only where a manifest exists, so a
+                # fresh copy without one cannot be proven un-widened later.
+                record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                    || { echo "write-failed"; return 1; }
                 echo "copied"
                 return 0
             fi
-            if sha_match "$src_file" "$dst_path"; then
+            if identity_match "$src_file" "$dst_path"; then
+                identity_drop_keeping_newest "$src_file" "$dst_path" \
+                    || { echo "write-failed"; return 1; }
+                record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                    || { echo "write-failed"; return 1; }
                 echo "identical-drop"
                 return 0
             fi
@@ -1159,22 +1494,28 @@ commit_one() {
                 echo "ERROR: $rel — cannot union $src_file into $dst_path (malformed JSON" >&2
                 echo "       or a field that is an array in one file and not the other)." >&2
                 echo "       Refusing to fall back to newest-wins; that would drop grants." >&2
+                echo "write-failed"
                 return 1
             fi
+            # The manifest is what lets phase three verify the scalar winner
+            # when the pre-union dest won — failing to record it fails closed.
+            record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                || { echo "write-failed"; return 1; }
             echo "unioned"
             return 0
             ;;
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ -e "$dst_path" ]; then
-                # Same content (mtime+size) → identical-drop. Different →
-                # keep-both: rename source-incoming to <file>.legacy-<tag>.
-                local src_mt src_sz dst_mt dst_sz
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
-                dst_sz="$(stat -f %z "$dst_path" 2>/dev/null || stat -c %s "$dst_path")"
-                if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
+                # Identical requires bytes AND mode; a mode-only difference
+                # falls through to keep-both so the source's mode survives.
+                local src_mt dst_mt
+                src_mt="$(_stat %Y %m "$src_file")"
+                dst_mt="$(_stat %Y %m "$dst_path")"
+                if identity_match "$src_file" "$dst_path"; then
+                    identity_drop_keeping_newest "$src_file" "$dst_path" \
+                        || { echo "write-failed"; return 1; }
                     echo "identical-drop"
                     return 0
                 fi
@@ -1194,35 +1535,36 @@ commit_one() {
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
                     # what was at dest before <src_tag> overwrote it" + the
                     # timestamp ensures 3-way collisions don't clobber.
-                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix"
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix" || { echo "write-failed"; return 1; }
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "src-wins-newer"
                 else
                     # src loses; preserve under tagged + timestamped sidecar.
-                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix"
+                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix" || { echo "write-failed"; return 1; }
                     echo "dest-wins-newer"
                 fi
                 return 0
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "copied"
                 return 0
             fi
             ;;
         newest-mtime)
             dst_path="$DEST_REAL/$rel"
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(_stat %Y %m "$src_file")"
+                dst_mt="$(_stat %Y %m "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "src-newer"
                 else
                     echo "dest-newer"
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "copied"
             fi
             return 0
@@ -1255,16 +1597,16 @@ commit_one() {
             # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(_stat %Y %m "$src_file")"
+                dst_mt="$(_stat %Y %m "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "rehomed-newer"
                 else
                     echo "rehomed-skip-older"
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "rehomed"
             fi
             return 0
@@ -1284,10 +1626,10 @@ commit_one() {
             # with a divider header carrying src-tag + mtime + size so the
             # downstream reader can split if needed.
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
-            mkdir -p "$(dirname "$dst_path")"
+            ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
             local src_mt src_sz
-            src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-            src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
+            src_mt="$(_stat %Y %m "$src_file")"
+            src_sz="$(_stat %s %z "$src_file")"
             # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
             # compound on a single line is NOT covered by `set -e` for its
             # left-side failure — the compound returns non-zero but execution
@@ -1370,7 +1712,7 @@ commit_one() {
             # --merge-append (Strategy B): concat with divider to <dest>/<rel>.
             if [ "$MERGE_APPEND" = "1" ]; then
                 dst_path="$DEST_REAL/$rel"
-                mkdir -p "$(dirname "$dst_path")"
+                ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
                 if [ -e "$dst_path" ]; then
                     # IMPORTANT: split the compound-redirect + mv + echo "merged"
                     # into separate statements with explicit error returns.
@@ -1406,12 +1748,12 @@ commit_one() {
                     }
                     echo "merged"
                 else
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "copied"
                 fi
             else
                 dst_path="$DEST_REAL/legacy/$tag/$rel"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "sidecar"
             fi
             return 0
@@ -1426,7 +1768,7 @@ commit_one() {
                 local subdir="${rel%%/*}"  # tasks or results
                 local file_base="${rel#*/}" # task-*.txt
                 dst_path="$DEST_REAL/$subdir/archive/$tag/$file_base"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "archived-stale"
             else
                 echo "skipped-inflight"
@@ -1439,7 +1781,7 @@ commit_one() {
             # experiments/, obsidian-vault/, personal-src/). Preserve under a
             # namespaced quarantine path rather than skip-unknown'ing it.
             dst_path="$DEST_REAL/legacy/$tag/quarantine/$rel"
-            copy_preserving_mtime "$src_file" "$dst_path"
+            copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
             echo "quarantined"
             return 0
             ;;
@@ -1527,7 +1869,7 @@ commit_source() {
     esac
     [ ${#walk_paths[@]} -eq 0 ] && { echo "  (nothing on surface; skip)"; return 0; }
 
-    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0
+    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0 n_write_failed=0
     # Phase 2 mode skips the commit walk entirely.
     if [ "$DO_COMMIT_WALK" = "0" ]; then
         # Skip ahead to the delete block (it walks walk_paths independently).
@@ -1557,13 +1899,15 @@ commit_source() {
             n_skipped=$((n_skipped+1)); continue
         fi
         cls="$(classify "$rel")"
-        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
+        # || true: the outcome string is the failure signal and the tally
+        # below judges, so one bad file cannot abort the walk with no verdict.
+        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")" || true
         # Per-file progress on stderr — visible feedback during the copy walk
         # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
         if [ "$PROGRESS_TOTAL" -gt 0 ]; then
             PROGRESS_N=$((PROGRESS_N + 1))
-            _fsize="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+            _fsize="$(_stat %s %z "$file" 0)"
             printf "  [%d/%d] %s (%s) → %s\n" \
                 "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
                 "$(humanize_bytes "$_fsize")" "$outcome" >&2
@@ -1587,6 +1931,8 @@ commit_source() {
                 n_quarantined=$((n_quarantined+1)) ;;
             skipped-class|skipped-inflight|skipped-fallthrough)
                 n_skipped=$((n_skipped+1)) ;;
+            write-failed|"")
+                n_write_failed=$((n_write_failed+1)) ;;
             *)
                 n_other=$((n_other+1)) ;;
         esac
@@ -1602,6 +1948,10 @@ commit_source() {
         echo "  skipped:     $n_skipped"
         [ "$n_other" -gt 0 ] && echo "  other:       $n_other"
 
+        if [ "$n_write_failed" -gt 0 ]; then
+            echo "  WRITE-FAILED: $n_write_failed — sentinel NOT written; source $tag is NOT committed" >&2
+            return 1
+        fi
         touch "$(source_sentinel "$tag")"
         echo "  sentinel:    $(source_sentinel "$tag")"
     fi
@@ -1637,7 +1987,7 @@ commit_source() {
                 "$DEST_REAL/$rel_d" \
                 "$DEST_REAL/legacy/$tag/$rel_d" \
                 "$DEST_REAL/legacy/$tag/quarantine/$rel_d"; do
-                if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                if [ -f "$cand" ] && identity_match "$file" "$cand"; then
                     matched="$cand"; break
                 fi
             done
@@ -1647,7 +1997,7 @@ commit_source() {
             if [ -z "$matched" ]; then
                 local g
                 for g in "$DEST_REAL/$rel_d.legacy-"*; do
-                    if [ -f "$g" ] && sha_match "$file" "$g"; then
+                    if [ -f "$g" ] && identity_match "$file" "$g"; then
                         matched="$g"; break
                     fi
                 done
@@ -1657,7 +2007,7 @@ commit_source() {
             if [ -z "$matched" ] && [ "$cls_d" = "rehome-state" ]; then
                 local b="$(basename "$rel_d")"
                 for cand in "$DEST_REAL/state/auth/$b" "$DEST_REAL/state/$b"; do
-                    if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                    if [ -f "$cand" ] && identity_match "$file" "$cand"; then
                         matched="$cand"; break
                     fi
                 done
@@ -2027,12 +2377,29 @@ verify_main() {
         done
         for cand in "${cands[@]}"; do
             if [ -f "$cand" ]; then
-                if sha_match "$src_file" "$cand"; then
+                if identity_match "$src_file" "$cand"; then
                     landed="$cand"; break
                 fi
             fi
         done
-        if [ -n "$landed" ]; then
+        # A union entry must clear union_contains, which owns the manifest mode
+        # check; byte identity with one input must never stand in for it.
+        # The leaf alone certifies nothing under a widened parent: the same
+        # governed chain the commit narrowed is re-checked here, read-only.
+        if [ -n "$landed" ] && [ "$cls" != "union-json-array" ]; then
+            if verify_dir_modes "$src_file" "$landed"; then
+                pass=$((pass+1))
+            else
+                mismatch=$((mismatch+1))
+                [ "$mismatch" -le 5 ] && echo "  MISMATCH: $tag/$rel ($cls) — a destination parent is wider than the source's"
+            fi
+        elif [ "$cls" = "union-json-array" ] && [ -f "$dst_canonical" ] \
+                && union_contains "$src_file" "$dst_canonical" \
+                    "$(ls -t "$DEST_REAL/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)" \
+                    "$rel" \
+                && verify_dir_modes "$src_file" "$dst_canonical"; then
+            # A union result differs from both inputs by design, so the
+            # invariant is containment via the union owner's fingerprint.
             pass=$((pass+1))
         elif [ -f "$dst_canonical" ] || [ -f "$dst_sidecar_legacy" ]; then
             # A dest path exists but sha doesn't match — content mismatch.
@@ -2116,7 +2483,7 @@ rollback_main() {
     else
         : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
     fi
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(stat -f %z "$backup_path")" >&2
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(_stat %s %z "$backup_path" 0)" >&2
     local sd
     [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
@@ -2143,28 +2510,48 @@ rollback_main() {
 }
 
 emit_json() {
-    # Reads XSRC_INDEX (TSV) + the resolved source paths/state and emits a
-    # machine-readable JSON dump for downstream tooling (dashboards, skill
-    # wrappers, the eventual --commit dry-run UI). Python3 is the bash-friendly
-    # path — sutando already requires it.
-    python3 - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" <<'PY'
+    # Machine-readable JSON for downstream tooling. Identity verdicts come from
+    # xsrc_identity_verdicts (single policy owner shared with the human report).
+    local py vf; py="$(require_python "$REPO_DIR" "emit the scan JSON")" || exit 2
+    # Named template like XSRC_INDEX: auditable, and countable by the cleanup
+    # regression on macOS, whose mktemp ignores $TMPDIR for placement.
+    vf="$(mktemp -t sutando-migrate-verdicts.XXXXXX)"; _VERDICTS_TMP="$vf"
+    xsrc_identity_verdicts > "$vf"
+    "$py" - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" "$vf" <<'PY'
 import json, sys, os
 from collections import defaultdict
-dest, a, b, c, idx_path = sys.argv[1:6]
+dest, a, b, c, idx_path, verdicts_path = sys.argv[1:7]
 entries = []
 if os.path.exists(idx_path):
     with open(idx_path) as f:
         for line in f:
-            rel, tag, cls, mt, sz = line.rstrip("\n").split("\t")
+            parts = line.rstrip("\n").split("\t")
+            rel, tag, cls, mt, sz = parts[:5]
+            path = parts[5] if len(parts) > 5 else ""
             entries.append({"rel": rel, "tag": tag, "class": cls,
-                            "mtime": int(mt or 0), "size": int(sz or 0)})
+                            "mtime": int(mt or 0), "size": int(sz or 0),
+                            "path": path})
 by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
-identical = sum(1 for v in collisions.values()
-                if len({(e["mtime"], e["size"]) for e in v}) == 1)
-genuine = len(collisions) - identical
+with open(verdicts_path) as vf:
+    _verdicts = json.load(vf)
+# Tri-state: None = could not hash — unverified, never proven divergence.
+# mode-divergent keeps byte_identical True, actionable via mode_conflict.
+_MAP = {"identical": True, "mode-divergent": True, "divergent": False, "unverified": None}
+_MODE = {"mode-divergent": True}
+ident_verdict = {k: _MAP[_verdicts.get(k, "unverified")] for k in collisions}
+mode_conflict = {k: _MODE.get(_verdicts.get(k, "unverified"), False) for k in collisions}
+# A row is actionable unless bytes are proven equal AND the modes agree — the
+# drop-safety rule is unchanged, only its REPORTING was split.
+def _actionable_rel(k):
+    return ident_verdict[k] is not True or mode_conflict[k]
+identical = sum(1 for k, x in ident_verdict.items() if x is True and not mode_conflict[k])
+unverified = sum(1 for x in ident_verdict.values() if x is None)
+# Proven divergence ONLY: unverified stays its own class — unknown must never
+# be published as genuine conflict (they already surface as identity_unverified).
+genuine = sum(1 for x in ident_verdict.values() if x is False)
 by_class = defaultdict(int)
 for v in collisions.values():
     by_class[v[0]["class"]] += 1
@@ -2173,43 +2560,59 @@ def has_size_mismatch(entries):
     return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
     return len({e["mtime"] for e in entries}) > 1
-# Sort by actionability: size-mismatch (real content conflict) first, then
-# mtime-only diff (commit's newest-mtime resolves it), then identical
-# (drop-dup). Tiebreak by class then rel.
+# Sort on the VERDICT first: divergent/unverified outrank byte-identical,
+# else ignorable entries can push the one actionable one past the render cap.
 def sort_key(item):
     k, v = item
-    sz_diff = has_size_mismatch(v)
-    mt_diff = has_mtime_mismatch(v)
-    # priority: 0=size-diff (real), 1=mtime-only, 2=identical
-    if sz_diff: prio = 0
-    elif mt_diff: prio = 1
-    else: prio = 2
+    if _actionable_rel(k):
+        prio = 0
+    elif has_mtime_mismatch(v) or has_size_mismatch(v):
+        prio = 1
+    else:
+        prio = 2
     return (prio, v[0]["class"], k)
-notable = [{"class": v[0]["class"], "rel": k,
-            "size_mismatch": has_size_mismatch(v),
-            "mtime_mismatch": has_mtime_mismatch(v),
-            "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
-           for k, v in sorted(collisions.items(), key=sort_key)]
+_rows = [{"class": v[0]["class"], "rel": k,
+          "byte_identical": ident_verdict[k],
+          "mode_conflict": mode_conflict[k],
+          "size_mismatch": has_size_mismatch(v),
+          "mtime_mismatch": has_mtime_mismatch(v),
+          "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
+         for k, v in sorted(collisions.items(), key=sort_key)]
+# The cap may only ever trim IGNORABLE rows: every actionable entry (verdict
+# False or None) is retained even when there are more than 50 of them.
+_actionable = [r for r in _rows if _actionable_rel(r["rel"])]
+_ignorable = [r for r in _rows if not _actionable_rel(r["rel"])]
+notable = _actionable + _ignorable[: max(0, 50 - len(_actionable))]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
-mtime_only = sum(1 for v in collisions.values() if not has_size_mismatch(v) and has_mtime_mismatch(v))
+mtime_only = sum(1 for k, v in collisions.items() if not has_size_mismatch(v)
+                 and has_mtime_mismatch(v) and ident_verdict[k] is False)
+# Only two successfully-read, differing hashes may claim proven divergence.
+proxy_identical_divergent = sum(
+    1 for k, v in collisions.items()
+    if not has_size_mismatch(v) and not has_mtime_mismatch(v) and ident_verdict[k] is False)
 out = {
     "dest": dest,
     "sources": {"A": a or None, "B": b or None, "C": c or None},
     "totals": {
         "unique_relpaths": len(by_rel),
         "collisions": len(collisions),
-        "identical_content": identical,
+        "identical_content": identical,  # byte-verified, never proxy-inferred
         "mtime_only_diff": mtime_only,  # commit's newest-mtime auto-resolves
-        "size_mismatch": size_diff,     # the actionable subset — real content conflicts
-        # Legacy "genuine_conflicts" kept for backward-compat; equals mtime_only + size_mismatch
-        "genuine_conflicts": genuine,
+        "size_mismatch": size_diff,     # actionable — real content conflicts
+        # Actionable — equal mtime+size but PROVEN different bytes (both read OK).
+        "proxy_identical_divergent": proxy_identical_divergent,
+        # Actionable — hash failed (unreadable entry); fix permissions, re-scan.
+        "identity_unverified": unverified,
+        "genuine_conflicts": genuine,   # verified-divergent only; unverified is separate
+
         "by_class": dict(by_class),
     },
-    "notable_collisions": notable[:50],
+    "notable_collisions": notable,
 }
 json.dump(out, sys.stdout, indent=2)
 print()
 PY
+    rm -f "$vf"; _VERDICTS_TMP=""
 }
 
 explain_main() {
