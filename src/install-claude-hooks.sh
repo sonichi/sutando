@@ -102,7 +102,10 @@ HOOKS=(
   "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
 
-# The transcript archiver writes OUTSIDE the workspace (~/Desktop). Omitting it
+# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
+# The location is not what keeps transcripts out of the vault: sync is a whitelist
+# (see .git/info/exclude -- `*` then the include list), so a workspace path is
+# unsynced until vault.sync.include names it. Omitting it
 # drops it from HOOKS, which every phase iterates, so a registered one is untouched.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()

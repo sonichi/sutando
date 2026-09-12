@@ -45,6 +45,8 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
+import { waitForProfileExit } from './profile-lock-wait.mjs';
+import { readLanding, landingExit } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -223,14 +225,32 @@ function pidsForProfile() {
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
+  const signalled = [];
   try {
     for (const pid of pidsForProfile().pids) {
-      try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
+      try { process.kill(parseInt(pid, 10), 'SIGTERM'); signalled.push(pid); } catch {}
     }
   } catch {}
-  try { execFileSync('sleep', ['1']); } catch {}
+  // WAIT for the SIGTERM to be honoured instead of killing on a fixed 1s. Chrome
+  // writes its cookie jar lazily and flushes on clean shutdown; a SIGKILL before
+  // that flush drops every cookie set since the last write — which is exactly the
+  // auth cookies from a sign-in that just happened.
+  const graceMs = Number(setting('X_PROFILE_GRACE_MS', '10000'));
+  const { remaining, waitedMs, exitedCleanly } = waitForProfileExit(
+    pidsForProfile,
+    graceMs,
+    (ms) => { try { execFileSync('sleep', [String(ms / 1000)]); } catch {} },
+  );
+  // Say what happened, so a surviving session is evidence the grace ENGAGED rather
+  // than an absence anyone can read either way: which pids were signalled, whether
+  // they exited on their own, and how long it took.
+  console.error(
+    `profile-lock: SIGTERM->[${signalled.join(',') || 'none'}] ` +
+    `exited_cleanly=${exitedCleanly} waited_ms=${waitedMs} ` +
+    `sigkilled=[${remaining.join(',') || 'none'}]`,
+  );
   try {
-    for (const pid of pidsForProfile().pids) {
+    for (const pid of remaining) {
       try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch {}
     }
   } catch {}
@@ -377,7 +397,7 @@ try {
       const shot = `${SHOT_DIR}/x-dryrun-${Date.now()}.png`;
       await page.screenshot({ path: shot });
       // report what the composer ACTUALLY holds, not what we asked for
-      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, verified: true, screenshot: shot }));
+      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, composer_matched: true, screenshot: shot }));
       process.exit(0);
     }
     // Publish: inline compose button (tweetButtonInline) or modal (tweetButton).
@@ -390,9 +410,16 @@ try {
     const finalText = await readComposer(page);
     if (!composerMatches(arg, finalText)) failComposerMismatch(arg, finalText);
     await btn.click();
-    await page.waitForTimeout(3000);
-    console.log(JSON.stringify({ posted: true, text: finalText, verified: true }));
-    process.exit(0);
+    // A click is not a post. The landing decision lives in readLanding so it can
+    // run against a stub page (tests/x-post-landing-check.test.mjs); here we only
+    // map its decision to output + exit code.
+    const decision = await readLanding(page, { timeout: 15000, shotDir: SHOT_DIR });
+    if (!decision.posted) {
+      console.log(JSON.stringify({ ...decision, composer_matched: true }));
+    } else {
+      console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
+    }
+    process.exit(landingExit(decision));
   }
 } catch (err) {
   console.error(`Error: ${err.message}`);
