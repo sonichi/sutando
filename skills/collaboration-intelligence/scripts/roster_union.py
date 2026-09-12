@@ -69,6 +69,59 @@ def host_rosters(workspace) -> "list[tuple[str, Path]]":
     return out
 
 
+# Every route kind a row can declare, and the field groups it must fill -- any
+# one spelling per group satisfies its group. The ONE statement of route shape.
+ROUTE_FIELDS = (
+    ("matrix", (("stand",), ("room",))),
+    ("discord", (("discord_id", "stand_discord_id"), ("home_channel",))),
+)
+
+
+def _names_route(value) -> bool:
+    """Whether a routing field NAMES a route. Built on `declared`, not a second
+    spelling of it: `false` and `0` are how a row says "no route", not a route."""
+    return is_declared(value) and bool(value)
+
+
+def routing_fields(kinds=None) -> "tuple[str, ...]":
+    """Every field the named routes read, deduped, in ROUTE_FIELDS order.
+
+    `kinds=None` means every route. A caller that narrows it is stating which
+    transports its question is about, which is the part that used to be an
+    unwritten assumption inside each consumer.
+    """
+    return tuple(dict.fromkeys(field for kind, groups in ROUTE_FIELDS
+                               if kinds is None or kind in kinds
+                               for group in groups for field in group))
+
+
+def declared_routes(row) -> "tuple[str, ...]":
+    """The route kinds this row can be delivered on, PREFERRED FIRST.
+
+    The union asks whether a row has ANY; the notifier asks WHICH. Reading one
+    table is what stops either deciding alone that a declared route does not
+    exist -- the union calling a usable Discord row a placeholder let a synced
+    peer's Matrix row take over a destination the local row already named.
+    """
+    if not isinstance(row, dict):
+        return ()
+    return tuple(kind for kind, groups in ROUTE_FIELDS
+                 if all(any(_names_route(row.get(field)) for field in group)
+                        for group in groups))
+
+
+def states_routing(row, kinds=None) -> bool:
+    """Any routing value at all for the named routes, complete or not.
+
+    A partial route still names an identity, so promoting over it routes under
+    a different one. Which transports that protection covers is the CALLER's
+    declaration, not this module's guess -- see the union's placeholder test.
+    """
+    if not isinstance(row, dict):
+        return False
+    return any(_names_route(row.get(field)) for field in routing_fields(kinds))
+
+
 def _usable(row) -> bool:
     """Addressable, OR a deliberate refusal. A blank `stand` carrying
     `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
@@ -76,12 +129,7 @@ def _usable(row) -> bool:
         return False
     if any(declared(row.get(k)) for k in ("refusal_basis", "note")):
         return True
-    # Only a route both consumers can actually deliver on counts. A discord id
-    # is not one here: resolve() builds Matrix targets from stand+room alone.
-    return bool(row.get("stand") and row.get("room"))
-
-
-_ROUTING = ("stand", "room")
+    return bool(declared_routes(row))
 
 
 def _is_routing_placeholder(row) -> bool:
@@ -91,10 +139,12 @@ def _is_routing_placeholder(row) -> bool:
     for a refusal row, which carries no routing value and must still never be
     overwritten. This adds the partial-identity case -- a row naming a stand but
     no room states an identity, and promoting over it routes under the wrong one.
+
+    Scoped to `matrix`: a COMPLETE Discord route is already protected by
+    `_usable`, while a lone Discord id is deliberately still promotable, so a
+    peer with a working Stand can reach someone this host cannot address.
     """
-    if not isinstance(row, dict):
-        return True
-    return not any(declared(row.get(k)) for k in _ROUTING)
+    return not states_routing(row, ("matrix",))
 
 
 def _promote(winner: dict, local: dict) -> dict:
@@ -110,8 +160,9 @@ def _promote(winner: dict, local: dict) -> dict:
             out.pop(alias, None)
     # `is_declared`, never `is not None`: a blank local field is ABSENT to every
     # reader, so overlaying it erases the refusal or identity the peer stated.
+    routing = routing_fields()
     for field, value in loc.items():
-        if field not in _ROUTING and is_declared(value):
+        if field not in routing and is_declared(value):
             out[field] = value
     return out
 
