@@ -44,6 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import roster_identity as ri  # noqa: E402
 from roster_union import roster_login  # noqa: E402
 
+# The collector JOINS a path and the revalidator SPLITS it; one codec owns both,
+# or a roster key containing the separator is unreachable and latches forever.
+_path_join, _path_split = ri.path_join, ri.path_split
+
 HUMAN, STAND = "human", "stand"
 
 # The writer overwrites the malformed slot; this key carries the finding on.
@@ -67,6 +71,31 @@ def _is_snowflake(v) -> bool:
     return isinstance(v, str) and bool(_SNOWFLAKE.fullmatch(v))
 
 
+def _structured_snowflakes(value) -> list:
+    """Every id a value NAMES, read from its scalar leaves in stable order.
+
+    Scanning `json.dumps(value)` instead let a non-ASCII digit's `\\uXXXX`
+    escape contribute its hex digits to an id present in no source.
+    """
+    out = []
+
+    def visit(v):
+        if isinstance(v, dict):
+            for k, sub in v.items():
+                visit(k)
+                visit(sub)
+        elif isinstance(v, (list, tuple)):
+            for sub in v:
+                visit(sub)
+        else:
+            for sf in _snowflakes(str(v)):
+                if sf not in out:
+                    out.append(sf)
+
+    visit(value)
+    return out
+
+
 def _cited_in(entry: dict, id_: str) -> list:
     """Field names (dotted for nested) whose value mentions this id."""
     hits = []
@@ -84,7 +113,7 @@ def _cited_in(entry: dict, id_: str) -> list:
                 and _discord_source(path[:-1], path[-1], provider):
                 # whole-id match: a 17-digit id is a substring of an
                 # 18-digit one, and that published the wrong referent.
-            hits.append(".".join(path))
+            hits.append(_path_join(path))
 
     walk(entry, [], None)
     return hits
@@ -117,7 +146,7 @@ def _verdicts_from_field(field: str) -> list:
     """
     # A bare id leaf inherits its ancestors (`wrapper.stand_status.id`); a
     # leaf naming its own object does not, or `human.<object>_id` is the human.
-    segs = str(field).split(".")
+    segs = _path_split(field)
     leaf = _field_words(segs[-1])
     words = leaf if leaf - _ID_WORDS else _field_words(field)
     out = []
@@ -141,7 +170,7 @@ def _bad(entries: list, value, states, reason: str, shapes: list) -> None:
     `str(container)` attaches the disagreement to a repr no reader can match,
     so the id it actually opposes keeps its slot.
     """
-    found = _snowflakes(json.dumps(value, default=str))
+    found = _structured_snowflakes(value)
     if not found:
         # `str(value)` here would publish a container repr into a field the
         # schema documents as ids only; record it as a shape failure instead.
@@ -228,7 +257,7 @@ def _principal_slot(field: str) -> bool:
     slots qualify by construction; everything else must declare an id and name no
     other object.
     """
-    segments = [p.strip() for p in str(field).split(".") if p.strip()]
+    segments = [p.strip() for p in _path_split(field) if p.strip()]
     if not segments:
         return False
     # Eligibility is a property of the PATH: reading only the leaf discarded
@@ -318,6 +347,10 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
         return False
     if str(key).strip().lower() in _HANDLE_KEYS:
         return False
+    # This schema's own slot names Discord; a SOURCE-declared provider names
+    # that source's namespace and cannot rename what this writer published.
+    if str(key) in ri.WRITER_OWNED:
+        return True
     if provider is not None:
         return provider == "discord"
     if "discord" in _field_words(key):
@@ -353,7 +386,7 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
     empty, so a v2 doc's own `[]` collections re-migrate untouched.
     """
     def _bad_shape(v):
-        shapes.append({"path": ".".join(path), "kind": type(v).__name__,
+        shapes.append({"path": _path_join(path), "kind": type(v).__name__,
                        "reason": "a field declaring an id holds a value no id "
                                  "can be read from, so the referent it states "
                                  "is discarded rather than absent"})
@@ -379,7 +412,7 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
             shapes[-1]["arbitrated_ids"] = sorted(seen)
             # FULL path, not the leaf: a leaf-only read says None, and None is
             # later treated as agreement with any other source.
-            _v = _verdicts_from_field(".".join(path)) if path else []
+            _v = _verdicts_from_field(_path_join(path)) if path else []
             # The SET, not one value: `None` cannot mean both "states no
             # referent" and "states two", or agreement accepts either.
             shapes[-1]["arbitrated_states"] = sorted({v for v, _ in _v})
@@ -421,7 +454,7 @@ def walk(obj, path, provider, sink, shapes):
             and shapes is not None and not _id_slot(path[-1]):
         # A declared slot is reported by _slot_failures; without this guard
         # a non-string there is reported twice.
-        shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
+        shapes.append({"path": _path_join(path), "kind": type(obj).__name__,
                        "reason": "typed field holds a non-string value, so "
                                  "its id is unreadable rather than absent"})
 
@@ -450,7 +483,7 @@ def _slot_erased(entry, path) -> bool:
     Absent, None and blank all mean the same thing here: the referent this slot
     once stated is no longer legible from the entry.
     """
-    segs = str(path).split(".")
+    segs = _path_split(path)
 
     def readable(node, i) -> bool:
         # A list does not consume a segment: `_cited_in` descends into members
@@ -557,7 +590,7 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
         return True
     # A list does not consume a segment: a dict-only descent made every
     # documented `identities[]` path permanently unreachable.
-    segs = str(path).split(".")
+    segs = _path_split(path)
     nodes = _nodes_at(entry, segs, 0, None)
     if not nodes:
         return True                         # unreachable: cannot re-check
@@ -659,7 +692,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
                 if ri.writer_owned_path(field):
-                    roots.setdefault(id_, set()).add(field.split(".")[0])
+                    roots.setdefault(id_, set()).add(_path_split(field)[0])
                     seeds.setdefault(id_, []).append(
                         {"path": field, "verdict": verdict, "reason": reason})
         claims.setdefault(id_, {})
@@ -679,7 +712,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         # The collision is between two IDENTITY AXES, so it exists whether or
         # not the colliding row happens to carry an id to hang it on.
         collisions.append({"key": key, "join": join, "reason": _why})
-        for sf in _snowflakes(json.dumps((_hit[1] if _hit else {}) or {})):
+        for sf in _structured_snowflakes((_hit[1] if _hit else {}) or {}):
             bad.append({"id": sf, "states": None, "collision": True,
                         "reason": _why})
     # A typed field states the referent but not that the VALUE is an id. An
@@ -720,7 +753,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             entry, arbitrated, observed, peer_ids, owner_id, src_version):
         claim(id_, verdict, reason)
         seeds.setdefault(id_, []).append(seed)
-        roots.setdefault(id_, set()).add(str(seed["path"]).split(".")[0])
+        roots.setdefault(id_, set()).add(_path_split(seed["path"])[0])
 
     for id_ in list(claims):
         if id_ in peer_ids:
@@ -839,6 +872,16 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         raise ValueError(
             "pr-triage `people` has conflicting case-variant keys: "
             + "; ".join(f"{a!r} vs {b!r}" for a, b in dupes))
+    malformed = ["pr-triage `people.%s`" % orig
+                 for _ck, (orig, v) in sorted(canon.items())
+                 if v is not None and not isinstance(v, dict)]
+    malformed += ["roster `%s`" % k for k, v in doc.items()
+                  if ri.is_person_key(k) and not isinstance(v, dict)]
+    if malformed:
+        # Consumed as anything else a person record states nothing, and the v2
+        # map blesses an identity no source was ever read for.
+        raise ValueError("a person record is not an object: "
+                         + "; ".join(malformed))
     out[ri.SCHEMA_KEY] = {
         "name": ri.SCHEMA_NAME,
         "version": ri.SCHEMA_VERSION,
@@ -911,7 +954,7 @@ def cross_role_collisions(rows):
     `alice.stand = H` alongside triage `people.bob.discord = H` both passed.
 
     Two rows for the SAME canonical login are an alias, not a clash."""
-    seen = {}
+    seen, rows_for = {}, {}
     for r in rows:
         login = r.get("login") or r["key"]
         for role, ids in (("human", [r.get("after_human")]),
@@ -920,15 +963,19 @@ def cross_role_collisions(rows):
             for i in ids:
                 if i:
                     seen.setdefault(str(i), {}).setdefault(role, set()).add(login)
+                    rows_for.setdefault(str(i), set()).add(str(r.get("key")))
     out = []
     for ident, roles in sorted(seen.items()):
         if len(roles) < 2:
             continue
         logins = set().union(*roles.values())
-        if len(logins) == 1:
-            continue          # one person, both referents: entry-local owns it
+        keys = sorted(rows_for.get(ident, ()))
+        # One ROW holding both referents is entry-local's to refuse; two rows
+        # are not, since no entry-local check ever sees an aliased pair at once.
+        if len(logins) == 1 and len(keys) == 1:
+            continue
         out.append({"id": ident, "human": sorted(roles.get("human", ())),
-                    "stand": sorted(roles.get("stand", ()))})
+                    "stand": sorted(roles.get("stand", ())), "keys": keys})
     return out
 
 
@@ -984,10 +1031,23 @@ def main() -> int:
                if not isinstance(v, str)}
     if owner_raw is not None and not isinstance(owner_raw, str):
         raw_bad["discord-config.json `owner`"] = owner_raw
+    # A STRING is not yet an id: a padded `" H "` matched no claim and so
+    # silently WITHDREW the evidence that makes owner-plus-stand a conflict.
+    shape_bad = {f"peers.json `{k}`": v for k, v in peer_raw.items()
+                 if isinstance(v, str) and v.strip() and not _is_snowflake(v)}
+    if isinstance(owner_raw, str) and owner_raw.strip() \
+            and not _is_snowflake(owner_raw):
+        shape_bad["discord-config.json `owner`"] = owner_raw
     if raw_bad:
         for k, v in raw_bad.items():
             print(f"refusing to migrate: {k} holds a {type(v).__name__} "
                   f"({v!r}); an external id must be a JSON string",
+                  file=sys.stderr)
+        return 2
+    if shape_bad:
+        for k, v in shape_bad.items():
+            print(f"refusing to migrate: {k} holds {v!r}, which is not a "
+                  f"discord id; an external id must be a bare snowflake",
                   file=sys.stderr)
         return 2
     peer_ids = {v: k for k, v in peer_raw.items()}
@@ -1004,8 +1064,8 @@ def main() -> int:
     if xrole:
         for c in xrole:
             print(f"refusing to migrate: id {c['id']} is a human for "
-                  f"{','.join(c['human'])} and a stand for {','.join(c['stand'])}",
-                  file=sys.stderr)
+                  f"{','.join(c['human'])} and a stand for {','.join(c['stand'])}"
+                  f" (rows: {','.join(c.get('keys') or ())})", file=sys.stderr)
         return 2
 
     dest = a.out or a.roster.with_suffix(".v2.json")

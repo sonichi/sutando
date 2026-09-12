@@ -41,8 +41,20 @@ class Unit(unittest.TestCase):
         ordinary row and make the pass useless."""
         self.assertEqual(m.cross_role_collisions(rows(("alice", H, H))), [])
 
-    def test_two_KEYS_for_one_login_are_an_alias_not_a_clash(self):
+    def test_two_KEYS_for_one_login_do_not_EXEMPT_a_swapped_role(self):
+        """An alias is two ROWS. `entry_is_coherent` validates one row at a
+        time, so nothing else in the pipeline can see H as a human here and a
+        stand there; exempting it on the login published both."""
         r = rows(("alice", None, H), ("alice", H, None))
+        r[1]["key"] = "alice-alt"
+        c = m.cross_role_collisions(r)
+        self.assertEqual(len(c), 1, c)
+        self.assertEqual(c[0]["id"], H)
+
+    def test_alias_rows_carrying_DISTINCT_ids_stay_clean(self):
+        """Control: an alias pair may still hold a human and a stand, so
+        refusing every two-row login would satisfy the case above."""
+        r = rows(("alice", None, H), ("alice", T, None))
         r[1]["key"] = "alice-alt"
         self.assertEqual(m.cross_role_collisions(r), [])
 
@@ -73,6 +85,36 @@ class Production(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(out.exists(), "a wrong map was published anyway")
         self.assertIn(H, r.stderr)
+
+    def test_main_refuses_ALIAS_rows_that_swap_the_role(self):
+        """Same login, two keys, H a stand in one row and the human in the
+        other: the published map made a person and their agent the same id."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        roster = d / "roster.json"
+        out = d / "v2.json"
+        roster.write_text(json.dumps({
+            "alice": {"gh": "alice", "stand_status": f"stand id {H}"},
+            "alice-alt": {"gh": "alice", "human": {"id": H}}}))
+        r = subprocess.run([sys.executable, str(SCRIPT), "--roster", str(roster),
+                            "--out", str(out)], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(out.exists(), "a wrong map was published anyway")
+        self.assertIn(H, r.stderr)
+
+    def test_alias_rows_with_DISTINCT_ids_still_migrate(self):
+        """Control: refusing every aliased pair would satisfy the case above."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        roster = d / "roster.json"
+        out = d / "v2.json"
+        roster.write_text(json.dumps({
+            "alice": {"gh": "alice", "stand_status": f"stand id {H}"},
+            "alice-alt": {"gh": "alice", "human": {"id": T}}}))
+        r = subprocess.run([sys.executable, str(SCRIPT), "--roster", str(roster),
+                            "--out", str(out)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        doc = json.loads(out.read_text())
+        self.assertEqual(doc["alice"]["stand_discord_id"], H)
+        self.assertEqual(doc["alice-alt"]["human_discord_id"], T)
 
     def test_a_DISTINCT_pair_still_migrates(self):
         """Control: without this, refusing every document passes the case above."""

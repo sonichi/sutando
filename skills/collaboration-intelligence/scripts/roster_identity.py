@@ -38,8 +38,39 @@ SHAPE_MAX = 32
 WRITER_OWNED = (HUMAN_FIELD, STAND_FIELD, OTHER_STANDS_FIELD, UNRESOLVED_FIELD)
 
 
+def path_join(segments) -> str:
+    """The ONE spelling of an evidence path. A separator INSIDE a segment is
+    escaped, so `path_split` returns the key the collector actually walked."""
+    return ".".join(str(s).replace("\\", "\\\\").replace(".", "\\.")
+                    for s in segments)
+
+
+def path_split(path) -> list:
+    """Inverse of `path_join`, and the ONLY reader of a stored path.
+
+    An UNESCAPED dot still separates, so every path spelled before this codec
+    existed parses into exactly the segments it always did.
+    """
+    out, cur, esc = [], [], False
+    for ch in str(path):
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ".":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if esc:
+        cur.append("\\")
+    out.append("".join(cur))
+    return out
+
+
 def writer_owned_path(path) -> bool:
-    return isinstance(path, str) and path.split(".")[0] in WRITER_OWNED
+    return isinstance(path, str) and path_split(path)[0] in WRITER_OWNED
 
 
 def path_referent(path):
@@ -51,7 +82,7 @@ def path_referent(path):
     """
     if not writer_owned_path(path):
         return None
-    head = path.split(".")[0]
+    head = path_split(path)[0]
     if head == HUMAN_FIELD:
         return "human"
     if head in (STAND_FIELD, OTHER_STANDS_FIELD):

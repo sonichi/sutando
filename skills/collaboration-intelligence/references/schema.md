@@ -351,6 +351,12 @@ Neither of the last two implies the other, and a mismatch is not cosmetic: a
 `human_discord_id` path carrying a `stand` verdict resolved the id to the
 opposite principal and returned success.
 
+A `path` — in `seeded_by` and in `id_shape_failures` alike — is the evidence
+location dot-joined from its segments, with a dot INSIDE a segment escaped as
+`\.`. A roster key may contain one, and a path that cannot be split back into
+the key the collector walked is unreachable: the revalidation reads "cannot
+re-check", and the refusal latches past every repair of the value it names.
+
 `id_shape_failures` is RESERVED and migration-owned: findings the migration
 could not re-derive from its own output, carried so a refusal survives a
 re-migration. `roster_identity.py` owns its record shape, its canonicalisation
