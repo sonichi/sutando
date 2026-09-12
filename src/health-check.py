@@ -3231,7 +3231,9 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
             d = _git("rev-parse", f"--disambiguate={rev}")
         except Exception:
             return ("unknown", "")
-        if d.returncode != 0:
+        # rc 0 with nothing on stdout and a complaint on stderr is a FAILED
+        # read, not an empty candidate set: an unreadable object dir does this.
+        if d.returncode != 0 or (not d.stdout.strip() and d.stderr.strip()):
             return ("unknown", "")
         n = len([ln for ln in d.stdout.split() if ln.strip()])
         # 0 candidates is the only positively-established absence. One candidate

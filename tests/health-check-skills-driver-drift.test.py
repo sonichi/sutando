@@ -348,6 +348,32 @@ def main() -> int:
             check("Re-arm" not in r["detail"],
                   f"n) and it advises no re-arm, got {r['detail']}")
 
+    # o) an unreadable OBJECT DIRECTORY: --verify fails and --disambiguate exits
+    #    ZERO with empty stdout, which reads as "no such object" unless stderr is read.
+    with tempfile.TemporaryDirectory() as td:
+        ws, head = _mk_ws(td, log_lines=["placeholder"])
+        sk = ws / "skill-repos" / "sutando-skills"
+        full = _git(sk, "rev-parse", "HEAD")
+        (sk / "f.txt").write_text("second\n")
+        _git(sk, "add", "f.txt"); _git(sk, "commit", "-q", "-m", "second")
+        (ws / "state" / "content-driver.log").write_text(
+            f"[v=e1e1f151715f@{full[:7]}] driver started\n")
+        objdir = sk / ".git" / "objects" / full[:2]
+        check(objdir.is_dir(), "o) fixture precondition: the stamped object has its own dir")
+        if objdir.is_dir():
+            objdir.chmod(0o000)
+            try:
+                dis = _git(sk, "rev-parse", f"--disambiguate={full[:7]}", check=False)
+                check("Permission denied" in dis or dis == "",
+                      f"o) fixture precondition: git cannot read the object dir, got {dis[:60]!r}")
+                r = hc.check_skills_driver_code_drift(ws)
+            finally:
+                objdir.chmod(0o755)
+            check(r["status"] == "ok" and "INCONCLUSIVE" in r["detail"],
+                  f"o) an unreadable object DIR is INCONCLUSIVE, not absent, got {r}")
+            check("Re-arm" not in r["detail"],
+                  f"o) and it advises no re-arm, got {r['detail']}")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED")
