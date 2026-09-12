@@ -15,10 +15,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 GATE = Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts" / "worker_bootstrap.py"
@@ -284,33 +287,126 @@ class TestTheShippedStartupNamesTheInbox(Base):
                     if "watch-tasks-stream.sh" in ln and "On `start` only" in ln)
         m = re.search(r"`command:\s*'([^']+)'`", line)
         self.assertIsNotNone(m, f"no quoted `command:` in the startup step: {line[:120]}")
+        # The shell's own tokenisation is the argv vector that command becomes.
+        cmd = m.group(1)
         self.assertNotEqual(
-            wb._target_from_argv(m.group(1)), "",
+            wb._target_from_argv(cmd, 4242, argv_vector=lambda pid: shlex.split(cmd)), "",
             "the shipped worker startup names no inbox in the watcher command, so "
             "decide() reads `unknown` forever and the worker never starts one")
 
     def test_a_watcher_started_that_way_is_recognised_as_this_workers(self):
         """The argv the instruction produces, parsed by the shipped probe."""
         argv = f'bash src/watch-tasks-stream.sh {self.inbox}'
-        self.assertEqual(wb._target_from_argv(argv), self.inbox)
+        self.assertEqual(wb._target_from_argv(
+            argv, 4242, argv_vector=lambda pid: shlex.split(argv)), self.inbox)
 
     def test_an_argv_without_an_inbox_is_still_unknown(self):
         self.assertEqual(wb._target_from_argv("bash src/watch-tasks-stream.sh"), "")
 
-    def test_a_spaced_inbox_survives_the_flattened_argv(self):
+    def test_a_spaced_inbox_survives_when_the_real_argv_is_read(self):
         spaced = "/Users/me/Library/Application Support/ws/deliveries/own"
-        self.assertEqual(
-            wb._target_from_argv(f"bash src/watch-tasks-stream.sh {spaced}"), spaced)
+        vec = ["bash", "src/watch-tasks-stream.sh", spaced]
+        self.assertEqual(wb._target_from_argv(
+            f"bash src/watch-tasks-stream.sh {spaced}", 4242, argv_vector=lambda pid: vec),
+            spaced)
+
+    def test_a_flattened_argv_with_operands_is_not_disowned_but_unobserved(self):
+        """A spaced script path and a script plus an operand are the same flat
+        string; the shared policy refuses to decide, and so must this gate."""
+        with self.assertRaises(wb.Unobserved):
+            wb._target_from_argv(f"bash src/watch-tasks-stream.sh {self.inbox}")
 
     def test_a_spaced_inbox_is_still_this_workers_own(self):
         spaced = str(self.ws / "Application Support" / "deliveries" / WORKER)
         self.sentinel(WORKER).write_text("4242\n")
+        vec = ["bash", "src/watch-tasks-stream.sh", spaced]
         decision, _ = wb.decide(
             instance=WORKER, inbox=spaced, workspace=str(self.ws),
             alive=lambda pid: True,
             watcher_target=lambda pid: wb._target_from_argv(
-                f"bash src/watch-tasks-stream.sh {spaced}"))
+                f"bash src/watch-tasks-stream.sh {spaced}", pid, argv_vector=lambda p: vec))
         self.assertEqual(decision, "skip")
+
+
+class TestThroughTheProcessInspectionBoundary(Base):
+    """`decide` with its SHIPPED inspector: a real `ps`, a real argv read.
+    Only the OS answer is varied -- by a real process, or at the `ps` call."""
+
+    def _decide(self, pid):
+        self.sentinel(WORKER).write_text(f"{pid}\n")
+        return wb.decide(instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+                         alive=lambda p: True)
+
+    def _spawn(self, argv):
+        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        import watcher_identity
+        for _ in range(50):
+            if watcher_identity.proc_argv_vector(p.pid) is not None:
+                break
+            time.sleep(0.02)
+        return p
+
+    def test_a_ps_that_exits_1_is_unknown_never_start(self):
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "ps: permission denied")
+        with patch.object(subprocess, "run", ps):
+            d, why = self._decide(4242)
+        self.assertEqual(d, "unknown", why)
+        self.assertIn("could not be observed", why)
+
+    def test_a_ps_that_times_out_is_unknown_never_start(self):
+        def ps(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 10))
+        with patch.object(subprocess, "run", ps):
+            d, why = self._decide(4242)
+        self.assertEqual(d, "unknown", why)
+        self.assertIn("timed out", why)
+
+    def test_an_observer_that_mentions_the_script_is_not_a_watcher(self):
+        """`python3 observer.py src/watch-tasks-stream.sh <this inbox>`: the
+        argv mentions the script and names THIS inbox, and is still not one."""
+        obs = self.ws / "observer.py"
+        obs.write_text("import time; time.sleep(30)\n")
+        p = self._spawn([sys.executable, str(obs), "src/watch-tasks-stream.sh", self.inbox])
+        d, why = self._decide(p.pid)
+        self.assertEqual(d, "start", why)
+        self.assertIn("not a watch-tasks-stream.sh", why)
+
+    def test_a_genuine_watcher_on_this_inbox_is_skipped(self):
+        script = self.ws / "watch-tasks-stream.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n")
+        p = self._spawn(["bash", str(script), self.inbox])
+        import watcher_identity
+        if watcher_identity.proc_argv_vector(p.pid) is None:
+            self.skipTest("no authoritative argv read on this platform")
+        d, why = self._decide(p.pid)
+        self.assertEqual(d, "skip", why)
+
+    def test_a_genuine_watcher_on_another_inbox_starts_ours(self):
+        script = self.ws / "watch-tasks-stream.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n")
+        p = self._spawn(["bash", str(script), str(self.ws / "deliveries" / OTHER)])
+        import watcher_identity
+        if watcher_identity.proc_argv_vector(p.pid) is None:
+            self.skipTest("no authoritative argv read on this platform")
+        d, why = self._decide(p.pid)
+        self.assertEqual(d, "start", why)
+
+    def test_the_cli_exit_code_carries_unknown(self):
+        """rc 2 is what `/startup --worker` acts on; an unobserved inspection
+        must not come out as rc 0 with `start`."""
+        self.sentinel(WORKER).write_text(f"{os.getpid()}\n")    # alive, for real
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        import contextlib
+        import io
+        out = io.StringIO()
+        with patch.object(subprocess, "run", ps), contextlib.redirect_stdout(out):
+            rc = wb.main(["--instance", WORKER, "--inbox", self.inbox, "--workspace", str(self.ws)])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.getvalue().splitlines()[0], "unknown")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)
