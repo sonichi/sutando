@@ -5735,27 +5735,11 @@ def _quota_windows(headers: dict) -> dict:
     return out
 
 
-def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
-    """Mirror of credential-proxy.ts `scopedKeychainService`.
-
-    Empty/whitespace -> None, so the caller falls back to the vanilla item —
-    the same contract the proxy implements.
-    """
-    dir_ = (config_dir or "").strip()
-    if not dir_:
-        return None
-    digest = hashlib.sha256(dir_.encode()).hexdigest()[:8]
-    return f"Claude Code-credentials-{digest}"
-
-
-def _keychain_service_exists(service: str) -> bool:
-    try:
-        return subprocess.run(
-            ["security", "find-generic-password", "-s", service],
-            capture_output=True, timeout=5,
-        ).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+# Centralized: auth_preflight.py needs this exact resolution too.
+from keychain_service import (  # noqa: E402
+    scoped_keychain_service as _scoped_keychain_service,
+    keychain_service_exists as _keychain_service_exists,
+)
 
 
 # Distinct from None and from "": the environment could not be READ at all.
