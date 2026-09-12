@@ -31,6 +31,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# moved out of src/ but still imports its helpers from there
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 
