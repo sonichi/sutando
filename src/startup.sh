@@ -692,7 +692,15 @@ fi
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
-if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
+# A writer left by a previous core (a restart from another checkout, a core
+# that died under it) would keep this boot from owning the file: stop the
+# recorded one first, and name an unrecorded survivor instead of hiding it.
+[ -n "$PY" ] && "$PY" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 || true
+if pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
+  echo "  ✗ core heartbeat NOT started: an unrecorded writer is already running" \
+       "(pid $(pgrep -f "src/core_heartbeat.py" | tr '\n' ' ')); it does not report this core." \
+       "Kill it and run: $PY $REPO/src/core_heartbeat.py &" >&2
+else
   echo "  Starting core heartbeat..."
   # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
   # unconditional echo claims a start that never happened when no interpreter
@@ -704,8 +712,6 @@ if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
   else
     echo "  ⊘ core heartbeat skipped — no runnable python3"
   fi
-else
-  echo "  ✓ core heartbeat (already running)"
 fi
 
 # Services-status emitter — aggregates sidecar liveness into
