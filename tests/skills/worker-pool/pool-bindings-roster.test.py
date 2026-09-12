@@ -12,7 +12,7 @@ owner did not ask for:
   * a binding naming a nonexistent worker is refused at COMPILE time, where one
     error is visible, rather than at routing time once per task.
 
-Run: python3 tests/pool-bindings-roster.test.py
+Run: python3 tests/skills/worker-pool/pool-bindings-roster.test.py
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 
 import pool_roster as pr  # noqa: E402
 
