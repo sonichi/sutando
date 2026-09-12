@@ -2752,22 +2752,46 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     /// The model the switch script last recorded as accepted (state/model-switch.json).
-    func recordedModel() -> String? {
-        guard let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return root["model"] as? String
+    /// The model the proxy last saw on the wire. `model-switch.json` records only
+    /// switches this menu completed, so it goes stale the moment anything else sets
+    /// the model — including the CLI's own default.
+    func liveModel() -> String? {
+        guard let data = FileManager.default.contents(atPath: workspace + "/state/quota-state.json"),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let last = root["last_request"] as? [String: Any] else { return nil }
+        return last["model"] as? String
+    }
+
+    /// (family, version) from either vocabulary: a menu id is a bare family alias or
+    /// a full claude-<family>-<ver> id, optionally context-tagged; the wire always
+    /// carries the full id. An alias has no version, so it matches any version of
+    /// its family; a versioned id must match exactly. Ids stay in the manifest.
+    func modelKey(_ id: String) -> (String, String?) {
+        var t = id
+        if let r = t.range(of: "[1m]") { t.removeSubrange(r) }
+        guard t.hasPrefix("claude-") else { return (t, nil) }
+        let parts = t.dropFirst("claude-".count).split(separator: "-", maxSplits: 1)
+        let fam = String(parts.first ?? "")
+        let ver = parts.count > 1 ? parts[1].replacingOccurrences(of: "-", with: ".") : nil
+        return (fam, ver)
+    }
+
+    func sameModel(_ menuID: String, _ live: String) -> Bool {
+        let (mf, mv) = modelKey(menuID), (lf, lv) = modelKey(live)
+        guard mf == lf else { return false }
+        return mv == nil || mv == lv
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === modelSubmenu else { return }
         menu.removeAllItems()
-        let current = recordedModel()
+        let current = liveModel()
         if let choices = modelChoices() {
             for c in choices {
                 let it = NSMenuItem(title: c.title, action: #selector(switchModel(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = c.id
-                it.state = (c.id == current) ? .on : .off
+                it.state = (current.map { sameModel(c.id, $0) } ?? false) ? .on : .off
                 menu.addItem(it)
             }
         } else {

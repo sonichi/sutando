@@ -16,7 +16,8 @@ assert len(pairs) >= 2 and all(len(p) == 2 and p[0].strip() and p[1].strip() for
 assert "default" in [p[0].strip() for p in pairs]
 PY
 grep -q 'title: "Other model' "$F" && grep -q 'func switchOtherModel' "$F" && ok "2e a free-form Other model… entry exists for ids the list lacks" || fail "2e" "no Other model entry"
-grep -q '"/state/model-switch.json"' "$F" && grep -q 'it.state = (c.id == current)' "$F" && ok "2f the recorded model is check-marked" || fail "2f" "no current-model mark"
+grep -q '"/state/quota-state.json"' "$F" && grep -q 'last_request' "$F" && ok "2f the tick reads the LIVE model the proxy saw, not the switch record" || fail "2f" "tick still sourced from model-switch.json"
+grep -q 'func sameModel' "$F" && ! grep -q 'c.id == current' "$F" && ok "2g ...compared by family/version, not raw id equality across two vocabularies" || fail "2g" "raw id comparison remains"
 grep -q 'runCoreAction(script: repoRoot + "/scripts/switch-model.sh"' "$F" && ok "3 the handler runs scripts/switch-model.sh through the shared runner" || fail "3" "handler does not call the script"
 grep -A2 'scripts/switch-model.sh' "$F" | grep -q '"--confirm"' && ok "4 ...with --confirm (the click is the owner's instruction)" || fail "4" "no --confirm"
 grep -A2 'scripts/switch-model.sh' "$F" | grep -q '"--socket", sutandoTmuxSocket' && ok "5 ...on the configured socket" || fail "5" "socket not passed"
