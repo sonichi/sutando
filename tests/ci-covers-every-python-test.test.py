@@ -48,6 +48,17 @@ def _uncommented(text: str) -> str:
     return active_text(text)
 
 
+def _yaml_scalar(value: str) -> str:
+    """A wholly YAML-quoted `run:` value, unwrapped.
+
+    The quotes are YAML's, not the shell's; leaving them makes the shell-quote
+    blanking swallow a real invocation."""
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" and v[0] not in v[1:-1]:
+        return v[1:-1]
+    return value
+
+
 def _run_bodies(text: str) -> list[str]:
     """Lines inside a workflow `run:` value — the only place a command executes.
 
@@ -57,9 +68,11 @@ def _run_bodies(text: str) -> list[str]:
         stripped = ln.strip()
         m = re.match(r"-?\s*run:\s*\|?-?\s*(.*)$", stripped)
         if m and re.search(r"(^|\s)run:", stripped):
-            indent = len(ln) - len(ln.lstrip())
+            # The KEY's column, not the line's: a `- ` list marker sits left of
+            # it, so a sibling key would otherwise read as a continuation line.
+            indent = ln.index("run:")
             if m.group(1):
-                out.append(m.group(1))
+                out.append(_yaml_scalar(m.group(1)))
             continue
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
