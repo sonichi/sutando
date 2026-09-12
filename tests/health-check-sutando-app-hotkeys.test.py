@@ -10,7 +10,7 @@ defaults (⌃⇧C/⌃S/⌃⇧R/⌃V/⌃M). Since #1920 the app publishes the reg
 hotkeys to <workspace>/state/hotkeys.json; the check now reads that instead.
 
 Covers `sutando_app_hotkey_detail`:
-  a) missing hotkeys.json → "running (no hotkeys published)"
+  a) missing hotkeys.json → "running (watcher-watchdog + hotkeys, none published)"
   b) valid file → labels joined in publish order
   c) malformed JSON → fallback (no false claim on half-written files)
   d) empty list → fallback
@@ -60,7 +60,7 @@ def with_state(content):
 # a) missing file
 check("a_missing_file",
       hc.sutando_app_hotkey_detail(with_state(None)),
-      "running (no hotkeys published)")
+      "running (watcher-watchdog + hotkeys, none published)")
 
 # b) valid published file (shape from main.swift publishHotkeys)
 entries = [
@@ -70,30 +70,30 @@ entries = [
 ]
 check("b_valid_file",
       hc.sutando_app_hotkey_detail(with_state(entries)),
-      "running (hotkeys: ⌃⇧C/⌃S/⌃V)")
+      "running (watcher-watchdog + hotkeys: ⌃⇧C/⌃S/⌃V)")
 
 # c) malformed JSON
 check("c_malformed_json",
       hc.sutando_app_hotkey_detail(with_state("{broken")),
-      "running (no hotkeys published)")
+      "running (watcher-watchdog + hotkeys, none published)")
 
 # d) empty list
 check("d_empty_list",
       hc.sutando_app_hotkey_detail(with_state([])),
-      "running (no hotkeys published)")
+      "running (watcher-watchdog + hotkeys, none published)")
 
 # e) entries missing labels are skipped
 check("e_partial_labels",
       hc.sutando_app_hotkey_detail(with_state([{"action": "x"}, {"action": "y", "label": "⌃M"}])),
-      "running (hotkeys: ⌃M)")
+      "running (watcher-watchdog + hotkeys: ⌃M)")
 check("e_all_label_less",
       hc.sutando_app_hotkey_detail(with_state([{"action": "x"}])),
-      "running (no hotkeys published)")
+      "running (watcher-watchdog + hotkeys, none published)")
 
 # f) wrong shape (list of strings) → fallback, no crash
 check("f_wrong_shape",
       hc.sutando_app_hotkey_detail(with_state(["not-a-dict"])),
-      "running (no hotkeys published)")
+      "running (watcher-watchdog + hotkeys, none published)")
 
 if FAILURES:
     print(f"\n{len(FAILURES)} failure(s):")

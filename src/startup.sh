@@ -667,7 +667,12 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
+# THIS instance's sentinel only. The reaper deliberately kills a watcher that
+# OWNS its sentinel -- right for a leftover of this instance, fatal for a peer's
+# running one, and startup no longer precedes every watcher on a pool host.
+if __sentinel="$(sentinel_path_for "$WORKSPACE/state")" && [ -n "$__sentinel" ]; then
+  reap_stale_task_watcher "$__sentinel"
+fi
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —

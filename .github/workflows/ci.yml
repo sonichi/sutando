@@ -237,6 +237,32 @@ jobs:
           done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
           exit "$failed"
 
+      # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
+      # later: these suites existed and CI discovered none of them, so a .mjs
+      # suite could fail at HEAD while the run reported green.
+      - name: Run ESM standalone tests
+        run: |
+          failed=0
+          while IFS= read -r f; do
+            echo "→ $f"
+            # Same `if ! output=$(...)` form as the shell step: a bare assignment
+            # would abort the whole step under `bash -e` on the first failure and
+            # mask every later suite.
+            if ! output=$(timeout -k 5 300 node "$f" 2>&1); then
+              echo "✖ esm test failed: $f"
+              echo "$output"
+              failed=1
+            else
+              # Every suite must contribute a visible verdict. With a narrower
+              # pattern four of seven printed nothing, so a step that ran
+              # everything looked like a loop that matched no files — a green
+              # indistinguishable from absence. `tail -1` is the backstop for a
+              # suite whose closing line matches none of these.
+              echo "$output" | grep -E 'FAIL|^all ok|^all passed|^PASS' || echo "$output" | tail -1
+            fi
+          done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
+          exit "$failed"
+
   python-standalone-tests:
     name: python standalone tests
     runs-on: ubuntu-latest

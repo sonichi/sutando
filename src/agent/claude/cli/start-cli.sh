@@ -658,13 +658,20 @@ ensure_core_monitor() {
     # caller that captures start-cli.sh's output (e.g. tests/start-cli-*.test.py)
     # blocks on the pipe until this infinite loop closes it (never) and times out.
     # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
-    [ -n "$PY" ] && ( while true; do
-        "$PY" "$REPO/src/core-supervisor-relay.py" \
-          --signal "$mon_out" --state-file "$relay_state" \
-          --active-from "$ws/state/last-owner-activity.json"
-        sleep 30
-      done ) >> /tmp/core-supervisor-relay.log 2>&1 &
-    echo $! > "$relay_pid_file"
+    # An if-block with a simple command, not `A && ( … ) &`: the `&` on an
+    # AND-list forks a wrapper subshell that keeps the caller's stdout/stderr
+    # (only the inner subshell gets the redirect) and waits on this infinite
+    # loop forever — so any caller capturing start-cli.sh's output never saw
+    # EOF (desktop core_restart: 120 s timeout on every fresh boot). This form
+    # also makes $! the loop's own pid, so the pidfile can actually stop it.
+    # Loop only while the interpreter and script exist, and stop if sleep fails:
+    # with them gone (engine dir removed) `while true` would spin at full CPU.
+    if [ -n "$PY" ]; then
+      bash -c 'while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
+        relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" \
+        >> /tmp/core-supervisor-relay.log 2>&1 < /dev/null &
+      echo $! > "$relay_pid_file"
+    fi
   fi
 }
 

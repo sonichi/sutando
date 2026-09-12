@@ -65,6 +65,10 @@ __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 # into its env). Single resolution path = no divergence.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
+elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
+  # same `/startup` serves it with no argument change.
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
 elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
   __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
   TASKS_DIR="$__WS/tasks"
@@ -79,7 +83,9 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
-WORKSPACE_DIR="$(dirname "$TASKS_DIR_ABS")"
+# A watcher on <ws>/deliveries/<id> must not infer the workspace from its
+# inbox; whoever named that inbox names the workspace too.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
@@ -87,7 +93,9 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # of spawning an unbounded process fanout. Unhandled work still emits its
 # TASK_FILE event immediately, even while the provider queue is full.
 TASK_HANDLER_WORKERS=2
-SUTANDO_PY_BIN="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+# shellcheck source=../scripts/python-binary.sh
+. "$__REPO_ROOT/scripts/python-binary.sh"
+SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 DISPATCH_DIR=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -95,7 +103,12 @@ FSWATCH_PID=""
 CLEANING_UP=0
 GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-FALLBACKS_DIR="$WORKSPACE_DIR/state/task-event-handler-fallbacks"
+# Per instance: this receipt says "MY optional handler declined this task", and
+# a shared one makes another instance bypass its own handler. Owner: util_paths.
+FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+  echo "watch-tasks-stream: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 WATCHER_ID="$$-${RANDOM:-0}"
 
 claim_is_live() {
@@ -413,13 +426,13 @@ dispatch_task() {
 # the session and turn into an orphan. The trap below removes the file on a
 # clean exit; the Stop hook removes it after the kill on dirty exits.
 #
-# Same workspace resolution as TASKS_DIR (above): M0 cutover routes through
-# the canonical loader. Living under state/ matches the workspace contract
-# in CLAUDE.md (loose status/state files belong there). Post-v0.8 the legacy
-# env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
-STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
+# Derived from WORKSPACE_DIR like CLAIMS_DIR and FALLBACKS_DIR, never re-resolved:
+# an argv tasks dir moves every other state path but left this one on the checkout.
+STATE_DIR="$WORKSPACE_DIR/state"
 mkdir -p "$STATE_DIR"
-PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# Per instance: N watchers on one host each stamped the same file, so the
+# readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
+PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"

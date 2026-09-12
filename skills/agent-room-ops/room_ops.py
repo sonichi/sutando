@@ -23,7 +23,9 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
-task); usage errors exit 2. See SKILL.md for the boundary + the parity epic.
+task); usage errors exit 2. `--strict`, placed BEFORE the subcommand, is the
+opt-in exception: it exits 1 on `ok:false`, for shell callers that gate on the
+exit code. The default is unchanged. See SKILL.md for the boundary + the parity epic.
 `events stream` is the one JSONL surface: one compact JSON line per delivered
 event (journal-friendly), then a one-line summary.
 """
@@ -74,9 +76,16 @@ def _record_say(res):
         pass
 
 
+def _strict_rc(res, strict):
+    """Default stays 0 on a failed op: callers batch these and read `ok`.
+    --strict is for shell callers, where exit 0 reads as delivered."""
+    return 1 if strict and isinstance(res, dict) and res.get("ok") is False else 0
+
+
 def _events_stream(a):
     """`events stream`: one compact JSON line per event (journal-friendly), a
-    one-line JSON summary last. Exits 0 for any structured outcome — a
+    one-line JSON summary last. Exits 0 for any structured outcome unless
+    --strict, which exits 1 on ok:false — a
     disconnect without --cursor-file is a structured ok:false, not a crash.
     With --cursor-file the durable-cursor wrapper reconnects forever (#184);
     without it, one connection is made and its end is reported."""
@@ -99,7 +108,7 @@ def _events_stream(a):
     except (_events.StreamDisconnected, RuntimeError) as e:
         out = {"ok": False, "events": seen["n"], "cursor": seen["cursor"], "reason": str(e)}
     print(json.dumps(out, ensure_ascii=False), flush=True)
-    return 0
+    return _strict_rc(out, getattr(a, "strict", False))
 
 
 def _dispatch_events(a):
@@ -250,6 +259,8 @@ def _main(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
@@ -313,7 +324,7 @@ def _main(argv):
         fn = _react.react if a.cmd == "react" else _react.unreact
         res = fn(a.room_id, a.event_id, key, a.agent_mxid)
     print(json.dumps(res, indent=2))
-    return 0
+    return _strict_rc(res, a.strict)
 
 
 if __name__ == "__main__":

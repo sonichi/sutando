@@ -247,7 +247,7 @@ def main() -> int:
         # means nothing unless the reader can see WHICH workspace was examined.
         print(f"sync-conflicts: no unmerged peer content ({ws})")
         return 0
-    print(f"sync-conflicts: {len(rows)} file(s) hold peer content not in the live copy")
+    print(f"sync-conflicts: {len({rel for _batch, rel, _n in rows})} file(s) hold peer content not in the live copy")
     for batch, rel, n in rows:
         if n is None:
             where = "live file MISSING"

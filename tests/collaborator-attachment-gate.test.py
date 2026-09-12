@@ -140,6 +140,12 @@ class BridgeWiring(unittest.TestCase):
         self.assertFalse(fn({"groups": {"123": True}}, "123"))          # bool cfg, no dict
         self.assertTrue(fn({"groups": {"123": {"collaboratorAttachments": True}}}, "123"))
         self.assertFalse(fn({"groups": {"123": {"collaboratorAttachments": "yes"}}}, "123"))  # is True only
+        # `channels` is NOT a config section: only `groups` is consulted. This
+        # assertion FAILS on the pre-fix code, which looped ("groups","channels").
+        self.assertFalse(fn({"channels": {"123": {"collaboratorAttachments": True}}}, "123"))
+        # and a groups entry still wins when both are present
+        self.assertTrue(fn({"groups": {"123": {"collaboratorAttachments": True}},
+                            "channels": {"123": {"collaboratorAttachments": False}}}, "123"))
 
 
 class QuarantineRecord(unittest.TestCase):

@@ -17,13 +17,16 @@ Run: python3 tests/shutdown-sentinel-immediate-exit-controls.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import pty
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -70,6 +73,30 @@ PGREP_STUB = "#!/bin/bash\nexit 1\n"
 CODEX_STUB = "#!/bin/bash\nexit 0\n"
 
 
+def _reap_fixture_children(tmp: str) -> None:
+    """The launcher backgrounds a relay loop and a monitor that outlive it; kill whatever
+    still references the fixture before deleting it, or rmtree races their writes."""
+    marker = os.path.basename(tmp)
+    for _ in range(100):
+        pids = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+        if not pids:
+            return
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, ValueError):
+                os.kill(int(pid), signal.SIGTERM)
+        time.sleep(0.02)
+    failures.append(f"fixture children survived teardown: {pids}")
+
+
+@contextlib.contextmanager
+def _fixture():
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            yield tmp
+        finally:
+            _reap_fixture_children(tmp)
+
+
 def _launch(cmd, env, cwd, tty: bool):
     """Run the launcher, optionally under a pty so `[ -t 1 ]` is true."""
     if not tty:
@@ -106,7 +133,7 @@ def _launch(cmd, env, cwd, tty: bool):
 
 
 def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = False) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
+    with _fixture() as tmp:
         root, binp = Path(tmp) / "repo", Path(tmp) / "bin"
         binp.mkdir(parents=True)
         missing = False
