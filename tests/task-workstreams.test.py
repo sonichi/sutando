@@ -295,18 +295,19 @@ def test_history_derives_every_id_through_the_shared_path_to_id_owner() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-def test_result_index_survives_unreadable_roots() -> None:
-    # A missing results dir, or an archive root whose walk raises, yields an
-    # empty index rather than taking the history scan down.
+def test_result_resolution_survives_unreadable_roots() -> None:
+    # The property `_result_index` carried, asserted where it now lives: a
+    # missing results dir or a raising archive walk must not take the scan down.
     workspace = Path(tempfile.mkdtemp(prefix="sutando-result-index-"))
     try:
-        assert workstreams._result_index(workspace / "results") == {}
+        owner = workstreams.local_task_protocol
+        assert owner.resolve_result(workspace / "results", "task-r1")[0] == "missing"
         results = workspace / "results"
-        (results / "archive-2026").mkdir(parents=True)
+        (results / "archive" / "2026-08").mkdir(parents=True)
         (results / "task-r1.txt").write_text("done")
-        with mock.patch.object(Path, "rglob", side_effect=OSError(13, "denied")):
-            index = workstreams._result_index(results)
-        assert list(index) == ["task-r1"], index
+        with mock.patch("os.scandir", side_effect=OSError(13, "denied")):
+            state, _path, body = owner.resolve_result(results, "task-r1")
+        assert (state, body) == ("ready", "done"), (state, body)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 def test_context_bare_id_with_no_tasks_dir_fails_open() -> None:
@@ -1452,7 +1453,7 @@ def main() -> None:
         test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment,
         test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
         test_history_derives_every_id_through_the_shared_path_to_id_owner,
-        test_result_index_survives_unreadable_roots,
+        test_result_resolution_survives_unreadable_roots,
         test_context_bare_id_with_no_tasks_dir_fails_open,
         test_context_refuses_a_task_path_that_is_missing_or_carries_another_id,
         test_loader_parser_and_history_fail_open_edges,

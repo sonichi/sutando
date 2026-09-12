@@ -61,6 +61,7 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
     verdicts: Counter = Counter()
     by_source: dict = defaultdict(Counter)
     scanned = 0
+    unreadable = 0
     # rglob: the archiver nests monthly dirs (tasks/archive/YYYY-MM/) — a
     # flat glob silently drops those writers from the census (review blocker).
     for d in (ws / "tasks",):
@@ -72,7 +73,11 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
             try:
                 text = p.read_text(encoding="utf-8")
                 mtime = p.stat().st_mtime
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # Present-but-unreadable is evidence we DO NOT HAVE: dropping it
+                # can turn an unsigned writer into a MET gate. Vanished is a skip.
+                if p.exists():
+                    unreadable += 1
                 continue
             if _task_epoch(p.name, text, mtime) < cutoff:
                 continue
@@ -82,6 +87,9 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
             by_source[_source_of(text)][v] += 1
     return {
         "scanned": scanned,
+        # Unreadable files cannot be date-filtered either, so they count as
+        # possibly-in-window: the gate must fail closed on them.
+        "unreadable": unreadable,
         "days": days,
         "verdicts": dict(verdicts),
         "by_source": {s: dict(c) for s, c in sorted(by_source.items())},
@@ -112,6 +120,9 @@ def main(argv: list[str]) -> int:
     if r["unsigned_sources"]:
         print("  UNSIGNED writers still live (census gate not met): "
               + ", ".join(r["unsigned_sources"]))
+    elif r["unreadable"]:
+        print(f"  census gate UNKNOWN — {r['unreadable']} in-window file(s) could "
+              "not be read, so not every writer was judged")
     else:
         print("  census gate MET within window — no unsigned writers")
     return 0

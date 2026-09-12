@@ -88,7 +88,9 @@ def _seed(mod, td: str, holder_body: str, orig: str = ORIG):
     results, tasks = Path(td) / "results", Path(td) / "tasks"
     (results / "archive").mkdir(parents=True)
     tasks.mkdir(parents=True)
-    (results / "archive" / f"{HOLDER}-1785976425.txt").write_text(holder_body)
+    _h = results / "archive" / f"{HOLDER}-1785976425.txt"
+    # bytes = a torn holder: mid-write, so it decodes now but may not yet.
+    _h.write_bytes(holder_body) if isinstance(holder_body, bytes) else _h.write_text(holder_body)
     (tasks / f"{TID}.txt").write_text(orig)
     (results / f"{TID}.txt").write_text(DEDUP)
     mod.RESULTS_DIR, mod.TASKS_DIR = results, tasks
@@ -169,6 +171,22 @@ class DiscordPollLoopTest(unittest.TestCase):
                             f"owner never told the ask could not be recovered; sent={r['sent']}")
             self.assertEqual(r["requeued"], [], "looped instead of reporting")
 
+    def test_a_torn_holder_defers_and_nothing_is_lost(self):
+        """DEFER must retain the route, the result and the task.
+
+        Archiving here strands an answer that is merely unreadable YET, and the
+        asker gets a duplicate re-ask instead of the reply landing seconds later.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            r = self._one_pass(td, b"a partial answer \xe2\x9c")
+            self.assertEqual(r["requeued"], [], "re-asked while the holder was still arriving")
+            self.assertEqual(r["sent"], [], "reported a holder that had not been read yet")
+            self.assertIn(TID, r["pending"], "route dropped on defer — the reply is unroutable")
+            self.assertTrue((Path(td) / "results" / f"{TID}.txt").exists(),
+                            "result archived on defer — nothing left to retry")
+            self.assertTrue((Path(td) / "tasks" / f"{TID}.txt").exists(),
+                            "task archived on defer — the original ask is gone")
+
     def test_holder_that_answered_is_left_alone(self):
         with tempfile.TemporaryDirectory() as td:
             r = self._one_pass(td, "the full answer")
@@ -216,6 +234,22 @@ class SlackPollLoopTest(unittest.TestCase):
             r = self._one_pass(td, "")
             self.assertEqual(len(r["requeued"]), 1,
                              f"watcher did not recover the dedup; log={r['log'][:300]}")
+
+    def test_a_torn_holder_defers_and_nothing_is_lost(self):
+        """Same contract in the threaded watcher: defer retains all three."""
+        with tempfile.TemporaryDirectory() as td:
+            r = self._one_pass(td, b"a partial answer \xe2\x9c")
+            self.assertEqual(r["requeued"], [], "re-asked while the holder was still arriving")
+            # Narrow to the dedup REPORT: `sent` also collects the unrelated
+            # slow-task nag, so asserting it is empty fails for the wrong reason.
+            self.assertFalse([s for s in r["sent"] if "delivered nothing" in str(s)],
+                             "reported a holder that had not been read yet")
+            self.assertIsNotNone(self.sb._get_pending_reply(TID)
+                                 if hasattr(self.sb, "_get_pending_reply")
+                                 else self.sb.pending_replies.get(TID),
+                                 "route dropped on defer — the reply is unroutable")
+            self.assertTrue((Path(td) / "results" / f"{TID}.txt").exists(),
+                            "result archived on defer — nothing left to retry")
 
 
 if __name__ == "__main__":

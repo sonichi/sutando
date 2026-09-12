@@ -1174,6 +1174,9 @@ def main():  # pragma: no cover
                         if _rq:
                             pending_replies[_rq] = chat_id
                         if _disp == "retain":
+                            # The route was popped at the top of the loop; retaining
+                            # the files without it strands the answer with nowhere to go.
+                            pending_replies[task_id] = chat_id
                             print(f"  [dedup] report not delivered for {task_id} "
                                   f"— keeping for retry", flush=True)
                             continue

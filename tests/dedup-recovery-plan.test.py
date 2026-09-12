@@ -55,6 +55,9 @@ class _Space:
         else:
             (self.results / "archive" / f"{HOLDER}-1785976425.txt").write_text(body)
 
+    def live_holder(self, body: str):
+        (self.results / f"{HOLDER}.txt").write_text(body)
+
     def orig(self, text: str = ORIG):
         (self.tasks / f"{TID}.txt").write_text(text)
 
@@ -188,22 +191,51 @@ class CommitIdentityTest(unittest.TestCase):
 
 
 class UnreadableInputTest(unittest.TestCase):
-    """A task or holder path that exists but cannot be read is 'no record',
-    not an exception into the delivery loop."""
+    """An unreadable path is RETRYABLE, not 'no record'. Reversed at the
+    reviewer's request on #3317: treating it as missing takes a terminal
+    action against an answer that may land a moment later."""
 
-    def test_unreadable_original_task_is_treated_as_missing(self):
+    def test_unreadable_original_task_defers(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td)
             sp.holder("")
             # A directory where the task file is expected: read_text raises.
             (sp.tasks / f"{TID}.txt").mkdir()
-            self.assertEqual(sp.plan()[0], "report")
+            self.assertEqual(sp.plan()[0], "defer")
 
     def test_unreadable_holder_result_is_treated_as_not_delivered(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td)
             sp.orig()
             (sp.results / "archive" / f"{HOLDER}-1785976425.txt").mkdir()
+            self.assertEqual(sp.plan()[0], "requeue")
+
+
+class EmptyHolderLocationTest(unittest.TestCase):
+    """Where an empty holder body sits decides whether it is terminal.
+
+    A LIVE empty body may be a write in flight — `read_ready_result` calls it
+    not-ready — so a terminal requeue there re-asks a question that is about to
+    be answered. An ARCHIVED empty body was consumed having answered nothing,
+    and deferring on it would wait forever.
+    """
+
+    def test_a_live_empty_holder_defers(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.orig(); sp.live_holder("")
+            self.assertEqual(sp.plan()[0], "defer")
+            self.assertFalse((sp.tasks / f"{NEW}.txt").exists(),
+                             "deferred, so nothing may be re-asked yet")
+
+    def test_a_live_whitespace_only_holder_defers(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.orig(); sp.live_holder("  \n\t ")
+            self.assertEqual(sp.plan()[0], "defer")
+
+    def test_the_same_body_archived_still_requeues(self):
+        # The contrast is the point: identical bytes, opposite verdicts.
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.orig(); sp.holder("")
             self.assertEqual(sp.plan()[0], "requeue")
 
 
@@ -254,9 +286,11 @@ class DelegationTest(unittest.TestCase):
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()
-                self.assertIn(
-                    "find_result", src,
-                    f"{name}: must use local_task_protocol.find_result",
+                # Either shared entry point: `resolve_result` is `find_result`'s
+                # candidate order plus readiness, not a second lookup policy.
+                self.assertTrue(
+                    "find_result" in src or "resolve_result" in src,
+                    f"{name}: must look up through local_task_protocol, not its own scan",
                 )
                 self.assertNotIn(
                     "find_archived_result", src,

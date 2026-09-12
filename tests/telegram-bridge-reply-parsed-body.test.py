@@ -41,7 +41,8 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
         substring search for `.keys()` would find nothing at all, or could
         match the wrong location if the internals change again.
         """
-        start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
+        anchor = "for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):"
+        start = SRC.find(anchor)
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
         # End on the loop's own dedent, not a character count. A fixed window is
         # a latent break: any insertion pushes the last assertion off its edge.
