@@ -67,6 +67,21 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
+def _reply_to_id(msg):
+    """The parent's id from the reference METADATA, never the embedded body.
+
+    `referenced_message` is optional: Discord omits it when it was not fetched
+    and nulls it when the parent was deleted, while `message_reference` still
+    carries the id. Reading the body loses the edge in exactly those cases.
+    Type 1 is a FORWARD, which references a message it is not replying to.
+    """
+    ref = msg.get("message_reference") or {}
+    if ref.get("type", 0) != 0:
+        return ""
+    mid = ref.get("message_id") or (msg.get("referenced_message") or {}).get("id") or ""
+    return str(mid)
+
+
 def main(argv=None):
     env = claude_home_path("channels", "discord", ".env")
     token = _load_token(env)
@@ -128,7 +143,7 @@ def main(argv=None):
                 "text": _render(msg, clip), "reply": ctx or "",
                 # `reply` is clipped at REPLY_CLIP, so matching its text picks
                 # the wrong parent silently once a parent is longer. A key cannot.
-                "reply_to_id": str((msg.get("referenced_message") or {}).get("id", "")),
+                "reply_to_id": _reply_to_id(msg),
                 "url": f"https://discord.com/channels/{guild or '@me'}/{args.channel_id}/{msg.get('id', '')}",
             }, ensure_ascii=False))
             continue

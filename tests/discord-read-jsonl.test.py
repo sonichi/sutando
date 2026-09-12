@@ -114,5 +114,47 @@ class ReplyToId(unittest.TestCase):
         self.assertNotEqual(rendered_body, parent["text"])          # truncated
         self.assertLess(len(rendered_body), len(LONG_PARENT))
 
+
+class ReplyReferenceMetadata(unittest.TestCase):
+    """`referenced_message` is optional; `message_reference` is the edge."""
+
+    def _row(self, msg):
+        rc, out, _ = _run(["123", "--operator", "--jsonl"], messages=[msg])
+        self.assertEqual(rc, 0)
+        return json.loads(out.strip().splitlines()[0])
+
+    def _reply(self, **over):
+        m = {"id": "2000", "timestamp": "2026-09-12T18:00:01.000Z", "content": "child",
+             "author": {"username": "Sutando-Pro"},
+             "message_reference": {"message_id": "1000", "channel_id": "123"}}
+        m.update(over)
+        return m
+
+    def test_the_id_survives_an_omitted_embedded_parent(self):
+        # Discord omits referenced_message when it was not fetched.
+        self.assertEqual(self._row(self._reply())["reply_to_id"], "1000")
+
+    def test_the_id_survives_a_null_embedded_parent(self):
+        # null = the parent was deleted; the reference still names it.
+        self.assertEqual(self._row(self._reply(referenced_message=None))["reply_to_id"], "1000")
+
+    def test_a_present_embedded_parent_agrees(self):
+        row = self._row(self._reply(referenced_message={
+            "id": "1000", "timestamp": "2026-09-12T17:59:59.000Z",
+            "content": "parent", "author": {"username": "susanliu_"}}))
+        self.assertEqual(row["reply_to_id"], "1000")
+
+    def test_a_forward_references_without_replying(self):
+        # type 1 is a FORWARD: it points at a message it is not a reply to.
+        fwd = self._reply(message_reference={"message_id": "1000", "type": 1})
+        self.assertEqual(self._row(fwd)["reply_to_id"], "")
+
+    def test_a_non_reply_carries_an_empty_key_not_a_missing_one(self):
+        root = {"id": "3000", "timestamp": "2026-09-12T18:00:02.000Z", "content": "root",
+                "author": {"username": "susanliu_"}}
+        row = self._row(root)
+        self.assertIn("reply_to_id", row)
+        self.assertEqual(row["reply_to_id"], "")
+
 if __name__ == "__main__":
     unittest.main()
