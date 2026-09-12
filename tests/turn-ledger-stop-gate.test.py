@@ -32,6 +32,7 @@ Run: python3 tests/turn-ledger-stop-gate.test.py
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import datetime
 import io
@@ -42,6 +43,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 from unittest import mock
 import tempfile
 import time
@@ -418,6 +420,13 @@ def main() -> int:
         test_a_result_older_than_the_boundary_is_not_this_turns,
         test_bookkeeping_never_raises_into_the_send_path,
         test_two_sessions_do_not_reset_or_satisfy_each_others_gate,
+        test_session_scoping_helpers_direct,
+        test_session_tag_lands_in_a_recorded_entry,
+        test_cli_session_flag_scopes_turn_start,
+        test_module_reinserts_src_onto_a_bare_sys_path,
+        test_writer_lock_survives_flock_failure,
+        test_trim_survives_an_unwritable_state_dir,
+        test_result_after_skips_an_entry_whose_stat_races_away,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -919,6 +928,146 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
             second_u = _run_hook_script(stop_hook, ws3, None)
             check("control: without a session, a second silent stop is reminded again",
                   json.loads(second_u.stdout).get("decision") == "block", second_u.stdout)
+
+
+def test_session_scoping_helpers_direct() -> None:
+    """The session-scoping helpers' truthy branches, called directly — the
+    two-session test above exercises them only through subprocesses, which
+    `coverage run` in this process cannot see.
+    """
+    check("_scoped_name tags the base name with a session",
+          turn_ledger._scoped_name("turn-stop.json", "sess-1") == "turn-stop.sess-1.json",
+          turn_ledger._scoped_name("turn-stop.json", "sess-1"))
+    unsafe = turn_ledger._scoped_name("turn-stop.json", "a/b c")
+    check("_scoped_name sanitizes characters unsafe in a filename",
+          "/" not in unsafe and " " not in unsafe, unsafe)
+    check("_resolve_session returns an explicitly given session verbatim",
+          turn_ledger._resolve_session("explicit-id") == "explicit-id", "")
+    matching = turn_ledger._entry_matches_session({"session": "sess-1"}, "sess-1")
+    other = turn_ledger._entry_matches_session({"session": "sess-2"}, "sess-1")
+    check("_entry_matches_session accepts its own tag", matching, "")
+    check("_entry_matches_session rejects a different tag", not other, "")
+
+
+def test_session_tag_lands_in_a_recorded_entry() -> None:
+    """`record_send`/`record_no_send` write a `session` key when one is given —
+    called directly (not through the env-driven default) for a deterministic entry.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.record_send("room", "!r:ag2.space", workspace=ws, session="sess-x")
+        turn_ledger.record_no_send("checked", workspace=ws, session="sess-x")
+        entries = turn_ledger.read_entries(ws)
+        check("the send entry carries the session tag",
+              any(e.get("kind") == "room" and e.get("session") == "sess-x" for e in entries),
+              repr(entries))
+        check("the no-send entry carries the session tag",
+              any(e.get("kind") == "no-send" and e.get("session") == "sess-x" for e in entries),
+              repr(entries))
+
+
+def test_cli_session_flag_scopes_turn_start() -> None:
+    """`--session` on the CLI writes the PER-SESSION reminder file, not the shared one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        rc = turn_ledger.main(["--workspace", str(ws), "--session", "sess-cli", "turn-start"])
+        check("turn-start --session exits 0", rc == 0, repr(rc))
+        scoped = ws / "state" / turn_ledger._scoped_name(turn_ledger.TURN_NAME, "sess-cli")
+        shared = ws / "state" / turn_ledger.TURN_NAME
+        check("the per-session reminder file was written", scoped.is_file(), str(scoped))
+        check("the shared reminder file was NOT touched", not shared.exists(), str(shared))
+
+
+def test_module_reinserts_src_onto_a_bare_sys_path() -> None:
+    """The module-load guard (`if _SRC not in sys.path: sys.path.insert(...)`)
+    only fires when `_SRC` is absent — force that by removing EVERY occurrence
+    (other tests/imports leave several copies; `.remove()` only strips one, which
+    left `_SRC in sys.path` True and the guard never re-fired) and executing the
+    module fresh from its own file (`importlib.reload` needs `_SRC` on `sys.path`
+    to re-find the spec, which is exactly what this test removes).
+    """
+    src_dir = turn_ledger._SRC
+    saved_path = list(sys.path)
+    while src_dir in sys.path:
+        sys.path.remove(src_dir)
+    try:
+        spec = importlib.util.spec_from_file_location("turn_ledger_reload_probe",
+                                                       turn_ledger.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        check("executing the module fresh re-inserts _SRC when every copy was missing",
+              src_dir in sys.path, sys.path[:3])
+    finally:
+        sys.path[:] = saved_path
+
+
+def test_writer_lock_survives_flock_failure() -> None:
+    """`_writer_lock`'s except branch: `os.open` succeeds but `fcntl.flock` fails —
+    a different failure shape than the dir-never-writable case pinned elsewhere.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        path = turn_ledger.ledger_path(ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch("fcntl.flock", side_effect=OSError("flock unsupported here")):
+            with turn_ledger._writer_lock(path):
+                pass
+        check("a lock whose flock fails still yields without raising", True, "")
+
+
+def test_trim_survives_an_unwritable_state_dir() -> None:
+    """`_trim`'s except branch: the file is big enough to trim, but the state dir
+    cannot be written to, so the temp-file swap itself fails.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        path = turn_ledger.ledger_path(ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"ts": time.time(), "kind": "room", "target": "!r:ag2.space"}) + "\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            for _ in range(int(turn_ledger.MAX_BYTES / len(line)) + 10):
+                fh.write(line)
+        size_before = path.stat().st_size
+        check("setup: the fixture file exceeds MAX_BYTES",
+              size_before > turn_ledger.MAX_BYTES, size_before)
+        mode = path.parent.stat().st_mode
+        os.chmod(path.parent, 0o500)
+        try:
+            turn_ledger._trim(path)
+            check("a trim that cannot write its temp file does not raise", True, "")
+        finally:
+            os.chmod(path.parent, mode)
+
+
+def test_result_after_skips_an_entry_whose_stat_races_away() -> None:
+    """`_result_after`'s stat-loop except branch: one scanned entry's `stat()`
+    fails (a file removed between the scan and the stat), a second is fine.
+    """
+    class _RacedEntry:
+        name = "task-raced.txt"
+        path = "/nonexistent/task-raced.txt"
+
+        def is_file(self, follow_symlinks=True):
+            return True
+
+        def stat(self):
+            raise OSError("file vanished between scandir and stat")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        results = ws / "results"
+        good = results / "task-good.txt"
+        good.write_text("a real reply body\n", encoding="utf-8")
+        real_entries = list(os.scandir(results))
+        raced = _RacedEntry()
+
+        def _fake_scandir(directory):
+            return iter([raced, *real_entries]) if str(directory) == str(results) else iter([])
+
+        with mock.patch("os.scandir", side_effect=_fake_scandir):
+            found = turn_ledger._result_after(0.0, ws)
+        check("the raced entry's OSError is swallowed and the good one is still found",
+              found is not None and found["target"] == "task-good.txt", repr(found))
 
 
 if __name__ == "__main__":
