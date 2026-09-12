@@ -773,23 +773,29 @@ def compact(led: Path) -> int:
     return _rewrite(led, _streams(led))
 
 
-def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
+def _fold(streams: dict, per_stream, combine, canonical=None,
+          axis_of=None) -> dict:
     """Project each RAW stream's state, then fold onto the canonical actor.
 
     Reducing before folding is the invariant both readers need: one alias's
     definite failure settles only its own reservation.
+
+    `axis_of` names the identity of the ROW the projection selected. The stream's
+    ACCUMULATED identity is not that: a raw key can hold two people's rows, and
+    a later row's endpoint then retypes an earlier name-only ask onto its holder.
     """
     canon = canonical or (lambda w: w)
     # Keyed on the axis the row recorded: a raw key cannot separate one person's
     # endpoint from another's roster key, and the ask is attributed to both.
     on_axis = getattr(canon, "on_axis", None)
+    ident_of = axis_of or (lambda st: st.get("identity"))
     out = {}
     for (repo, num, who), st in streams.items():
         v = per_stream(st)
         if v is None:
             continue
         k = (repo, num,
-             on_axis(who, st.get("identity")) if on_axis else canon(who))
+             on_axis(who, ident_of(st)) if on_axis else canon(who))
         out[k] = combine(out[k], v) if k in out else v
     return out
 
@@ -827,7 +833,13 @@ def _first_ask(led: Path, canonical=None) -> dict:
     def earliest(a, b):
         return min(x for x in (a, b) if x) if (a and b) else (a or b)
 
-    return _fold(_streams(led), per_stream, earliest, canonical=canonical)
+    def axis_of(st):
+        # The identity of the row `per_stream` just picked, and only that row.
+        return st["first_identity"] if st["first_ask"] is not None \
+            else st["last_identity"]
+
+    return _fold(_streams(led), per_stream, earliest, canonical=canonical,
+                 axis_of=axis_of)
 
 
 def retry_clause(kind: str, parked: bool = True) -> str:
@@ -1281,7 +1293,9 @@ def component_resolver(roster):
         for field, axis in _KEY_AXES:
             if (identity or {}).get(field) == w:
                 return axes[axis].get(w, w)
-        return canon(w)
+        # No recorded axis, so no attribution: the fixed order would hand a
+        # persisted endpoint to whoever's roster key spells the same.
+        return w
 
     canon.on_axis = on_axis
     return canon

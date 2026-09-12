@@ -924,6 +924,65 @@ class TypedIdentityMembership(unittest.TestCase):
         self.assertEqual(nr.valid_tags(["endpoint:mx:@sutando-rui:ag2.space"]),
                          {nr._tag("endpoint", "mx", "@sutando-rui:ag2.space")})
 
+    def _legacy_then_endpoint(self, nr, led):
+        """Both rows through the PRODUCTION writer, aged past the 30-min window.
+
+        A row written before the endpoint field carries only names, so its raw
+        key is the NAME -- which is also bob's durable endpoint. One raw stream
+        therefore holds two people's rows.
+        """
+        nr.record_asks(MSG, "@shared:x", "confirmed", actor="@shared:x")
+        nr.record_asks(MSG, "bob", "failed", actor="bob", endpoint="@shared:x")
+        rows = [json.loads(x) for x in led.read_text().splitlines()]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual(len({nr._row(r)[2] for r in rows}), 1,
+                         "fixture is void unless both rows share one raw stream")
+        for r in rows:
+            r["ts"] = "2020-01-01T00:00:00Z"
+        led.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_a_legacy_ask_is_not_reattributed_by_a_later_row_on_another_axis(self):
+        """The stream's identity is ACCUMULATED, so a later endpoint row retypes
+        an earlier name-only ask. bob's send definitely `failed` -- he was never
+        asked -- yet the legacy ask to @shared:x folds onto him and refuses him.
+        """
+        nr = _nr()
+        led = self._isolated_ledger()
+        self._legacy_then_endpoint(nr, led)
+        self.assertIs(self._stale(nr, "bob"), False,
+                      "bob's only send FAILED, so nothing was ever asked of him; "
+                      "a legacy ask to @shared:x was folded onto his endpoint")
+        self.assertIs(self._stale(nr, "@shared:x"), True,
+                      "the legacy ask reached @shared:x and must still refuse "
+                      "a repeat to them")
+        self.assertIs(self._stale(nr, "carol"), False,
+                      "control: an unrelated third party must never read as asked")
+
+    def test_a_production_written_endpoint_ask_still_refuses_its_own_repeat(self):
+        """Positive control for the projection: the ordinary production shape --
+        one confirmed, endpoint-addressed ask -- must keep refusing a repeat."""
+        nr = _nr()
+        led = self._isolated_ledger()
+        self._aged_ask(nr, led, "bob")
+        self.assertIs(self._stale(nr, "bob"), True,
+                      "a confirmed ask on bob's own endpoint stopped refusing "
+                      "a repeat to bob")
+        self.assertIs(self._stale(nr, "@shared:x"), False)
+
+    def test_an_untypeable_spelling_resolves_to_itself_not_to_a_roster_key(self):
+        """No recorded axis -> no attribution. Handing the miss to the fixed
+        name-first order is what gives one person's endpoint to the reviewer
+        whose roster key spells the same."""
+        nr = _nr()
+        canon = nr.component_resolver(self.COLLIDING)
+        ep = nr.durable_endpoint(self.COLLIDING["bob"])
+        self.assertEqual(ep, "@shared:x")
+        self.assertEqual(canon.on_axis(ep, {}), ep,
+                         "an unattributable spelling was resolved name-first")
+        self.assertNotEqual(canon.on_axis(ep, {}), canon("@shared:x"))
+        # Control: a spelling that DOES carry its axis still resolves.
+        self.assertEqual(canon.on_axis(ep, {"endpoint": ep}), canon("bob"))
+
 
 class ABoundedUnionRefusesInsteadOfRaising(unittest.TestCase):
     """component_tags bounds ONE component; the UNION of two can exceed the same bound.
