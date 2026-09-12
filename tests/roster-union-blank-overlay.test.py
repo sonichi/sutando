@@ -40,6 +40,10 @@ SCRIPTS = (Path(__file__).resolve().parents[1] / "skills"
 PEER_REFUSAL = "DO NOT ROUTE"
 PEER_ROUTE = {"stand": "@peer:x", "room": "!peer:x"}
 BLANKS = ("", "   ", "\t\n")
+# A text field states nothing when it holds one of these: `stated_reason` prints
+# no reason for any of them, so neither may overlay a peer's stated refusal.
+NON_STRINGS = (False, 0, ["x"], {"a": 1})
+TEXT_FIELDS = ("refusal_basis", "note")
 
 
 def _load(name, filename):
@@ -75,13 +79,13 @@ class BlankOverlay(unittest.TestCase):
             targets, rc = self.nr.resolve([name], merged)
         return targets, rc, err.getvalue()
 
-    def three_rosters(self, local_basis):
+    def three_rosters(self, local_basis, field="refusal_basis"):
         """The reviewer's measured case: blank local, peer refusal, routable legacy."""
         return self.union(
             ("local", {"reviewer": {"stand": "", "room": "",
-                                    "refusal_basis": local_basis}}),
+                                    field: local_basis}}),
             ("PEER_REFUSAL", {"reviewer": {"stand": "", "room": "",
-                                           "refusal_basis": PEER_REFUSAL}}),
+                                           field: PEER_REFUSAL}}),
             ("LEGACY", {"reviewer": dict(PEER_ROUTE)}),
         )
 
@@ -107,6 +111,43 @@ class BlankOverlay(unittest.TestCase):
         fill the fields in — which converts the refusal into a route (#3468)."""
         _, _, err = self.resolve(self.three_rosters(""))
         self.assertIn(PEER_REFUSAL, err)
+
+    # --- the same three rosters, non-string local text fields ------------
+    def test_a_NON_STRING_local_text_field_does_not_route_a_refused_reviewer(self):
+        """`is_declared` calls every non-`None` present, which is right for
+        `allowlisted` and wrong here: a list states no reason a reader can read,
+        so overlaying it leaves a refusal that prints nothing and then routes."""
+        for field in TEXT_FIELDS:
+            for value in NON_STRINGS:
+                with self.subTest(field=field, local=value):
+                    merged = self.three_rosters(value, field)
+                    targets, rc, _ = self.resolve(merged)
+                    self.assertEqual(
+                        (len(targets), rc), (0, 3),
+                        f"a peer stated {PEER_REFUSAL} and a local {value!r} "
+                        f"in {field} erased it — {targets} got routed")
+
+    def test_a_non_string_local_text_field_leaves_the_reason_readable(self):
+        for field in TEXT_FIELDS:
+            for value in NON_STRINGS:
+                with self.subTest(field=field, local=value):
+                    merged = self.three_rosters(value, field)
+                    self.assertEqual(self.nr.stated_reason(merged["reviewer"]),
+                                     PEER_REFUSAL)
+                    _, _, err = self.resolve(merged)
+                    self.assertIn(PEER_REFUSAL, err,
+                                  "the refusal withholds but states no reason, "
+                                  "so filling the fields in overrides it")
+
+    def test_the_routable_row_loses_to_the_refusal_but_is_still_kept(self):
+        """The erased refusal let a THIRD roster promote over the same key, so
+        the routable row took the bare key instead of a suffix — and the second
+        promotion overwrote the only `@local` copy of the row this host wrote."""
+        merged = self.three_rosters(False)
+        self.assertIn("reviewer@LEGACY", merged,
+                      f"the routable row won the bare key: {sorted(merged)}")
+        self.assertIs(merged["reviewer@local"].get("refusal_basis"), False,
+                      "the local row was replaced by a promoted copy")
 
     # --- arms 4-6: a real value MUST still overlay -----------------------
     def test_a_real_local_value_still_overlays_onto_the_promoted_row(self):
@@ -136,6 +177,18 @@ class BlankOverlay(unittest.TestCase):
         self.assertIs(merged["reviewer"].get("allowlisted"), False)
         _, rc, _ = self.resolve(merged)
         self.assertEqual(rc, 4, "off-allowlist must still be refused")
+
+    def test_CONTROL_a_non_string_still_overlays_a_field_that_is_not_text(self):
+        """Making the predicate strict everywhere would pass every arm above and
+        fail here — only a TEXT field asks for text."""
+        for value in NON_STRINGS:
+            with self.subTest(local=value):
+                merged = self.union(
+                    ("local", {"reviewer": {"stand": "", "room": "",
+                                            "allowlisted": value}}),
+                    ("peer", {"reviewer": dict(PEER_ROUTE, allowlisted=True)}),
+                )
+                self.assertEqual(merged["reviewer"].get("allowlisted"), value)
 
     # --- arms 7-9: the same overlay, on identity -------------------------
     def _resolved_login(self, merged, name="reviewer"):
@@ -234,6 +287,29 @@ class SharedPresencePredicate(unittest.TestCase):
         source = (SCRIPTS / "notify_reviewers.py").read_text()
         self.assertRegex(source, r"from roster_union import [^\n]*\bdeclared\b")
         self.assertIn("declared(entry.get(key))", source)
+
+    def test_states_field_asks_text_fields_for_text_and_others_for_a_value(self):
+        for field in TEXT_FIELDS:
+            for value in NON_STRINGS + BLANKS + (None,):
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(self.ru.states_field(field, value))
+            self.assertTrue(self.ru.states_field(field, " x "))
+        for value in NON_STRINGS:
+            with self.subTest(field="allowlisted", value=value):
+                self.assertTrue(self.ru.states_field("allowlisted", value))
+        self.assertFalse(self.ru.states_field("allowlisted", None))
+
+    def test_the_text_fields_are_named_once_and_both_readers_use_that_name(self):
+        """A second literal list is how the union and the notifier come to
+        disagree about which fields carry a reason at all."""
+        self.assertEqual(self.ru.TEXT_FIELDS, TEXT_FIELDS)
+        union_src = (SCRIPTS / "roster_union.py").read_text()
+        notify_src = (SCRIPTS / "notify_reviewers.py").read_text()
+        literal = re.compile(r'\(\s*"refusal_basis"\s*,\s*"note"\s*,?\s*\)')
+        self.assertEqual(len(literal.findall(union_src + notify_src)), 1,
+                         "the text-field list is spelled more than once")
+        self.assertRegex(notify_src,
+                         r"from roster_union import [^\n]*\bTEXT_FIELDS\b")
 
 
 if __name__ == "__main__":

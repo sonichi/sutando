@@ -36,6 +36,22 @@ def is_declared(value) -> bool:
     return bool(declared(value)) if isinstance(value, str) else value is not None
 
 
+# The roster fields schema.md types as STRING, in the precedence the notifier
+# prints them. The ONE statement of which fields carry text rather than a value.
+TEXT_FIELDS = ("refusal_basis", "note")
+
+
+def states_field(field, value) -> bool:
+    """Whether a NAMED field states something, by that field's OWN type.
+
+    `is_declared` stays the default because its permissiveness is what keeps
+    `allowlisted: false` meaningful. A text field asks `declared` instead: a
+    list or a `False` in one prints as no reason at all, so letting it overlay
+    would erase a peer's stated refusal with a value no reader can read.
+    """
+    return bool(declared(value)) if field in TEXT_FIELDS else is_declared(value)
+
+
 def roster_login(row) -> "tuple[str, str]":
     """(GitHub login this row declares, the field it came from); ("", "") if none.
 
@@ -147,7 +163,7 @@ def _usable(row, kinds=None) -> bool:
     `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
     if not isinstance(row, dict):
         return False
-    if any(declared(row.get(k)) for k in ("refusal_basis", "note")):
+    if any(declared(row.get(k)) for k in TEXT_FIELDS):
         return True
     return bool(declared_routes(row, kinds))
 
@@ -178,11 +194,11 @@ def _promote(winner: dict, local: dict) -> dict:
     if roster_login(loc)[0] or declared(loc.get("same_actor_as")):
         for alias in IDENTITY_FIELDS + ("same_actor_as",):
             out.pop(alias, None)
-    # `is_declared`, never `is not None`: a blank local field is ABSENT to every
-    # reader, so overlaying it erases the refusal or identity the peer stated.
+    # Per FIELD, never `is not None`: absence is the field's own type's answer,
+    # so overlaying erases neither the refusal nor the identity the peer stated.
     routing = routing_fields()
     for field, value in loc.items():
-        if field not in routing and is_declared(value):
+        if field not in routing and states_field(field, value):
             out[field] = value
     return out
 

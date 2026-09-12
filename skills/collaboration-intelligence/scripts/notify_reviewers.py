@@ -51,7 +51,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import (declared, declared_routes, host_rosters,
+from roster_union import (TEXT_FIELDS, declared, declared_routes, host_rosters,
                           roster_login, roster_union)
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
@@ -131,7 +131,7 @@ def stated_reason(entry: dict) -> str:
     A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
     entry knows which, and a refusal that omits it invites the repair that
     overrides it (#3468)."""
-    for key in ("refusal_basis", "note"):
+    for key in TEXT_FIELDS:
         reason = declared(entry.get(key))
         if reason:
             return " ".join(reason.split())
