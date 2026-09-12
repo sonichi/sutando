@@ -67,16 +67,28 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
-def _reply_to_id(msg):
-    """The parent's id from the reference METADATA, never the embedded body.
+REPLY_MESSAGE_TYPE = 19   # Discord message type: an inline reply
 
-    `referenced_message` is optional: Discord omits it when it was not fetched
-    and nulls it when the parent was deleted, while `message_reference` still
-    carries the id. Reading the body loses the edge in exactly those cases.
-    Type 1 is a FORWARD, which references a message it is not replying to.
+
+def _reply_to_id(msg):
+    """The parent's id, for a REPLY only.
+
+    Two independent facts are needed and neither alone is enough. The enclosing
+    message TYPE says this is a reply (19); `message_reference` says what it
+    points at. `reference.type` 0 is DEFAULT, which Discord also uses for
+    crossposts and pins -- both carry `{type: 0, message_id: ...}` with no
+    embedded parent, so keying on it invents a reply edge for a syndicated post
+    or a pin notification. And `referenced_message` is optional: omitted when
+    unfetched, null when the parent was deleted, which is when a key matters.
+
+    Deliberately excluded, each referencing a message it is not replying to:
+    THREAD_STARTER_MESSAGE (21) points at the message a thread grew from, and
+    CONTEXT_MENU_COMMAND (23) at the command's target.
     """
+    if msg.get("type") != REPLY_MESSAGE_TYPE:
+        return ""
     ref = msg.get("message_reference") or {}
-    if ref.get("type", 0) != 0:
+    if ref.get("type", 0) != 0:          # 1 is FORWARD
         return ""
     mid = ref.get("message_id") or (msg.get("referenced_message") or {}).get("id") or ""
     return str(mid)
