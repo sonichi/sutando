@@ -1734,6 +1734,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
+                # The room's declared config as one-line JSON: intention only,
+                # never enforced (dedicated branch below re-serializes a dict).
+                "room_config",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -2930,6 +2933,14 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "room_config":
+            # A string passes through flattened; a dict becomes compact sorted
+            # JSON so the header never carries a Python repr. Other types drop.
+            rc = task.get("room_config")
+            if isinstance(rc, dict):
+                rc = json.dumps(rc, separators=(",", ":"), sort_keys=True)
+            if isinstance(rc, str) and rc:
+                lines.append(f"room_config: {_one_line(rc)}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
             # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
