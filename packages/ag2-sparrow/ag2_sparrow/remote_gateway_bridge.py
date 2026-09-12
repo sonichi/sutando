@@ -54,6 +54,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import uuid
 import re
 import shlex
@@ -2463,15 +2464,28 @@ def _read_pool_advertisement() -> "tuple[str, dict | None]":
     BEFORE the /v1/tasks poll and may never raise: the outer handler backs off
     and retries the same file, so any exception here — a RecursionError from a
     deeply nested value, not only OSError/ValueError — would stall intake for
-    as long as that file stays. The size is bounded before the parse so a
-    runaway file cannot cost the loop a full read per pass either."""
+    as long as that file stays. The path is opened ONCE, non-blocking, and
+    everything is decided on that descriptor: a FIFO with no writer would park
+    a blocking open forever, and a size read from a second lookup can be
+    stale by the time the content is read, so the bound is enforced on the
+    bytes actually read (MAX+1: one more than allowed proves the overflow)."""
+    fd = -1
     try:
-        if _POOL_ADVERTISEMENT_FILE.stat().st_size > _POOL_ADVERTISEMENT_MAX_BYTES:
+        fd = os.open(str(_POOL_ADVERTISEMENT_FILE), os.O_RDONLY | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return ("", None)
-        rec = json.loads(_POOL_ADVERTISEMENT_FILE.read_text())
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read(_POOL_ADVERTISEMENT_MAX_BYTES + 1)
+        if len(data) > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return ("", None)
+        rec = json.loads(data.decode("utf-8"))
         canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"))
     except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
         return ("", None)
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not isinstance(rec, dict):
         return ("", None)
     if not isinstance(rec.get("workers"), dict):

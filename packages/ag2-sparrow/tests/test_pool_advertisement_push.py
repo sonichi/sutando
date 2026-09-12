@@ -513,6 +513,56 @@ def test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals(
         assert [c[0] for c in calls] == ["POST", "PUT"], "past the cadence: both halves resent unchanged"
 
 
+def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
+    """The reader runs in the intake loop before the /v1/tasks poll: a FIFO at
+    the advertisement path with no writer must come back UNAVAILABLE at once,
+    not park the loop on a blocking open. Exercised in a child process under a
+    timeout, since a wedge here would wedge the test too."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        (base / "state").mkdir()
+        fifo = base / "state" / "pool-advertisement.json"
+        os.mkfifo(fifo)
+        env = {**os.environ, "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+               "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
+               "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
+               "REMOTE_TASK_URL": "https://gw.example/relay", "REMOTE_TASK_TOKEN": "dummy-secret"}
+        code = ("import sys; sys.path.insert(0, %r); "
+                "from ag2_sparrow import remote_gateway_bridge as m; "
+                "print(repr(m._read_pool_advertisement()))"
+                % str(pathlib.Path(__file__).resolve().parents[1]))
+        try:
+            r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                               text=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("the reader wedged on a FIFO with no writer")
+        assert r.returncode == 0, r.stderr[-400:]
+        assert "('', None)" in r.stdout, r.stdout
+        print("PASS test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop")
+
+
+def test_a_record_that_grows_after_a_small_stat_is_still_bounded():
+    """Mutation control for the two-lookup race: the bound is enforced on the
+    bytes read, so a file replaced between a one-byte stat and the read cannot
+    slip an oversized record past the guard."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        big = _record(1)
+        big["pad"] = "x" * m._POOL_ADVERTISEMENT_MAX_BYTES
+        _advertise(m, big)
+        # Prove the guard is on the read: a stat that lied small would not help.
+        real_fstat = os.fstat
+        os.fstat = lambda fd: type("st", (), {"st_mode": real_fstat(fd).st_mode, "st_size": 1})()
+        try:
+            assert m._read_pool_advertisement() == ("", None)
+        finally:
+            os.fstat = real_fstat
+        _advertise(m, _record(2), age=5)
+        assert m._read_pool_advertisement()[1] is not None, "positive control"
+        print("PASS test_a_record_that_grows_after_a_small_stat_is_still_bounded")
+
+
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
     test_a_missing_file_pushes_nothing_at_all()
@@ -524,6 +574,8 @@ if __name__ == "__main__":
     test_a_non_dict_workers_value_is_ignored()
     test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll()
     test_an_oversized_record_is_unavailable_before_it_is_parsed()
+    test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop()
+    test_a_record_that_grows_after_a_small_stat_is_still_bounded()
     test_a_later_mtime_repushes_both()
     test_a_bumped_mtime_with_unchanged_content_repushes_neither()
     test_a_restore_at_or_below_the_prior_mtime_repushes_both()
