@@ -33,29 +33,60 @@ def scratch():
         shutil.rmtree(path, ignore_errors=True)
 
 REPO = Path(__file__).resolve().parent.parent
-LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+
+# The launcher polls `pgrep -ax claude`, then `ps -o args=` for `--name $SESSION`:
+# the stub reports the launched stub's own pid, and the real ps shows its argv.
+PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
+              '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
 
 
-def _launch_argv(extra_env: dict) -> list[str]:
-    """start-cli.sh through its real tmux path on a private socket; returns the
+def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
+    """start-cli.sh through its real tmux path on a private socket, from a COPIED
+    repo whose sutando-config.sh names a scratch workspace: past its liveness
+    poll the launcher clears the shutdown sentinel and ensures the supervisor,
+    and the real workspace must never be a test's write target. Returns the
     argv of the process it put in the pane. A stub claude that persists is what
-    keeps the session alive long enough to read it."""
+    keeps the session alive long enough to read it.
+
+    The pgrep stub answers the liveness probe with nothing until the stub claude
+    has recorded its pid; every other probe (the monitor guard) still "finds"
+    its target, and a live pid in the relay pidfile passes that guard, so no
+    launcher child outlives the run.
+
+    Raises AssertionError unless the launcher's own verdict was success (exit 0):
+    a pane left behind by a failed launch is not the state under test."""
     import shutil
     tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not tmux:
         raise unittest.SkipTest("tmux not found")
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        bind = td / "bin"; bind.mkdir(); (td / "home").mkdir(); (td / "workspace" / "state").mkdir(parents=True)
+        root = td / "repo"
+        shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+        ws = td / "workspace"; (ws / "state").mkdir(parents=True)
+        (root / "scripts" / "sutando-config.sh").write_text(
+            '#!/bin/bash\ncase "$1" in\n'
+            '  workspace) echo "%s";;\n'
+            '  claude-sutando-config-dir) echo "%s/.claude-sutando";;\n'
+            '  python-bin) echo python3;;\n'
+            '  core-runtime) echo claude;;\n'
+            '  host-label) echo testhost;;\n'
+            '  *) echo "";;\nesac\n' % (ws, ws))
+        (ws / "state" / "core-supervisor-relay-loop.pid").write_text(str(os.getpid()))
+        bind = td / "bin"; bind.mkdir(); (td / "home").mkdir()
         sock = td / "t.sock"
-        for stub, body in (("claude", "sleep 300\n"), ("pgrep", "exit 0\n")):
+        for stub, body in (("claude", 'echo $$ > "$HOME/claude.pid"\nsleep 300\n'), ("pgrep", pgrep_stub),
+                           ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body); (bind / stub).chmod(0o755)
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)
         env = {"PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
-               "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1",
-               "SUTANDO_WORKSPACE": str(td / "workspace"), **extra_env}
+               "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1", **extra_env}
         try:
-            subprocess.run(["/bin/bash", str(LAUNCHER)], env=env, capture_output=True, text=True, timeout=60)
+            run = subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
+                                 env=env, capture_output=True, text=True, timeout=60)
+            assert run.returncode == 0, (
+                f"launcher exited {run.returncode}\nstdout: {run.stdout}\nstderr: {run.stderr}")
             argv = []
             for pid in tm("list-panes", "-s", "-a", "-F", "#{pane_pid}").stdout.split():
                 argv += subprocess.run(["ps", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout.split()
@@ -82,6 +113,13 @@ class TestLauncherGate(unittest.TestCase):
         self.assertEqual(argv[argv.index("--session-id") + 1], "11111111-2222-3333-4444-555555555555")
         self.assertEqual(argv[argv.index("--name") + 1], "sutando-worker-" + "a" * 32)
         self.assertNotIn("sutando-core", argv)
+
+    def test_control_a_liveness_probe_that_reports_nothing_fails_the_fixture(self):
+        """The launcher's poll reads `pgrep -ax claude`; a probe that never names
+        the launched process is the launcher's own failure verdict (exit 1), and
+        the fixture must surface it rather than assert against the pane it left."""
+        with self.assertRaisesRegex(AssertionError, r"launcher exited 1[\s\S]*did not come up"):
+            _launch_argv({}, pgrep_stub="exit 0\n")
 
 
 def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:

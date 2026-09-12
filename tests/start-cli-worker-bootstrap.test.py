@@ -26,12 +26,26 @@ REPO = Path(__file__).resolve().parent.parent
 TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 
 
-def _boot(extra_env: dict, server_env: "dict | None" = None) -> dict:
+# The launcher polls `pgrep -ax claude`, then `ps -o args=` for `--name $SESSION`:
+# the stub reports the launched stub's own pid, and the real ps shows its argv.
+PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
+              '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
+CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nenv > "$HOME/claude.env"\nsleep 120\n'
+
+
+def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = PGREP_STUB) -> dict:
     """One launcher run against a COPIED repo whose sutando-config.sh names a
     scratch workspace — the real one must never be a test's write target.
 
     `server_env` starts the tmux server FIRST, from a process carrying that env:
     what a core launch does, since it exports its marker before it touches tmux.
+
+    The pgrep stub answers the liveness probe with nothing until the stub claude
+    has recorded its pid; every other probe (the monitor guard) still "finds"
+    its target, so no launcher child outlives the run.
+
+    Raises AssertionError unless the launcher's own verdict was success (exit 0):
+    a pane left behind by a failed launch is not the state under test.
 
     Returns the pane argv and env, the session's and server's tmux env, the
     workspace rows, and what the SessionStart hint says to that pane."""
@@ -52,13 +66,13 @@ def _boot(extra_env: dict, server_env: "dict | None" = None) -> dict:
             '  core-runtime) echo claude;;\n'
             '  host-label) echo testhost;;\n'
             '  *) echo "";;\nesac\n' % (ws, ws))
-        # A live pid in the relay pidfile, and a pgrep that always "finds" the
-        # monitor: both guards pass, so no launcher child outlives this run.
+        # A live pid in the relay pidfile: that guard passes, so no relay loop
+        # outlives this run.
         (ws / "state" / "core-supervisor-relay-loop.pid").write_text(str(os.getpid()))
         bind = td / "bin"
         bind.mkdir()
         (td / "home").mkdir()
-        for stub, body in (("claude", 'env > "$HOME/claude.env"\nsleep 120\n'), ("pgrep", "exit 0\n"),
+        for stub, body in (("claude", CLAUDE_STUB), ("pgrep", pgrep_stub),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body)
             (bind / stub).chmod(0o755)
@@ -75,8 +89,10 @@ def _boot(extra_env: dict, server_env: "dict | None" = None) -> dict:
             if server_env:
                 subprocess.run([TMUX, "-S", str(sock), "new-session", "-d", "-s", "seed", "sleep 120"],
                                env={**env, **server_env}, capture_output=True, check=True)
-            subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
-                           env=env, capture_output=True, text=True, timeout=90)
+            run = subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
+                                 env=env, capture_output=True, text=True, timeout=90)
+            assert run.returncode == 0, (
+                f"launcher exited {run.returncode}\nstdout: {run.stdout}\nstderr: {run.stderr}")
             argv = []
             for pid in tm("list-panes", "-s", "-a", "-F", "#{pane_pid}").stdout.split():
                 argv += subprocess.run(["ps", "-o", "args=", "-p", pid],
@@ -172,6 +188,15 @@ class TestWorkerOnAServerBornFromACoreLaunch(unittest.TestCase):
     def test_the_session_hint_stays_silent_for_the_worker(self):
         self.assertEqual(self.got["hint"], "",
                          "the worker was told to run the canonical core's /startup")
+
+
+class TestAFailedLaunchCannotLeaveThisSuiteGreen(unittest.TestCase):
+    def test_control_a_liveness_probe_that_reports_nothing_fails_the_fixture(self):
+        """The launcher's poll reads `pgrep -ax claude`; a probe that never names
+        the launched process is the launcher's own failure verdict (exit 1), and
+        the fixture must surface it rather than assert against the pane it left."""
+        with self.assertRaisesRegex(AssertionError, r"launcher exited 1[\s\S]*did not come up"):
+            _boot({}, pgrep_stub="exit 0\n")
 
 
 if __name__ == "__main__":
