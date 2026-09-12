@@ -290,6 +290,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
+from .core_state_notice import sweep_core_state_notices
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
@@ -2976,6 +2977,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
+    # Room sidecar BEFORE publish, else a crash could queue a task the
+    # notice sweep can't route. Best-effort/advisory — never vetoes the ack.
+    _record_task_room(tid, str(task.get("channel_id") or ""))
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
@@ -2987,7 +2991,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
     except Exception:
         pass
-    _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
@@ -3500,6 +3503,72 @@ def _post_proactive() -> None:
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
         _ENGINE_COUNTS["legacy_sends"] += 1
         _log(f"delivered proactive {f.name} to {dest_room}")
+
+
+def _core_notice_send(room: str, body: str) -> bool:
+    """One best-effort room message for a core-state notice. True = the gateway
+    confirmed the send (`ok`/`event_id`) — a bare 2xx is NOT delivery: the room
+    op returns 200 with ``{ok: false}`` for a failed send (kicked from the room,
+    unroutable id), and recording that as delivered would put the room in
+    `active` to later get a "back online" for a notice that never landed. A
+    notice is informational, so unlike results it takes no confirmation/outbox
+    machinery — False just means the sweep retries on a later pass. 401/403
+    propagate: the poll loop owns auth. Short timeout: a notice runs on the poll
+    loop's thread, so one slow send must not hold it long (the sweep's overall
+    NOTICE_BUDGET_S bounds the batch; this bounds a single request within it)."""
+    try:
+        answer = _req("POST", "/v1/room",
+                      {"op": "message", "room_id": room, "body": body}, timeout=6)
+        ok = isinstance(answer, dict) and bool(answer.get("ok") or answer.get("event_id"))
+        if not ok:
+            _log(f"core-state notice to {room} not confirmed by gateway")
+        return ok
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise
+        _log(f"core-state notice to {room} failed: HTTP {e.code}")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"core-state notice to {room} network error: {e}")
+        return False
+
+
+def _maybe_core_state_notices(inflight: set[str]) -> None:
+    """Tell rooms with queued-but-unanswered tasks WHY the core is silent
+    (usage limit / logged out / crashed / wedged), and announce recovery.
+
+    Detection + dedup + ledger live in core_state_notice.sweep_core_state_notices;
+    this binder only picks the rooms: every in-flight task without a ready
+    result, mapped through the task→room sidecar, filtered to real Matrix room
+    ids (an empty/foreign channel id has no gateway room op to send to).
+    Runs every poll pass, so a message that arrives DURING an outage is
+    noticed on the same pass that queued it — and a core that dies mid-task
+    is noticed on the next one. Never breaks the loop: only the send's own
+    401/403 escape (the loop's auth-recovery path must see those)."""
+    try:
+        task_rooms = _load_task_rooms()
+        rooms = set()
+        for tid in inflight:
+            if not _valid_local_tid(tid):
+                continue  # defense-in-depth: never derive a path from an unsafe id
+            if (RESULTS_DIR / f"{tid}.txt").exists():
+                continue  # answer already produced — silence ends on its own
+            room = task_rooms.get(tid, "")
+            if room and _MATRIX_ROOM_RE.match(room):
+                rooms.add(room)
+        # Validate ledger-derived recovery targets against the Matrix room
+        # shape, so a corrupt/forged `active` key is purged, not POSTed to.
+        sweep_core_state_notices(
+            _STATE, rooms, _core_notice_send, log=_log,
+            # Instance-suffix the ledger like every other gateway state file, so
+            # a named + default instance on one workspace don't collide.
+            ledger_name=f"core-state-notice{_INST_SUFFIX}.json",
+            recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)),
+            debounce_s=10.0)  # a login/restart flap must not fire premature notices
+    except urllib.error.HTTPError:
+        raise
+    except Exception as e:  # noqa: BLE001 — a notice must never stall delivery
+        _log(f"core-state notice sweep failed: {e}")
 
 
 def _load_inflight() -> set[str]:
@@ -4301,6 +4370,7 @@ def main() -> None:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _reconcile_orphan_results(inflight)
+            _maybe_core_state_notices(inflight)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)

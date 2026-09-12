@@ -286,7 +286,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True):
+def compose_state(pane, base_health, gateway_alive, process=True, runtime="claude"):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -296,6 +296,14 @@ def compose_state(pane, base_health, gateway_alive, process=True):
 
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
+
+    `runtime` selects the pane grammar. classify()'s signatures are Claude's TUI,
+    so for a non-Claude core (codex) they'd misfire and could even preempt the
+    runtime-neutral verdicts (a logged-out codex core, detected by runtime-health
+    via `codex login status`, must map to logged-out — not a mis-matched gate).
+    So the Claude gate classifier runs only for the Claude runtime; codex relies
+    on the neutral base_health (offline/needs_login/working/idle/unknown). Codex
+    gate semantics (e.g. its rate-limit screen) are a tracked follow-up.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -303,7 +311,9 @@ def compose_state(pane, base_health, gateway_alive, process=True):
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane) if pane else None
+    # Allowlist, not a codex denylist: a future runtime (gemini, …) must not
+    # fall through to Claude's pane grammar either.
+    hit = classify(pane) if (pane and runtime == "claude") else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -335,6 +345,11 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         if process is None:  # no session observed = no wedge evidence; never RECOVER
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
+        if runtime != "claude":
+            # Only Claude's idle footer rescues unknown→hung; without an idle
+            # grammar for this runtime a stale status is not wedge evidence.
+            return ("unobserved", "status stale; no idle grammar for this runtime "
+                    "to tell idle from wedged — holding", tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
 
@@ -628,6 +643,22 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
+# Written EVERY tick (state file is write-on-change); best-effort. Must match
+# ag2_sparrow.core_state_notice.CORE_HEARTBEAT_FILE — the reader keys on it.
+_HEARTBEAT_FILENAME = "core-supervisor-heartbeat"
+
+
+def _write_heartbeat(out_path):
+    hb = os.path.join(os.path.dirname(out_path), _HEARTBEAT_FILENAME)
+    try:
+        tmp = hb + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(int(time.time())))
+        os.replace(tmp, hb)
+    except Exception:  # noqa: BLE001 — liveness ping is best-effort
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", required=True)
@@ -667,7 +698,8 @@ def main():
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True))
+            process=(base.get("signals") or {}).get("process", True),
+            runtime=rh.core_runtime())
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -690,6 +722,7 @@ def main():
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
+        _write_heartbeat(a.out)  # every tick — liveness, independent of state change
         sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:
             payload = {"state": state, "detail": detail,

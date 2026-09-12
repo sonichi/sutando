@@ -59,6 +59,10 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ag2-sparrow package root — locates the shared core_state_notice module (same
+# path the gateway/discord bridges add for `import ag2_sparrow`).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"))
+from ag2_sparrow.core_state_notice import sweep_core_state_notices as _sweep_core_notices  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -965,6 +969,107 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
         return _slack_context_unavailable_note(), set()
 
 
+# --- Core-state notices (silent-core fix), parity with gateway + discord ------
+
+# Shared dedup/cooldown/recovery live in core_state_notice; this is Slack's
+# (synchronous) binder. Distinct ledger file: no cross-surface collision.
+_CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
+_CORE_NOTICE_SUFFIX = " _(automated notice)_"
+_CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
+
+# All sends run on ONE background thread (not slack_bolt's handler pool), so a
+# slow notice can't stall handlers; single sender → no lock needed.
+_CORE_NOTICE_INTERVAL_S = 5
+# Notice "room" = the reply TARGET: a channel @mention threads its notice, so we
+# encode channel[+thread_ts] (sep outside Slack's alphabets); per-conversation.
+_CORE_NOTICE_SEP = "\x1f"
+
+
+def _core_notice_target(channel: str, thread_ts: str | None) -> str:
+    return f"{channel}{_CORE_NOTICE_SEP}{thread_ts}" if thread_ts else channel
+
+
+def _core_notice_target_ok(room: str) -> bool:
+    """Validate a ledger-derived RECOVERY target's shape:
+    a Slack channel/DM id (C/D/G + alnum), optionally a thread_ts (digits.dot)
+    after the separator. Purges a corrupt/forged `active` key instead of posting
+    to it; Slack's API already rejects channels the bot isn't in."""
+    channel, sep, thread_ts = room.partition(_CORE_NOTICE_SEP)
+    if not re.fullmatch(r"[CDG][A-Z0-9]{3,}", channel):
+        return False
+    if sep and not re.fullmatch(r"\d+\.\d+", thread_ts):
+        return False
+    return True
+
+
+def _core_notice_send(room: str, body: str) -> bool:
+    """Post one notice to a Slack reply target (channel, in-thread when the room
+    key carries a thread_ts). True iff it reached Slack. Best-effort: a failure
+    just means the next sweep retries — it must never raise into intake or the
+    recovery thread."""
+    channel, _, thread_ts = room.partition(_CORE_NOTICE_SEP)
+    try:
+        kwargs = {"channel": channel, "text": body}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        app.client.chat_postMessage(**kwargs)
+        return True
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] send to {channel} failed: {e}", flush=True)
+        return False
+
+
+def _core_notice_pending_rooms() -> set:
+    """Reply targets of queued-but-unanswered tasks — the degraded-notice
+    candidates. Deriving these every tick means a task admitted while the core
+    was healthy still gets a notice if the core later dies, and a first notice
+    whose send failed is retried, without a new message.
+    The shared cooldown keeps this to one notice per (target, reason)."""
+    rooms = set()
+    with pending_replies_lock:
+        items = list(pending_replies.items())
+    for task_id, info in items:
+        if not isinstance(info, dict):
+            continue
+        channel = info.get("channel")
+        if not channel or (RESULTS_DIR / f"{task_id}.txt").exists():
+            continue  # no channel, or already answered → its silence is over
+        rooms.add(_core_notice_target(channel, info.get("thread_ts")))
+    return rooms
+
+
+def _core_notice_sweep(rooms) -> None:
+    """One sweep over the shared core-state logic on Slack's ledger. Degraded →
+    notice the given targets; healthy → recover any owed ones. Runs ONLY on the
+    single sender thread, so it needs no lock. Never raises."""
+    try:
+        _sweep_core_notices(
+            STATE_DIR, rooms, _core_notice_send,
+            log=lambda m: print(f"  [core-notice] {m}", flush=True),
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+            recovery_target_ok=_core_notice_target_ok,
+            debounce_s=_CORE_NOTICE_DEBOUNCE_S)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [core-notice] sweep failed: {e}", flush=True)
+
+
+def _core_notice_loop() -> None:
+    """The sole notice sender: every tick, notice pending-unanswered targets if
+    the core is degraded, and announce recovery to owed targets once it's
+    healthy. Keeping every send here (not on intake) is the main stall fix.
+
+    The WHOLE iteration — pending-room collection included — is inside the
+    try, because _core_notice_pending_rooms() does filesystem reads that can
+    raise (a transient EACCES on a result path): an uncaught raise here would
+    kill this one-and-only sender thread for the rest of the process."""
+    while True:
+        try:
+            _core_notice_sweep(_core_notice_pending_rooms())
+        except Exception as e:  # noqa: BLE001 — never let the sender thread die
+            print(f"  [core-notice] loop iteration failed: {e}", flush=True)
+        time.sleep(_CORE_NOTICE_INTERVAL_S)
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -1266,6 +1371,8 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         task_processed("slack")
     except Exception:  # pragma: no cover — telemetry must never break the bridge
         pass
+    # Task is queued (pending_replies); the notice is sent by _core_notice_loop
+    # from pending tasks — intake does NOT post inline, so it never stalls.
     return task_id
 
 
@@ -1844,6 +1951,7 @@ def main():  # pragma: no cover
         print("", flush=True)
 
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
+    threading.Thread(target=_core_notice_loop, name="slack-core-notice", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
     global _socket_handler

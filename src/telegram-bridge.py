@@ -37,6 +37,10 @@ sys.stderr.reconfigure(line_buffering=True)
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
 # best-effort so the bridge keeps booting if vision_push.py is missing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ag2-sparrow package root — the shared core_state_notice module (same path the
+# gateway/discord/slack bridges add for `import ag2_sparrow`).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"))
+from ag2_sparrow.core_state_notice import sweep_core_state_notices as _sweep_core_notices  # noqa: E402
 try:
     from vision_push import push_image as _push_vision_image  # type: ignore
 except Exception:  # pragma: no cover — bridge must keep running
@@ -290,7 +294,9 @@ def tofu_onboard(sender_id, username):
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
-def api(method, **params):
+def api(method, _timeout_s=30, **params):
+    # _timeout_s (Telegram params never use that name): a short value stops a
+    # slow notice send from stalling the single poll loop.
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     if params:
         data = json.dumps(params).encode()
@@ -298,7 +304,7 @@ def api(method, **params):
     else:
         req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout_s) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode()
@@ -726,6 +732,49 @@ def log_privacy_setting(get_me):
     )
 
 
+# --- Core-state notices (silent-core fix), parity with gateway/discord/slack --
+
+# Telegram's (synchronous) binder over the shared core_state_notice logic.
+# Distinct ledger file (no cross-surface collision); PLAIN suffix (no parse_mode).
+_CORE_NOTICE_LEDGER = "core-state-notice-telegram.json"
+_CORE_NOTICE_SUFFIX = " (automated notice)"
+_CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
+
+
+def _core_notice_send(chat_id, body) -> bool:
+    """Send one notice to a Telegram chat. True iff Telegram accepted it.
+    Best-effort: a failure just means the next sweep retries — never raises."""
+    try:
+        return bool(api("sendMessage", _timeout_s=6,
+                        chat_id=int(chat_id), text=body).get("ok"))
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] send to {chat_id} failed: {e}", flush=True)
+        return False
+
+
+def _core_notice_target_ok(room: str) -> bool:
+    """Validate a ledger-derived RECOVERY target's shape:
+    a Telegram chat id is an integer (group/channel ids are negative). Purges a
+    corrupt/forged `active` key instead of hitting the API with garbage; Telegram
+    already rejects chats the bot isn't in."""
+    return bool(re.fullmatch(r"-?\d+", room))
+
+
+def _core_notice_sweep(rooms) -> None:
+    """One sweep over the shared core-state logic on Telegram's ledger.
+    Degraded → notice the given chats; healthy → recover any owed chats.
+    Never raises (intake and the per-tick recovery both depend on that)."""
+    try:
+        _sweep_core_notices(
+            STATE_DIR, rooms, _core_notice_send,
+            log=lambda m: print(f"  [core-notice] {m}", flush=True),
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+            recovery_target_ok=_core_notice_target_ok,
+            debounce_s=_CORE_NOTICE_DEBOUNCE_S)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [core-notice] sweep failed: {e}", flush=True)
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
@@ -1032,6 +1081,8 @@ def main():  # pragma: no cover
                     pass
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
+                # No inline core-state sweep: the end-of-iteration sweep sees
+                # this chat via pending_replies; inline sends stall the loop.
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
@@ -1237,6 +1288,12 @@ def main():  # pragma: no cover
                 archive_file(result_file, "results", task_id)
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+
+        # After result draining: notice pending unanswered chats if degraded,
+        # else recover owed chats. Single loop → no lock; cooldown dedups.
+        _pending_chats = {str(cid) for tid, cid in pending_replies.items()
+                          if not (RESULTS_DIR / f"{tid}.txt").exists()}
+        _core_notice_sweep(_pending_chats)
 
         time.sleep(1)
 
