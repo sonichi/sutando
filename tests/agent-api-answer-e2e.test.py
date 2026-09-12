@@ -182,6 +182,31 @@ still_open = [q["id"] for q in data.get("questions", [])]
 check("answered question no longer listed", target["id"] not in still_open)
 check("unanswered question still listed", len(still_open) == 1, f"got {still_open}")
 
+# 3b. A reply is not an answer. The triage card's Reply sends resolve=false; a question
+#     back is treated the same whatever the flag says. Either way the item stays open.
+other = still_open[0] if still_open else None
+other_text = next((q["text"] for q in data.get("questions", []) if q["id"] == other), None)
+code, data = req("POST", "/answer", {"id": other, "answer": "before I decide: which two?", "resolve": False})
+check("POST /answer resolve=false → 200 and resolved=false", code == 200 and data.get("resolved") is False,
+      f"got {code} {data}")
+code, data = req("GET", "/tasks/active")
+# Ids are content hashes, so the replied section gets a NEW id (by design: a stale id must
+# never resolve to a neighbour). The question itself must still be listed.
+check("a replied question is STILL listed (under its new content id)",
+      other_text in [q["text"] for q in data.get("questions", [])], f"got {[q['text'] for q in data.get('questions', [])]}")
+body = PQ_FILE.read_text()
+check("the reply lands on an open Status line", "**Status:** open — owner replied" in body
+      and "which two?" in body)
+replies = [t for t in (tmp / "tasks").glob("answer-*.txt") if "replied on" in t.read_text()]
+check("the agent task says replied, and that the item stays open",
+      len(replies) == 1 and "stays open" in replies[0].read_text(), f"got {[t.name for t in replies]}")
+new_id = next((q["id"] for q in data.get("questions", [])), None)
+code, data = req("POST", "/answer", {"id": new_id, "answer": "and what does B cost?"})
+check("a question back never resolves, even without the flag",
+      code == 200 and data.get("resolved") is False, f"got {code} {data}")
+code, data = req("GET", "/tasks/active")
+check("still listed after the question back", len(data.get("questions", [])) == 1)
+
 # 4. Genuine 404s — the message now only fires when it's true.
 code, data = req("POST", "/answer", {"id": target["id"], "answer": "again"})
 check("re-answering the same id → 404 (already answered)", code == 404, f"got {code}")

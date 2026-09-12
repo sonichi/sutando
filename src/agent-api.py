@@ -316,16 +316,28 @@ def parse_pending_questions(content: str) -> list[dict]:
     return questions
 
 
-def answer_pending_question(content: str, question: dict, answer: str) -> str:
-    """Return `content` with `question`'s section marked answered.
+def is_question_back(answer: str) -> bool:
+    """A reply that ends in a question mark asks the agent something; it decides nothing."""
+    return " ".join((answer or "").split()).endswith("?")
+
+
+def answer_pending_question(content: str, question: dict, answer: str, *, resolve: bool = True) -> str:
+    """Return `content` with `question`'s section marked answered, or — with ``resolve=False`` —
+    carrying the owner's reply while staying open.
 
     The resolution has to land on a **Status:** line: check-pending-questions.py
     treats a status-less section as unanswered (its free-form convention), so a
     [RESOLVED] title prefix alone would silence this API's own reader while the
-    notifier kept re-asking the owner hourly.
+    notifier kept re-asking the owner hourly. A reply that is not a decision (the
+    triage card's Reply, or a question back) must NOT resolve: `**Status:** open`
+    is the prefix both readers keep listing (check-pending-questions `section_is_waiting`,
+    and PQ_ANSWERED_RE here does not match it).
     """
     section = content[question["start"]:question["end"]]
-    status = f"**Status:** Answered {datetime.now().strftime('%Y-%m-%d')} — {' '.join(answer.split())}"
+    today = datetime.now().strftime('%Y-%m-%d')
+    text = ' '.join(answer.split())
+    status = (f"**Status:** Answered {today} — {text}" if resolve
+              else f"**Status:** open — owner replied {today}: {text}")
     if PQ_STATUS_RE.search(section):
         # A function repl, not a string: a raw answer may contain \1-style escapes.
         new_section = PQ_STATUS_RE.sub(lambda _m: status, section, count=1)
@@ -1325,6 +1337,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not qid or not answer:
                     self.send_json(400, {"error": "id and answer required"})
                     return
+                # A reply is the owner's words to the agent, not a decision: the triage card
+                # sends resolve=false, and a question back can never be an answer.
+                resolve = data.get("resolve", True) is not False and not is_question_back(answer)
                 pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
                 if pq_file.exists():
                     content = pq_file.read_text()
@@ -1334,7 +1349,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         None,
                     )
                     if match:
-                        pq_file.write_text(answer_pending_question(content, match, answer))
+                        # Both readers read this one file: write it whole or not at all, so
+                        # neither can see a truncated state between them.
+                        rewritten = answer_pending_question(content, match, answer, resolve=resolve)
+                        tmp_pq = pq_file.with_suffix(pq_file.suffix + ".tmp")
+                        tmp_pq.write_text(rewritten)
+                        os.replace(tmp_pq, pq_file)
                         ts = int(datetime.now().timestamp() * 1000)
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
@@ -1346,8 +1366,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
                             )
                             if task_file_str.startswith(task_dir_real + os.sep):
-                                Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
-                        self.send_json(200, {"ok": True, "id": qid, "answer": answer})
+                                verb = "answered" if resolve else "replied on"
+                                note = "" if resolve else " (the item stays open)"
+                                Path(task_file_str).write_text(
+                                    f"User {verb} {safe_qid}{note}: {confine_user_content(answer)}")
+                        self.send_json(200, {"ok": True, "id": qid, "answer": answer, "resolved": resolve})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})
                 else:
