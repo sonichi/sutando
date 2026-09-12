@@ -33,7 +33,7 @@ class TestScopedKeychainService(unittest.TestCase):
 
     def test_scoped_name_is_deterministic_sha256_prefix(self):
         import hashlib
-        d = "/Users/wangchi/Library/Application Support/space.ag2.app/workspace/.claude-sutando"
+        d = "/x/some install/.claude-sutando"
         digest = hashlib.sha256(d.encode()).hexdigest()[:8]
         self.assertEqual(ks.scoped_keychain_service(d), f"Claude Code-credentials-{digest}")
 
