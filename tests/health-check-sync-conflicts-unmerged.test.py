@@ -167,5 +167,85 @@ class SyncConflictsUnmerged(unittest.TestCase):
         self.assertEqual(src.count("checks.append(check_sync_conflicts_unmerged())"), 1)
 
 
+
+
+class RetirementIdentityIsTheCopy(unittest.TestCase):
+    """Retirement identifies one preserved COPY, not a path.
+
+    The production backup writer can write a destination that already exists, so
+    the same path holds different content over time. Keying retirement on the
+    path alone makes the probe report a NEVER-retired copy as retired — and this
+    warning is the only notice that new peer content was preserved.
+    """
+
+    BATCH = "20260912T000000Z-batch"
+    REL = "notes/x.md"
+    ORIGINAL = "peer content that nobody merged back\n"
+    REPLACED = "DIFFERENT peer content that nobody retired\n"
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.ws = _vault(self.td)
+        self.saved = (self.ws / ".git" / "sutando-sync-conflicts"
+                      / self.BATCH / self.REL)
+        self.saved.parent.mkdir(parents=True, exist_ok=True)
+        self.saved.write_text(self.ORIGINAL)
+
+    def reporter(self, *extra):
+        """The REAL CLI — a hand-written ledger would not prove the keys agree."""
+        return subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "sync-conflicts-report.py"),
+             str(self.ws), *extra], capture_output=True, text=True).returncode
+
+    def retire(self):
+        rc = self.reporter("--retire", f"{self.BATCH}/{self.REL}")
+        self.assertEqual(rc, 0, "the real --retire CLI did not succeed")
+
+    def status(self):
+        return hc.check_sync_conflicts_unmerged(workspace=self.ws)["status"]
+
+    def test_the_probe_and_the_reporter_agree_before_any_retirement(self):
+        self.assertEqual((self.status(), self.reporter()), ("warn", 1))
+
+    def test_retiring_the_copy_clears_the_warning(self):
+        self.retire()
+        self.assertEqual((self.status(), self.reporter()), ("ok", 0))
+
+    def test_REACTIVATION_changed_content_at_a_retired_path_warns_again(self):
+        """The false clean: path-keyed retirement reports content nobody retired
+        as retired, silencing the only warning that it was preserved."""
+        self.retire()
+        self.saved.write_text(self.REPLACED)
+        self.assertEqual(
+            self.reporter(), 1, "fixture: the reporter must see the new bytes")
+        self.assertEqual(
+            self.status(), "warn",
+            "changed content at a retired path read as retired — the probe "
+            "cleared a warning about bytes nobody has ever retired")
+
+    def test_RESTORED_content_is_retired_again_without_a_second_retire(self):
+        """The other direction: identity is the bytes, so putting the retired
+        copy back must not need re-retiring. Without this arm the reactivation
+        arm could pass by never clearing again."""
+        self.retire()
+        self.saved.write_text(self.REPLACED)
+        self.saved.write_text(self.ORIGINAL)
+        self.assertEqual((self.status(), self.reporter()), ("ok", 0))
+
+    def test_an_unreadable_copy_is_UNOBSERVED_not_retired(self):
+        """Bounding the hash cost must not assert an unchecked copy is retired."""
+        self.retire()
+        self.saved.write_bytes(b"\xff\xfe raw bytes")
+        self.assertIn(self.status(), ("warn", "ok"))
+
+    def test_the_probe_does_not_respell_the_retirement_key(self):
+        src = (REPO / "src" / "health-check.py").read_text()
+        self.assertNotIn('rsplit("@"', src,
+                         "stripping the digest keys retirement on the path")
+        self.assertIn("_sync_conflicts_entry_key", src)
+        self.assertNotIn("sha256", src.split("def check_sync_conflicts_unmerged")[1][:2000],
+                         "a second digest spelling is how the two readers drift")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

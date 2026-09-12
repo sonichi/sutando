@@ -3217,21 +3217,56 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
     except OSError as exc:
         return {"name": name, "status": "ok",
                 "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
-    # Retired was ruled on. The writer keys each copy `<batch>/<rel>@<digest>`;
-    # one (batch, rel) has one digest, so the prefix is exact and needs no re-hash.
+    # The digest is IN the writer's key so retiring one copy cannot silence a
+    # later, DIFFERENT one at the same path; the reporter owns that identity.
     try:
-        retired = {str(k).rsplit("@", 1)[0] for k in json.loads((root / ".retired.json").read_text())}
+        retired = set(json.loads((root / ".retired.json").read_text()))
     except Exception:
         retired = set()
-    live = [f for f in files if str(f.relative_to(root)) not in retired]
-    if not live:
+    entry_key = _sync_conflicts_entry_key()
+    if entry_key is None:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(files)} peer file(s) preserved across {len(batches)} keep-ours "
+                           "batch(es); the reporter's retirement key could not be loaded, so "
+                           "retirement is UNOBSERVED here rather than assumed — run "
+                           f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
+    live, unobserved = [], []
+    for batch in batches:
+        for f in sorted(x for x in batch.rglob("*") if x.is_file()):
+            try:
+                # errors="replace" matches the writer: a different decode is a
+                # different digest, and every copy would then read un-retired.
+                key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+            except OSError:
+                unobserved.append(f)
+                continue
+            if key not in retired:
+                live.append(f)
+    if not live and not unobserved:
         return {"name": name, "status": "ok",
                 "detail": "no preserved peer files outstanding — all retired or none kept"}
+    if not live:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unobserved)} preserved peer file(s) could not be read, so their "
+                           "retirement is UNOBSERVED — not asserting they are retired")}
     oldest = batches[0].name if batches else "?"
     return {"name": name, "status": "warn",
             "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
                        f"oldest {oldest}, not retired — whether each is still absent from the live copy "
                        f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_entry_key():
+    """The reporter OWNS retirement identity; a second spelling here would drift."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync-conflicts-report.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_sync_conflicts_report", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._entry_key
+    except Exception:
+        return None
 
 
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
