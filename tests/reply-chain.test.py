@@ -279,6 +279,66 @@ check("the gate precedes the reply-context fetch it protects", 0 < _guard_i < _f
 check("no ungated `if message.reference and message.reference.message_id:` fetch remains",
       "if message.reference and message.reference.message_id:\n        try:" not in _bridge)
 
+
+# --- a FORWARDED parent keeps body and files in message_snapshots, so reading
+# --- ref_msg.content / .attachments saw an empty message and lost both.
+class _A:
+    def __init__(self, fn):
+        self.filename = fn
+
+
+class _M:
+    def __init__(self, content="", atts=(), snaps=()):
+        self.content, self.attachments, self.message_snapshots = content, list(atts), list(snaps)
+
+
+class _S:
+    def __init__(self, m):
+        self.message = m
+
+
+_inner = _M("", [_A("sutando-trayicon.svg"), _A("sutando-logo.svg")])
+_fwd = _M("", [], [_S(_inner)])
+
+check("forwarded parent: attachments are reachable",
+      [a.filename for a in rc.readable_attachments(_fwd)]
+      == ["sutando-trayicon.svg", "sutando-logo.svg"])
+check("forwarded parent: files are NAMED in the body, not blank",
+      rc.readable_content(_fwd)
+      == "[forwarded] <attachment: sutando-trayicon.svg> <attachment: sutando-logo.svg>")
+check("forwarded parent: the reply-context block is no longer empty",
+      "sutando-logo.svg" in rc.format_reply_chain([E("sonichi", "t", rc.readable_content(_fwd))]))
+
+# The forward is LABELLED, never inlined as the forwarder's own words.
+_txt = _M("", [], [_S(_M("the forwarded sentence"))])
+check("forwarded body is labelled, not attributed to the forwarder",
+      rc.readable_content(_txt) == "[forwarded] the forwarded sentence")
+check("the forwarder's own comment is kept alongside",
+      rc.readable_content(_M("my note", [], [_S(_M("inner body"))]))
+      == "my note [forwarded] inner body")
+
+# --- CONTROLS: an ordinary message must be untouched by all of the above ---
+_plain = _M("just text", [_A("own.png")])
+check("control: plain message content unchanged",
+      rc.readable_content(_plain) == "just text")
+check("control: plain message attachments unchanged",
+      [a.filename for a in rc.readable_attachments(_plain)] == ["own.png"])
+check("control: a message with neither body nor snapshot stays empty",
+      rc.readable_content(_M("")) == "" and rc.readable_attachments(_M("")) == [])
+check("control: an empty snapshot list is not a forward",
+      rc.forwarded_payload(_M("x")) is None)
+check("control: a forward with an empty payload falls back to the own body",
+      rc.readable_content(_M("only mine", [], [_S(_M(""))])) == "only mine")
+
+# The download loop is bridge glue (not unit-importable), so pin it by source:
+# it must iterate the forward-aware helper, never `ref_msg.attachments` raw.
+check("the bridge's parent-attachment loop is forward-aware",
+      "for att in readable_attachments(ref_msg):" in _bridge)
+check("no raw `ref_msg.attachments` iteration remains",
+      'for att in getattr(ref_msg, "attachments", [])' not in _bridge)
+check("the bridge imports the helper it calls",
+      "readable_attachments" in _bridge.split("async def")[0])
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
