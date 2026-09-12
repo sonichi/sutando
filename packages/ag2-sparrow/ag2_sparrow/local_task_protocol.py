@@ -179,6 +179,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # Backend-owned accepted room-question metadata. It is correlation data;
+    # runtime HITL authority remains in the legacy local requirement fields.
+    "question_delivery",
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",

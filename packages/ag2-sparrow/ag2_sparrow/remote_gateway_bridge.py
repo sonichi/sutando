@@ -1737,11 +1737,67 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
-                "platform_card")
+                "platform_card",
+                # Backend-owned answer correlation for an ordinary broker task;
+                # never local HITL authority or an alternative access policy.
+                "question_delivery")
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
 _PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
+
+_QUESTION_DELIVERY_KEYS = (
+    "version", "delivery_id", "question_id", "question_event_id", "revision",
+    "status", "response", "respondent", "accepted_at",
+)
+
+
+def _question_delivery_header(value):
+    """Return compact validated room-question delivery metadata, or None."""
+    if not isinstance(value, dict) or set(value) != set(_QUESTION_DELIVERY_KEYS):
+        return None
+    if value.get("version") != 1 or value.get("status") != "resolved":
+        return None
+    if not isinstance(value.get("revision"), int) or value["revision"] < 1:
+        return None
+    bounded = {
+        "delivery_id": 128,
+        "question_id": 128,
+        "question_event_id": 255,
+        "respondent": 255,
+        "accepted_at": 64,
+    }
+    if any(
+        not isinstance(value.get(key), str)
+        or not value[key]
+        or len(value[key]) > limit
+        for key, limit in bounded.items()
+    ):
+        return None
+    response = value.get("response")
+    if not isinstance(response, dict):
+        return None
+    kind = response.get("kind")
+    if kind == "choice":
+        if set(response) - {"kind", "option_id", "note"}:
+            return None
+        if not isinstance(response.get("option_id"), str) or not response["option_id"]:
+            return None
+        if len(response["option_id"]) > 64:
+            return None
+        note = response.get("note")
+        if note is not None and (not isinstance(note, str) or len(note) > 2000):
+            return None
+    elif kind == "text":
+        if set(response) != {"kind", "text"}:
+            return None
+        if not isinstance(response.get("text"), str) or not response["text"]:
+            return None
+        if len(response["text"]) > 4000:
+            return None
+    else:
+        return None
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
 
 # Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
 # values outside this set degrade to "message" rather than passing through.
@@ -2930,6 +2986,16 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "question_delivery":
+            delivery = _question_delivery_header(task.get(f))
+            expected_delivery_id = None
+            if delivery is not None:
+                expected_delivery_id = json.loads(delivery)["delivery_id"]
+            if (
+                task.get("source") == "ag2space-question-delivery"
+                and broker_tid == f"task-{expected_delivery_id}"
+            ):
+                lines.append(f"question_delivery: {delivery}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
             # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.

@@ -98,7 +98,7 @@ const _HEADER_KEYS = [
 	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
-	'content_modalities', 'media_form', 'attachments', 'platform_card',
+	'content_modalities', 'media_form', 'attachments', 'platform_card', 'question_delivery',
 	'instance_id', 'collaborator', 'requested_worker', 'hitl_click',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
