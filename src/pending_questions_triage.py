@@ -47,24 +47,17 @@ RECHECK_BLOCKING = "blocking"
 _OPEN_STATES = {"OPEN"}
 _RESOLVED_STATES = {"MERGED", "CLOSED"}
 
-# A question about undoing something a PR did: the PR MERGING is what makes the
-# decision live, not what resolves it. Only CLOSED (never landed) retires it —
-# if it never landed there is nothing to revert, which is a real answer.
-REVERT_RE = re.compile(r'\b(revert|roll\s*back)\b', re.IGNORECASE)
-
-# "Should we deploy/replace/... #N?" — the reference is the SUBJECT of a live
-# decision, not a blocker; neither MERGED nor CLOSED answers it (see PR body).
-DECISION_QUESTION_RE = re.compile(r'\bshould (we|i|you|it|they)\b', re.IGNORECASE)
+# A reference resolves a question only when the text says it is WAITING ON that
+# reference — everything else stays neutral regardless of MERGED/CLOSED state.
+BLOCKING_RE = re.compile(r'\b(blocked on|waiting (?:on|for)|pending)\b', re.IGNORECASE)
 
 
 def _resolved_states_for(row: dict) -> frozenset:
     """Which reference states count as 'this row's blocker is gone', for one row."""
     text = f"{row.get('text') or ''} {row.get('detail') or ''}"
-    if REVERT_RE.search(text):
-        return frozenset({"CLOSED"})
-    if DECISION_QUESTION_RE.search(text):
-        return frozenset()
-    return frozenset(_RESOLVED_STATES)
+    if BLOCKING_RE.search(text):
+        return frozenset(_RESOLVED_STATES)
+    return frozenset()
 
 
 def extract_refs(*texts: Optional[str]) -> list[tuple]:

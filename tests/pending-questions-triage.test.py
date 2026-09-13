@@ -122,12 +122,15 @@ class RecheckVerdict(unittest.TestCase):
         self.assertIn("a/b#10 merged", rows[0]["recheck"]["note"])
 
     def test_a_partly_resolved_row_is_reported_as_still_blocking(self):
+        """Review, 2026-09-13 (round 6): a bare mention carries no blocking wording
+        at all, so neither reference resolves regardless of its state — the row
+        stays fully blocking rather than reading one merge as partial progress."""
         rows = triage.apply_recheck(
             [_row("Q1", "a/b#10 a/b#11")],
             {("a/b", 10): "MERGED", ("a/b", 11): "OPEN"},
         )
-        self.assertEqual(triage.RECHECK_BLOCKING, rows[0]["recheck"]["status"])
-        self.assertEqual(1, rows[0]["blocks"])
+        self.assertIsNone(rows[0]["recheck"])
+        self.assertEqual(2, rows[0]["blocks"])
 
     def test_a_row_with_no_references_gets_no_verdict(self):
         rows = triage.apply_recheck(
@@ -151,14 +154,17 @@ class RecheckVerdict(unittest.TestCase):
         self.assertEqual(1, rows[0]["blocks"])
 
     def test_a_revert_question_closes_when_its_target_never_landed(self):
-        """The other half: a revert target that was CLOSED without merging really
-        is moot — nothing landed, so there is nothing left to revert."""
+        """Review, 2026-09-13 (round 6): the old revert-only carveout treated a
+        CLOSED target as auto-resolving. Retired along with the rest of the
+        denylist — without explicit blocking wording, a CLOSED reference stays
+        neutral too, so this needs an explicit reply rather than reading a
+        state change as an answer."""
         rows = triage.apply_recheck(
             [_row("Q1", "Should we revert sonichi/sutando#3963?")],
             {("sonichi/sutando", 3963): "CLOSED"},
         )
-        self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
-        self.assertEqual(0, rows[0]["blocks"])
+        self.assertIsNone(rows[0]["recheck"])
+        self.assertEqual(1, rows[0]["blocks"])
 
     def test_roll_back_phrasing_is_recognised_too(self):
         rows = triage.apply_recheck(
@@ -197,15 +203,17 @@ class RecheckVerdict(unittest.TestCase):
         self.assertIsNone(rows[0]["recheck"])
         self.assertEqual(1, rows[0]["blocks"])
 
-    def test_a_should_we_question_with_no_decision_wording_still_falls_through_to_blocking(self):
-        """The generalization must not swallow every question that happens to
-        mention a PR — only ones actually phrased as a live decision."""
+    def test_a_bare_mention_with_no_blocking_wording_never_auto_resolves(self):
+        """Review, 2026-09-13 (round 6): the allowlist replaces "every other
+        phrasing defaults to resolved" with "nothing resolves without explicit
+        blocking wording" — a bare mention of a merged PR is informational,
+        not a signal the row's ask has been answered."""
         rows = triage.apply_recheck(
             [_row("Q1", "sonichi/sutando#3963 needs a look")],
             {("sonichi/sutando", 3963): "MERGED"},
         )
-        self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
-        self.assertEqual(0, rows[0]["blocks"])
+        self.assertIsNone(rows[0]["recheck"])
+        self.assertEqual(1, rows[0]["blocks"])
 
 
 class Ranking(unittest.TestCase):
