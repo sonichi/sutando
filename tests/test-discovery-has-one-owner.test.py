@@ -67,15 +67,30 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
                              f"{r.name} has its own test-discovery find: {offenders}. "
                              "Two implementations drift, and the drift is silent.")
 
-    def test_the_helper_actually_reaches_both_roots(self):
+    def test_the_helper_actually_reaches_the_tests_root(self):
         out = subprocess.run(["bash", str(DISCOVER)], cwd=str(REPO),
                              capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, f"helper failed: {out.stderr.strip()}")
         paths = out.stdout.split()
         self.assertTrue(any(p.startswith("tests/") for p in paths), "no tests/ files discovered")
-        if (REPO / "skills").is_dir():
-            self.assertTrue(any(p.startswith("skills/") for p in paths),
-                            "skills/ exists but the helper reached none of it")
+
+    def test_the_helper_reaches_the_skills_root_too(self):
+        # A synthetic tree: no committed skill puts a *.test.py directly under
+        # skills/ today, so a real-content check here would fail regardless.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "tests").mkdir()
+            (td / "tests" / "a.test.py").write_text("")
+            (td / "skills" / "demo" / "tests").mkdir(parents=True)
+            (td / "skills" / "demo" / "tests" / "b.test.py").write_text("")
+            (td / "scripts").mkdir()
+            shutil.copy2(DISCOVER, td / "scripts" / DISCOVER.name)
+            out = subprocess.run(["bash", "scripts/" + DISCOVER.name], cwd=str(td),
+                                 capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, f"helper failed: {out.stderr.strip()}")
+        paths = out.stdout.split()
+        self.assertIn("skills/demo/tests/b.test.py", paths,
+                      "the helper's skills-root walk did not reach a real skill test")
 
     def test_a_commented_out_call_does_not_satisfy_delegation(self):
         """keweichen's mutation, committed: the runner names the helper in a
