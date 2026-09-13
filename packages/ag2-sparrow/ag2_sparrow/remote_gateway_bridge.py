@@ -2545,6 +2545,17 @@ def _push_pool_advertisement() -> None:
         _PUSH_THREAD.start()
 
 
+def _join_push_thread(timeout: float = 5.0) -> None:
+    """A normal exit finishes the snapshot+card pair (bounded): the broker must
+    not be left holding a snapshot and a card from different revisions."""
+    t = _PUSH_THREAD
+    if t is not None and t.is_alive():
+        t.join(timeout)
+
+
+atexit.register(_join_push_thread)
+
+
 def _push_pool_advertisement_now() -> None:
     """One read of the advertisement per beat, handed to BOTH publications:
     two reads let a sibling writer's atomic rename land between them, and the

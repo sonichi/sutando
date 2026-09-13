@@ -633,6 +633,9 @@ def test_the_hand_off_returns_before_its_requests_complete():
         t = threading.Thread(target=m._push_pool_advertisement, daemon=True)
         t.start(); t.join(1.0)
         assert not t.is_alive(), "the beat is stuck behind a push that has not returned"
+        for _ in range(100):          # the push thread issues its first request on its own clock
+            if calls: break
+            time.sleep(0.05)
         assert len(calls) == 1 and calls[0][1] == "/v1/workers", calls
         gate.set(); m._PUSH_THREAD.join(5)
         assert len(calls) == 2 and calls[1][1].startswith("/v1/agents/") and calls[1][1].endswith("/profile"), calls
@@ -668,6 +671,26 @@ def test_a_failing_background_push_is_logged_not_silent():
         print("PASS test_a_failing_background_push_is_logged_not_silent")
 
 
+def test_a_normal_exit_waits_for_the_pair_bounded():
+    """The exit hook joins a live push thread within its bound and returns at
+    once when none is live, so a shutdown cannot split snapshot from card."""
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(Path(d)); _advertise(m, _record(1))
+        gate = threading.Event(); calls = []
+        def blocked(*a, **k):
+            calls.append(a); gate.wait(5); return {}
+        m._req = blocked
+        m._push_pool_advertisement()
+        t0 = time.time(); m._join_push_thread(timeout=0.3); waited = time.time() - t0
+        assert 0.25 <= waited < 2.0, f"bounded join did not wait its bound: {waited:.2f}s"
+        gate.set(); m._PUSH_THREAD.join(5)
+        t0 = time.time(); m._join_push_thread(timeout=5.0)
+        assert time.time() - t0 < 0.5, "no live thread must mean no wait"
+        assert len(calls) == 2, calls
+        print("PASS test_a_normal_exit_waits_for_the_pair_bounded")
+
+
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
     test_a_missing_file_pushes_nothing_at_all()
@@ -696,4 +719,5 @@ if __name__ == "__main__":
     test_the_hand_off_returns_before_its_requests_complete()
     test_an_in_flight_push_is_skipped_not_queued()
     test_a_failing_background_push_is_logged_not_silent()
+    test_a_normal_exit_waits_for_the_pair_bounded()
     print("ALL PASS test_pool_advertisement_push")
