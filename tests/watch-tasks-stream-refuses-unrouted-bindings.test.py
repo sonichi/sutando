@@ -75,6 +75,9 @@ class TestWatcher(unittest.TestCase):
             (self.ws / d).mkdir(parents=True)
         self.tmp = Path(self._t.name) / "tmp"
         self.tmp.mkdir()
+        # Seeded before every start: the gate runs ahead of the sweep, so this
+        # changes nothing for a refusal and gives a start something to announce.
+        (self.ws / "tasks" / "task-seed1.txt").write_text("id: task-seed1\ntask: seed\n")
         self.procs = []
         self.addCleanup(self._kill_all)
 
@@ -95,9 +98,15 @@ class TestWatcher(unittest.TestCase):
                if k not in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_ALLOW_UNROUTED_BINDINGS")}
         env.update({"TMPDIR": str(self.tmp), "SUTANDO_WORKSPACE_DIR": str(self.ws)})
         env.update(env_extra)
-        p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
-                             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+        # Files, not pipes: a started watcher never exits, so its output has to be
+        # readable while it still runs, and a refusal's stderr after it is gone.
+        self.out = self.tmp / f"out{len(self.procs)}"
+        self.err = self.tmp / f"err{len(self.procs)}"
+        with open(self.out, "w") as o, open(self.err, "w") as e:
+            p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+                                 cwd=str(REPO), env=env, stdout=o, stderr=e,
+                                 text=True, start_new_session=True)
+        p._out, p._err = self.out, self.err
         self.procs.append(p)
         return p
 
@@ -106,9 +115,10 @@ class TestWatcher(unittest.TestCase):
 
     def _assert_refused(self, p):
         try:
-            _out, err = p.communicate(timeout=30)
+            p.wait(timeout=30)
         except subprocess.TimeoutExpired:
             self.fail("watcher did not exit; it should have refused")
+        err = p._err.read_text()
         self.assertEqual(p.returncode, 78, err)
         self.assertIn("REFUSING to start", err)
         self.assertIn("SUTANDO_TASK_EVENT_HANDLER=", err)
@@ -117,13 +127,18 @@ class TestWatcher(unittest.TestCase):
         return err
 
     def _assert_started(self, p):
-        # A refusal exits within a second; a started watcher is still running well after.
-        deadline = time.time() + 4
+        # Proven by the work the gate lets through, not by still being alive:
+        # liveness also needs fswatch, which CI lacks. The sweep precedes it.
+        deadline = time.time() + 20
         while time.time() < deadline:
+            if "TASK_FILE:" in p._out.read_text():
+                self.assertNotIn("REFUSING to start", p._err.read_text())
+                return
             if p.poll() is not None:
-                _out, err = p.communicate()
-                self.fail(f"watcher exited rc={p.returncode}: {err[-400:]}")
+                break
             time.sleep(0.2)
+        self.fail(f"watcher never swept the seeded task (rc={p.poll()}): "
+                  f"{p._err.read_text()[-400:]}")
 
     def test_bindings_and_no_handler_refuse_and_name_the_fix(self):
         self._bind()
