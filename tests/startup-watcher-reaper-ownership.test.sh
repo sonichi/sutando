@@ -246,6 +246,54 @@ fi
 kill "$live7" 2>/dev/null; wait "$live7" 2>/dev/null
 
 
+# --- case 8: `dead` from a SUCCEEDING helper still licenses the release -------
+# The control for case 9: same stub, same live pid, only the exit code differs.
+sleep 30 &
+live8=$!
+f="$TMP/case8.pid"
+echo "$live8" > "$f"
+ok8="$TMP/ok8"; mkdir -p "$ok8"
+cat > "$ok8/python3" << 'SH'
+#!/bin/sh
+echo "dead"
+echo "why=no such process"
+exit 0
+SH
+chmod +x "$ok8/python3"
+out="$(PATH="$ok8:$PATH" SUTANDO_PY="$ok8/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ ! -f "$f" ]; then
+  ok "dead from a succeeding helper: sentinel released"
+else
+  bad "dead from a succeeding helper: sentinel released" "still present ($out)"
+fi
+kill "$live8" 2>/dev/null; wait "$live8" 2>/dev/null
+
+
+# --- case 9: `dead` from a FAILED helper licenses nothing ---------------------
+# The error gate exempted `dead`, so a helper that exited non-zero while printing
+# it released a LIVE watcher's sentinel. A failed run is not a verdict.
+sleep 30 &
+live9=$!
+f="$TMP/case9.pid"
+echo "$live9" > "$f"
+bad9="$TMP/bad9"; mkdir -p "$bad9"
+cat > "$bad9/python3" << 'SH'
+#!/bin/sh
+echo "dead"
+echo "why=no such process"
+exit 42
+SH
+chmod +x "$bad9/python3"
+out="$(PATH="$bad9:$PATH" SUTANDO_PY="$bad9/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live9" 2>/dev/null; then
+  ok "dead from a FAILED helper: neither killed nor released"
+else
+  bad "dead from a FAILED helper: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live9" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live9" 2>/dev/null; wait "$live9" 2>/dev/null
+
+
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"
   exit 0

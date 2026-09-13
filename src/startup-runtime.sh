@@ -363,9 +363,9 @@ reap_stale_task_watcher() {
     watcher|not-watcher|dead|unknown) ;;
     *) _wi_verdict="unknown"; _wi_rc=2 ;;
   esac
-  # `dead` is knowledge (ps ran, the pid is gone) and licenses the release below;
-  # `unknown` is its absence and licenses nothing.
-  if [ "$_wi_verdict" != "dead" ] && { [ "$_wi_rc" -ne 0 ] || [ "$_wi_verdict" = "unknown" ]; }; then
+  # A verdict is knowledge only if the helper SUCCEEDED. Exempting `dead` from
+  # that let a FAILED run printing it release a live watcher's sentinel.
+  if [ "$_wi_rc" -ne 0 ] || [ "$_wi_verdict" = "unknown" ]; then
     echo "  ⚠ cannot determine whether pid $stale_pid is a watcher ($(printf '%s' "$_wi_out" | sed -n 2p)); leaving the sentinel alone"
     return 0
   fi
