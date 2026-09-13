@@ -150,6 +150,9 @@ fi
 # The worker gate `/startup --worker` runs, named by the spawner: this launcher
 # is the core's, so it forwards the path and never knows which skill owns it.
 [ -n "${SUTANDO_WORKER_BOOTSTRAP:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKER_BOOTSTRAP=$SUTANDO_WORKER_BOOTSTRAP")
+# The done-flag writer, same seam: tmux hands a new session the SERVER's env, so
+# an unforwarded writer leaves the hook complete but never reached.
+[ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_POOL_DELIVERY_SCRIPT=$SUTANDO_POOL_DELIVERY_SCRIPT")
 # A worker session's cwd is the spawner's --cwd, which need not be the repo, and
 # its PATH python3 may be the CLT stub: name both absolutely from here instead.
 if [ -n "$WORKER_INSTANCE" ]; then

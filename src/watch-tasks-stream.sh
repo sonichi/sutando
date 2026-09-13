@@ -32,8 +32,13 @@ record_worker_done() {
   # writer: its spawner injects one, so unset means "not a worker", not an error.
   [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
   [ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
-  [ -x "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
-  "$SUTANDO_POOL_DELIVERY_SCRIPT" \
+  # `-f` not `-x`: we hand it to the interpreter below, so the execute bit is
+  # the wrong property to require of a script the pool may ship non-executable.
+  [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
+  # The RESOLVED interpreter, never the shebang: a worker's PATH python3 may be
+  # the macOS CLT stub, which is why the launcher forwards one at all.
+  [ -n "${SUTANDO_PY_BIN:-}" ] || return 1
+  "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" \
     --workspace "$ws" --recipient "$SUTANDO_INSTANCE_ID" \
     mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
 }
