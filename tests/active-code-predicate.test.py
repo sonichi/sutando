@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines, invokes, unquoted  # noqa: E402
+from active_code import active_lines, invokes, python_args, unquoted  # noqa: E402
 
 NAME = "discover-python-tests.sh"
 
@@ -68,6 +68,26 @@ class CommandPosition(unittest.TestCase):
 
     def test_unquoted_blanks_quoted_runs_only(self):
         self.assertEqual(unquoted("a 'bc' d"), "a      d")
+
+
+class PythonArgsPosition(unittest.TestCase):
+    def test_a_quoted_real_invocation_is_named(self):
+        self.assertEqual(python_args("python3 'packages/x/test_real.py'"),
+                         ["packages/x/test_real.py"])
+
+    def test_an_echoed_unquoted_invocation_is_not_named(self):
+        self.assertEqual(python_args("echo python3 packages/x/test_echo.py"), [])
+
+    def test_a_timeout_wrapped_invocation_is_still_named(self):
+        self.assertEqual(python_args("timeout -k 5 120 python3 x/test_real.py"),
+                         ["x/test_real.py"])
+
+    def test_a_bare_timeout_duration_with_no_flag_still_peels(self):
+        self.assertEqual(python_args("timeout 120 python3 x/test_real.py"),
+                         ["x/test_real.py"])
+
+    def test_a_commented_invocation_is_not_named(self):
+        self.assertEqual(python_args("# python3 dead.py"), [])
 
 
 if __name__ == "__main__":

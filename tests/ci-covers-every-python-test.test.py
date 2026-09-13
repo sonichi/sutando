@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines, active_text, unquoted  # noqa: E402
+from active_code import active_lines, active_text, python_args  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
@@ -85,13 +85,15 @@ def _run_bodies(text: str) -> list[str]:
 def named_in_workflows():
     """Files any workflow ACTIVELY invokes, e.g. `python3 path/to/x.py`.
 
-    Quoted text is blanked first: `echo 'python3 x.py'` names x.py without
-    running it, and counting it masks a genuinely orphaned test."""
+    Position, not presence, via python_args(): `echo python3 x.py` (no
+    quotes to blank) used to name x.py as if it ran, and a real quoted
+    invocation like `python3 'x.py'` used to be blanked to nothing along
+    with it — a regex over unquoted text can't tell an argument from a
+    caller in either direction."""
     named = set()
     for wf in (REPO / ".github" / "workflows").glob("*.yml"):
         for ln in active_lines("\n".join(_run_bodies(wf.read_text()))):
-            for m in re.finditer(r"python3?\s+(\S+\.py)", unquoted(ln)):
-                named.add(m.group(1))
+            named.update(python_args(ln))
     return named
 
 
