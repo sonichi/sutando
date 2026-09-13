@@ -250,7 +250,9 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # The shared readiness contract, not existence: an empty or whitespace-only
     # file is a placeholder still being written, and must not suppress recovery.
     has_result = read_ready_result(result_path(ws, task_id)) is not None
-    has_flag = done_flag(ws, recipient, task_id).is_file()
+    # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
+    # verdict is what `sweep` deletes on, so a planted link would retire real work.
+    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
 

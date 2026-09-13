@@ -644,6 +644,39 @@ class TestIsDoneFlag(Base):
             pd.is_done_flag(link)
 
 
+class TestTheDestructiveReaderUsesThePredicate(Base):
+    """`sweep` DELETES on residue's verdict, so the flag read there must be the
+    fail-closed predicate and not `is_file()`, which follows a symlink."""
+
+    def _completed(self, recipient="worker-3", task_id="task-1"):
+        self.ws.payload(task_id)
+        pd.accept(self.ws.deliver(recipient, task_id))
+        self.ws.result(task_id)
+        return task_id
+
+    def test_a_symlink_at_the_flag_name_does_not_retire_the_delivery(self):
+        task_id = self._completed()
+        target = self.root / "planted"
+        target.write_text("", encoding="utf-8")
+        link = pd.done_flag(self.root, "worker-3", task_id)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        with self.assertRaises(OSError):
+            pd.residue(self.root, "worker-3", task_id)
+        with self.assertRaises(OSError):
+            pd.sweep(self.root, "worker-3")
+        # The work survives: a planted link must not discard an accepted delivery.
+        self.assertEqual([q.name for q in pd.accepted(self.root, "worker-3")],
+                         [f"{task_id}.accepted"])
+
+    def test_a_real_flag_still_retires_it(self):
+        task_id = self._completed()
+        pd.mark_done(self.root, "worker-3", task_id, published=True)
+        self.assertEqual(pd.residue(self.root, "worker-3", task_id), "finished")
+        self.assertEqual(pd.sweep(self.root, "worker-3").get("retired"), [task_id])
+        self.assertEqual([q.name for q in pd.accepted(self.root, "worker-3")], [])
+
+
 class TestTheWriterMakesFinishedReachable(Base):
     """The reason the writer exists: `residue` has a `finished` state that no
     path could reach, so `sweep` never retired a completed delivery.
