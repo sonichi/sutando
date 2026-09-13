@@ -329,10 +329,13 @@ def _classify_run(base: dict, nov: Novelty, raw_static: bool, ps: dict,
         if ps["retry_current"] and not bs["abnormal_current"]:
             return {**base, "kind": "retry-loop", "confidence": conf, "warn": True, "reason": why}
         return {**base, "kind": "abnormal", "confidence": conf, "warn": True, "reason": why}
-    # Case 1 is pure static on the RAW pane (spec): no normalization here.
+    # Case 1 is pure static on the RAW pane (spec). Ignores work_outstanding by
+    # design (Chi, 2026-09-10), but must not then CLAIM nothing is outstanding.
     if raw_static:
-        return {**base, "kind": "idle", "confidence": "high", "warn": False,
-                "reason": "pane unchanged and nothing outstanding"}
+        reason = ("pane unchanged and nothing outstanding" if not work_outstanding else
+                  f"pane unchanged; work is outstanding ({work_detail or 'unspecified'}) but "
+                  "this verdict is text-only and does not weigh the queue")
+        return {**base, "kind": "idle", "confidence": "high", "warn": False, "reason": reason}
     return {**base, "kind": "working", "confidence": "medium" if nov.novelty_rate < 0.6 else "high", "warn": False,
             "reason": f"{nov.novel_state_count} distinct states over {nov.sample_count} samples"}
 

@@ -92,6 +92,15 @@ class Classifier(unittest.TestCase):
             v = w.classify([IDLE] * 6, work, 900, "core-status running")
             self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
 
+    def test_idle_reason_does_not_claim_nothing_outstanding_when_something_is(self):
+        # qingyun-wu, #4131 review: the verdict correctly ignores the queue (Chi's
+        # design), but the reason text must not then assert the queue is empty.
+        v = w.classify([IDLE] * 6, True, 900, "core-status running")
+        self.assertNotIn("nothing outstanding", v["reason"])
+        self.assertIn("core-status running", v["reason"])
+        v2 = w.classify([IDLE] * 6, False, 900, "")
+        self.assertIn("nothing outstanding", v2["reason"])
+
     def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
         for frame in ("❯ \n⏵⏵ APIError: 500 Internal Server Error\n",
                       "❯ \n⏵⏵ Network error: could not reach the API\n",
