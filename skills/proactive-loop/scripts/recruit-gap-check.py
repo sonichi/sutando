@@ -35,17 +35,22 @@ def latest_states(reviews):
     return out
 
 
-def classify(required, latest, shared_logins):
+def classify(required, latest, shared_logins, ineligible=frozenset()):
     """Pure verdict. A shared login is counted by GitHub but identifies no one.
 
     Two shortfalls, never one: `github` decides mergeability, `distinct` decides
     whether anyone outside the shared logins actually vouched. This repo has more
     than one such account, so the parameter is a SET -- a single-login version
     scores the second shared account as a distinct party.
+
+    `ineligible` (keweichen, #4055): an approval from an account that cannot
+    satisfy the repo's approval gate (not a collaborator) must not satisfy
+    EITHER count -- the caller resolves eligibility live and passes the set.
     """
     shared = {shared_logins} if isinstance(shared_logins, str) else set(shared_logins)
     blocking = sorted(u for u, s in latest.items() if s == "CHANGES_REQUESTED")
-    counted = sorted(u for u, s in latest.items() if s == "APPROVED")
+    counted = sorted(u for u, s in latest.items()
+                      if s == "APPROVED" and u not in ineligible)
     distinct = [u for u in counted if u not in shared]
     github_short = max(0, required - len(counted))
     distinct_short = max(0, required - len(distinct))
@@ -84,6 +89,19 @@ def _gh(args):
     if p.returncode != 0:
         raise RuntimeError(f"gh api {' '.join(args)}: {p.stderr.strip()[:200]}")
     return json.loads(p.stdout)
+
+
+def is_collaborator(repo, login) -> "bool | None":
+    """Can `login`'s approval satisfy this repo's gate? `None` = undetermined
+    (never guessed as False): a 204 on `collaborators/<login>` is yes, a 404
+    is no, anything else (rate limit, network, auth) is unknown."""
+    p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
+                        capture_output=True, text=True)
+    if p.returncode == 0:
+        return True
+    if "404" in p.stderr:
+        return False
+    return None
 
 
 def required_approvals(repo, branch):
@@ -127,7 +145,21 @@ def main(argv=None):
             print(f"#{pr}: cannot answer -- {exc}")
             rc = max(rc, 2)
             continue
-        v = classify(required, latest_states(reviews), a.shared_logins)
+        latest = latest_states(reviews)
+        approved = [u for u, s in latest.items() if s == "APPROVED"]
+        ineligible, unknown = set(), []
+        for login in approved:
+            elig = is_collaborator(a.repo, login)
+            if elig is False:
+                ineligible.add(login)
+            elif elig is None:
+                unknown.append(login)
+        if unknown:
+            print(f"#{pr}: cannot answer -- eligibility undetermined for "
+                  f"{', '.join(sorted(unknown))}")
+            rc = max(rc, 2)
+            continue
+        v = classify(required, latest, a.shared_logins, ineligible)
         print(render(pr, v, a.shared_logins))
         if v["verdict"] == RECRUIT:
             rc = max(rc, 1)

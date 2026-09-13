@@ -84,6 +84,29 @@ class Classify(unittest.TestCase):
     def test_a_zero_bar_never_recruits(self):
         self.assertEqual(g.classify(0, {}, SHARED)["verdict"], g.MET)
 
+    # --- ineligible approvals (keweichen, #4055) ---------------------------
+    def test_an_ineligible_approval_counts_toward_NEITHER_total(self):
+        """#3698 shape: TustinOC (not a collaborator) + john-the-dev + a
+        shared login all approved -- eligible+distinct is really just
+        john-the-dev, one short of 2."""
+        v = g.classify(2, {"TustinOC": "APPROVED", "john-the-dev": "APPROVED",
+                            SHARED[0]: "APPROVED"}, SHARED,
+                        ineligible={"TustinOC"})
+        self.assertEqual(v["counted"], ["john-the-dev", SHARED[0]])
+        self.assertEqual(v["verdict"], g.THIN)
+        self.assertEqual(v["distinct_short_by"], 1)
+
+    def test_CONTROL_without_the_ineligible_set_the_bug_reproduces(self):
+        """Same inputs, default `ineligible` -- the pre-fix shape: TustinOC's
+        approval satisfies the bar outright, MET instead of THIN."""
+        v = g.classify(2, {"TustinOC": "APPROVED", "john-the-dev": "APPROVED",
+                            SHARED[0]: "APPROVED"}, SHARED)
+        self.assertEqual(v["verdict"], g.MET)
+
+    def test_an_ineligible_only_approval_still_recruits(self):
+        v = g.classify(1, {"TustinOC": "APPROVED"}, SHARED, ineligible={"TustinOC"})
+        self.assertEqual(v["verdict"], g.RECRUIT)
+
 
 class Render(unittest.TestCase):
     def test_every_verdict_names_the_pr_and_the_counts(self):
@@ -153,9 +176,11 @@ class RequiredApprovals(unittest.TestCase):
 
 class Main(unittest.TestCase):
     def _stub(self, rules, reviews_by_pr):
-        orig = g._gh
+        orig, orig_collab = g._gh, g.is_collaborator
+        self.gh_calls = []
 
         def fake(args):
+            self.gh_calls.append(args[0])
             if "rules/branches" in args[0]:
                 return rules
             pr = args[0].split("/pulls/")[1].split("/")[0]
@@ -164,7 +189,9 @@ class Main(unittest.TestCase):
                 raise got
             return got
         g._gh = fake
+        g.is_collaborator = lambda repo, login: True  # every approver eligible unless overridden
         self.addCleanup(lambda: setattr(g, "_gh", orig))
+        self.addCleanup(lambda: setattr(g, "is_collaborator", orig_collab))
 
     RULES = [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]
 
@@ -196,18 +223,47 @@ class Main(unittest.TestCase):
         "bar met, nobody to recruit" -- rc 0, the same as a real MET. Now it
         must refuse to answer rather than fabricate a satisfied bar, and it
         must do so WITHOUT ever reading a PR's reviews (nothing to score
-        against)."""
+        against).
+
+        keweichen (#4055): asserting only `rc == 2` cannot tell this apart
+        from the generic per-PR `except Exception` handler a few lines down
+        also returning 2 -- deleting the `if required is None` branch
+        entirely still passes that assertion, because the stubbed reviews
+        call then raises and is caught there instead. Assert the reviews
+        endpoint was never called, which only the correct branch satisfies.
+        """
         self._stub([{"type": "deletion", "parameters": {}}],
                    {"7": RuntimeError("must not be called")})
         rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0],
                      "--branch", "docs/worker-pool-design", "7"])
         self.assertEqual(rc, 2)
+        self.assertFalse(any("pulls/7/reviews" in c for c in self.gh_calls),
+                         f"reviews were fetched despite no bar: {self.gh_calls}")
 
     def test_repeatable_shared_login_reaches_classify(self):
         self._stub(self.RULES, {"7": [rv(SHARED[0], "APPROVED"), rv(SHARED[1], "APPROVED")]})
         rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0],
                      "--shared-login", SHARED[1], "7"])
         self.assertEqual(rc, 0, "the bar is met, so it is thin -- not a recruit")
+
+    # --- eligibility wiring end-to-end (keweichen, #4055) -------------------
+    def test_an_ineligible_approver_is_excluded_from_the_live_verdict(self):
+        self._stub(self.RULES, {"7": [rv("TustinOC", "APPROVED"), rv("a", "APPROVED")]})
+        g.is_collaborator = lambda repo, login: login != "TustinOC"
+        rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"])
+        self.assertEqual(rc, 1, "one real approval, short of the bar of 2")
+
+    def test_undetermined_eligibility_is_cannot_answer_not_a_guess(self):
+        """#7's undetermined approver refuses (worst code 2); #8 is a
+        genuine RECRUIT (code 1) and must still run -- main() keeps going
+        and reports the worst code rather than aborting the whole pass."""
+        self._stub(self.RULES, {"7": [rv("a", "APPROVED"), rv("b", "APPROVED")],
+                                 "8": [rv("c", "APPROVED")]})
+        g.is_collaborator = lambda repo, login: None if login == "b" else True
+        rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7", "8"])
+        self.assertEqual(rc, 2)
+        self.assertIn("repos/o/r/pulls/8/reviews", self.gh_calls,
+                      "an undetermined approver on #7 must not abort #8")
 
 
 if __name__ == "__main__":
