@@ -153,6 +153,33 @@ class Gh(unittest.TestCase):
         finally:
             g.subprocess.run = orig
 
+    def test_is_collaborator_204_is_true(self):
+        orig = g.subprocess.run
+        g.subprocess.run = self._run(0)
+        try:
+            self.assertIs(g.is_collaborator("o/r", "a"), True)
+        finally:
+            g.subprocess.run = orig
+
+    def test_is_collaborator_404_is_false(self):
+        orig = g.subprocess.run
+        g.subprocess.run = self._run(1, "", "gh: Not Found (HTTP 404)")
+        try:
+            self.assertIs(g.is_collaborator("o/r", "a"), False)
+        finally:
+            g.subprocess.run = orig
+
+    def test_is_collaborator_ANYTHING_ELSE_is_undetermined_not_false(self):
+        """A rate limit, a network blip, an auth failure -- none of these is
+        evidence the login lacks access, and guessing False would let a real
+        collaborator's approval be silently dropped from the count."""
+        orig = g.subprocess.run
+        g.subprocess.run = self._run(1, "", "gh: API rate limit exceeded (HTTP 403)")
+        try:
+            self.assertIsNone(g.is_collaborator("o/r", "a"))
+        finally:
+            g.subprocess.run = orig
+
 
 class RequiredApprovals(unittest.TestCase):
     def _with(self, payload):
