@@ -201,6 +201,18 @@ def _is_routing_placeholder(row) -> bool:
     return not states_routing(row, ("matrix",))
 
 
+def _states_anything(row) -> bool:
+    """True unless EVERY field in the row states nothing by its own type.
+
+    Broader than `_is_routing_placeholder`, which only asks about matrix
+    routing (right for its own caller). A row holding only `allowlisted:
+    false`, or only a caveat, states something and must not be treated like a
+    row that states nothing at all."""
+    if not isinstance(row, dict):
+        return False
+    return any(states_field(f, v) for f, v in row.items())
+
+
 def _promote(winner: dict, local: dict) -> dict:
     """Peer routing, local everything-else. `allowlisted: false` is a refusal and
     survives; consumers check it AFTER the bare-key lookup, so an @local copy
@@ -251,7 +263,7 @@ def roster_union(paths, kinds=None) -> dict:
                 if placeholder and _usable(row, kinds):
                     merged[f"{key}@local"] = merged[key]
                     merged[key] = _promote(row, merged[key])
-                elif placeholder and not _is_routing_placeholder(row):
+                elif placeholder and _states_anything(row):
                     # Unusable but not nothing (a partial stand, a bare
                     # `allowlisted: false`): absorb it, so a farther peer next compares against IT, not the placeholder it would otherwise still see.
                     merged[f"{key}@local"] = merged[key]

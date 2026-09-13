@@ -488,6 +488,46 @@ class OffAllowlistPolicySurvivesShadowing(unittest.TestCase):
         targets, rc, _ = self.resolve(merged)
         self.assertEqual((len(targets), rc), (0, 3))
 
+    # qingyun-wu's follow-up (2026-09-13): a bare `allowlisted: false`, with
+    # no stand at all, fell through the first fix the same way.
+    BARE_OFF_ALLOWLIST = {"allowlisted": False}
+    EXPLICIT_NULL_OFF_ALLOWLIST = {"stand": None, "room": None, "allowlisted": False}
+
+    def test_a_bare_policy_row_with_no_stand_at_all_is_not_bypassed_either(self):
+        for shape in (self.BARE_OFF_ALLOWLIST, self.EXPLICIT_NULL_OFF_ALLOWLIST):
+            with self.subTest(shape=shape):
+                merged = self.union(
+                    ("local", {"reviewer": {"stand": None, "room": None}}),
+                    ("nearer", {"reviewer": dict(shape)}),
+                    ("farther", {"reviewer": dict(self.COMPLETE_ROUTE)}),
+                )
+                targets, _, _ = self.resolve(merged)
+                self.assertEqual(len(targets), 0,
+                                 f"routed despite policy — bare row: "
+                                 f"{merged.get('reviewer')}")
+                self.assertIs(merged["reviewer"].get("allowlisted"), False)
+
+    def test_a_null_local_row_is_a_no_op_whichever_way_the_policy_resolves(self):
+        """The invariant a bare policy row must ALSO satisfy: prepending a
+        row that states nothing must not change what the same two peer rows
+        already resolve to without it -- whether that resolution is `blocked
+        with no route learned` (the partial-stand shape) or `blocked with the
+        farther route learned and the policy overlaid` (the bare shape,
+        already true before either fix, and unaffected by both)."""
+        farther = dict(self.COMPLETE_ROUTE)
+        for shape in (self.PARTIAL_OFF_ALLOWLIST, self.BARE_OFF_ALLOWLIST,
+                     self.EXPLICIT_NULL_OFF_ALLOWLIST):
+            with self.subTest(shape=shape):
+                no_local = self.resolve(self.union(
+                    ("nearer", {"reviewer": dict(shape)}),
+                    ("farther", {"reviewer": dict(farther)})))
+                with_local = self.resolve(self.union(
+                    ("local", {"reviewer": {"stand": None, "room": None}}),
+                    ("nearer", {"reviewer": dict(shape)}),
+                    ("farther", {"reviewer": dict(farther)})))
+                self.assertEqual(no_local[:2], with_local[:2],
+                                 f"a no-op local row changed the outcome for {shape}")
+
     def test_CONTROL_a_complete_off_allowlist_row_still_wins_outright(self):
         merged = self.union(
             ("local", {"reviewer": {"stand": None, "room": None}}),
