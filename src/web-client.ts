@@ -3393,9 +3393,11 @@ function renderTabContent() {
 
   } else if (tab === 'questions') {
     // Re-check immediately before display, once per visit rather than per re-render.
+    // Renders directly on completion — updateDynamicRegion() would refuse while
+    // this tab is still the locally-set one, which is the entire time it's open.
     if (!window._drQueueChecked) {
       window._drQueueChecked = true;
-      refreshQuestionQueue().then(function() { updateDynamicRegion(); });
+      refreshQuestionQueue().then(function() { updateTabHighlights(); renderTabContent(); });
     }
     if (!window._drQueue) window._drQueue = window._drQuestions || [];
     container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0);

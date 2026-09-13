@@ -130,6 +130,51 @@ class QueueRedraw(unittest.TestCase):
         self.assertIn("Second question", out["after"])
         self.assertEqual(["Q2"], out["remainingIds"])
 
+    def test_the_first_visit_recheck_redraws_once_it_completes(self):
+        """A distinct third instance of the same bug (2026-09-13 review, round 4):
+        renderTabContent()'s once-per-visit refreshQuestionQueue().then(...) also
+        went through updateDynamicRegion(), so a live re-check completing while the
+        tab is open never reached the screen either — the visible card stayed
+        whatever the queue looked like BEFORE the fetch resolved."""
+        program = (
+            SHIM
+            + "var API_BASE = 'http://x';\n"
+            + "function fetch() { return Promise.resolve({ json: function() {"
+            + " return Promise.resolve({questions: [{id:'Q2', text:'Fresh question',"
+            + " detail:'', age_days: 1, refs: [], blocks: 0, recheck: null}]}); } }); }\n"
+            + _action_source()
+            + r"""
+window._drActiveTab = 'questions';
+window._drLocalContent = true;
+window._drQueueChecked = false;   // this visit has not re-checked yet
+window._drTaskCount = 0;
+window._drNoteCount = 0;
+window._drQueue = [{id: 'Q1', text: 'Stale question', detail: '', age_days: 9,
+                     refs: [], blocks: 0, recheck: null}];
+window._drQuestions = window._drQueue.slice();
+window._drQueueIndex = 0;
+
+renderTabContent();  // triggers the once-per-visit refresh, in flight
+var beforeFetchResolves = document.getElementById('dr-content').innerHTML;
+
+await new Promise(function(r) { setTimeout(r, 20); });  // let the .then() run
+var afterFetchResolves = document.getElementById('dr-content').innerHTML;
+
+console.log(JSON.stringify({ before: beforeFetchResolves, after: afterFetchResolves }));
+"""
+        )
+        result = subprocess.run(
+            [_node(), "--input-type=module", "-e", program],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"node exited {result.returncode}: {result.stderr.strip()}")
+        out = json.loads(result.stdout)
+        self.assertIn("Stale question", out["before"])
+        self.assertIn("Fresh question", out["after"],
+                       "the completed re-check changed the queue but the card never updated")
+        self.assertNotIn("Stale question", out["after"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
