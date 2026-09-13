@@ -147,6 +147,76 @@ if [ -n "$sent" ] && [ -n "$rel" ] && [ -n "$kil" ] && [ -n "$fbk" ]; then
           "yes" "$([ "$sent" -lt "$fbk" ] && echo yes || echo no)"
 fi
 
+# ── real shutdown recovery: a resolved payload, an accepted-but-still-running
+# handler, and an external TERM must reach fallback_outstanding_handlers()
+# naming the RESOLVED path, never the empty sentinel basename (kewei, #4238
+# review) — the structural checks above accept any simple `"$var"` reference,
+# including a reverted `$filename`, so only a real end-to-end run can tell a
+# correct rename from a regression that still emits the sentinel.
+RTMP="$(mktemp -d)"
+RWS="$RTMP/ws"; RINBOX="$RWS/deliveries/w-test"
+mkdir -p "$RWS/tasks" "$RINBOX" "$RWS/results"
+RPAYLOAD="$RWS/tasks/task-probe1.txt"
+printf 'id: task-probe1\naccess_tier: owner\ntask: resolve me\n' > "$RPAYLOAD"
+: > "$RINBOX/task-probe1.txt"          # the sentinel: zero bytes, by design
+
+RRESOLVER="$RTMP/resolver.sh"
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$RPAYLOAD" > "$RRESOLVER"; chmod +x "$RRESOLVER"
+
+# Accepts the probe (optional/fallback disposition), then the REAL run just
+# sleeps — never reaching HANDLER_DONE — so the task is still genuinely
+# RUNNING when the external TERM below lands, forcing the shutdown path
+# (fallback_outstanding_handlers) rather than the handler-failure path
+# (already covered by watch-tasks-stream-announce-survives-failure.test.sh).
+RHANDLER="$RTMP/handler.sh"
+cat > "$RHANDLER" << 'HEOF'
+#!/bin/sh
+for a in "$@"; do [ "$a" = "--probe" ] && exit 0; done
+sleep 30
+HEOF
+chmod +x "$RHANDLER"
+
+run_shutdown_sweep() {  # $1 = 1 to set SUTANDO_INBOX_RESOLVER, 0 to leave it unset
+    local with_resolver="$1" outfile="$RTMP/sweep-$1.out" pid i resolver_env=""
+    [ "$with_resolver" -eq 1 ] && resolver_env="$RRESOLVER"
+    : > "$outfile"
+    set -m
+    SUTANDO_INBOX_RESOLVER="$resolver_env" SUTANDO_WORKSPACE_DIR="$RWS" \
+      SUTANDO_RESULTS_DIR="$RWS/results" SUTANDO_INSTANCE="w-test-$1" \
+      SUTANDO_TASK_EVENT_HANDLER="$RHANDLER" TMPDIR="$RTMP" \
+      bash "$WATCHER" "$RINBOX" > "$outfile" 2>"$RTMP/sweep-$1.err" &
+    pid=$!
+    set +m
+    # Wait for the handler to actually be spawned and running (not merely
+    # probed) before pulling the rug — otherwise TERM can land before
+    # queue_handler_task moved the marker into running/, and the shutdown
+    # sweep would legitimately find nothing to recover.
+    for i in $(seq 1 60); do
+        [ -n "$(ls "$RTMP"/sutando-task-dispatch.*/running/ 2>/dev/null)" ] && break
+        sleep 0.1
+    done
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    grep 'TASK_FILE:' "$outfile" 2>/dev/null | tail -1
+}
+
+line_with_resolver="$(run_shutdown_sweep 1)"
+echo "  shutdown recovery, resolver configured: ${line_with_resolver:-<nothing>}"
+check "a resolver-configured shutdown recovery names the RESOLVED payload, not the sentinel" \
+      "TASK_FILE: $RPAYLOAD" "$line_with_resolver"
+
+# Control: same flow, no resolver — the announcement must be the bare
+# sentinel basename. Without this control, a test that always asserted "the
+# announcement is not the bare sentinel" would pass even if resolution were
+# silently never engaged at all.
+: > "$RINBOX/task-probe1.txt"
+line_no_resolver="$(run_shutdown_sweep 0)"
+echo "  shutdown recovery, no resolver:          ${line_no_resolver:-<nothing>}"
+check "...and with no resolver configured, the control still names the bare basename" \
+      "TASK_FILE: task-probe1.txt" "$line_no_resolver"
+
+rm -rf "$RTMP"
+
 if [ "$fail" -ne 0 ]; then
     echo "Results: FAILED"; exit 1
 fi

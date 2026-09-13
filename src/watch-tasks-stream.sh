@@ -358,7 +358,7 @@ drain_dispatch_queue() {
       "$WATCH_RUNTIME_DIR/events" \
       "$(basename "$marker")" &
     printf '%s\n' "$!" > "$worker_receipt"
-    activity_transition RUNNING "$(basename "$marker")"  # a launched handler is the task's pickup
+    activity_transition RUNNING "$task_path"  # keys on the real payload, resolved or not
     running_count=$((running_count + 1))
   done
   shopt -u nullglob
@@ -409,7 +409,9 @@ dispatch_task() {
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
-  queued_activity_row "$filename"
+  # By announce, not filename: a resolved entry's activity row must key on
+  # the real payload, never the sentinel that basename alone would resolve.
+  queued_activity_row "$announce"
   if [ -z "$DISPATCH_DIR" ]; then
     emit_dispatch_task_file "$announce"
     return

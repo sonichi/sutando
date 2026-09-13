@@ -1,9 +1,6 @@
 #!/bin/bash
-# A recipient can be woken by a sentinel whose body lives elsewhere: the entry
-# that appears in its inbox is zero bytes and the task text is in tasks/. The
-# core must not learn that mapping (it belongs to whoever wrote the sentinel),
-# so it runs a resolver it was handed — and refuses rather than dispatch an
-# entry it could not resolve. With no resolver the behaviour is unchanged.
+# A woken sentinel can be zero bytes with its real body elsewhere; the core runs
+# a resolver it was handed and refuses rather than dispatch what it can't resolve.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0; fail=0
@@ -44,10 +41,8 @@ out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 [ "$rc" = "0" ] && [ "$out" = "$PAYLOAD" ]
 check $? "a sentinel resolves to the tasks/ payload"
 
-# 2b. A relative answer is refused, not misdispatched: `-f` is checked against
-#     the CALLER's cwd, not the resolver's, so a bare relative name almost
-#     never happens to name a real file there. Fails safe, silently — the
-#     header comment says so; this pins that the refusal actually fires.
+# 2b. A relative answer is refused outright (this cwd has no matching file,
+#     so bare `-f` would refuse it by luck too — 2c below is the real trap).
 RELATIVE="$(mk relative.sh "#!/bin/sh
 cd /
 echo 'tasks/task-probe1.txt'")"
@@ -56,24 +51,28 @@ out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 [ "$rc" = "3" ] && [ -z "$out" ]
 check $? "a relative resolver answer is refused rather than misdispatched"
 
-# 2c. Bounded: a resolver that never returns must not hang the watcher.
-#     `SUTANDO_INBOX_RESOLVER_TIMEOUT=1` keeps this test itself fast; the
-#     resolver sleeps far longer, so the ONLY way this returns quickly is if
-#     the timeout actually fired.
-if command -v timeout >/dev/null 2>&1; then
-  SLOW="$(mk slow.sh "#!/bin/sh
+# 2c. The trap the bare-`-f` form misses: a relative answer that HAPPENS to
+#     name a real file in the watcher's own cwd must still be refused.
+COINCIDENCE="$(mk coincidence.sh "#!/bin/sh
+printf '%s\\n' 'coincidental-name.txt'")"
+: > "$TMP/coincidental-name.txt"
+export SUTANDO_INBOX_RESOLVER="$COINCIDENCE"
+( cd "$TMP" && out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+  [ "$rc" = "3" ] && [ -z "$out" ] )
+check $? "a relative answer that coincidentally exists in the caller's cwd is still refused"
+
+# 2c. Bounded: a resolver that never returns must not hang the watcher, on
+#     whichever branch this host takes (GNU timeout or the hand-rolled watchdog).
+SLOW="$(mk slow.sh "#!/bin/sh
 sleep 30
 printf '%s\\n' \"$PAYLOAD\"")"
-  export SUTANDO_INBOX_RESOLVER="$SLOW" SUTANDO_INBOX_RESOLVER_TIMEOUT=1
-  start=$(date +%s)
-  out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
-  elapsed=$(( $(date +%s) - start ))
-  unset SUTANDO_INBOX_RESOLVER_TIMEOUT
-  [ "$rc" = "3" ] && [ -z "$out" ] && [ "$elapsed" -lt 10 ]
-  check $? "a hanging resolver is bounded, not left to block the watcher forever (elapsed ${elapsed}s)"
-else
-  echo '  skip a hanging resolver is bounded — no timeout binary on this host'
-fi
+export SUTANDO_INBOX_RESOLVER="$SLOW" SUTANDO_INBOX_RESOLVER_TIMEOUT=1
+start=$(date +%s)
+out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+elapsed=$(( $(date +%s) - start ))
+unset SUTANDO_INBOX_RESOLVER_TIMEOUT
+[ "$rc" = "3" ] && [ -z "$out" ] && [ "$elapsed" -lt 10 ]
+check $? "a hanging resolver is bounded, not left to block the watcher forever (elapsed ${elapsed}s)"
 
 # 3. A banner ahead of the answer is not the answer — the first line must BE a
 #    file, or noise passes as a verdict.
@@ -93,11 +92,8 @@ export SUTANDO_INBOX_RESOLVER="$TMP/not-installed.sh"
 out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 [ "$rc" = "3" ] && [ -z "$out" ]; check $? "a resolver that is not executable is refused"
 
-# 7. The shipped path, not the module alone: the real watcher's initial sweep
-#    over a sentinel inbox must announce the payload's name, never the sentinel's.
-#    Same basename either way, so assert on the FILE the emitted name resolves to.
-#    `set -m` is not optional: the watcher's cleanup ends in `kill -TERM 0`, so
-#    sharing this runner's process group would kill the test that started it.
+# 7. The real watcher's initial sweep must announce the payload's name, not the
+#    sentinel's. `set -m` isolates this runner's group from the watcher's `kill -TERM 0`.
 run_sweep() {
   local resolver="${1:-}" outfile="$TMP/sweep.out" pid i
   : > "$outfile"
@@ -119,9 +115,8 @@ echo "  watcher emitted: ${line:-<nothing>}"
 [ "$line" = "TASK_FILE: $PAYLOAD" ]
 check $? "the sweep announces the payload by path, not the sentinel's name"
 
-# The assertion that makes the one above a result: a refusing resolver leaves
-# the sweep SILENT, so the emit came from resolution, not from the sentinel
-# being surfaced regardless.
+# What makes the check above meaningful: a refusing resolver leaves the sweep
+# SILENT, so the emit above came from resolution, not the sentinel regardless.
 line_refused="$(run_sweep "$GHOST")"
 echo "  with a refusing resolver: ${line_refused:-<nothing>}"
 [ -z "$line_refused" ]; check $? "an unresolvable sentinel is not surfaced to the agent at all"

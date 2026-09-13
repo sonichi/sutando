@@ -12,7 +12,7 @@
 # resolver would hang every future dispatch, not just its own.
 SUTANDO_INBOX_RESOLVER_TIMEOUT="${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}"
 resolve_inbox_entry() {
-	local entry="$1" out rc resolved
+	local entry="$1" out rc resolved not_absolute out_file resolver_pid watchdog_pid
 	if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ]; then
 		printf '%s\n' "$entry"
 		return 0
@@ -25,15 +25,34 @@ resolve_inbox_entry() {
 	# empty array raises "unbound variable" under `set -u` on bash < 4.4.
 	if command -v timeout >/dev/null 2>&1; then
 		out="$(timeout "$SUTANDO_INBOX_RESOLVER_TIMEOUT" "$SUTANDO_INBOX_RESOLVER" "$entry" 2>/dev/null)"
+		rc=$?
 	else
-		out="$("$SUTANDO_INBOX_RESOLVER" "$entry" 2>/dev/null)"
+		# No GNU timeout on this host (e.g. macOS's shipped /bin): bound it by
+		# hand, a background killer racing the resolver, so this path is not
+		# "bounded" in name only.
+		out_file="$(mktemp)"
+		"$SUTANDO_INBOX_RESOLVER" "$entry" > "$out_file" 2>/dev/null &
+		resolver_pid=$!
+		( sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT"; kill "$resolver_pid" 2>/dev/null ) &
+		watchdog_pid=$!
+		wait "$resolver_pid" 2>/dev/null
+		rc=$?
+		kill "$watchdog_pid" 2>/dev/null
+		wait "$watchdog_pid" 2>/dev/null
+		out="$(cat "$out_file" 2>/dev/null)"
+		rm -f "$out_file"
 	fi
-	rc=$?
 	# First line only, and it must BE a file: a resolver that printed a banner
 	# ahead of its answer has not answered, and must not pass as one.
 	resolved="$(printf '%s\n' "$out" | head -1)"
-	if [ "$rc" -ne 0 ] || [ -z "$resolved" ] || [ ! -f "$resolved" ]; then
-		echo "watch-tasks-stream: resolver $SUTANDO_INBOX_RESOLVER did not name an existing file for $entry (rc=$rc, first line: ${resolved:-<empty>}); not dispatching it" >&2
+	# The contract says ABSOLUTE; a relative one that happens to name a file
+	# in the watcher's own cwd would otherwise pass `-f` and misdispatch.
+	case "$resolved" in
+		/*) not_absolute=0 ;;
+		*) not_absolute=1 ;;
+	esac
+	if [ "$rc" -ne 0 ] || [ -z "$resolved" ] || [ "$not_absolute" -eq 1 ] || [ ! -f "$resolved" ]; then
+		echo "watch-tasks-stream: resolver $SUTANDO_INBOX_RESOLVER did not name an existing ABSOLUTE file for $entry (rc=$rc, first line: ${resolved:-<empty>}); not dispatching it" >&2
 		return 3
 	fi
 	printf '%s\n' "$resolved"
