@@ -177,6 +177,36 @@ class RecheckVerdict(unittest.TestCase):
         self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
         self.assertEqual(0, rows[0]["blocks"])
 
+    def test_a_should_we_deploy_question_is_not_resolved_by_the_merge_it_asks_about(self):
+        """Review, 2026-09-13 (P2, generalized beyond revert/roll-back): a merge
+        makes deploying possible, it does not answer whether to deploy."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "Should we deploy sonichi/sutando#3963?")],
+            {("sonichi/sutando", 3963): "MERGED"},
+        )
+        self.assertIsNone(rows[0]["recheck"])
+        self.assertEqual(1, rows[0]["blocks"])
+
+    def test_a_should_we_replace_question_is_not_resolved_by_the_closed_original(self):
+        """Closing the abandoned original does not answer whether a replacement
+        is needed — the exact case the review's table flagged as still wrong."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "Should we replace the abandoned fix in sonichi/sutando#3963?")],
+            {("sonichi/sutando", 3963): "CLOSED"},
+        )
+        self.assertIsNone(rows[0]["recheck"])
+        self.assertEqual(1, rows[0]["blocks"])
+
+    def test_a_should_we_question_with_no_decision_wording_still_falls_through_to_blocking(self):
+        """The generalization must not swallow every question that happens to
+        mention a PR — only ones actually phrased as a live decision."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "sonichi/sutando#3963 needs a look")],
+            {("sonichi/sutando", 3963): "MERGED"},
+        )
+        self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
+        self.assertEqual(0, rows[0]["blocks"])
+
 
 class Ranking(unittest.TestCase):
     def test_what_it_blocks_can_outrank_a_longer_wait(self):
