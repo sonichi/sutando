@@ -44,6 +44,37 @@ out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 [ "$rc" = "0" ] && [ "$out" = "$PAYLOAD" ]
 check $? "a sentinel resolves to the tasks/ payload"
 
+# 2b. A relative answer is refused, not misdispatched: `-f` is checked against
+#     the CALLER's cwd, not the resolver's, so a bare relative name almost
+#     never happens to name a real file there. Fails safe, silently — the
+#     header comment says so; this pins that the refusal actually fires.
+RELATIVE="$(mk relative.sh "#!/bin/sh
+cd /
+echo 'tasks/task-probe1.txt'")"
+export SUTANDO_INBOX_RESOLVER="$RELATIVE"
+out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+[ "$rc" = "3" ] && [ -z "$out" ]
+check $? "a relative resolver answer is refused rather than misdispatched"
+
+# 2c. Bounded: a resolver that never returns must not hang the watcher.
+#     `SUTANDO_INBOX_RESOLVER_TIMEOUT=1` keeps this test itself fast; the
+#     resolver sleeps far longer, so the ONLY way this returns quickly is if
+#     the timeout actually fired.
+if command -v timeout >/dev/null 2>&1; then
+  SLOW="$(mk slow.sh "#!/bin/sh
+sleep 30
+printf '%s\\n' \"$PAYLOAD\"")"
+  export SUTANDO_INBOX_RESOLVER="$SLOW" SUTANDO_INBOX_RESOLVER_TIMEOUT=1
+  start=$(date +%s)
+  out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  unset SUTANDO_INBOX_RESOLVER_TIMEOUT
+  [ "$rc" = "3" ] && [ -z "$out" ] && [ "$elapsed" -lt 10 ]
+  check $? "a hanging resolver is bounded, not left to block the watcher forever (elapsed ${elapsed}s)"
+else
+  echo '  skip a hanging resolver is bounded — no timeout binary on this host'
+fi
+
 # 3. A banner ahead of the answer is not the answer — the first line must BE a
 #    file, or noise passes as a verdict.
 export SUTANDO_INBOX_RESOLVER="$BANNER"
