@@ -63,6 +63,18 @@ class IngestTests(unittest.TestCase):
         [req] = self.mgr.active()
         self.assertEqual(req.device, {"id": "core-2", "name": "core-2", "socket": "/tmp/s.sock", "host": "Chis-MacBook-Pro"})
 
+    def test_the_host_is_read_once_per_requirement(self):
+        import hitl.events as E
+        calls = []
+        def once():
+            calls.append(1)
+            return "Chis-MacBook-Pro" if len(calls) == 1 else ""
+        with mock.patch.object(E, "device_host", side_effect=once):
+            self.drop("core-2-g1", event())
+            ingest(self.mgr, self.ws)
+        [req] = self.mgr.active()
+        self.assertEqual((req.device.get("host"), len(calls)), ("Chis-MacBook-Pro", 1))
+
     def test_reingest_is_idempotent(self):
         self.drop("core-2-g1", event())
         ingest(self.mgr, self.ws)

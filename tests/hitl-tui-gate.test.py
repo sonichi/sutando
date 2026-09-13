@@ -68,6 +68,17 @@ class TestRequirement(unittest.TestCase):
         with mock.patch.object(G, "device_host", return_value=""):
             self.assertNotIn("host", req("permission", PERM).device)  # unknown host: no key, not ""
 
+    def test_the_host_is_read_once_so_guard_and_value_cannot_disagree(self):
+        # Two evaluations could pass the guard and then write "" (reviewers, #4248); one call
+        # makes the no-empty-key invariant structural, and spawns scutil once per card.
+        calls = []
+        def once():
+            calls.append(1)
+            return "Chis-MacBook-Pro" if len(calls) == 1 else ""
+        with mock.patch.object(G, "device_host", side_effect=once):
+            self.assertEqual(req("permission", PERM).device.get("host"), "Chis-MacBook-Pro")
+        self.assertEqual(len(calls), 1)
+
     def test_an_unreadable_host_label_never_breaks_the_card(self):
         from hitl.host import device_host
         with mock.patch("util_paths._host_label", side_effect=RuntimeError("no scutil")):

@@ -64,8 +64,9 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
     # The session keys dedup, the jump and (with its socket) the driver's action
     # file; `host` only tells a reader which machine that is.
     device = {"id": session, "name": session, "socket": str(ev.get("socket") or "")}
-    if device_host():
-        device["host"] = device_host()
+    host = device_host()
+    if host:
+        device["host"] = host
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,

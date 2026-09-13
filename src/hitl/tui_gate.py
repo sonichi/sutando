@@ -133,8 +133,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     subject["option_for_action"] = option_for_action
     # `name` is the tmux session, identical on every host; `host` says which machine.
     device = {"id": session, "name": session}
-    if device_host():
-        device["host"] = device_host()
+    host = device_host()
+    if host:
+        device["host"] = host
     return HumanRequirement(
         kind=kind, runtime="claude", message=message, title=title,
         guard=guard_for(session, prompt, state),
