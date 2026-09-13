@@ -154,6 +154,12 @@ fi
 # The worker gate `/startup --worker` runs, named by the spawner: this launcher
 # is the core's, so it forwards the path and never knows which skill owns it.
 [ -n "${SUTANDO_WORKER_BOOTSTRAP:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKER_BOOTSTRAP=$SUTANDO_WORKER_BOOTSTRAP")
+# A worker session's cwd is the spawner's --cwd, which need not be the repo, and
+# its PATH python3 may be the CLT stub: name both absolutely from here instead.
+if [ -n "$WORKER_INSTANCE" ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+  [ -n "$PY" ] && CORE_ENV_ARGS+=(-e "SUTANDO_PY=$PY")
+fi
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
