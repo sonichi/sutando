@@ -205,3 +205,37 @@ def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable
             root = parent[root]
         trees.setdefault(root, set()).add(pid)
     return trees
+
+
+def main(argv=None) -> int:
+    """`watcher_identity.py <pid>` -> `watcher`, `not-watcher`, `dead` or
+    `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
+    so a shell adapter cannot read an unobservable `ps` as a proven answer."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 1:
+        print("usage: watcher_identity.py <pid>", file=sys.stderr)
+        return 64
+    seen = inspect_pid(args[0])
+    if not seen.observed or seen.watcher is None:
+        # An unobserved pid is two different facts: gone, or unobservable. Only
+        # the first licenses a caller to clean up after it.
+        pid = as_pid(args[0])
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print("dead")
+                print(f"why=no such process ({seen.reason})")
+                return 0
+            except Exception:  # noqa: BLE001 -- EPERM and friends: it exists, we cannot say more
+                pass
+        print("unknown")
+        print(f"why={seen.reason or 'argv could not be decided'}")
+        return 2
+    print("watcher" if seen.watcher else "not-watcher")
+    print(f"why={seen.argv}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover -- exercised as a subprocess
+    raise SystemExit(main())
