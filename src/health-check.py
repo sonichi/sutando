@@ -69,6 +69,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
@@ -1583,6 +1584,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
     "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
+    "dismissed-questions.json",  # per-host, alongside pending-questions.md
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",
@@ -3172,6 +3174,130 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
         return None          # no such remote ref (fresh clone, renamed remote)
     raw = out.stdout.strip()
     return int(raw) if raw.isdigit() else None
+
+
+def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
+                                  repo_root: "Path | None" = None) -> dict:
+    """Peer content the sync preserved and nobody merged back.
+
+    `_resolve_conflicts_keep_ours` keeps OUR side on a conflict and banks THEIRS
+    under the git dir. That happens at exit 0, and the sync cron is told to speak
+    only on failure, so the fact lands where nothing reads it. Measured on two
+    hosts the same hour: both agents read past the line while quoting other rows.
+
+    Counts the preserved files; it does NOT diff them against the live copy.
+    That diff is what `scripts/sync-conflicts-report.py` does and it costs 24s
+    over 892 MB here and over 120s on a peer -- a per-pass probe cannot run it,
+    and a probe whose only reachable arm is its timeout prints a tick forever.
+    """
+    name = "sync-conflicts-unmerged"
+    ws = Path(workspace) if workspace else resolve_workspace()
+    try:
+        # `rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+        # its parent; require the toplevel to BE the workspace, as the reporter does.
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--show-toplevel", "--git-dir"),
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or len(lines) < 2:
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git checkout — no conflict backups to read"}
+        if Path(lines[0]).resolve() != Path(ws).resolve():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git top level (git resolved {lines[0]}) — not asserting a count"}
+        gitdir = Path(lines[1])
+        if not gitdir.is_absolute():
+            gitdir = Path(ws) / gitdir
+    except Exception as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
+    root = gitdir / "sutando-sync-conflicts"
+    if not root.is_dir():
+        return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
+    try:
+        batches = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    batch_files, unreadable_dirs = _sync_conflicts_walk_batches(batches)
+    # The digest is IN the writer's key so retiring one copy cannot silence a
+    # later, DIFFERENT one at the same path; the reporter owns that identity.
+    try:
+        retired = set(json.loads((root / ".retired.json").read_text()))
+    except Exception:
+        retired = set()
+    entry_key = _sync_conflicts_entry_key()
+    if entry_key is None:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(batch_files)} peer file(s) preserved across {len(batches)} keep-ours "
+                           "batch(es); the reporter's retirement key could not be loaded, so "
+                           "retirement is UNOBSERVED here rather than assumed — run "
+                           f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
+    live, unobserved = [], []
+    for batch, f in batch_files:
+        try:
+            # errors="replace" matches the writer: a different decode is a
+            # different digest, and every copy would then read un-retired.
+            key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+        except OSError:
+            unobserved.append(f)
+            continue
+        if key not in retired:
+            live.append(f)
+    if unreadable_dirs and not live:
+        # A subtree os.walk could not list may hold live, un-retired files we
+        # structurally never enumerated -- never report clean while that holds.
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unreadable_dirs)} subdirectory read failure(s) across "
+                           f"{len(batches)} keep-ours batch(es) ({len(unobserved)} file(s) also "
+                           "unreadable) — retirement is UNOBSERVED for whatever those subtrees "
+                           "hold, not asserting clean")}
+    if not live and not unobserved:
+        return {"name": name, "status": "ok",
+                "detail": "no preserved peer files outstanding — all retired or none kept"}
+    if not live:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unobserved)} preserved peer file(s) could not be read, so their "
+                           "retirement is UNOBSERVED — not asserting they are retired")}
+    oldest = batches[0].name if batches else "?"
+    return {"name": name, "status": "warn",
+            "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, not retired — whether each is still absent from the live copy "
+                       f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_walk_batches(batches: "list[Path]") -> "tuple[list[tuple[Path, Path]], list[str]]":
+    """Enumerate files under each batch, reporting subtrees `rglob` would hide.
+
+    `Path.rglob()` swallows `OSError` when `scandir` fails on a subdirectory and
+    silently treats it as empty rather than raising -- a permission-denied
+    subtree then reads as "no files here" instead of "unreadable", which is how
+    a batch holding live, un-retired content could report a clean verdict.
+    `os.walk`'s `onerror` hook is what makes that failure visible.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    unreadable: list[str] = []
+    for batch in batches:
+        for dirpath, _dirnames, filenames in os.walk(
+                str(batch), onerror=lambda exc: unreadable.append(str(exc))):
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_file():
+                    pairs.append((batch, p))
+    pairs.sort(key=lambda bf: (bf[0].name, bf[1]))
+    return pairs, unreadable
+
+
+def _sync_conflicts_entry_key():
+    """The reporter OWNS retirement identity; a second spelling here would drift."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync-conflicts-report.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_sync_conflicts_report", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._entry_key
+    except Exception:
+        return None
 
 
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
@@ -8573,43 +8699,9 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
     return None
 
 
-def _proc_argv_vector(pid: int) -> "list[str] | None":
-    """Real argv of `pid` as a LIST, or None when no authoritative read exists.
-
-    A flattened argv cannot separate an operand containing a space from two
-    operands, so the executed script is not recoverable from it by any rule.
-    """
-    try:  # linux: NUL-delimited, authoritative
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        if raw:
-            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
-    except Exception:  # noqa: BLE001 -- not linux, or gone
-        pass
-    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-        size = ctypes.c_size_t(262144)
-        buf = ctypes.create_string_buffer(size.value)
-        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None
-        data = buf.raw[:size.value]
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        parts = data[4:].split(b"\0")
-        i = 0
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += 1                                   # the exec path
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        out = []
-        while i < len(parts) and len(out) < argc:
-            out.append(parts[i].decode("utf8", "replace"))
-            i += 1
-        return out or None
-    except Exception:  # noqa: BLE001 -- probe failure must not fail the check
-        return None
+# Module-level names, looked up at call time: the suites that fabricate pids
+# rebind these here, and the wrappers below must see what they bound.
+_proc_argv_vector = watcher_identity.proc_argv_vector
 
 
 def _proc_argv(pid: int) -> str:
@@ -8698,59 +8790,10 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
-# The argv must BE the script invocation, not merely mention it. A substring
-# test counts the observer: any shell whose command line contains the name —
-# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
-# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
-# match reported 3 trees where 2 were real, the phantom being the shell that
-# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
-# fix is to anchor on the whole command rather than search inside it.
-_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
-
-
-# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
-# and a mention inside a longer word cannot match.
-_WATCHER_SCRIPT_NAME = "watch-tasks-stream.sh"
-_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
-
-
-def _as_pid(tok: str) -> "int | None":
-    try:
-        return int(tok)
-    except (TypeError, ValueError):
-        return None
-
-
 def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     """True/False from the EXECUTED script; None when nothing can prove it.
-
-    Callers disagree on what None should mean, which is why this is tri-state:
-    over-counting a watcher costs delayed tasks, publishing a wrong pid costs a
-    killed stranger.
-    """
-    vec = _proc_argv_vector(pid) if pid is not None else None
-    if vec is not None and len(vec) >= 2:
-        if vec[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-            return False
-        if vec[1].startswith("-"):
-            return False
-        return os.path.basename(vec[1]) == _WATCHER_SCRIPT_NAME
-    parts = argv.split()
-    if len(parts) < 2:
-        return False
-    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-        return False
-    if parts[1].startswith("-"):
-        return False
-    # Authoritative only when argv ends at parts[1]: with more tokens the real
-    # pathname may continue past a space and end in a different name.
-    if _WATCHER_SCRIPT.search(parts[1]) is not None:
-        return True if len(parts) == 2 else None
-    if len(parts) == 2:
-        return False
-    # Only a later token matches, and a spaced script path is the same string as a
-    # script plus arguments -- nothing here can decide between them.
-    return None if _WATCHER_SCRIPT.search(argv) else False
+    The policy is `watcher_identity`; this binds it to the argv reader above."""
+    return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
 # Read from the module that defines the precedence; a copy here is how this
@@ -8865,27 +8908,8 @@ def _group_roots_by_target(state_dir, roots):
 
 
 def _ps_watcher_index(ps_output: str) -> tuple:
-    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
-
-    Both the tree walk and the ownership split need this; two parses could
-    disagree about a process that exited between them.
-    """
-    me = str(os.getpid())
-    parent: dict = {}
-    live: set = set()
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        live.add(parts[0])
-        if parts[0] == me:
-            continue
-        # None is UNKNOWN: count it, because a missed watcher starts a second
-        # one and every task is then processed twice.
-        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
-            continue
-        parent[parts[0]] = parts[1]
-    return parent, live
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse."""
+    return watcher_identity.ps_watcher_index(ps_output, is_watcher=_is_watcher_argv)
 
 
 def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
@@ -8906,34 +8930,9 @@ def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
-    """Map root PID -> set of PIDs for each distinct watcher TREE running.
-
-    Each watcher is several processes (a shell wrapper, the script, a
-    subshell), so counting matching lines overcounts. A "root" is a match
-    whose parent is not itself a match — one per independent watcher. Callers
-    need the whole tree, not just the root, to tell which tree owns the
-    sentinel PID (the sentinel records the script's PID, not the wrapper's).
-
-    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
-    the reason in _proc_argv: pgrep would match the caller. Our own argv is
-    the health-check invocation, but we drop it explicitly anyway.
-    """
-    if ps_output is None:
-        try:
-            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                                       capture_output=True, text=True,
-                                       timeout=5).stdout
-        except Exception:  # noqa: BLE001
-            return {}
-    parent, _live = _ps_watcher_index(ps_output)
-    trees: dict = {}
-    for pid in parent:
-        root, seen = pid, set()
-        while parent.get(root) in parent and root not in seen:
-            seen.add(root)
-            root = parent[root]
-        trees.setdefault(root, set()).add(pid)
-    return trees
+    """Root PID -> member PIDs per distinct watcher TREE; None runs `ps`.
+    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`."""
+    return watcher_identity.watcher_trees(ps_output, is_watcher=_is_watcher_argv)
 
 
 def extras_present(trees, live) -> bool:
@@ -12516,6 +12515,7 @@ def run_all_checks() -> list[dict]:
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
     checks.append(check_skills_driver_code_drift())
+    checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
