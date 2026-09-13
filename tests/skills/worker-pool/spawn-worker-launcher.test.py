@@ -514,7 +514,7 @@ class TestBootstrapSeam(Base):
         self.assertNotIn("skills/worker-pool", skill)
         # The scan is live: the core launcher's own suite reaches this skill by
         # path on purpose, and the same needle finds it there.
-        control = REPO / "tests" / "start-cli-worker-env-forwarded.test.sh"
+        control = REPO / "tests" / "skills" / "worker-pool" / "start-cli-worker-env-forwarded.test.sh"
         self.assertIn("skills/worker-pool", control.read_text(encoding="utf-8"))
 
 
