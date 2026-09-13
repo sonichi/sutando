@@ -294,6 +294,45 @@ fi
 kill "$live9" 2>/dev/null; wait "$live9" 2>/dev/null
 
 
+# --- case 10: a watcher that does not exit on TERM must not be left running ---
+# kewei on #4230: `kill ... || true` swallowed the signal's outcome and the
+# release ran unconditionally, so a watcher that ignores TERM stayed ALIVE with
+# its sentinel gone — and the next bootstrap, seeing none, starts a SECOND one.
+# `trap '' TERM` is not exotic here: bash also DEFERS a TERM trap until the
+# foreground child returns, which is the shape case 2's own fixture has.
+mkdir -p "$TMP/fakebin10"
+cat > "$TMP/fakebin10/watch-tasks-stream.sh" << 'SH'
+#!/bin/bash
+trap '' TERM
+sleep 30
+SH
+chmod +x "$TMP/fakebin10/watch-tasks-stream.sh"
+bash "$TMP/fakebin10/watch-tasks-stream.sh" &
+live10=$!
+f="$TMP/case10.pid"
+echo "$live10" > "$f"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps -p "$live10" -o args= 2>/dev/null | grep -q watch-tasks-stream && break
+  sleep 0.1
+done
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+# The discriminator is ALIVE-vs-DEAD: pre-fix this pid survived while its
+# sentinel was released and success was printed anyway.
+if ! kill -0 "$live10" 2>/dev/null; then
+  ok "watcher ignoring TERM: escalated until actually gone"
+else
+  bad "watcher ignoring TERM: escalated until actually gone" \
+      "still running after the reap, so the release below was unverified ($out)"
+fi
+if kill -0 "$live10" 2>/dev/null && [ ! -f "$f" ]; then
+  bad "watcher ignoring TERM: no sentinel released while alive" \
+      "sentinel gone while the watcher runs — untracked watcher ($out)"
+else
+  ok "watcher ignoring TERM: no sentinel released while alive"
+fi
+kill -KILL "$live10" 2>/dev/null; wait "$live10" 2>/dev/null
+
+
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"
   exit 0

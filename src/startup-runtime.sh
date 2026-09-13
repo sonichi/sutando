@@ -386,7 +386,25 @@ reap_stale_task_watcher() {
       echo "  ⚠ pid $stale_pid is a watcher but its ownership of the sentinel is UNMEASURABLE; leaving both alone"
       return 0
     fi
-    kill "$stale_pid" 2>/dev/null || true
+    # Releasing the sentinel while the watcher still runs strands it untracked,
+    # so escalate like the voice takeover above and confirm death before release.
+    local _reap_rc=0 _reap_i
+    kill "$stale_pid" 2>/dev/null || _reap_rc=$?
+    for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$stale_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$stale_pid" 2>/dev/null; then
+      kill -KILL "$stale_pid" 2>/dev/null || _reap_rc=$?
+      for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$stale_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+    if kill -0 "$stale_pid" 2>/dev/null; then
+      echo "  ⚠ pid $stale_pid survived TERM and KILL (last signal rc $_reap_rc) — leaving its sentinel in place so the live watcher stays tracked"
+      return 0
+    fi
     echo "  ✓ reaped stale watch-tasks-stream watcher (pid $stale_pid)"
   fi
 
