@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines, active_text, python_args  # noqa: E402
+from active_code import active_lines, active_text, python_args, program_python_args  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
@@ -92,9 +92,14 @@ def named_in_workflows():
     caller in either direction."""
     named = set()
     for wf in (REPO / ".github" / "workflows").glob("*.yml"):
-        for ln in active_lines("\n".join(_run_bodies(wf.read_text()))):
-            named.update(python_args(ln))
+        named.update(_named_in(wf.read_text()))
     return named
+
+
+def _named_in(workflow_text: str) -> set:
+    """One workflow's actively-invoked scripts: run bodies scanned as ONE program,
+    so a `false &&` guard survives the line break it sits on."""
+    return set(program_python_args("\n".join(_run_bodies(workflow_text))))
 
 
 def test_looking_files():
@@ -158,6 +163,32 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])
+
+
+class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
+    """keweichen's [P2] on #4202 (third round): per-line scanning of run bodies,
+    and the two YAML repairs that no test pinned -- each case below is one
+    in-memory mutation he ran that stayed green."""
+
+    def test_a_guard_at_the_end_of_a_line_still_guards_the_next_line(self):
+        wf = "steps:\n  - run: |\n      false &&\n        python3 packages/x/test_dead.py || true\n"
+        self.assertEqual(_named_in(wf), set())
+
+    def test_a_wholly_quoted_run_scalar_names_its_real_call(self):
+        # Drop the _yaml_scalar() unwrap and the shell-quote blanking swallows this.
+        wf = "steps:\n  - run: \"python3 packages/x/test_real.py\"\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_a_sibling_env_block_is_not_a_run_body(self):
+        # Key-column indent: `env:` sits at the key's column, and its block-scalar
+        # value is a bare invocation -- the line a dash-based indent would swallow.
+        wf = ("steps:\n  - run: |\n      python3 packages/x/test_real.py\n"
+              "    env:\n      CMD: |\n        python3 packages/x/test_inert.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_an_attached_dash_c_does_not_name_its_argument(self):
+        wf = "steps:\n  - run: python3 -cpass packages/x/test_dead.py\n"
+        self.assertEqual(_named_in(wf), set())
 
 
 if __name__ == "__main__":

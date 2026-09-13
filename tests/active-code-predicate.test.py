@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines, invokes, python_args, unquoted  # noqa: E402
+from active_code import active_lines, invokes, python_args, unquoted, program_invokes, program_python_args  # noqa: E402
 
 NAME = "discover-python-tests.sh"
 
@@ -124,6 +124,36 @@ class ConditionalOperators(unittest.TestCase):
         self.assertTrue(invokes(f"bash scripts/{NAME} &", NAME))
 
 
+class MultiLinePrograms(unittest.TestCase):
+    """keweichen's third [P2] on #4202: the AND-OR state `_segments()` tracks
+    ended at each physical line, so `false &&` on one line never guarded the
+    command on the next. Program-level scanning keeps it across the break."""
+
+    def test_a_guard_at_the_end_of_a_line_guards_the_next_line(self):
+        self.assertFalse(program_invokes(f": > files\nfalse &&\n  bash scripts/{NAME} > files || true\n", NAME))
+        self.assertEqual(program_python_args("false &&\n  python3 packages/x/test_dead.py || true\n"), [])
+
+    def test_a_newline_ends_an_unguarded_command_like_a_semicolon(self):
+        self.assertTrue(program_invokes(f": > files\nbash scripts/{NAME} > files\n", NAME))
+        self.assertEqual(program_python_args("echo hi\npython3 x/test_real.py\n"), ["x/test_real.py"])
+
+    def test_a_guard_does_not_leak_past_the_line_it_closed_on(self):
+        """`false && echo no` is complete on its line; the next line is unconditional."""
+        self.assertTrue(program_invokes(f"false && echo no\nbash scripts/{NAME}\n", NAME))
+
+    def test_a_backslash_continuation_is_one_logical_line(self):
+        self.assertFalse(program_invokes(f"false && \\\n  bash scripts/{NAME}\n", NAME))
+
+    def test_a_comment_line_inside_a_program_is_not_a_command(self):
+        self.assertFalse(program_invokes(f"false &&\n  # bash scripts/{NAME}\n", NAME))
+
+    def test_the_single_line_forms_agree_with_the_program_forms(self):
+        line = f"echo hi; false && echo no; bash scripts/{NAME}"
+        self.assertEqual(invokes(line, NAME), program_invokes(line, NAME))
+        self.assertEqual(python_args("python3 x/a.py; false && python3 x/b.py"),
+                         program_python_args("python3 x/a.py; false && python3 x/b.py"))
+
+
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
     `-c`/`-m` is the script's OWN argv, not something python loads."""
@@ -133,6 +163,16 @@ class PythonArgsScriptOperand(unittest.TestCase):
 
     def test_a_dash_m_argument_is_not_named(self):
         self.assertEqual(python_args("python3 -m mymod packages/x/test_argv.py"), [])
+
+    def test_an_attached_dash_c_is_still_dash_c(self):
+        """Python accepts `-cpass`; the flag is the letter, not the token."""
+        self.assertEqual(python_args("python3 -cpass packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 -mmymod packages/x/test_argv.py"), [])
+
+    def test_a_clustered_short_option_carrying_c_is_dash_c(self):
+        self.assertEqual(python_args("python3 -uc 'pass' packages/x/test_dead.py"), [])
+        # A cluster WITHOUT c/m still leaves the script operand in place.
+        self.assertEqual(python_args("python3 -uB packages/x/test_real.py"), ["packages/x/test_real.py"])
 
     def test_only_the_first_dot_py_token_is_named(self):
         """An argument to the real script that happens to end in .py is not

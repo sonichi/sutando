@@ -101,19 +101,61 @@ def _command_tokens(seg: str) -> list[str]:
     return toks
 
 
+def _consumes_script(tok: str) -> bool:
+    """A short-option token that carries `c` or `m` has no script operand.
+
+    `-c` and `-m` take the REST of the command line, and Python lets them be
+    attached (`-cpass`) or clustered (`-uc code`), so the flag is any letter in
+    the cluster, not the whole token (measured: `python3 -cpass x/test_dead.py`
+    returned 0 without executing the file and was still credited)."""
+    if not tok.startswith("-") or tok.startswith("--") or tok == "-":
+        return False
+    for ch in tok[1:]:
+        if ch in "cm":
+            return True
+        if not ch.isalpha():
+            break
+    return False
+
+
+def _segment_invokes(seg: str, name: str) -> bool:
+    toks = _command_tokens(seg)
+    if toks and toks[0] in ("bash", "sh", "source", ".") and len(toks) > 1:
+        toks = toks[1:]
+    return bool(toks) and toks[0].split("/")[-1] == name
+
+
+def _segment_python_arg(seg: str):
+    toks = _command_tokens(seg)
+    if not toks or toks[0] not in ("python3", "python"):
+        return None
+    rest = toks[1:]
+    i = 0
+    while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
+        if _consumes_script(rest[i]):
+            return None  # no script operand exists in this shape
+        i += 1
+    if i < len(rest) and rest[i].endswith(".py"):
+        return rest[i]
+    return None
+
+
 def invokes(line: str, name: str) -> bool:
     """True when `name` runs in COMMAND position on this line.
 
     Position, not presence: `echo "x.sh"` has the name as an ARGUMENT, an
-    assignment `T=x.sh` runs nothing, and `not-x.sh` merely ends with it."""
-    code = _strip_comment(line)
-    for seg in _segments(code):
-        toks = _command_tokens(seg)
-        if toks and toks[0] in ("bash", "sh", "source", ".") and len(toks) > 1:
-            toks = toks[1:]
-        if toks and toks[0].split("/")[-1] == name:
-            return True
-    return False
+    assignment `T=x.sh` runs nothing, and `not-x.sh` merely ends with it.
+    One physical line: a program spanning lines needs program_invokes()."""
+    return any(_segment_invokes(seg, name) for seg in _segments(_strip_comment(line)))
+
+
+def program_invokes(text: str, name: str) -> bool:
+    """invokes() over a WHOLE program, so AND-OR state survives line breaks.
+
+    `false &&` at the end of one line guards the command on the next; scanning
+    the lines one at a time credited that command (measured: both real
+    consumers did, and Bash returned 0 with the planted test never run)."""
+    return any(_segment_invokes(seg, name) for seg in _segments(active_text(text)))
 
 
 def python_args(line: str) -> list[str]:
@@ -126,22 +168,23 @@ def python_args(line: str) -> list[str]:
     test_argv.py as invoked). Only the first non-flag token counts as the
     script, so a later `.py`-looking argument is never credited either.
     `echo python3 x.py` names x.py as an ARGUMENT to echo, not a caller —
-    same position discipline as `invokes()`, extracting instead of testing."""
-    code = _strip_comment(line)
+    same position discipline as `invokes()`, extracting instead of testing.
+    One physical line: a program spanning lines needs program_python_args()."""
     out = []
-    for seg in _segments(code):
-        toks = _command_tokens(seg)
-        if not toks or toks[0] not in ("python3", "python"):
-            continue
-        rest = toks[1:]
-        i = 0
-        while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
-            if rest[i] in ("-c", "-m"):
-                i = len(rest)  # no script operand exists in this shape
-                break
-            i += 1
-        if i < len(rest) and rest[i].endswith(".py"):
-            out.append(rest[i])
+    for seg in _segments(_strip_comment(line)):
+        a = _segment_python_arg(seg)
+        if a:
+            out.append(a)
+    return out
+
+
+def program_python_args(text: str) -> list[str]:
+    """python_args() over a WHOLE program; see program_invokes()."""
+    out = []
+    for seg in _segments(active_text(text)):
+        a = _segment_python_arg(seg)
+        if a:
+            out.append(a)
     return out
 
 
@@ -158,7 +201,11 @@ def _segments(line: str):
     the conditional run, so what follows it is unconditional again.
 
     Inside single quotes nothing is special, backslash included: `'a\\'`
-    is a 2-char literal, not an escaped, still-open quote."""
+    is a 2-char literal, not an escaped, still-open quote.
+
+    Multi-line input is one program: an unquoted newline ends an open command
+    the way `;` does, but a line that ended right after `&&`/`||` leaves the
+    next line's command under that guard, and backslash-newline joins."""
     out, cur, quote, i, conditional = [], [], None, 0, False
 
     def flush():
@@ -171,8 +218,14 @@ def _segments(line: str):
     while i < len(line):
         ch = line[i]
         nxt = line[i + 1] if i + 1 < len(line) else ""
+        if ch == "\\" and quote != "'" and nxt == "\n":
+            i += 2; continue  # line continuation: one logical line
         if ch == "\\" and quote != "'" and i + 1 < len(line):
             cur.append(ch); cur.append(line[i + 1]); i += 2; continue
+        if ch == "\n" and not quote:
+            if "".join(cur).strip():
+                flush(); conditional = False
+            i += 1; continue
         if quote:
             cur.append(ch)
             if ch == quote:

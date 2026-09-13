@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from active_code import active_lines, invokes  # noqa: E402
+from active_code import active_lines, invokes, program_invokes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
@@ -59,7 +59,9 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
             self.assertTrue(active,
                             f"{r.name} names {DISCOVER.name} only in a comment (or not at all) — "
                             "a named-but-uncalled helper leaves the runner discovering nothing")
-            self.assertTrue(any(invokes(ln, DISCOVER.name) for ln in active),
+            # The WHOLE program, not a line at a time: `false &&` at the end of
+            # one line guards the call on the next, and a per-line scan credited it.
+            self.assertTrue(program_invokes(_shell_text(r), DISCOVER.name),
                             f"{r.name} mentions {DISCOVER.name} outside a comment but never "
                             f"runs it in command position: {active}")
 
@@ -198,6 +200,15 @@ class TestAdjacentGuardDefects(unittest.TestCase):
                          "a quoted path read as an invocation")
         self.assertNotIn("packages/x/test_nameonly.py", named,
                          "a path under name: is data, not a command")
+
+    def test_a_call_guarded_across_a_line_break_is_not_an_active_caller(self):
+        """keweichen's third [P2] on #4202: the shell state that `&&` opens at the
+        end of one line was lost at the physical line boundary, so both real
+        consumers credited a call Bash never reaches."""
+        program = f": > files\nfalse &&\n  bash scripts/{DISCOVER.name} > files || true\n"
+        self.assertFalse(program_invokes(program, DISCOVER.name))
+        # The same helper, unguarded on its own line, still counts.
+        self.assertTrue(program_invokes(f": > files\nbash scripts/{DISCOVER.name} > files\n", DISCOVER.name))
 
     def test_a_commented_invocation_is_not_an_active_caller(self):
         """Drives named_in_workflows() over a real workflow file on disk."""
