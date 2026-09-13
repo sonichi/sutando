@@ -134,6 +134,50 @@ body: {
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
+### `POST /v1/workers` *(optional)*
+
+The worker pool this gateway fronts, pushed when the local advertisement's
+content changes and re-sent every 600 s so a relay that restarted with an empty
+copy heals without an operator. Sent only when the gateway finds a readable
+advertisement; a gateway with no pool never calls it.
+
+```
+body: {
+  "roster_version": <int>,           // monotonic per publisher
+  "live_cores": ["<worker id>", …],  // ids currently serving
+  "dead_cores": ["<worker id>", …],
+  "bindings": { "<room id>": "<worker id>" },  // rooms the owner pinned
+  "ts": <unix seconds>               // when the publisher compiled it
+}
+success: 2xx, body ignored
+```
+
+### `PUT /v1/agents/<mxid>/profile` *(optional)*
+
+The instance's identity card, pushed on the same change signal and cadence as
+the workers snapshot, from the same single read, so the two can never describe
+different revisions. `<mxid>` is percent-encoded as one path segment.
+
+```
+body: {
+  "display": { "name": "<display name>" },
+  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
+             // label always; runtime when the publisher knows it
+}
+success: 2xx, body ignored
+```
+
+The broker REPLACES the profile document, so the gateway sends this only from
+an advertisement it could read in full.
+
+**Unsupported is not an error.** A relay that does not implement either route
+answers `404`, `405` or `501`; the gateway logs once and stops trying for an
+hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
+Neither call can fail the task loop, and both run AFTER the beat's durable
+retries so an optional push never delays an owner-approved publication or the
+next `/v1/tasks` poll.
+
 ## Media markers (optional)
 
 Instead of raw bytes, a gateway may hand the task body a media marker:

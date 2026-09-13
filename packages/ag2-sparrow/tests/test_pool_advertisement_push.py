@@ -205,19 +205,22 @@ def test_a_non_dict_workers_value_is_ignored():
         print("PASS test_a_non_dict_workers_value_is_ignored")
 
 
-class _ReadRaises:
-    """A stand-in for the advertisement path whose read fails the way a
-    parser does: the exception the loop must survive is not an OSError."""
-    name = "pool-advertisement.json"
+class _ParserRaises:
+    """The json module as the reader sees it, with `loads` failing the way a
+    decoder does. Injected at the seam the SHIPPED reader calls (kewei on
+    #4216: a stand-in for the path object is never touched, because the reader
+    opens `str(path)` and reads bytes from the descriptor)."""
 
-    def __init__(self, exc):
-        self._exc = exc
+    def __init__(self, real, exc):
+        self._real, self._exc = real, exc
+        self.loads_calls = 0
 
-    def stat(self):
-        return os.stat_result((0o100644, 0, 0, 1, 0, 0, 64, 0, 0, 0))
-
-    def read_text(self):
+    def loads(self, *a, **k):
+        self.loads_calls += 1
         raise self._exc
+
+    def dumps(self, *a, **k):
+        return self._real.dumps(*a, **k)
 
 
 def test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll():
@@ -243,14 +246,21 @@ def test_a_parser_failure_of_any_kind_is_unavailable_not_a_stalled_poll():
             assert calls[0][2] == rec["workers"], "the unknown key ships nothing"
         n = len(calls)
 
-        real_path = m._POOL_ADVERTISEMENT_FILE
-        m._POOL_ADVERTISEMENT_FILE = _ReadRaises(RecursionError("maximum recursion depth exceeded"))
-        assert m._read_pool_advertisement() == ("", None), "the UNAVAILABLE sentinel"
-        assert m._maybe_push_workers_snapshot(m._advertisement_or_none()) is False
-        assert m._maybe_push_agent_profile(m._advertisement_or_none()) is False
+        # A readable file whose DECODE fails: the seam is json.loads, the only
+        # place the reader can raise something that is not an OSError.
+        _advertise(m, _record(1))
+        real_json = m.json
+        boom = _ParserRaises(real_json, RecursionError("maximum recursion depth exceeded"))
+        m.json = boom
+        try:
+            assert m._read_pool_advertisement() == ("", None), "the UNAVAILABLE sentinel"
+            assert m._maybe_push_workers_snapshot(m._advertisement_or_none()) is False
+            assert m._maybe_push_agent_profile(m._advertisement_or_none()) is False
+        finally:
+            m.json = real_json
+        assert boom.loads_calls >= 1, "the injected parser seam was never reached"
         assert len(calls) == n, "a parser failure issues no request"
 
-        m._POOL_ADVERTISEMENT_FILE = real_path
         rec = _record(2)
         rec["profile_workers"][W1]["label"] = "after"
         _advertise(m, rec, age=5)
@@ -445,6 +455,19 @@ def test_the_production_loop_calls_both_relays():
     beats = calls.count("_post_heartbeat")
     assert beats >= 1, "no heartbeat in main()"
     assert calls.count("_push_pool_advertisement") >= beats, calls
+    # Each retry's FIRST call precedes the first push, so two optional 15 s
+    # requests cannot delay an owner-approved publication.
+    watched = ("_push_pool_advertisement", "_retry_pending_publications",
+               "_retry_review_card_resolutions", "_retry_review_control_results")
+    lines = {}
+    for n in ast.walk(main_fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in watched:
+            lines.setdefault(n.func.id, []).append(n.lineno)
+    first_push = min(lines["_push_pool_advertisement"])
+    for name in watched[1:]:
+        assert name in lines, f"{name} is not called in main()"
+        assert min(lines[name]) < first_push, (
+            f"{name} first runs at {min(lines[name])}, after the advertisement push at {first_push}")
     # and never the two pushers separately: that is the two-reads shape
     assert calls.count("_maybe_push_workers_snapshot") == 0 and calls.count("_maybe_push_agent_profile") == 0, calls
 
@@ -542,22 +565,56 @@ def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
         print("PASS test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop")
 
 
+class _StaleStatPath:
+    """The advertisement path as a two-lookup reader sees it: `stat()` answers
+    from a stale, small observation while the pathname names the oversized file
+    the read would actually get. A reader that sizes the file with a SEPARATE
+    lookup (`path.stat()` then `path.read_text()`) accepts the record; a reader
+    that opens once and bounds the bytes it reads refuses it."""
+
+    def __init__(self, real: pathlib.Path):
+        self._real = real
+        self.name = real.name
+
+    def __fspath__(self):
+        return str(self._real)
+
+    def __str__(self):
+        return str(self._real)
+
+    def exists(self):
+        return self._real.exists()
+
+    def stat(self):
+        st = self._real.stat()
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                               st.st_gid, 1, st.st_atime, st.st_mtime, st.st_ctime))
+
+    def read_text(self, *a, **k):
+        return self._real.read_text(*a, **k)
+
+
 def test_a_record_that_grows_after_a_small_stat_is_still_bounded():
-    """Mutation control for the two-lookup race: the bound is enforced on the
-    bytes read, so a file replaced between a one-byte stat and the read cannot
-    slip an oversized record past the guard."""
+    """Mutation control for the two-lookup race (kewei on #4216: the earlier
+    version patched os.fstat, which the buggy implementation never called, so
+    it passed before the fix as well). The size a separate lookup reported can
+    be stale by the time the bytes arrive, so the bound is enforced on the
+    bytes actually read: this FAILS on the stat()-then-read_text() reader and
+    passes here."""
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
         big = _record(1)
         big["pad"] = "x" * m._POOL_ADVERTISEMENT_MAX_BYTES
         _advertise(m, big)
-        # Prove the guard is on the read: a stat that lied small would not help.
-        real_fstat = os.fstat
-        os.fstat = lambda fd: type("st", (), {"st_mode": real_fstat(fd).st_mode, "st_size": 1})()
+        real_path = m._POOL_ADVERTISEMENT_FILE
+        assert real_path.stat().st_size > m._POOL_ADVERTISEMENT_MAX_BYTES, "the file is oversized"
+        m._POOL_ADVERTISEMENT_FILE = _StaleStatPath(real_path)
         try:
-            assert m._read_pool_advertisement() == ("", None)
+            assert m._POOL_ADVERTISEMENT_FILE.stat().st_size == 1, "the stale lookup lies small"
+            assert m._read_pool_advertisement() == ("", None), (
+                "an oversized record passed a stale small stat: the bound is not on the read")
         finally:
-            os.fstat = real_fstat
+            m._POOL_ADVERTISEMENT_FILE = real_path
         _advertise(m, _record(2), age=5)
         assert m._read_pool_advertisement()[1] is not None, "positive control"
         print("PASS test_a_record_that_grows_after_a_small_stat_is_still_bounded")

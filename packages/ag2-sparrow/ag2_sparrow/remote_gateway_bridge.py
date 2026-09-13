@@ -3146,10 +3146,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f == "picker_command":
-            # Stamped is stamped: an EMPTY command must reach the parser as a
-            # refused stamp, not vanish and let the prose decide the intent.
-            if f in task and task[f] is not None:
-                lines.append(f"picker_command: {_one_line(task[f])}")
+            # Present but unusable (empty OR null) reaches the parser as a
+            # refused stamp; dropping it lets prose decide an unstamped action.
+            if f in task:
+                _pc = task[f]
+                lines.append(f"picker_command: {'' if _pc is None else _one_line(_pc)}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
             # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
@@ -4473,12 +4474,12 @@ def main() -> None:
                     _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
-            # The pool's advertisement rides the same beat: push-on-change, never
-            # raising, so a broker without the endpoints costs one deferred log.
-            _push_pool_advertisement()
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
+            # LAST of the beat's work: two optional 15 s requests must never
+            # delay an owner-approved publication or the next task poll.
+            _push_pool_advertisement()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()

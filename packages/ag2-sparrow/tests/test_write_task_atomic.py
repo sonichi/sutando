@@ -178,6 +178,46 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
 
 
+def test_a_present_but_unusable_picker_stamp_is_written_as_refused():
+    """kewei on #4216: `picker_command: null` is PRESENT and unusable. Dropping
+    it let the reader fall through to the legacy prose sentence and act on an
+    intent nobody stamped; docs/remote-gateway-protocol.md says an unusable
+    stamp is refused. Absent stays absent; present-null and present-empty both
+    reach the reader as the refused stamp."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        sentence = "Add a new worker to the pool (worker picker '+' button): grow the pool."
+
+        def body(tid, **extra):
+            t = {**_task(tid), "task": sentence, "source": "worker-picker", **extra}
+            assert m._write_task(t) is not None, "the writer refused the task itself"
+            return (pathlib.Path(d) / "tasks" / f"{tid}.txt").read_text()
+
+        absent = body("task-1784500000001")
+        assert "picker_command:" not in absent, "an absent stamp must not be invented"
+
+        for tid, value, label in (("task-1784500000002", None, "null"),
+                                  ("task-1784500000003", "", "empty")):
+            text = body(tid, picker_command=value)
+            assert "picker_command: \n" in text or text.rstrip().endswith("picker_command:"), (
+                f"a present-{label} stamp must be written as the refused stamp, got: "
+                f"{[l for l in text.splitlines() if l.startswith('picker_command')]}")
+
+        # And the reader agrees: the refused stamp is not an action.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "wpc", pathlib.Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts/worker_picker_commands.py")
+        if spec and spec.loader and spec.origin and pathlib.Path(spec.origin).exists():
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
+            wpc = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(wpc)
+            refused = wpc.parse({"source": "worker-picker", "channel_id": "!r:x",
+                                 "picker_command": ""}, sentence)
+            assert refused is None or refused.get("action") != "add", (
+                f"the refused stamp still produced an action: {refused}")
+        print("PASS test_a_present_but_unusable_picker_stamp_is_written_as_refused")
+
+
 if __name__ == "__main__":
     test_write_task_publishes_atomically_and_completely()
     test_write_task_never_leaves_partial_file_on_publish_crash()
@@ -185,4 +225,5 @@ if __name__ == "__main__":
     test_write_task_does_not_reexecute_a_completed_task()
     test_write_task_drops_unsafe_and_idless()
     test_write_task_shell_quotes_channel_id_in_skill_instructions()
+    test_a_present_but_unusable_picker_stamp_is_written_as_refused()
     print("ALL PASS test_write_task_atomic")
