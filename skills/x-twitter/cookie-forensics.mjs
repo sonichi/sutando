@@ -39,35 +39,45 @@ export function isClearing(setCookieLine) {
 export function attachCookieForensics(ctx, logPath) {
   let cleared = 0;
 
-  ctx.cookies().then((cs) => {
-    write(logPath, {
-      event: 'launch',
-      auth_present: cs.filter((c) => AUTH.includes(c.name)).map((c) => c.name).sort(),
-      total_cookies: cs.length,
-    });
-  }).catch(() => {});
+  // Both calls below are synchronous and throw immediately on a `ctx` that
+  // does not implement the full BrowserContext surface (a real Playwright
+  // context always does; a lightweight test double need not). A throw here
+  // is not caught by a chained .catch() -- the exception fires before the
+  // chain method even returns -- so it would otherwise crash the caller,
+  // which is exactly what this module exists to never do.
+  try {
+    ctx.cookies().then((cs) => {
+      write(logPath, {
+        event: 'launch',
+        auth_present: cs.filter((c) => AUTH.includes(c.name)).map((c) => c.name).sort(),
+        total_cookies: cs.length,
+      });
+    }).catch(() => {});
+  } catch { /* forensics must never break a publish */ }
 
-  ctx.on('response', async (res) => {
-    let headers;
-    try { headers = await res.headersArray(); } catch { return; }
-    for (const h of headers) {
-      if (h.name.toLowerCase() !== 'set-cookie') continue;
-      // headersArray keeps repeated Set-Cookie separate; a merged value would
-      // hide all but the first, which is the one case that matters here.
-      for (const line of h.value.split('\n')) {
-        const hit = isClearing(line);
-        if (!hit) continue;
-        cleared++;
-        write(logPath, {
-          event: 'auth-cookie-cleared',
-          cookie: hit.name,
-          how: hit.reason,
-          by_url: res.url().slice(0, 200),
-          status: res.status(),
-        });
+  try {
+    ctx.on('response', async (res) => {
+      let headers;
+      try { headers = await res.headersArray(); } catch { return; }
+      for (const h of headers) {
+        if (h.name.toLowerCase() !== 'set-cookie') continue;
+        // headersArray keeps repeated Set-Cookie separate; a merged value would
+        // hide all but the first, which is the one case that matters here.
+        for (const line of h.value.split('\n')) {
+          const hit = isClearing(line);
+          if (!hit) continue;
+          cleared++;
+          write(logPath, {
+            event: 'auth-cookie-cleared',
+            cookie: hit.name,
+            how: hit.reason,
+            by_url: res.url().slice(0, 200),
+            status: res.status(),
+          });
+        }
       }
-    }
-  });
+    });
+  } catch { /* forensics must never break a publish */ }
 
   return async function snapshot(label) {
     try {
