@@ -410,6 +410,12 @@ dispatch_task() {
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
+  # A sentinel nothing retires is re-swept after every restart, and resolution
+  # turns that from re-reading an empty file into RE-RUNNING the real task.
+  if handler_result_exists "$filename"; then
+    printf 'already answered, not dispatching again: %s\n' "$announce" >&2
+    return 0
+  fi
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"

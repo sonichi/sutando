@@ -148,5 +148,24 @@ echo "  with no resolver: ${line_plain:-<nothing>}"
 [ "$line_plain" = "TASK_FILE: task-probe1.txt" ]
 check $? "no resolver — the announcement is the bare basename, unchanged"
 
+# 9. A sentinel nothing retires is re-swept after every restart, and resolution
+#    turns re-reading an empty file into RE-RUNNING the real task.
+printf 'answered already\n' > "$WS/results/task-probe1.txt"
+line_done="$(run_sweep "$GOOD")"
+echo "  with a substantive result already present: ${line_done:-<nothing>}"
+[ -z "$line_done" ]
+check $? "an already-answered task is not dispatched again after a restart"
+grep -q 'already answered, not dispatching again' "$TMP/sweep.err"
+check $? "...and the refusal says so rather than passing silently"
+
+# 10. Control: a whitespace-only result is the undeliverable placeholder, NOT an
+#     answer, so it must not suppress the dispatch.
+printf '   \n' > "$WS/results/task-probe1.txt"
+line_ws="$(run_sweep "$GOOD")"
+echo "  with a whitespace-only result: ${line_ws:-<nothing>}"
+[ -n "$line_ws" ]
+check $? "a whitespace-only result does not count as answered"
+rm -f "$WS/results/task-probe1.txt"
+
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
