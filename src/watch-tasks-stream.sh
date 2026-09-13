@@ -247,8 +247,9 @@ release_dispatch_lock() {
 }
 
 finish_handler_task() {
-  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled
+  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled announce
   filename="$(basename "$task_path")"
+  announce="$(task_announce "$task_path")"
   worker_receipt="$DISPATCH_DIR/workers/$filename"
   settled="$DISPATCH_DIR/settled/$filename.worker"
   # Cleanup and the completion path race by atomically moving the same receipt.
@@ -269,7 +270,7 @@ finish_handler_task() {
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
           echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          emit_fallback_task_file "$filename"
+          emit_fallback_task_file "$announce"
           ;;
         *)
           echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -385,15 +386,27 @@ queue_handler_task() {
   drain_dispatch_queue
 }
 
+# A name is read relative to the reader's own inbox: a body that resolution
+# moved OUT of that inbox must be announced by its full path, not a bare name.
+
+# Shared by dispatch_task's own emit and the queued-handler completion and
+# shutdown-recovery paths, which only have the resolved path to work from.
+task_announce() {
+  local path="$1" dir
+  dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)"
+  if [ "$dir" = "$TASKS_DIR_ABS" ]; then
+    basename "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 dispatch_task() {
   local task_path="$1" rc filename announce resolved
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   resolved="$(resolve_inbox_entry "$task_path")" || return 0
-  # A name is read relative to the reader's own inbox, so a body that resolution
-  # moved OUT of that inbox must be announced by path. Unresolved = unchanged.
-  announce="$(basename "$resolved")"
-  [ "$resolved" = "$task_path" ] || announce="$resolved"
+  announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
   queued_activity_row "$filename"
@@ -500,7 +513,7 @@ _tmux_wake() {
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
 fallback_outstanding_handlers() {
-  local marker task_path filename settled made_progress found claim owner_id cleanup_ready claim_settled
+  local marker task_path filename announce settled made_progress found claim owner_id cleanup_ready claim_settled
   local worker_receipt worker_pid job_pid
   [ -n "$DISPATCH_DIR" ] && [ -d "$DISPATCH_DIR" ] || return
   : > "$DISPATCH_DIR/shutting-down"
@@ -517,6 +530,7 @@ fallback_outstanding_handlers() {
       mv "$marker" "$settled" 2>/dev/null || continue
       task_path="$(cat "$settled")"
       filename="$(basename "$task_path")"
+      announce="$(task_announce "$task_path")"
       if claim_is_ours "$filename"; then
         claim_settled=1
         claim_disposition "$filename"
@@ -530,7 +544,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            emit_task_file "$filename"
+            emit_task_file "$announce"
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -554,6 +568,7 @@ fallback_outstanding_handlers() {
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     [ -n "$task_path" ] || continue
     filename="$(basename "$task_path")"
+    announce="$(task_announce "$task_path")"
     claim_settled=1
     claim_disposition "$filename"
     case $? in
@@ -566,7 +581,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        emit_task_file "$filename"
+        emit_task_file "$announce"
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2

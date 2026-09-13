@@ -37,9 +37,9 @@ silent=$(grep -cE "printf 'TASK_FILE: %s\\\\n' \"\\\$filename\"( >&9)? \|\| true
 check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
 check "both shutdown call sites go through the shutdown emitter" \
-      "2" "$(grep -cE '^\s+emit_task_file "\$filename"' "$WATCHER" || true)"
+      "2" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 check "the handler-fallback site goes through its own emitter" \
-      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$filename"' "$WATCHER" || true)"
+      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 
 # The call sites above are worthless if the definitions never load. There is no
 # `set -e` here, so a missing function is rc=127 and NON-FATAL: the watcher would

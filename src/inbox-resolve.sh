@@ -2,17 +2,14 @@
 # Inbox-entry resolver — sourceable so a test can invoke it in isolation.
 # Sourcing this file defines resolve_inbox_entry and nothing else.
 
-# An inbox entry need not be the task body: a recipient can be woken by a
-# sentinel whose payload lives elsewhere, and only the adapter that wrote it
-# knows the mapping — so the core runs the executable it was handed. The
-# resolver MUST print an ABSOLUTE path: it is checked with `-f` against the
-# watcher's own cwd, not the resolver's, so a relative answer is refused
-# rather than dispatched (fails safe, but silently — name it if you hit it).
-# Prints the path to dispatch (rc 0), or nothing and why on stderr (rc 3).
-#
-# Bounded, not because a resolver is untrusted, but because it runs inline in
-# the single-threaded dispatch loop: a hung resolver would hang every future
-# dispatch, for every entry, not just its own.
+# Only the adapter that wrote a sentinel knows where its payload lives, so
+# the core just runs the executable it was handed.
+
+# The resolver MUST print an ABSOLUTE path: checked with `-f` against the
+# watcher's cwd, not the resolver's, so a relative one fails safe, silently.
+
+# Bounded: this runs inline in the single-threaded dispatch loop, so a hung
+# resolver would hang every future dispatch, not just its own.
 SUTANDO_INBOX_RESOLVER_TIMEOUT="${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}"
 resolve_inbox_entry() {
 	local entry="$1" out rc resolved
@@ -25,9 +22,7 @@ resolve_inbox_entry() {
 		return 3
 	fi
 	# Two explicit branches, not an optionally-empty array: `"${arr[@]}"` on an
-	# empty array raises "unbound variable" under `set -u` on bash < 4.4 (the
-	# macOS-shipped /bin/bash is 3.2), which would make a clean host with no
-	# `timeout` binary fail this call instead of just skipping the bound.
+	# empty array raises "unbound variable" under `set -u` on bash < 4.4.
 	if command -v timeout >/dev/null 2>&1; then
 		out="$(timeout "$SUTANDO_INBOX_RESOLVER_TIMEOUT" "$SUTANDO_INBOX_RESOLVER" "$entry" 2>/dev/null)"
 	else
