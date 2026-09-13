@@ -17,6 +17,9 @@ STUB_PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # `--print-core-env` is `printf '%s\n' "${CORE_ENV_ARGS[@]}"`, so each element is
 # its own line and a value containing spaces stays whole. Never split on spaces.
 env_value() { printf '%s\n' "$1" | grep "^$2=" | head -1; }
+# The launcher forwards the PHYSICAL path (pwd -P), so expected values are
+# canonicalised the same way: $TMP itself sits behind /var -> /private/var on macOS.
+canon() { printf '%s/%s' "$(cd "${1%/*}" && pwd -P)" "${1##*/}"; }
 
 # An executable interpreter the launcher must forward verbatim. Injected rather
 # than inherited: the host's own resolution is not what this case measures.
@@ -40,8 +43,8 @@ case "$got" in *=/*) [ -f "${got#*=}" ]; check $? "the forwarded watcher path ex
 
 py="$(env_value "$worker_env" SUTANDO_PY)"
 echo "  worker: ${py:-<absent>}"
-[ "$py" = "SUTANDO_PY=$INJECTED_PY" ] && [ -x "${py#*=}" ]
-check $? "worker is handed the executable interpreter verbatim, not a bare name"
+[ "$py" = "SUTANDO_PY=$(canon "$INJECTED_PY")" ] && [ -x "${py#*=}" ]
+check $? "worker is handed the executable interpreter as its canonical path, not a bare name"
 
 # A checkout path with a space is the DEFAULT macOS install location, and no CI
 # runner has one — so the parser is pinned here instead of by where this runs.
@@ -73,14 +76,41 @@ noclt_py="$(env_value "$noclt_env" SUTANDO_PY)"
 noclt_watcher="$(env_value "$noclt_env" SUTANDO_WATCHER_CMD)"
 echo "  no-interpreter worker: py=${noclt_py:-<absent>} watcher=${noclt_watcher:+present}"
 case "$noclt_py" in
-  "")            bare=0 ;;
-  SUTANDO_PY=/*) [ -x "${noclt_py#*=}" ]; bare=$? ;;
-  *)             bare=1 ;;
+  "SUTANDO_PY=")  bare=0 ;;
+  SUTANDO_PY=/*)  [ -x "${noclt_py#*=}" ]; bare=$? ;;
+  *)              bare=1 ;;
 esac
 [ "$bare" -eq 0 ] && [ -n "$noclt_watcher" ]
 check $? "no-interpreter host: never a bare interpreter name, and the watcher is still named"
-[ -z "$noclt_py" ]
-check $? "no runnable interpreter: no SUTANDO_PY forwarded at all"
+# An EMPTY override, not an absent one: tmux hands a worker the server's global
+# env, so a launch that omits -e leaves a stale SUTANDO_PY from an earlier core in force.
+[ "$noclt_py" = "SUTANDO_PY=" ]
+check $? "no runnable interpreter: an empty SUTANDO_PY override is emitted, never nothing"
+
+# The forwarded interpreter is CANONICAL: a relative override is executable from
+# the launcher's cwd only, and `..` cannot be trusted from the spawner's --cwd.
+mkdir -p "$TMP/relpy"; printf '#!/bin/sh\nexit 0\n' > "$TMP/relpy/python3"; chmod +x "$TMP/relpy/python3"
+ln -s "$TMP/relpy" "$REPO/.relpy-test-$$" 2>/dev/null
+rel_env="$(env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_INSTANCE_ID=w-test \
+    SUTANDO_PY=".relpy-test-$$/python3" bash "$STARTCLI" --print-core-env 2>/dev/null)"
+rm -f "$REPO/.relpy-test-$$"
+rel_py="$(env_value "$rel_env" SUTANDO_PY)"; echo "  relative override -> ${rel_py:-<absent>}"
+case "$rel_py" in SUTANDO_PY=/*) [ -x "${rel_py#*=}" ] && [ "${rel_py#*=}" = "$(canon "$TMP/relpy/python3")" ] ;; *) false ;; esac
+check $? "a relative SUTANDO_PY is forwarded as its canonical absolute path"
+dot_env="$(env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_INSTANCE_ID=w-test \
+    SUTANDO_PY="$TMP/relpy/../relpy/python3" bash "$STARTCLI" --print-core-env 2>/dev/null)"
+dot_py="$(env_value "$dot_env" SUTANDO_PY)"; echo "  dot-dot override -> ${dot_py:-<absent>}"
+[ "$dot_py" = "SUTANDO_PY=$(canon "$TMP/relpy/python3")" ] && case "$dot_py" in *"/../"*) false ;; *) true ;; esac
+check $? "a dot-dot SUTANDO_PY is forwarded canonical, without the .."
+
+# --print-core-env is a PROBE. It used to run the hook installer first, so every
+# call in this file wrote <checkout>/.claude/settings.json (kewei, #4235).
+SETTINGS="$REPO/.claude/settings.json"
+snap() { [ -f "$SETTINGS" ] && cksum < "$SETTINGS" || echo ABSENT; }
+s_before="$(snap)"
+env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_INSTANCE_ID=w-test bash "$STARTCLI" --print-core-env >/dev/null 2>&1
+[ "$(snap)" = "$s_before" ]
+check $? "--print-core-env leaves the checkout's .claude/settings.json untouched"
 
 # The control that makes the cases above a real result: a core launch gets neither.
 if ! printf '%s\n' "$core_env" | grep -qE '^SUTANDO_(WATCHER_CMD|PY)='; then
