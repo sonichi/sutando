@@ -381,10 +381,8 @@ reap_stale_task_watcher() {
   fi
 
   if [ "$_wi_verdict" = "watcher" ]; then
-    # A watcher younger than the sentinel did not write it, so it is a NEW
-    # watcher on a reissued pid — signalling it would kill a live drain.
-    # errexit-safe: a bare call here terminates startup.sh (set -e) on rc 1/2
-    # before either branch below can run.
+    # A watcher younger than the sentinel is on a reissued pid, not its owner.
+    # errexit-safe: a bare call here would terminate startup.sh (set -e) on rc 1/2.
     local owned_rc=0
     sentinel_pid_wrote_file "$stale_pid" "$pid_file" || owned_rc=$?
     if [ "$owned_rc" -eq 1 ]; then

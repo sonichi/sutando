@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # startup's watch-tasks-stream reaper must only delete the sentinel it inspected.
-#
-# Unlinking a sentinel this reap did not inspect strands a live watcher untrackable.
-# Case 3 makes that window deterministic: the `ps` shim re-stamps the file mid-reap.
-#
-# Run: bash tests/startup-watcher-reaper-ownership.test.sh
-# Exit: 0 = all pass, 1 = failure
+# Run: bash tests/startup-watcher-reaper-ownership.test.sh (0 = pass, 1 = fail)
 set -uo pipefail
 
 REPO="${REPO_UNDER_TEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -125,9 +120,7 @@ fi
 fi  # have_fn
 
 # --- wiring: startup.sh must delegate, and reap only THIS instance -------------
-# This used to assert `sentinel_paths_in` — the enumeration of EVERY instance's
-# sentinel. The reaper deliberately kills a watcher that owns its sentinel, so
-# that loop killed a peer's live watcher and removed its record.
+# Not `sentinel_paths_in` (every instance's sentinel) -- that loop killed a peer's live watcher.
 if grep -q 'reap_stale_task_watcher "\$__sentinel"' "$REPO/src/startup.sh" \
    && grep -q 'sentinel_path_for "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
   ok "startup.sh delegates to the shared reaper for its OWN sentinel"
@@ -141,10 +134,7 @@ else
 fi
 
 # --- peer survival: the property the enumeration assertion could not express ---
-# LIMIT, measured: this case calls sentinel_path_for + the reaper DIRECTLY, so it
-# proves the scoped shape is safe -- it does NOT re-fail if startup.sh regresses
-# to the enumeration. The two greps above are what pin the wiring; restoring the
-# loop failed exactly those two while this case still reported ok.
+# LIMIT: calls the reaper directly, so it does NOT re-fail if startup.sh regresses to enumeration.
 if [ -n "${have_fn:-}" ] && command -v sentinel_path_for >/dev/null 2>&1; then
   _pt="$(mktemp -d)"; mkdir -p "$_pt/state" "$_pt/src"
   printf '#!/bin/bash\nsleep 60\n' > "$_pt/src/watch-tasks-stream.sh"; chmod +x "$_pt/src/watch-tasks-stream.sh"
@@ -200,9 +190,7 @@ fi
 kill "$obs_pid" 2>/dev/null; wait "$obs_pid" 2>/dev/null
 
 # --- case 6: an UNOBSERVED ps must not release the sentinel -------------------
-# A silent non-zero `ps` (no stderr) used to fall through to the release.
-# The pid must be ALIVE: a dead one is knowledge, and cleaning up after it is
-# correct. The hazard is a LIVE watcher whose ps cannot be read.
+# A silent non-zero `ps` (no stderr) used to fall through to release; hazard is a LIVE, unreadable watcher.
 sleep 30 &
 live6=$!
 f="$TMP/case6.pid"
