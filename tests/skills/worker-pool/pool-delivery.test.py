@@ -538,5 +538,198 @@ class TestAcceptIsExclusive(Base):
         self.assertTrue((self.root / "deliveries" / "core" / pd.LOCK_NAME).exists())
 
 
+class TestDoneFlagWriter(Base):
+    """The writer half. `residue`/`sweep` already branch on the flag; until this
+    cluster existed nothing wrote it, so `finished` was unreachable.
+    """
+
+    def test_the_pending_stage_substitutes_the_suffix_rather_than_appending(self):
+        pend = pd.pending_flag(self.root, "worker-3", "task-1")
+        done = pd.done_flag(self.root, "worker-3", "task-1")
+        self.assertEqual(pend.parent, done.parent)
+        # Spelled literally: a reader that globs *.flag must not also see pending.
+        self.assertEqual(pend.name, "task-1.pending")
+        self.assertEqual(done.name, "task-1.flag")
+
+    def test_pending_lays_the_first_stage_and_not_the_second(self):
+        got = pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        self.assertEqual(got, pd.pending_flag(self.root, "worker-3", "task-1"))
+        self.assertTrue(got.is_file())
+        self.assertFalse(pd.done_flag(self.root, "worker-3", "task-1").exists())
+
+    def test_publishing_promotes_and_removes_the_pending_stage(self):
+        pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        got = pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        self.assertEqual(got, pd.done_flag(self.root, "worker-3", "task-1"))
+        self.assertTrue(got.is_file())
+        self.assertFalse(pd.pending_flag(self.root, "worker-3", "task-1").exists())
+
+    def test_publishing_without_a_prior_pending_stage_still_records(self):
+        got = pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        self.assertTrue(got.is_file())
+
+    def test_a_published_record_is_never_demoted(self):
+        pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        got = pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        # A late pending must not reopen retired work, so it returns the
+        # published stage and writes nothing.
+        self.assertEqual(got, pd.done_flag(self.root, "worker-3", "task-1"))
+        self.assertFalse(pd.pending_flag(self.root, "worker-3", "task-1").exists())
+
+    def test_publishing_twice_is_idempotent(self):
+        a = pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        b = pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        self.assertEqual(a, b)
+        self.assertTrue(b.is_file())
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        names = sorted(q.name for q in pd.done_flag(self.root, "worker-3", "task-1").parent.iterdir())
+        self.assertEqual(names, ["task-1.flag"])
+
+    def test_a_recipient_id_that_is_not_one_is_refused(self):
+        for bad in ("", "../escape", "Worker3", "a/b", "x" * 33):
+            with self.assertRaises(ValueError, msg=bad):
+                pd.mark_done(self.root, bad, "task-1", published=True)
+
+    def test_a_task_id_that_is_not_one_is_refused(self):
+        for bad in ("", "1", "task-", "task-a/b", "task-a.b", "../task-a"):
+            with self.assertRaises(ValueError, msg=bad):
+                pd.mark_done(self.root, "worker-3", bad, published=True)
+
+    def test_a_refused_id_writes_nothing(self):
+        with self.assertRaises(ValueError):
+            pd.mark_done(self.root, "worker-3", "task-a/b", published=True)
+        self.assertEqual(list((self.root / "state" / "workers").iterdir()), [])
+
+
+class TestPublishRecordCleansUpOnFailure(Base):
+    def test_a_directory_at_the_target_name_raises_and_leaves_no_temp_file(self):
+        dst = pd.done_flag(self.root, "worker-3", "task-1")
+        dst.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            pd._publish_record(dst)
+        # A refused publish must not litter: the next listing would otherwise
+        # accumulate one orphan per attempt.
+        self.assertEqual(sorted(q.name for q in dst.parent.iterdir()), ["task-1.flag"])
+
+
+class TestIsDoneFlag(Base):
+    """Completion evidence is a regular file. Anything else at that name is
+    malformed state, and reading it as a finish invents a claimant.
+    """
+
+    def test_absent_is_not_evidence(self):
+        self.assertFalse(pd.is_done_flag(self.root / "state" / "workers" / "w" / "done" / "task-1.flag"))
+
+    def test_a_regular_file_is(self):
+        got = pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        self.assertTrue(pd.is_done_flag(got))
+
+    def test_a_directory_at_the_name_is_not(self):
+        d = pd.done_flag(self.root, "worker-3", "task-1")
+        d.mkdir(parents=True)
+        self.assertFalse(pd.is_done_flag(d))
+
+    def test_a_symlink_at_the_name_refuses_loudly_instead_of_reading_through(self):
+        target = self.root / "real"
+        target.write_text("", encoding="utf-8")
+        link = pd.done_flag(self.root, "worker-3", "task-1")
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+        # O_NOFOLLOW: a link to a regular file must not read as this worker's
+        # own finish. Raising is the fail-closed answer, not False.
+        with self.assertRaises(OSError):
+            pd.is_done_flag(link)
+
+
+class TestTheWriterMakesFinishedReachable(Base):
+    """The reason the writer exists: `residue` has a `finished` state that no
+    path could reach, so `sweep` never retired a completed delivery.
+    """
+
+    def _completed(self, recipient="worker-3", task_id="task-1"):
+        self.ws.payload(task_id)
+        pd.accept(self.ws.deliver(recipient, task_id))
+        self.ws.result(task_id)
+        return task_id
+
+    def test_without_the_record_a_completed_delivery_is_never_retired(self):
+        task_id = self._completed()
+        self.assertEqual(pd.residue(self.root, "worker-3", task_id), "completed")
+        pd.sweep(self.root, "worker-3")
+        # Still there: `completed` is reported, never unlinked — so every boot
+        # re-reports the same delivery.
+        self.assertEqual([q.name for q in pd.accepted(self.root, "worker-3")],
+                         [f"{task_id}.accepted"])
+
+    def test_with_the_record_the_same_delivery_reads_finished_and_is_retired(self):
+        task_id = self._completed()
+        pd.mark_done(self.root, "worker-3", task_id, published=True)
+        self.assertEqual(pd.residue(self.root, "worker-3", task_id), "finished")
+        pd.sweep(self.root, "worker-3")
+        self.assertEqual([q.name for q in pd.accepted(self.root, "worker-3")], [])
+
+    def test_the_pending_stage_alone_does_not_retire_the_delivery(self):
+        task_id = self._completed()
+        pd.mark_done(self.root, "worker-3", task_id, published=False)
+        # Only the published stage is a finish; a pending hold must not retire.
+        self.assertEqual(pd.residue(self.root, "worker-3", task_id), "completed")
+
+
+class TestMarkDoneCli(Base):
+    """The CLI is the only surface a non-python caller can reach, and the core
+    watcher reaches it that way.
+    """
+
+    def _main(self, *args):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        rc = None
+        with redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), "--recipient", "worker-3", *args])
+        return rc, buf.getvalue()
+
+    def test_it_writes_the_pending_stage(self):
+        rc, out = self._main("mark-done", "--task-id", "task-1", "--stage", "pending")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), str(pd.pending_flag(self.root, "worker-3", "task-1")))
+        self.assertTrue(pd.pending_flag(self.root, "worker-3", "task-1").is_file())
+
+    def test_it_promotes_to_the_published_stage(self):
+        self._main("mark-done", "--task-id", "task-1", "--stage", "pending")
+        rc, out = self._main("mark-done", "--task-id", "task-1", "--stage", "done")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), str(pd.done_flag(self.root, "worker-3", "task-1")))
+        self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
+
+    def test_a_missing_stage_is_refused_rather_than_defaulted(self):
+        # Defaulting a stage would let a caller that forgot it publish a finish.
+        with self.assertRaises(SystemExit):
+            self._main("mark-done", "--task-id", "task-1")
+        self.assertFalse((self.root / "state" / "workers" / "worker-3").exists())
+
+    def test_a_missing_task_id_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self._main("mark-done", "--stage", "done")
+
+    def test_a_refused_id_raises_rather_than_writing(self):
+        with self.assertRaises(ValueError):
+            self._main("mark-done", "--task-id", "not-a-task", "--stage", "done")
+        self.assertFalse((self.root / "state" / "workers" / "worker-3").exists())
+
+    def test_the_shipped_executable_records_a_stage(self):
+        """The watcher spawns this file as a program, so the argv path is proven
+        through the real executable and not only through main()."""
+        r = subprocess.run(
+            [sys.executable, str(Path(pd.__file__)), "--workspace", str(self.root),
+             "--recipient", "worker-3", "mark-done", "--task-id", "task-1", "--stage", "done"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

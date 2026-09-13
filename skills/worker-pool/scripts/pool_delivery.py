@@ -26,6 +26,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -115,7 +116,7 @@ def is_done_flag(path) -> bool:
     except OSError:
         raise
     try:
-        return os.path.stat.S_ISREG(os.fstat(fd).st_mode)
+        return stat.S_ISREG(os.fstat(fd).st_mode)
     finally:
         os.close(fd)
 
