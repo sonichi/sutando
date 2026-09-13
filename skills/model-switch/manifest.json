@@ -9,6 +9,6 @@
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
-    "MODEL_SWITCH_CHOICES": "default=Default (auto-fallback);opus=Opus 5;sonnet=Sonnet 5;haiku=Haiku 4.5;claude-fable-5-1[1m]=Fable 5.1"
+    "MODEL_SWITCH_CHOICES": "default=Default (auto-fallback);opus=Opus 5;claude-sonnet-5[1m]=Sonnet 5 1M;haiku=Haiku 4.5;claude-fable-5-1[1m]=Fable 5.1"
   }
 }
