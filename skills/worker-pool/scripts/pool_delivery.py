@@ -159,6 +159,29 @@ def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Pa
     return done
 
 
+def clear_pending(workspace, recipient: str, task_id: str) -> Path:
+    """Withdraw a `.pending` hold this worker will not finish: the task went back to
+    the live core, or its handler never ran. Never touches `.flag` -- a finish is
+    never undone -- and is idempotent, so a fallback that fires twice is harmless.
+    """
+    if not RECIPIENT.match(recipient):
+        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    pend = pending_flag(workspace, recipient, task_id)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
+    return pend
+
+
+def writer_path() -> Path:
+    """The executable a spawner injects as SUTANDO_POOL_DELIVERY_SCRIPT: this file,
+    absolute. The core never locates it (docs/architecture-boundaries.md); the
+    skill hands it over, and the launcher forwards it into the worker session.
+    """
+    return Path(__file__).resolve()
+
+
 def pending(workspace: Path, recipient: str) -> list[Path]:
     """Pending sentinels in this recipient's folder, oldest first.
 
@@ -331,17 +354,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
     ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
-                                       "mark-done"))
+                                       "mark-done", "writer-path"))
     ap.add_argument("--task-id")
-    ap.add_argument("--stage", choices=("pending", "done"),
-                    help="for `mark-done`: pending = before the result, done = after")
+    ap.add_argument("--stage", choices=("pending", "done", "abandon"),
+                    help="for `mark-done`: pending = before the result, done = after, "
+                         "abandon = withdraw a pending hold (never a finish)")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
+    if a.command == "writer-path":
+        print(writer_path())
+        return 0
     if a.command == "mark-done":
         if not a.task_id or not a.stage:
             ap.error("--task-id and --stage are required for mark-done")
+        if a.stage == "abandon":
+            print(clear_pending(ws, a.recipient, a.task_id))
+            return 0
         print(mark_done(ws, a.recipient, a.task_id, published=a.stage == "done"))
         return 0
     if a.command == "residue":

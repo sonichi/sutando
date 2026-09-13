@@ -306,6 +306,7 @@ finish_handler_task() {
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
           echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+          record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
           emit_fallback_task_file "$filename"
           ;;
         *)
@@ -384,7 +385,7 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
-    /bin/bash "$0" --handler-runner \
+    SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
       "$SUTANDO_TASK_EVENT_HANDLER" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
@@ -559,6 +560,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+            record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
             emit_task_file "$filename"
             ;;
           *)
@@ -595,6 +597,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
         emit_task_file "$filename"
         ;;
       *)

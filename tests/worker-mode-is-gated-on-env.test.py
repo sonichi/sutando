@@ -191,7 +191,8 @@ def _state_root(extra_env: dict, td: Path):
 
 
 WORKER_KEYS = ("SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR", "SUTANDO_WORKSPACE_DIR",
-               "SUTANDO_INBOX_KIND", "SUTANDO_RESULTS_DIR", "SUTANDO_WORKER_BOOTSTRAP")
+               "SUTANDO_INBOX_KIND", "SUTANDO_RESULTS_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+               "SUTANDO_POOL_DELIVERY_SCRIPT")
 
 
 def _core_env(extra_env: dict, td: Path) -> list[str]:
@@ -255,6 +256,22 @@ class TestWatcherGate(unittest.TestCase):
             ws_hit, inbox_hit = _state_root({"SUTANDO_WORKSPACE_DIR": str(Path(td) / "ws")}, Path(td))
         self.assertTrue(ws_hit, "claims dir was not created under the explicit workspace")
         self.assertFalse(inbox_hit, "claims dir leaked under deliveries/")
+
+    def test_a_worker_is_handed_the_pool_writer(self):
+        """The spawner names the writer; tmux hands the session the SERVER's env, so
+        it reaches the worker only if the launcher forwards it -- and without it no
+        delivery can ever read `finished`."""
+        with scratch() as td:
+            env = _core_env({"SUTANDO_INSTANCE_ID": "f" * 32,
+                             "SUTANDO_POOL_DELIVERY_SCRIPT": "/opt/pool_delivery.py"}, Path(td))
+        self.assertIn("SUTANDO_POOL_DELIVERY_SCRIPT=/opt/pool_delivery.py", env, env)
+
+    def test_an_unset_pool_writer_is_not_invented(self):
+        """Control: a host with no pool never sees the key."""
+        with scratch() as td:
+            env = _core_env({"SUTANDO_INSTANCE_ID": "g" * 32}, Path(td))
+        keys = {tok.split("=", 1)[0] for tok in env}
+        self.assertNotIn("SUTANDO_POOL_DELIVERY_SCRIPT", keys, env)
 
     def test_without_it_the_inbox_parent_is_taken_as_the_workspace(self):
         """Control: the seam exists — absent the variable, state lands under deliveries/."""

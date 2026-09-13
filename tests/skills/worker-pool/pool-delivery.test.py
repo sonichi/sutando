@@ -764,5 +764,54 @@ class TestMarkDoneCli(Base):
         self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
 
 
+class TestClearPending(Base):
+    """A hold the worker will not finish is withdrawn; a finish is never undone."""
+
+    def test_it_removes_the_pending_stage(self):
+        pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        got = pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertEqual(got, pd.pending_flag(self.root, "worker-3", "task-1"))
+        self.assertFalse(got.exists())
+
+    def test_it_never_touches_a_published_flag(self):
+        pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
+
+    def test_it_is_idempotent_when_nothing_is_pending(self):
+        got = pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertFalse(got.exists())
+        self.assertFalse((self.root / "state" / "workers" / "worker-3").exists())
+
+    def test_it_refuses_bad_ids_without_writing(self):
+        for rec, tid in (("../x", "task-1"), ("worker-3", "task-a/b"), ("", "task-1")):
+            with self.assertRaises(ValueError, msg=(rec, tid)):
+                pd.clear_pending(self.root, rec, tid)
+        self.assertEqual(list((self.root / "state" / "workers").iterdir())
+                         if (self.root / "state" / "workers").exists() else [], [])
+
+    def test_the_cli_abandon_stage_withdraws_a_hold(self):
+        import io
+        from contextlib import redirect_stdout
+        pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), "--recipient", "worker-3",
+                          "mark-done", "--task-id", "task-1", "--stage", "abandon"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(pd.pending_flag(self.root, "worker-3", "task-1").exists())
+
+    def test_writer_path_is_this_file_absolute_and_the_cli_prints_it(self):
+        import io
+        from contextlib import redirect_stdout
+        self.assertTrue(pd.writer_path().is_absolute())
+        self.assertEqual(pd.writer_path(), Path(pd.__file__).resolve())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), "writer-path"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), str(pd.writer_path()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
