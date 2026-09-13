@@ -3213,10 +3213,10 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
         return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
     try:
         batches = sorted(d for d in root.iterdir() if d.is_dir())
-        files = [f for d in batches for f in d.rglob("*") if f.is_file()]
     except OSError as exc:
         return {"name": name, "status": "ok",
                 "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    batch_files, unreadable_dirs = _sync_conflicts_walk_batches(batches)
     # The digest is IN the writer's key so retiring one copy cannot silence a
     # later, DIFFERENT one at the same path; the reporter owns that identity.
     try:
@@ -3226,22 +3226,29 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
     entry_key = _sync_conflicts_entry_key()
     if entry_key is None:
         return {"name": name, "status": "warn",
-                "detail": (f"{len(files)} peer file(s) preserved across {len(batches)} keep-ours "
+                "detail": (f"{len(batch_files)} peer file(s) preserved across {len(batches)} keep-ours "
                            "batch(es); the reporter's retirement key could not be loaded, so "
                            "retirement is UNOBSERVED here rather than assumed — run "
                            f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
     live, unobserved = [], []
-    for batch in batches:
-        for f in sorted(x for x in batch.rglob("*") if x.is_file()):
-            try:
-                # errors="replace" matches the writer: a different decode is a
-                # different digest, and every copy would then read un-retired.
-                key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
-            except OSError:
-                unobserved.append(f)
-                continue
-            if key not in retired:
-                live.append(f)
+    for batch, f in batch_files:
+        try:
+            # errors="replace" matches the writer: a different decode is a
+            # different digest, and every copy would then read un-retired.
+            key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+        except OSError:
+            unobserved.append(f)
+            continue
+        if key not in retired:
+            live.append(f)
+    if unreadable_dirs and not live:
+        # A subtree os.walk could not list may hold live, un-retired files we
+        # structurally never enumerated -- never report clean while that holds.
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unreadable_dirs)} subdirectory read failure(s) across "
+                           f"{len(batches)} keep-ours batch(es) ({len(unobserved)} file(s) also "
+                           "unreadable) — retirement is UNOBSERVED for whatever those subtrees "
+                           "hold, not asserting clean")}
     if not live and not unobserved:
         return {"name": name, "status": "ok",
                 "detail": "no preserved peer files outstanding — all retired or none kept"}
@@ -3254,6 +3261,28 @@ def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
             "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
                        f"oldest {oldest}, not retired — whether each is still absent from the live copy "
                        f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_walk_batches(batches: "list[Path]") -> "tuple[list[tuple[Path, Path]], list[str]]":
+    """Enumerate files under each batch, reporting subtrees `rglob` would hide.
+
+    `Path.rglob()` swallows `OSError` when `scandir` fails on a subdirectory and
+    silently treats it as empty rather than raising -- a permission-denied
+    subtree then reads as "no files here" instead of "unreadable", which is how
+    a batch holding live, un-retired content could report a clean verdict.
+    `os.walk`'s `onerror` hook is what makes that failure visible.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    unreadable: list[str] = []
+    for batch in batches:
+        for dirpath, _dirnames, filenames in os.walk(
+                str(batch), onerror=lambda exc: unreadable.append(str(exc))):
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_file():
+                    pairs.append((batch, p))
+    pairs.sort(key=lambda bf: (bf[0].name, bf[1]))
+    return pairs, unreadable
 
 
 def _sync_conflicts_entry_key():

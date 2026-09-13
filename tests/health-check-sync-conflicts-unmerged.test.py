@@ -166,6 +166,74 @@ class SyncConflictsUnmerged(unittest.TestCase):
         src = (REPO / "src" / "health-check.py").read_text()
         self.assertEqual(src.count("checks.append(check_sync_conflicts_unmerged())"), 1)
 
+    def test_an_unreadable_NESTED_directory_is_unobserved_not_clean(self):
+        """rglob silently skips a scandir failure on a subdirectory instead of
+        raising -- a locked-down nested dir must not read as "nothing here"."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["locked/x.md"]})
+            locked_dir = (ws / ".git" / "sutando-sync-conflicts"
+                          / "20260802T000000Z-origin_host_A" / "locked")
+            locked_dir.chmod(0o000)
+            try:
+                try:
+                    list(locked_dir.iterdir())
+                except OSError:
+                    pass
+                else:
+                    self.skipTest("this user can list a 000 directory (root?) — no OSError to hide")
+                r = hc.check_sync_conflicts_unmerged(ws)
+            finally:
+                locked_dir.chmod(0o755)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("UNOBSERVED", r["detail"])
+        self.assertNotIn("all retired or none kept", r["detail"])
+
+    def test_an_unreadable_BATCH_directory_is_unobserved_not_clean(self):
+        """Same failure one level up: the batch itself is listed by iterdir()
+        (that only needs the parent readable), but its own contents cannot be."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {"20260802T000000Z-origin_host_A": ["x.md"]})
+            batch_dir = (ws / ".git" / "sutando-sync-conflicts"
+                         / "20260802T000000Z-origin_host_A")
+            batch_dir.chmod(0o000)
+            try:
+                try:
+                    list(batch_dir.iterdir())
+                except OSError:
+                    pass
+                else:
+                    self.skipTest("this user can list a 000 directory (root?) — no OSError to hide")
+                r = hc.check_sync_conflicts_unmerged(ws)
+            finally:
+                batch_dir.chmod(0o755)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("UNOBSERVED", r["detail"])
+        self.assertNotIn("all retired or none kept", r["detail"])
+
+    def test_an_unreadable_directory_alongside_a_LIVE_file_still_names_the_live_one(self):
+        """Directory-level unobserved must not swallow a live file the walk DID
+        reach in a sibling batch -- the two signals are independent."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _vault(td, {
+                "20260802T000000Z-origin_host_A": ["locked/x.md"],
+                "20260903T000000Z-origin_host_B": ["visible/y.md"],
+            })
+            locked_dir = (ws / ".git" / "sutando-sync-conflicts"
+                          / "20260802T000000Z-origin_host_A" / "locked")
+            locked_dir.chmod(0o000)
+            try:
+                try:
+                    list(locked_dir.iterdir())
+                except OSError:
+                    pass
+                else:
+                    self.skipTest("this user can list a 000 directory (root?) — no OSError to hide")
+                r = hc.check_sync_conflicts_unmerged(ws)
+            finally:
+                locked_dir.chmod(0o755)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("1 peer file(s)", r["detail"])
+
 
 
 
