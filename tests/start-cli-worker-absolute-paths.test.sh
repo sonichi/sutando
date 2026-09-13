@@ -49,32 +49,31 @@ spaced="$(printf '%s\n' "-e" "SUTANDO_WATCHER_CMD=/Library/Application Support/x
 [ "$(env_value "$spaced" SUTANDO_WATCHER_CMD)" = "SUTANDO_WATCHER_CMD=/Library/Application Support/x/src/watch-tasks-stream.sh" ]
 check $? "a value containing spaces survives the parse whole"
 
-# Fail closed: the launcher must never hand a worker a BARE interpreter name.
-# The CLT-stub rule is macOS-only by design in _sutando_safe_path_python, and
-# $OSTYPE is shell-set so a PATH stub cannot fake the platform — so the absence
-# half is asserted only where production applies it.
-mkdir -p "$TMP/noclt"; printf '#!/bin/sh\nexit 1\n' > "$TMP/noclt/xcode-select"
-for stub in lsof launchctl; do printf '#!/bin/sh\nexit 1\n' > "$TMP/noclt/$stub"; done
-chmod +x "$TMP"/noclt/*
-noclt_env="$(env -i HOME="$HOME" PATH="$TMP/noclt:/usr/bin:/bin:/usr/sbin:/sbin" \
+# "No runnable interpreter" must mean the same thing on every platform, so the
+# fixture PATH is the real one minus any python, not a macOS CLT stub.
+mkdir -p "$TMP/noclt"
+for _d in /usr/bin /bin; do
+  [ -d "$_d" ] || continue
+  for _f in "$_d"/*; do
+    _b=${_f##*/}
+    case "$_b" in python*|pydoc*|idle*) continue ;; esac
+    [ -e "$TMP/noclt/$_b" ] || ln -s "$_f" "$TMP/noclt/$_b" 2>/dev/null
+  done
+done
+noclt_env="$(env -i HOME="$HOME" PATH="$TMP/noclt" \
     SUTANDO_INSTANCE_ID=w-test bash "$STARTCLI" --print-core-env 2>/dev/null)"
 noclt_py="$(env_value "$noclt_env" SUTANDO_PY)"
 noclt_watcher="$(env_value "$noclt_env" SUTANDO_WATCHER_CMD)"
-echo "  no-CLT worker: py=${noclt_py:-<absent>} watcher=${noclt_watcher:+present}"
+echo "  no-interpreter worker: py=${noclt_py:-<absent>} watcher=${noclt_watcher:+present}"
 case "$noclt_py" in
   "")            bare=0 ;;
   SUTANDO_PY=/*) [ -x "${noclt_py#*=}" ]; bare=$? ;;
   *)             bare=1 ;;
 esac
 [ "$bare" -eq 0 ] && [ -n "$noclt_watcher" ]
-check $? "no-CLT host: never a bare interpreter name, and the watcher is still named"
-case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
-  darwin*|Darwin)
-    [ -z "$noclt_py" ]
-    check $? "macOS no-CLT: no SUTANDO_PY forwarded at all" ;;
-  *)
-    echo "  (absence half skipped: the CLT-stub rule is macOS-only in _sutando_safe_path_python)" ;;
-esac
+check $? "no-interpreter host: never a bare interpreter name, and the watcher is still named"
+[ -z "$noclt_py" ]
+check $? "no runnable interpreter: no SUTANDO_PY forwarded at all"
 
 # The control that makes the cases above a real result: a core launch gets neither.
 if ! printf '%s\n' "$core_env" | grep -qE '^SUTANDO_(WATCHER_CMD|PY)='; then
