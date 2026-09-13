@@ -230,7 +230,7 @@ class TestMain(Base):
         import types
         b = self._assigned()
         stub = types.ModuleType("workspace_default")
-        stub.resolve_workspace = lambda: self.ws
+        stub.resolve_workspace = lambda *a, **kw: self.ws
         real = sys.modules.get("workspace_default")
         sys.modules["workspace_default"] = stub
         try:
