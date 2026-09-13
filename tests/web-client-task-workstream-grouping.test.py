@@ -48,9 +48,9 @@ function esc(value) {
 }
 """ + _visibility_policy_source() + _helper_source() + r"""
 const rows = [
-  ['a1', {time: new Date(10), status: 'done', workstream_id: 'a', workstream_name: '<img src=x onerror=boom>'}],
+  ['a1', {time: new Date(10), status: 'done', workstream_id: 'a', workstream_name: 'Alpha <img src=x onerror=boom>'}],
   ['b1', {time: new Date(20), status: 'done', workstream_id: 'b', workstream_name: 'Mission B'}],
-  ['a2', {time: new Date(30), status: 'done', workstream_id: 'a', workstream_name: '<img src=x onerror=boom>'}],
+  ['a2', {time: new Date(30), status: 'done', workstream_id: 'a', workstream_name: 'Alpha <img src=x onerror=boom>'}],
   ['b2', {time: new Date(40), status: 'working', workstream_id: 'b', workstream_name: 'Mission B'}],
   ['u1', {time: new Date(5), status: 'done'}],
 ];
@@ -124,23 +124,23 @@ def test_internal_system_tasks_are_hidden_from_owner_history() -> None:
     assert data["entries"] == ["task-owner-message", "task-owner-api"]
 
 
-def test_group_order_chronology_numbering_and_escaping() -> None:
+def test_group_order_alphabetical_numbering_and_escaping() -> None:
     data = _run_helper_probe()
 
-    # Mission B owns the latest task, then Mission A; tasks remain newest-first
-    # within each group. Ungrouped tasks remain a final explicit bucket.
-    assert data["groupIds"] == ["b", "a", "__ungrouped__"]
-    assert data["groupEntries"] == [["b2", "b1"], ["a2", "a1"], ["u1"]]
-    assert data["displayEntries"] == ["b2", "b1", "a2", "a1", "u1"]
+    # Groups are alphabetical by display name; tasks remain newest-first within
+    # each group. Ungrouped tasks remain a final explicit bucket.
+    assert data["groupIds"] == ["a", "b", "__ungrouped__"]
+    assert data["groupEntries"] == [["a2", "a1"], ["b2", "b1"], ["u1"]]
+    assert data["displayEntries"] == ["a2", "a1", "b2", "b1", "u1"]
 
     # The renderer numbers the flattened display globally and escapes inferred
     # names before inserting them into HTML.
-    assert "1:b2" in data["groupedHtml"] and "5:u1" in data["groupedHtml"]
+    assert "1:a2" in data["groupedHtml"] and "5:u1" in data["groupedHtml"]
     assert "&lt;img src=x onerror=boom&gt;" in data["groupedHtml"]
     assert "<img src=x onerror=boom>" not in data["groupedHtml"]
     assert data["collapsedWorkstreams"] == ["a", "__ungrouped__"]
-    assert 'data-workstream-id="b" aria-expanded="true"' in data["groupedHtml"]
     assert 'data-workstream-id="a" aria-expanded="false"' in data["groupedHtml"]
+    assert 'data-workstream-id="b" aria-expanded="true"' in data["groupedHtml"]
 
 
 def test_all_ungrouped_keeps_flat_appearance() -> None:
@@ -200,7 +200,7 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
 def main() -> None:
     tests = [
         test_internal_system_tasks_are_hidden_from_owner_history,
-        test_group_order_chronology_numbering_and_escaping,
+        test_group_order_alphabetical_numbering_and_escaping,
         test_all_ungrouped_keeps_flat_appearance,
         test_all_three_display_paths_share_order_and_history_is_quiet,
     ]
