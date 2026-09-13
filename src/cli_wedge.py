@@ -120,9 +120,9 @@ def raw_state_id(frame: str) -> str:
     return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
 
 
-# Leading decoration a CLI puts before a banner: indent, quote/prompt glyphs,
-# spinner frames, box rules. Stripped so the anchor sees the banner's first word.
-_BANNER_DECOR = re.compile(r"^[\s>\u00b7*\u2022\-\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u28c0-\u28ff]+")
+# Leading decoration before a banner: indent, spinner frames, box rules.
+# Excludes '>' '*' '-' '\u2022' \u2014 those double as markdown syntax in the agent's own prose.
+_BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u28c0-\u28ff]+")
 
 
 def matched_abnormal(frames: list) -> list:

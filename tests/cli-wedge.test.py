@@ -940,6 +940,14 @@ class ProseMentioningAStateIsNotThatState(unittest.TestCase):
         ("awaiting-input", "the draft is waiting for your input before it sends"),
         ("out-of-credits", "the ticket says the user was out of usage credits last week"),
         ("quota-limit", "the docs explain what happens when you hit your weekly limit"),
+        # Markdown decoration must not unmask prose as a banner.
+        ("compacting", "- compacting the transcript is what the hook does"),
+        ("compacting", "**compaction** is the thing that lost the context"),
+        ("compacting", "> compacting conversation"),
+        ("compacting", "  - compaction happens at 90%"),
+        ("awaiting-input", "- waiting for your approval before I merge"),
+        ("awaiting-input", "**Waiting for input** on the developer-mode question"),
+        ("needs-login", "- authentication failed on the dev lane, per the log"),
     ]
     BANNERS = [
         ("compacting", "Compacting conversation"),
