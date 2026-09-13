@@ -38,6 +38,12 @@ class Base(unittest.TestCase):
         self._env = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self._env)))
         os.environ.pop("SUTANDO_INSTANCE_ID", None)
+        # A bound worker is only usable if the core can route to it, so the
+        # default fixture is a routable core; the gate itself is pinned below.
+        self.handler = self.ws / "handler.py"
+        self.handler.write_text("#!/usr/bin/env python3\n")
+        self.handler.chmod(0o755)
+        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(self.handler)
         self.spawned = []
 
         def fake_spawn(workspace, repo, **kw):
@@ -282,6 +288,51 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
     def test_an_absent_roster_still_succeeds(self):
         self.assertEqual(self.run_cli(), 0)
         self.assertEqual(set(pr.load_roster(self.ws)["workers"]), {self.spawned[0]})
+
+
+
+class TestABindingNeedsARouter(Base):
+    """A room binding with no task-event handler sends that room's work to the
+    core instead — silently, while the binding claims otherwise. Creation must
+    refuse BEFORE any of the four side effects, not report success."""
+
+    def test_binding_a_room_without_a_handler_is_refused(self):
+        os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli("--room", ROOM)
+        self.assertEqual(rc, cw.REFUSED)
+        self.assertIn("task-event handler", err.getvalue())
+
+    def test_the_refusal_leaves_no_side_effects(self):
+        os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli("--room", ROOM)
+        self.assertEqual([], self.spawned, "a worker was spawned before the refusal")
+        for leftover in ("deliveries", "state/workers"):
+            d = self.ws / leftover
+            self.assertFalse(d.is_dir() and any(d.iterdir()),
+                             f"{leftover} gained an entry despite the refusal")
+
+    def test_a_non_executable_handler_is_refused_and_named(self):
+        dud = self.ws / "not-exec.py"
+        dud.write_text("#!/usr/bin/env python3\n")
+        dud.chmod(0o644)
+        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(dud)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli("--room", ROOM)
+        self.assertEqual(rc, cw.REFUSED)
+        self.assertIn("not executable", err.getvalue())
+
+    def test_an_unbound_worker_needs_no_handler(self):
+        # The control: the gate is about ROUTING, so it must not block a worker
+        # that has no room to route. Without this the fix could be a blanket ban.
+        os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        self.assertEqual(self.run_cli("--label", "unbound"), 0)
+
+    def test_a_handler_present_allows_the_binding(self):
+        self.assertEqual(self.run_cli("--room", ROOM), 0)
 
 
 if __name__ == "__main__":

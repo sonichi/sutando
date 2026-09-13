@@ -78,6 +78,18 @@ def preflight(workspace, repo, room: str) -> None:
         raise Refused("this checkout writes ONE watcher sentinel for every "
                       "watcher, so a second watcher would erase the core's "
                       "stamp — see #3875")
+    if room is not None:
+        # Publishing a binding with no router sends that room's work to the
+        # core instead — silently, and the binding says otherwise.
+        handler = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if not handler or not os.access(handler, os.X_OK):
+            raise Refused(
+                "binding a room needs the core's task-event handler: set "
+                "SUTANDO_TASK_EVENT_HANDLER to an executable and re-arm the "
+                "core's watcher with it, then retry. Creating an unbound "
+                "worker (no --room) does not need one."
+                + (f" (it names {handler!r}, which is not executable)"
+                   if handler else ""))
 
 
 def compile_with(workspace, worker_id: str, label: str, room) -> dict:
