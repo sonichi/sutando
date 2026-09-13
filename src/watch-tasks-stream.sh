@@ -272,8 +272,8 @@ if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HAND
       fi
       echo "watch-tasks-stream: REFUSING to start: $reason; $why." >&2
       echo "  Bound rooms would be answered by this core instead of their workers." >&2
-      echo "  Fix: export SUTANDO_TASK_EVENT_HANDLER=<checkout>/skills/worker-pool/scripts/pool_route_handler.py" >&2
-      echo "  (the checkout that carries the pool) and start the watcher again; or set" >&2
+      echo "  Fix: export SUTANDO_TASK_EVENT_HANDLER=<your pool route handler: pool_route_handler.py," >&2
+      echo "  from the checkout that carries the pool>, then start the watcher again; or set" >&2
       echo "  SUTANDO_ALLOW_UNROUTED_BINDINGS=1 to run without routing on purpose." >&2
       exit 78
     fi
