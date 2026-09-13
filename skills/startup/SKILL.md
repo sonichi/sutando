@@ -10,7 +10,26 @@ The canonical entry point for a fresh Sutando session. Bundles every action that
 
 **Usage**: `/startup`
 
-ARGUMENTS: $ARGUMENTS (currently unused — reserved for future per-instance overrides)
+ARGUMENTS: $ARGUMENTS — `--worker` selects the worker bootstrap below; empty is the canonical core.
+
+## Worker mode (`/startup --worker`)
+
+A pool worker is an instance, not the canonical core. It shares the host's workspace but owns exactly one thing: the watcher on its own delivery folder. **When `$ARGUMENTS` contains `--worker`, run ONLY the sequence in this section and none of the steps below it** — no orphan check (the core owns `tasks/`), no cron registration (a second registrant duplicates every scheduled fire), no ceremony gate (it stamps the core's `schedule-crons-stamp.json`), and no `/startup complete` line.
+
+1. Ask whether this instance's own watcher is already live. **The core's step 1.5 gate is the wrong question here** — it is satisfied by *any* watcher tree on the host, and the core's own always satisfies it, so a worker that consults it never starts the watcher it exists to run:
+
+   ```bash
+   python3 "$SUTANDO_WORKER_BOOTSTRAP"
+   ```
+
+   The gate belongs to the optional `worker-pool` skill, not to this one, so it is **named by the spawner in the session's env** and never spelled as a path here — a core install without that skill must still boot. If `$SUTANDO_WORKER_BOOTSTRAP` is unset or names no file, treat it as `unknown`: say so and start nothing.
+
+   It answers about THIS instance's sentinel (`util_paths.watcher_sentinel_path`, the same file the watcher stamps) in the assigned workspace — read from the `SUTANDO_WORKSPACE_DIR` variable the spawner sets and the watcher honours, so gate and watcher can never inspect two trees — and prints one word: `start`, `skip`, or `unknown`.
+
+2. On `start` only, start the streaming watcher via the `Monitor` tool — `command: 'bash src/watch-tasks-stream.sh "$SUTANDO_TASKS_DIR"'` (the inbox is named in the argv, not left to env: the bootstrap's ownership check reads the watched inbox from the process's command line, and a watcher that does not name it cannot be told from another worker's), `persistent: true`, `description: 'Worker task watcher'`. It reads `$SUTANDO_TASKS_DIR`, which the spawner set to this worker's delivery folder. On `skip`, do nothing. On `unknown` (rc 2) do NOT start one and say why: a duplicate watcher on the same folder processes every delivery twice.
+
+3. Report one line — `worker <instance> ready: watching <inbox>` — and wait for deliveries.
+
 
 ## What this replaces
 
