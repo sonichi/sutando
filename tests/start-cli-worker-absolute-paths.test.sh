@@ -49,8 +49,8 @@ spaced="$(printf '%s\n' "-e" "SUTANDO_WATCHER_CMD=/Library/Application Support/x
 [ "$(env_value "$spaced" SUTANDO_WATCHER_CMD)" = "SUTANDO_WATCHER_CMD=/Library/Application Support/x/src/watch-tasks-stream.sh" ]
 check $? "a value containing spaces survives the parse whole"
 
-# "No runnable interpreter" must mean the same thing on every platform, so the
-# fixture PATH is the real one minus any python, not a macOS CLT stub.
+# resolve_python also probes <repo>/../runtime/python absolutely, which a PATH
+# fixture cannot close: absence needs a launcher copy with no runtime/ sibling.
 mkdir -p "$TMP/noclt"
 for _d in /usr/bin /bin; do
   [ -d "$_d" ] || continue
@@ -60,8 +60,15 @@ for _d in /usr/bin /bin; do
     [ -e "$TMP/noclt/$_b" ] || ln -s "$_f" "$TMP/noclt/$_b" 2>/dev/null
   done
 done
+NOPY_REPO="$TMP/norepo/sutando"
+mkdir -p "$NOPY_REPO/src/agent/claude/cli" "$NOPY_REPO/src/agent" "$NOPY_REPO/scripts"
+cp "$STARTCLI" "$NOPY_REPO/src/agent/claude/cli/start-cli.sh"
+cp "$REPO/scripts/python-binary.sh" "$NOPY_REPO/scripts/" 2>/dev/null
+for _dep in "$REPO/src/agent"/*.sh; do [ -f "$_dep" ] && cp "$_dep" "$NOPY_REPO/src/agent/"; done
+[ -d "$TMP/norepo/runtime/python" ] && { echo "  fixture invalid: a runtime/ sibling exists"; exit 1; }
 noclt_env="$(env -i HOME="$HOME" PATH="$TMP/noclt" \
-    SUTANDO_INSTANCE_ID=w-test bash "$STARTCLI" --print-core-env 2>/dev/null)"
+    SUTANDO_INSTANCE_ID=w-test bash "$NOPY_REPO/src/agent/claude/cli/start-cli.sh" \
+    --print-core-env 2>/dev/null)"
 noclt_py="$(env_value "$noclt_env" SUTANDO_PY)"
 noclt_watcher="$(env_value "$noclt_env" SUTANDO_WATCHER_CMD)"
 echo "  no-interpreter worker: py=${noclt_py:-<absent>} watcher=${noclt_watcher:+present}"
