@@ -16,20 +16,35 @@ function write(logPath, row) {
   } catch { /* forensics must never break a publish */ }
 }
 
-/** A Set-Cookie clears a cookie when it empties the value or dates it in the past. */
+/**
+ * A Set-Cookie clears a cookie when it empties the value or dates it in the past.
+ * The reason is set by whichever rule actually fired, not re-derived from the
+ * value afterward — a quoted-empty value and a bare Max-Age=0 both cleared but
+ * were misreported as 'past-expiry' when the reason was inferred separately.
+ */
 export function isClearing(setCookieLine) {
   const [pair, ...attrs] = setCookieLine.split(';').map((s) => s.trim());
   const eq = pair.indexOf('=');
   const name = eq === -1 ? pair : pair.slice(0, eq);
   const value = eq === -1 ? '' : pair.slice(eq + 1);
   if (!AUTH.includes(name)) return null;
-  let clearing = value === '' || value === '""';
+  let reason = (value === '' || value === '""') ? 'empty-value' : null;
   for (const a of attrs) {
     const [k, v] = a.split('=').map((s) => s.trim());
-    if (/^max-age$/i.test(k) && Number(v) <= 0) clearing = true;
-    if (/^expires$/i.test(k) && v && new Date(v).getTime() <= Date.now()) clearing = true;
+    if (/^max-age$/i.test(k) && Number(v) <= 0) reason = reason || 'max-age-0';
+    if (/^expires$/i.test(k) && v && new Date(v).getTime() <= Date.now()) reason = reason || 'past-expiry';
   }
-  return clearing ? { name, reason: value === '' ? 'empty-value' : 'past-expiry' } : null;
+  return reason ? { name, reason } : null;
+}
+
+/** origin+pathname only — a query string on an auth endpoint routinely carries a token. */
+function urlWithoutQuery(url) {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname;
+  } catch {
+    return url.split('?')[0].slice(0, 200);
+  }
 }
 
 /**
@@ -71,7 +86,7 @@ export function attachCookieForensics(ctx, logPath) {
             event: 'auth-cookie-cleared',
             cookie: hit.name,
             how: hit.reason,
-            by_url: res.url().slice(0, 200),
+            by_url: urlWithoutQuery(res.url()),
             status: res.status(),
           });
         }
