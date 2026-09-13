@@ -24,6 +24,20 @@ exec 9>&1
 
 set -u
 
+# Defined above the runner because the runner is where a worker can put its name
+# down BEFORE the handler publishes the result that record attributes.
+record_worker_done() {
+  local task_id="${1%.txt}" stage="$2" ws="$3"
+  # Only a pool recipient has a claim to record, and the core cannot locate the
+  # writer: its spawner injects one, so unset means "not a worker", not an error.
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
+  [ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
+  [ -x "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
+  "$SUTANDO_POOL_DELIVERY_SCRIPT" \
+    --workspace "$ws" --recipient "$SUTANDO_INSTANCE_ID" \
+    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
+}
+
 if [ "${1:-}" = "--handler-runner" ]; then
   handler="$2"
   runtime="$3"
@@ -33,13 +47,21 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
-  if "$handler" \
+  # `pending` before the result so a result the drain can see always has
+  # attribution beside it; an injected-but-broken writer fails the task instead.
+  if ! record_worker_done "$filename" pending "$workspace"; then
+    echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
+    handler_rc=1
+  elif "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
       --task-file "$task_path" \
       --results-dir "$results" \
       --repo "$repo" >/dev/null; then
     handler_rc=0
+    # Promote only after the result is visible: `.flag` is the sole stage the
+    # sweep retires on, so it must never precede the thing it attributes.
+    record_worker_done "$filename" done "$workspace" || handler_rc=1
   else
     handler_rc=$?
   fi
