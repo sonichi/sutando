@@ -21,35 +21,25 @@ resolve_inbox_entry() {
 		echo "watch-tasks-stream: SUTANDO_INBOX_RESOLVER names no executable ($SUTANDO_INBOX_RESOLVER); refusing to dispatch $entry unresolved" >&2
 		return 3
 	fi
-	# Two explicit branches, not an optionally-empty array: `"${arr[@]}"` on an
-	# empty array raises "unbound variable" under `set -u` on bash < 4.4.
-	if command -v timeout >/dev/null 2>&1; then
-		out="$(timeout "$SUTANDO_INBOX_RESOLVER_TIMEOUT" "$SUTANDO_INBOX_RESOLVER" "$entry" 2>/dev/null)"
-		rc=$?
-	else
-		# No GNU timeout on this host (e.g. macOS's shipped /bin): bound it by
-		# hand, a background killer racing the resolver, so this path is not
-		# "bounded" in name only.
-		out_file="$(mktemp)"
-		"$SUTANDO_INBOX_RESOLVER" "$entry" > "$out_file" 2>/dev/null &
-		resolver_pid=$!
-		# The sleep runs in the BACKGROUND of the watchdog under a TERM trap: bash
-		# defers a signal while a foreground child runs, so a foreground sleep made
-		# `wait "$watchdog_pid"` below stall every successful resolution to the full
-		# deadline. TERM then KILL, because a resolver that traps TERM is otherwise
-		# unbounded -- the same escalation the startup reaper uses.
-		( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
-		  sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT" & _s=$!; wait "$_s"
-		  kill -TERM "$resolver_pid" 2>/dev/null; sleep 1
-		  kill -KILL "$resolver_pid" 2>/dev/null ) &
-		watchdog_pid=$!
-		wait "$resolver_pid" 2>/dev/null
-		rc=$?
-		kill -TERM "$watchdog_pid" 2>/dev/null
-		wait "$watchdog_pid" 2>/dev/null
-		out="$(cat "$out_file" 2>/dev/null)"
-		rm -f "$out_file"
-	fi
+	# One bounding path, never `timeout` when available: `timeout` with no
+	# kill-after leaves a TERM-resistant resolver unbounded, and only one branch runs per host.
+	out_file="$(mktemp)"
+	"$SUTANDO_INBOX_RESOLVER" "$entry" > "$out_file" 2>/dev/null &
+	resolver_pid=$!
+	# The sleep runs in the watchdog's BACKGROUND under a TERM trap: bash defers a
+	# signal while a foreground child runs, which stalled every resolution.
+	( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
+	  sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT" & _s=$!; wait "$_s"
+	  # TERM then KILL: a resolver that traps TERM is otherwise unbounded.
+	  kill -TERM "$resolver_pid" 2>/dev/null; sleep 1
+	  kill -KILL "$resolver_pid" 2>/dev/null ) &
+	watchdog_pid=$!
+	wait "$resolver_pid" 2>/dev/null
+	rc=$?
+	kill -TERM "$watchdog_pid" 2>/dev/null
+	wait "$watchdog_pid" 2>/dev/null
+	out="$(cat "$out_file" 2>/dev/null)"
+	rm -f "$out_file"
 	# First line only, and it must BE a file: a resolver that printed a banner
 	# ahead of its answer has not answered, and must not pass as one.
 	resolved="$(printf '%s\n' "$out" | head -1)"

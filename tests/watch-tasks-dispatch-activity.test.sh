@@ -31,10 +31,8 @@ grep -q "transition RUNNING" "$log" 2>/dev/null && echo "PASS RUNNING follows th
 grep -q "transition QUEUED" "$log" 2>/dev/null && { echo "FAIL emit_dispatch_task_file must not re-mark QUEUED"; fail=1; } || echo "PASS QUEUED is dispatch_task's, not the emitter's"
 rm -rf "$tmp"
 
-# Behaviour, not text: a resolved entry's QUEUED transition must key on the
-# real payload, not the sentinel basename would resolve to (kewei, #4238
-# review) -- a structural grep for the argument NAME cannot tell a correct
-# variable from a reverted one, since both are simple `"$var"` references.
+# Behaviour, not text: a grep for the argument NAME cannot tell the resolved
+# variable from a reverted one -- both are plain `"$var"`. Assert the row.
 tmp2="$(mktemp -d)"; log2="$tmp2/bus.log"
 cat > "$tmp2/py" << PY
 #!/usr/bin/env bash
@@ -50,10 +48,8 @@ resolver="$tmp2/resolver.sh"
 printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$payload" > "$resolver"; chmod +x "$resolver"
 outfile="$tmp2/sweep.out"
 set -m
-# SUTANDO_PY, not SUTANDO_PY_BIN: watch-tasks-stream.sh resolves its own
-# SUTANDO_PY_BIN from require_python() at startup (line ~100) and overwrites
-# whatever the caller exported, so that name is not the override channel for
-# a live watcher process -- only resolve_python()'s SUTANDO_PY check is.
+# SUTANDO_PY, not SUTANDO_PY_BIN: the watcher re-resolves SUTANDO_PY_BIN at
+# startup and overwrites the caller's, so only SUTANDO_PY overrides it.
 SUTANDO_INBOX_RESOLVER="$resolver" SUTANDO_WORKSPACE_DIR="$ws" \
   SUTANDO_RESULTS_DIR="$ws/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp2/py" \
   bash "$SRC/watch-tasks-stream.sh" "$inbox" > "$outfile" 2>"$tmp2/sweep.err" &
@@ -71,13 +67,11 @@ case "$queued_line" in
 esac
 rm -rf "$tmp2"
 
-# Behaviour: a required handler that fails publishes the scheduler's FAILED, and
-# that row must key on the resolved payload too -- publish_terminal_failure used
-# to re-derive $TASKS_DIR/$filename, the sentinel (kewei, #4238 round 5).
+# A failing required handler publishes FAILED, and that row must name the
+# resolved payload: the failure path used to re-derive the sentinel instead.
 tmp3="$(mktemp -d)"; log3="$tmp3/bus.log"
-# A pass-through SPY, not a stub: the failure path needs the real interpreter for
-# util_paths.py (the sentinel) and the claim helpers before it ever reaches
-# activity_bus.py; a stub that swallows those never publishes a failure at all.
+# A pass-through spy, not a stub: the failure path needs the real interpreter
+# first, and a stub that swallows those calls never publishes a failure at all.
 cat > "$tmp3/py" << PY
 #!/usr/bin/env bash
 case " \$* " in *activity_bus.py*) printf '%s\n' "\$*" >> "$log3"; exit 0 ;; esac

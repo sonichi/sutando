@@ -10,9 +10,8 @@
 # alive for the lifetime of the CLI session.
 #
 # Output format per event:
-#   TASK_FILE: <basename>
-# Plus an INITIAL_SCAN block at startup for any pre-existing files:
-#   TASK_FILE: <basename>  (one per line)
+#   TASK_FILE: <name>   a basename, or an ABSOLUTE path when a resolver is set.
+#   INITIAL_SCAN block at startup for pre-existing files, same shape.
 #
 # The agent reads the named files via the Read tool when notifications
 # arrive — no need to inline file contents in stdout (Monitor's 200ms

@@ -74,29 +74,25 @@ unset SUTANDO_INBOX_RESOLVER_TIMEOUT
 [ "$rc" = "3" ] && [ -z "$out" ] && [ "$elapsed" -lt 10 ]
 check $? "a hanging resolver is bounded, not left to block the watcher forever (elapsed ${elapsed}s)"
 
-# 2d/2e. The hand-rolled watchdog, FORCED (a PATH holding only the tools the
-#     resolver needs and no `timeout`), so both branches are measured on every
-#     host -- a fallback exercised only where GNU timeout is absent is green on
-#     CI and red on the real install (kewei, #4238 round 4).
-NOBIN="$TMP/nobin"; mkdir -p "$NOBIN"
-for t in sleep cat mktemp head rm printf sh; do b="$(command -v "$t" 2>/dev/null)"; [ -n "$b" ] && ln -s "$b" "$NOBIN/$t"; done
+# 2d/2e. The bound itself, on the one path production takes: a fast resolver
+#     must not wait for the deadline, and a TERM-resistant one must still die.
 export SUTANDO_INBOX_RESOLVER="$GOOD" SUTANDO_INBOX_RESOLVER_TIMEOUT=3
 start=$(date +%s)
-out="$(PATH="$NOBIN" resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 elapsed=$(( $(date +%s) - start ))
 [ "$rc" = "0" ] && [ "$out" = "$PAYLOAD" ] && [ "$elapsed" -le 1 ]
-check $? "fallback watchdog: a fast resolver returns at once, not at the deadline (elapsed ${elapsed}s of 3)"
+check $? "bounded: a fast resolver returns at once, not at the deadline (elapsed ${elapsed}s of 3)"
 STUBBORN="$(mk stubborn.sh "#!/bin/sh
 trap '' TERM
 sleep 30
 printf '%s\\n' \"$PAYLOAD\"")"
 export SUTANDO_INBOX_RESOLVER="$STUBBORN" SUTANDO_INBOX_RESOLVER_TIMEOUT=1
 start=$(date +%s)
-out="$(PATH="$NOBIN" resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
+out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 elapsed=$(( $(date +%s) - start ))
 unset SUTANDO_INBOX_RESOLVER_TIMEOUT
 [ "$rc" = "3" ] && [ -z "$out" ] && [ "$elapsed" -le 4 ]
-check $? "fallback watchdog: a resolver that ignores TERM is KILLed at the deadline, not left running (elapsed ${elapsed}s of 1+1)"
+check $? "bounded: a resolver that ignores TERM is KILLed at the deadline, not left running (elapsed ${elapsed}s of 1+1)"
 
 # 3. A banner ahead of the answer is not the answer — the first line must BE a
 #    file, or noise passes as a verdict.

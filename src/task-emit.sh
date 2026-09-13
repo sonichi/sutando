@@ -11,9 +11,8 @@
 # The scheduler owns the task's lifecycle: QUEUED when the file lands, RUNNING once a live core was
 # told, CANCELLED for the task a CANCEL_INSTRUCTION names. Through the activity bus (state, then rows),
 # fire-and-forget: it can neither delay nor fail the emit, and it is inert when TASKS_DIR is unset.
-# `$2` may be a bare basename (joined to TASKS_DIR, as always) OR an absolute
-# path from a resolved inbox entry — an entry resolution moved out of
-# TASKS_DIR must not be silently rejoined to it and read as missing.
+# `$2` is a basename (joined to TASKS_DIR) or an absolute resolved path: rejoining
+# an absolute one to TASKS_DIR would read an existing payload as missing.
 _activity_task_file() {
 	case "$1" in
 		/*) printf '%s\n' "$1" ;;
