@@ -6,7 +6,6 @@ import hashlib
 import re
 from typing import Dict, List, Optional, Tuple
 
-from .host import device_host
 from .schema import Action, HumanRequirement
 
 SOURCE = "tui"
@@ -131,15 +130,10 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
     subject["option_for_action"] = option_for_action
-    # `name` is the tmux session, identical on every host; `host` says which machine.
-    device = {"id": session, "name": session}
-    host = device_host()
-    if host:
-        device["host"] = host
     return HumanRequirement(
         kind=kind, runtime="claude", message=message, title=title,
         guard=guard_for(session, prompt, state),
-        device=device,
+        device={"id": session, "name": session},
         actions=actions + [_open_terminal()],
         subject=subject,
     )

@@ -19,7 +19,6 @@ from typing import Dict, List, Optional
 
 from workspace_default import resolve_workspace
 
-from .host import device_host
 from .manager import HitlManager
 from .schema import (
     STATUS_IN_PROGRESS,
@@ -62,11 +61,8 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
         "choice": f"{runtime} is asking you a question",
     }.get(ev.get("kind"), f"{runtime} is waiting on something in its terminal")
     # The session keys dedup, the jump and (with its socket) the driver's action
-    # file; `host` only tells a reader which machine that is.
+    # file on a click; the host label is added at the wire (schema.wire_device).
     device = {"id": session, "name": session, "socket": str(ev.get("socket") or "")}
-    host = device_host()
-    if host:
-        device["host"] = host
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,
