@@ -219,12 +219,21 @@ claim_disposition() {
 
 # 0 = the task is settled (failure published, or a real answer already exists).
 # 1 = NOT settled: another writer may own the destination, so nothing was touched.
+# One place for "this delivery is over", so every terminal publication settles the
+# record rather than each call site remembering to.
+settle_worker_record() {
+  record_worker_done "$1" done "$WORKSPACE_DIR" || true
+}
+
 publish_terminal_failure() {
   local filename="$1" reason="$2" result temporary rc
   result="$RESULTS_DIR/$filename"
   # The shared readiness contract, not -f/-s: an empty OR whitespace-only body
   # is the undeliverable placeholder state and must not suppress this failure.
-  handler_result_exists "$filename" && return 0
+  if handler_result_exists "$filename"; then
+    settle_worker_record "$filename"
+    return 0
+  fi
   mkdir -p "$RESULTS_DIR"
   temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
   chmod 600 "$temporary" 2>/dev/null || true
@@ -242,6 +251,9 @@ publish_terminal_failure() {
     rc=1
   fi
   rm -f "$temporary"
+  # A terminal publication settles the delivery, so the record must reach its
+  # published stage or `residue` reads `completed` forever and nothing retires it.
+  [ "$rc" -eq 0 ] && settle_worker_record "$filename"
   return "$rc"
 }
 
