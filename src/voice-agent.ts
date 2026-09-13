@@ -32,6 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { notify as platformNotify } from './platform.js';
 import { inlineTools, personalSkillSetups } from './inline-tools.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -39,11 +40,20 @@ import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
+	if (process.platform === 'win32') {
+		console.warn(
+			`[voice-agent] running on ${process.platform} — voice + screen capture + clipboard ` +
+			`work, but AppleScript-driven tools (switch_app, type_text, slide_control, etc.) ` +
+			`will return macOSOnly errors. See README "Windows support" section.`,
+		);
+		return;
+	}
 	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
-		console.error('Sutando requires macOS');
+		console.error('Sutando requires macOS or Windows');
 		process.exit(1);
 	}
 }
@@ -74,7 +84,7 @@ import {
 	type AgentStateV1,
 } from './voice-agent-state.js';
 
-import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath, voiceMemoryProjectSlug } from './util_paths.js';
 import { nextConnectingTick } from './voice-connect-watchdog.js';
 import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
 import { WatchdogLedger } from './voice-watchdog-ledger.js';
@@ -242,7 +252,10 @@ function acquirePidLock(): void {
 		// writer — a second writer implementation would reopen the lock races
 		// the guarded helper exists to close.
 		console.error(`${ts()} [Startup] FATAL: cannot resolve a usable python3 for the voice lock helper — ${py.detail}`);
-		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
+		const fix = process.platform === 'win32'
+			? 'install Python from python.org so python or py -3 works, or set SUTANDO_PY'
+			: 'install python3 (brew install python), set SUTANDO_PY, or run xcode-select --install';
+		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: ${fix}. Exiting.`);
 		process.exit(1);
 	}
 	try { mkdirSync(join(WORKSPACE_DIR, 'state', 'locks'), { recursive: true }); } catch { /* acquire fails closed below */ }
@@ -455,15 +468,21 @@ function applyModeRequest() {
 }
 setInterval(applyModeRequest, 1_000);
 
-// Detect active meeting on startup — sync so it runs before first greeting
+// Detect active meeting on startup — sync so it runs before first greeting.
+// Skips on non-macOS: pgrep + osascript aren't available on Windows, and the
+// Zoom meeting-detection heuristic is macOS-shaped (process.zoom.us + window
+// count via System Events). Windows would need a different probe; left as a
+// follow-up.
 try {
-	const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-	if (zoomRunning) {
-		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-		if (parseInt(inMeeting) >= 2) {
-			meetingActive = true;
-			voiceWatchdogShadow.noteMeetingMode(true);
-			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+	if (process.platform === 'darwin') {
+		const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+		if (zoomRunning) {
+			const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+			if (parseInt(inMeeting) >= 2) {
+				meetingActive = true;
+				voiceWatchdogShadow.noteMeetingMode(true);
+				console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+			}
 		}
 	}
 } catch { /* no zoom */ }
@@ -820,7 +839,7 @@ function bootstrapMemoryDir(): void {
 	// Claude Code keys its project dir on the REPO it was launched in, not on the
 	// workspace. Passing WORKSPACE_DIR derives a slug no project dir ever has, so
 	// this silently created an empty memory dir beside the real one.
-	const slug = claudeProjectSlug(dirname(_voiceAgentDir).replace(/\/$/, ''));
+	const slug = voiceMemoryProjectSlug(_voiceAgentDir);
 	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
@@ -982,9 +1001,7 @@ async function main() {
 		voiceNotifiedCategories.clear();
 		console.log(`${ts()} [VoiceRecovered] ACTIVE after ${had} — notifying owner + re-arming alerts`);
 		try {
-			execFileSync('osascript', ['-e',
-				`display notification "${formatVoiceRecoveryNotification(new Date())}" with title "Sutando — voice online"`,
-			], { stdio: 'ignore' });
+			platformNotify(formatVoiceRecoveryNotification(new Date()), 'Sutando — voice online');
 		} catch {}
 	};
 
@@ -1387,14 +1404,12 @@ async function main() {
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
-			// OS notification — visible even if no browser tab is open.
-			// execFileSync avoids the shell entirely, so no sanitization of
-			// single-quotes or other shell metacharacters is needed. The
-			// double-quote stripping below protects the AppleScript string
-			// literal itself (not the shell).
+			// OS notification — visible even if no browser tab is open. Routed
+			// through the cross-platform platform.notify helper (osascript on
+			// macOS, PowerShell balloon-tip on Windows, notify-send on Linux).
 			try {
 				const safe = formatVoiceOfflineNotification(c.userMessage, new Date());
-				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
+				platformNotify(safe, 'Sutando — voice offline');
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {
@@ -1482,7 +1497,7 @@ async function main() {
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).
-	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
+	const liveTranscriptPath = VOICE_TRANSCRIPT_PATH;
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;

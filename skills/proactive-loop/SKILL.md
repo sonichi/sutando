@@ -19,6 +19,7 @@ caps this file and refuses date stamps in it).
 1. `/schedule-crons` — registers the session crons and stamps them.
 2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
 
@@ -45,6 +46,9 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
+   When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
+   `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
+   archive their own claims.
    Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"` (1 = a task got no result).
 2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
    when voice is connected, plus a macOS notification.

@@ -593,14 +593,14 @@ class TestAuthorityBoundaries(unittest.TestCase):
     def test_reenrollment_during_lock_wait_uses_fresh_identity(self):
         # TOCTOU control: identity is snapshotted INSIDE the transaction — a
         # mutation that waited out a re-enrollment must act as the NEW Stand
-        import fcntl
         import threading
+        from file_lock import lock_fd, unlock_fd
         self._enroll()
         self._verify()
         lock_path = self.el.links_path(self.state).with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         holder = open(lock_path, "w")
-        fcntl.flock(holder, fcntl.LOCK_EX)  # external holder blocks mutators
+        lock_fd(holder.fileno())
         result = {}
 
         def mutate():
@@ -617,7 +617,7 @@ class TestAuthorityBoundaries(unittest.TestCase):
         # re-enroll as a DIFFERENT Stand while the mutator waits
         (self.state / "auth" / "ag2space.json").write_text(
             json.dumps({"agent_id": "@stand-b:x"}))
-        fcntl.flock(holder, fcntl.LOCK_UN)
+        unlock_fd(holder.fileno())
         holder.close()
         t.join(timeout=10)
         # fresh snapshot = Stand B; the discord row belongs to the ORIGINAL

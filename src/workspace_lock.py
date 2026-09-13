@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 import socket
@@ -64,6 +63,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from file_lock import lock_fd, unlock_fd  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_STALE_SECONDS = 90  # same freshness window as state/cores/<host>.alive
@@ -99,7 +100,7 @@ def _lock_path(workspace: Path, role: str) -> Path:
 @contextlib.contextmanager
 def _guard(workspace: Path, role: str):
     """Serialize a lock's read-decide-write critical section with an exclusive
-    `fcntl.flock` on a persistent sidecar guard file (never unlinked). This is
+    advisory lock on a persistent sidecar guard file (never unlinked). This is
     what makes reap+acquire and heartbeat mutually exclusive, closing the
     heartbeat-overwrites-a-freshly-reaped-owner race: a slow holder that resumes
     into heartbeat() cannot interleave between another process's reap and
@@ -109,11 +110,11 @@ def _guard(workspace: Path, role: str):
     gp = _locks_dir(workspace) / f"{role}.lock.guard"
     fd = os.open(str(gp), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_fd(fd)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_fd(fd)
         finally:
             os.close(fd)
 

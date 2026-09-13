@@ -13,7 +13,6 @@ Run: python3 tests/health-check-bridge-log-content.test.py
 """
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -111,23 +110,11 @@ check("discord healthy log → no override", result8 is None)
 # them no-op safely, which is what we want here) and points WORKSPACE_DIR /
 # claude_home_path at a temp tree so the log content is fully controlled.
 
-_orig_subprocess_run = subprocess.run
-
-
-def _fake_pgrep_slack(cmd, *args, **kwargs):
-    if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "/usr/bin/pgrep" and "slack-bridge" in cmd[2]:
-        class _Result:
-            returncode = 0
-            stdout = "999999\n"
-        return _Result()
-    return _orig_subprocess_run(cmd, *args, **kwargs)
-
-
 def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
     with tempfile.TemporaryDirectory() as tmpws, tempfile.TemporaryDirectory() as tmphome:
         tmpws = Path(tmpws)
         (tmpws / "logs").mkdir(parents=True)
-        (tmpws / "logs" / "slack-bridge.log").write_text(log_contents)
+        (tmpws / "logs" / "slack-bridge.log").write_text(log_contents, encoding="utf-8")
         channel_dir = Path(tmphome) / "channels" / "slack"
         channel_dir.mkdir(parents=True)
         (channel_dir / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
@@ -144,7 +131,7 @@ def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
 
         with patch.object(hc, "WORKSPACE_DIR", tmpws), \
              patch.object(hc, "claude_home_path", side_effect=_fake_chp), \
-             patch.object(subprocess, "run", side_effect=_fake_pgrep_slack):
+             patch.object(hc, "probe_pids", return_value=(["999999"], True)):
             checks = hc.run_all_checks()
         return next((c for c in checks if c["name"] == "slack-bridge"), None)
 

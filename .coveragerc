@@ -18,12 +18,31 @@ sigterm = True
 # instead of inheriting (fork) or losing (spawn/forkserver) the parent's.
 concurrency = multiprocessing
 source =
+    hooks
+    packages/ag2-sparrow
     src
     scripts
     skills
 
 omit =
     tests/*
+    # These package files are byte-for-byte generated from canonical src/
+    # modules; tests/ag2-sparrow-drift.test.py enforces the mapping.
+    packages/ag2-sparrow/ag2_sparrow/task_archive.py
+    packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py
+    packages/ag2-sparrow/ag2_sparrow/result_markers.py
+    packages/ag2-sparrow/ag2_sparrow/result_ready.py
+    packages/ag2-sparrow/ag2_sparrow/dedup_recovery.py
+    packages/ag2-sparrow/ag2_sparrow/file_lock.py
+    packages/ag2-sparrow/ag2_sparrow/workspace_lock.py
+    packages/ag2-sparrow/ag2_sparrow/chat_secret_filter.py
+    packages/ag2-sparrow/ag2_sparrow/team_result_guard.py
+    packages/ag2-sparrow/ag2_sparrow/team_guardrail.py
+    packages/ag2-sparrow/ag2_sparrow/vault_set_grammar.py
+    packages/ag2-sparrow/ag2_sparrow/send_failure_policy.py
+    packages/ag2-sparrow/ag2_sparrow/proactive_recovery.py
+    packages/ag2-sparrow/ag2_sparrow/outbox.py
+    packages/ag2-sparrow/ag2_sparrow/outbox_adapter.py
     */node_modules/*
     */.venv/*
     */venv/*

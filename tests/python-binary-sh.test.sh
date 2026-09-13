@@ -2,15 +2,17 @@
 # Contract test for scripts/python-binary.sh — the shell twin of
 # src/python-binary.ts and src/git_binary.py.
 #
-# The rule being pinned: NEVER execute a candidate to decide whether it is
-# usable. On a Mac without the Xcode Command Line Tools, /usr/bin/python3 is
-# Apple's stub (one inode hardlinked across 78 names); executing it raises a
+# The macOS rule being pinned: NEVER execute a candidate to decide whether it
+# is usable. On a Mac without the Xcode Command Line Tools, /usr/bin/python3
+# is Apple's stub (one inode hardlinked across 78 names); executing it raises a
 # modal install dialog BEFORE it can fail, so a probe like
 #
 #     "$candidate" -c "pass"
 #
 # is itself the bug. Only `xcode-select -p` is safe — /usr/bin/xcode-select is a
-# real binary, so asking it never prompts.
+# real binary, so asking it never prompts. Windows is intentionally different:
+# its Microsoft Store alias exits without a modal, so a functional probe is
+# required to reject it and fall through to `py` / `python`.
 #
 # Run: bash tests/python-binary-sh.test.sh
 # Exit: 0 = all pass, 1 = failure
@@ -112,6 +114,20 @@ else bad "a stubbed uname cannot flip the platform" "got empty — PATH spoofed 
 
 out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
 check "control: a real Mac with no CLT still refuses the stub" "$out" ""
+
+# --- 5d. Windows: reject Store alias and fall through to py -----------------
+winlab=$(mktemp -d)
+mkdir -p "$winlab/bin"
+printf '#!/bin/sh\necho probed >> "%s/store-probed"\nexit 49\n' "$winlab" > "$winlab/bin/python3"
+printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 0\nexit 1\n' > "$winlab/bin/py"
+chmod +x "$winlab/bin/python3" "$winlab/bin/py"
+out=$(OSTYPE=msys PATH="$winlab/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+check "Windows rejects Store python3 and selects the py launcher" "$out" "$winlab/bin/py"
+if [ -f "$winlab/store-probed" ]; then
+  ok "Windows functionally probes the Store alias before rejecting it"
+else
+  bad "Windows functionally probes the Store alias" "probe did not run"
+fi
 
 # --- 6. bundled runtime beats PATH ------------------------------------------
 lab4=$(mklab)

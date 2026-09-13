@@ -148,7 +148,8 @@ class SelectGitOrdering(unittest.TestCase):
         """The clean-VM case — the whole point of the fix."""
         self.assertIsNone(
             git_binary.select_git(
-                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: False
+                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: False,
+                realpath=lambda p: p,
             )
         )
 
@@ -180,7 +181,8 @@ class SelectGitOrdering(unittest.TestCase):
     def test_shim_with_developer_tools_is_usable(self):
         self.assertEqual(
             git_binary.select_git(
-                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True
+                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True,
+                realpath=lambda p: p,
             ),
             SYSTEM_GIT,
         )
@@ -188,24 +190,44 @@ class SelectGitOrdering(unittest.TestCase):
 
 class PathCandidates(unittest.TestCase):
     def test_returns_every_executable_in_path_order(self):
+        directories = [str(REPO / "fixture-bin-a"), str(REPO / "fixture-bin-b")]
+        executable = [os.path.join(directory, "git") for directory in directories]
         found = git_binary.path_candidates(
-            "git", path_env="/usr/fake/a:/usr/fake/b",
-            is_exec=lambda p: p in ("/usr/fake/a/git", "/usr/fake/b/git"),
+            "git", path_env=os.pathsep.join(directories),
+            is_exec=lambda p: p in executable,
         )
-        self.assertEqual(found, ["/usr/fake/a/git", "/usr/fake/b/git"])
+        self.assertEqual(found, executable)
 
     def test_skips_empty_path_entries(self):
         self.assertEqual(
-            git_binary.path_candidates("git", path_env="::", is_exec=lambda p: False),
+            git_binary.path_candidates(
+                "git", path_env=os.pathsep * 2, is_exec=lambda p: False
+            ),
             [],
         )
 
     def test_skips_non_executables(self):
+        directories = [str(REPO / "fixture-bin-a"), str(REPO / "fixture-bin-b")]
+        executable = os.path.join(directories[1], "git")
         found = git_binary.path_candidates(
-            "git", path_env="/usr/fake/a:/usr/fake/b",
-            is_exec=lambda p: p == "/usr/fake/b/git",
+            "git", path_env=os.pathsep.join(directories),
+            is_exec=lambda p: p == executable,
         )
-        self.assertEqual(found, ["/usr/fake/b/git"])
+        self.assertEqual(found, [executable])
+
+    def test_default_probe_honors_platform_executable_resolution(self):
+        directories = [str(REPO / "fixture-bin-a"), str(REPO / "fixture-bin-b")]
+        calls = []
+
+        def which(name, path):
+            calls.append((name, path))
+            return os.path.join(path, "git.EXE") if path == directories[1] else None
+
+        found = git_binary.path_candidates(
+            "git", path_env=os.pathsep.join(directories), which=which
+        )
+        self.assertEqual(found, [os.path.join(directories[1], "git.EXE")])
+        self.assertEqual(calls, [("git", directory) for directory in directories])
 
 
 class DeveloperToolsProbe(unittest.TestCase):

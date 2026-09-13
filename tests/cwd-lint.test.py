@@ -87,8 +87,8 @@ def check_ts_cwd() -> list[str]:
     # imported at runtime and resolves paths exactly like src/ does.
     ts_files = _scan_files(TS_ROOTS, TS_EXTS)
     for path in ts_files:
-        rel = path.relative_to(REPO)
-        if str(rel) in TS_ALLOWLIST:
+        rel = path.relative_to(REPO).as_posix()
+        if rel in TS_ALLOWLIST:
             continue
         for lineno, line in _non_comment_lines(path):
             if TS_CWD_RE.search(line):
@@ -110,8 +110,8 @@ def check_py_cwd() -> list[str]:
     failures = []
     py_files = _scan_files(PY_ROOTS, PY_EXTS)
     for path in py_files:
-        rel = path.relative_to(REPO)
-        if str(rel) in PY_ALLOWLIST:
+        rel = path.relative_to(REPO).as_posix()
+        if rel in PY_ALLOWLIST:
             continue
         for lineno, line in _non_comment_lines(path):
             if PY_CWD_RE.search(line):

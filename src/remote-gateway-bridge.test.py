@@ -540,27 +540,34 @@ def main() -> int:
     # A string assertion passes even when the named file holds no gateway vars,
     # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
+    import shutil as _shutil
     import subprocess as _sp
     import tempfile as _tf
     _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
                             "scripts", "channel-env.sh")
+    _bash = _shutil.which("bash")
+    if _os.name == "nt" and (_git := _shutil.which("git")):
+        _git_bash = Path(_git).resolve().parent.parent / "bin" / "bash.exe"
+        if _git_bash.is_file():
+            _bash = str(_git_bash)
     def _resolve(files):
-        d = _tf.mkdtemp()
-        ch = _os.path.join(d, "channels", "ag2space")
-        _os.makedirs(ch)
-        for name, body in files.items():
-            with open(_os.path.join(ch, name), "w") as fh:
-                fh.write(body)
-        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
-        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
-        return r.returncode, r.stdout.strip()
+        with _tf.TemporaryDirectory() as d:
+            ch = _os.path.join(d, "channels", "ag2space")
+            _os.makedirs(ch)
+            for name, body in files.items():
+                with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
+                        text=True, env=env, timeout=30)
+            return r.returncode, r.stdout.strip()
     _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
     _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
     rc, got = _resolve({".env": _TOK})
-    check(rc == 0 and got.endswith("/.env"),
+    check(rc == 0 and Path(got).name == ".env",
           "layout A (.env carries the token) resolves to .env")
     rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
-    check(rc == 0 and got.endswith("/relay-client.env"),
+    check(rc == 0 and Path(got).name == "relay-client.env",
           "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
     rc, got = _resolve({".env": _MATRIX})
     check(rc != 0 and not got,

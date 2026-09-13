@@ -65,6 +65,12 @@ from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_platform import (  # noqa: E402
+    find_pids,
+    probe_pids,
+    process_executable as _platform_process_executable,
+    process_snapshot as _platform_process_snapshot,
+)
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -717,12 +723,7 @@ _VAULT_SCANNER_SCRIPTS = {
 def _proc_executable(pid: "str | int") -> "str | None":
     """Executable path of `pid`, or None. `comm` is one field, so a path with
     spaces survives it — argv cannot be split back apart reliably."""
-    try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip() or None
+    return _platform_process_executable(pid)
 
 
 # The script must appear as its own argv token — a `-c` payload that merely
@@ -7595,11 +7596,12 @@ def check_disk_space() -> dict:
     targets = {}
     for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
         try:
-            st = os.statvfs(str(path))
+            device = path.stat().st_dev
+            free_gib = shutil.disk_usage(path).free / (1024 ** 3)
         except OSError as e:
             return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
         # Key by device so the same volume isn't reported twice.
-        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+        targets[device or label] = (label, path, free_gib)
 
     worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
     where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
@@ -7636,8 +7638,19 @@ def _is_ephemeral(target: str) -> bool:
     Equality counts: a link pointing AT the root is as ephemeral as one pointing
     inside it, and a trailing-slash prefix test answers False for exactly that case.
     """
-    t = os.path.normpath(target).rstrip("/") or "/"
-    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+    t = os.path.normcase(os.path.normpath(target))
+    roots = (os.path.normcase(os.path.normpath(r)) for r in _ephemeral_roots())
+    return any(t == r or t.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _is_skill_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        # Directory junctions are mount-point reparse tags, including on Python 3.11.
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError):
+        return False
 
 
 def check_skill_symlinks() -> dict:
@@ -7701,13 +7714,14 @@ def check_skill_symlinks() -> dict:
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if dst.is_symlink() and not dst.exists():
+        is_link = _is_skill_link(dst)
+        if is_link and not dst.exists():
             broken.append(skill_name)
-        elif not dst.exists() and not dst.is_symlink():
+        elif not dst.exists() and not is_link:
             unlinked.append(skill_name)
-        elif dst.is_dir() and not dst.is_symlink():
+        elif dst.is_dir() and not is_link:
             shadowed.append(skill_name)
-        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+        elif (is_link and _is_ephemeral(os.path.realpath(dst))
               and not _is_ephemeral(str(skills_src.resolve()))):
             # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
             # is self-consistent, and another DURABLE clone is a supported layout.
@@ -7725,7 +7739,7 @@ def check_skill_symlinks() -> dict:
         for entry in sorted(skills_dst.iterdir()):
             if entry.name in repo_names:
                 continue
-            if entry.is_symlink() and not entry.exists():
+            if _is_skill_link(entry) and not entry.exists():
                 orphaned.append(entry.name)
     except OSError:
         pass
@@ -8549,12 +8563,7 @@ def _ps_snapshot() -> "str | None":
     a nonzero exit: its empty stdout would otherwise read as a successful scan
     that found nothing, which is the absence callers must not assert.
     """
-    try:
-        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5)
-    except Exception:  # noqa: BLE001
-        return None
-    return done.stdout if done.returncode == 0 else None
+    return _platform_process_snapshot()
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -12602,19 +12611,9 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Anchor on the .py suffix so we don't match unrelated processes
-            # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
-            # name produces false-positive "multiple processes" warnings
-            # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            # rc 1 is the authoritative no-match; any other non-zero exit is a
-            # PROBE ERROR and must not read as "bridge is down".
-            _probe_ok = result.returncode in (0, 1)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-            # A launcher's argv ends with the same script path, so it matches
-            # this pgrep too — see _drop_launcher_parents.
+            # Anchor to the script suffix; find_pids preserves anchors on every OS.
+            # Drop launcher parents so only actual pollers remain.
+            pids, _probe_ok = probe_pids(f"{proc_name}\\.py$")
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []

@@ -726,7 +726,7 @@ def test_classifier_enqueue_is_off_by_default() -> None:
     assert workstreams.classifier_status(active).reason == "active-user-task"
 
 
-def test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open() -> None:
+def test_classifier_source_directory_cache_is_portable_and_rejects_unsafe_entries() -> None:
     missing = Path(tempfile.mkdtemp()) / "missing-workspace"
     directories = workstreams._source_directories(
         missing,
@@ -734,12 +734,19 @@ def test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open() ->
             "source_directories": [
                 None,
                 "../outside",
+                r"C:\outside",
+                r"tasks\archive\2026-08",
+                r"results\archive\2026-08",
                 "results/archive-2026-08-03",
             ],
         },
         discover=True,
     )
     assert "../outside" not in directories
+    assert r"C:\outside" not in directories
+    assert "tasks/archive/2026-08" in directories
+    assert "results/archive/2026-08" in directories
+    assert all("\\" not in value for value in directories)
     assert "results/archive-2026-08-03" in directories
 
 
@@ -1213,7 +1220,9 @@ def test_concurrent_inheritance_keeps_every_assignment() -> None:
             "task_ids": ["task-a1"],
         }],
     })
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context(
+        "spawn" if sys.platform == "win32" else "fork"
+    )
     start = context.Event()
     children = [f"task-child-{index}" for index in range(8)]
     processes = [
@@ -1465,7 +1474,7 @@ def main() -> None:
         test_classifier_enqueue_is_off_by_default,
         test_classifier_task_is_envelope_stamped,
         test_classifier_task_survives_a_raising_stamper,
-        test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
+        test_classifier_source_directory_cache_is_portable_and_rejects_unsafe_entries,
         test_stale_classifier_is_archived_before_replacement,
         test_stale_classifier_is_archived_under_its_pool_assigned_name,
         test_a_worker_held_classifier_claim_is_left_alone,

@@ -315,14 +315,19 @@ def _write_artifact(path: Path, payload: dict) -> bool:
         return True
     fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temporary, path)
+            if os.name == "nt":
+                # Windows rename is atomic and refuses to replace an existing file.
+                os.rename(temporary, path)
+            else:
+                os.link(temporary, path)
         except FileExistsError:
             pass
         return path.is_file()

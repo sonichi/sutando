@@ -67,7 +67,7 @@ skill hook. The hook never depends on the agent remembering anything:
   "closed, no message sent from here", never "replied"; a `[deduped: task-X]` pointer closes it as
   "consolidated" with `task.into` = X's message event id (the reply lives under that message).
 - **Bounded, one writer at a time.** Every append and the rotation that follows it run under one
-  `flock` on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
+  cross-platform advisory lock on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
   sessions write at once. The live log keeps the newest 400 rows (older rows move to
   `agent-activity.archive.<YYYY-MM-DD>.jsonl` by the row's own UTC day), and the session bindings
   file drops a task once its done row exists, so the per-tool-call reads stay small.

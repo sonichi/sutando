@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import weakref
 from pathlib import Path
@@ -663,10 +664,10 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
         urllib.request.urlopen(req, timeout=2).read()
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
-INBOX_DIR = Path("/tmp/discord-inbox")
+INBOX_DIR = Path("/tmp/discord-inbox") if os.name == "posix" else Path(tempfile.gettempdir()) / "discord-inbox"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-INBOX_DIR.mkdir(exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:
@@ -3058,33 +3059,13 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
 
 
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
-    """True iff `sender_id` is listed under the SERVING channel's `collaborators`
-    array in access.json.
-
-    A collaborator is a team-tier sender the owner has designated for
-    substantive engagement in ONE specific channel (see the `team-collaborator`
-    rulebook). Scope is strictly per-channel: membership in some OTHER channel's
-    `collaborators` does NOT carry over — the check keys on the serving channel
-    only. Fail-closed: any malformed config or missing key yields False.
-
-    Pure + side-effect-free so it can be unit-tested directly (the caller lives
-    inside the async Discord handler, which is not independently exercisable).
-    """
-    try:
-        serving_cfg = (access_data.get("groups", {}) or {}).get(str(serving_channel_id), {})
-        if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", []) or []):
-            return True
-    except Exception:
-        pass
-    return False
+    from discord_access import resolve_is_collaborator as resolve
+    return resolve(access_data, sender_id, serving_channel_id)
 
 
 def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
-    """Collaborator status for a TEAM sender, however that tier was reached.
-    Global-allowlist members resolved to team by the tierMap are eligible too."""
-    if access_tier != "team":
-        return False
-    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+    from discord_access import resolve_team_collaborator as resolve
+    return resolve(access_data, access_tier, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3997,7 +3978,6 @@ async def _handle_discord_message(message, force=False):
         )
     else:
         codex_prompt_text = user_task_text
-
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):

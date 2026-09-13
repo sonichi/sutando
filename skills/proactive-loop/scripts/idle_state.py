@@ -5,11 +5,18 @@ Two tools mutate this record; an unlocked read-modify-replace drops one silently
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
 from pathlib import Path
+
+REPO = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "src" / "file_lock.py").is_file()
+)
+sys.path.insert(0, str(REPO / "src"))
+
+from file_lock import locked_file  # noqa: E402
 
 # Returned by a mutate() that declines to write. None is NOT this sentinel, so
 # a mutate that forgets to return cannot silently skip its own write.
@@ -56,18 +63,14 @@ def locked_update(path: Path, mutate, indent: int | None = None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(".json.lock")
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            doc, err = read_state_strict(path)
-            if err is not None:
-                # A parse failure is not authorisation to discard the record.
-                print(f"REFUSED: {path} {err} — not overwriting", file=sys.stderr)
-                return REFUSED
-            result = mutate(doc)
-            if result is ABORT:
-                return ABORT
-            write_state(path, doc, indent=indent)
-            return result
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    with locked_file(lock):
+        doc, err = read_state_strict(path)
+        if err is not None:
+            # A parse failure is not authorisation to discard the record.
+            print(f"REFUSED: {path} {err} — not overwriting", file=sys.stderr)
+            return REFUSED
+        result = mutate(doc)
+        if result is ABORT:
+            return ABORT
+        write_state(path, doc, indent=indent)
+        return result

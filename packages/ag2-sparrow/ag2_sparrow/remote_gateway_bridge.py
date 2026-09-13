@@ -299,6 +299,7 @@ from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
+from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -682,15 +683,15 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
 
 
 def _publish_staged(tmp: Path, path: Path) -> bool:
-    """Rename a staged file into place and fsync the directory entry, so the
-    publication is durable the moment it becomes visible."""
+    """Rename a staged file into place and fsync the directory where supported."""
     try:
         os.replace(tmp, path)
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({exc})")
@@ -2747,12 +2748,13 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 
 
 def _fsync_in_place(tid: str, *targets: Path) -> bool:
-    """fsync files (and directories) already on disk. A pre-durability writer
-    left these bytes uncommitted, so nothing may be claimed durable until this
-    lands; False when it did not."""
+    """Fsync existing files and directories where supported."""
     try:
         for target in targets:
-            fd = os.open(target, os.O_RDONLY)
+            if os.name == "nt" and target.is_dir():
+                continue
+            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+            fd = os.open(target, flags)
             try:
                 os.fsync(fd)
             finally:
@@ -3269,16 +3271,6 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {e} "
              "(delivery unaffected)")
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True  # exists but not signalable — treat as alive
-    return True
 
 
 def _recover_orphan_proactive() -> None:

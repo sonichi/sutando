@@ -16,11 +16,9 @@ threads racing a tier-map-shaped mutation against a thread-group-shaped
 mutation, and asserts BOTH survive. Each mutator sleeps mid-transaction to
 force the threads' critical sections to overlap in time; if `mutate_access_file`
 did not serialize them via `_locked`, the two would race and one mutation
-would be lost. `fcntl.flock` locks are scoped to the *open file description*,
-not the process, so two threads in one process each doing their own
-`os.open()` (which `_locked` always does) are genuinely exclusded from each
-other — this is real mutual exclusion, not merely the GIL serializing Python
-bytecode.
+would be lost. The shared cross-platform lock operates on separately opened
+handles, so this is real mutual exclusion, not merely the GIL serializing
+Python bytecode.
 
 Run: python3 tests/access-store-concurrency.test.py
 Exit: 0 on pass, 1 on fail.

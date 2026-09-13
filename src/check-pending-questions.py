@@ -295,10 +295,13 @@ def notify_macos(count, titles):
     # notification silently reports FAILED (bit us 2026-07-26 — a title
     # containing a quoted phrase broke every fire while it sat in the top 3).
     esc = msg.replace("\\", "\\\\").replace('"', '\\"')
-    r = subprocess.run([
-        "osascript", "-e",
-        f'display notification "{esc}" with title "Sutando"'
-    ], capture_output=True)
+    try:
+        r = subprocess.run([
+            "osascript", "-e",
+            f'display notification "{esc}" with title "Sutando"'
+        ], capture_output=True)
+    except (FileNotFoundError, OSError):
+        return False
     return r.returncode == 0
 
 

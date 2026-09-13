@@ -27,12 +27,14 @@ adapter that already resolves the workspace stays the one that decides. Shape:
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from file_lock import locked_file
 
 ARMED = "armed"
 EXPIRED = "expired"
@@ -45,6 +47,8 @@ PROBE_FAILED = "probe-failed"
 MAX_PINS = 32
 _FIELD_MAX = 500
 _REQUIRED = ("service", "pid", "lstart", "reason", "expires_at")
+_WINDOWS_REPLACE_ATTEMPTS = 50
+_WINDOWS_REPLACE_DELAY_S = 0.01
 
 
 def load_pins(path) -> list:
@@ -108,9 +112,21 @@ def save_pins(path, pins: list) -> None:
     tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
     try:
         tmp.write_text(payload)
-        os.replace(tmp, target)
+        _replace_snapshot(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _replace_snapshot(tmp: Path, target: Path) -> None:
+    """Publish atomically, retrying transient Windows sharing violations."""
+    for attempt in range(_WINDOWS_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt + 1 == _WINDOWS_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(_WINDOWS_REPLACE_DELAY_S)
 
 
 def _load_strict(path) -> list:
@@ -135,12 +151,8 @@ def _locked(path):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.with_name(f".{target.name}.lock")
-    with open(lock, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with locked_file(lock):
+        yield
 
 
 def arm_pin(path, service, pid, lstart, reason, expires_at) -> dict:

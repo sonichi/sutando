@@ -204,31 +204,15 @@ class AtomicPublish(unittest.TestCase):
         class Boom(Exception):
             pass
 
-        real_fdopen = ltp.os.fdopen
-
         def vanish(fd, *a, **k):
-            # The staged file is removed under us, then the write fails: cleanup's
-            # own unlink raises, and the caller must still see the real cause.
+            # Close before removal so this fault injection has the same shape
+            # on Windows, which does not unlink open files.
+            os.close(fd)
             for p in list(self.dir.iterdir()):
                 p.unlink()
-            fh = real_fdopen(fd, *a, **k)
+            raise Boom()
 
-            class F:
-                def __enter__(self_):
-                    fh.__enter__()
-                    return self_
-
-                def __exit__(self_, *e):
-                    return fh.__exit__(*e)
-
-                def write(self_, s):
-                    raise Boom()
-
-                def __getattr__(self_, n):
-                    return getattr(fh, n)
-
-            return F()
-
+        real_fdopen = ltp.os.fdopen
         ltp.os.fdopen = vanish
         try:
             with self.assertRaises(Boom):

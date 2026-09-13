@@ -545,10 +545,10 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
 
     def test_a_name_the_grammar_rejects_is_skipped_not_emitted_as_null(self):
-        # An LF is legal in a POSIX filename and matches the glob, but the id
-        # grammar rejects it; a null taskId breaks the string-ID contract.
+        # A missing id suffix is filesystem-portable and matches the glob, but
+        # the grammar rejects it; a null taskId breaks the string-ID contract.
         self._write("task-rtapi-ok.txt", "task-rtapi-ok")
-        (self.tasks / "task-rtapi-A\nB.txt").write_text("id: x\ntask: y\n")
+        (self.tasks / "task-.txt").write_text("id: x\ntask: y\n")
 
         rows = self.view.list_tasks()["tasks"]
         self.assertEqual([e["taskId"] for e in rows], ["task-rtapi-ok"])

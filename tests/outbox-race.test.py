@@ -1,9 +1,10 @@
 import json
 import multiprocessing as mp
 import contextlib
+import os
 # forkserver, not fork: a forked worker inherits a lock the parent's tracer
 # thread holds under coverage, and the pool then hangs in terminate() on CI.
-_CTX = mp.get_context("forkserver")
+_CTX = mp.get_context("spawn" if os.name == "nt" else "forkserver")
 
 
 @contextlib.contextmanager

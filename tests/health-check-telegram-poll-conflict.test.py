@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -98,18 +97,6 @@ check("3-arg call still works (detail defaults)", _r11 is not None and _r11[0] =
 
 print("wiring through run_all_checks (guards the call-site gate):")
 
-_orig_run = subprocess.run
-
-
-def _fake_pgrep(cmd, *args, **kwargs):
-    if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "/usr/bin/pgrep" and "telegram-bridge" in cmd[2]:
-        class _R:
-            returncode = 0
-            stdout = "999999\n"
-        return _R()
-    return _orig_run(cmd, *args, **kwargs)
-
-
 def _telegram_check(log_contents: str, heartbeat_age_s: Optional[int] = None):
     with tempfile.TemporaryDirectory() as tmpws, tempfile.TemporaryDirectory() as tmphome:
         tmpws = Path(tmpws)
@@ -139,7 +126,7 @@ def _telegram_check(log_contents: str, heartbeat_age_s: Optional[int] = None):
 
         with patch.object(hc, "WORKSPACE_DIR", tmpws), \
              patch.object(hc, "claude_home_path", side_effect=_fake_chp), \
-             patch.object(subprocess, "run", side_effect=_fake_pgrep):
+             patch.object(hc, "probe_pids", return_value=(["999999"], True)):
             checks = hc.run_all_checks()
         return next((c for c in checks if c["name"] == "telegram-bridge"), None)
 

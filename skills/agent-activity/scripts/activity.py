@@ -12,7 +12,6 @@ at <workspace>/state/agent-activity.jsonl. Rows of a task stay live in the drawe
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import sys

@@ -20,6 +20,7 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 import json
+import os
 import re
 import sys
 import tempfile
@@ -191,6 +192,9 @@ def behavioral() -> list:
     with tempfile.TemporaryDirectory() as td:
         directory = Path(td)
         original_link = guard.os.link
+        original_name = guard.os.name
+        original_rename = guard.os.rename
+        original_fchmod = getattr(guard.os, "fchmod", None)
         try:
             def raced_link(_temporary, destination):
                 Path(destination).write_text("race winner", encoding="utf-8")
@@ -206,8 +210,26 @@ def behavioral() -> list:
             guard.os.link = consuming_link
             if not guard._write_artifact(directory / "consumed.json", {"value": 2}):
                 fails.append("cleanup must tolerate an already-consumed temporary file")
+
+            def consuming_rename(temporary, destination):
+                original_rename(temporary, destination)
+
+            guard.os.name = "nt"
+            guard.os.link = lambda *_args: (_ for _ in ()).throw(
+                AssertionError("Windows artifact publication must not require hard links"))
+            guard.os.rename = consuming_rename
+            guard.os.fchmod = lambda *_args: (_ for _ in ()).throw(
+                AssertionError("Windows artifact publication must not require fchmod"))
+            if not guard._write_artifact(directory / "windows.json", {"value": 3}):
+                fails.append("Windows artifact publication must use atomic rename")
         finally:
+            guard.os.name = original_name
             guard.os.link = original_link
+            guard.os.rename = original_rename
+            if original_fchmod is None:
+                del guard.os.fchmod
+            else:
+                guard.os.fchmod = original_fchmod
 
     with tempfile.TemporaryDirectory() as td:
         state = Path(td) / "state"
@@ -226,7 +248,7 @@ def behavioral() -> list:
                 fails.append("review artifact must retain the human-readable room name")
             if payload.get("status") != "pending_dm" or not payload.get("review_id", "").startswith("wr_"):
                 fails.append("review artifact must carry a stable id and pending-DM state")
-            if saved[0].stat().st_mode & 0o777 != 0o600:
+            if os.name != "nt" and saved[0].stat().st_mode & 0o777 != 0o600:
                 fails.append("withheld review artifact must be mode 0600")
 
         retry = guard.materialize_withheld_verdict(

@@ -236,12 +236,32 @@ Skill installs are pinned to an upstream commit and record provenance for later
 updates. Tool repositories can be searched and inspected but are
 install-disabled because their setup and permissions are source-specific.
 
-**App launcher** — open any macOS app:
+**App launcher** — open an app on the user's visible desktop:
 ```bash
-open -a "Safari"                    # open by name
+# Windows: use the registered display name; success requires verified foreground focus.
+pwsh -NoProfile -File scripts/open-app.ps1 "Paint"
+pwsh -NoProfile -File scripts/open-app.ps1 "Microsoft Store"
+
+# macOS
+open -a "Safari"
 open -a "Slack"
 open "https://github.com"           # open URL in default browser
 ```
+Voice and phone can use `switch_app` on macOS and Windows. The Windows CLI and
+inline tool share `src/windows-app-launcher.ps1`; bundled services ship the same
+backend beside their JavaScript artifacts.
+
+Windows matches registered app IDs or exact executable paths, never window-title
+substrings. It reuses an existing window (restoring it if minimized) or launches
+once, then verifies the intended app actually owns the foreground. An already
+foreground app is left alone; otherwise the first matching window is selected,
+not a particular document or profile. Shortcuts whose identity cannot be resolved
+fail rather than guessing from their display name.
+
+An interactive desktop is required. Windows may refuse foreground activation,
+especially when the agent runs in the background; the tool reports that refusal
+and asks the user to select the app from the taskbar. Merely launching a process
+or making a window visible is not success.
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
