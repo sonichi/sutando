@@ -174,9 +174,11 @@ an advertisement it could read in full.
 **Unsupported is not an error.** A relay that does not implement either route
 answers `404`, `405` or `501`; the gateway logs once and stops trying for an
 hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
-Neither call can fail the task loop, and both run AFTER the beat's durable
-retries so an optional push never delays an owner-approved publication or the
-next `/v1/tasks` poll.
+Neither call can fail the task loop: both are handed to a background thread
+AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
+a slow push is still in flight and an optional push never delays an
+owner-approved publication. A push still running when the next beat arrives is
+left to finish; that beat's push is skipped, not queued.
 
 ## Media markers (optional)
 

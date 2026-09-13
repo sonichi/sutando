@@ -488,13 +488,13 @@ def test_one_beat_publishes_one_revision_even_if_the_file_changes_mid_beat():
                 _advertise(m, {**_record(ts=2), "profile_workers": {W1: {"label": "second", "runtime": "codex"}}})
             return {}
         m._req = req
-        m._push_pool_advertisement()
+        m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], calls
         assert calls[0][2]["ts"] == 1
         assert calls[1][2]["workers"][W1]["label"] == "reviewer", "card from the same revision as the snapshot"
         # the next beat ships revision 2 as a whole
         calls.clear()
-        m._push_pool_advertisement()
+        m._push_pool_advertisement_now()
         assert calls[0][2]["ts"] == 2 and calls[1][2]["workers"][W1]["label"] == "second"
 
 
@@ -525,14 +525,14 @@ def test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals(
         clock = [1000.0]
         m._now = lambda: clock[0]
         calls = _capture(m)
-        m._push_pool_advertisement()
+        m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], calls
         calls.clear()
         clock[0] += 60
-        m._push_pool_advertisement()
+        m._push_pool_advertisement_now()
         assert calls == [], "within the cadence and unchanged: nothing resent"
         clock[0] += m._REPUSH_EVERY_S
-        m._push_pool_advertisement()
+        m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], "past the cadence: both halves resent unchanged"
 
 
@@ -620,6 +620,54 @@ def test_a_record_that_grows_after_a_small_stat_is_still_bounded():
         print("PASS test_a_record_that_grows_after_a_small_stat_is_still_bounded")
 
 
+def test_the_hand_off_returns_before_its_requests_complete():
+    """P1#2: the two 15 s pushes must not sit between the beat and the next
+    /v1/tasks poll. With every request blocked, the hand-off still returns."""
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(Path(d)); _advertise(m, _record(1))
+        gate = threading.Event(); calls = []
+        def blocked(*a, **k):
+            calls.append(a); gate.wait(5); return {}
+        m._req = blocked
+        t = threading.Thread(target=m._push_pool_advertisement, daemon=True)
+        t.start(); t.join(1.0)
+        assert not t.is_alive(), "the beat is stuck behind a push that has not returned"
+        assert len(calls) == 1 and calls[0][1] == "/v1/workers", calls
+        gate.set(); m._PUSH_THREAD.join(5)
+        assert len(calls) == 2 and calls[1][1].startswith("/v1/agents/") and calls[1][1].endswith("/profile"), calls
+        print("PASS test_the_hand_off_returns_before_its_requests_complete")
+
+
+def test_an_in_flight_push_is_skipped_not_queued():
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(Path(d)); _advertise(m, _record(1))
+        gate = threading.Event(); calls = []
+        def blocked(*a, **k):
+            calls.append(a); gate.wait(5); return {}
+        m._req = blocked
+        m._push_pool_advertisement(); time.sleep(0.1)
+        first = m._PUSH_THREAD
+        m._push_pool_advertisement(); m._push_pool_advertisement()
+        assert m._PUSH_THREAD is first, "a second push thread was minted behind a live one"
+        gate.set(); first.join(5)
+        assert len(calls) == 2, calls
+        print("PASS test_an_in_flight_push_is_skipped_not_queued")
+
+
+def test_a_failing_background_push_is_logged_not_silent():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(Path(d)); _advertise(m, _record(1))
+        lines = []; m._log = lines.append
+        def boom(*a, **k):
+            raise RuntimeError("relay exploded")
+        m._advertisement_or_none = boom
+        m._push_pool_advertisement(); m._PUSH_THREAD.join(5)
+        assert any("push failed" in ln and "relay exploded" in ln for ln in lines), lines
+        print("PASS test_a_failing_background_push_is_logged_not_silent")
+
+
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
     test_a_missing_file_pushes_nothing_at_all()
@@ -645,4 +693,7 @@ if __name__ == "__main__":
     test_one_beat_publishes_one_revision_even_if_the_file_changes_mid_beat()
     test_the_identity_is_one_path_segment()
     test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals()
+    test_the_hand_off_returns_before_its_requests_complete()
+    test_an_in_flight_push_is_skipped_not_queued()
+    test_a_failing_background_push_is_logged_not_silent()
     print("ALL PASS test_pool_advertisement_push")

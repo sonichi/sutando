@@ -2527,7 +2527,25 @@ _last_full_push_at = 0.0
 _now = time.monotonic
 
 
+_PUSH_THREAD: "threading.Thread | None" = None
+_PUSH_LOCK = threading.Lock()
+
+
 def _push_pool_advertisement() -> None:
+    """Hand the beat's publications to a daemon thread and return at once: both
+    requests carry 15 s timeouts and the intake poll must never wait on them.
+    A push still in flight from the last beat is left to finish; this beat's is
+    skipped, not queued, since the next beat re-reads the advertisement."""
+    global _PUSH_THREAD
+    with _PUSH_LOCK:
+        if _PUSH_THREAD is not None and _PUSH_THREAD.is_alive():
+            return
+        _PUSH_THREAD = threading.Thread(target=_push_pool_advertisement_now,
+                                        name="pool-advertisement", daemon=True)
+        _PUSH_THREAD.start()
+
+
+def _push_pool_advertisement_now() -> None:
     """One read of the advertisement per beat, handed to BOTH publications:
     two reads let a sibling writer's atomic rename land between them, and the
     broker would then hold a snapshot and a card from different revisions."""
@@ -2536,9 +2554,12 @@ def _push_pool_advertisement() -> None:
         _workers_pushed_identity = ""
         _profile_pushed_identity = ""
         _last_full_push_at = _now()
-    record = _advertisement_or_none()
-    _maybe_push_workers_snapshot(record)
-    _maybe_push_agent_profile(record)
+    try:
+        record = _advertisement_or_none()
+        _maybe_push_workers_snapshot(record)
+        _maybe_push_agent_profile(record)
+    except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
+        _log(f"pool advertisement push failed: {e}")
 
 
 def _maybe_push_workers_snapshot(record) -> bool:
@@ -4480,8 +4501,8 @@ def main() -> None:
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
-            # LAST of the beat's work: two optional 15 s requests must never
-            # delay an owner-approved publication or the next task poll.
+            # LAST of the beat's work, on a daemon thread: two optional 15 s
+            # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
