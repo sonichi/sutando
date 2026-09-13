@@ -179,6 +179,46 @@ else
   ok "startup.sh keeps no unguarded copy"
 fi
 
+# --- case 5: an OBSERVER whose argv merely NAMES the script is not a watcher --
+# kewei on #4230: the old substring test killed this process. Identity belongs
+# to src/watcher_identity.py, which rejects it because argv[1] is not the script.
+cat > "$TMP/observer.sh" << 'SH'
+#!/bin/bash
+# argv carries the watcher's name as an OPERAND, which is what used to match.
+sleep 30
+SH
+chmod +x "$TMP/observer.sh"
+"$TMP/observer.sh" src/watch-tasks-stream.sh "$TMP/inbox" &
+obs_pid=$!
+f="$TMP/case5.pid"
+echo "$obs_pid" > "$f"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+if kill -0 "$obs_pid" 2>/dev/null; then
+  ok "observer naming the script is NOT killed"
+else
+  bad "observer naming the script is NOT killed" "reaped an unrelated process ($out)"
+fi
+kill "$obs_pid" 2>/dev/null; wait "$obs_pid" 2>/dev/null
+
+# --- case 6: an UNOBSERVED ps must not release the sentinel -------------------
+# A silent non-zero `ps` (no stderr) used to fall through to the release.
+# The pid must be ALIVE: a dead one is knowledge, and cleaning up after it is
+# correct. The hazard is a LIVE watcher whose ps cannot be read.
+sleep 30 &
+live6=$!
+f="$TMP/case6.pid"
+echo "$live6" > "$f"
+shimdir="$TMP/shim6"; mkdir -p "$shimdir"
+printf '#!/bin/sh\nexit 1\n' > "$shimdir/ps"; chmod +x "$shimdir/ps"
+out="$(PATH="$shimdir:$PATH" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ]; then
+  ok "unobserved ps: sentinel left in place"
+else
+  bad "unobserved ps: sentinel left in place" "released on an unproven pid ($out)"
+fi
+kill "$live6" 2>/dev/null; wait "$live6" 2>/dev/null
+
+
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"
   exit 0

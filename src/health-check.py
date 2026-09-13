@@ -69,6 +69,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
@@ -8573,43 +8574,9 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
     return None
 
 
-def _proc_argv_vector(pid: int) -> "list[str] | None":
-    """Real argv of `pid` as a LIST, or None when no authoritative read exists.
-
-    A flattened argv cannot separate an operand containing a space from two
-    operands, so the executed script is not recoverable from it by any rule.
-    """
-    try:  # linux: NUL-delimited, authoritative
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        if raw:
-            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
-    except Exception:  # noqa: BLE001 -- not linux, or gone
-        pass
-    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-        size = ctypes.c_size_t(262144)
-        buf = ctypes.create_string_buffer(size.value)
-        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None
-        data = buf.raw[:size.value]
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        parts = data[4:].split(b"\0")
-        i = 0
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += 1                                   # the exec path
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        out = []
-        while i < len(parts) and len(out) < argc:
-            out.append(parts[i].decode("utf8", "replace"))
-            i += 1
-        return out or None
-    except Exception:  # noqa: BLE001 -- probe failure must not fail the check
-        return None
+# Module-level names, looked up at call time: the suites that fabricate pids
+# rebind these here, and the wrappers below must see what they bound.
+_proc_argv_vector = watcher_identity.proc_argv_vector
 
 
 def _proc_argv(pid: int) -> str:
@@ -8698,59 +8665,10 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
-# The argv must BE the script invocation, not merely mention it. A substring
-# test counts the observer: any shell whose command line contains the name —
-# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
-# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
-# match reported 3 trees where 2 were real, the phantom being the shell that
-# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
-# fix is to anchor on the whole command rather than search inside it.
-_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
-
-
-# The script named as a whole final path component, so `x-watch-tasks-stream.sh`
-# and a mention inside a longer word cannot match.
-_WATCHER_SCRIPT_NAME = "watch-tasks-stream.sh"
-_WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
-
-
-def _as_pid(tok: str) -> "int | None":
-    try:
-        return int(tok)
-    except (TypeError, ValueError):
-        return None
-
-
 def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     """True/False from the EXECUTED script; None when nothing can prove it.
-
-    Callers disagree on what None should mean, which is why this is tri-state:
-    over-counting a watcher costs delayed tasks, publishing a wrong pid costs a
-    killed stranger.
-    """
-    vec = _proc_argv_vector(pid) if pid is not None else None
-    if vec is not None and len(vec) >= 2:
-        if vec[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-            return False
-        if vec[1].startswith("-"):
-            return False
-        return os.path.basename(vec[1]) == _WATCHER_SCRIPT_NAME
-    parts = argv.split()
-    if len(parts) < 2:
-        return False
-    if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
-        return False
-    if parts[1].startswith("-"):
-        return False
-    # Authoritative only when argv ends at parts[1]: with more tokens the real
-    # pathname may continue past a space and end in a different name.
-    if _WATCHER_SCRIPT.search(parts[1]) is not None:
-        return True if len(parts) == 2 else None
-    if len(parts) == 2:
-        return False
-    # Only a later token matches, and a spaced script path is the same string as a
-    # script plus arguments -- nothing here can decide between them.
-    return None if _WATCHER_SCRIPT.search(argv) else False
+    The policy is `watcher_identity`; this binds it to the argv reader above."""
+    return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
 # Read from the module that defines the precedence; a copy here is how this
@@ -8865,27 +8783,8 @@ def _group_roots_by_target(state_dir, roots):
 
 
 def _ps_watcher_index(ps_output: str) -> tuple:
-    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
-
-    Both the tree walk and the ownership split need this; two parses could
-    disagree about a process that exited between them.
-    """
-    me = str(os.getpid())
-    parent: dict = {}
-    live: set = set()
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        live.add(parts[0])
-        if parts[0] == me:
-            continue
-        # None is UNKNOWN: count it, because a missed watcher starts a second
-        # one and every task is then processed twice.
-        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
-            continue
-        parent[parts[0]] = parts[1]
-    return parent, live
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse."""
+    return watcher_identity.ps_watcher_index(ps_output, is_watcher=_is_watcher_argv)
 
 
 def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
@@ -8906,34 +8805,9 @@ def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
-    """Map root PID -> set of PIDs for each distinct watcher TREE running.
-
-    Each watcher is several processes (a shell wrapper, the script, a
-    subshell), so counting matching lines overcounts. A "root" is a match
-    whose parent is not itself a match — one per independent watcher. Callers
-    need the whole tree, not just the root, to tell which tree owns the
-    sentinel PID (the sentinel records the script's PID, not the wrapper's).
-
-    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
-    the reason in _proc_argv: pgrep would match the caller. Our own argv is
-    the health-check invocation, but we drop it explicitly anyway.
-    """
-    if ps_output is None:
-        try:
-            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                                       capture_output=True, text=True,
-                                       timeout=5).stdout
-        except Exception:  # noqa: BLE001
-            return {}
-    parent, _live = _ps_watcher_index(ps_output)
-    trees: dict = {}
-    for pid in parent:
-        root, seen = pid, set()
-        while parent.get(root) in parent and root not in seen:
-            seen.add(root)
-            root = parent[root]
-        trees.setdefault(root, set()).add(pid)
-    return trees
+    """Root PID -> member PIDs per distinct watcher TREE; None runs `ps`.
+    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`."""
+    return watcher_identity.watcher_trees(ps_output, is_watcher=_is_watcher_argv)
 
 
 def extras_present(trees, live) -> bool:
