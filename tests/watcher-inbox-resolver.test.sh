@@ -158,6 +158,21 @@ check $? "an already-answered task is not dispatched again after a restart"
 grep -q 'already answered, not dispatching again' "$TMP/sweep.err"
 check $? "...and the refusal says so rather than passing silently"
 
+# 9b. An answer that merely MENTIONS the refusal wording is still an answer:
+#     mistaking it for a refusal re-runs work that already completed.
+printf 'Done. The earlier run said it could not safely process the file, so I finished it.\n' > "$WS/results/task-probe1.txt"
+line_mentions="$(run_sweep "$GOOD")"
+echo "  result that mentions the refusal phrase: ${line_mentions:-<nothing>}"
+[ -z "$line_mentions" ]
+check $? "a result that only mentions the refusal wording still counts as answered"
+
+# 9c. Control: our OWN refusal, which starts with it, must still re-dispatch.
+printf 'I could not safely process this Team-tier task because the restricted runtime was interrupted.\n' > "$WS/results/task-probe1.txt"
+line_refusal="$(run_sweep "$GOOD")"
+echo "  our own terminal refusal: ${line_refusal:-<nothing>}"
+[ -n "$line_refusal" ]
+check $? "our own terminal refusal does NOT suppress the dispatch"
+
 # 10. Control: a whitespace-only result is the undeliverable placeholder, NOT an
 #     answer, so it must not suppress the dispatch.
 printf '   \n' > "$WS/results/task-probe1.txt"

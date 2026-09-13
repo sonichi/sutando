@@ -292,15 +292,16 @@ finish_handler_task() {
 TERMINAL_REFUSAL_MARK="could not safely process"
 
 handler_result_is_answer() {
-  # An interrupted handler leaves OUR terminal refusal behind, and a restart is
-  # REQUIRED to re-dispatch that; only a real answer may suppress a dispatch.
-  # A LIVE answer only. An archived result means the reply already went out and
-  # the reap path owns that case; treating it as answered here changed behaviour
-  # the dead-worker suite pins, and this guard exists for the un-retired sentinel.
-  local filename="$1" live="$RESULTS_DIR/$1"
+  # Our own refusal means the handler was interrupted and a restart MUST
+  # re-dispatch; an archived result belongs to the reap path, not to this guard.
+  local filename="$1" live="$RESULTS_DIR/$1" first
   [ -f "$live" ] || return 1
   handler_result_exists "$filename" || return 1
-  ! grep -qF "$TERMINAL_REFUSAL_MARK" "$live" 2>/dev/null
+  # The FIRST line, anchored: an answer that merely mentions the phrase is an
+  # answer, and mistaking it for a refusal re-runs work that already completed.
+  IFS= read -r first < "$live" || first=""
+  case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
+  return 0
 }
 
 handler_result_exists() {
