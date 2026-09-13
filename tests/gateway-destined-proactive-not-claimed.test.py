@@ -145,4 +145,13 @@ print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 # finalization can race its writes and abort after the assertions pass.
 sys.stdout.flush()
 sys.stderr.flush()
+# os._exit skips atexit, where coverage writes this run's fragment; save it first.
+try:
+    import coverage
+
+    _cov = coverage.Coverage.current()
+    if _cov is not None:
+        _cov.save()
+except Exception:
+    pass
 os._exit(1 if failures else 0)
