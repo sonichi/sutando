@@ -27,7 +27,7 @@ run_case() {  # $1=.env body  $2=relay-client.env body -> prints the stub's line
   # so the pre-fix wrapper's own lookup works here and case 2 is a real control.
   printf '#!/bin/bash\nif [ "${1:-}" = "claude-home-path" ]; then\n  if [ -n "${2:-}" ]; then echo "%s/home/$2"; else echo "%s/home"; fi\n  exit 0\nfi\nexit 0\n' \
       "$d" "$d" > "$d/scripts/sutando-config.sh"; chmod +x "$d/scripts/sutando-config.sh"
-  printf 'import os\nprint("BRIDGE_STARTED token=%%s" %% (os.environ.get("REMOTE_TASK_TOKEN") or "<none>"))\n' \
+  printf 'import os\nprint("BRIDGE_STARTED token=%%s tier=%%s" %% (os.environ.get("REMOTE_TASK_TOKEN") or "<none>", os.environ.get("REMOTE_TASK_TIER") or "<none>"))\n' \
       > "$d/src/remote-gateway-bridge.py"
   printf '%s' "$1" > "$d/home/channels/ag2space/.env"
   printf '%s' "$2" > "$d/home/channels/ag2space/relay-client.env"
@@ -56,6 +56,25 @@ out="$(run_case '' '')"
 echo "  no token       -> $out"
 case "$out" in *"nothing to run"*) check 0 "no token anywhere: unchanged clean stand-down" ;;
                *) check 1 "no token anywhere: unchanged clean stand-down" ;; esac
+
+# 4. Policy in `.env` must survive a token that lives in the sibling. The gate
+#    that picks the token file must not become the only file that is sourced.
+out="$(run_case 'REMOTE_TASK_TIER=team
+' 'REMOTE_TASK_TOKEN=sibling-token
+')"
+echo "  policy split  -> $out"
+case "$out" in *"token=sibling-token"*) check 0 "sibling token is still found when .env holds only policy" ;;
+               *) check 1 "sibling token is still found when .env holds only policy" ;; esac
+case "$out" in *"tier=team"*) check 0 ".env policy (tier) survives — the access cap is not dropped" ;;
+               *) check 1 ".env policy (tier) survives — the access cap is not dropped" ;; esac
+
+# 5. Shell-form credentials in `.env` still work: the wrapper sources that file,
+#    so `export KEY=value` is honoured even though a KEY=VALUE reader skips it.
+out="$(run_case 'export REMOTE_TASK_TOKEN=exported-token
+' '')"
+echo "  export form   -> $out"
+case "$out" in *"token=exported-token"*) check 0 "export-form token in .env still starts the bridge" ;;
+               *) check 1 "export-form token in .env still starts the bridge" ;; esac
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
