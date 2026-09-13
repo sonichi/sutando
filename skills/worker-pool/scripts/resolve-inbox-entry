@@ -1,0 +1,12 @@
+#!/bin/sh
+# The core execs this directly and a worker's PATH python3 may be the macOS CLT
+# stub, so run the interpreter the launcher forwarded before trying PATH.
+set -u
+_d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+for _py in "${SUTANDO_PY:-}" python3; do
+  [ -n "$_py" ] || continue
+  command -v "$_py" >/dev/null 2>&1 || [ -x "$_py" ] || continue
+  exec "$_py" "$_d/resolve_inbox_entry.py" "$@"
+done
+echo "resolve-inbox-entry: no usable interpreter (SUTANDO_PY=${SUTANDO_PY:-<unset>})" >&2
+exit 1

@@ -18,21 +18,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pool_delivery as pd  # noqa: E402
 
+# Spelled here, not read from pd: this is the shape of the path we are GIVEN.
+DELIVERIES = "deliveries"
 
-def _workspace(explicit=None) -> Path | None:
-    """The tree this worker was assigned. `SUTANDO_WORKSPACE_DIR` is the variable
-    the spawner sets and the watcher honours, so both inspect one tree."""
+
+def _workspace(entry: str, explicit=None) -> Path:
+    """The workspace `entry` itself names: a sentinel lives at
+    `<ws>/deliveries/<recipient>/<id>`, so the tree is read from the path the
+    caller passed rather than an env var both sides must agree about."""
     if explicit is not None:
         return Path(explicit)
-    env = os.environ.get("SUTANDO_WORKSPACE_DIR", "").strip()
-    return Path(env) if env else None
+    p = Path(entry).resolve()
+    if len(p.parents) < 3 or p.parent.parent.name != DELIVERIES:
+        raise ValueError(f"entry is not inside {DELIVERIES}/<recipient>/: {entry!r}")
+    return p.parent.parent.parent
 
 
 def resolve(entry: str, workspace=None) -> Path:
     """The payload `entry` stands for. Raises ValueError when it stands for none.
 
-    `entry` may arrive as a bare name or a path; only its basename carries the
-    sentinel, so a caller that already resolved one does not get a second read.
+    `entry` must be the path the watcher saw: its basename carries the sentinel
+    and its parents carry the workspace, so one argument fixes both.
     """
     got = pd.parse_sentinel(os.path.basename(entry))
     if got is None:
@@ -40,7 +46,7 @@ def resolve(entry: str, workspace=None) -> Path:
     task_id, _accepted = got
     # Accepted and pending spell the same task, so both resolve: the watcher
     # announces whichever name it saw and neither implies a different body.
-    path = pd.payload_path(_workspace(workspace), task_id).resolve()
+    path = pd.payload_path(_workspace(entry, workspace), task_id).resolve()
     if not path.is_file():
         raise ValueError(f"sentinel {task_id} names no payload at {path}")
     return path
