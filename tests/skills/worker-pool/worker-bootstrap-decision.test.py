@@ -197,11 +197,53 @@ class TestMain(Base):
         self.assertEqual((rc, out[0]), (2, "unknown"))
 
     def test_no_workspace_given_falls_back_to_the_loader(self):
-        """Not the spawner's env var: a worker shares the host's workspace, so
-        the canonical loader is the only resolution path here."""
-        rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+        """Neither the flag nor the spawner's env var: the canonical loader
+        answers, as it does for a worker launched by hand."""
+        with patch.dict(os.environ):
+            os.environ.pop("SUTANDO_WORKSPACE_DIR", None)
+            rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
         self.assertIn(out[0], ("start", "skip", "unknown"))
         self.assertIn(rc, (0, 2))
+
+
+    def _assigned(self):
+        """Workspace B, the one the spawner assigns and the watcher inspects,
+        holding this instance's sentinel; the configured A (self.ws) holds none."""
+        import util_paths
+        b = Path(self._t.name) / "assigned"
+        (b / "state").mkdir(parents=True)
+        util_paths.watcher_sentinel_path(b / "state", instance=WORKER).write_text("4242\n")
+        return b
+
+    def test_the_assigned_workspace_in_env_is_the_one_inspected(self):
+        """Env-only invocation, as the shipped worker gate runs it: the answer
+        must come from B's sentinel, not from A having none."""
+        b = self._assigned()
+        with patch.dict(os.environ, {"SUTANDO_WORKSPACE_DIR": str(b)}):
+            rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+        self.assertIn(str(b), out[2], out)
+        self.assertNotIn("no sentinel", out[2], out)
+
+    def test_control_the_configured_workspace_alone_would_authorise_a_duplicate(self):
+        """The pre-fix shape: env unset and a loader naming A -> `start` with
+        B's live sentinel never read. This is what the test above rules out."""
+        import types
+        b = self._assigned()
+        stub = types.ModuleType("workspace_default")
+        stub.resolve_workspace = lambda: self.ws
+        real = sys.modules.get("workspace_default")
+        sys.modules["workspace_default"] = stub
+        try:
+            with patch.dict(os.environ):
+                os.environ.pop("SUTANDO_WORKSPACE_DIR", None)
+                rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+        finally:
+            if real is None:
+                del sys.modules["workspace_default"]
+            else:
+                sys.modules["workspace_default"] = real
+        self.assertEqual(out[0], "start")
+        self.assertNotIn(str(b), out[2])
 
 
 class TestCli(Base):

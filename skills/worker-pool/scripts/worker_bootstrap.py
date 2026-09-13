@@ -32,6 +32,10 @@ if str(REPO / "src") not in sys.path:
 import watcher_identity as wid  # noqa: E402
 
 WATCHER_SCRIPT = wid.WATCHER_SCRIPT_NAME
+# The spawner's key for the assigned workspace (spawn_worker.plan sets it;
+# the watcher honours it). Not the retired workspace override.
+ASSIGNED_WORKSPACE_ENV = "SUTANDO_WORKSPACE_DIR"
+
 
 
 class Unobserved(Exception):
@@ -148,9 +152,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="worker watcher bootstrap decision")
     ap.add_argument("--instance", default=os.environ.get("SUTANDO_INSTANCE_ID", ""))
     ap.add_argument("--inbox", default=os.environ.get("SUTANDO_TASKS_DIR", ""))
-    # Not the spawner's env var: a worker SHARES the host's workspace, so the
-    # canonical loader is the answer and the contract's only resolution path.
-    ap.add_argument("--workspace", default="")
+    # The assigned workspace, as the watcher reads it; the loader answers
+    # only for a hand-launched worker whose spawner named none.
+    ap.add_argument("--workspace", default=os.environ.get(ASSIGNED_WORKSPACE_ENV, ""))
     a = ap.parse_args(argv)
     workspace = a.workspace
     if not workspace:
