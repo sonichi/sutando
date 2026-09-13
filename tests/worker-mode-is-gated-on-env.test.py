@@ -192,6 +192,7 @@ def _state_root(extra_env: dict, td: Path):
 
 WORKER_KEYS = ("SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR", "SUTANDO_WORKSPACE_DIR",
                "SUTANDO_INBOX_KIND", "SUTANDO_RESULTS_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+               "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
                "SUTANDO_POOL_DELIVERY_SCRIPT")
 
 
@@ -226,6 +227,26 @@ class TestCoreEnvInvariance(unittest.TestCase):
         self.assertIn("SUTANDO_CORE_SESSION=1", env, env)
         keys = {tok.split("=", 1)[0] for tok in env}
         self.assertFalse(keys & set(WORKER_KEYS), f"worker key forwarded to a core: {keys & set(WORKER_KEYS)}")
+
+    def test_a_worker_is_handed_the_inbox_resolver_and_its_timeout(self):
+        """tmux hands a new session the SERVER's env, not this shell's, so a
+        resolver the spawner set is absent unless the launcher forwards it —
+        and without it the watcher announces the zero-byte sentinel itself."""
+        with scratch() as td:
+            env = _core_env({"SUTANDO_INSTANCE_ID": "d" * 32,
+                             "SUTANDO_INBOX_RESOLVER": "/opt/resolve-inbox",
+                             "SUTANDO_INBOX_RESOLVER_TIMEOUT": "7"}, Path(td))
+        self.assertIn("SUTANDO_INBOX_RESOLVER=/opt/resolve-inbox", env, env)
+        self.assertIn("SUTANDO_INBOX_RESOLVER_TIMEOUT=7", env, env)
+
+    def test_an_unset_resolver_is_not_invented(self):
+        """Control: the two keys above are forwarded because they were set, not
+        because the launcher names them unconditionally."""
+        with scratch() as td:
+            env = _core_env({"SUTANDO_INSTANCE_ID": "e" * 32}, Path(td))
+        keys = {tok.split("=", 1)[0] for tok in env}
+        self.assertNotIn("SUTANDO_INBOX_RESOLVER", keys, env)
+        self.assertNotIn("SUTANDO_INBOX_RESOLVER_TIMEOUT", keys, env)
 
     def test_set_the_marker_is_blanked_and_the_instance_named(self):
         with scratch() as td:
