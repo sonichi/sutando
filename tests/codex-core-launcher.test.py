@@ -220,7 +220,7 @@ exit 0
                                   check=True, text=False).stdout.decode().split()
         return f"{checksum[0]}-{checksum[1]}"
 
-    def run_launcher(self, *args, env_extra=None):
+    def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         # A suite run from inside a core would otherwise inherit the marker
@@ -243,7 +243,7 @@ exit 0
         })
         env.update(env_extra or {})
         result = subprocess.run(
-            ["/bin/bash", str(self.root / "src/agent/start-cli.sh"), *args],
+            ["/bin/bash", str(self.root / launcher), *args],
             cwd=self.root, env=env, capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -343,6 +343,42 @@ exit 0
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
+        """There is no Codex worker mode. Through the dispatcher's --runtime and
+        directly, an instance launch is refused, and none of the core's durable
+        records or managed processes is touched."""
+        worker = {"SUTANDO_INSTANCE_ID": "a" * 32,
+                  "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
+                  "SUTANDO_TASKS_DIR": str(Path(self.tmp.name) / "never-read")}
+        for entry, args in (("src/agent/start-cli.sh", ("--runtime", "codex")),
+                            ("src/agent/codex/cli/start-cli.sh", ())):
+            with self.subTest(entry=entry):
+                result = self.run_launcher(*args, env_extra=worker, launcher=entry)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("SUTANDO_INSTANCE_ID", result.stderr)
+                self.assertIn("Codex workers are unsupported", result.stderr)
+        state = self.root / "workspace" / "state"
+        self.assertFalse((state / "core-runtime.json").exists(),
+                         "a worker wrote the core's runtime record")
+        self.assertFalse((state / "session-starts.log").exists(),
+                         "a worker appended the core's launch log")
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("new-session", calls, calls)
+        self.assertNotIn("kill-session", calls, calls)
+        for name in ("scheduler.log", "heartbeat.log", "monitor.log", "install.log"):
+            self.assertFalse((Path(self.tmp.name) / name).exists(), f"{name} was written")
+
+    def test_a_core_launch_still_writes_its_runtime_record(self):
+        """The other polarity: with no instance id the same launch is the core's,
+        and the records the worker test proves untouched are written."""
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.root / "workspace" / "state"
+        runtime = json.loads((state / "core-runtime.json").read_text())
+        self.assertEqual(runtime["session"], "sutando-core")
+        self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
+        self.assertIn("new-session -d -s sutando-core", self.log.read_text())
+
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
         config = workspace / "hosts" / "test-host" / "crons.json"

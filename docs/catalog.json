@@ -453,6 +453,16 @@
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
    "last_verified": "2026-09-04"
+  },
+  "docs/recovery-issue-metrics.md": {
+   "title": "Recovery issue metrics",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "canonical",
+   "canonical_for": "Recovery issue identity, event lifecycle, and rate query semantics",
+   "last_verified": "2026-09-11"
   }
  }
 }

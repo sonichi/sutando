@@ -21,7 +21,8 @@ class RecoveryMetrics(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name) / 'recovery.json'
         self.events = []
-        self.mock = patch.object(hc, '_recovery_metric', side_effect=lambda event, **props: self.events.append((event, props)))
+        self.issue_events = []
+        self.mock = patch.object(hc, '_recovery_metric', side_effect=lambda event, **props: (self.issue_events if event.startswith('recovery_issue_') else self.events).append((event, props)))
         self.mock.start()
         self.addCleanup(self.mock.stop)
         for name, value in [('RECOVER_WEDGE_SEC', 600), ('RECOVER_CONFIRM_SEC', 120),
@@ -160,11 +161,51 @@ class RecoveryMetrics(unittest.TestCase):
         with patch.object(telemetry, 'capture', side_effect=RuntimeError('offline')):
             self.restart()
 
+    def test_issue_ids_survive_failed_restarts_and_close_once(self):
+        self.run_core(10000)
+        self.run_core(10121, restart=False)
+        self.run_core(10122, restart=False)
+        self.run_core(10123)
+        self.run_core(10130, status_ts=11)
+        self.run_core(10140, status_ts=12)
+        self.assertEqual([e[0] for e in self.issue_events], [
+            'recovery_issue_detected', 'recovery_issue_attempted',
+            'recovery_issue_attempted', 'recovery_issue_attempted',
+            'recovery_issue_recovered'])
+        self.assertEqual(len({e[1]['issue_id'] for e in self.issue_events}), 1)
+        self.assertNotIn('private-task-path', json.dumps(self.issue_events))
+
+    def test_health_issues_close_individually_after_partial_batch(self):
+        checks = [{'name': 'private-one', 'status': 'down'},
+                  {'name': 'private-two', 'status': 'down'}]
+        hc.track_health_fix(checks, start=True, state_file=self.state, now=10)
+        checks[0]['status'] = 'ok'
+        hc.track_health_fix(checks, state_file=self.state, now=20)
+        hc.track_health_fix(checks, start=True, state_file=self.state, now=30)
+        checks[1]['status'] = 'ok'
+        hc.track_health_fix(checks, state_file=self.state, now=40)
+        hc.track_health_fix(checks, state_file=self.state, now=50)
+        detected = [p['issue_id'] for e, p in self.issue_events if e.endswith('_detected')]
+        recovered = [p['issue_id'] for e, p in self.issue_events if e.endswith('_recovered')]
+        self.assertEqual(len(detected), 2)
+        self.assertEqual(sorted(detected), sorted(recovered))
+        self.assertNotIn('private-', json.dumps(self.issue_events))
+
+    def test_unimportable_issue_tracker_cannot_prevent_core_restart(self):
+        import sys
+        with patch.dict(sys.modules, {'recovery_issues': None}):
+            self.restart()
+        self.assertEqual([e[0] for e in self.events],
+                         ['core_recovery_attempted', 'core_restart_result'])
+
     def test_opt_out_and_short_lived_delivery(self):
         self.mock.stop()
         import telemetry
         with patch.object(telemetry, '_dispatch') as dispatch:
             hc._recovery_metric('core_recovery_attempted', trigger='wedged')
+            hc.track_health_fix([{'name': 'private', 'status': 'down'}],
+                                start=True, state_file=self.state)
+            self.restart()
             dispatch.assert_not_called()
         with patch.object(telemetry, 'capture') as capture:
             hc._recovery_metric('core_recovery_attempted', trigger='wedged')

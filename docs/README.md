@@ -38,6 +38,8 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Operations
 
+- [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
+
 - [Release process and migrations](release-process.md)
 - [Workspace sync across machines](workspace-sync.md)
 - [Per-host workspace convention](workspace-hosts-convention.md)

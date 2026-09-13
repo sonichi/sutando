@@ -13717,6 +13717,15 @@ def _recovery_metric(event: str, **properties) -> None:
         pass
 
 
+def _track_core_issue(state_file, **observation):
+    try:
+        from recovery_issues import track_core_issue
+        track_core_issue(state_file.with_name(state_file.stem + "-issues.json"),
+                         emit=_recovery_metric, **observation)
+    except Exception:
+        pass
+
+
 def _recovery_duration(seconds: float) -> str:
     for threshold, bucket in ((60, "<1m"), (300, "1-5m"), (1800, "5-30m")):
         if seconds < threshold:
@@ -13730,6 +13739,9 @@ def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=
         if fcntl is None:
             return
         state_file = state_file or WORKSPACE_DIR / "state" / "health-fix-metrics.json"
+        from recovery_issues import track_health_issues
+        track_health_issues(state_file.with_name(state_file.stem + "-issues.json"),
+                            checks, start=start, emit=_recovery_metric)
         now = time.time() if now is None else now
         state_file.parent.mkdir(parents=True, exist_ok=True)
         with open(state_file.with_name(state_file.name + ".lock"), "a") as lock:
@@ -13870,6 +13882,7 @@ def recover_core_if_wedged(
                   f"UNKNOWN, not dead; suppressing restart and RESETTING the "
                   f"confirmation window", file=sys.stderr)
             return {"action": "probe-failed", "probe": which}
+        _track_core_issue(state_file, alive=alive, task=cur_key, status_ts=status_ts)
         pending = state.get("recovery_metric_pending")
         if pending and alive and (
             oldest is None or cur_key != pending["task"] or (
@@ -13993,6 +14006,8 @@ def recover_core_if_wedged(
         if not dm_ok:
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
+        _track_core_issue(state_file, alive=alive, task=cur_key,
+                          status_ts=status_ts, start=True)
         _recovery_metric("core_recovery_attempted", trigger=cur_mode)
         try:
             restart_ok = restart_fn()
