@@ -246,8 +246,14 @@ def roster_union(paths, kinds=None) -> dict:
             elif merged[key] != row:
                 # Precedence is by origin EXCEPT when exactly one row is usable:
                 # `stand: null` is a row, so it won a collision like a filled one.
-                if (_usable(row, kinds) and not _usable(merged[key], kinds)
-                        and _is_routing_placeholder(merged[key])):
+                placeholder = (not _usable(merged[key], kinds)
+                               and _is_routing_placeholder(merged[key]))
+                if placeholder and _usable(row, kinds):
+                    merged[f"{key}@local"] = merged[key]
+                    merged[key] = _promote(row, merged[key])
+                elif placeholder and not _is_routing_placeholder(row):
+                    # Unusable but not nothing (a partial stand, a bare
+                    # `allowlisted: false`): absorb it, so a farther peer next compares against IT, not the placeholder it would otherwise still see.
                     merged[f"{key}@local"] = merged[key]
                     merged[key] = _promote(row, merged[key])
                 else:

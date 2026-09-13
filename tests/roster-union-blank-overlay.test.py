@@ -417,6 +417,87 @@ class CaveatFamily(unittest.TestCase):
         self.assertFalse(self.ru.is_text_field("allowlisted"))
 
 
+class OffAllowlistPolicySurvivesShadowing(unittest.TestCase):
+    """An earlier peer's `allowlisted: false` must not be shadowed by a farther
+    peer's complete route, when a NULL local row sits between them (#4047 P2,
+    keweichen's Codex automation).
+
+    `_promote` only ever compares the incoming row against `merged[key]`. A row
+    that names a partial identity plus `allowlisted: false` (no room) is not
+    `_usable` and not a routing placeholder either -- the union's original
+    handling dropped it straight to a `@host` suffix without ever making it
+    `merged[key]`, so a THIRD, farther peer's later complete route still saw
+    only the original null local placeholder and promoted over THAT, with no
+    memory of the intervening refusal. Three measured points:
+
+      BUG        null local + off-allowlist partial peer + complete farther
+                 peer -> the farther peer's complete route wins outright and
+                 resolves live (targets=1, rc=0). Fails at the parent commit.
+      NO-LOCAL   the same two peer rows with no local row at all -> the
+                 off-allowlist partial row already wins correctly (targets=0,
+                 rc=3) at the parent commit; the null local is what breaks it.
+      COMPLETE   the off-allowlist row is itself a complete route -> it wins
+                 outright either way (targets=0, rc=4) -- this arm was never
+                 broken and must stay that way.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        self.ru = _load("roster_union", "roster_union.py")
+        self.nr = _load("notify_reviewers", "notify_reviewers.py")
+        self.dir = Path(tempfile.mkdtemp())
+
+    def union(self, *rosters):
+        paths = []
+        for host, data in rosters:
+            p = self.dir / (host + ".json")
+            p.write_text(json.dumps(data))
+            paths.append((host, p))
+        return self.ru.roster_union(paths)
+
+    def resolve(self, merged, name="reviewer"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            targets, rc = self.nr.resolve([name], merged)
+        return targets, rc, err.getvalue()
+
+    PARTIAL_OFF_ALLOWLIST = {"stand": "@peer:x", "room": None, "allowlisted": False}
+    COMPLETE_ROUTE = {"stand": "@peer:x", "room": "!peer:x"}
+
+    def test_a_null_local_row_does_not_let_a_farther_route_bypass_the_policy(self):
+        merged = self.union(
+            ("local", {"reviewer": {"stand": None, "room": None}}),
+            ("nearer", {"reviewer": dict(self.PARTIAL_OFF_ALLOWLIST)}),
+            ("farther", {"reviewer": dict(self.COMPLETE_ROUTE)}),
+        )
+        targets, rc, _ = self.resolve(merged)
+        self.assertEqual(
+            (len(targets), rc), (0, 3),
+            f"the farther peer's route bypassed nearer's allowlisted:false "
+            f"policy — bare row: {merged.get('reviewer')}")
+        self.assertIs(merged["reviewer"].get("allowlisted"), False,
+                      "the policy must be readable on the bare key, not only "
+                      f"a suffix: {sorted(merged)}")
+
+    def test_CONTROL_no_local_row_already_worked(self):
+        merged = self.union(
+            ("nearer", {"reviewer": dict(self.PARTIAL_OFF_ALLOWLIST)}),
+            ("farther", {"reviewer": dict(self.COMPLETE_ROUTE)}),
+        )
+        targets, rc, _ = self.resolve(merged)
+        self.assertEqual((len(targets), rc), (0, 3))
+
+    def test_CONTROL_a_complete_off_allowlist_row_still_wins_outright(self):
+        merged = self.union(
+            ("local", {"reviewer": {"stand": None, "room": None}}),
+            ("nearer", {"reviewer": dict(self.COMPLETE_ROUTE, allowlisted=False)}),
+            ("farther", {"reviewer": dict(self.COMPLETE_ROUTE)}),
+        )
+        targets, rc, _ = self.resolve(merged)
+        self.assertEqual((len(targets), rc), (0, 4))
+
+
 class SharedPresencePredicate(unittest.TestCase):
     """The one predicate the three sites now share, pinned directly.
 
