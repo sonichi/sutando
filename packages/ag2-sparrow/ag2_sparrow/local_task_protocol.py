@@ -148,7 +148,7 @@ def canonical_access_tier(value) -> str:
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "wire_source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
@@ -188,6 +188,9 @@ KNOWN_HEADER_KEYS = (
     # Which worker the sender asked for. INTENT, not placement: the pool's
     # own binding table decides, and no claim path consults this header.
     "requested_worker",
+    # A card click the HITL store already recorded, passed on for the turn it causes;
+    # the core trusts it, so the guard must defang a forged copy in body text.
+    "hitl_click",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 

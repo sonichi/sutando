@@ -228,6 +228,44 @@ class Dismissal(unittest.TestCase):
         )
         self.assertEqual([], list(self.dir.glob("state/*.tmp")), "temp file left behind")
 
+    def test_two_concurrent_dismissals_do_not_clobber_each_other(self):
+        """Reviewer-caught race: two callers both read {seed} before either writes,
+        so a plain read-modify-write drops whichever writer finishes first. The
+        second writer must not proceed until the first has actually written.
+
+        Forces the interleaving deterministically instead of hoping for it: the
+        first dismiss() is paused mid-save (signalling `started` first), the second
+        is only launched once we know the first has reached that point. Against an
+        unlocked dismiss() the second call proceeds immediately (no lock to wait
+        on), reads the pre-write snapshot, and clobbers it when it writes second;
+        against the locked one it blocks at lock acquisition until the first
+        finishes, so it starts from a snapshot that already includes Q1.
+        """
+        triage.dismiss(self.store, "seed")
+        started = threading.Event()
+        proceed = threading.Event()
+        original_save = triage.save_dismissed
+
+        def slow_save(path, ids):
+            started.set()
+            self.assertTrue(proceed.wait(timeout=5), "test deadlocked waiting to proceed")
+            original_save(path, ids)
+
+        def dismiss_q1():
+            with mock.patch.object(triage, "save_dismissed", side_effect=slow_save):
+                triage.dismiss(self.store, "Q1")
+
+        t1 = threading.Thread(target=dismiss_q1)
+        t1.start()
+        self.assertTrue(started.wait(timeout=5), "first dismiss() never reached save")
+        t2 = threading.Thread(target=lambda: triage.dismiss(self.store, "Q2"))
+        t2.start()
+        proceed.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        self.assertFalse(t1.is_alive() or t2.is_alive(), "a dismiss() thread hung")
+        self.assertEqual({"seed", "Q1", "Q2"}, triage.load_dismissed(self.store))
+
 
 PQ_FIXTURE = """# Pending Questions
 

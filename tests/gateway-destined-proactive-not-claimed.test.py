@@ -54,6 +54,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path.startswith("/v1/agents"):  # the owner DM is the gateway's to publish, never the pin's
+            self._json({"agents": [{"id": "@mock-agent:example.org", "owner": "@o:example.org",
+                                    "owner_dm_room": "!mock:example.org"}]})
+            return
         if self.path.startswith("/v1/tasks"):
             with LOCK:
                 STATE["polls"] += 1
@@ -97,7 +101,8 @@ env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
             "REMOTE_TASK_PROVIDER": "remote-gateway",
             "REMOTE_TASK_POLL_WAIT": "1",
             "REMOTE_OUTBOUND_SCAN_S": "1",
-            "REMOTE_PROACTIVE_ROOM": "!mock:example.org"})
+            "REMOTE_PROACTIVE_ROOM": "!mock:example.org",
+            "AGENT_MXID": "@mock-agent:example.org"})
 env.pop("GATEWAY_INSTANCE", None)
 
 proc = subprocess.Popen(

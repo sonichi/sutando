@@ -109,6 +109,10 @@ class DesignAClaimBackend:
                     outbox.park_item(self.root, item_id, "max-attempts")
             return outbox._release_locked(self.root, item_id, token.worker)
 
+    def resend_epoch(self, item_id: str) -> int:
+        """Operator re-send generation; 0 until a requeue bumps it."""
+        return outbox.resend_epoch_for(self.root, item_id)
+
     def attempts(self, item_id: str) -> int:
         return outbox.attempts_for(self.root, item_id)
 

@@ -88,6 +88,8 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
 
 
 def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None,
+              pid_instance: "str | None" = "",
+              pid_actor: "str | None" = "",
               trees: dict | None = None, parents: dict | None = None) -> dict:
     """Call check_task_watcher against a temp WORKSPACE_DIR. `argv` patches
     the _proc_argv probe: None = leave the real one (only used where no PID
@@ -101,7 +103,8 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+                 hc._pid_actor_id)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
@@ -109,10 +112,15 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             hc._watcher_trees = lambda *a, **k: (trees or {})
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
+            # A synthetic pid has no readable environment; the default instance is
+            # what these fixtures have always meant.
+            hc._pid_instance_id = lambda pid: pid_instance
+            hc._pid_actor_id = lambda pid: pid_actor
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+             hc._pid_actor_id) = saved
 
 
 @contextlib.contextmanager
@@ -127,17 +135,21 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
     with tempfile.TemporaryDirectory() as td:
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+                 hc._pid_actor_id)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda p, ps=None: "500"
+            hc._pid_instance_id = lambda p: ""
+            hc._pid_actor_id = lambda p: ""
             yield ws
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
+             hc._pid_actor_id) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -454,6 +466,30 @@ def case_y_json_repair_line_goes_to_stderr() -> list[str]:
     return fails
 
 
+def case_z_an_unreadable_watcher_identity_offers_no_repair_target() -> list[str]:
+    """Every other case stubs the identity as the default, which is what these
+    fixtures have always meant. This one covers the state the stub hides."""
+    fails = []
+    res = run_check(core_alive=True, pid_text=None, trees={"901": {"901"}},
+                    parents={"901": "900"}, pid_instance=None)
+    if res.get("status") != "warn":
+        fails.append(f"z) expected a warn, got {res.get('status')!r}")
+    if "_sentinel_restamp_path" in res:
+        fails.append("z) a guessed repair target was published for an unreadable identity")
+    if "_sentinel_restamp_pid" not in res:
+        fails.append("z) the live pid must still be reported")
+    if "unreadable" not in (res.get("detail") or ""):
+        fails.append(f"z) the detail must say why: {res.get('detail')!r}")
+    if "Do NOT stop it" not in (res.get("detail") or ""):
+        fails.append("z) a draining watcher must never be prescribed for stopping")
+    # The positive control: the SAME shape with a readable identity does offer one.
+    ok = run_check(core_alive=True, pid_text=None, trees={"901": {"901"}},
+                   parents={"901": "900"}, pid_instance="")
+    if "_sentinel_restamp_path" not in ok:
+        fails.append("z) control: a readable identity must still name a target")
+    return fails
+
+
 def case_y2_private_keys_stay_out_of_the_json_payload() -> list[str]:
     """`_sentinel_restamp_pid` is the fix pass's internal channel, and whether it
     is present depends on the flags — so `--json` must not publish it."""
@@ -619,8 +655,8 @@ def case_l_dead_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"l) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
-        fails.append(f"l) detail should name the orphan, got {r['detail']!r}")
+    if "ownerless" not in r["detail"] or "supervised" not in r["detail"]:
+        fails.append(f"l) detail must split roots by owner, got {r['detail']!r}")
     if "IS being drained" not in r["detail"]:
         fails.append("l) must not claim tasks/ is unattended when a watcher runs")
     return fails
@@ -631,8 +667,8 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"m) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
-        fails.append(f"m) detail should name the orphan, got {r['detail']!r}")
+    if "ownerless" not in r["detail"] or "supervised" not in r["detail"]:
+        fails.append(f"m) detail must split roots by owner, got {r['detail']!r}")
     return fails
 
 
@@ -647,7 +683,9 @@ def case_m2_fabricated_pid_ignores_the_host_process_table() -> list[str]:
         r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
     finally:
         hc._pid_parent = saved
-    if "orphaned" not in r["detail"]:
+    # run_check stubs _pid_parent from its own `parents` arg, so the lambda above
+    # is overwritten before the check runs -- 9000's parent reads None either way.
+    if "ownerless" not in r["detail"] or "9000" not in r["detail"]:
         return [f"m2) host pid table leaked into the verdict, got {r['detail']!r}"]
     return []
 
@@ -731,6 +769,68 @@ def case_q_trees_swallows_probe_failure() -> list[str]:
     return []
 
 
+def case_aa_argv_classification_binds_to_the_executed_script():
+    """The EXECUTED script decides, read from the real argv vector — not from spelling.
+
+    Spawns real processes: a flattened argv cannot separate a spaced path from
+    two operands, so no string rule can pass this matrix.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    fails = []
+    tmp = tempfile.mkdtemp()
+
+    def mk(rel):
+        path = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/bash\nsleep 8\n")
+        os.chmod(path, 0o755)
+        return path
+
+    shapes = [
+        ("dir ending .sh, real watcher", ["/bin/bash", mk("dir.sh/src/watch-tasks-stream.sh"), "/ws/tasks"], True),
+        ("no extension + path as DATA", ["/bin/bash", mk("unrelated"), "/repo/src/watch-tasks-stream.sh"], False),
+        (".bash + path as DATA", ["/bin/bash", mk("unrelated.bash"), "/repo/src/watch-tasks-stream.sh"], False),
+        (".sh + path as DATA", ["/bin/bash", mk("unrelated.sh"), "/repo/src/watch-tasks-stream.sh"], False),
+        ("path WITH SPACES + tasks", ["/bin/bash", mk("My Path/src/watch-tasks-stream.sh"), "/ws/tasks"], True),
+        ("plain watcher, no args", ["/bin/bash", mk("plain/src/watch-tasks-stream.sh")], True),
+    ]
+    try:
+        for label, cmd, want in shapes:
+            proc = subprocess.Popen(cmd)
+            try:
+                time.sleep(0.35)
+                got = hc._is_watcher_argv(" ".join(cmd), proc.pid)
+                if got is not want:
+                    fails.append(f"aa) {label}: got {got}, want {want}")
+            finally:
+                proc.kill()
+                proc.wait()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return fails
+
+
+def case_ab_ambiguous_flattened_argv_declines_rather_than_guesses():
+    """No pid and >2 tokens is UNDECIDABLE, and must report None, not a guess."""
+    fails = []
+    checks = [
+        ("bash /a/b.sh /c/watch-tasks-stream.sh", None),   # script + operand, or spaced path?
+        ("bash /repo/src/watch-tasks-stream.sh", True),    # one operand however spelled
+        ("python3 /repo/src/watch-tasks-stream.sh", False),
+        ("bash -c echo watch-tasks-stream.sh", False),
+        ("bash", False),
+    ]
+    for argv, want in checks:
+        got = hc._is_watcher_argv(argv)
+        if got is not want:
+            fails.append(f"ab) _is_watcher_argv({argv!r}) = {got}, want {want}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -767,6 +867,9 @@ def main() -> int:
         ("x", case_x_fix_is_reachable_from_main),
         ("y", case_y_json_repair_line_goes_to_stderr),
         ("y2", case_y2_private_keys_stay_out_of_the_json_payload),
+        ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
+        ("aa", case_aa_argv_classification_binds_to_the_executed_script),
+        ("ab", case_ab_ambiguous_flattened_argv_declines_rather_than_guesses),
     ]
     all_failures = []
     for label, fn in cases:

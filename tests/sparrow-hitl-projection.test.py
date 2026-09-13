@@ -40,6 +40,8 @@ class ProjectHitl(unittest.TestCase):
         self._saved = (B._STATE, B.PROACTIVE_ROOM, B._req)
         B._STATE = self.ws / "state"
         B.PROACTIVE_ROOM = "!room:example.invalid"
+        # the card is owner-private: it goes to the gateway's owner DM reading, never the pin
+        B._ROUTING.update(owner_dm="!room:example.invalid", loaded=True, next=B.time.time() + 3600)
         self.answer = {"ok": True, "event_id": "$card"}
         B._req = lambda method, path, payload=None, timeout=None: (
             self.calls.append((method, path, payload)) or self.answer)
@@ -48,6 +50,7 @@ class ProjectHitl(unittest.TestCase):
 
     def tearDown(self):
         B._STATE, B.PROACTIVE_ROOM, B._req = self._saved
+        B._ROUTING.update(owner_dm="", loaded=False, next=0.0)
 
     def _requirement(self, guard="g1"):
         return self.manager.create(hs.HumanRequirement(
@@ -123,6 +126,7 @@ class ProjectHitl(unittest.TestCase):
     def test_no_proactive_room_posts_nothing(self):
         self._requirement()
         B.PROACTIVE_ROOM = ""
+        B._ROUTING["owner_dm"] = ""  # no owner DM reading: the card waits, whatever the pin says
         self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
         self.assertEqual(self.calls, [])
 

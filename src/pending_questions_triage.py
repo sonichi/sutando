@@ -12,10 +12,13 @@ behind it.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import tempfile
+import threading
+from pathlib import Path
 from typing import Iterable, Optional
 
 # A reference carrying its own repository: `owner/repo#123`, or a github.com pull/
@@ -149,6 +152,32 @@ def rank(rows: list[dict]) -> list[dict]:
 # Permanent by design: a changed situation is written as a NEW section, which
 # hashes to a new id. So this stores ids, never "until" state.
 
+# Paired with the flock below, matching triage_actions.py's _locked_for_append.
+_dismiss_write_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _locked_for_dismiss(path):
+    """Hold an exclusive lock across one dismiss()'s full read-modify-write.
+
+    Without this, two concurrent dismiss() calls can both read the same starting
+    set, each add their own id in memory, and each write — the second write wins
+    outright and silently drops the first id (review finding: two calls reading
+    {seed} in parallel both "succeed"; final store [Q2, seed], Q1 lost). The lock
+    is on a sidecar file next to the store, not the store itself, so a reader
+    (`load_dismissed`) is never blocked by a writer holding it.
+    """
+    path = Path(path) if not isinstance(path, Path) else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(f"{path.suffix}.lock")
+    with _dismiss_write_lock, lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def load_dismissed(path) -> set[str]:
     """Dismissed question ids. A missing or unreadable store means none."""
     try:
@@ -181,11 +210,16 @@ def save_dismissed(path, ids: Iterable[str]) -> None:
 
 
 def dismiss(path, qid: str) -> set[str]:
-    """Record `qid` as dismissed forever and return the resulting id set."""
-    ids = load_dismissed(path)
-    ids.add(str(qid))
-    save_dismissed(path, ids)
-    return ids
+    """Record `qid` as dismissed forever and return the resulting id set.
+
+    Locked end to end (see `_locked_for_dismiss`) so two concurrent dismissals
+    can never both start from the same snapshot and clobber each other.
+    """
+    with _locked_for_dismiss(path):
+        ids = load_dismissed(path)
+        ids.add(str(qid))
+        save_dismissed(path, ids)
+        return ids
 
 
 def without_dismissed(rows: list[dict], dismissed: set[str]) -> list[dict]:

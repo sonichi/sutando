@@ -123,5 +123,29 @@ case "$OUT" in
   *) bad "empty queue emits {}" "got: ${OUT:0:120}" ;;
 esac
 
+# 6. THE REJECTION PATH. When the resolver refuses an interpreter the hook must
+# not execute a bare `python3` — that is the CLT stub the resolver just declined.
+REJ="$(mktemp -d)"
+mkdir -p "$REJ/scripts" "$REJ/src" "$REJ/workspace/tasks" "$REJ/workspace/results"
+printf '#!/bin/bash\n[ "$1" = "workspace" ] && { echo "%s/workspace"; exit 0; }\nexit 1\n' "$REJ" \
+  > "$REJ/scripts/sutando-config.sh"
+chmod +x "$REJ/scripts/sutando-config.sh"
+cp "$HOOK" "$REJ/src/"
+printf 'id: probe\ntask: rejected-interpreter\n' > "$REJ/workspace/tasks/$PROBE"
+# A recording shim: if the hook falls back to PATH python this fires.
+printf '#!/bin/bash\necho FALLBACK_INVOKED >&2\nexit 79\n' > "$REJ/python3"
+chmod +x "$REJ/python3"
+REJ_ERR="$(PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
+REJ_OUT="$(PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
+case "$REJ_ERR" in
+  *FALLBACK_INVOKED*) bad "a refused interpreter is not worked around" "the bare python3 fallback ran" ;;
+  *) ok "a refused interpreter is not worked around" ;;
+esac
+case "$REJ_OUT" in
+  '{}') ok "a refused interpreter still emits valid JSON" ;;
+  *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
+esac
+rm -rf "$REJ"
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

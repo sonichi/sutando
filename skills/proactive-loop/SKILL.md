@@ -77,11 +77,14 @@ caps this file and refuses date stamps in it).
 6.5. **Idle surface.** Record the pass:
    `python3 skills/proactive-loop/scripts/idle-surface-hash.py --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop`.
    The held set is edited only through
-   `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate>`
+   `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
    (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
    retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
-   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run with
-   `--write` and `--commit`. Never commit before the send; never build the list from recall.
+   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run the same
+   pipe with `--write` on `idle-held.py` AND `--commit` on `idle-surface-hash.py` — each flag belongs
+   to its own side, and `--commit` alone leaves added holds, removal reasons and notes unpersisted, so
+   the next pass re-posts the stale hold. Never commit before the send; never build the list from
+   recall.
    `quiet` + owner active in the last ~30 min → still drop a one-line activity signal.
 6.7. **Failure closure.** Every reported failure ends with the mechanism that prevents its recurrence,
    linked, or the sentence "no mechanism exists, because X". A filed lesson is not a third option.
@@ -90,8 +93,8 @@ caps this file and refuses date stamps in it).
    (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
 7.5. **Memory index.** Before adding a row to `MEMORY.md`:
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>"` (0 safe · 1 refuse,
-   casualty named · 2 cannot answer). On refusal run `scripts/memory-hub-containment.py` before trimming;
-   which rows go is the owner's call.
+   casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+   from its hub before removing it; which rows go is the owner's call.
 8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
    placed by importance (only the top 5 render anywhere), and assert with the reader:
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
@@ -101,8 +104,8 @@ caps this file and refuses date stamps in it).
    owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
    Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
    is UNKNOWN, not dead; never hand-roll a process check.
-9.5. **PR thread gate**, before posting to a PR thread:
-   `python3 skills/proactive-loop/scripts/pr-monologue-check.py <number> --me <your-login>`
+9.5. **PR thread gate**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
 10. **Discord.** Check the channels in `reference_discord_channels.md`; forward actionable public items to
     the dev channel. #bot2bot tags: `claim:` `blocked:` `done:` `ping:` `nack:` `opinion-requested:`.

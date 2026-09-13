@@ -35,6 +35,7 @@ idle / wedged":
     unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
+    (idle, + refused turn)  →   blocked-human (turn-rejected)   (net-new: refused_turn)
 
 runtime-health.json stays the Console's coarse view (unchanged, its consumers
 untouched); core-supervisor.json is the escalation-facing refinement of the same
@@ -138,10 +139,29 @@ _AWAIT_HINT = re.compile(
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
 
+# A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
+# pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
+_REFUSAL = re.compile(
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    r"|Please run /login|OAuth access token has expired"
+    # "not logged in" is three common words: only the CLI's own line-start form, or
+    # the phrase beside a /login token, is a refusal; a tool result quoting it is not.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
+    re.I)
+# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
+# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
+_TURN_DONE = re.compile(
+    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+_TURN_SHORT = re.compile(r"[01]s")
+_PROMPT_LINE = re.compile(r"^\s*❯")
+#: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
+_TURN_WINDOW = 40
+
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
 # session-limit is a spend/wait decision: never auto-answered, never a login.
-_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused", "unknown"}
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused",
+                "turn-rejected", "unknown"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
 # once per prompt instance (`--no-auto-answer` disables). Unlisted → None → ESCALATE.
@@ -217,6 +237,43 @@ def _is_idle_ready(pane: str) -> bool:
     return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
 
 
+def refused_turn(pane: str):
+    """(kind, line) when the pane sits at the idle footer and the turn that ended there —
+    the last completed one, with nothing newer below it — was refused: a short turn (≤1s
+    or no duration) whose only content is a `⎿` result carrying a _REFUSAL line. Else
+    None — a long turn that merely mentions the words, a turn that ran (any `●`/`⏺`
+    line, so a tool result that quoted a refusal stays the tool's), a completion with a
+    newer prompt or active turn below it, or a pane not at the footer all stay as they were."""
+    if not _is_idle_ready(pane):
+        return None
+    lines = [ln for ln in pane.splitlines() if ln.strip()][-_TURN_WINDOW:]
+    done = next((i for i in range(len(lines) - 1, -1, -1) if _TURN_DONE.match(lines[i])), None)
+    if done is None:
+        return None
+    # Only the footer may follow the completion: a typed prompt, a spinner or any turn
+    # glyph below it means a newer turn owns the pane and the old refusal is history.
+    for ln in lines[done + 1:]:
+        core = ln.strip()
+        if core[:1] in "●⏺⎿✻" or (_PROMPT_LINE.match(ln) and core.lstrip("❯").strip()):
+            return None
+    dur = _TURN_DONE.match(lines[done]).group("dur")
+    if dur and not _TURN_SHORT.fullmatch(dur):
+        return None
+    start = next((i for i in range(done - 1, -1, -1) if _PROMPT_LINE.match(lines[i])), -1)
+    turn = [ln.strip() for ln in lines[start + 1:done]]
+    # A refused turn prints nothing but its `⎿` result. Agent output (`●`) or a tool call
+    # (`⏺`) means the turn ran, and any `⎿` in it is that tool's result, not the CLI's.
+    if any(core[:1] in "●⏺" for core in turn):
+        return None
+    in_result = False
+    for core in turn:
+        if core.startswith("⎿"):
+            in_result = True
+        if in_result and _REFUSAL.search(core):
+            return "turn-rejected", core.lstrip("⎿").strip()
+    return None
+
+
 # runtime-health health string → supervisor state, for the non-gate branches.
 _BASE_TO_STATE = {
     "offline": ("crashed", "core process/session not found"),
@@ -254,6 +311,12 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
     if base_health == "needs_login":
         return "logged-out", _BASE_TO_STATE["needs_login"][1], None, None
+    # A refused turn leaves the core at its idle footer, which every branch below reads
+    # as healthy; the refusal line is the only evidence and it is finished, not a gate.
+    refused = refused_turn(pane) if pane else None
+    if refused:
+        kind, line = refused
+        return "blocked-human", f"awaiting user: {kind}", line, kind
     if not gateway_alive:
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])

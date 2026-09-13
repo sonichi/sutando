@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
@@ -48,7 +49,26 @@ SIGNED_OUT_SENTINEL = "__signed_out__"
 # Owner prefs written by the desktop Settings UI (host is the single writer).
 # autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
 # that carries incidental owner data, so it is opt-in rather than opt-out.
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False}
+PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
+# Ask-first: an automatic report is parked as a draft and the owner gets a card
+# (File / File without logs / Skip) instead of a filing; the reply files or drops it.
+DRAFTS_DIR = "feedback-drafts"
+DRAFT_ID_RE = re.compile(r"^fb_[0-9a-f]{10}$")  # the writer's grammar; anything else never becomes a path
+HITL_RUNTIME = "report-feedback"
+FILED_SUFFIX = ".filed"  # the receipt: the post landed, the card is not yet resolved
+POSTING_SUFFIX = ".posting"  # in flight: the post was sent and no answer was recorded
+ENGINE_SRC = Path(__file__).resolve().parents[2] / "src"
+
+
+def _engine_modules() -> None:
+    """hitl lives in the engine's src: one place adds the path, for every importer in this file."""
+    if str(ENGINE_SRC) not in sys.path:
+        sys.path.insert(0, str(ENGINE_SRC))
+ASK_ACTIONS = [
+    {"id": "file", "kind": "confirmation", "label": "File this bug report"},
+    {"id": "file_no_logs", "kind": "confirmation", "label": "File without logs"},
+    {"id": "skip", "kind": "confirmation", "label": "Skip"},
+]
 # Auto-report throttle state (this script is the single writer).
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
@@ -259,9 +279,216 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
+        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
     except Exception:
         pass
     return prefs
+
+
+def _drafts_dir(ws: Path) -> Path:
+    return ws / "state" / DRAFTS_DIR
+
+
+def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
+    """Park a report the owner has not approved yet; returns the draft id."""
+    d = _drafts_dir(ws)
+    d.mkdir(parents=True, exist_ok=True)
+    draft_id = f"fb_{uuid.uuid4().hex[:10]}"
+    rec = {"id": draft_id, "created": now if now is not None else time.time(), "payload": payload}
+    tmp = d / f".{draft_id}.tmp"
+    tmp.write_text(json.dumps(rec, indent=2) + "\n")
+    os.replace(tmp, d / f"{draft_id}.json")
+    return draft_id
+
+
+def list_drafts(ws: Path, state: str = "draft") -> list:
+    """Parked drafts (default), or the in-flight ones (`state="posting"`), oldest first."""
+    suffix = POSTING_SUFFIX if state == "posting" else ".json"
+    out = []
+    for f in sorted(_drafts_dir(ws).glob(f"fb_*{suffix}")):
+        try:
+            out.append(json.loads(f.read_text()))
+        except Exception:
+            continue
+    return out
+
+
+def _draft_path(ws: Path, draft_id: str) -> Path:
+    if not DRAFT_ID_RE.match(draft_id or ""):
+        raise ValueError(f"not a draft id: {draft_id!r}")
+    return _drafts_dir(ws) / f"{draft_id}.json"
+
+
+def load_draft(ws: Path, draft_id: str) -> dict | None:
+    try:
+        return json.loads(_draft_path(ws, draft_id).read_text())
+    except Exception:
+        return None
+
+
+def drop_draft(ws: Path, draft_id: str) -> None:
+    try:
+        _draft_path(ws, draft_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def filed_receipt(ws: Path, draft_id: str) -> Path:
+    return _draft_path(ws, draft_id).with_suffix(FILED_SUFFIX)
+
+
+def posting_marker(ws: Path, draft_id: str) -> Path:
+    return _draft_path(ws, draft_id).with_suffix(POSTING_SUFFIX)
+
+
+def mark_posting(ws: Path, draft_id: str) -> None:
+    """Before the post: the draft becomes the in-flight marker, so a death mid-request leaves
+    an indeterminate outcome on disk instead of a draft that a retry would post again."""
+    os.replace(_draft_path(ws, draft_id), posting_marker(ws, draft_id))
+
+
+def unmark_posting(ws: Path, draft_id: str) -> None:
+    """The server answered and did not file: the draft is a draft again."""
+    os.replace(posting_marker(ws, draft_id), _draft_path(ws, draft_id))
+
+
+def mark_filed(ws: Path, draft_id: str) -> None:
+    """The server answered 2xx: one atomic rename, and a retry that finds the receipt never posts."""
+    os.replace(posting_marker(ws, draft_id), filed_receipt(ws, draft_id))
+
+
+def clear_filed(ws: Path, draft_id: str) -> None:
+    filed_receipt(ws, draft_id).unlink(missing_ok=True)
+
+
+def decision_for_reply(text: str) -> str | None:
+    """Map an action reply's body (the card label, optionally `label — note`) to a decision."""
+    head = (text or "").split(" — ", 1)[0].strip().lower()
+    for a in ASK_ACTIONS:
+        if head == a["label"].lower():
+            return a["id"]
+    return None
+
+
+def hitl_manager(ws: Path):
+    """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
+    _engine_modules()
+    from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
+
+    return HitlManager(HitlStore(default_store(ws)))
+
+
+def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
+    """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
+    _engine_modules()
+    from hitl.schema import Action, HumanRequirement  # type: ignore
+
+    req = HumanRequirement(
+        kind="choice", runtime=HITL_RUNTIME, title="File a bug report?",
+        message=f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
+        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
+        subject={"draft_id": draft_id, "title": title},
+        turn_on_action=True,  # the click reaches the core as a task, so the Stop hook runs at once
+    )
+    return hitl_manager(ws).create(req).id
+
+
+def requirement_for_draft(manager, draft_id: str):
+    for req in manager.active():
+        if req.runtime == HITL_RUNTIME and req.guard == draft_id:
+            return req
+    return None
+
+
+HELD_ACTIONS = [
+    {"id": "file", "kind": "confirmation", "label": "File it again"},
+    {"id": "skip", "kind": "confirmation", "label": "Skip"},
+]
+
+
+def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> str:
+    """The post got no answer: a new card says so and asks again. Same guard grammar with a suffix,
+    so the store dedupes a repeat and the click's task path is the same one."""
+    from hitl.schema import Action, HumanRequirement  # type: ignore
+
+    req = HumanRequirement(
+        kind="choice", runtime=HITL_RUNTIME, title="Bug report: filed or not?",
+        message=(f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
+                 f"File it again, or skip it?"),
+        guard=f"{draft_id}:held", device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device},
+        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in HELD_ACTIONS],
+        subject={"draft_id": draft_id, "title": title, "held": True},
+        turn_on_action=True,
+    )
+    return manager.create(req).id
+
+
+def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
+    """Register parked drafts that have no card yet, then run every choice the owner clicked.
+    A decision that cannot complete (signed out, API down) stays in progress for the next run;
+    one whose post landed but whose card did not resolve finishes from its receipt, without posting."""
+    out = {"registered": [], "applied": [], "kept": [], "cancelled": [], "held": []}
+    manager = hitl_manager(ws)
+    for rec in list_drafts(ws):
+        if requirement_for_draft(manager, rec["id"]) is None:
+            out["registered"].append(register_ask(ws, rec["id"], rec["payload"]["title"], device))
+    for req in manager.active():
+        if req.runtime != HITL_RUNTIME or req.status != "in_progress" or not req.chosen_action:
+            continue
+        draft_id = str((req.subject or {}).get("draft_id") or req.guard)
+        if not DRAFT_ID_RE.match(draft_id):
+            manager.cancel(req.id)
+            out["cancelled"].append(req.id)
+            continue
+        if (req.subject or {}).get("held"):
+            # The owner answered the held card: file again on purpose, or drop the in-flight draft.
+            if not posting_marker(ws, draft_id).exists() and load_draft(ws, draft_id) is None:
+                manager.cancel(req.id)  # settled by hand meanwhile
+                out["cancelled"].append(req.id)
+                continue
+            if decide(ws, prefs, draft_id, req.chosen_action) == 0:
+                manager.resolve(req.id)
+                clear_filed(ws, draft_id)
+                out["applied"].append(req.id)
+            else:
+                out["kept"].append(req.id)
+            continue
+        if filed_receipt(ws, draft_id).exists():
+            manager.resolve(req.id)
+            clear_filed(ws, draft_id)
+            out["applied"].append(req.id)
+            continue
+        if posting_marker(ws, draft_id).exists():
+            # The post was sent and nothing came back: it may or may not have filed. Never
+            # re-post on a guess: the answered card closes, and a new card asks the owner.
+            title = str((req.subject or {}).get("title") or draft_id)
+            held_id = register_held(ws, manager, draft_id, title, device)
+            manager.resolve(req.id)
+            print(f"HELD: draft {draft_id} has an in-flight post with no recorded answer; "
+                  f"asked again as {held_id} (File it again / Skip); --decide {draft_id} file|skip also settles it.")
+            out["held"].append(held_id)
+            continue
+        if load_draft(ws, draft_id) is None:
+            manager.cancel(req.id)  # the draft is gone (decided by hand, or never valid): nothing to run
+            out["cancelled"].append(req.id)
+            continue
+        if decide(ws, prefs, draft_id, req.chosen_action) == 0:
+            manager.resolve(req.id)
+            clear_filed(ws, draft_id)
+            out["applied"].append(req.id)
+        else:
+            out["kept"].append(req.id)
+    return out
+
+
+def pending_clicks(ws: Path) -> int:
+    """How many cards the owner has answered that this skill has not finished — the hook's cheap gate."""
+    try:
+        return sum(1 for r in hitl_manager(ws).active()
+                   if r.runtime == HITL_RUNTIME and r.status == "in_progress" and r.chosen_action)
+    except Exception:  # noqa: BLE001 — no store, no engine: nothing to apply
+        return 0
 
 
 def _auto_state_path(ws: Path) -> Path:
@@ -371,9 +598,72 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
         return post_feedback(nxt, payload, token, _hops + 1)
 
 
+def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
+    """The owner answered the card: file (with logs per prefs), file without logs, or skip.
+    Returns the exit code; every failure keeps the draft parked."""
+    if choice not in ("file", "file_no_logs", "skip"):
+        print(f"ERROR: choice must be file | file_no_logs | skip, got {choice!r}.")
+        return 1
+    if DRAFT_ID_RE.match(draft_id or "") and filed_receipt(ws, draft_id).exists():
+        print(f"OK: draft {draft_id} was already filed; the receipt closes the card on the next --apply.")
+        return 0
+    if DRAFT_ID_RE.match(draft_id or "") and posting_marker(ws, draft_id).exists():
+        # An explicit --decide on an in-flight draft is the owner's call: skip drops it, file re-posts.
+        if choice == "skip":
+            posting_marker(ws, draft_id).unlink()
+            print(f"SKIPPED: in-flight draft {draft_id} dropped at the owner's request.")
+            return 0
+        unmark_posting(ws, draft_id)
+    rec = load_draft(ws, draft_id)
+    if not rec:
+        print(f"ERROR: no parked draft {draft_id}.")
+        return 1
+    if choice == "skip":
+        drop_draft(ws, draft_id)
+        print(f"SKIPPED: draft {draft_id} dropped at the owner's request.")
+        return 0
+    base, token = read_cloud_auth(ws)
+    if not token:
+        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry.")
+        return 2
+    d = rec["payload"]
+    ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
+                 "auto": bool(d.get("auto")), "owner_approved": True, "idempotency_key": draft_id}
+    with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
+    if with_logs:
+        excerpt, names = logs_excerpt(ws)
+        if excerpt:
+            ctx["last_logs_excerpt"] = excerpt
+            ctx["log_files"] = names
+        else:
+            ctx["logs_omitted"] = why_no_logs(ws)
+    else:
+        ctx["logs_opted_out"] = True
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    mark_posting(ws, draft_id)
+    try:
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            unmark_posting(ws, draft_id)  # a client error proves no write: the draft is a draft again
+            print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
+        else:
+            # A 5xx can follow a committed write; it proves nothing, so the marker stays and the
+            # held card asks the owner rather than a retry posting on a guess.
+            print(f"ERROR: feedback API {e.code} — draft {draft_id} held as in flight (it may have been filed).")
+        return 1
+    except Exception as e:  # noqa: BLE001 — no answer: indeterminate, the marker stays for --apply to hold
+        print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")
+        return 1
+    mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
+    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--title", required=True)
+    # Optional at parse time: --drafts and --decide carry no title; filing and asking enforce it below.
+    ap.add_argument("--title", default="")
     ap.add_argument("--body", default="")
     ap.add_argument("--kind", choices=["bug", "feature", "other"], default="bug")
     ap.add_argument("--severity", choices=["low", "medium", "high", "critical"], default="medium")
@@ -384,22 +674,67 @@ def main() -> None:
         help="Agent-initiated automatic report: honors the owner's auto-report "
         "setting and is deduped/rate-limited. Exits 3 (SKIPPED) when gated.",
     )
+    ap.add_argument("--ask", action="store_true",
+                    help="Park the report as a draft and ask with a File / File without logs / Skip card instead of filing.")
+    ap.add_argument("--apply", action="store_true",
+                    help="Register parked drafts that have no card yet and run the choices the owner clicked.")
+    ap.add_argument("--decide", nargs=2, metavar=("DRAFT_ID", "CHOICE"),
+                    help="Apply a choice to a parked draft by hand: file | file_no_logs | skip.")
+    ap.add_argument("--drafts", action="store_true", help="List parked drafts as JSON and exit.")
     a = ap.parse_args()
+
+    ws = resolve_workspace()
+    prefs = read_prefs(ws)
+
+    device = platform.node().split(".")[0]
+    if a.drafts:
+        print(json.dumps(list_drafts(ws), indent=2))
+        return
+    if a.apply:
+        out = apply_clicks(ws, prefs, device)
+        print("APPLIED: " + json.dumps(out))
+        return
+    if a.decide:
+        rc = decide(ws, prefs, a.decide[0], a.decide[1])
+        if rc == 0:
+            manager = hitl_manager(ws)
+            req = requirement_for_draft(manager, a.decide[0])
+            if req is not None:
+                manager.resolve(req.id)  # the card follows the hand-made decision
+            held = next((r for r in manager.active() if r.runtime == HITL_RUNTIME and r.guard == f"{a.decide[0]}:held"), None)
+            if held is not None:
+                manager.resolve(held.id)
+            clear_filed(ws, a.decide[0]) if DRAFT_ID_RE.match(a.decide[0]) else None
+        if rc:
+            sys.exit(rc)
+        return
 
     if not a.title.strip():
         print("ERROR: --title is required (a short one-line summary).")
         sys.exit(1)
-
-    ws = resolve_workspace()
-    prefs = read_prefs(ws)
-    if a.auto:
+    if a.auto or a.ask:
         if not prefs["autoReport"]:
-            print("SKIPPED: automatic bug reports are disabled (Settings → Agent → Bug reports).")
+            print("SKIPPED: automatic bug reports are disabled (Settings → Bug reports).")
             sys.exit(3)
         ok, reason = check_auto_gate(ws, a.title)
         if not ok:
             print(f"SKIPPED: {reason}.")
             sys.exit(3)
+
+    if a.ask or (a.auto and prefs["askFirst"]):
+        draft = {"kind": a.kind, "severity": a.severity, "title": a.title.strip(),
+                 "body": a.body.strip() or a.title.strip(), "auto": bool(a.auto), "no_logs": bool(a.no_logs)}
+        draft_id = write_draft(ws, draft)
+        # The ask is the throttled event: a card is the more intrusive channel, so it
+        # counts toward the dedupe window and the daily cap whether or not it is later filed.
+        record_auto_report(ws, draft["title"])
+        try:
+            req_id = register_ask(ws, draft_id, draft["title"], device)
+        except Exception as e:  # noqa: BLE001
+            print(f"PARKED: draft {draft_id} kept, card not registered yet ({e}); --apply retries it.")
+            sys.exit(3)
+        print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
+        return
 
     base, token = read_cloud_auth(ws)
     if not token:

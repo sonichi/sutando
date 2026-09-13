@@ -308,6 +308,15 @@ class DesignCClaimBackend:
     def attempts(self, item_id: str) -> int:
         return self.attempts_by_key(_safe_key(item_id))
 
+    def resend_epoch(self, item_id: str) -> int:
+        """Operator re-send generation; 0 until a requeue bumps it.
+
+        Same store as A: the epoch is written by `outbox.requeue_item` into the
+        item record on this root, so reading it here is what makes a requeue
+        present a NEW idempotency key instead of the parked attempt's.
+        """
+        return outbox.resend_epoch_for(self.root, item_id)
+
     def park(self, item_id: str, reason: str) -> None:
         key = _safe_key(item_id)
         with self._lock(key):

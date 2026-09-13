@@ -19,6 +19,13 @@ WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # re-disabling the hook the way the old path did.
 [ -n "$WORKSPACE" ] || WORKSPACE="$REPO_DIR/workspace"
 
+# The resolver owns which interpreter is usable; a bare `python3` is wrong on a
+# configured install and re-enters the CLT stub it refused, so a refusal stands.
+if ! PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)" \
+   || [ -z "$PYBIN" ] || [ ! -x "$PYBIN" ]; then
+  PYBIN=""
+fi
+
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 
@@ -26,13 +33,30 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
-  # Skip if result already exists
-  [ -f "$RESULTS_DIR/$BASENAME" ] && continue
-  UNPROCESSED+="--- $BASENAME ---\n$(cat "$f")\n\n"
+  # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
+  # consumer uses; a local re-implementation drifts from what will actually be sent.
+  if [ -f "$RESULTS_DIR/$BASENAME" ]; then
+    if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$BASENAME" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then continue; fi
+    UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+    continue
+  fi
+  UNPROCESSED+="--- $BASENAME ---
+$(cat "$f")
+
+"
 done
 
-if [ -n "$UNPROCESSED" ]; then
-  printf '{"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n%s"}' "$(echo -e "$UNPROCESSED" | sed 's/"/\\"/g' | tr '\n' ' ')"
+if [ -n "$UNPROCESSED" ] && [ -z "$PYBIN" ]; then
+  # Encoding needs an interpreter the resolver would not supply. Say so on stderr
+  # and allow the stop: a hand-rolled JSON block is what made this guard unparseable.
+  echo "check-pending-tasks: no usable interpreter; queue not reported" >&2
+  echo '{}'
+elif [ -n "$UNPROCESSED" ]; then
+  # A real JSON encoder: hand-rolled escaping put a raw newline inside a string
+  # value, so every block decision was unparseable and the guard never fired.
+  SUTANDO_HOOK_BODY="$UNPROCESSED" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'
 fi

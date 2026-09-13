@@ -40,14 +40,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # A workflow-level `paths:` filter would never report this REQUIRED context,
+      # stranding the PR — so the gate skips STEPS and the job still reports.
+      - name: Decide whether this diff has anything to lint
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          # Unknown or empty scope lints: a lookup that failed is not evidence
+          # that no lintable file changed.
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+             || ! gh pr diff "$PR" --name-only > /tmp/eslint-scope.txt \
+             || ! grep -q . /tmp/eslint-scope.txt; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+            echo 'Scope undetermined (or push to main) — linting.'
+            exit 0
+          fi
+          # Everything ESLint reads, plus every dependency input `npm ci` consults:
+          # package.json, package-lock.json, npm-shrinkwrap.json and .npmrc.
+          if grep -qE '\.(ts|tsx|js|mjs|cjs)$|^eslint\.config\.mjs$|^package(-lock)?\.json$|^npm-shrinkwrap\.json$|^\.npmrc$|^tsconfig[^/]*\.json$|^\.github/workflows/eslint\.yml$' /tmp/eslint-scope.txt; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No file ESLint reads changed — nothing to lint. Changed files:'
+            cat /tmp/eslint-scope.txt
+          fi
+
       - name: Setup Node
+        if: steps.scope.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies (clean)
+        if: steps.scope.outputs.run == 'true'
         run: npm ci
 
       - name: Run ESLint
+        if: steps.scope.outputs.run == 'true'
         run: npm run lint

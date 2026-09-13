@@ -25,6 +25,7 @@ from ag2_sparrow.delivery_core import (  # noqa: E402
     BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
     ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
+from ag2_sparrow.delivery_core.core import _resend_epoch  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
 
@@ -79,6 +80,44 @@ class ContractCase(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_every_backend_declares_resend_epoch(self):
+        """Declared, not duck-typed (per sonichi on #3853).
+
+        `_resend_epoch` falls back to 0 for a backend without the method, and 0
+        keeps the idempotency key at `id#0` — so the provider dedupes an
+        operator re-send against the very attempt that parked the item while
+        the operator reads `result: requeued`. The fallback is what made that
+        silent, so no first-party backend may rely on it.
+        """
+        fn = getattr(self.backend, "resend_epoch", None)
+        self.assertTrue(callable(fn),
+                        "resend_epoch is on the ClaimBackend protocol; a backend "
+                        "without it takes the duck-type fallback and its re-sends "
+                        "are deduped against the parked attempt")
+        self.assertIsInstance(fn(ITEM), int)
+
+    def test_a_requeue_presents_a_new_idempotency_key(self):
+        """The coupling itself, not the spelling: requeue must change the key.
+
+        Guarded on outbox visibility because the epoch lives in the outbox item
+        record — a backend whose items outbox cannot see mints no epoch, and
+        `requeue_item` correctly answers ABSENT there rather than reporting a
+        recovery it did not perform.
+        """
+        root = Path(self.tmp.name)
+        self.backend.publish(ITEM, b"x")
+        if not any(r.get("item_id") == ITEM for r in outbox.list_items(root)):
+            self.skipTest("outbox cannot see this backend's items, so requeue "
+                          "answers ABSENT and no epoch is minted")
+        before = idempotency_key(ITEM, _resend_epoch(self.backend, ITEM))
+        outbox.park_item(root, ITEM, "max-attempts")
+        self.assertIs(outbox.requeue_item(root, ITEM, operator="contract"),
+                      outbox.RequeueOutcome.REQUEUED)
+        after = idempotency_key(ITEM, _resend_epoch(self.backend, ITEM))
+        self.assertNotEqual(before, after,
+                            f"requeue must present a NEW logical side effect; "
+                            f"key stayed {after} so the provider dedupes it")
 
     def test_capabilities_are_declared_not_sniffed(self):
         self.assertIsInstance(self.backend.capabilities, BackendCapabilities)
@@ -186,6 +225,47 @@ class ContractCase(unittest.TestCase):
                                    msg="non-declaring backend must raise, "
                                        "never silently no-op"):
                 self.backend.force_release(ITEM)
+
+
+class SharedRootResendEpoch(unittest.TestCase):
+    """sonichi's #3853 control: two backends, ONE outbox root.
+
+    The per-backend suite above gives each backend its own root, so C never
+    holds an outbox-visible item and its behavioural coupling is skipped there.
+    This is the shape the defect was reported in: Design A published, so the
+    record exists and `requeue_item` mints an epoch — and C must read that same
+    epoch, or the operator is told `requeued` while the provider dedupes the
+    re-send against the attempt that parked the item.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.a = DesignAClaimBackend(self.root)
+        self.c = DesignCClaimBackend(self.root, activate=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_both_backends_see_the_same_requeued_epoch(self):
+        self.a.publish(ITEM, b"x")
+        outbox.park_item(self.root, ITEM, "max-attempts")
+        self.assertIs(outbox.requeue_item(self.root, ITEM, operator="contract"),
+                      outbox.RequeueOutcome.REQUEUED)
+        stored = outbox.resend_epoch_for(self.root, ITEM)
+        self.assertEqual(stored, 1, "requeue must mint an epoch on this root")
+        for name, backend in (("A", self.a), ("C", self.c)):
+            with self.subTest(backend=name):
+                self.assertEqual(
+                    _resend_epoch(backend, ITEM), stored,
+                    f"backend {name} reports epoch "
+                    f"{_resend_epoch(backend, ITEM)} against a stored {stored}; "
+                    f"its key would be {idempotency_key(ITEM, _resend_epoch(backend, ITEM))} "
+                    f"while the provider already saw {idempotency_key(ITEM, 0)}")
+        self.assertEqual(idempotency_key(ITEM, _resend_epoch(self.a, ITEM)),
+                         idempotency_key(ITEM, _resend_epoch(self.c, ITEM)),
+                         "the two backends must present the SAME key for the "
+                         "same item on the same root")
 
 
 class CorePolicy(unittest.TestCase):
@@ -511,6 +591,9 @@ def load_tests(loader, tests, pattern):
                     {"backend_name": name})
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(loader.loadTestsFromTestCase(CorePolicy))
+    # An unregistered class is collected by nothing here: load_tests
+    # replaces discovery, so a new case must be added explicitly.
+    suite.addTests(loader.loadTestsFromTestCase(SharedRootResendEpoch))
     return suite
 
 

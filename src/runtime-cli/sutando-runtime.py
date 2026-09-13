@@ -737,7 +737,18 @@ def _print_stand_card(card: dict, section: "str | None") -> int:
     return 0
 
 
+def _delegate_outbox(rest) -> int:
+    """Hand straight to the one implementation; never re-derive its behaviour."""
+    from outbox_cli import main as outbox_main
+    return outbox_main(list(rest))
+
+
 def main(argv=None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Intercepted before argparse: REMAINDER drops a leading --option, and the
+    # delegate must receive argv byte-for-byte or the two surfaces diverge.
+    if raw and raw[0] == "outbox":
+        return _delegate_outbox(raw[1:])
     ap = argparse.ArgumentParser(prog="sutando-runtime")
     sub = ap.add_subparsers(dest="group", required=True)
 

@@ -14,8 +14,12 @@ privileged mode for the core's own monitoring (no serving context exists);
 choosing it is visible in the invocation, not a silent default.
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env or env var.
+
+--jsonl prints one JSON object per message (id, ts, author, text, reply, url) instead of the
+text lines, for a consumer that needs to link back to the message (the owner's triage card).
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -53,6 +57,8 @@ def _parse_args(argv):
     parser.add_argument("--full", action="store_true",
                         help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
+    parser.add_argument("--jsonl", action="store_true",
+                        help="One JSON object per message (id, ts, author, text, reply, url) instead of the text lines. url is the message's jump link; it costs one channel lookup for the guild id.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--serving", default=None,
                       help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
@@ -105,6 +111,8 @@ def main(argv=None):
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    # A jump link needs the guild; a DM channel has none and Discord spells that "@me".
+    guild = discord_context_policy.resolve_guild(args.channel_id, token) if args.jsonl else None
     # Oldest first (snowflake id is time-ordered). Trim anything strictly older
     # than the --until boundary so the output stops exactly where requested.
     for msg in sorted(messages, key=lambda m: int(m["id"])):
@@ -113,8 +121,15 @@ def main(argv=None):
         author = msg.get("author", {}).get("username", "?")
         ts = msg.get("timestamp", "")[:19]
         clip = None if args.full else CLIP
-        print(f"[{ts}] {author}: {_render(msg, clip)}")
         ctx = _reply_context(msg, None if args.full else REPLY_CLIP)
+        if args.jsonl:
+            print(json.dumps({
+                "id": str(msg.get("id", "")), "ts": ts, "author": author,
+                "text": _render(msg, clip), "reply": ctx or "",
+                "url": f"https://discord.com/channels/{guild or '@me'}/{args.channel_id}/{msg.get('id', '')}",
+            }, ensure_ascii=False))
+            continue
+        print(f"[{ts}] {author}: {_render(msg, clip)}")
         if ctx:
             print(f"    {ctx}")
     return 0

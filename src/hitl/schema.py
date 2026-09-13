@@ -90,6 +90,9 @@ class HumanRequirement:
     answer: Optional[Any] = None
     # Absolute epoch after which the producer treats the requirement as expired.
     expires_at: Optional[float] = None
+    # The applied click also reaches the core as a task, so an executor that runs
+    # at the end of an agent turn (a Stop hook) runs now, not after an unrelated turn.
+    turn_on_action: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -143,6 +146,8 @@ class HumanRequirement:
             wire["subject"] = dict(self.subject)
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
+        if self.turn_on_action:
+            wire["turn_on_action"] = True
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
         return wire

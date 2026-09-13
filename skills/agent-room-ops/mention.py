@@ -3,27 +3,37 @@
 
 The whole point: an agent should never hand-craft a peer's mxid (and get it wrong,
 or forget it — the single most-repeated delivery failure). Give `mention` a handle
-("qingyun-001") and a message; it resolves the one canonical mxid from the live
-/v1/agents directory and posts an op:message with that mxid leading the body — the
-form the broker's `is_mention` matches (localpart as a whole token), so the peer is
-actually triggered.
+("qingyun-001", a label, or the name the room shows — "Bassil's Sutando") and a
+message; it resolves the one canonical mxid — the live /v1/agents directory
+first (narrowed to the room's members when it over-matches), then the broker's
+room-scoped resolver, then the room's own member list — and posts an
+op:message with that mxid leading the body plus `mentions:[mxid]`.
+The broker routes on the mxid either way: it stamps `mentions` into `m.mentions`,
+and a member mxid in the plain body is matched as a whole token, auto-mentioned
+and rendered as a pill — so the peer is actually triggered and a human reading
+the room sees who was asked.
 
-`build_body` (pure) is separated from the network post so the mention-construction
-is unit-tested without a gateway.
+Ambiguity never posts: two candidates from any source is a refusal carrying the
+candidate list, because mentioning the wrong agent is worse than mentioning
+nobody. `build_body` (pure) is separated from the network post so the
+mention-construction is unit-tested without a gateway.
 """
 from __future__ import annotations
 
 import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
-from resolve import resolve_user, match_member
+from resolve import resolve_user, match_member, resolve_in_room, slug_handle, is_ambiguous
 import receipt as _receipt
 from relations import RelationError, relation_fields
 
 
-def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None):
+def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None,
+            resolved_by=None):
+    # `resolved_by` names the source that produced `mxid` OR refused the handle —
+    # directory | directory+room | broker | room — so both are traceable.
     return {"ok": bool(ok), "room_id": room_id, "mxid": mxid, "event_id": event_id,
-            "candidates": candidates or [], "reason": reason}
+            "candidates": candidates or [], "reason": reason, "resolved_by": resolved_by}
 
 
 def build_body(mxid: str, message: str) -> str:
@@ -37,25 +47,90 @@ def build_body(mxid: str, message: str) -> str:
     return f"{mxid} — {message}" if message else mxid
 
 
-def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None) -> "dict | None":
-    """Second chance for `handle` against the target room's membership.
+_UNREAD = object()   # the roster was not fetched yet (None = fetched and unreadable)
 
-    None when the member list itself could not be read, so the caller keeps the
-    directory's own reason rather than reporting a membership miss that never
-    happened. Imported lazily: `members` reaches the network, and the directory
-    path must not pay for it.
+
+def _read_roster(room_id: str, agent_mxid: str | None) -> "list | None":
+    """The room's members ({user_id, display_name, kind}); None when unreadable.
+
+    `members` is imported lazily: it reaches the network, and the directory
+    path must not pay for it. A failed import or read is None — "could not
+    look", never "nobody is there" — so the caller keeps its own reason.
     """
     try:
         from members import room_members
     except ImportError:
         return None
-    got = room_members(room_id, agent_mxid)
-    if not got.get("ok"):
+    read = room_members(room_id, agent_mxid)
+    if not read.get("ok"):
         return None
-    ids = [m if isinstance(m, str) else (m.get("user_id") or m.get("id"))
-           for m in got.get("members") or []]
-    hit = match_member(handle, [i for i in ids if i])
-    return hit if hit.get("ok") or hit.get("candidates") else None
+    return read.get("members") or []
+
+
+def _narrow_to_room(res: dict, handle: str, roster: list) -> dict:
+    """An ambiguous directory answer, narrowed to the candidates in the room.
+
+    Measured live 2026-09-11: an owner with several agent identities has the
+    directory over-match "Bassil's Sutando" against 13 stale `sutando-…` ids,
+    while the room being posted to holds exactly one of them — and `mention`
+    refused as "ambiguous — 13" although the broker and the roster both
+    resolved it. Membership narrows, never widens: exactly one candidate
+    present resolves (`resolved_by: "directory+room"`); two or more present
+    stay a refusal carrying just those; none present leaves the directory's
+    list untouched for the room-scoped sources to answer instead.
+    """
+    present = set()
+    for m in roster or []:
+        present.add(str((m.get("user_id") or m.get("id") or "") if isinstance(m, dict) else (m or "")))
+    kept = [c for c in res.get("candidates") or [] if c in present]
+    if len(kept) == 1:
+        return {"ok": True, "mxid": kept[0], "candidates": [], "reason": None,
+                "resolved_by": "directory+room"}
+    if len(kept) > 1:
+        return {**res, "candidates": kept, "resolved_by": "directory+room",
+                "reason": f"ambiguous — {len(kept)} agents match {handle!r} in this room"}
+    return {**res, "resolved_by": "directory"}
+
+
+def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None,
+                       *, roster=_UNREAD) -> "dict | None":
+    """Second chance for `handle` inside the target room: broker, then roster.
+
+    (a) The broker's `op: resolve_user` sees the room's display names, so it is
+        asked first — with the handle as given, then (on a plain miss) with the
+        platform's localpart spelling of it (`slug_handle`), since the broker
+        normalises nothing. A hit resolves. An AMBIGUOUS answer is returned as
+        the refusal it is: a second source could only turn "too many" into a
+        guess, so it is never widened.
+    (b) When the gateway has no such op (older broker), the broker found
+        nobody, or the network failed, the member list is read — unless the
+        caller already read it (`roster`: the list, or None for a read that
+        failed and is not retried) — and matched with its display names,
+        agents preferred on a tie.
+
+    None when neither source could answer, so the caller keeps the directory's
+    own reason rather than reporting a membership miss that never happened.
+    """
+    got = resolve_in_room(handle, room_id)
+    if not got.get("ok") and not is_ambiguous(got) and not got.get("unsupported"):
+        slug = slug_handle(handle)
+        # The broker matches case-insensitively, so a case-only difference is
+        # the same query and not worth a round trip.
+        if slug and slug != (handle or "").strip().casefold():
+            got = resolve_in_room(slug, room_id)
+    if got.get("ok"):
+        return {**got, "resolved_by": "broker"}
+    if is_ambiguous(got):
+        return {**got, "resolved_by": "broker"}
+
+    if roster is _UNREAD:
+        roster = _read_roster(room_id, agent_mxid)
+    if roster is None:
+        return None
+    hit = match_member(handle, roster, prefer_agents=True)
+    if hit.get("ok") or hit.get("candidates"):
+        return {**hit, "resolved_by": "room"}
+    return None
 
 
 def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = None,
@@ -63,9 +138,9 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
             reply_to: str | None = None) -> dict:
     """Resolve `handle` → mxid and post a triggering @-mention into `room_id`.
 
-    Returns {ok, room_id, mxid, event_id, candidates, reason}. On an ambiguous
-    handle it does NOT post — it returns ok:false + the candidate mxids so the
-    caller disambiguates rather than mentioning the wrong agent.
+    Returns {ok, room_id, mxid, event_id, candidates, reason, resolved_by}. On
+    an ambiguous handle it does NOT post — it returns ok:false + the candidate
+    mxids so the caller disambiguates rather than mentioning the wrong agent.
     """
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
@@ -81,30 +156,42 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         return _result(False, room_id=room_id, reason=str(e))
 
     res = resolve_user(handle, agents=agents)
-    if not res.get("ok") and not res.get("candidates"):
+    # A full mxid counts as the directory's answer: resolve_user short-circuits it.
+    source = "directory"
+    roster = _UNREAD
+    if not res.get("ok") and res.get("candidates"):
+        # Too many in the directory: who is actually in the room decides,
+        # and the one roster read also serves the fallback below.
+        roster = _read_roster(room_id, agent_mxid)
+        if roster is not None:
+            res = _narrow_to_room(res, handle, roster)
+            source = res["resolved_by"]
+    if not res.get("ok"):
         # /v1/agents lists only this account's own agents, so a peer agent in
         # the room resolves nowhere and the mention would be unreachable.
-        res = _resolve_from_room(handle, room_id, agent_mxid) or res
+        room_res = _resolve_from_room(handle, room_id, agent_mxid, roster=roster)
+        if room_res is not None:
+            res, source = room_res, room_res.get("resolved_by")
     if not res.get("ok"):
         return _result(False, room_id=room_id, candidates=res.get("candidates"),
-                       reason=res.get("reason") or "could not resolve handle")
+                       reason=res.get("reason") or "could not resolve handle",
+                       resolved_by=source)
     mxid = res["mxid"]
 
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
-        return _result(False, room_id=room_id, mxid=mxid,
+        return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
                        reason=f"client gate denied for {agent_mxid}")
 
     base, headers = gateway()
     if not base:
-        return _result(False, room_id=room_id, mxid=mxid, reason="no gateway configured")
+        return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
+                       reason="no gateway configured")
 
     body = build_body(mxid, message)
     try:
-        # `mentions` is forward-compat: the leading mxid in `body` already
-        # triggers via the broker's localpart text-match, so this is harmlessly
-        # ignored today — but it auto-activates structured push-notifications the
-        # moment the broker honors it (a peer-review ask, ties to broker #151).
+        # `mentions` → m.mentions (broker, 2026-07-21); the mxid LEADING `body` is
+        # the routing token AND the literal pilled for humans. Both stay — never move it.
         cid = os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID")
         worker = os.environ.get("SUTANDO_WORKER_ID") or (f"worker-{cid}" if cid else None)
         _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
@@ -125,9 +212,11 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
             {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid], **rel, **stamp},
         )
     except HTTPError as e:
-        return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
+                       reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
-        return _result(False, room_id=room_id, mxid=mxid, reason=f"network error: {e}")
+        return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
+                       reason=f"network error: {e}")
     # Same envelope as `say`, so the same reading — see receipt.py.
     _state, event_id, _reason = _receipt.classify(parsed)
-    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id)
+    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id, resolved_by=source)
