@@ -168,6 +168,49 @@ class TestTheWorkersResolvedInterpreter(Base):
         self.assertIn("no usable interpreter", r.stderr)
 
 
+class TestMainInProcess(Base):
+    """The wrapper cases above prove the shipped path; these run main() in this
+    process so its branches are measured rather than only exercised."""
+
+    def _main(self, *args):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        import resolve_inbox_entry as r
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = r.main(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_it_prints_the_payload_and_returns_zero(self):
+        want = self.payload()
+        rc, out, _ = self._main(self.inbox("task-1.txt"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out.strip()).resolve(), want.resolve())
+
+    def test_a_refusal_returns_one_with_an_empty_stdout(self):
+        rc, out, err = self._main(self.inbox("task-missing.txt"))
+        self.assertEqual((rc, out.strip()), (1, ""))
+        self.assertIn("no payload", err)
+
+    def test_a_wrong_argument_count_returns_two(self):
+        for args in ((), ("a", "b")):
+            rc, out, err = self._main(*args)
+            self.assertEqual((rc, out.strip()), (2, ""))
+            self.assertIn("usage", err)
+
+    def test_an_entry_outside_a_delivery_folder_returns_one(self):
+        self.payload()
+        rc, out, err = self._main(str(self.root / "tasks" / "task-1.txt"))
+        self.assertEqual((rc, out.strip()), (1, ""))
+        self.assertIn("deliveries", err)
+
+    def test_the_workspace_helper_reads_the_entrys_own_parents(self):
+        import resolve_inbox_entry as r
+        self.assertEqual(r._workspace(self.inbox("task-1.txt")).resolve(),
+                         self.root.resolve())
+        self.assertEqual(r._workspace("ignored", self.root), self.root)
+
+
 class TestItDelegatesRatherThanReimplementing(Base):
     def test_the_payload_path_is_OBTAINED_from_pool_delivery(self):
         """Behaviourally, not by agreeing numerically: an equivalent hand-rolled
