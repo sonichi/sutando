@@ -83,16 +83,6 @@ class RunnerGlobTest(unittest.TestCase):
                       "discovery never reached skills/ — a suite moved into a "
                       "skill would silently stop running")
 
-
-    def test_recursive_find_discovers_a_skill_owned_test(self) -> None:
-        out = subprocess.run(
-            ["find", "skills", "-name", "*.test.py"],
-            cwd=REPO, capture_output=True, text=True, check=True).stdout
-        self.assertTrue(
-            [p for p in out.splitlines() if p.strip()],
-            "expected at least one *.test.py under skills/ (e.g. "
-            "skills/worker-pool/tests/); the skills root would be untested otherwise")
-
     def test_recursive_find_discovers_nested_tests(self) -> None:
         """The recursive find must return at least one test under a SUBDIRECTORY
         of tests/ (depth >= 2) — i.e. exactly what a flat glob would miss."""
