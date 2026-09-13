@@ -71,4 +71,48 @@ case "$queued_line" in
 esac
 rm -rf "$tmp2"
 
+# Behaviour: a required handler that fails publishes the scheduler's FAILED, and
+# that row must key on the resolved payload too -- publish_terminal_failure used
+# to re-derive $TASKS_DIR/$filename, the sentinel (kewei, #4238 round 5).
+tmp3="$(mktemp -d)"; log3="$tmp3/bus.log"
+# A pass-through SPY, not a stub: the failure path needs the real interpreter for
+# util_paths.py (the sentinel) and the claim helpers before it ever reaches
+# activity_bus.py; a stub that swallows those never publishes a failure at all.
+cat > "$tmp3/py" << PY
+#!/usr/bin/env bash
+case " \$* " in *activity_bus.py*) printf '%s\n' "\$*" >> "$log3"; exit 0 ;; esac
+exec python3 "\$@"
+PY
+chmod +x "$tmp3/py"
+# --probe: 4 = must-handle (never the live core); any run: exit 1 = the handler failed.
+cat > "$tmp3/handler.sh" << 'H'
+#!/usr/bin/env bash
+case " $* " in *" --probe "*) exit 4 ;; esac
+exit 1
+H
+chmod +x "$tmp3/handler.sh"
+ws3="$tmp3/ws"; inbox3="$ws3/deliveries/w-test"
+mkdir -p "$ws3/tasks" "$inbox3" "$ws3/results"
+payload3="$ws3/tasks/task-probe3.txt"
+printf 'id: task-probe3\naccess_tier: team\ntask: fail me\n' > "$payload3"
+: > "$inbox3/task-probe3.txt"
+resolver3="$tmp3/resolver.sh"
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$payload3" > "$resolver3"; chmod +x "$resolver3"
+set -m
+SUTANDO_INBOX_RESOLVER="$resolver3" SUTANDO_TASK_EVENT_HANDLER="$tmp3/handler.sh" SUTANDO_WORKSPACE_DIR="$ws3" \
+  SUTANDO_RESULTS_DIR="$ws3/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp3/py" \
+  bash "$SRC/watch-tasks-stream.sh" "$inbox3" > "$tmp3/sweep.out" 2>"$tmp3/sweep.err" &
+sweep3=$!
+set +m
+for _ in $(seq 1 60); do grep -q 'transition FAILED' "$log3" 2>/dev/null && break; sleep 0.25; done
+kill -TERM -"$sweep3" 2>/dev/null || kill -TERM "$sweep3" 2>/dev/null
+wait "$sweep3" 2>/dev/null
+failed_line="$(grep 'transition FAILED' "$log3" 2>/dev/null | head -1)"
+echo "  FAILED call: ${failed_line:-<none>}"
+case "$failed_line" in
+  *"--task-file $payload3 "*) echo "PASS FAILED keys on the resolved payload, not the sentinel" ;;
+  *) echo "FAIL FAILED did not name the resolved payload path: ${failed_line:-<none>} (stderr: $(tail -2 "$tmp3/sweep.err" 2>/dev/null))"; fail=1 ;;
+esac
+rm -rf "$tmp3"
+
 [ "$fail" -eq 0 ] && echo "watch-tasks-dispatch-activity: PASS" || { echo "watch-tasks-dispatch-activity: FAIL"; exit 1; }

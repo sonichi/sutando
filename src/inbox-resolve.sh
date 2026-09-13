@@ -33,11 +33,19 @@ resolve_inbox_entry() {
 		out_file="$(mktemp)"
 		"$SUTANDO_INBOX_RESOLVER" "$entry" > "$out_file" 2>/dev/null &
 		resolver_pid=$!
-		( sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT"; kill "$resolver_pid" 2>/dev/null ) &
+		# The sleep runs in the BACKGROUND of the watchdog under a TERM trap: bash
+		# defers a signal while a foreground child runs, so a foreground sleep made
+		# `wait "$watchdog_pid"` below stall every successful resolution to the full
+		# deadline. TERM then KILL, because a resolver that traps TERM is otherwise
+		# unbounded -- the same escalation the startup reaper uses.
+		( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
+		  sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT" & _s=$!; wait "$_s"
+		  kill -TERM "$resolver_pid" 2>/dev/null; sleep 1
+		  kill -KILL "$resolver_pid" 2>/dev/null ) &
 		watchdog_pid=$!
 		wait "$resolver_pid" 2>/dev/null
 		rc=$?
-		kill "$watchdog_pid" 2>/dev/null
+		kill -TERM "$watchdog_pid" 2>/dev/null
 		wait "$watchdog_pid" 2>/dev/null
 		out="$(cat "$out_file" 2>/dev/null)"
 		rm -f "$out_file"

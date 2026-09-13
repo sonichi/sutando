@@ -195,7 +195,9 @@ claim_disposition() {
 # 0 = the task is settled (failure published, or a real answer already exists).
 # 1 = NOT settled: another writer may own the destination, so nothing was touched.
 publish_terminal_failure() {
-  local filename="$1" reason="$2" result temporary rc
+  # $3 is the resolved payload: a sentinel entry's FAILED row must key on the
+  # body the resolver named, never the sentinel a basename alone would resolve.
+  local filename="$1" reason="$2" payload="${3:-$TASKS_DIR/$1}" result temporary rc
   result="$RESULTS_DIR/$filename"
   # The shared readiness contract, not -f/-s: an empty OR whitespace-only body
   # is the undeliverable placeholder state and must not suppress this failure.
@@ -209,7 +211,7 @@ publish_terminal_failure() {
   if ln "$temporary" "$result" 2>/dev/null; then
     rc=0
     # The scheduler's FAILED: the task ends here, whatever a provider observed.
-    ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$TASKS_DIR/$filename" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
+    ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$payload" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
   elif handler_result_exists "$filename"; then
     rc=0
   else
@@ -265,7 +267,7 @@ finish_handler_task() {
           echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
           # An unsettled publish leaves the claim held rather than clobbering a
           # destination this watcher does not own; cross-restart retry is separate.
-          publish_terminal_failure "$filename" "failed" || claim_settled=0
+          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
           ;;
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
@@ -435,7 +437,7 @@ dispatch_task() {
     # receipt and never make this task visible to the unrestricted live core.
     rm -f "$FALLBACKS_DIR/$filename"
     if ! queue_handler_task "$task_path" "must-handle"; then
-      publish_terminal_failure "$filename" "could not be queued" || true
+      publish_terminal_failure "$filename" "could not be queued" "$task_path" || true
     fi
   elif [ "$rc" -eq 3 ]; then
     emit_dispatch_task_file "$announce"
@@ -541,7 +543,7 @@ fallback_outstanding_handlers() {
             echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
             # As above: hold the claim rather than publish over a destination this
             # watcher does not own.
-            publish_terminal_failure "$filename" "was interrupted" || claim_settled=0
+            publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
             ;;
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
@@ -578,7 +580,7 @@ fallback_outstanding_handlers() {
         echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
         # Hold the claim rather than release: a task that is neither delivered nor
         # failed must keep its last record. Cross-restart retry is separate work.
-        publish_terminal_failure "$filename" "was interrupted" || claim_settled=0
+        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
         ;;
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
