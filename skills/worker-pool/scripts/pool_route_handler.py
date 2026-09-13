@@ -10,6 +10,9 @@ The watcher's handler protocol carries the design's recipient rules exactly:
     probe 3   decline    not a roster hit -- unbound, or a name never created.
                           The core takes it; it is a recipient, not a fallback.
     probe 0   accept     every target is on the roster; the real run delivers.
+    4         must-handle a header id that is not the file's, or an admitted
+                          target left without a sentinel: the core must not
+                          inherit it, and 0 would release the claim on nothing.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
 """
@@ -103,7 +106,14 @@ def main(argv=None) -> int:
 
     ws = args.workspace
     task = read_task(args.task_file)
-    code, _targets, roster = classify(ws, task)
+    code, targets, roster = classify(ws, task)
+    stem = Path(args.task_file).stem
+    if code == 0 and task["id"] != stem:
+        # The router delivers BY id: a header naming another file delivers
+        # nothing, and the shared writer rejects the sentinel anyway.
+        print(f"pool_route_handler: header id {task['id']!r} is not the file's "
+              f"{stem!r}; refusing", file=sys.stderr)
+        return MUST_HANDLE
     if args.probe:
         return code
     if code == DECLINE:
@@ -115,11 +125,12 @@ def main(argv=None) -> int:
         # The pass refused; the core must not silently inherit the task.
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE
-    if out.get("failed"):
-        # Unreachable via the probe, which declines these; kept so a direct
-        # caller cannot turn an unknown name into a delivery.
-        print(json.dumps(out), file=sys.stderr)
-        return DECLINE
+    settled = set(out.get("delivered") or []) | set(out.get("already") or [])
+    unsettled = [t for t in targets if t not in settled] + list(out.get("skipped") or [])
+    if unsettled:
+        # 0 here releases the watcher's claim on a task no worker holds.
+        print(json.dumps({**out, "unsettled": unsettled}), file=sys.stderr)
+        return MUST_HANDLE
     return 0
 
 

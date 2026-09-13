@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -133,6 +134,31 @@ class TestDelivery(Base):
         self.assertTrue(s.exists())
         self.assertEqual(s.stat().st_size, 0)
         self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
+
+    def test_a_header_id_naming_another_file_is_refused_in_both_modes(self):
+        """The router delivers by id, so this header would deliver nothing while
+        the handler reported success. Probe AND run say must-handle, so the
+        watcher never holds a fallback claim it would later release on 0."""
+        self.roster()
+        p = self.ws / "tasks" / "task-1.txt"
+        p.write_text("id: task-9\nchannel_id: !room:x\ntask: body\n")
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.MUST_HANDLE)
+        self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws)]), h.MUST_HANDLE)
+        for name in ("task-1.txt", "task-9.txt"):
+            self.assertFalse((self.ws / "deliveries" / W / name).exists(), name)
+
+    def test_an_admitted_target_left_without_a_sentinel_is_not_a_success(self):
+        """The router reports a missing payload in `skipped`, never `failed`;
+        the handler must read what the router returns."""
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        miss = {"task_id": "task-1", "version": 1, "delivered": [], "already": [],
+                "skipped": [W], "redirected": [], "error": None}
+        with patch.object(h.rt, "route", return_value=miss):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.MUST_HANDLE)
+        hit = {**miss, "delivered": [W], "skipped": []}
+        with patch.object(h.rt, "route", return_value=hit):
+            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
 
     def test_the_gateways_field_order_still_routes(self):
         """The local-hs gateway writes `task:` BEFORE channel_id/source. The
