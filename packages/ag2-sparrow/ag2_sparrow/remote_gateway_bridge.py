@@ -3131,13 +3131,16 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f == "picker_args":
-            # The reader parses this with json.loads, so an object must be
-            # re-serialized as JSON — _one_line would emit a Python repr.
-            pa = task.get(f)
-            if isinstance(pa, (dict, list)):
-                lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
-            elif pa not in (None, ""):
-                lines.append(f"picker_args: {_one_line(pa)}")
+            # Present-but-unusable is preserved as a refusing stamp, like
+            # picker_command: dropping it makes `add` + bad args a valid add.
+            if f in task:
+                pa = task[f]
+                if isinstance(pa, (dict, list)):
+                    # json.loads reads this, so re-serialize — _one_line would
+                    # emit a Python repr the reader cannot parse.
+                    lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
+                else:
+                    lines.append(f"picker_args: {'' if pa is None else _one_line(pa)}")
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never
