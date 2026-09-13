@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,47 @@ class RecheckVerdict(unittest.TestCase):
         )
         self.assertEqual(0, rows[0]["blocks"])
         self.assertIsNone(rows[0]["recheck"])
+
+    def test_a_revert_question_is_not_marked_stale_by_the_merge_it_asks_about(self):
+        """qingyun-wu's review, 2026-09-07 (P2), reproduced again 2026-09-13 —
+        never fixed until now. 'Should we revert sonichi/sutando#3963?' asks
+        whether to undo a merge; the merge landing is what makes the question
+        live, not what closes it. Treating MERGED as resolved here would render
+        the reassuring 'everything this blocks is done' banner on a question
+        that still needs a decision."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "Should we revert sonichi/sutando#3963?")],
+            {("sonichi/sutando", 3963): "MERGED"},
+        )
+        self.assertIsNone(rows[0]["recheck"], "a landed revert target must not read as stale")
+        self.assertEqual(1, rows[0]["blocks"])
+
+    def test_a_revert_question_closes_when_its_target_never_landed(self):
+        """The other half: a revert target that was CLOSED without merging really
+        is moot — nothing landed, so there is nothing left to revert."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "Should we revert sonichi/sutando#3963?")],
+            {("sonichi/sutando", 3963): "CLOSED"},
+        )
+        self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
+        self.assertEqual(0, rows[0]["blocks"])
+
+    def test_roll_back_phrasing_is_recognised_too(self):
+        rows = triage.apply_recheck(
+            [_row("Q1", "Should we roll back sonichi/sutando#3963?")],
+            {("sonichi/sutando", 3963): "MERGED"},
+        )
+        self.assertIsNone(rows[0]["recheck"])
+
+    def test_an_ordinary_blocked_question_is_unaffected_by_the_revert_carveout(self):
+        """The carveout must not blunt the ordinary case: a ready-to-merge PR
+        merging really does resolve a question that was waiting on it."""
+        rows = triage.apply_recheck(
+            [_row("Q1", "waiting on sonichi/sutando#3963")],
+            {("sonichi/sutando", 3963): "MERGED"},
+        )
+        self.assertEqual(triage.RECHECK_STALE, rows[0]["recheck"]["status"])
+        self.assertEqual(0, rows[0]["blocks"])
 
 
 class Ranking(unittest.TestCase):
@@ -332,9 +374,22 @@ class ReferenceProbe(unittest.TestCase):
 
 
 class AdapterRows(unittest.TestCase):
-    """The API adapter over a workspace that is provably not the operator's."""
+    """The API adapter over a workspace that is provably not the operator's.
+
+    The class docstring's guarantee only holds while `hosts/<host>/` has the
+    file: personal_path() falls through past a MISSING one to the real
+    `$SUTANDO_MEMORY_DIR/machine-<host>/`, which on a host where that env var
+    is set for real (qingyun-wu's review, 2026-09-13) resolves to the
+    operator's own file instead of "nothing" — an unlink-then-resolve test
+    silently reading real, private data instead of failing closed. Neutralize
+    both memory-dir env vars for every test in this class, the same way
+    `tests/util-paths-hosts-resolution.test.py`'s `clear_env()` does.
+    """
 
     def setUp(self):
+        self._saved_env = {
+            k: os.environ.pop(k, None) for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")
+        }
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-triage-ws-"))
         host = _host_label()
         # Per-host file FIRST so personal_path's first probe hits: a fresh tmp
@@ -349,6 +404,9 @@ class AdapterRows(unittest.TestCase):
 
     def tearDown(self):
         api.WORKSPACE_DIR = self._saved_ws
+        for k, v in self._saved_env.items():
+            if v is not None:
+                os.environ[k] = v
 
     def test_no_questions_file_yields_no_rows_rather_than_an_error(self):
         self.pq.unlink()

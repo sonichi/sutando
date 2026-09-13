@@ -47,6 +47,18 @@ RECHECK_BLOCKING = "blocking"
 _OPEN_STATES = {"OPEN"}
 _RESOLVED_STATES = {"MERGED", "CLOSED"}
 
+# A question about undoing something a PR did: the PR MERGING is what makes the
+# decision live, not what resolves it. Only CLOSED (never landed) retires it.
+REVERT_RE = re.compile(r'\b(revert|roll\s*back)\b', re.IGNORECASE)
+
+
+def _resolved_states_for(row: dict) -> frozenset:
+    """Which reference states count as 'this row's blocker is gone', for one row."""
+    text = f"{row.get('text') or ''} {row.get('detail') or ''}"
+    if REVERT_RE.search(text):
+        return frozenset({"CLOSED"})
+    return frozenset(_RESOLVED_STATES)
+
 
 def extract_refs(*texts: Optional[str]) -> list[tuple]:
     """References a question makes, as `(repo, number)` pairs in first-seen order.
@@ -90,7 +102,8 @@ def apply_recheck(rows: list[dict], ref_states: Optional[dict[int, str]] = None)
         refs = extract_refs(row.get("text"), row.get("detail"))
         row["refs"] = [ref_label(ref) for ref in refs]
         known = {ref: states[ref] for ref in refs if ref in states}
-        resolved = [ref for ref, state in known.items() if state in _RESOLVED_STATES]
+        resolved_states = _resolved_states_for(row)
+        resolved = [ref for ref, state in known.items() if state in resolved_states]
         # Unknown counts as open: the probe failing must not look like "nothing is blocked".
         row["blocks"] = len(refs) - len(resolved)
         if refs and len(resolved) == len(refs):
