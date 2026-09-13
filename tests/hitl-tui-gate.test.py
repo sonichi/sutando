@@ -4,6 +4,7 @@ answer THAT dialog: never a guessed key, never a key into a dialog the human did
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 from hitl import tui_gate as G  # noqa: E402
@@ -57,7 +58,15 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
         self.assertEqual(r.subject["option_for_action"], {"deny": 2, "allow": 0})
         self.assertEqual(r.subject["source"], G.SOURCE)
-        self.assertEqual(r.device, {"id": "s", "name": "s"})
+        self.assertEqual({k: v for k, v in r.device.items() if k != "host"}, {"id": "s", "name": "s"})
+
+    def test_the_device_names_the_host_so_a_card_can_say_which_machine(self):
+        # A card read on another machine must be able to say where its terminal is; the
+        # session name alone ("sutando-core") is the same on every host.
+        with mock.patch.object(G, "device_host", return_value="Chis-MacBook-Pro"):
+            self.assertEqual(req("permission", PERM).device, {"id": "s", "name": "s", "host": "Chis-MacBook-Pro"})
+        with mock.patch.object(G, "device_host", return_value=""):
+            self.assertNotIn("host", req("permission", PERM).device)  # unknown host: no key, not ""
 
     def test_a_selection_is_a_choice_with_one_button_per_option(self):
         r = req("selection", SELECT)
