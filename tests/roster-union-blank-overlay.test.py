@@ -216,6 +216,25 @@ class BlankOverlay(unittest.TestCase):
                 _, rc, _ = self.resolve(merged)
                 self.assertEqual(rc, 4, "off-allowlist must still be refused")
 
+    def test_CONTROL_zero_and_False_are_not_the_same_row(self):
+        """Python's `==` treats `0 == False`, so a malformed null-route local
+        (`allowlisted: 0`, blank stand/room) and a null-route peer
+        (`allowlisted: False`, blank stand/room) used to compare as the SAME
+        ROW at the dict-equality level -- the collision branch (where the
+        fix above lives) was never entered. Reproduces keweichen's exact
+        #4047 review repro: local placeholder, peer placeholder, then a
+        farther roster supplies the real route; the bare `allowlisted` must
+        still read `False` once a usable route lands, not the malformed `0`."""
+        merged = self.union(
+            ("local", {"reviewer": {"stand": "", "room": "", "allowlisted": 0}}),
+            ("peer", {"reviewer": {"stand": "", "room": "", "allowlisted": False}}),
+            ("matrix", {"reviewer": dict(PEER_ROUTE)}),
+        )
+        self.assertIs(merged["reviewer"].get("allowlisted"), False,
+                     "the malformed local 0 must not silently stand in for the peer's real False")
+        _, rc, _ = self.resolve(merged)
+        self.assertEqual(rc, 4, "off-allowlist must still be refused")
+
     # --- arms 7-9: the same overlay, on identity -------------------------
     def _resolved_login(self, merged, name="reviewer"):
         self.nr._is_github_user = lambda login: True

@@ -244,6 +244,29 @@ def _promote(winner: dict, local: dict) -> dict:
     return out
 
 
+def _rows_equal(a, b) -> bool:
+    """Row equality, but type-sensitive for BOOL_FIELDS.
+
+    Python's `==` treats `0 == False` and `1 == True`, so a malformed local
+    `allowlisted: 0` and a real peer `allowlisted: False` compared as THE SAME
+    ROW -- the collision branch below (which is where the bool-aware
+    `states_field` promotion logic lives) was never entered, so the peer's
+    real refusal was silently kept only because it happened to look identical
+    to the malformed placeholder (keweichen, #4047 review).
+    """
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return a == b
+    if a.keys() != b.keys():
+        return False
+    for k, av in a.items():
+        bv = b[k]
+        if k in BOOL_FIELDS and isinstance(av, bool) != isinstance(bv, bool):
+            return False
+        if av != bv:
+            return False
+    return True
+
+
 def roster_union(paths, kinds=None) -> dict:
     """(host, path) pairs, NEAREST FIRST -> merged rows.
 
@@ -266,7 +289,7 @@ def roster_union(paths, kinds=None) -> dict:
         for key, row in data.items():
             if key.startswith("_") or key not in merged:
                 merged[key] = row
-            elif merged[key] != row:
+            elif not _rows_equal(merged[key], row):
                 # Precedence is by origin EXCEPT when exactly one row is usable:
                 # `stand: null` is a row, so it won a collision like a filled one.
                 placeholder = (not _usable(merged[key], kinds)
