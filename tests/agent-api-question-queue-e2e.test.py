@@ -12,6 +12,7 @@ Exit: 0 = all pass, 1 = failure
 import http.server
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -54,6 +55,11 @@ tmp = Path(tempfile.mkdtemp(prefix="pq-queue-e2e-"))
 api.WORKSPACE_DIR = tmp
 api.API_TOKEN = "test-token-123"
 
+# A real machine-<host>/dismissed-questions.json under $SUTANDO_MEMORY_DIR would
+# otherwise take the dismiss route's write below. No teardown: one-shot script.
+os.environ.pop("SUTANDO_MEMORY_DIR", None)
+os.environ.pop("SUTANDO_PRIVATE_DIR", None)
+
 # Per-host file FIRST so personal_path's first probe hits: a fresh tmp otherwise
 # falls through to the operator's vault-synced memory tree. See agent-api-answer-e2e.
 PQ_FILE = tmp / "hosts" / _host_label() / "pending-questions.md"
@@ -62,6 +68,11 @@ PQ_FILE.write_text(PQ)
 
 _resolved = Path(api.personal_path("pending-questions.md", tmp))
 assert _resolved == PQ_FILE, f"personal_path escaped the tmp workspace: {_resolved}"
+
+_dismiss_resolved = Path(api.personal_path("dismissed-questions.json", tmp))
+assert tmp in _dismiss_resolved.parents, (
+    f"dismissed-questions.json resolves outside the tmp workspace: {_dismiss_resolved}"
+)
 
 # Handler runs on the MAIN thread; requests come from a worker. Inverted on purpose
 # — the coverage tracer misses handler-THREAD execution.
@@ -157,6 +168,16 @@ check("the dismissed question is gone from the queue", target not in left, f"got
 check("...and only that one went", len(left) == 1, f"got {len(left)}")
 
 check("dismissing never edits the questions file", PQ_FILE.read_text() == PQ)
+check(
+    "the dismissal store the route actually wrote is inside the tmp workspace",
+    tmp in _dismiss_resolved.parents and _dismiss_resolved.is_file(),
+    f"resolved to {_dismiss_resolved}",
+)
+check(
+    "...and it holds exactly the id just dismissed through the route",
+    json.loads(_dismiss_resolved.read_text()) == {"dismissed": [target]},
+    f"got {_dismiss_resolved.read_text()}",
+)
 
 code, data = req("POST", "/question/dismiss", {"id": ""})
 check("POST /question/dismiss with no id → 400", code == 400, f"got {code} {data}")

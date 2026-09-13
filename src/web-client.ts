@@ -3636,17 +3636,21 @@ function refreshQuestionQueue() {
     .catch(function() { return window._drQueue; });
 }
 
+// Renders directly rather than via updateDynamicRegion(): that gate skips
+// rendering for as long as the questions tab is open (see PR body).
 function advanceQuestionQueue(step) {
   window._drQueueIndex = questionQueueCursor(
     window._drQueue || [], (window._drQueueIndex || 0) + step);
-  updateDynamicRegion();
+  updateTabHighlights();
+  renderTabContent();
 }
 
 function dropQuestionFromQueue(qid) {
   window._drQueue = (window._drQueue || []).filter(function(q) { return q.id !== qid; });
   window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
   window._drQueueIndex = questionQueueCursor(window._drQueue, window._drQueueIndex || 0);
-  updateDynamicRegion();
+  updateTabHighlights();
+  renderTabContent();
 }
 
 function dismissQuestion(qid) {
