@@ -34,10 +34,14 @@ def _shell_text(runner: Path) -> str:
     package.json embeds its script inside a JSON string, so reading the file as
     text puts the whole pipeline on one JSON line and no command position is
     visible. Ask each format for its shell rather than pattern-matching bytes.
+
+    Joining every script's value let an unrelated key satisfy "actively
+    invokes the helper" while `test:py` — the one `npm test` actually
+    reaches — was gutted to a no-op. Pin that one script, not the object.
     """
     if runner.name == "package.json":
         import json
-        return "\n".join(json.loads(runner.read_text()).get("scripts", {}).values())
+        return json.loads(runner.read_text()).get("scripts", {}).get("test:py", "")
     return runner.read_text()
 
 
@@ -58,6 +62,22 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
             self.assertTrue(any(invokes(ln, DISCOVER.name) for ln in active),
                             f"{r.name} mentions {DISCOVER.name} outside a comment but never "
                             f"runs it in command position: {active}")
+
+    def test_package_json_check_is_pinned_to_test_py(self):
+        # An unrelated script must not satisfy this for package.json — only
+        # test:py, the one `npm test` actually reaches, may.
+        import json
+        import tempfile
+        pkg = json.loads((REPO / "package.json").read_text())
+        pkg["scripts"]["test:py"] = ': > "$RECDIR/files"'
+        pkg["scripts"]["unrelated"] = f"bash scripts/{DISCOVER.name}"
+        with tempfile.TemporaryDirectory() as td:
+            mutated = Path(td) / "package.json"
+            mutated.write_text(json.dumps(pkg))
+            active = [ln for ln in active_lines(_shell_text(mutated)) if DISCOVER.name in ln]
+        self.assertEqual(active, [],
+                         "test:py was gutted but an unrelated script still satisfied "
+                         "the guard — package.json must be pinned to test:py alone")
 
     def test_no_runner_reimplements_discovery(self):
         for r in RUNNERS:
