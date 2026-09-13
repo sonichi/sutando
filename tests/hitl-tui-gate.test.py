@@ -68,6 +68,11 @@ class TestRequirement(unittest.TestCase):
         with mock.patch.object(G, "device_host", return_value=""):
             self.assertNotIn("host", req("permission", PERM).device)  # unknown host: no key, not ""
 
+    def test_an_unreadable_host_label_never_breaks_the_card(self):
+        from hitl.host import device_host
+        with mock.patch("util_paths._host_label", side_effect=RuntimeError("no scutil")):
+            self.assertEqual(device_host(), "")
+
     def test_a_selection_is_a_choice_with_one_button_per_option(self):
         r = req("selection", SELECT)
         self.assertEqual(r.kind, "choice")
