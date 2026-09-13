@@ -52,6 +52,8 @@ __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh
 source "$__SCRIPT_DIR/task-emit.sh"
+# shellcheck source=inbox-resolve.sh
+source "$__SCRIPT_DIR/inbox-resolve.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -384,11 +386,19 @@ queue_handler_task() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename
+  local task_path="$1" rc filename announce resolved
+  # Resolve before anything observes it: claim, handler and emit must all name
+  # the body, never the sentinel that merely pointed at it.
+  resolved="$(resolve_inbox_entry "$task_path")" || return 0
+  # A name is read relative to the reader's own inbox, so a body that resolution
+  # moved OUT of that inbox must be announced by path. Unresolved = unchanged.
+  announce="$(basename "$resolved")"
+  [ "$resolved" = "$task_path" ] || announce="$resolved"
+  task_path="$resolved"
   filename="$(basename "$task_path")"
   queued_activity_row "$filename"
   if [ -z "$DISPATCH_DIR" ]; then
-    emit_dispatch_task_file "$filename"
+    emit_dispatch_task_file "$announce"
     return
   fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
@@ -401,10 +411,10 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      emit_dispatch_task_file "$filename"
+      emit_dispatch_task_file "$announce"
       return
     fi
-    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$filename"
+    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$announce"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
@@ -413,10 +423,10 @@ dispatch_task() {
       publish_terminal_failure "$filename" "could not be queued" || true
     fi
   elif [ "$rc" -eq 3 ]; then
-    emit_dispatch_task_file "$filename"
+    emit_dispatch_task_file "$announce"
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    emit_dispatch_task_file "$filename"
+    emit_dispatch_task_file "$announce"
   fi
 }
 
