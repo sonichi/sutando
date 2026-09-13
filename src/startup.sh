@@ -1235,17 +1235,20 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       # An absent CLI must not read as agreement: say UNCHECKED, never a tick.
       echo "  ⊘ Funnel configured ($FUNNEL_CFG_URL) — tailscale CLI not found, drift UNCHECKED"
     else
-      FUNNEL_LIVE=$("$TS_BIN" funnel status 2>/dev/null \
-        | grep -oE 'https://[A-Za-z0-9.-]+\.ts\.net(:[0-9]+)?' | head -1)
-      FUNNEL_LIVE="$(funnel_origin "$FUNNEL_LIVE")"
-      if [ -z "$FUNNEL_LIVE" ]; then
+      # `funnel status` can list several served origins (qingyun-wu, #4187):
+      # `head -1` kept only the first, so output ORDER decided the verdict.
+      # Normalise the whole set and check membership instead.
+      FUNNEL_LIVE_SET="$("$TS_BIN" funnel status 2>/dev/null \
+        | grep -oE 'https://[A-Za-z0-9.-]+\.ts\.net(:[0-9]+)?' \
+        | while IFS= read -r line; do funnel_origin "$line"; done)"
+      if [ -z "$FUNNEL_LIVE_SET" ]; then
         echo "  ⊘ Funnel configured ($FUNNEL_CFG_URL) — no funnel is serving, drift UNCHECKED"
-      elif [ "$FUNNEL_CFG_ORIGIN" = "$FUNNEL_LIVE" ]; then
-        echo "  ✓ Funnel ($FUNNEL_LIVE — matches TWILIO_WEBHOOK_URL)"
+      elif printf '%s\n' "$FUNNEL_LIVE_SET" | grep -qxF "$FUNNEL_CFG_ORIGIN"; then
+        echo "  ✓ Funnel ($FUNNEL_CFG_ORIGIN — matches TWILIO_WEBHOOK_URL)"
       else
         echo "  ⚠ TWILIO_WEBHOOK_URL names a DIFFERENT host than this machine's funnel:"
         echo "      configured: $FUNNEL_CFG_ORIGIN"
-        echo "      this host:  $FUNNEL_LIVE"
+        echo "      this host serves: $(printf '%s' "$FUNNEL_LIVE_SET" | tr '\n' ' ')"
         echo "      Twilio reaches the configured host, not this one — repoint one of them."
       fi
     fi

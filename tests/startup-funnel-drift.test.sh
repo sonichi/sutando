@@ -23,9 +23,11 @@ ok "block extracted from src/startup.sh"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A stub tailscale: prints whatever funnel status we want it to.
-mk_ts() {  # $1 = the https://... line to emit, or empty for "nothing serving"
+mk_ts() {  # $1... = each https://... line to emit, in order; none = "nothing serving"
   printf '#!/usr/bin/env bash\n[ "$1" = funnel ] || exit 0\n' > "$TMP/ts"
-  [ -n "$1" ] && printf 'echo "%s (Funnel on)"\n' "$1" >> "$TMP/ts"
+  for origin in "$@"; do
+    [ -n "$origin" ] && printf 'echo "%s (Funnel on)"\n' "$origin" >> "$TMP/ts"
+  done
   chmod +x "$TMP/ts"; echo "$TMP/ts"
 }
 run_case() {  # $1=.env body  $2=TAILSCALE_BIN
@@ -98,6 +100,29 @@ case "$out" in
   *) bad "explicit :443 normalises" "got: $out" ;;
 esac
 
-total=$((12))
+# --- multiple served origins (john-the-dev/qingyun-wu on #4187): `head -1`
+# --- kept only the first, so output ORDER decided the verdict. Check the
+# --- COMPLETE set instead; pin both orders, an absent origin, and confirm the
+# --- single-port cases above are untouched by the set-based rewrite.
+out="$(run_case "TWILIO_WEBHOOK_URL=$PRO:8443" "$(mk_ts "$PRO:443" "$PRO:8443")")"
+case "$out" in
+  *"matches TWILIO_WEBHOOK_URL"*) ok "configured origin present, listed SECOND -> matches" ;;
+  *) bad "configured origin present, listed second -> matches" "got: $out" ;;
+esac
+
+out="$(run_case "TWILIO_WEBHOOK_URL=$PRO:8443" "$(mk_ts "$PRO:8443" "$PRO:443")")"
+case "$out" in
+  *"matches TWILIO_WEBHOOK_URL"*) ok "configured origin present, listed FIRST -> matches" ;;
+  *) bad "configured origin present, listed first -> matches" "got: $out" ;;
+esac
+
+out="$(run_case "TWILIO_WEBHOOK_URL=$AIR" "$(mk_ts "$PRO:443" "$PRO:8443")")"
+case "$out" in
+  *"DIFFERENT host"*) ok "configured origin absent from either serving port -> warns" ;;
+  *) bad "configured origin absent from a two-origin set -> warns" "got: $out" ;;
+esac
+case "$out" in *"$PRO"*) ok "warning lists a serving origin" ;; *) bad "warning lists a serving origin" "got: $out" ;; esac
+
+total=$((16))
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ]
