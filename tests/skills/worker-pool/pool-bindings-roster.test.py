@@ -17,13 +17,14 @@ Run: python3 tests/skills/worker-pool/pool-bindings-roster.test.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
+SCRIPTS = Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts"
+sys.path.insert(0, str(SCRIPTS))
 
 import pool_roster as pr  # noqa: E402
 
@@ -209,6 +210,123 @@ class TestCorruptDeclarations(Base):
             self.declare(bad)
             with self.assertRaises(pr.RosterError, msg=bad):
                 pr.load_bindings(self.ws)
+
+    def test_a_saved_declaration_reloads_and_compiles(self):
+        pr.save_bindings(self.ws, {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_bindings(self.ws), {"!x:ag2.space": W1})
+        self.assertEqual(json.loads(pr.bindings_path(self.ws).read_text()),
+                         {"bindings": {"!x:ag2.space": W1}})
+        r = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(pr.targets_for(r, "!x:ag2.space"), [W1])
+
+
+class TestTheWriterRefusesAnUnreadableOrMalformedRoster(Base):
+    """Absent starts empty; unreadable or malformed must not — either would
+    silently discard whatever roster a concurrent writer or a permissions
+    problem is hiding."""
+
+    def unreadable(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"version": 7, "workers": live(W1), "bindings": {}}))
+        p.chmod(0o000)
+        self.addCleanup(lambda: p.chmod(0o644))
+        return p
+
+    def test_an_absent_roster_starts_empty(self):
+        r = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(r["version"], 1)
+        pr.register_worker(self.ws, W2, "w2")
+        self.assertEqual(set(pr.load_roster(self.ws)["workers"]), {W1, W2})
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_compile_roster_refuses_an_unreadable_roster(self):
+        p = self.unreadable()
+        before = p.stat().st_mode
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W2))
+        self.assertEqual(p.stat().st_mode, before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_register_worker_refuses_an_unreadable_roster(self):
+        p = self.unreadable()
+        before = p.stat().st_mode
+        with self.assertRaises(pr.RosterError):
+            pr.register_worker(self.ws, W2, "w2")
+        self.assertEqual(p.stat().st_mode, before)
+
+    def test_compile_roster_refuses_a_malformed_roster(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(p.read_text(), "{not json")
+
+    def test_register_worker_refuses_a_malformed_roster(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        with self.assertRaises(pr.RosterError):
+            pr.register_worker(self.ws, W1, "w1")
+        self.assertEqual(p.read_text(), "{not json")
+
+
+class TestBindRoom(Base):
+    """`bind_room`/`unbind_room`: the pin's own writers, locked like register_worker."""
+
+    def setUp(self):
+        super().setUp()
+        pr.compile_roster(self.ws, live(W1, W2))
+
+    def test_a_pin_by_id_lands_in_bindings_and_roster(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W1)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_bindings(self.ws), {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {"!x:ag2.space": W1})
+
+    def test_a_pin_by_unique_label_resolves_to_the_id(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2[:6])
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_an_unknown_name_is_refused_before_anything_is_saved(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "nobody")
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {})
+
+    def test_an_ambiguous_label_is_refused(self):
+        pr.compile_roster(self.ws, {W1: {"label": "same", "state": "live"},
+                                    W2: {"label": "same", "state": "live"}})
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "same")
+
+    def test_a_repin_replaces_the_binding(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_the_version_moves_so_the_advertisement_can_cite_it(self):
+        v0 = pr.load_roster(self.ws)["version"]
+        self.assertEqual(pr.bind_room(self.ws, "!x:ag2.space", W1)["version"], v0 + 1)
+
+    def test_unpin_removes_the_binding_and_keeps_the_others(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        pr.bind_room(self.ws, "!y:ag2.space", W2)
+        r = pr.unbind_room(self.ws, "!x:ag2.space")
+        self.assertEqual(r["bindings"], {"!y:ag2.space": W2})
+        self.assertEqual(pr.load_bindings(self.ws), {"!y:ag2.space": W2})
+
+    def test_unpin_of_an_unbound_room_is_the_state_asked_for(self):
+        r = pr.unbind_room(self.ws, "!never:ag2.space")
+        self.assertEqual(r["bindings"], {})
+
+    def test_no_roster_refuses_both(self):
+        ws = Path(tempfile.mkdtemp())
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(ws, "!x:ag2.space", W1)
+        with self.assertRaises(pr.RosterError):
+            pr.unbind_room(ws, "!x:ag2.space")
 
 
 if __name__ == "__main__":

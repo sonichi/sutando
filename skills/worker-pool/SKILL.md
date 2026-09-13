@@ -33,3 +33,16 @@ authoritative description.
 
 Describing what each module owns is deliberately left to the PR that wires the pool
 into the core, where the descriptions can be checked against a caller.
+
+## Modules (`scripts/`)
+
+- `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher; refuses before any side effect, rolls back on a launcher failure.
+- `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
+- `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write.
+- `worker_identity.py` — worker / session / incarnation records.
+- `pool_router.py` — resolve one task to its recipients from the roster.
+- `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
+- `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags.
+
+Suites live at `tests/skills/worker-pool/`.
