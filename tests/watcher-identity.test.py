@@ -15,7 +15,9 @@ Run: python3 tests/watcher-identity.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import re
 import subprocess
@@ -23,6 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,6 +235,69 @@ class TestHealthCheckDelegates(unittest.TestCase):
             body = src[src.index(f"def {name}("):]
             body = body[:body.index("\ndef ", 1)]
             self.assertIn("watcher_identity.", body, f"{name} does not delegate")
+
+
+class TestCliVerdicts(unittest.TestCase):
+    """The shell adapter reads one word: each verdict must be reachable, and an
+    unobservable pid must never print the word that licenses cleanup."""
+
+    def _run(self, argv, **patches):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            with mock.patch.multiple(wid, **patches) if patches else contextlib.nullcontext():
+                rc = wid.main(argv)
+        return rc, buf.getvalue().splitlines(), err.getvalue()
+
+    def test_watcher(self):
+        seen = wid.Inspection(True, True, ["/inbox"], "bash src/watch-tasks-stream.sh /inbox", "")
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out[0]), (0, "watcher"))
+
+    def test_not_watcher(self):
+        seen = wid.Inspection(True, False, None, "python3 observer.py", "")
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out[0]), (0, "not-watcher"))
+
+    def test_gone_is_dead_not_unknown(self):
+        # ps proved nothing AND the pid is gone: cleanup is licensed.
+        seen = wid.Inspection(False, None, None, "", "ps answered rc 1")
+        def _kill(_pid, _sig):
+            raise ProcessLookupError
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen,
+                               os=mock.Mock(kill=_kill))
+        self.assertEqual((rc, out[0]), (0, "dead"))
+
+    def test_live_but_unobservable_is_unknown(self):
+        # The hazard: a LIVE watcher whose ps cannot be read must license nothing.
+        seen = wid.Inspection(False, None, None, "", "ps answered rc 1")
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen,
+                               os=mock.Mock(kill=lambda *_a: None))
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_undecidable_argv_is_unknown(self):
+        seen = wid.Inspection(True, None, None, "bash -c something", "argv could not be decided")
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_exists_but_unprobeable_is_unknown(self):
+        # EPERM: the pid exists, so `dead` would be a lie; we still know nothing.
+        def _kill(_pid, _sig):
+            raise PermissionError
+        seen = wid.Inspection(False, None, None, "", "ps answered rc 1")
+        rc, out, _ = self._run(["123"], inspect_pid=lambda *_a, **_k: seen,
+                               os=mock.Mock(kill=_kill))
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_unparseable_pid_is_unknown(self):
+        seen = wid.Inspection(False, None, None, "", "ps answered rc 1")
+        rc, out, _ = self._run(["not-a-pid"], inspect_pid=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_usage_error(self):
+        rc, out, err = self._run([])
+        self.assertEqual(rc, 64)
+        self.assertIn("usage", err)
+        self.assertEqual(out, [])
 
 
 if __name__ == "__main__":

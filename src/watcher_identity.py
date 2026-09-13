@@ -216,9 +216,9 @@ def main(argv=None) -> int:
         print("usage: watcher_identity.py <pid>", file=sys.stderr)
         return 64
     seen = inspect_pid(args[0])
-    if not seen.observed or seen.watcher is None:
-        # An unobserved pid is two different facts: gone, or unobservable. Only
-        # the first licenses a caller to clean up after it.
+    if not seen.observed:
+        # Unobserved is two facts: gone, or unobservable — only the first
+        # licenses cleanup. An observed process is never `dead`, whatever its argv.
         pid = as_pid(args[0])
         if pid is not None:
             try:
@@ -229,6 +229,10 @@ def main(argv=None) -> int:
                 return 0
             except Exception:  # noqa: BLE001 -- EPERM and friends: it exists, we cannot say more
                 pass
+        print("unknown")
+        print(f"why={seen.reason}")
+        return 2
+    if seen.watcher is None:
         print("unknown")
         print(f"why={seen.reason or 'argv could not be decided'}")
         return 2
