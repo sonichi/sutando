@@ -354,6 +354,8 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
                 p=f"{r}/src/check-pending-tasks.sh")}]}],
+            "UserPromptSubmit": [{"hooks": [
+                {"command": f"bash {r}/src/turn-start.sh"}]}],
         }}))
         return r
 
@@ -363,7 +365,7 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         # probe warns on every healthy host.
         out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
         self.assertEqual(out["status"], "ok", out["detail"])
-        self.assertIn("4", out["detail"])
+        self.assertIn("5", out["detail"])
 
     def test_decoys_are_rejected_on_the_REAL_installer_shape(self):
         for label, cmd in {
