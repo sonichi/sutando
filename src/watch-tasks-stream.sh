@@ -204,7 +204,7 @@ publish_terminal_failure() {
   mkdir -p "$RESULTS_DIR"
   temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
   chmod 600 "$temporary" 2>/dev/null || true
-  printf '%s\n' "I could not safely process this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
+  printf '%s\n' "I $TERMINAL_REFUSAL_MARK this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
   # `ln` is the only write to the destination: it establishes ownership or fails.
   # Reading then mutating a path a provider can still claim has no safe ordering.
   if ln "$temporary" "$result" 2>/dev/null; then
@@ -285,6 +285,22 @@ finish_handler_task() {
   fi
   rm -f "$worker_receipt"
   drain_dispatch_queue
+}
+
+# Our own terminal-refusal wording, shared by the writer and the reader below so
+# a reworded refusal cannot silently stop counting as one.
+TERMINAL_REFUSAL_MARK="could not safely process"
+
+handler_result_is_answer() {
+  # An interrupted handler leaves OUR terminal refusal behind, and a restart is
+  # REQUIRED to re-dispatch that; only a real answer may suppress a dispatch.
+  # A LIVE answer only. An archived result means the reply already went out and
+  # the reap path owns that case; treating it as answered here changed behaviour
+  # the dead-worker suite pins, and this guard exists for the un-retired sentinel.
+  local filename="$1" live="$RESULTS_DIR/$1"
+  [ -f "$live" ] || return 1
+  handler_result_exists "$filename" || return 1
+  ! grep -qF "$TERMINAL_REFUSAL_MARK" "$live" 2>/dev/null
 }
 
 handler_result_exists() {
@@ -412,7 +428,7 @@ dispatch_task() {
   filename="$(basename "$task_path")"
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
-  if handler_result_exists "$filename"; then
+  if handler_result_is_answer "$filename"; then
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
