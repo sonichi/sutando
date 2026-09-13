@@ -98,5 +98,49 @@ class PythonArgsPosition(unittest.TestCase):
         self.assertEqual(python_args("# python3 dead.py"), [])
 
 
+class ConditionalOperators(unittest.TestCase):
+    """keweichen's [P2] on #4202: `&&`/`||` were split like `;`, so a command
+    guarded by a false left side was still credited as invoked."""
+
+    def test_a_short_circuited_and_call_is_not_invoked(self):
+        self.assertFalse(invokes(
+            f"false && bash scripts/{NAME} || true", NAME))
+
+    def test_a_short_circuited_and_python_arg_is_not_named(self):
+        self.assertEqual(python_args(
+            "false && python3 packages/x/test_dead.py || true"), [])
+
+    def test_an_unconditional_command_after_a_conditional_chain_still_counts(self):
+        """`a; b && c; d` — `d` follows `;`, not `&&`, so it always runs."""
+        self.assertTrue(invokes(f"echo hi; false && echo no; bash scripts/{NAME}", NAME))
+
+    def test_the_first_command_of_an_and_chain_still_counts(self):
+        self.assertTrue(invokes(f"bash scripts/{NAME} && echo done", NAME))
+
+    def test_a_piped_command_still_counts(self):
+        self.assertTrue(invokes(f"bash scripts/{NAME} | tee log", NAME))
+
+    def test_a_backgrounded_command_still_counts(self):
+        self.assertTrue(invokes(f"bash scripts/{NAME} &", NAME))
+
+
+class PythonArgsScriptOperand(unittest.TestCase):
+    """keweichen's second repro on the same [P2]: a `.py`-looking argument to
+    `-c`/`-m` is the script's OWN argv, not something python loads."""
+
+    def test_a_dash_c_argument_is_not_named(self):
+        self.assertEqual(python_args("python3 -c 'pass' packages/x/test_argv.py"), [])
+
+    def test_a_dash_m_argument_is_not_named(self):
+        self.assertEqual(python_args("python3 -m mymod packages/x/test_argv.py"), [])
+
+    def test_only_the_first_dot_py_token_is_named(self):
+        """An argument to the real script that happens to end in .py is not
+        itself invoked — only the script operand is."""
+        self.assertEqual(
+            python_args("python3 x/test_real.py --fixture x/data.py"),
+            ["x/test_real.py"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

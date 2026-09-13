@@ -117,39 +117,73 @@ def invokes(line: str, name: str) -> bool:
 
 
 def python_args(line: str) -> list[str]:
-    """`.py` arguments to python3/python when it runs in COMMAND position.
+    """The SCRIPT `.py` argument to python3/python in COMMAND position.
 
+    `-c`/`-m` invocations have no script file to credit — everything after
+    them is inline code or a module name, and a `.py`-looking token that
+    follows is the script's OWN argv, never something python loads (measured
+    false positive: `python3 -c 'pass' packages/x/test_argv.py` used to name
+    test_argv.py as invoked). Only the first non-flag token counts as the
+    script, so a later `.py`-looking argument is never credited either.
     `echo python3 x.py` names x.py as an ARGUMENT to echo, not a caller —
     same position discipline as `invokes()`, extracting instead of testing."""
     code = _strip_comment(line)
     out = []
     for seg in _segments(code):
         toks = _command_tokens(seg)
-        if toks and toks[0] in ("python3", "python"):
-            out.extend(t for t in toks[1:] if t.endswith(".py"))
+        if not toks or toks[0] not in ("python3", "python"):
+            continue
+        rest = toks[1:]
+        i = 0
+        while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
+            if rest[i] in ("-c", "-m"):
+                i = len(rest)  # no script operand exists in this shape
+                break
+            i += 1
+        if i < len(rest) and rest[i].endswith(".py"):
+            out.append(rest[i])
     return out
 
 
 def _segments(line: str):
-    """Split on UNESCAPED command separators, so `echo a\\; b` is one command.
+    """Split into AND-OR lists on UNCONDITIONAL separators, keeping only each
+    list's FIRST command — the only one Bash is guaranteed to reach.
+
+    `cmd1 && cmd2` may skip cmd2 depending on cmd1's exit status, so cmd2 is
+    never credited as invoked (measured false positive: `false && python3
+    packages/x/test_dead.py || true` used to name test_dead.py as invoked,
+    though Bash never runs it). `;`, a lone `&` (background), and a lone `|`
+    (pipe) don't gate on exit status, so each command they separate is its
+    own independently-scanned list — and a `;` after a `&&`/`||` chain ends
+    the conditional run, so what follows it is unconditional again.
 
     Inside single quotes nothing is special, backslash included: `'a\\'`
     is a 2-char literal, not an escaped, still-open quote."""
-    out, cur, quote, i = [], [], None, 0
+    out, cur, quote, i, conditional = [], [], None, 0, False
+
+    def flush():
+        nonlocal cur
+        s = "".join(cur)
+        if s.strip() and not conditional:
+            out.append(s)
+        cur = []
+
     while i < len(line):
         ch = line[i]
+        nxt = line[i + 1] if i + 1 < len(line) else ""
         if ch == "\\" and quote != "'" and i + 1 < len(line):
             cur.append(ch); cur.append(line[i + 1]); i += 2; continue
         if quote:
             cur.append(ch)
             if ch == quote:
                 quote = None
-        elif ch in "'\"":
-            quote = ch; cur.append(ch)
-        elif ch in ";|&":
-            out.append("".join(cur)); cur = []
-        else:
-            cur.append(ch)
-        i += 1
-    out.append("".join(cur))
+            i += 1; continue
+        if ch in "'\"":
+            quote = ch; cur.append(ch); i += 1; continue
+        if ch in "&|" and nxt == ch:
+            flush(); conditional = True; i += 2; continue
+        if ch in ";|&":
+            flush(); conditional = False; i += 1; continue
+        cur.append(ch); i += 1
+    flush()
     return [s for s in out if s.strip()]
