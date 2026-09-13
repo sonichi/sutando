@@ -180,8 +180,7 @@ else
 fi
 
 # --- case 5: an OBSERVER whose argv merely NAMES the script is not a watcher --
-# kewei on #4230: the old substring test killed this process. Identity belongs
-# to src/watcher_identity.py, which rejects it because argv[1] is not the script.
+# Identity belongs to src/watcher_identity.py: argv[1] is not the script.
 cat > "$TMP/observer.sh" << 'SH'
 #!/bin/bash
 # argv carries the watcher's name as an OPERAND, which is what used to match.
@@ -220,9 +219,7 @@ kill "$live6" 2>/dev/null; wait "$live6" 2>/dev/null
 
 
 # --- case 7: stdout NOISE ahead of the verdict must not be read as one --------
-# kewei on #4230: a sitecustomize banner on inherited PYTHONPATH made the first
-# line "site-banner". The adapter consumed it, left the watcher ALIVE and
-# deleted its ownership sentinel. Unrecognised output is not an answer.
+# A startup hook can prepend a line; unrecognised output is not an answer.
 sleep 30 &
 live7=$!
 f="$TMP/case7.pid"
@@ -270,8 +267,7 @@ kill "$live8" 2>/dev/null; wait "$live8" 2>/dev/null
 
 
 # --- case 9: `dead` from a FAILED helper licenses nothing ---------------------
-# The error gate exempted `dead`, so a helper that exited non-zero while printing
-# it released a LIVE watcher's sentinel. A failed run is not a verdict.
+# A failed run is not a verdict, whatever it printed.
 sleep 30 &
 live9=$!
 f="$TMP/case9.pid"
@@ -295,11 +291,7 @@ kill "$live9" 2>/dev/null; wait "$live9" 2>/dev/null
 
 
 # --- case 10: a watcher that does not exit on TERM must not be left running ---
-# kewei on #4230: `kill ... || true` swallowed the signal's outcome and the
-# release ran unconditionally, so a watcher that ignores TERM stayed ALIVE with
-# its sentinel gone — and the next bootstrap, seeing none, starts a SECOND one.
-# `trap '' TERM` is not exotic here: bash also DEFERS a TERM trap until the
-# foreground child returns, which is the shape case 2's own fixture has.
+# bash DEFERS a TERM trap until the foreground child returns.
 mkdir -p "$TMP/fakebin10"
 cat > "$TMP/fakebin10/watch-tasks-stream.sh" << 'SH'
 #!/bin/bash
@@ -331,6 +323,66 @@ else
   ok "watcher ignoring TERM: no sentinel released while alive"
 fi
 kill -KILL "$live10" 2>/dev/null; wait "$live10" 2>/dev/null
+
+
+# --- case 11: a verdict-shaped line from a startup hook is still not a verdict -
+# Case 7 covers an unrecognised prelude; this one uses protocol vocabulary.
+sleep 30 &
+live11=$!
+f="$TMP/case11.pid"
+echo "$live11" > "$f"
+vocab="$TMP/vocab11"; mkdir -p "$vocab"
+cat > "$vocab/python3" << 'SH'
+#!/bin/sh
+printf 'watcher\nnot-watcher\nwhy=python3 observer.py src/watch-tasks-stream.sh /inbox\n'
+SH
+chmod +x "$vocab/python3"
+out="$(PATH="$vocab:$PATH" SUTANDO_PY="$vocab/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live11" 2>/dev/null; then
+  ok "vocabulary prelude: neither killed nor released"
+else
+  bad "vocabulary prelude: neither killed nor released" \
+      "sentinel=$([ -f "$f" ] && echo present || echo gone) alive=$(kill -0 "$live11" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live11" 2>/dev/null; wait "$live11" 2>/dev/null
+
+
+# --- case 12: identity is re-proved before KILL, so a reused pid is not killed --
+# The wait is long enough for an exited watcher's pid to be reissued.
+mkdir -p "$TMP/fakebin12"
+cat > "$TMP/fakebin12/watch-tasks-stream.sh" << 'SH'
+#!/bin/bash
+trap '' TERM
+sleep 30
+SH
+chmod +x "$TMP/fakebin12/watch-tasks-stream.sh"
+bash "$TMP/fakebin12/watch-tasks-stream.sh" &
+live12=$!
+f="$TMP/case12.pid"
+echo "$live12" > "$f"
+flip="$TMP/flip12"; mkdir -p "$flip"
+export FLIP_COUNT="$TMP/flip12.count"; : > "$FLIP_COUNT"
+cat > "$flip/python3" << 'SH'
+#!/bin/sh
+n=$(cat "$FLIP_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1)); printf '%s' "$n" > "$FLIP_COUNT"
+if [ "$n" -le 1 ]; then printf 'watcher\nwhy=original\n'; else printf 'not-watcher\nwhy=reissued\n'; fi
+SH
+chmod +x "$flip/python3"
+out="$(PATH="$flip:$PATH" SUTANDO_PY="$flip/python3" reap_stale_task_watcher "$f" 2>&1)"
+if kill -0 "$live12" 2>/dev/null && [ -f "$f" ]; then
+  ok "identity changed before KILL: not escalated, both left alone"
+else
+  bad "identity changed before KILL: not escalated, both left alone" \
+      "alive=$(kill -0 "$live12" 2>/dev/null && echo yes || echo no) sentinel=$([ -f "$f" ] && echo present || echo gone) ($out)"
+fi
+if printf '%s' "$out" | grep -q 'no longer proves to be this sentinel'"'"'s watcher'; then
+  ok "identity changed before KILL: refusal is the reason, not an earlier return"
+else
+  bad "identity changed before KILL: refusal is the reason, not an earlier return" "($out)"
+fi
+unset FLIP_COUNT
+kill -KILL "$live12" 2>/dev/null; wait "$live12" 2>/dev/null
 
 
 if [ "$fails" -eq 0 ]; then

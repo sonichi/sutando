@@ -338,15 +338,32 @@ reap_wedged_voice_agent() {
 # both the value in the sentinel and the `ps` argv check. Ownership is resolved by
 # src/watcher_sentinel.sh, which asks the OS whether the process is old enough to
 # have written the file. Nothing here decides ownership locally.
+
+# Echo the classifier's verdict when the answer is usable, rc 1 otherwise, so
+# noise and an unusable answer fail closed alike.
+_reaper_watcher_verdict() {
+  local _pid="$1" _py="$2" _repo="$3" _out _rc=0
+  # -S -I stops a sitecustomize or PYTHONPATH hook printing a verdict-shaped line;
+  # the exact two-line frame refuses any contamination that still arrives.
+  _out="$("$_py" -S -I "$_repo/src/watcher_identity.py" "$_pid" 2>/dev/null)" || _rc=$?
+  [ "$_rc" -eq 0 ] || return 1
+  [ "$(printf '%s\n' "$_out" | grep -c '')" -eq 2 ] || return 1
+  case "$(printf '%s' "$_out" | head -1)" in
+    watcher)     printf 'watcher' ;;
+    not-watcher) printf 'not-watcher' ;;
+    dead)        printf 'dead' ;;
+    *)           return 1 ;;
+  esac
+  return 0
+}
+
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid
   [ -f "$pid_file" ] || return 0
   stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
 
-  # Identity is src/watcher_identity.py's to decide: a substring test here killed
-  # an observer whose argv merely names the script, and a silent non-zero `ps`
-  # reached the release below and deleted a live watcher's sentinel.
-  local _wi_repo _wi_py _wi_out _wi_verdict _wi_rc=0
+  # Identity is src/watcher_identity.py's to decide, never a local argv test.
+  local _wi_repo _wi_py _wi_verdict _wi_rc=0
   _wi_repo="$(sutando_repo_root)"
   # shellcheck source=../scripts/python-binary.sh
   source "$_wi_repo/scripts/python-binary.sh"
@@ -355,18 +372,11 @@ reap_stale_task_watcher() {
     echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (no interpreter); leaving the sentinel alone"
     return 0
   fi
-  _wi_out="$("$_wi_py" "$_wi_repo/src/watcher_identity.py" "$stale_pid" 2>/dev/null)" || _wi_rc=$?
-  _wi_verdict="$(printf '%s' "$_wi_out" | head -1)"
-  # Anything that is not one of the four verdicts is NOISE, not an answer: a
-  # sitecustomize banner ahead of it must not be consumed as one.
-  case "$_wi_verdict" in
-    watcher|not-watcher|dead|unknown) ;;
-    *) _wi_verdict="unknown"; _wi_rc=2 ;;
-  esac
-  # A verdict is knowledge only if the helper SUCCEEDED. Exempting `dead` from
-  # that let a FAILED run printing it release a live watcher's sentinel.
-  if [ "$_wi_rc" -ne 0 ] || [ "$_wi_verdict" = "unknown" ]; then
-    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher ($(printf '%s' "$_wi_out" | sed -n 2p)); leaving the sentinel alone"
+  # Only a successful helper carrying one exact frame is a verdict; everything
+  # else, `unknown` included, leaves the record untouched.
+  _wi_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _wi_rc=$?
+  if [ "$_wi_rc" -ne 0 ] || [ -z "$_wi_verdict" ]; then
+    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher; leaving the sentinel alone"
     return 0
   fi
 
@@ -395,6 +405,15 @@ reap_stale_task_watcher() {
       sleep 0.1
     done
     if kill -0 "$stale_pid" 2>/dev/null; then
+      # `kill -0` proves A process exists, not the one inspected, and the wait above
+      # is long enough for an exited watcher's pid to be reused — re-prove before KILL.
+      local _re_verdict _re_owned=0
+      _re_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _re_verdict=""
+      sentinel_pid_wrote_file "$stale_pid" "$pid_file" || _re_owned=$?
+      if [ "$_re_verdict" != "watcher" ] || [ "$_re_owned" -ne 0 ]; then
+        echo "  ⚠ pid $stale_pid no longer proves to be this sentinel's watcher — not escalating to KILL; leaving both alone"
+        return 0
+      fi
       kill -KILL "$stale_pid" 2>/dev/null || _reap_rc=$?
       for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "$stale_pid" 2>/dev/null || break
