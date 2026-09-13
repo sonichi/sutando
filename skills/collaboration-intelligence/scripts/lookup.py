@@ -45,6 +45,16 @@ def load(d):
     return q, ents
 
 
+def _ri():
+    """The shared owner of the metadata rule; a copy here would drift silently."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "roster_identity", pathlib.Path(__file__).with_name("roster_identity.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
@@ -68,7 +78,9 @@ def load_roster(d):
         return []
     rows = []
     for key, r in merged.items():
-        if not isinstance(r, dict):
+        # A v2 document carries a reserved `_schema` block. Accepting every
+        # top-level dict renders metadata as a person the caller can address.
+        if not isinstance(r, dict) or not _ri().is_person_key(key):
             continue
         gh = roster_login(r)[0]
         rows.append({
