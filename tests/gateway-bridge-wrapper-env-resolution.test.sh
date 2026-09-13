@@ -31,7 +31,11 @@ run_case() {  # $1=.env body  $2=relay-client.env body -> prints the stub's line
       > "$d/src/remote-gateway-bridge.py"
   printf '%s' "$1" > "$d/home/channels/ag2space/.env"
   printf '%s' "$2" > "$d/home/channels/ag2space/relay-client.env"
-  ( cd "$d" && SUTANDO_PY="$PY" bash src/launchd/gateway-bridge-wrapper.sh 2>&1 ) | tail -1
+  # Hermetic regardless of the calling shell's own env: an ambient gateway
+  # credential must never leak into this test's stdout or steer its outcome.
+  ( cd "$d" && unset REMOTE_TASK_TOKEN REMOTE_TASK_TIER AG2_REMOTE_TOKEN \
+        AG2_REMOTE_TIER REMOTE_MEDIA_MARKER
+    SUTANDO_PY="$PY" bash src/launchd/gateway-bridge-wrapper.sh 2>&1 ) | tail -1
   rm -rf "$d"
 }
 
