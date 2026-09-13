@@ -143,9 +143,12 @@ class RequiredApprovals(unittest.TestCase):
                      "parameters": {"required_approving_review_count": 2}}])
         self.assertEqual(g.required_approvals("o/r", "main"), 2)
 
-    def test_no_pull_request_rule_means_no_bar(self):
+    def test_no_pull_request_rule_means_UNKNOWN_not_zero(self):
+        """A missing rule states nothing; 0 is a SATISFIED bar (yixuan-ag2,
+        #4055): the old `return 0` read "no rule" as "bar met" for a PR
+        with zero approvals on any branch lacking a ruleset."""
         self._with([{"type": "deletion", "parameters": {}}])
-        self.assertEqual(g.required_approvals("o/r", "main"), 0)
+        self.assertIsNone(g.required_approvals("o/r", "main"))
 
 
 class Main(unittest.TestCase):
@@ -186,6 +189,19 @@ class Main(unittest.TestCase):
         g.required_approvals = lambda *a: (_ for _ in ()).throw(RuntimeError("404"))
         self.addCleanup(lambda: setattr(g, "required_approvals", orig))
         self.assertEqual(g.main(["--repo", "o/r", "--shared-login", SHARED[0], "7"]), 2)
+
+    def test_a_branch_with_no_pull_request_rule_exits_2_never_MET(self):
+        """The bug (yixuan-ag2, #4055): `docs/worker-pool-design` has no
+        `pull_request` rule, so a zero-approval PR based there used to print
+        "bar met, nobody to recruit" -- rc 0, the same as a real MET. Now it
+        must refuse to answer rather than fabricate a satisfied bar, and it
+        must do so WITHOUT ever reading a PR's reviews (nothing to score
+        against)."""
+        self._stub([{"type": "deletion", "parameters": {}}],
+                   {"7": RuntimeError("must not be called")})
+        rc = g.main(["--repo", "o/r", "--shared-login", SHARED[0],
+                     "--branch", "docs/worker-pool-design", "7"])
+        self.assertEqual(rc, 2)
 
     def test_repeatable_shared_login_reaches_classify(self):
         self._stub(self.RULES, {"7": [rv(SHARED[0], "APPROVED"), rv(SHARED[1], "APPROVED")]})

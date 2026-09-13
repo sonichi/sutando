@@ -87,10 +87,17 @@ def _gh(args):
 
 
 def required_approvals(repo, branch):
+    """The bar, or `None` if the branch has no `pull_request` rule.
+
+    `None` is not zero: a missing rule states nothing, and 0 is a satisfied
+    bar. Returning 0 for "no rule found" made a branch with no ruleset read as
+    MET for a PR with zero approvals -- the absence of a rule as a satisfied
+    one, silently.
+    """
     for rule in _gh([f"repos/{repo}/rules/branches/{branch}"]):
         if rule.get("type") == "pull_request":
             return int(rule["parameters"].get("required_approving_review_count", 0))
-    return 0
+    return None
 
 
 def main(argv=None):
@@ -107,6 +114,11 @@ def main(argv=None):
         required = required_approvals(a.repo, a.branch)
     except Exception as exc:
         print(f"cannot answer: {exc}")
+        return 2
+    if required is None:
+        # No `pull_request` rule at all -- not zero required, unknown required.
+        print(f"cannot answer: no pull_request rule on branch {a.branch!r} "
+              f"of {a.repo}")
         return 2
     for pr in a.prs:
         try:
