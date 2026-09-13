@@ -14,12 +14,21 @@ mkdir -p "$TMP/bin"; for stub in lsof launchctl; do printf '#!/bin/sh\nexit 1\n'
 chmod +x "$TMP"/bin/*
 STUB_PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# `--print-core-env` is `printf '%s\n' "${CORE_ENV_ARGS[@]}"`, so each element is
+# its own line and a value containing spaces stays whole. Never split on spaces.
+env_value() { printf '%s\n' "$1" | grep "^$2=" | head -1; }
+
+# An executable interpreter the launcher must forward verbatim. Injected rather
+# than inherited: the host's own resolution is not what this case measures.
+INJECTED_PY="$TMP/bin/python3-injected"
+printf '#!/bin/sh\nexit 0\n' > "$INJECTED_PY"; chmod +x "$INJECTED_PY"
+
 worker_env="$(env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_INSTANCE_ID=w-test \
-    bash "$STARTCLI" --print-core-env 2>/dev/null)"
-core_env="$(env -i HOME="$HOME" PATH="$STUB_PATH" \
+    SUTANDO_PY="$INJECTED_PY" bash "$STARTCLI" --print-core-env 2>/dev/null)"
+core_env="$(env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_PY="$INJECTED_PY" \
     bash "$STARTCLI" --print-core-env 2>/dev/null)"
 
-got="$(printf '%s\n' "$worker_env" | tr ' ' '\n' | grep '^SUTANDO_WATCHER_CMD=' | head -1)"
+got="$(env_value "$worker_env" SUTANDO_WATCHER_CMD)"
 echo "  worker: ${got:-<absent>}"
 case "$got" in
   "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh") check 0 "worker is handed the repo-absolute watcher path" ;;
@@ -29,16 +38,37 @@ esac
 case "$got" in *=/*) [ -f "${got#*=}" ]; check $? "the forwarded watcher path exists" ;;
                *) check 1 "the forwarded watcher path exists" ;; esac
 
-py="$(printf '%s\n' "$worker_env" | tr ' ' '\n' | grep '^SUTANDO_PY=' | head -1)"
+py="$(env_value "$worker_env" SUTANDO_PY)"
 echo "  worker: ${py:-<absent>}"
-case "$py" in *=/*) [ -x "${py#*=}" ]; check $? "worker is handed an executable interpreter, not a bare name" ;;
-               *) check 1 "worker is handed an executable interpreter, not a bare name" ;; esac
+[ "$py" = "SUTANDO_PY=$INJECTED_PY" ] && [ -x "${py#*=}" ]
+check $? "worker is handed the executable interpreter verbatim, not a bare name"
 
-# The control that makes the two above a real result: a core launch gets neither.
-printf '%s\n' "$core_env" | tr ' ' '\n' | grep -qE '^SUTANDO_(WATCHER_CMD|PY)='
-if [ $? -ne 0 ]; then check 0 "core launch forwards neither — env invariance holds"; else
-  echo "    core env leaked: $(printf '%s\n' "$core_env" | tr ' ' '\n' | grep -E '^SUTANDO_(WATCHER_CMD|PY)=')"
-  check 1 "core launch forwards neither — env invariance holds"; fi
+# A checkout path with a space is the DEFAULT macOS install location, and no CI
+# runner has one — so the parser is pinned here instead of by where this runs.
+spaced="$(printf '%s\n' "-e" "SUTANDO_WATCHER_CMD=/Library/Application Support/x/src/watch-tasks-stream.sh" "-e" "SUTANDO_PY=/x/python3")"
+[ "$(env_value "$spaced" SUTANDO_WATCHER_CMD)" = "SUTANDO_WATCHER_CMD=/Library/Application Support/x/src/watch-tasks-stream.sh" ]
+check $? "a value containing spaces survives the parse whole"
+
+# Fail closed, not open: with no runnable interpreter the launcher forwards NO
+# SUTANDO_PY rather than a bare name, and still names the watcher absolutely.
+mkdir -p "$TMP/noclt"; printf '#!/bin/sh\nexit 1\n' > "$TMP/noclt/xcode-select"
+for stub in lsof launchctl; do printf '#!/bin/sh\nexit 1\n' > "$TMP/noclt/$stub"; done
+chmod +x "$TMP"/noclt/*
+noclt_env="$(env -i HOME="$HOME" PATH="$TMP/noclt:/usr/bin:/bin:/usr/sbin:/sbin" \
+    SUTANDO_INSTANCE_ID=w-test bash "$STARTCLI" --print-core-env 2>/dev/null)"
+noclt_py="$(env_value "$noclt_env" SUTANDO_PY)"
+noclt_watcher="$(env_value "$noclt_env" SUTANDO_WATCHER_CMD)"
+echo "  no-interpreter worker: py=${noclt_py:-<absent>} watcher=${noclt_watcher:+present}"
+[ -z "$noclt_py" ] && [ -n "$noclt_watcher" ]
+check $? "no runnable interpreter: no SUTANDO_PY forwarded, watcher still named"
+
+# The control that makes the cases above a real result: a core launch gets neither.
+if ! printf '%s\n' "$core_env" | grep -qE '^SUTANDO_(WATCHER_CMD|PY)='; then
+  check 0 "core launch forwards neither — env invariance holds"
+else
+  echo "    core env leaked: $(printf '%s\n' "$core_env" | grep -E '^SUTANDO_(WATCHER_CMD|PY)=')"
+  check 1 "core launch forwards neither — env invariance holds"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
