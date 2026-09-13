@@ -357,6 +357,12 @@ reap_stale_task_watcher() {
   fi
   _wi_out="$("$_wi_py" "$_wi_repo/src/watcher_identity.py" "$stale_pid" 2>/dev/null)" || _wi_rc=$?
   _wi_verdict="$(printf '%s' "$_wi_out" | head -1)"
+  # Anything that is not one of the four verdicts is NOISE, not an answer: a
+  # sitecustomize banner ahead of it must not be consumed as one.
+  case "$_wi_verdict" in
+    watcher|not-watcher|dead|unknown) ;;
+    *) _wi_verdict="unknown"; _wi_rc=2 ;;
+  esac
   # `dead` is knowledge (ps ran, the pid is gone) and licenses the release below;
   # `unknown` is its absence and licenses nothing.
   if [ "$_wi_verdict" != "dead" ] && { [ "$_wi_rc" -ne 0 ] || [ "$_wi_verdict" = "unknown" ]; }; then

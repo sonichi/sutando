@@ -219,6 +219,33 @@ fi
 kill "$live6" 2>/dev/null; wait "$live6" 2>/dev/null
 
 
+# --- case 7: stdout NOISE ahead of the verdict must not be read as one --------
+# kewei on #4230: a sitecustomize banner on inherited PYTHONPATH made the first
+# line "site-banner". The adapter consumed it, left the watcher ALIVE and
+# deleted its ownership sentinel. Unrecognised output is not an answer.
+sleep 30 &
+live7=$!
+f="$TMP/case7.pid"
+echo "$live7" > "$f"
+noisy="$TMP/noisy"; mkdir -p "$noisy"
+cat > "$noisy/python3" << 'SH'
+#!/bin/sh
+echo "site-banner"
+echo "watcher"
+echo "why=bash /x/watch-tasks-stream.sh /inbox"
+exit 0
+SH
+chmod +x "$noisy/python3"
+out="$(PATH="$noisy:$PATH" SUTANDO_PY="$noisy/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live7" 2>/dev/null; then
+  ok "banner ahead of the verdict: neither killed nor released"
+else
+  bad "banner ahead of the verdict: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live7" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live7" 2>/dev/null; wait "$live7" 2>/dev/null
+
+
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"
   exit 0
