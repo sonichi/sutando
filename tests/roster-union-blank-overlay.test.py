@@ -185,15 +185,36 @@ class BlankOverlay(unittest.TestCase):
 
     def test_CONTROL_a_non_string_still_overlays_a_field_that_is_not_text(self):
         """Making the predicate strict everywhere would pass every arm above and
-        fail here — only a TEXT field asks for text."""
+        fail here — only a TEXT field asks for text. Uses a synthetic field name,
+        not `allowlisted`: that one is bool-typed now (see the next test) and a
+        real-world example of a non-text, non-bool field does not exist in the
+        schema, so the general "not text -> any value states it" rule needs its
+        own field to stay provable."""
         for value in NON_STRINGS:
             with self.subTest(local=value):
                 merged = self.union(
                     ("local", {"reviewer": {"stand": "", "room": "",
-                                            "allowlisted": value}}),
-                    ("peer", {"reviewer": dict(PEER_ROUTE, allowlisted=True)}),
+                                            "some_other_field": value}}),
+                    ("peer", {"reviewer": dict(PEER_ROUTE, some_other_field=True)}),
                 )
-                self.assertEqual(merged["reviewer"].get("allowlisted"), value)
+                self.assertEqual(merged["reviewer"].get("some_other_field"), value)
+
+    def test_CONTROL_a_malformed_allowlisted_value_does_NOT_overlay(self):
+        """`allowlisted` is bool | null (schema.md) — a malformed local value (0,
+        a list, a dict) is not a `False` the schema recognizes and must not
+        outrank a peer's real `allowlisted: false` the way a genuine `False`
+        does (keweichen, #4047 review: this was the P2 finding)."""
+        for value in (0, ["x"], {"a": 1}, "false"):
+            with self.subTest(local=value):
+                merged = self.union(
+                    ("local", {"reviewer": {"stand": "", "room": "",
+                                            "allowlisted": value}}),
+                    ("peer", {"reviewer": dict(PEER_ROUTE, allowlisted=False)}),
+                )
+                self.assertIs(merged["reviewer"].get("allowlisted"), False,
+                             f"malformed local {value!r} erased the peer's real False")
+                _, rc, _ = self.resolve(merged)
+                self.assertEqual(rc, 4, "off-allowlist must still be refused")
 
     # --- arms 7-9: the same overlay, on identity -------------------------
     def _resolved_login(self, merged, name="reviewer"):
@@ -604,8 +625,12 @@ class SharedPresencePredicate(unittest.TestCase):
                     self.assertFalse(self.ru.states_field(field, value))
             self.assertTrue(self.ru.states_field(field, " x "))
         for value in NON_STRINGS:
+            expect_stated = isinstance(value, bool)
             with self.subTest(field="allowlisted", value=value):
-                self.assertTrue(self.ru.states_field("allowlisted", value))
+                self.assertEqual(self.ru.states_field("allowlisted", value), expect_stated)
+        for value in (0, ["x"], {"a": 1}, "false"):
+            with self.subTest(field="allowlisted", malformed=value):
+                self.assertFalse(self.ru.states_field("allowlisted", value))
         self.assertFalse(self.ru.states_field("allowlisted", None))
 
     def test_the_text_fields_are_named_once_and_both_readers_use_that_name(self):

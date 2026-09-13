@@ -40,6 +40,9 @@ def is_declared(value) -> bool:
 REFUSAL_FIELDS = ("refusal_basis", "note")
 # The ONE list of fields carrying TEXT, not a value: a False or list reads blank.
 TEXT_FIELDS = REFUSAL_FIELDS + ("authority_caveat", "same_actor_as") + IDENTITY_FIELDS
+# schema.md: bool | null. A malformed local value here (0, [], {}, "false") is not
+# a `False` the schema recognizes, so it must not outrank a peer's real `False`.
+BOOL_FIELDS = ("allowlisted",)
 
 
 CAVEAT_SUFFIX = "_caveat"
@@ -66,8 +69,16 @@ def states_field(field, value) -> bool:
     `allowlisted: false` meaningful. A text field asks `declared` instead: a
     list or a `False` in one prints as no reason at all, so letting it overlay
     would erase a peer's stated refusal with a value no reader can read.
+    A bool field (`allowlisted`) asks for an actual `bool`: `is_declared`'s
+    `value is not None` would let a malformed local placeholder (0, [], {},
+    "false") outrank a peer's real `allowlisted: false` the same way a text
+    field's list/False would (keweichen, #4047 review).
     """
-    return bool(declared(value)) if is_text_field(field) else is_declared(value)
+    if is_text_field(field):
+        return bool(declared(value))
+    if field in BOOL_FIELDS:
+        return isinstance(value, bool)
+    return is_declared(value)
 
 
 def roster_login(row) -> "tuple[str, str]":
