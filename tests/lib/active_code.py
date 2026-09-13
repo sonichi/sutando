@@ -70,11 +70,17 @@ def active_text(text: str) -> str:
     return "\n".join(active_lines(text))
 
 
+import re
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def _command_tokens(seg: str) -> list[str]:
     """`seg`'s tokens with a leading env/VAR= prefix peeled off.
 
-    Shared by every COMMAND-position check below: `env FOO=1 cmd` and
-    `FOO=1 cmd` both run `cmd`, not `env` or the assignment."""
+    `FOO=1 cmd` runs `cmd`; `BAD-NAME=1 cmd` is not a valid assignment (a
+    hyphen can't start a shell identifier), so bash tries to RUN it and
+    fails — peeling it here would wrongly credit `cmd` as invoked."""
     import shlex
     try:
         toks = shlex.split(seg)
@@ -83,7 +89,7 @@ def _command_tokens(seg: str) -> list[str]:
     changed = True
     while changed and toks:
         changed = False
-        if ("=" in toks[0]) and not toks[0].startswith("="):
+        if _IDENT_RE.match(toks[0]):
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -125,11 +131,14 @@ def python_args(line: str) -> list[str]:
 
 
 def _segments(line: str):
-    """Split on UNESCAPED command separators, so `echo a\\; b` is one command."""
+    """Split on UNESCAPED command separators, so `echo a\\; b` is one command.
+
+    Inside single quotes nothing is special, backslash included: `'a\\'`
+    is a 2-char literal, not an escaped, still-open quote."""
     out, cur, quote, i = [], [], None, 0
     while i < len(line):
         ch = line[i]
-        if ch == "\\" and i + 1 < len(line):
+        if ch == "\\" and quote != "'" and i + 1 < len(line):
             cur.append(ch); cur.append(line[i + 1]); i += 2; continue
         if quote:
             cur.append(ch)

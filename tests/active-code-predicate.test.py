@@ -66,6 +66,14 @@ class CommandPosition(unittest.TestCase):
         self.assertFalse(invokes(f"# bash scripts/{NAME} > f", NAME))
         self.assertFalse(invokes(f": > f ;# scripts/{NAME}", NAME))
 
+    def test_an_invalid_identifier_prefix_is_not_an_assignment(self):
+        # A hyphen can't start a shell identifier: bash tries to RUN it, rc=127.
+        self.assertFalse(invokes(f"BAD-NAME=1 scripts/{NAME}", NAME))
+
+    def test_a_trailing_backslash_inside_single_quotes_is_literal(self):
+        # `'inert\'` closes there in bash — the `;` after it is a real separator.
+        self.assertTrue(invokes(f"echo 'inert\\'; bash scripts/{NAME}", NAME))
+
     def test_unquoted_blanks_quoted_runs_only(self):
         self.assertEqual(unquoted("a 'bc' d"), "a      d")
 
