@@ -29,11 +29,11 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
-# $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
-# config helper falls back to ~/.claude otherwise.
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+# Resolved by CONTENT, not filename: some hosts keep REMOTE_TASK_* in the
+# channel's `.env`, others in a sibling while `.env` holds Matrix creds.
+if _RELAY_ENV="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" \
+   && [ -n "$_RELAY_ENV" ] && [ -f "$_RELAY_ENV" ]; then
+    set -a; . "$_RELAY_ENV"; set +a;
 fi
 
 # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
