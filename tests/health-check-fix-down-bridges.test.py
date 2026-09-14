@@ -49,6 +49,8 @@ REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+# Keep fix-run metrics isolated from real workspace state and analytics.
+hc.track_health_fix = lambda *args, **kwargs: None
 
 
 def check(name: str, status: str, detail: str) -> dict:

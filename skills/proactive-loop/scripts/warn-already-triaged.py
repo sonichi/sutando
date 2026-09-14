@@ -120,18 +120,24 @@ def report(name, text, files):
             print(f"             +{len(hits) - SHOW_CANDIDATES} further candidate(s) NOT shown — "
                   f"narrow the claim to see them")
         return "parked"
-    body = []
+    hits_by_file = {}
     for tok in toks:
         for f in files:
             for i, line in enumerate(lines_of(f), 1):
                 if tok.lower() in line.lower():
-                    body.append((tok, display(f), i)); break
-    if body:
-        # "No heading" is NOT "nothing written" — material is often parked in a
-        # BODY under a neighbouring heading.
-        tok, fn, i = body[0]
-        print(f"  NO HEADING {label:25} — but {len(body)} body mention(s), first "
-              f"'{tok}' -> {fn}:{i}. READ before investigating")
+                    hits_by_file.setdefault(display(f), {}).setdefault(i, tok)
+    if hits_by_file:
+        # Parking files are append-only, so the NEWEST line of the file holding
+        # the MOST mentions is the verdict; token order is not relevance.
+        total = sum(len(v) for v in hits_by_file.values())
+        fn, at = max(hits_by_file.items(), key=lambda kv: len(kv[1]))
+        ls = sorted(at)
+        first, last, n = ls[0], ls[-1], len(ls)
+        extra = ("" if len(hits_by_file) == 1 else
+                 f", +{total - n} in {len(hits_by_file) - 1} other file(s)")
+        print(f"  NO HEADING {label:25} — but {n} body mention(s) in {fn}{extra}; "
+              f"NEWEST '{at[last]}' -> {fn}:{last}, oldest :{first}. "
+              f"READ the newest first")
         return "parked"
     print(f"  NONE FOUND {label:25} — no heading, no body mention; genuinely "
           f"untriaged, OR every token missed (try one from the warn text)")

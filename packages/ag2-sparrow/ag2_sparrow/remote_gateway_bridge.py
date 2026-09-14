@@ -912,10 +912,21 @@ def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
     return (*candidates[0], answer) if len(candidates) == 1 else None
 
 
+def _released_review_body(raw: str) -> str:
+    """Room text for an owner-released result. Markers are stripped, never executed:
+    the release posts to the original room only and uploads nothing."""
+    parsed = parse_markers(raw)
+    dropped = sum(1 for action in parsed.actions if action.kind == "attach")
+    if not dropped:
+        return parsed.body
+    note = f"({dropped} attachment{'' if dropped == 1 else 's'} not published)"
+    return f"{parsed.body}\n\n{note}" if parsed.body else note
+
+
 def _publish_review(path: Path, record: dict) -> bool:
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
-    body = str(record.get("withheld_body") or "")
+    body = _released_review_body(str(record.get("withheld_body") or ""))
     if not room.startswith("!") or not body:
         record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
                        "card_resolution_pending": True})
