@@ -118,10 +118,7 @@ def extract_bundle(tar_gz: bytes, dest: Path) -> None:
                 continue
             out = dest.joinpath(*parts)
             out.parent.mkdir(parents=True, exist_ok=True)
-            src = archive.extractfile(m)
-            if src is None:
-                raise ValueError(f"could not read bundle member: {m.name}")
-            with src, open(out, "wb") as fh:
+            with archive.extractfile(m) as src, open(out, "wb") as fh:
                 shutil.copyfileobj(src, fh)
             if m.mode & 0o111:
                 out.chmod(0o755)

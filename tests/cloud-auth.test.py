@@ -71,5 +71,31 @@ class TestCloudRequest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "network")
 
 
+
+class TestCloudRequestEdges(unittest.TestCase):
+    def test_insecure_test_host_allowed_only_when_opted_in(self):
+        cloud_auth.check_trusted_base("http://127.0.0.1:9", frozenset({"127.0.0.1"}))
+
+    def test_unreadable_error_body_timeout_and_decoding(self):
+        err = urllib.error.HTTPError("u", 500, "x", {}, None)
+        opener = mock.MagicMock()
+        opener.open.side_effect = err
+        with mock.patch.object(cloud_auth.urllib.request, "build_opener", return_value=opener), \
+                mock.patch.object(err, "read", side_effect=OSError("closed")), \
+                self.assertRaises(cloud_auth.CloudError) as ctx:
+            cloud_auth.cloud_request("https://sutando.ag2.space", "t", "GET", "/api/me")
+        self.assertEqual(ctx.exception.code, "http_500")
+
+        opener.open.side_effect = TimeoutError()
+        with mock.patch.object(cloud_auth.urllib.request, "build_opener", return_value=opener), \
+                self.assertRaises(cloud_auth.CloudError) as ctx:
+            cloud_auth.cloud_request("https://sutando.ag2.space", None, "GET", "/api/me")
+        self.assertEqual(ctx.exception.detail, "request timed out")
+
+        self.assertIsNone(cloud_auth._decode(b""))
+        self.assertEqual(cloud_auth._decode(b"<html>"), {"detail": "<html>"})
+        self.assertIsNone(cloud_auth._NoRedirect().redirect_request(None, None, 307, "", {}, "https://evil"))
+
+
 if __name__ == "__main__":
     unittest.main()
