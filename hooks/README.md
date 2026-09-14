@@ -402,3 +402,35 @@ PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the n
 **Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
 the same login and is outside the subcommand set, as is a body read from stdin
 (`-F -`). Both are deliberate — the guard reads a body it can see.
+
+## `gh-policy-gate.py`
+
+Denies a `gh issue create` that duplicates an existing issue (via
+`skills/proactive-loop/scripts/gh-duplicate-check.py`) or a `gh pr comment` posted
+into a thread that is only the caller talking to itself, unanswered (via
+`skills/proactive-loop/scripts/pr-monologue-check.py`) — for **any** Bash caller,
+not only the skills whose own checklist remembers to chain the check.
+
+Both underlying scripts already existed as real, measured, `&&`-chained gates for
+proactive-loop's own steps 3.45 and 9.5. The gap: `skills/submit-use-case/SKILL.md`
+runs `gh issue create` with no reference to gh-duplicate-check.py anywhere, and
+`skills/pr-triage/SKILL.md` posts comments through its own `pr-comment-gated.py`
+(sha/cited-link/unread-reviewer checks) with no monologue detection at all. The
+policy was enforced by which skill happened to remember it, not by the action. This
+hook moves enforcement to the action — same two scripts, run as subprocesses, so
+there is exactly one duplicate-check algorithm and one monologue-check algorithm.
+
+Fails open on uncertainty, denies only on a positive finding: a lookup that could
+not run (network, auth, unresolvable `--repo`/`--title`/PR number) is "cannot
+answer" and the command is allowed; only an explicit REFUSE (exit 1) from the
+underlying script denies.
+
+- `SUTANDO_ALLOW_UNGATED_GH=1` — one-shot override, same shape as
+  `SUTANDO_ALLOW_UNSIGNED_COMMENT` above.
+- `SUTANDO_GH_LOGIN` — the caller's own GitHub login, used for the monologue check's
+  `--me`. Falls back to `gh api user` when unset.
+
+**Not covered:** `gh api repos/o/r/issues -f title=…` (same reasoning as
+comment-signature-guard's uncovered `gh api` path above), and any duplicate/monologue
+check whose `--repo`/`--title`/PR number cannot be resolved from the command line —
+those fail open rather than block a large class of legitimate reads.
