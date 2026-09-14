@@ -287,7 +287,7 @@ release_dispatch_lock() {
 }
 
 finish_handler_task() {
-  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled announce
+  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled announce verdict
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   worker_receipt="$DISPATCH_DIR/workers/$filename"
@@ -299,8 +299,15 @@ finish_handler_task() {
   if mv "$marker" "$settled" 2>/dev/null; then
     if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
       claim_settled=1
-      claim_disposition "$filename"
-      case $? in
+      # THIS run's own terminal code outranks a disposition fixed back at probe
+      # time: 4 is the handler saying the live core must not inherit the task.
+      if [ "$rc" -eq 4 ]; then
+        verdict=0
+      else
+        claim_disposition "$filename"
+        verdict=$?
+      fi
+      case $verdict in
         0)
           echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
           # An unsettled publish leaves the claim held rather than clobbering a
