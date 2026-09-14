@@ -82,13 +82,16 @@ def preflight(workspace, repo, room: str) -> None:
         # Publishing a binding with no router sends that room's work to the
         # core instead — silently, and the binding says otherwise.
         handler = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
-        if not handler or not os.access(handler, os.X_OK):
+        # A REGULAR file: `X_OK` alone is satisfied by a searchable directory,
+        # which the watcher cannot execute, so the binding would still be unrouted.
+        if (not handler or not os.path.isfile(handler)
+                or not os.access(handler, os.X_OK)):
             raise Refused(
                 "binding a room needs the core's task-event handler: set "
                 "SUTANDO_TASK_EVENT_HANDLER to an executable and re-arm the "
                 "core's watcher with it, then retry. Creating an unbound "
                 "worker (no --room) does not need one."
-                + (f" (it names {handler!r}, which is not executable)"
+                + (f" (it names {handler!r}, which is not an executable file)"
                    if handler else ""))
 
 

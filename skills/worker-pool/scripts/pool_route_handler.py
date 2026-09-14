@@ -125,6 +125,11 @@ def main(argv=None) -> int:
         # The pass refused; the core must not silently inherit the task.
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE
+    except OSError as e:
+        # A delivery I/O failure is still "a worker holds this": rc 1 would read
+        # as an optional decline and hand the task to the unrestricted core.
+        print(f"pool_route_handler: delivery failed: {e}", file=sys.stderr)
+        return MUST_HANDLE
     settled = set(out.get("delivered") or []) | set(out.get("already") or [])
     unsettled = [t for t in targets if t not in settled] + list(out.get("skipped") or [])
     if unsettled:

@@ -135,6 +135,28 @@ class TestDelivery(Base):
         self.assertEqual(s.stat().st_size, 0)
         self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
 
+    def test_a_delivery_io_failure_is_must_handle_not_an_optional_decline(self):
+        """kewei's repro: the recipient's delivery directory replaced by a regular
+        file. Only RouterRefused was caught, so an OSError escaped as rc 1 — which
+        the watcher reads as "optional handler declined" and hands to the live core.
+        """
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        d = self.ws / "deliveries" / W
+        if d.exists():
+            import shutil; shutil.rmtree(d)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_text("not a directory\n", encoding="utf-8")   # the I/O failure
+        rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertEqual(rc, h.MUST_HANDLE,
+                         f"a delivery I/O failure returned {rc}; rc 1 sends the task to the core")
+
+    def test_control_the_same_route_succeeds_with_the_directory_intact(self):
+        # Without this, the case above passes for a handler that fails on everything.
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+
     def test_a_header_id_naming_another_file_is_refused_in_both_modes(self):
         """The router delivers by id, so this header would deliver nothing while
         the handler reported success. Probe AND run say must-handle, so the

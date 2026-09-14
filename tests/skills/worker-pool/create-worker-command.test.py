@@ -323,7 +323,20 @@ class TestABindingNeedsARouter(Base):
         with contextlib.redirect_stderr(err):
             rc = self.run_cli("--room", ROOM)
         self.assertEqual(rc, cw.REFUSED)
-        self.assertIn("not executable", err.getvalue())
+        self.assertIn("not an executable file", err.getvalue())
+
+    def test_a_searchable_directory_is_not_an_executable_handler(self):
+        """`os.access(X_OK)` is satisfied by a searchable directory, which the
+        watcher cannot execute — so the binding would publish still unrouted."""
+        import os as _os
+        d = self.ws / "handler-dir"; d.mkdir()
+        self.assertTrue(_os.access(d, _os.X_OK), "control: X_OK does pass on a directory")
+        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(d)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.run_cli("--room", ROOM)
+        self.assertEqual(rc, cw.REFUSED, "a directory was accepted as the handler")
+        self.assertIn("executable file", err.getvalue())
 
     def test_an_unbound_worker_needs_no_handler(self):
         # The control: the gate is about ROUTING, so it must not block a worker
