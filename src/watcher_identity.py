@@ -41,6 +41,27 @@ def as_pid(tok) -> Optional[int]:
         return None
 
 
+def proc_cwd(pid) -> Optional[str]:
+    """Working directory of `pid`, or None when it cannot be read.
+
+    Only ever a RESOLVER for a relative script operand -- never the ownership
+    signal itself, which is the conflation an earlier revision was rejected for.
+    """
+    try:  # linux: the symlink is authoritative
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:  # noqa: BLE001 -- not linux, gone, or not permitted
+        pass
+    try:  # darwin: lsof is the only non-privileged reader
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001 -- absent, slow, or denied
+        return None
+    for line in out.split("\n"):
+        if line.startswith("n"):
+            return line[1:] or None
+    return None
+
+
 def proc_argv_vector(pid) -> Optional[List[str]]:
     """Real argv of `pid` as a LIST, or None when no authoritative read exists.
 

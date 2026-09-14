@@ -106,5 +106,32 @@ PS_UNKNOWN = """  400     1 /bin/bash /somewhere/watch-tasks-stream.sh --tasks /
 check("a root whose argv cannot prove ownership is KEPT, not dropped",
       sorted(wi.watcher_trees(PS_UNKNOWN, repo=A)), ["400"])
 
+import importlib.util  # noqa: E402
+
+# The report stays multi-instance ON PURPOSE: a pool host runs one watcher per
+# instance, so only the boot gate's narrower question takes a repo.
+
+_spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+_hc = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_hc)
+except SystemExit:
+    pass
+
+PS_TWO = f"""  100     1 /bin/bash {A}/src/watch-tasks-stream.sh
+  101   100 /bin/bash {A}/src/watch-tasks-stream.sh
+  200     1 /bin/bash {B}/src/watch-tasks-stream.sh
+"""
+check("health-check's report is NOT filtered by default",
+      sorted(_hc._watcher_trees(PS_TWO)), ["100", "200"])
+check("and the same snapshot filtered to a repo keeps only its own",
+      sorted(_hc._watcher_trees(PS_TWO, repo=A)), ["100"])
+check("the sibling's repo selects the other tree, so neither is dropped",
+      sorted(_hc._watcher_trees(PS_TWO, repo=B)), ["200"])
+check("proc_cwd reads this process's own cwd",
+      wi.proc_cwd(__import__("os").getpid()) is not None, True)
+check("proc_cwd on a pid that cannot exist is None, never a guess",
+      wi.proc_cwd(999999), None)
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else "PASS — ownership comes from the executed script")
 sys.exit(1 if FAILURES else 0)
