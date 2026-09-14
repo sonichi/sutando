@@ -93,17 +93,18 @@ class TestWatcher(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     os.killpg(p.pid, signal.SIGKILL)
 
-    def _start(self, **env_extra):
+    def _start(self, inbox=None, **env_extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_ALLOW_UNROUTED_BINDINGS")}
         env.update({"TMPDIR": str(self.tmp), "SUTANDO_WORKSPACE_DIR": str(self.ws)})
         env.update(env_extra)
+        inbox = Path(inbox) if inbox else (self.ws / "tasks")
         # Files, not pipes: a started watcher never exits, so its output has to be
         # readable while it still runs, and a refusal's stderr after it is gone.
         self.out = self.tmp / f"out{len(self.procs)}"
         self.err = self.tmp / f"err{len(self.procs)}"
         with open(self.out, "w") as o, open(self.err, "w") as e:
-            p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+            p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox)],
                                  cwd=str(REPO), env=env, stdout=o, stderr=e,
                                  text=True, start_new_session=True)
         p._out, p._err = self.out, self.err
@@ -173,6 +174,27 @@ class TestWatcher(unittest.TestCase):
         stub.write_text("#!/bin/sh\nexit 3\n")
         stub.chmod(0o755)
         self._assert_started(self._start(SUTANDO_TASK_EVENT_HANDLER=str(stub)))
+
+    def _delivery_inbox(self):
+        """A worker's inbox: <ws>/deliveries/<id>, seeded so a start can announce."""
+        d = self.ws / "deliveries" / W
+        d.mkdir(parents=True)
+        (d / "task-seed1.txt").write_text("id: task-seed1\ntask: seed\n")
+        return d
+
+    def test_a_worker_delivery_watcher_starts_under_the_same_declaration(self):
+        # A worker legitimately carries no routing handler, so a correctly
+        # configured multi-worker host must not trip this gate.
+        self._bind()
+        self._assert_started(self._start(inbox=self._delivery_inbox()))
+
+    def test_the_core_intake_still_refuses_under_that_same_setup(self):
+        # Positive control: identical declaration and env, only the inbox differs,
+        # or the start above is satisfied by a gate that fires nowhere.
+        self._bind()
+        self._delivery_inbox()
+        err = self._assert_refused(self._start())
+        self.assertIn("is unset", err)
 
 
 if __name__ == "__main__":

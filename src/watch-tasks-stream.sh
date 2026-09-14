@@ -260,9 +260,16 @@ publish_terminal_failure() {
   return "$rc"
 }
 
+# Only the core's own intake routes bound rooms. A delivery watcher consumes
+# work already assigned to its worker, so refusing there breaks a healthy host.
+serves_routing_intake() {
+  [ "$TASKS_DIR_ABS" = "$(cd "$WORKSPACE_DIR/tasks" 2>/dev/null && pwd -P)" ]
+}
+
 # A watcher without the routing handler answers every bound room from this
 # core, silently; refuse unless the declaration is empty or the operator opts in.
-if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+if serves_routing_intake &&
+   { [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; }; then
   if [ "${SUTANDO_ALLOW_UNROUTED_BINDINGS:-}" != "1" ]; then
     if ! reason="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_bindings_declared.py" "$WORKSPACE_DIR/state")"; then
       if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
