@@ -81,5 +81,30 @@ check("the executed script path is reported verbatim",
       wi.watcher_script_path("", pid=12, argv_vector=vec(f"{B}/src/watch-tasks-stream.sh")),
       f"{B}/src/watch-tasks-stream.sh")
 
+# The whole point, end to end: a `ps` snapshot carrying BOTH checkouts' watchers,
+# which is the live condition on a host that also runs a worker pool from a clone.
+PS = f"""  100     1 /bin/bash {A}/src/watch-tasks-stream.sh
+  101   100 /bin/bash {A}/src/watch-tasks-stream.sh
+  200     1 /bin/bash {B}/src/watch-tasks-stream.sh
+  201   200 /bin/bash {B}/src/watch-tasks-stream.sh
+  300     1 /usr/bin/python3 something-else.py
+"""
+
+unfiltered = wi.watcher_trees(PS)
+check("without a repo, both checkouts' trees are returned", sorted(unfiltered), ["100", "200"])
+
+ours = wi.watcher_trees(PS, repo=A)
+check("filtered to this checkout, only our tree survives", sorted(ours), ["100"])
+check("and it still carries its whole tree", sorted(ours.get("100", [])), ["100", "101"])
+
+theirs = wi.watcher_trees(PS, repo=B)
+check("the same snapshot filtered to the sibling gives the other tree", sorted(theirs), ["200"])
+
+# The fail-safe direction, which is the half that matters when a probe is wrong.
+PS_UNKNOWN = """  400     1 /bin/bash /somewhere/watch-tasks-stream.sh --tasks /x/y
+"""
+check("a root whose argv cannot prove ownership is KEPT, not dropped",
+      sorted(wi.watcher_trees(PS_UNKNOWN, repo=A)), ["400"])
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else "PASS — ownership comes from the executed script")
 sys.exit(1 if FAILURES else 0)
