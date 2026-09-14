@@ -801,6 +801,30 @@ class TestClearPending(Base):
         self.assertEqual(rc, 0)
         self.assertFalse(pd.pending_flag(self.root, "worker-3", "task-1").exists())
 
+    def test_abandon_retires_the_sentinel_so_the_sweep_never_reports_it_again(self):
+        # Both sentinel names: the hold is gone, and so is the entry the sweep would read.
+        for suffix in (pd.PENDING_SUFFIX, pd.ACCEPTED_SUFFIX):
+            d = pd.deliveries_dir(self.root, "worker-3"); d.mkdir(parents=True, exist_ok=True)
+            (d / ("task-1" + suffix)).write_text("")
+            (self.root / "tasks").mkdir(exist_ok=True)
+            (self.root / "tasks" / "task-1.txt").write_text("id: task-1\ntask: hi\n")
+            pd.mark_done(self.root, "worker-3", "task-1", published=False)
+            pd.clear_pending(self.root, "worker-3", "task-1")
+            self.assertIsNone(pd.find(self.root, "worker-3", "task-1"), suffix)
+            # the live core publishes later: nothing of this recipient's is left to misread
+            (self.root / "results").mkdir(exist_ok=True)
+            (self.root / "results" / "task-1.txt").write_text("done\n")
+            self.assertEqual(pd.sweep(self.root, "worker-3")["completed"], [], suffix)
+            (self.root / "results" / "task-1.txt").unlink()
+
+    def test_abandon_leaves_a_finished_delivery_for_the_sweep(self):
+        d = pd.deliveries_dir(self.root, "worker-3"); d.mkdir(parents=True, exist_ok=True)
+        (d / ("task-1" + pd.ACCEPTED_SUFFIX)).write_text("")
+        pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+        self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
+
     def test_writer_path_is_this_file_absolute_and_the_cli_prints_it(self):
         import io
         from contextlib import redirect_stdout

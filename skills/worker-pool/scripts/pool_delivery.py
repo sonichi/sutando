@@ -161,8 +161,9 @@ def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Pa
 
 def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     """Withdraw a `.pending` hold this worker will not finish: the task went back to
-    the live core, or its handler never ran. Never touches `.flag` -- a finish is
-    never undone -- and is idempotent, so a fallback that fires twice is harmless.
+    the live core, or its handler never ran. Retires this recipient's sentinel with
+    it. Never touches `.flag` -- a finish is never undone -- and is idempotent, so a
+    fallback that fires twice is harmless.
     """
     if not RECIPIENT.match(recipient):
         raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
@@ -171,6 +172,14 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     pend = pending_flag(workspace, recipient, task_id)
     with contextlib.suppress(FileNotFoundError):
         os.unlink(pend)
+    # The live core owns the payload now; a sentinel left here reads `completed`
+    # once it publishes, and `sweep` retires only on a flag.
+    if not is_done_flag(done_flag(workspace, recipient, task_id)):
+        sentinel = find(Path(workspace), recipient, task_id)
+        if sentinel is not None:
+            with arbitration(workspace, recipient):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(sentinel)
     return pend
 
 
