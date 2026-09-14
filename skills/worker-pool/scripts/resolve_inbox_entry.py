@@ -11,6 +11,7 @@ non-zero exit with the reason on stderr and an empty stdout.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,21 +27,33 @@ def resolve(entry: str, workspace=None) -> Path:
     and its validation belong to pool_delivery; this reads the payload it names.
     """
     ws, _recipient, task_id, _accepted = pd.parse_entry(entry, workspace)
-    # Accepted and pending spell the same task, so both resolve: the watcher
-    # announces whichever name it saw and neither implies a different body.
-    path = pd.payload_path(ws, task_id).resolve()
-    if not path.is_file():
+    # abspath, NOT resolve(): resolving would follow a symlink at the payload
+    # name, and the caller adopts the returned basename as the task's identity.
+    path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
+    if not pd.is_regular_file(path):
         raise ValueError(f"sentinel {task_id} names no payload at {path}")
     return path
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if len(args) != 1:
-        print(f"usage: {Path(sys.argv[0]).name} <sentinel-path>", file=sys.stderr)
+    """`--workspace` is the tree the CALLER is serving, and it wins. The watcher
+    treats its own assignment as authoritative, so a resolver that derived one
+    could answer for a tree whose claims, state and results live elsewhere."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    workspace = None
+    if "--workspace" in args:
+        i = args.index("--workspace")
+        if i + 1 >= len(args):
+            print("--workspace needs a directory", file=sys.stderr)
+            return 2
+        workspace = args[i + 1].strip() or None
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1 or not args[0]:
+        print(f"usage: {Path(sys.argv[0]).name} <sentinel-path> [--workspace <dir>]",
+              file=sys.stderr)
         return 2
     try:
-        print(resolve(args[0]))
+        print(resolve(args[0], workspace))
     except (ValueError, pd.NotDelivered) as e:
         print(f"resolve_inbox_entry: {e}", file=sys.stderr)
         return 1

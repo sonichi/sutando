@@ -149,20 +149,46 @@ class TestItFailsClosed(Base):
 
 
 class TestItResolvesTheAssignedTree(Base):
-    def test_the_workspace_comes_from_the_entry_not_from_the_environment(self):
-        """Two trees cannot diverge if there is only one source: the sentinel's
-        own path. A decoy payload in another tree must not be chosen."""
-        want = self.payload()
+    """`--workspace` is the tree the caller is serving, passed by the watcher
+    (src/inbox-resolve.sh). A resolver that derived its own instead could answer
+    for a tree whose claims, state and results belong elsewhere.
+    """
+
+    def test_an_assigned_workspace_that_disagrees_is_refused_through_the_wrapper(self):
+        # The mismatch case: entry in tree A, the watcher serving tree B. Neither
+        # is authoritative over the other, so the only safe answer is refusal.
+        self.payload()
+        entry = self.deliver("task-1.txt")
         other = self.root / "other"
         (other / "tasks").mkdir(parents=True)
+        (other / "deliveries" / "worker-1").mkdir(parents=True)
         (other / "tasks" / "task-1.txt").write_text("WRONG TREE\n", encoding="utf-8")
-        r = self.run_resolver(self.deliver("task-1.txt"),
-                              env={"SUTANDO_WORKSPACE_DIR": str(other)})
+        r = self.run_resolver(entry, "--workspace", str(other))
+        self.assertNotEqual(r.returncode, 0, "the resolver answered across two trees")
+        self.assertEqual(r.stdout.strip(), "", "a mismatch must print no path")
+
+    def test_the_assigned_workspace_agreeing_resolves(self):
+        want = self.payload()
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry, "--workspace", str(self.root))
         self.assertEqual(r.returncode, 0, r.stderr)
-        got = Path(r.stdout.strip()).resolve()
-        self.assertEqual(got, want.resolve())
-        # The env var names the decoy and is deliberately ignored.
-        self.assertNotEqual(got, (other / "tasks" / "task-1.txt").resolve())
+        self.assertEqual(Path(r.stdout.strip()), want)
+
+    def test_omitted_falls_back_to_the_entrys_own_tree(self):
+        # The control that keeps the two above honest: with no assignment passed,
+        # the entry is the only source and resolution must still work.
+        want = self.payload()
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(r.stdout.strip()), want)
+
+    def test_the_watcher_passes_the_workspace_it_was_assigned(self):
+        """The two halves are one contract: a resolver that requires the flag and
+        a caller that never sends it would pass every case above and ship broken."""
+        src = (REPO / "src/inbox-resolve.sh").read_text()
+        self.assertIn('"$entry" --workspace "${WORKSPACE_DIR:-}"', src,
+                      "the watcher does not pass its assigned workspace to the resolver")
 
     def test_an_entry_outside_a_delivery_folder_is_refused(self):
         self.payload()
@@ -183,6 +209,42 @@ class TestItResolvesTheAssignedTree(Base):
         (other / "tasks" / "task-1.txt").write_text("WRONG TREE\n", encoding="utf-8")
         with self.assertRaises(pd.NotDelivered):
             r.resolve(entry, other)
+
+
+class TestItRefusesPlantedPaths(Base):
+    """A delivery entry and a payload are REGULAR files. A directory or symlink
+    at either name lets whoever planted it choose which body the core runs, and
+    the caller adopts the returned basename as the task's identity.
+    """
+
+    def test_a_directory_at_the_sentinel_name_is_not_a_delivery(self):
+        self.payload()
+        d = Path(self.inbox("task-1.txt")); d.parent.mkdir(parents=True, exist_ok=True)
+        d.mkdir()
+        r = self.run_resolver(str(d))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_a_symlink_at_the_sentinel_name_is_not_a_delivery(self):
+        self.payload()
+        real = self.root / "planted"; real.write_text("", encoding="utf-8")
+        link = Path(self.inbox("task-1.txt")); link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        r = self.run_resolver(str(link))
+        self.assertNotEqual(r.returncode, 0, "a symlink authorised a delivery")
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_a_symlinked_payload_cannot_redirect_the_task_identity(self):
+        """The escape kewei measured: the payload name is a link to another
+        task's body, and following it dispatches that body under this name."""
+        other = self.root / "tasks" / "task-other.txt"
+        other.write_text("id: task-other\ntask: NOT THIS ONE\n", encoding="utf-8")
+        link = self.root / "tasks" / "task-1.txt"
+        link.symlink_to(other)
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry)
+        self.assertNotEqual(r.returncode, 0, "a symlinked payload was accepted")
+        self.assertEqual(r.stdout.strip(), "", "it printed a path into another task")
 
 
 class TestTheWorkersResolvedInterpreter(Base):
@@ -278,6 +340,79 @@ class TestMainInProcess(Base):
         rc, out, err = self._main(str(self.root / "tasks" / "task-1.txt"))
         self.assertEqual((rc, out.strip()), (1, ""))
         self.assertIn("deliveries", err)
+
+
+class TestTheseBranchesInProcess(Base):
+    """The wrapper cases prove the shipped path but run in a subprocess, so they
+    earn no coverage. These reach the same branches in-process.
+    """
+
+    def _main(self, *args):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        import resolve_inbox_entry as r
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = r.main(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_workspace_flag_is_accepted_and_stripped(self):
+        want = self.payload()
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", str(self.root))
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out.strip()), want)
+
+    def test_a_workspace_flag_with_no_value_is_a_usage_error(self):
+        rc, out, err = self._main(self.deliver("task-1.txt"), "--workspace")
+        self.assertEqual((rc, out.strip()), (2, ""))
+        self.assertIn("needs a directory", err)
+
+    def test_an_empty_workspace_value_reads_as_not_assigned(self):
+        # The watcher passes "${WORKSPACE_DIR:-}", so an unset one arrives empty
+        # rather than absent; it must mean "no assignment", not "the tree ''".
+        want = self.payload()
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", "  ")
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out.strip()), want)
+
+    def test_a_disagreeing_workspace_returns_one_in_process(self):
+        self.payload()
+        other = self.root / "elsewhere"
+        (other / "deliveries" / "worker-1").mkdir(parents=True)
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", str(other))
+        self.assertEqual((rc, out.strip()), (1, ""))
+
+
+class TestIsRegularFile(Base):
+    """Every rejection branch of the predicate `find` and the payload check rest
+    on. A directory, a symlink and an absent path must each read as "not a file"
+    rather than raising into the caller.
+    """
+
+    def test_a_regular_file_is(self):
+        p = self.root / "plain"; p.write_text("", encoding="utf-8")
+        self.assertTrue(pd.is_regular_file(p))
+
+    def test_absent_is_not(self):
+        self.assertFalse(pd.is_regular_file(self.root / "nope"))
+
+    def test_a_path_under_a_non_directory_is_not(self):
+        f = self.root / "afile"; f.write_text("", encoding="utf-8")
+        self.assertFalse(pd.is_regular_file(f / "under-a-file"))
+
+    def test_a_directory_is_not(self):
+        self.assertFalse(pd.is_regular_file(self.root / "tasks"))
+
+    def test_a_symlink_is_not_even_when_its_target_is_regular(self):
+        # O_NOFOLLOW raises ELOOP here; the predicate answers False rather than
+        # letting a planted link decide which body the caller reads.
+        target = self.root / "real"; target.write_text("", encoding="utf-8")
+        link = self.root / "link"; link.symlink_to(target)
+        self.assertFalse(pd.is_regular_file(link))
+
+    def test_a_broken_symlink_is_not(self):
+        link = self.root / "broken"; link.symlink_to(self.root / "absent")
+        self.assertFalse(pd.is_regular_file(link))
 
 
 class TestItDelegatesRatherThanReimplementing(Base):

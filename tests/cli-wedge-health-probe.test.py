@@ -148,21 +148,18 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
     def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
-        # The abnormal predicate must reach classify_window, which the probe calls.
-        self.frames = ["❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n"] * 12
+        # The queue no longer decides a verdict (Chi), so the probe warns on TEXT.
+        self.frames = ["❯ \n⏵⏵ APIError: 500 Internal Server Error\n"] * 12
         for _ in range(12):
             c = self.check()
         self.assertEqual(c["status"], "warn")
         self.assertIn("reads the pane, not the process", c["detail"])
 
-    def test_static_pane_with_work_outstanding_warns(self):
+    def test_a_static_pane_does_not_warn_however_much_is_queued(self):
         (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": self._t[0] + 60.0}))
         for _ in range(3):
             c = self.check()
-        self.assertEqual(c["status"], "warn")
-        self.assertIn("static-with-work", c["detail"])
-        self.assertTrue(c["evidence"]["work_outstanding"])
-        self.assertIn("reads the pane, not the process", c["detail"])
+        self.assertNotEqual(c["status"], "warn")
 
     def test_retry_loop_warns_even_when_the_pane_moves(self):
         self.frames = [f"Connection error. Retrying in {3 * (i % 3)}s (attempt {i}/10) 04:2{i % 10}:11\n" for i in range(12)]
