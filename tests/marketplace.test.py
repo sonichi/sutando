@@ -367,6 +367,34 @@ class TestSkillInstall(unittest.TestCase):
             self.install(b"not a tarball")
         self.assertEqual([p.name for p in self.root.iterdir()], [])
 
+    def test_mac_packed_bundle_with_appledouble_litter_installs(self):
+        # the exact member list of catalog bundle live-preview 0.4.1 (tar'd on a Mac)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            def add(name, body=None):
+                info = tarfile.TarInfo(name)
+                if body is None:
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                else:
+                    info.size = len(body)
+                    tar.addfile(info, io.BytesIO(body))
+            add("._live-preview-skill", b"\x00\x05\x16\x07")
+            add("live-preview-skill")
+            add("live-preview-skill/._scripts", b"x")
+            add("live-preview-skill/scripts")
+            add("live-preview-skill/._SKILL.md", b"x")
+            add("live-preview-skill/SKILL.md", b"---\nname: live-preview\n---\n")
+            add("live-preview-skill/._manifest.json", b"x")
+            add("live-preview-skill/manifest.json", b'{"version": "0.4.1"}')
+            add("live-preview-skill/scripts/._live-preview.py", b"x")
+            add("live-preview-skill/scripts/live-preview.py", b"print(1)")
+            add("__MACOSX/live-preview-skill/._SKILL.md", b"x")
+            add("live-preview-skill/.DS_Store", b"x")
+        target = self.install(buf.getvalue(), slug="live-preview")
+        files = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
+        self.assertEqual(files, [".sutando-source.json", "SKILL.md", "manifest.json", "scripts/live-preview.py"])
+
     def test_a_skill_md_directory_is_not_a_skill(self):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:

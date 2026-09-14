@@ -30,6 +30,15 @@ PROVENANCE_FILE = ".sutando-source.json"
 SLUG_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 MAX_FILES = 500
 MAX_BYTES = 25 * 1024 * 1024
+# Archive litter from packing on a Mac: AppleDouble `._name` resource forks and
+# Finder metadata. Never skill content, and a top-level `._<dir>` beside the
+# wrapper directory otherwise reads as a second top-level entry (live catalog
+# bundle live-preview 0.4.1, 2026-09-14).
+_MAC_LITTER = ("__MACOSX", ".DS_Store")
+
+
+def _is_mac_litter(parts: tuple[str, ...]) -> bool:
+    return any(p in _MAC_LITTER or p.startswith("._") for p in parts)
 
 
 def check_slug(slug: str) -> str:
@@ -109,7 +118,7 @@ def extract_bundle(tar_gz: bytes, dest: Path) -> None:
             if not (m.isfile() or m.isdir()):
                 raise ValueError(f"bundle member is not a regular file or directory: {m.name}")
             parts = tuple(p for p in rel.parts if p not in ("", "."))
-            if parts:
+            if parts and not _is_mac_litter(parts):
                 paths.append((m, parts))
         strip = _wrapper_depth(paths)
         for m, parts in paths:
