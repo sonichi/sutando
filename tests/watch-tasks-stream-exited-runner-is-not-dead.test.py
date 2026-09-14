@@ -252,6 +252,43 @@ def scenario_an_incomplete_receipt_is_not_an_exit_code():
         h.stop()
 
 
+def scenario_an_oversized_numeric_receipt_is_not_an_exit_code():
+    """All-digit but far outside 0-255. `[ "$rc" -eq ... ]` ERRORS on such a body,
+    so neither settlement branch runs while the marker retires anyway -- the task
+    leaves the queue with its claim still held, and nothing replies or retries.
+    Only two tasks: the pool runs TASK_HANDLER_WORKERS=2 at a time.
+    """
+    h = reap.Harness()
+    h.start()
+    try:
+        for name in ("task-huge.txt", "task-gone.txt"):
+            h.deliver(name)
+        if not reap.wait_for(lambda: len(reap.names(h.dispatch() and h.dispatch() / "running")) >= 2):
+            check("oversized receipt: both tasks dispatched", False); return
+        d = h.dispatch()
+        drop_redelivery(h, "task-huge.txt", "task-gone.txt")
+        (d / "settled" / "task-huge.txt.rc").write_text("1" * 40 + "\n")
+        # Control: the absent receipt is the recovery shape the oversized one must match.
+        claims = h.ws / "state" / "task-event-handler-claims"
+        held = {n: (claims / n).is_file() for n in ("task-huge.txt", "task-gone.txt")}
+        h.kill_workers(expect=2)
+        h.deliver("task-nudge-huge.txt")
+        for name, label in (("task-huge.txt", "an oversized numeric"),
+                            ("task-gone.txt", "control: an absent")):
+            res = h.ws / "results" / name
+            got = reap.wait_for(
+                lambda res=res: res.is_file() and reap.FAILURE_TEXT in res.read_text(),
+                timeout=30, nudge=lambda i, n=name: h.deliver(f"task-nudge-{n[5:-4]}-{i}.txt"))
+            check(f"{label} receipt publishes the terminal failure", got,
+                  f"exists={res.exists()}")
+            released = reap.wait_for(lambda name=name: not (claims / name).exists(), timeout=15)
+            check(f"{label} receipt releases the claim rather than stranding the task",
+                  held[name] and released,
+                  f"held_before={held[name]} still_held={(claims / name).exists()}")
+    finally:
+        h.stop()
+
+
 def scenario_shutdown_settles_a_completed_receipt():
     """A runner that returned 0 and was killed before its fifo notification has
     already succeeded. Graceful shutdown used to publish an owner-facing
@@ -305,6 +342,7 @@ if __name__ == "__main__":
     scenario_the_runner_writes_the_receipt()
     scenario_an_interrupted_receipt_write_leaves_no_receipt()
     scenario_an_incomplete_receipt_is_not_an_exit_code()
+    scenario_an_oversized_numeric_receipt_is_not_an_exit_code()
     scenario_shutdown_settles_a_completed_receipt()
     scenario_shutdown_control_a_receiptless_marker_is_interrupted()
     scenario_a_dead_runner_is_still_reaped()

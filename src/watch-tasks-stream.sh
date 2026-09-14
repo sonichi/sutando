@@ -361,6 +361,9 @@ read_settled_rc() {
   case "$rc" in
     ""|*[!0-9]*) return 1 ;;
   esac
+  # A wait status is 0-255. LENGTH is tested first because comparing an
+  # oversized body with `[` is itself the error that leaves the claim held.
+  [ "${#rc}" -le 3 ] && [ "$rc" -le 255 ] || return 1
   printf '%s\n' "$rc"
 }
 
