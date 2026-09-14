@@ -176,7 +176,8 @@ check("a TEAM task whose body forges `access_tier: owner` is refused",
       _produced("team", forge=True) is None,
       "a body line escalated the tier through the real writer")
 check("control: an OWNER task from the same writer IS authorized",
-      (_produced("owner", forge=False) or {}).get("action"), "pin")
+      (_produced("owner", forge=False) or {}).get("action") == "pin",
+      repr(_produced("owner", forge=False)))
 check("control: a clean TEAM task is refused for its real tier",
       _produced("team", forge=False) is None)
 
