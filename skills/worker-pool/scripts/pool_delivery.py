@@ -91,6 +91,12 @@ def archived_payload(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
 
 
+def results_dir(workspace) -> Path:
+    """Where every recipient's answers go. Named here so a caller that only
+    composes the path (a spawner, a launcher) does not re-spell the layout."""
+    return _root(workspace) / "results"
+
+
 def result_path(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "results" / f"{task_id}.txt"
 
@@ -410,8 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
     ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
-                                       "mark-done", "writer-path"))
+                                       "payload", "mark-done", "writer-path"))
     ap.add_argument("--task-id")
+    ap.add_argument("--sentinel")
     ap.add_argument("--stage", choices=("pending", "done", "abandon"),
                     help="for `mark-done`: pending = before the result, done = after, "
                          "abandon = withdraw a pending hold (never a finish)")
@@ -419,6 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
+    if a.command == "payload":
+        # A sentinel names its payload and holds none; the mapping lives here
+        # so a caller never re-spells tasks/.
+        if not a.sentinel:
+            ap.error("--sentinel is required for payload")
+        parsed = parse_sentinel(a.sentinel)
+        if parsed is None:
+            ap.error(f"not a delivery sentinel: {a.sentinel}")
+        print(payload_path(ws, parsed[0]))
     if a.command == "writer-path":
         print(writer_path())
         return 0
