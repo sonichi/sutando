@@ -133,5 +133,29 @@ check("proc_cwd reads this process's own cwd",
 check("proc_cwd on a pid that cannot exist is None, never a guess",
       wi.proc_cwd(999999), None)
 
+# proc_cwd's failure paths. An unreadable cwd must be UNKNOWN, because
+# `owns_watcher` treats None as unprovable and KEEPS the tree.
+_real_run = wi.subprocess.run
+try:
+    wi.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("lsof"))
+    check("no lsof on the host is None, not a crash", wi.proc_cwd(1), None)
+
+    class _Out:
+        stdout = "p123\nf cwd\n"          # a reply carrying no n-line
+
+    wi.subprocess.run = lambda *a, **k: _Out()
+    check("an lsof reply with no name line is None", wi.proc_cwd(1), None)
+finally:
+    wi.subprocess.run = _real_run
+
+check("control: the real reader still answers for this process",
+      wi.proc_cwd(__import__("os").getpid()) is not None, True)
+
+# The boot gate's own entry point, not just the function it delegates to.
+check("_watcher_trees_here scopes to this checkout",
+      sorted(_hc._watcher_trees_here(PS_TWO)), [])
+check("control: the same snapshot names trees when the repo matches",
+      sorted(_hc._watcher_trees(PS_TWO, repo=A)), ["100"])
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else "PASS — ownership comes from the executed script")
 sys.exit(1 if FAILURES else 0)
