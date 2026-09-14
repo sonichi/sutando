@@ -79,7 +79,11 @@ if [ "${1:-}" = "--handler-runner" ]; then
   else
     handler_rc=$?
   fi
-  printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >> "$runner_log" 2>/dev/null || true
+  # The ALREADY-OPEN descriptor, never a reopen: reopening re-enters the block
+  # this guard exists to avoid, after the handler has already run.
+  if [ "$handler_err" = 3 ]; then
+    printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >&3 2>/dev/null || true
+  fi
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
 fi
