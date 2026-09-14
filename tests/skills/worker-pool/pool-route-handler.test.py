@@ -148,6 +148,23 @@ class TestDelivery(Base):
         rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
         self.assertNotEqual(rc, 1, "rc 1 is read as an optional decline and reaches the live core")
 
+    def test_an_unanticipated_crash_is_must_handle_not_a_decline(self):
+        """The class, not the instance: three separate narrow `except` clauses have
+        each let a failure out as rc 1, which the watcher cannot tell from an
+        optional decline. Whatever escapes next must fail closed at the entry."""
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("unanticipated"))
+        with patch.object(h, "read_task", boom):
+            rc = h.guarded_main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertEqual(rc, h.MUST_HANDLE, f"a crash returned {rc}; rc 1 reaches the live core")
+
+    def test_control_the_guard_does_not_mask_a_normal_answer(self):
+        # Without this, returning MUST_HANDLE unconditionally would pass above.
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.guarded_main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+
 
     def test_a_delivery_io_failure_is_must_handle_not_an_optional_decline(self):
         """kewei's repro: the recipient's delivery directory replaced by a regular

@@ -168,5 +168,18 @@ def main(argv=None) -> int:
     return 0
 
 
+def guarded_main(argv=None) -> int:
+    """`main` for the watcher, failing CLOSED on anything it did not anticipate.
+
+    A handler that crashed did not settle the task, and any other non-zero code
+    reads as an optional decline — which hands a bound task to the live core.
+    """
+    try:
+        return main(argv)
+    except Exception as e:  # noqa: BLE001 — the exit code IS the routing decision
+        print(f"pool_route_handler: unhandled {e!r}", file=sys.stderr)
+        return MUST_HANDLE
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guarded_main())
