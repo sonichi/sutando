@@ -133,6 +133,34 @@ def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     return None
 
 
+def parse_entry(entry, workspace=None) -> tuple[Path, str, str, bool]:
+    """The (workspace, recipient, task_id, accepted) a delivery entry path names.
+
+    Inverse of `deliveries_dir` plus the sentinel grammar, and the only reader in
+    that direction: a second inverse drifts the first time the layout moves.
+
+    Raises NotDelivered unless the path is shaped the way this module writes one
+    AND a sentinel for that task is present — a name on its own is not delivered.
+    """
+    p = Path(entry)
+    got = parse_sentinel(p.name)
+    if got is None:
+        raise NotDelivered(f"not a delivery sentinel: {entry!r}")
+    task_id, was_accepted = got
+    folder = p.parent
+    recipient = folder.name
+    if not RECIPIENT.match(recipient):
+        raise NotDelivered(f"not a recipient id: {recipient!r}")
+    ws = Path(workspace) if workspace is not None else folder.parent.parent
+    # Against the forward builder rather than a literal layout, so the two
+    # directions cannot disagree about where a recipient's deliveries live.
+    if deliveries_dir(ws, recipient).resolve() != folder.resolve():
+        raise NotDelivered(f"not inside this workspace's deliveries: {entry!r}")
+    if find(ws, recipient, task_id) is None:
+        raise NotDelivered(f"no delivery for {task_id} under {folder}")
+    return ws, recipient, task_id, was_accepted
+
+
 @contextlib.contextmanager
 def arbitration(workspace, recipient: str):
     """One lock per folder around publish, accept and release, so a check of

@@ -538,5 +538,78 @@ class TestAcceptIsExclusive(Base):
         self.assertTrue((self.root / "deliveries" / "core" / pd.LOCK_NAME).exists())
 
 
+class TestParseEntry(Base):
+    """The inverse of `deliveries_dir` + the sentinel grammar. It lives here
+    because the forward builder does: two owners of one layout drift.
+    """
+
+    def test_a_pending_entry_yields_its_workspace_recipient_and_task(self):
+        s = self.ws.deliver("core", "task-1")
+        ws, recipient, task_id, was_accepted = pd.parse_entry(s)
+        self.assertEqual((recipient, task_id, was_accepted), ("core", "task-1", False))
+        self.assertEqual(Path(ws).resolve(), self.root.resolve())
+
+    def test_an_accepted_entry_reports_that_it_was_accepted(self):
+        c = pd.accept(self.ws.deliver("core", "task-1"))
+        _ws, _r, task_id, was_accepted = pd.parse_entry(c)
+        self.assertEqual((task_id, was_accepted), ("task-1", True))
+
+    def test_it_round_trips_the_forward_builder(self):
+        s = self.ws.deliver("core", "task-1")
+        ws, recipient, task_id, _ = pd.parse_entry(s)
+        self.assertEqual(pd.deliveries_dir(ws, recipient) / f"{task_id}.txt", s)
+
+    def test_the_pending_name_still_parses_once_the_sentinel_was_accepted(self):
+        """The caller announces the name it saw; the delivery is the same one,
+        so a rename in between must not read as undelivered."""
+        s = self.ws.deliver("core", "task-1")
+        pd.accept(s)
+        self.assertFalse(s.exists())
+        _ws, _r, task_id, _a = pd.parse_entry(s)
+        self.assertEqual(task_id, "task-1")
+
+    def test_a_name_with_no_sentinel_behind_it_is_refused(self):
+        # Well-formed and in the right folder, but nothing was delivered: the
+        # name alone must not authorise work.
+        entry = pd.deliveries_dir(self.root, "core") / "task-1.txt"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(pd.NotDelivered):
+            pd.parse_entry(entry)
+
+    def test_a_name_that_is_not_a_sentinel_is_refused(self):
+        d = pd.deliveries_dir(self.root, "core")
+        d.mkdir(parents=True, exist_ok=True)
+        for bad in ("notes.md", "task-1", "task-1.flag", ".lock"):
+            (d / bad).write_text("", encoding="utf-8")
+            with self.assertRaises(pd.NotDelivered, msg=bad):
+                pd.parse_entry(d / bad)
+
+    def test_a_folder_that_is_not_a_recipient_id_is_refused(self):
+        d = self.root / "deliveries" / "Core_1"
+        d.mkdir(parents=True)
+        (d / "task-1.txt").write_text("", encoding="utf-8")
+        with self.assertRaises(pd.NotDelivered):
+            pd.parse_entry(d / "task-1.txt")
+
+    def test_an_entry_outside_a_delivery_folder_is_refused(self):
+        p = self.ws.payload("task-1")
+        with self.assertRaises(pd.NotDelivered):
+            pd.parse_entry(p)
+
+    def test_an_explicit_workspace_that_agrees_is_returned_as_given(self):
+        s = self.ws.deliver("core", "task-1")
+        ws, _r, _t, _a = pd.parse_entry(s, self.root)
+        self.assertEqual(ws, Path(self.root))
+
+    def test_an_explicit_workspace_that_disagrees_is_refused(self):
+        """Not a redirect: a tree the entry does not live in cannot be the one
+        that delivered it, and picking either silently would split the two."""
+        s = self.ws.deliver("core", "task-1")
+        other = self.root / "elsewhere"
+        (other / "deliveries" / "core").mkdir(parents=True)
+        with self.assertRaises(pd.NotDelivered):
+            pd.parse_entry(s, other)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

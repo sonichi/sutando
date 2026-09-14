@@ -1,12 +1,22 @@
 #!/bin/sh
-# The core execs this directly and a worker's PATH python3 may be the macOS CLT
-# stub, so run the interpreter the launcher forwarded before trying PATH.
+# The core execs this directly, and executing a PATH python3 that is the macOS
+# stub raises a modal dialog, so the interpreter comes from the repo's resolver.
 set -u
-_d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-for _py in "${SUTANDO_PY:-}" python3; do
-  [ -n "$_py" ] || continue
-  command -v "$_py" >/dev/null 2>&1 || [ -x "$_py" ] || continue
-  exec "$_py" "$_d/resolve_inbox_entry.py" "$@"
-done
-echo "resolve-inbox-entry: no usable interpreter (SUTANDO_PY=${SUTANDO_PY:-<unset>})" >&2
-exit 1
+_d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+_repo=$(CDPATH= cd -- "$_d/../../.." && pwd -P) || exit 1
+_pb="$_repo/scripts/python-binary.sh"
+if [ -r "$_pb" ]; then
+  . "$_pb"
+  _py="$(resolve_python "$_repo")"
+elif [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+  # No resolver reachable: the forwarded interpreter is the only candidate whose
+  # safety is already decided. PATH is not probed here.
+  _py="$SUTANDO_PY"
+else
+  _py=""
+fi
+[ -n "$_py" ] || {
+  echo "resolve-inbox-entry: no usable interpreter (SUTANDO_PY=${SUTANDO_PY:-<unset>})" >&2
+  exit 1
+}
+exec "$_py" "$_d/resolve_inbox_entry.py" "$@"
