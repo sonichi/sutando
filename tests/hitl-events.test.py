@@ -55,25 +55,14 @@ class IngestTests(unittest.TestCase):
         self.assertIn(("1", "tui_select"), kinds)
         self.assertEqual(req.actions[-1].id, JUMP_ACTION_ID)
 
-    def test_requirement_device_names_the_host_and_keeps_session_and_socket(self):
-        import hitl.events as E
-        with mock.patch.object(E, "device_host", return_value="Chis-MacBook-Pro"):
-            self.drop("core-2-g1", event())
-            ingest(self.mgr, self.ws)
+    def test_requirement_device_keeps_session_and_socket_and_leaves_host_to_the_wire(self):
+        self.drop("core-2-g1", event())
+        ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
-        self.assertEqual(req.device, {"id": "core-2", "name": "core-2", "socket": "/tmp/s.sock", "host": "Chis-MacBook-Pro"})
-
-    def test_the_host_is_read_once_per_requirement(self):
-        import hitl.events as E
-        calls = []
-        def once():
-            calls.append(1)
-            return "Chis-MacBook-Pro" if len(calls) == 1 else ""
-        with mock.patch.object(E, "device_host", side_effect=once):
-            self.drop("core-2-g1", event())
-            ingest(self.mgr, self.ws)
-        [req] = self.mgr.active()
-        self.assertEqual((req.device.get("host"), len(calls)), ("Chis-MacBook-Pro", 1))
+        self.assertEqual(req.device, {"id": "core-2", "name": "core-2", "socket": "/tmp/s.sock"})
+        import hitl.schema as SCHEMA
+        with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
+            self.assertEqual(req.to_wire()["device"]["host"], "Chis-MacBook-Pro")
 
     def test_reingest_is_idempotent(self):
         self.drop("core-2-g1", event())
