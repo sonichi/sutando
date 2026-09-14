@@ -30,10 +30,8 @@ PROVENANCE_FILE = ".sutando-source.json"
 SLUG_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 MAX_FILES = 500
 MAX_BYTES = 25 * 1024 * 1024
-# Archive litter from packing on a Mac: AppleDouble `._name` resource forks and
-# Finder metadata. Never skill content, and a top-level `._<dir>` beside the
-# wrapper directory otherwise reads as a second top-level entry (live catalog
-# bundle live-preview 0.4.1, 2026-09-14).
+# Mac archive litter (AppleDouble `._x`, Finder metadata): never content, and a top-level
+# `._<dir>` beside the wrapper would read as a second root (catalog bundle live-preview 0.4.1).
 _MAC_LITTER = ("__MACOSX", ".DS_Store")
 
 
