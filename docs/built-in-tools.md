@@ -236,6 +236,19 @@ Skill installs are pinned to an upstream commit and record provenance for later
 updates. Tool repositories can be searched and inspected but are
 install-disabled because their setup and permissions are source-specific.
 
+**Marketplace (Superpower Station)** — install skills, activate cloud tools, and
+keep them current for the signed-in owner, without the Marketplace UI:
+```bash
+M=skills/marketplace/scripts/marketplace.py
+python3 "$M" find "lead enrichment"
+python3 "$M" status                                   # missing / outdated skills
+python3 "$M" install intent-leads campaign-runner     # plan; exit 3 = spends credits
+python3 "$M" install intent-leads campaign-runner --yes
+python3 "$M" update --yes                             # never charges
+```
+Skills are usable immediately; newly activated cloud tools need a core restart
+(Settings → Agent → Restart Core), which the owner does.
+
 **App launcher** — open any macOS app:
 ```bash
 open -a "Safari"                    # open by name
