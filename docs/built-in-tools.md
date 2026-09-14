@@ -247,7 +247,7 @@ python3 "$M" install intent-leads campaign-runner --yes
 python3 "$M" update --yes                             # never charges
 ```
 Skills are usable immediately; newly activated cloud tools need a core restart
-(Settings → Agent → Restart Core), which the owner does.
+(Agent settings → Runtime → Restart engine), which the owner does.
 
 **App launcher** — open any macOS app:
 ```bash

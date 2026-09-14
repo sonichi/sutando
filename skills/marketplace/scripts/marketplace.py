@@ -49,10 +49,9 @@ TIER_RANK = {"free": 0, "plus": 1, "pro": 2, "max": 3}
 BUNDLE_TIMEOUT_S = 60
 STATION_MCP_SERVER = "sutando-station"
 RESTART_HINT = (
-    "New cloud tools are active on your account, but I can only use them after a core "
-    "restart: open Settings → Agent → Restart Core (also under Settings → Services, or the "
-    "restart button in the Agent Console). Restarting ends my current session; your tasks "
-    "and files are kept."
+    "New cloud tools are active on your account, but I can only use them after an engine "
+    "restart: open Agent settings (the bot icon, bottom left), scroll down to Runtime, and "
+    "click Restart engine. Restarting ends my current session; your tasks and files are kept."
 )
 
 

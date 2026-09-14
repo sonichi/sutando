@@ -151,7 +151,7 @@ class TestInstall(unittest.TestCase):
         code, out = run(ctx, ["install", "leads", "--yes"])
         self.assertEqual(out["activated"], ["leads"])
         self.assertTrue(out["restart_required"])
-        self.assertIn("Settings → Agent → Restart Core", out["restart_hint"])
+        self.assertIn("scroll down to Runtime, and click Restart engine", out["restart_hint"])
 
         ctx = self.ctx(catalog=[item(TOOL_UUID, "leads", kind="cloud_tool")])
         ctx.install_responses[TOOL_UUID] = {"ok": True, "deduped": True}

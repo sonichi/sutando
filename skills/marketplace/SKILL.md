@@ -46,9 +46,9 @@ cloud tools together; the script works out which is which.
    everything else:
 
    > New cloud tools are active on your account, but I can only use them after
-   > a core restart: open **Settings → Agent → Restart Core** (also under
-   > Settings → Services, or the restart button in the Agent Console).
-   > Restarting ends my current session; your tasks and files are kept.
+   > an engine restart: open **Agent settings** (the bot icon, bottom left),
+   > scroll down to **Runtime**, and click **Restart engine**. Restarting ends
+   > my current session; your tasks and files are kept.
 
    Never restart the core yourself. Installed **skills** need no restart; they
    are usable right away.
