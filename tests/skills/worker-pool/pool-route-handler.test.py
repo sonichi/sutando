@@ -135,6 +135,20 @@ class TestDelivery(Base):
         self.assertEqual(s.stat().st_size, 0)
         self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
 
+    def test_a_malformed_roster_row_does_not_route_a_bound_task_to_the_core(self):
+        """kewei's case: a valid JSON roster whose worker row is a STRING. The
+        renderer does `row.get(...)` and raises AttributeError, which escaped an
+        OSError-only catch and took the bound task to the unrestricted core.
+        """
+        self.roster()
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {W: "not-a-mapping"},
+             "bindings": {"!room:x": W}}))
+        t = self.task_file("task-1", channel_id="!room:x")
+        rc = h.main(["--task-file", t, "--workspace", str(self.ws)])
+        self.assertNotEqual(rc, 1, "rc 1 is read as an optional decline and reaches the live core")
+
+
     def test_a_delivery_io_failure_is_must_handle_not_an_optional_decline(self):
         """kewei's repro: the recipient's delivery directory replaced by a regular
         file. Only RouterRefused was caught, so an OSError escaped as rc 1 — which

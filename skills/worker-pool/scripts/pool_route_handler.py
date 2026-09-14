@@ -129,8 +129,9 @@ def main(argv=None) -> int:
     # the edge is here, and a failure to publish must never stop routing.
     try:
         pa.ensure_advertisement(ws)
-    except OSError as e:
-        print(f"pool_route_handler: advertisement not ensured: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
+        # an escape here routes a BOUND task to the unrestricted live core.
+        print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         apply_picker(ws, args.task_file)
