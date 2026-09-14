@@ -263,7 +263,11 @@ publish_terminal_failure() {
 # Only the core's own intake routes bound rooms. A delivery watcher consumes
 # work already assigned to its worker, so refusing there breaks a healthy host.
 serves_routing_intake() {
-  [ "$TASKS_DIR_ABS" = "$(cd "$WORKSPACE_DIR/tasks" 2>/dev/null && pwd -P)" ]
+  # An unresolvable core inbox is "cannot tell", which must not take the same
+  # branch as "this is a worker": a refusal gate answers that side closed.
+  __core_tasks="$(cd "$WORKSPACE_DIR/tasks" 2>/dev/null && pwd -P)"
+  [ -n "$__core_tasks" ] || return 0
+  [ "$TASKS_DIR_ABS" = "$__core_tasks" ]
 }
 
 # A watcher without the routing handler answers every bound room from this

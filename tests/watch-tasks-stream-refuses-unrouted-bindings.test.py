@@ -188,6 +188,16 @@ class TestWatcher(unittest.TestCase):
         self._bind()
         self._assert_started(self._start(inbox=self._delivery_inbox()))
 
+    def test_an_unresolvable_core_inbox_refuses_rather_than_reading_as_worker(self):
+        # "Cannot tell" must not share a branch with "definitely a worker".
+        elsewhere = Path(self._t.name) / "no-tasks-ws"
+        (elsewhere / "state").mkdir(parents=True)
+        # Under the DECLARED workspace, or an absent declaration decides the start.
+        (elsewhere / "state" / "bindings.json").write_text(
+            json.dumps({"bindings": {"!r:x": W}}))
+        self.assertFalse((elsewhere / "tasks").exists())
+        self._assert_refused(self._start(SUTANDO_WORKSPACE_DIR=str(elsewhere)))
+
     def test_the_core_intake_still_refuses_under_that_same_setup(self):
         # Positive control: identical declaration and env, only the inbox differs,
         # or the start above is satisfied by a gate that fires nowhere.
