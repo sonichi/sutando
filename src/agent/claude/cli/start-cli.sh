@@ -147,9 +147,16 @@ fi
 # go. Derived in-session they become deliveries/results, which no bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+# Third half of that seam: without the resolver a worker reads the sentinel
+# itself, so an unforwarded one is the zero-byte read, not a missing option.
+[ -n "${SUTANDO_INBOX_RESOLVER:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER=$SUTANDO_INBOX_RESOLVER")
+[ -n "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER_TIMEOUT=$SUTANDO_INBOX_RESOLVER_TIMEOUT")
 # The worker gate `/startup --worker` runs, named by the spawner: this launcher
 # is the core's, so it forwards the path and never knows which skill owns it.
 [ -n "${SUTANDO_WORKER_BOOTSTRAP:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKER_BOOTSTRAP=$SUTANDO_WORKER_BOOTSTRAP")
+# The done-flag writer, same seam: tmux hands a new session the SERVER's env, so
+# an unforwarded writer leaves the hook complete but never reached.
+[ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_POOL_DELIVERY_SCRIPT=$SUTANDO_POOL_DELIVERY_SCRIPT")
 # A worker session's cwd is the spawner's --cwd, which need not be the repo, and
 # its PATH python3 may be the CLT stub: name both absolutely from here instead.
 if [ -n "$WORKER_INSTANCE" ]; then
