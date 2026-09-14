@@ -334,17 +334,21 @@ def replay_reason(workspace, cmd: dict, task_id, results_dir=None) -> "str | Non
 
 def _record_applied(workspace, cmd: dict, task_id) -> int:
     """Record BEFORE mutating. A crash between the two must LOSE a command —
-    which the owner can see and re-issue — never resurrect an older one."""
-    with _applied_locked(workspace):
-        log = _read_applied(workspace)
-        seq = int(log.get("seq") or 0) + 1
-        log["seq"] = seq
-        log.setdefault("applied", {})[str(task_id)] = {
-            "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq}
-        if cmd.get("room"):
-            log.setdefault("rooms", {})[cmd["room"]] = {
-                "seq": seq, "task_id": str(task_id), "action": cmd.get("action")}
-        pr._write_atomic(applied_path(workspace), log)
+    which the owner can see and re-issue — never resurrect an older one.
+
+    The caller already holds the ledger lock: flock blocks on a second
+    acquisition of the same file, so taking it here would deadlock the writer
+    against itself.
+    """
+    log = _read_applied(workspace)
+    seq = int(log.get("seq") or 0) + 1
+    log["seq"] = seq
+    log.setdefault("applied", {})[str(task_id)] = {
+        "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq}
+    if cmd.get("room"):
+        log.setdefault("rooms", {})[cmd["room"]] = {
+            "seq": seq, "task_id": str(task_id), "action": cmd.get("action")}
+    pr._write_atomic(applied_path(workspace), log)
     return seq
 
 
@@ -357,21 +361,24 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
     replay-gated, and an ungated door is how this defect returns.
     """
     action = (cmd or {}).get("action")
-    if action in ("pin", "unpin"):
+    if action not in ("pin", "unpin"):
+        return None
+    # ONE critical section for gate, record and mutation: split, two probes can
+    # commit sequence 1/2 and then mutate in the opposite order.
+    with _applied_locked(workspace):
         reason = replay_reason(workspace, cmd, task_id, results_dir)
         if reason:
             return {"action": "skipped", "room": cmd.get("room"), "reason": reason}
-        _record_applied(workspace, cmd, task_id)
-    if action == "pin":
-        workers = list(cmd.get("workers") or [])
-        if len(workers) != 1:
-            raise pr.RosterError(f"pin names {len(workers)} workers; a room takes one")
-        roster = pr.bind_room(workspace, cmd["room"], workers[0])
-    elif action == "unpin":
-        roster = pr.unbind_room(workspace, cmd["room"])
-    else:
-        return None
-    path = pa.write_advertisement(workspace)
+        if action == "pin":
+            workers = list(cmd.get("workers") or [])
+            if len(workers) != 1:
+                raise pr.RosterError(f"pin names {len(workers)} workers; a room takes one")
+            _record_applied(workspace, cmd, task_id)
+            roster = pr.bind_room(workspace, cmd["room"], workers[0])
+        else:
+            _record_applied(workspace, cmd, task_id)
+            roster = pr.unbind_room(workspace, cmd["room"])
+        path = pa.write_advertisement(workspace)
     return {"action": action, "room": cmd["room"], "roster_version": roster.get("version"),
             "advertisement": str(path)}
 
