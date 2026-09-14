@@ -509,12 +509,16 @@ class TestCoverageEdges(unittest.TestCase):
         ctx.install_responses[SKILL_UUID] = {"bundleUrl": "https://b/bad", "signingHash": hashlib.sha256(bad).hexdigest()}
         ctx.bundles["https://b/bad"] = bad
         self.assertIn("download/install failed", run(ctx, ["install", "demo", "--yes"])[1]["failed"][0]["reason"])
-        ctx.install_responses[SKILL_UUID] = {"bundleUrl": "https://b/bad", "signingHash": None}
-        ctx.bundles["https://b/bad"] = GOOD
-        with mock.patch.object(skill_install, "atomic_install") as inst:
-            code, out = run(ctx, ["install", "demo", "--yes", "--allow-unsigned"])
-        self.assertEqual(out["installed"], ["demo"])
-        inst.assert_called_once()
+        # no bypass: an unsigned bundle is refused before anything is downloaded,
+        # and the old hidden --allow-unsigned flag no longer exists
+        ctx.install_responses[SKILL_UUID] = {"bundleUrl": "https://b/unsigned", "signingHash": None}
+        with mock.patch.object(ctx, "download") as dl, mock.patch.object(skill_install, "atomic_install") as inst:
+            code, out = run(ctx, ["install", "demo", "--yes"])
+        self.assertIn("unsigned", out["failed"][0]["reason"])
+        dl.assert_not_called()
+        inst.assert_not_called()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            marketplace.parser().parse_args(["install", "demo", "--yes", "--allow-unsigned"])
 
     def test_status_text_rendering(self):
         (self.root / "stale").mkdir()

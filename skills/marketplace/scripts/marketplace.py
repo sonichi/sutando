@@ -353,7 +353,7 @@ def render_plan(plan: dict) -> str:
     return "\n".join(lines)
 
 
-def install_item(ctx: Context, item: dict, allow_unsigned: bool, plan_name: str) -> dict:
+def install_item(ctx: Context, item: dict, plan_name: str) -> dict:
     body = {"agentId": ctx.agent_id} if ctx.agent_id else None
     try:
         resp = ctx.http("POST", f"/api/skills/{item['id']}/install", body) or {}
@@ -362,20 +362,21 @@ def install_item(ctx: Context, item: dict, allow_unsigned: bool, plan_name: str)
     newly = not resp.get("deduped", False)
     if item["kind"] == "cloud_tool":
         return {"slug": item["slug"], "status": "activated" if newly else "already_active", "restart": newly}
-    return materialize(ctx, item, resp, allow_unsigned)
+    return materialize(ctx, item, resp)
 
 
-def materialize(ctx: Context, item: dict, resp: dict, allow_unsigned: bool) -> dict:
+def materialize(ctx: Context, item: dict, resp: dict) -> dict:
     slug = item["slug"]
     url, sha = resp.get("bundleUrl"), (resp.get("signingHash") or "").lower()
     if not url:
         return {"slug": slug, "status": "failed", "reason": "the marketplace has no downloadable bundle for this skill"}
-    if not sha and not allow_unsigned:
-        return {"slug": slug, "status": "failed", "reason": "bundle is unsigned (no signingHash); refusing to install it"}
+    if not sha:
+        # no bypass flag: every install is checksum-verified against the catalog
+        return {"slug": slug, "status": "failed", "reason": "bundle is unsigned (no signingHash) — refusing to install it; the Marketplace UI can still install it"}
     try:
         data = ctx.download(url)
         digest = hashlib.sha256(data).hexdigest()
-        if sha and digest != sha:
+        if digest != sha:
             return {"slug": slug, "status": "failed", "reason": "bundle checksum mismatch — nothing was installed"}
         meta = {
             "schema_version": 1,
@@ -410,7 +411,7 @@ def run_install(ctx: Context, args: argparse.Namespace, slugs: list[str]) -> int
     results = []
     for item in plan["items"]:
         if item["action"] in ("install", "download", "activate"):
-            results.append(install_item(ctx, item, args.allow_unsigned, plan["plan"]))
+            results.append(install_item(ctx, item, plan["plan"]))
         elif item["action"] == "skip":
             results.append({"slug": item["slug"], "status": "skipped", "reason": item.get("reason")})
         else:
@@ -563,7 +564,7 @@ def cmd_update(ctx: Context, args: argparse.Namespace) -> int:
             results.append({"slug": s["slug"], "status": "failed", "reason": "no longer in the marketplace"})
             continue
         item = {"slug": s["slug"], "id": row["id"], "kind": row.get("kind") or "skill"}
-        results.append(install_item(ctx, item, args.allow_unsigned, plan_name))
+        results.append(install_item(ctx, item, plan_name))
     return report_results(args, results)
 
 
@@ -623,11 +624,9 @@ def parser() -> argparse.ArgumentParser:
     i = sub.add_parser("install")
     i.add_argument("slugs", nargs="+")
     i.add_argument("--yes", action="store_true")
-    i.add_argument("--allow-unsigned", action="store_true", help=argparse.SUPPRESS)
     u = sub.add_parser("update")
     u.add_argument("slugs", nargs="*")
     u.add_argument("--yes", action="store_true")
-    u.add_argument("--allow-unsigned", action="store_true", help=argparse.SUPPRESS)
     r = sub.add_parser("uninstall")
     r.add_argument("slug")
     r.add_argument("--yes", action="store_true")
