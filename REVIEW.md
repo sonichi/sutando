@@ -508,15 +508,25 @@ and loads whichever repo it reviews.
     named for it (`test_a_commit_AT_the_approval_timestamp_does_not_count_as_after`, docstring
     "Pins the boundary so widening `>` to `>=` cannot pass silently").
 
-    That distinction is the practical warning, and it is why a harness matters more than a rule:
-    a loop that restores the pristine file between mutants **and runs it** never collides, because
-    that run is what makes CPython observe the pristine size and rewrite the entry. A restore that
-    is written but never imported does not: CPython never sees the intermediate file, so m2's entry
-    still matches m3's size and mtime and serves m2's bytes. Measured both ways at this head —
-    write m2, run, write pristine WITHOUT running, write m3, run reports SURVIVED; the same m3
-    against a cleared cache reports CAUGHT, as does the same sequence with the pristine restore
-    executed. So the danger is "consecutive same-size variants share a cache entry", and the
-    remedies are clearing the cache or a restore that executes. A restore alone is not one.
+    That distinction is the practical warning, and it is why a harness matters more than a rule.
+    A restore that is written but never imported is never a remedy: CPython never sees the
+    intermediate file, so m2's entry still matches m3's size and mtime and serves m2's bytes.
+    Measured at this head — write m2, run, write pristine WITHOUT running, write m3, run reports
+    SURVIVED; the same m3 against a cleared cache reports CAUGHT.
+
+    **A restore that executes is a remedy only when that run actually invalidates the entry**, and
+    this arm does not generalize. It worked here because pristine is 11,285 B while both mutants
+    are 11,286 B: the run observes a size mismatch and rewrites. Where pristine matches the cached
+    mutant's size AND `int(st_mtime)`, the run finds the entry valid, serves the cached bytes and
+    rewrites nothing — so the next same-size mutant still reports a false SURVIVED. Measured by
+    @keweichen on 3.13.5, three 14-B sources sharing one integer mtime: restoring pristine *and
+    running it* still loaded the cached mutant, and the following mutant returned a false
+    SURVIVED that a fresh cache caught.
+
+    So the danger is "consecutive same-size variants share a cache entry", and the remedies to
+    rely on are the unconditional ones below — unlink the entry, or a fresh cache prefix per run.
+    Restore-and-execute is not a substitute for either; it is a remedy only in the narrow case
+    where the pristine metadata differs from the cached mutant's.
 
     **m2's SURVIVED is real and must not be swept up in this.** Against a cleared cache it still
     survives: the suite genuinely does not catch `staleness > -> >=`. A reader who blames the
