@@ -506,6 +506,37 @@ class TestBootstrapSeam(Base):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual((r.stdout or "").splitlines()[0], "unknown")
 
+    def test_the_plan_names_the_resolver_the_inbox_requires(self):
+        """`SUTANDO_TASKS_DIR` points at a delivery folder holding SENTINELS, so a
+        worker with no resolver opens the zero-byte one instead of its task. The
+        launcher only FORWARDS these, so the spawner must name them."""
+        env = sw.plan(self.ws, REPO)["env"]
+        self.assertEqual(env["SUTANDO_INBOX_KIND"], "deliveries",
+                         "control: this test only matters while the inbox holds sentinels")
+        for key in ("SUTANDO_INBOX_RESOLVER", "SUTANDO_POOL_DELIVERY_SCRIPT"):
+            self.assertIn(key, env, f"the spawn plan does not name {key}")
+            p = Path(env[key])
+            self.assertTrue(p.is_file(), f"{key} -> {p} is not a file")
+            self.assertEqual(p.parent, Path(sw.__file__).resolve().parent,
+                             f"{key} must come from this skill, not a guessed path")
+
+    def test_the_named_resolver_runs_and_refuses_a_non_sentinel(self):
+        """Named, not just spelled: execute what the plan points at. A rename
+        leaving a stale string passes the check above and fails here."""
+        resolver = sw.plan(self.ws, REPO)["env"]["SUTANDO_INBOX_RESOLVER"]
+        r = subprocess.run([resolver, str(self.ws / "tasks" / "not-a-sentinel")],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, "a non-sentinel was accepted")
+        self.assertEqual(r.stdout.strip(), "", "it printed a path for a non-sentinel")
+
+    def test_the_launcher_forwards_both_rather_than_naming_them(self):
+        """The core must not name a concrete skill path; it forwards what it is
+        given. This is the other half of the contract the two cases above pin."""
+        launcher = (REPO / "src/agent/claude/cli/start-cli.sh").read_text(encoding="utf-8")
+        for key in ("SUTANDO_INBOX_RESOLVER", "SUTANDO_POOL_DELIVERY_SCRIPT"):
+            self.assertIn(f'"{key}=${key}"', launcher, f"the launcher does not forward {key}")
+        self.assertNotIn("skills/worker-pool", launcher)
+
     def test_the_core_startup_skill_names_the_env_not_a_path(self):
         """The core boots with this skill absent, so its own `/startup` carries
         no path into it. Prose may name the skill; a runnable path may not."""

@@ -193,7 +193,13 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
-                "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py")},
+                "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
+                # Same rule, and REQUIRED here: the inbox above holds sentinels,
+                # so without a resolver the watcher hands over the zero-byte one.
+                "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
+                # The done-flag writer, so a finished delivery can reach
+                # `finished` instead of being re-reported on every boot.
+                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},
     }
 
 
