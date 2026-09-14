@@ -88,6 +88,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
+- **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
@@ -194,6 +195,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
+- **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
+- **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
 - **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
@@ -289,6 +292,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`__init__.py`** — _(no header comment)_
 - **`detector.py`** — Claude readiness detector — the Requirement Detector half of the runtime supervisor, and the one-state ClaudeTuiDriver v0 (AUTH_REQUIRED only).
 - **`events.py`** — Ingest RuntimeEvents dropped by the runtime drivers (the desktop watchdog's `hitl_events.rs`) into the HumanRequirement Manager.
+- **`host.py`** — The machine a requirement's terminal is on: the per-host label, "" when unreadable.
 - **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
 - **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
 - **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.

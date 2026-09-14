@@ -26,7 +26,9 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -95,6 +97,89 @@ def result_path(workspace: Path, task_id: str) -> Path:
 
 def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
     return _root(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
+
+
+def pending_flag(workspace: Path, recipient: str, task_id: str) -> Path:
+    """The first stage of the same record: owned, result not yet published."""
+    return done_flag(workspace, recipient, task_id).with_suffix(".pending")
+
+
+def is_done_flag(path) -> bool:
+    """Completion evidence is a REGULAR file and nothing else: a directory or a
+    symlink at the name is malformed state, and reading either as a finish
+    invents a claimant.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
+def _publish_record(dst: Path) -> None:
+    # Temp file + rename inside the same directory, so a concurrent reader sees
+    # the name either absent or complete, never half-written.
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(tmp)
+        raise
+
+
+def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Path:
+    """Record `recipient`'s hold on `task_id`. The ONLY writer of either stage.
+
+    `published=False` lays `.pending` BEFORE the result, so a result the drain
+    can see always has attribution beside it; `published=True` promotes it to
+    `.flag` after, and that is the only stage `residue` retires on. A promoted
+    record is never demoted, so a late `pending` cannot reopen retired work.
+    """
+    if not RECIPIENT.match(recipient):
+        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    done = done_flag(workspace, recipient, task_id)
+    pend = pending_flag(workspace, recipient, task_id)
+    if not published:
+        if is_done_flag(done):
+            return done
+        _publish_record(pend)
+        return pend
+    _publish_record(done)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
+    return done
+
+
+def clear_pending(workspace, recipient: str, task_id: str) -> Path:
+    """Withdraw a `.pending` hold this worker will not finish: the task went back to
+    the live core, or its handler never ran. Never touches `.flag` -- a finish is
+    never undone -- and is idempotent, so a fallback that fires twice is harmless.
+    """
+    if not RECIPIENT.match(recipient):
+        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    pend = pending_flag(workspace, recipient, task_id)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
+    return pend
+
+
+def writer_path() -> Path:
+    """The executable a spawner injects as SUTANDO_POOL_DELIVERY_SCRIPT: this file,
+    absolute. The core never locates it (docs/architecture-boundaries.md); the
+    skill hands it over, and the launcher forwards it into the worker session.
+    """
+    return Path(__file__).resolve()
 
 
 def pending(workspace: Path, recipient: str) -> list[Path]:
@@ -216,7 +301,9 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # The shared readiness contract, not existence: an empty or whitespace-only
     # file is a placeholder still being written, and must not suppress recovery.
     has_result = read_ready_result(result_path(ws, task_id)) is not None
-    has_flag = done_flag(ws, recipient, task_id).is_file()
+    # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
+    # verdict is what `sweep` deletes on, so a planted link would retire real work.
+    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
     payload = payload_path(ws, task_id).is_file()
 
@@ -294,12 +381,27 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue"))
+    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
+                                       "mark-done", "writer-path"))
     ap.add_argument("--task-id")
+    ap.add_argument("--stage", choices=("pending", "done", "abandon"),
+                    help="for `mark-done`: pending = before the result, done = after, "
+                         "abandon = withdraw a pending hold (never a finish)")
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args(argv)
     ws = Path(a.workspace)
 
+    if a.command == "writer-path":
+        print(writer_path())
+        return 0
+    if a.command == "mark-done":
+        if not a.task_id or not a.stage:
+            ap.error("--task-id and --stage are required for mark-done")
+        if a.stage == "abandon":
+            print(clear_pending(ws, a.recipient, a.task_id))
+            return 0
+        print(mark_done(ws, a.recipient, a.task_id, published=a.stage == "done"))
+        return 0
     if a.command == "residue":
         if not a.task_id:
             ap.error("--task-id is required for residue")
