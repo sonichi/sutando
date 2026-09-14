@@ -145,6 +145,17 @@ check("an empty stamp is refused, not read as prose",
       isinstance(_empty_intent, dict) and _empty_intent.get("action") == "malformed",
       repr(_empty_intent))
 
+
+# The tier is appended AFTER the body, so a last-wins scan lets the writer's own
+# value beat a body line forging it. That safety is positional, so pin it.
+_src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+check("access_tier is NOT hoisted into _TASK_FIELDS",
+      "\"access_tier\"" not in _src.split("_TASK_FIELDS = (", 1)[1].split(")", 1)[0],
+      "the tier moved above `task:`; a body line after it now wins under last-wins")
+check("the writer still appends access_tier after the body",
+      'lines.append(f"access_tier: ' in _src,
+      "the append that makes the tier the LAST occurrence is gone")
+
 print()
 if failures:
     print(f"FAIL — {len(failures)} check(s): {failures}")

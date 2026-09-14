@@ -181,6 +181,10 @@ def guarded_main(argv=None) -> int:
     """
     try:
         return main(argv)
+    except SystemExit as e:
+        # argparse exits rather than raising, and SystemExit is a BaseException:
+        # an `Exception` floor moves this fail-open instead of closing it.
+        return MUST_HANDLE if (e.code or 0) != 0 else 0
     except Exception as e:  # noqa: BLE001 — the exit code IS the routing decision
         print(f"pool_route_handler: unhandled {e!r}", file=sys.stderr)
         return MUST_HANDLE

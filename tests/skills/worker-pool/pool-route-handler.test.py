@@ -245,6 +245,17 @@ class TestDelivery(Base):
             rc = h.guarded_main(["--task-file", t, "--workspace", str(self.ws)])
         self.assertEqual(rc, h.MUST_HANDLE, f"a crash returned {rc}; rc 1 reaches the live core")
 
+    def test_an_argparse_exit_is_must_handle_not_a_decline(self):
+        """SystemExit derives from BaseException, so an `Exception` floor MOVES
+        this fail-open rather than closing it: rc 2 is not 4, and the watcher
+        hands the task to the unrestricted core."""
+        self.assertEqual(h.guarded_main([]), h.MUST_HANDLE)
+
+    def test_control_a_deliberate_zero_exit_still_means_success(self):
+        # Without this, mapping every SystemExit to MUST_HANDLE would pass above.
+        with patch.object(h, "main", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0))):
+            self.assertEqual(h.guarded_main(["--task-file", "x"]), 0)
+
     def test_control_the_guard_does_not_mask_a_normal_answer(self):
         # Without this, returning MUST_HANDLE unconditionally would pass above.
         self.roster()

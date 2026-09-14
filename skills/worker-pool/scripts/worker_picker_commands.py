@@ -329,10 +329,6 @@ def replay_reason(workspace, cmd: dict, task_id, results_dir=None) -> "str | Non
         return "a delivered result already exists for this task"
     if ltp.find_archived_result(rd, str(task_id)) is not None:
         return "an archived result already exists for this task"
-    room = (cmd or {}).get("room")
-    room_rec = (log.get("rooms") or {}).get(room) if room else None
-    if room_rec and int(room_rec.get("seq") or 0) > int(log.get("seq") or 0):
-        return f"a newer command (seq {room_rec.get('seq')}) already holds {room}"
     return None
 
 
