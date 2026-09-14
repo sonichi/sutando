@@ -2529,6 +2529,15 @@ _now = time.monotonic
 
 _PUSH_THREAD: "threading.Thread | None" = None
 _PUSH_LOCK = threading.Lock()
+# The profile PUT is unversioned and REPLACES the broker document, so a request
+# landing after a successor took the lock overwrites the successor's card.
+_OWNERSHIP_RELINQUISHED = threading.Event()
+
+
+def _publication_permitted() -> bool:
+    """False once ownership is being handed over: no request may START, because
+    its completion could land after a successor owns the document."""
+    return not _OWNERSHIP_RELINQUISHED.is_set()
 
 
 def _push_pool_advertisement() -> None:
@@ -2545,12 +2554,17 @@ def _push_pool_advertisement() -> None:
         _PUSH_THREAD.start()
 
 
-def _join_push_thread(timeout: float = 5.0) -> None:
+def _join_push_thread(timeout: float = 5.0) -> bool:
     """A normal exit finishes the snapshot+card pair (bounded): the broker must
-    not be left holding a snapshot and a card from different revisions."""
+    not be left holding a snapshot and a card from different revisions.
+
+    True when nothing is in flight — ownership may only be handed over then.
+    """
     t = _PUSH_THREAD
-    if t is not None and t.is_alive():
-        t.join(timeout)
+    if t is None or not t.is_alive():
+        return True
+    t.join(timeout)
+    return not t.is_alive()
 
 
 atexit.register(_join_push_thread)
@@ -2580,6 +2594,8 @@ def _maybe_push_workers_snapshot(record) -> bool:
     endpoint backs the push off an hour and any other HTTP status 5m;
     nothing here may ever break the task loop."""
     global _workers_pushed_identity, _workers_push_retry_at
+    if not _publication_permitted():
+        return False
     now = time.time()
     if now < _workers_push_retry_at:
         return False
@@ -2631,6 +2647,8 @@ def _maybe_push_agent_profile(record) -> bool:
     a record we could not read would erase the pool. Same retry taxonomy as
     the workers-snapshot push; nothing here may break the task loop."""
     global _profile_pushed_identity, _profile_push_retry_at
+    if not _publication_permitted():
+        return False
     now = time.time()
     if now < _profile_push_retry_at:
         return False
@@ -4328,6 +4346,16 @@ def _lock_on() -> bool:
 
 def _release_singleton() -> None:
     if not _lock_on():
+        return
+    # The ORDER is the invariant, not the registration order of two atexit hooks
+    # (atexit runs them in reverse, so that ordering released the lock first).
+    _OWNERSHIP_RELINQUISHED.set()
+    if not _join_push_thread():
+        # Still in flight, and the request cannot be recalled. Holding the lock
+        # costs a successor the stale window; releasing costs it its card.
+        _log("singleton: a publication is still in flight — holding the lock so "
+             "a successor waits for it to go stale instead of having its "
+             "advertisement overwritten by this generation")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)

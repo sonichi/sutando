@@ -691,6 +691,92 @@ def test_a_normal_exit_waits_for_the_pair_bounded():
         print("PASS test_a_normal_exit_waits_for_the_pair_bounded")
 
 
+_CHILD_GENERATION = '''
+import os, pathlib, sys, time
+sys.path.insert(0, %r)
+from ag2_sparrow import remote_gateway_bridge as m
+started = pathlib.Path(os.environ["PROBE_STARTED"])
+gate = pathlib.Path(os.environ["PROBE_GATE"])
+done = pathlib.Path(os.environ["PROBE_DONE"])
+
+
+def blocked(method, path, *a, **k):
+    started.write_text(path)
+    while not gate.exists():
+        time.sleep(0.02)
+    with open(done, "a") as fh:
+        fh.write(path + "\\n")
+    return {}
+
+
+m._req = blocked
+assert m._acquire_singleton() is True, "child could not acquire the singleton"
+m._push_pool_advertisement()
+while not started.exists():
+    time.sleep(0.02)
+print("SHUTDOWN-BEGINS", flush=True)
+sys.exit(0)
+'''
+
+
+def test_shutdown_holds_the_lock_until_no_publication_can_complete():
+    """The overwrite kewei reproduced: the exit hooks released the workspace lock
+    while this generation's publication was still in flight, so a successor could
+    acquire, publish, and then have its card REPLACED by the old request landing.
+
+    Measured across a real process boundary, because the failure lives exactly at
+    the exit an in-process test returns from: while the child is ALIVE and a
+    request is blocked, the lock must never become acquirable.
+    """
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        (base / "state").mkdir()
+        (base / "state" / "pool-advertisement.json").write_text(json.dumps(_record(1)))
+        started, gate, done = (base / "started"), (base / "gate"), (base / "done")
+        env = {**os.environ,
+               "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+               "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
+               "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
+               "REMOTE_TASK_URL": "https://gw.example/relay",
+               "REMOTE_TASK_TOKEN": "dummy-secret",
+               "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
+               "PROBE_DONE": str(done)}
+        code = _CHILD_GENERATION % str(pathlib.Path(__file__).resolve().parents[1])
+        child = subprocess.Popen([sys.executable, "-c", code], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.time() + 10
+            while not started.exists() and child.poll() is None and time.time() < deadline:
+                time.sleep(0.02)
+            assert started.exists(), f"child never issued a request (rc={child.poll()})"
+
+            # The successor: a second generation trying to take ownership while
+            # the first is shutting down with that request still blocked.
+            m2 = _load(base)
+            samples, stolen = 0, None
+            while child.poll() is None and time.time() < deadline:
+                r = m2._ws_acquire(m2._LOCK_ROLE, m2._LOCK_WS)
+                samples += 1
+                if r.status != "deferred":
+                    stolen = r.status
+                    break
+                time.sleep(0.05)
+            assert samples > 0, "the child exited before the shutdown window could be sampled"
+            assert stolen is None, (
+                "the lock became acquirable (%s) while the old generation was alive with a "
+                "publication in flight — its completion would overwrite the successor's card"
+                % stolen)
+            assert not done.exists(), "the blocked request completed; the control proved nothing"
+        finally:
+            gate.write_text("open")
+            try:
+                child.wait(10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+        print("PASS test_shutdown_holds_the_lock_until_no_publication_can_complete")
+
+
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
     test_a_missing_file_pushes_nothing_at_all()
@@ -720,4 +806,5 @@ if __name__ == "__main__":
     test_an_in_flight_push_is_skipped_not_queued()
     test_a_failing_background_push_is_logged_not_silent()
     test_a_normal_exit_waits_for_the_pair_bounded()
+    test_shutdown_holds_the_lock_until_no_publication_can_complete()
     print("ALL PASS test_pool_advertisement_push")
