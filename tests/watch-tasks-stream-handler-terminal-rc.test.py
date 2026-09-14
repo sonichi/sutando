@@ -75,6 +75,75 @@ def run(real_run_rc: int, probe_rc: int = 0):
     return emitted, published
 
 
+def restart_witness():
+    """REVIEW.md 15 for this change: a watcher that is STOPPED and STARTED AGAIN
+    takes one probe-0/rc-4 task through to a published terminal failure.
+
+    The watcher is a real process both times -- the same `src/watch-tasks-stream.sh`
+    the core runs -- so what is exercised is the shipped path across a restart
+    boundary, not a harness standing in for it. Only the workspace and the
+    fswatch trigger are synthetic.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="term-rc-restart-"))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    feed = tmp / "feed"; feed.write_text("")
+    b = tmp / "bin"; b.mkdir()
+    (b / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {feed}\n"); (b / "fswatch").chmod(0o755)
+    h = tmp / "handler.sh"
+    h.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && exit 0; done\nexit 4\n')
+    h.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
+    env.pop("SUTANDO_INSTANCE_ID", None)
+
+    def start():
+        return subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")],
+                                cwd=str(REPO), env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+
+    def stop(p):
+        try: os.killpg(os.getpgid(p.pid), 15)
+        except Exception: pass
+        try: p.wait(timeout=10)
+        except Exception: p.kill()
+
+    first = start()
+    time.sleep(2.0)                      # let the first generation come up and settle
+    first_pid = first.pid
+    stop(first)                          # THE RESTART BOUNDARY
+
+    # Written while NO watcher runs, so the restarted process admits it on its own
+    # startup sweep; created later, the stub fswatch never fires and nothing runs.
+    (ws / "tasks" / "task-restart.txt").write_text("id: task-restart\naccess_tier: owner\ntask: probe\n")
+    second = start()
+    out, t0 = [], time.time()
+    published = []
+    try:
+        os.set_blocking(second.stdout.fileno(), False)
+        while time.time() - t0 < 15:
+            time.sleep(0.3)
+            try:
+                c = second.stdout.read()
+                if c: out.append(c)
+            except Exception:
+                pass
+            published = sorted(q.name for q in (ws / "results").glob("*.txt"))
+            if published:
+                break
+    finally:
+        stop(second)
+    emitted = any("TASK_FILE" in c for c in out)
+    body = ""
+    if published:
+        body = (ws / "results" / published[0]).read_text(errors="replace")[:200]
+    return first_pid, second.pid, emitted, published, body
+
+
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
@@ -97,6 +166,15 @@ check("control: an ordinary failure still falls back to the core", emitted_one,
 # watcher that never emits anything at all.
 emitted_zero, _ = run(real_run_rc=0)
 check("control: a successful run emits nothing and needs no failure", not emitted_zero)
+
+pid1, pid2, emitted_r, published_r, body_r = restart_witness()
+print(f"\n  restart witness: watcher pid {pid1} stopped, pid {pid2} started; task arrived after the restart")
+print(f"    emitted to the live core: {emitted_r}")
+print(f"    published by the restarted watcher: {published_r}")
+print(f"    result body: {body_r.strip()[:120]!r}")
+check("restart: the restarted watcher does NOT hand the task to the core", not emitted_r)
+check("restart: the restarted watcher publishes a terminal failure", published_r != [],
+      "no result file, so the task is neither delivered nor failed")
 
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else "PASS — handler terminal rc outranks the probe-time disposition")
 sys.exit(1 if FAILURES else 0)
