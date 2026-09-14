@@ -18,7 +18,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 
-import pool_route_handler as h  # noqa: E402
+import pool_route_handler as h
+import worker_picker_commands as wpc  # noqa: E402
 
 W = "a" * 32
 
@@ -44,6 +45,87 @@ class Base(unittest.TestCase):
         lines = [f"id: {name}"] + [f"{k}: {v}" for k, v in headers.items()]
         p.write_text("\n".join(lines) + "\ntask: body\n")
         return str(p)
+
+
+class TestPickerReplayAcrossRestart(Base):
+    """A completed picker command must not be reapplied by the startup sweep.
+
+    The sweep re-probes every RETAINED task, and the gateway archives a result
+    before its task (swallowing a task-archive failure), so a finished command
+    routinely survives as a live task with no live result. Without a gate the
+    older of two commands wins on the next restart.
+    """
+
+    ROOM = "!review:example.test"
+
+    def picker(self, name, sentence):
+        # the gateway writer shape: `task:` first, the picker mark below it.
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(f"id: {name}\ntask: {sentence}\nsource: ag2space\n"
+                     f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
+                     f"user_id: @q:b\naccess_tier: owner\n")
+        return str(p)
+
+    def bindings(self):
+        return json.loads((self.ws / "state" / "roster.json").read_text()).get("bindings", {})
+
+    def probe(self, task_file):
+        return h.main(["--task-file", task_file, "--workspace", str(self.ws), "--probe"])
+
+    def setUp(self):
+        super().setUp()
+        (self.ws / "results" / "archive").mkdir(parents=True, exist_ok=True)
+        self.roster(bindings={})
+        self.pin = self.picker("task-old-pin", f"Pin room {self.ROOM} to {W} (worker picker)")
+        self.unpin = self.picker(
+            "task-new-unpin",
+            f"Unpin room {self.ROOM} (worker picker: back to auto routing)")
+
+    def test_a_completed_pin_is_not_reapplied_over_a_newer_unpin(self):
+        self.probe(self.pin)
+        self.assertEqual(self.bindings().get(self.ROOM), W, "the pin never applied")
+        self.probe(self.unpin)
+        # PRECONDITION: without it the assertion below passes for a handler that
+        # never binds anything, because the binding would already be absent.
+        self.assertIsNone(self.bindings().get(self.ROOM), "the unpin never cleared it")
+
+        for tid in ("task-old-pin", "task-new-unpin"):
+            (self.ws / "results" / "archive" / f"{tid}.txt").write_text("done\n")
+        Path(self.unpin).unlink()          # the newer task was archived away
+        self.probe(self.pin)               # the startup sweep re-probes what is left
+        self.assertIsNone(self.bindings().get(self.ROOM),
+                          "the completed pin was replayed over the owner's newer unpin")
+
+    def test_an_archived_result_alone_blocks_the_replay(self):
+        """The record and the archive are two independent gates, and only this
+        case exercises the second. A host that lost `picker-applied.json` — a
+        fresh checkout, cleared state — has the completion contract and nothing
+        else, which is the situation the gateway's archive-first ordering makes
+        ordinary rather than rare.
+        """
+        (self.ws / "results" / "archive" / "task-old-pin.txt").write_text("done\n")
+        self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
+        self.probe(self.pin)
+        self.assertIsNone(self.bindings().get(self.ROOM),
+                          "an archived result did not block the replay")
+
+    def test_a_live_result_alone_blocks_the_replay(self):
+        (self.ws / "results" / "task-old-pin.txt").write_text("done\n")
+        self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
+        self.probe(self.pin)
+        self.assertIsNone(self.bindings().get(self.ROOM),
+                          "a live result did not block the replay")
+
+    def test_control_a_pin_with_no_completed_result_still_applies(self):
+        # Without this, refusing every command would satisfy the case above.
+        self.probe(self.pin)
+        self.assertEqual(self.bindings().get(self.ROOM), W)
+
+    def test_control_an_archived_result_for_another_task_does_not_block(self):
+        # The gate must key on THIS task's id, not on any archived result.
+        (self.ws / "results" / "archive" / "task-unrelated.txt").write_text("done\n")
+        self.probe(self.pin)
+        self.assertEqual(self.bindings().get(self.ROOM), W)
 
 
 class TestClassification(Base):

@@ -26,6 +26,8 @@ It returns intent. Acting on one is the caller's, so a misparse cannot spawn.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import re
 import sys
@@ -270,11 +272,94 @@ def authorized_command(path) -> "dict | None":
     return parse(trusted.headers, sentence)
 
 
-def apply(workspace, cmd: dict) -> "dict | None":
+def applied_path(workspace) -> Path:
+    return pr.roster_path(workspace).parent / "picker-applied.json"
+
+
+@contextlib.contextmanager
+def _applied_locked(workspace):
+    # Its OWN lock file: taking pool_roster's here and then calling bind_room,
+    # which takes the same one, deadlocks this process against itself.
+    p = pr.roster_path(workspace).parent / ".picker-applied.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _read_applied(workspace) -> dict:
+    try:
+        got = json.loads(applied_path(workspace).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _results_dir(workspace, results_dir=None) -> Path:
+    return Path(results_dir) if results_dir else pr.roster_path(workspace).parent.parent / "results"
+
+
+def replay_reason(workspace, cmd: dict, task_id, results_dir=None) -> "str | None":
+    """Why this picker command must NOT be applied, or None to go ahead.
+
+    The startup sweep re-probes every RETAINED task, so a command whose task
+    outlived its result would re-bind a room the owner has since unpinned.
+    """
+    if not task_id:
+        # No id means this call cannot be replay-gated at all. An optional gate
+        # is not a gate: refuse rather than silently apply ungated.
+        return "no task id, so this command cannot be replay-gated"
+    log = _read_applied(workspace)
+    rec = (log.get("applied") or {}).get(str(task_id))
+    if rec:
+        return f"already applied as seq {rec.get('seq')}"
+    rd = _results_dir(workspace, results_dir)
+    # Live AND archive: a finished command routinely survives as a live task
+    # with no live result, so a live-only check reads it as never having run.
+    if (rd / f"{task_id}.txt").is_file():
+        return "a delivered result already exists for this task"
+    if ltp.find_archived_result(rd, str(task_id)) is not None:
+        return "an archived result already exists for this task"
+    room = (cmd or {}).get("room")
+    room_rec = (log.get("rooms") or {}).get(room) if room else None
+    if room_rec and int(room_rec.get("seq") or 0) > int(log.get("seq") or 0):
+        return f"a newer command (seq {room_rec.get('seq')}) already holds {room}"
+    return None
+
+
+def _record_applied(workspace, cmd: dict, task_id) -> int:
+    """Record BEFORE mutating. A crash between the two must LOSE a command —
+    which the owner can see and re-issue — never resurrect an older one."""
+    with _applied_locked(workspace):
+        log = _read_applied(workspace)
+        seq = int(log.get("seq") or 0) + 1
+        log["seq"] = seq
+        log.setdefault("applied", {})[str(task_id)] = {
+            "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq}
+        if cmd.get("room"):
+            log.setdefault("rooms", {})[cmd["room"]] = {
+                "seq": seq, "task_id": str(task_id), "action": cmd.get("action")}
+        pr._write_atomic(applied_path(workspace), log)
+    return seq
+
+
+def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | None":
     """Apply a parsed pin or unpin AND publish it: binding, roster and the
     advertisement in one call, so the new binding is on the wire without
-    waiting for another task. `add` is create_worker's and returns None."""
+    waiting for another task. `add` is create_worker's and returns None.
+
+    `task_id` is required for a pin or unpin: without it the call cannot be
+    replay-gated, and an ungated door is how this defect returns.
+    """
     action = (cmd or {}).get("action")
+    if action in ("pin", "unpin"):
+        reason = replay_reason(workspace, cmd, task_id, results_dir)
+        if reason:
+            return {"action": "skipped", "room": cmd.get("room"), "reason": reason}
+        _record_applied(workspace, cmd, task_id)
     if action == "pin":
         workers = list(cmd.get("workers") or [])
         if len(workers) != 1:

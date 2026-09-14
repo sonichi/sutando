@@ -454,7 +454,8 @@ class TestApply(unittest.TestCase):
         return pa.advertisement_path(self.ws).read_text()
 
     def test_a_pin_is_bound_and_advertised(self):
-        out = wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to {W1} (worker picker)"))
+        out = wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to {W1} (worker picker)"),
+                        task_id="task-pin-1")
         self.assertEqual(out["action"], "pin")
         self.assertEqual(pr.load_bindings(self.ws), {ROOM: W1})
         self.assertEqual(out["roster_version"], pr.load_roster(self.ws)["version"])
@@ -462,12 +463,15 @@ class TestApply(unittest.TestCase):
         self.assertIn(ROOM, self._advertised())
 
     def test_a_pin_by_label_is_bound_to_the_id(self):
-        wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to sudoo (worker picker)"))
+        wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to sudoo (worker picker)"),
+                  task_id="task-pin-label")
         self.assertEqual(pr.load_bindings(self.ws), {ROOM: W2})
 
     def test_an_unpin_is_removed_and_advertised(self):
-        wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to {W1} (worker picker)"))
-        out = wpc.apply(self.ws, wpc.parse(hdr(), f"Unpin room {ROOM} (worker picker: back to auto routing)"))
+        wpc.apply(self.ws, wpc.parse(hdr(), f"Pin room {ROOM} to {W1} (worker picker)"),
+                  task_id="task-pin-2")
+        out = wpc.apply(self.ws, wpc.parse(hdr(), f"Unpin room {ROOM} (worker picker: back to auto routing)"),
+                        task_id="task-unpin-1")
         self.assertEqual(out["action"], "unpin")
         self.assertEqual(pr.load_bindings(self.ws), {})
         self.assertNotIn(ROOM, self._advertised())
@@ -476,12 +480,12 @@ class TestApply(unittest.TestCase):
         cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W1} {W2} — bound set, "
                                "pool-restriction routing (worker picker)")
         with self.assertRaises(pr.RosterError):
-            wpc.apply(self.ws, cmd)
+            wpc.apply(self.ws, cmd, task_id="task-refused")
         self.assertEqual(pr.load_bindings(self.ws), {})
         self.assertFalse(pa.advertisement_path(self.ws).exists())
 
     def test_add_is_not_applied_here(self):
-        self.assertIsNone(wpc.apply(self.ws, wpc.parse(hdr(), ADD)))
+        self.assertIsNone(wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add"))
         self.assertFalse(pa.advertisement_path(self.ws).exists())
 
 

@@ -102,14 +102,19 @@ def apply_picker(workspace, task_file) -> "dict | None":
     edge, so the bridge ships the new binding without waiting for another
     task. Runs on the probe as well: the watcher probes once and, on DECLINE,
     hands the task straight to the core, so the probe is the only call a
-    picker task gets. Idempotent; a failure is reported, never fatal."""
+    picker task gets -- EXCEPT across a restart, where the startup sweep
+    re-probes every retained task, so the replay gate is what makes that safe.
+    Idempotent; a failure is reported, never fatal."""
     try:
         cmd = wpc.authorized_command(task_file)
-        out = wpc.apply(workspace, cmd) if cmd else None
+        out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem) if cmd else None
     except (pr.RosterError, OSError, ValueError) as e:
         print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
         return None
-    if out:
+    if out and out.get("action") == "skipped":
+        print(f"pool_route_handler: picker command for {out['room']} not replayed: "
+              f"{out['reason']}", file=sys.stderr)
+    elif out:
         print(f"pool_route_handler: applied {out['action']} for {out['room']} "
               f"(roster v{out['roster_version']}, advertisement written)", file=sys.stderr)
     return out
