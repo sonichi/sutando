@@ -801,6 +801,59 @@ class TestClearPending(Base):
         self.assertEqual(rc, 0)
         self.assertFalse(pd.pending_flag(self.root, "worker-3", "task-1").exists())
 
+    def _accepted(self, recipient, task_id):
+        # Spelled literally for the same reason Workspace.deliver spells `.txt`.
+        p = self.root / "deliveries" / recipient / f"{task_id}.accepted"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("")
+        return p
+
+    def test_abandon_retires_the_sentinel_so_the_sweep_never_reports_it_again(self):
+        # Both sentinel names: the hold is gone, and so is the entry the sweep would read.
+        for name, make in (("pending", lambda: self.ws.deliver("worker-3", "task-1")),
+                           ("accepted", lambda: self._accepted("worker-3", "task-1"))):
+            make(); self.ws.payload("task-1")
+            pd.mark_done(self.root, "worker-3", "task-1", published=False)
+            pd.clear_pending(self.root, "worker-3", "task-1")
+            self.assertIsNone(pd.find(self.root, "worker-3", "task-1"), name)
+            # the live core publishes later: nothing of this recipient's is left to misread
+            self.ws.result("task-1")
+            self.assertEqual(pd.sweep(self.root, "worker-3")["completed"], [], name)
+            (self.root / "results" / "task-1.txt").unlink()
+
+    def test_the_sentinel_is_found_and_removed_under_the_lock_accept_and_release_take(self):
+        # A rename between the check and the unlink would leave the sentinel alive under
+        # its other name, with the hold already withdrawn. The check must run locked.
+        import fcntl
+        from unittest import mock
+        self.ws.deliver("worker-3", "task-1"); self.ws.payload("task-1")
+        pd.mark_done(self.root, "worker-3", "task-1", published=False)
+        seen = {}
+        real_find = pd.find
+
+        def find_under_scrutiny(workspace, recipient, task_id):
+            with open(pd.deliveries_dir(workspace, recipient) / pd.LOCK_NAME, "a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    seen["held"] = True
+                else:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                    seen["held"] = False
+            return real_find(workspace, recipient, task_id)
+
+        with mock.patch.object(pd, "find", find_under_scrutiny):
+            pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertIs(seen.get("held"), True, "find ran outside the arbitration lock")
+        self.assertIsNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_abandon_leaves_a_finished_delivery_for_the_sweep(self):
+        self._accepted("worker-3", "task-1")
+        pd.mark_done(self.root, "worker-3", "task-1", published=True)
+        pd.clear_pending(self.root, "worker-3", "task-1")
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+        self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
+
     def test_writer_path_is_this_file_absolute_and_the_cli_prints_it(self):
         import io
         from contextlib import redirect_stdout
