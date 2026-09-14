@@ -35,25 +35,23 @@ repo because one lookup failed is a worse failure than the rare duplicate
 this hook exists to catch. Only an explicit "yes, this duplicates/monologues"
 (exit 1) denies.
 
-Reuses `_is_gh` from comment-signature-guard.py rather than re-implementing
-gh-command detection — see that file's own docstring for why a second copy
-of the tokenizer is the thing that goes stale.
+Tokenizes via the shared `_shell_scan` scanner rather than `shlex` — see that
+module's own docstring for the three ways a hand-rolled `shlex`/lookbehind
+parser under-denies against real bash. Scanning per-segment (a `_shell_scan`
+segment is one simple command) also means an `issue create` in one `&&`-ed
+command can never be matched against a `gh` invoked in another.
 """
-import importlib.util
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-_HOOKS_DIR = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("_csg", _HOOKS_DIR / "comment-signature-guard.py")
-_csg = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_csg)
-_is_gh = _csg._is_gh
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _shell_scan  # noqa: E402  (sibling module; path set above)
 
+_HOOKS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _HOOKS_DIR.parent
 DUP_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "gh-duplicate-check.py"
 MONO_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "pr-monologue-check.py"
@@ -61,30 +59,27 @@ MONO_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "pr-monologu
 EQUALS_FORM = re.compile(r"(--repo|--title|-R)=")
 
 
-def _tokenize(command):
+def _gh_segments(command):
+    """Each `gh`-invoking segment of `command`, as (words-after-gh) texts."""
     if not isinstance(command, str) or "gh" not in command:
-        return None
+        return []
     command = EQUALS_FORM.sub(r"\1 ", command)
-    try:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        return list(lex)
-    except ValueError:
-        return None
+    out = []
+    for seg in _shell_scan.segments(command):
+        for i, w in enumerate(seg):
+            if w.basename_is("gh"):
+                out.append([w.text for w in seg[i + 1:]])
+                break
+    return out
 
 
 def _find_subcommand(words, pair):
-    """Index just past `words[i], words[i+1] == pair`, honouring a global
-    flag (e.g. `-R owner/repo`) between `gh` and the subcommand — same
-    adjacency rule as comment-signature-guard._publishes."""
+    """Index just past `words[i], words[i+1] == pair` in a single gh segment,
+    honouring a global flag (e.g. `-R owner/repo`) before the subcommand."""
     a, b = pair
-    for i, w in enumerate(words):
-        if not _is_gh(w):
-            continue
-        rest = words[i + 1:]
-        for j in range(len(rest) - 1):
-            if rest[j] == a and rest[j + 1] == b:
-                return i + 1 + j + 2  # index just past the subcommand pair
+    for i in range(len(words) - 1):
+        if words[i] == a and words[i + 1] == b:
+            return i + 2
     return None
 
 
@@ -181,15 +176,18 @@ def check_pr_comment(words, start):
 
 def evaluate(command):
     """Returns (subcommand, reason) to deny, or None to allow."""
-    words = _tokenize(command)
-    if not words:
-        return None
-    idx = _find_subcommand(words, ("issue", "create"))
-    if idx is not None:
-        return check_issue_create(words, idx)
-    idx = _find_subcommand(words, ("pr", "comment"))
-    if idx is not None:
-        return check_pr_comment(words, idx)
+    for words in _gh_segments(command):
+        idx = _find_subcommand(words, ("issue", "create"))
+        if idx is not None:
+            found = check_issue_create(words, idx)
+            if found:
+                return found
+            continue
+        idx = _find_subcommand(words, ("pr", "comment"))
+        if idx is not None:
+            found = check_pr_comment(words, idx)
+            if found:
+                return found
     return None
 
 

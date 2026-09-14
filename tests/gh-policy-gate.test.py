@@ -37,48 +37,62 @@ def _stub(tmpdir, name, rc, stdout=""):
     return p
 
 
+def _words(command):
+    """First gh-invoking segment's words (past `gh` itself), or []."""
+    segs = G._gh_segments(command)
+    return segs[0] if segs else []
+
+
 class Tokenize(unittest.TestCase):
     def test_finds_issue_create_past_a_global_flag(self):
-        words = G._tokenize('gh -R o/r issue create --title "x"')
+        words = _words('gh -R o/r issue create --title "x"')
         idx = G._find_subcommand(words, ("issue", "create"))
         self.assertEqual(words[idx:idx + 2], ["--title", "x"])
 
     def test_finds_pr_comment_with_equals_form_flags(self):
-        words = G._tokenize('gh pr comment 42 --repo=o/r --body "hi"')
+        words = _words('gh pr comment 42 --repo=o/r --body "hi"')
         idx = G._find_subcommand(words, ("pr", "comment"))
         self.assertIsNotNone(idx)
 
     def test_a_path_qualified_gh_is_still_gh(self):
-        words = G._tokenize('/opt/homebrew/bin/gh issue create --title "x"')
+        words = _words('/opt/homebrew/bin/gh issue create --title "x"')
         self.assertIsNotNone(G._find_subcommand(words, ("issue", "create")))
 
     def test_a_command_that_merely_mentions_gh_matches_no_subcommand(self):
-        """`_tokenize` only cheap-filters on the substring "gh" (fast reject for
-        commands with no gh at all); the real word-boundary check is `_is_gh`
-        inside `_find_subcommand` — so a token that merely CONTAINS "gh" must
-        not be mistaken for the `gh` binary itself."""
-        words = G._tokenize('echo "gh is just a word here"')
+        """`_gh_segments` finds `gh` by matching a WORD's basename, via the
+        shared `_shell_scan` tokenizer — so a token that merely CONTAINS "gh"
+        (inside a quoted string here) is never mistaken for the `gh` binary."""
+        words = _words('echo "gh is just a word here"')
         self.assertIsNone(G._find_subcommand(words, ("issue", "create")))
         self.assertIsNone(G._find_subcommand(words, ("pr", "comment")))
 
     def test_unrelated_gh_subcommand_matches_neither_pair(self):
-        words = G._tokenize('gh pr view 1 --json body')
+        words = _words('gh pr view 1 --json body')
         self.assertIsNone(G._find_subcommand(words, ("issue", "create")))
         self.assertIsNone(G._find_subcommand(words, ("pr", "comment")))
+
+    def test_an_and_chain_does_not_leak_a_subcommand_across_segments(self):
+        """`gh pr view` in one `&&`-ed command must not combine with `issue
+        create` typed in a later, unrelated one — each gh segment is scanned
+        on its own."""
+        words_list = G._gh_segments('gh pr view 1 && gh issue create --title "x"')
+        self.assertEqual(len(words_list), 2)
+        self.assertIsNone(G._find_subcommand(words_list[0], ("issue", "create")))
+        self.assertIsNotNone(G._find_subcommand(words_list[1], ("issue", "create")))
 
 
 class CheckIssueCreate(unittest.TestCase):
     def test_no_candidate_allows(self):
         with tempfile.TemporaryDirectory() as td:
             G.DUP_CHECK = _stub(td, "dup.py", 0, "no candidate")
-            words = G._tokenize('gh issue create --repo o/r --title "brand new title"')
+            words = _words('gh issue create --repo o/r --title "brand new title"')
             idx = G._find_subcommand(words, ("issue", "create"))
             self.assertIsNone(G.check_issue_create(words, idx))
 
     def test_a_real_duplicate_denies_with_a_reason(self):
         with tempfile.TemporaryDirectory() as td:
             G.DUP_CHECK = _stub(td, "dup.py", 1, "REFUSE: looks like #123")
-            words = G._tokenize('gh issue create --repo o/r --title "dup"')
+            words = _words('gh issue create --repo o/r --title "dup"')
             idx = G._find_subcommand(words, ("issue", "create"))
             found = G.check_issue_create(words, idx)
             self.assertIsNotNone(found)
@@ -88,12 +102,12 @@ class CheckIssueCreate(unittest.TestCase):
     def test_cannot_answer_fails_open(self):
         with tempfile.TemporaryDirectory() as td:
             G.DUP_CHECK = _stub(td, "dup.py", 2, "no network")
-            words = G._tokenize('gh issue create --repo o/r --title "x"')
+            words = _words('gh issue create --repo o/r --title "x"')
             idx = G._find_subcommand(words, ("issue", "create"))
             self.assertIsNone(G.check_issue_create(words, idx))
 
     def test_unresolvable_title_fails_open_without_running_the_script(self):
-        words = G._tokenize('gh issue create --repo o/r')  # no --title
+        words = _words('gh issue create --repo o/r')  # no --title
         idx = G._find_subcommand(words, ("issue", "create"))
         self.assertIsNone(G.check_issue_create(words, idx))
 
@@ -108,14 +122,14 @@ class CheckPrComment(unittest.TestCase):
     def test_no_monologue_allows(self):
         with tempfile.TemporaryDirectory() as td:
             G.MONO_CHECK = _stub(td, "mono.py", 0, "safe to post")
-            words = G._tokenize('gh pr comment 42 --repo o/r --body "hi"')
+            words = _words('gh pr comment 42 --repo o/r --body "hi"')
             idx = G._find_subcommand(words, ("pr", "comment"))
             self.assertIsNone(G.check_pr_comment(words, idx))
 
     def test_a_real_monologue_denies_with_a_reason(self):
         with tempfile.TemporaryDirectory() as td:
             G.MONO_CHECK = _stub(td, "mono.py", 1, "REFUSE: trailing run of yours = 4")
-            words = G._tokenize('gh pr comment 42 --repo o/r --body "hi"')
+            words = _words('gh pr comment 42 --repo o/r --body "hi"')
             idx = G._find_subcommand(words, ("pr", "comment"))
             found = G.check_pr_comment(words, idx)
             self.assertIsNotNone(found)
@@ -125,12 +139,12 @@ class CheckPrComment(unittest.TestCase):
     def test_cannot_answer_fails_open(self):
         with tempfile.TemporaryDirectory() as td:
             G.MONO_CHECK = _stub(td, "mono.py", 2, "cannot answer")
-            words = G._tokenize('gh pr comment 42 --repo o/r --body "hi"')
+            words = _words('gh pr comment 42 --repo o/r --body "hi"')
             idx = G._find_subcommand(words, ("pr", "comment"))
             self.assertIsNone(G.check_pr_comment(words, idx))
 
     def test_unresolvable_pr_number_fails_open_without_running_the_script(self):
-        words = G._tokenize('gh pr comment --repo o/r --body "no number here"')
+        words = _words('gh pr comment --repo o/r --body "no number here"')
         idx = G._find_subcommand(words, ("pr", "comment"))
         self.assertIsNone(G.check_pr_comment(words, idx))
 
