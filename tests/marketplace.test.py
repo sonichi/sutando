@@ -257,6 +257,19 @@ class TestStatusUpdateUninstall(unittest.TestCase):
         self.assertEqual(set(tools), {"mine", "pinned-elsewhere"})
         self.assertEqual(tools["pinned-elsewhere"]["assigned_to_other_agents"], ["@old-identity:ag2.space"])
 
+    def test_status_text_names_other_agent_owners_and_skips_junk_rows(self):
+        ctx = FakeContext(self.root, inventory={
+            "installed": [{"slug": "theirs", "version": "1", "agents": ["@old:ag2.space"]}],
+            "cloudTools": ["junk", {"slug": "leads"}],
+            "connectors": [],
+        })
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            marketplace.main(["status"], ctx=ctx)
+        self.assertIn("- theirs: missing (equipped on @old:ag2.space, not this agent)", out.getvalue())
+        self.assertIn("Cloud tools: leads", out.getvalue())
+        self.assertNotIn("need updating", out.getvalue(), "another agent's skill is not this agent's update")
+
     def test_update_skips_other_agents_skills_unless_named(self):
         ctx = FakeContext(self.root, inventory=self.inv(
             {"slug": "gone", "version": "1"},
@@ -353,6 +366,18 @@ class TestSkillInstall(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tar.gz"):
             self.install(b"not a tarball")
         self.assertEqual([p.name for p in self.root.iterdir()], [])
+
+    def test_a_skill_md_directory_is_not_a_skill(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            d = tarfile.TarInfo("SKILL.md")
+            d.type = tarfile.DIRTYPE
+            tar.addfile(d)
+            f = tarfile.TarInfo("SKILL.md/inner.txt")
+            f.size = 1
+            tar.addfile(f, io.BytesIO(b"x"))
+        with self.assertRaisesRegex(ValueError, "no SKILL.md at its root"):
+            self.install(buf.getvalue())
 
     def test_refuses_symlink_target_and_bad_slug(self):
         real = self.root / "_real"
