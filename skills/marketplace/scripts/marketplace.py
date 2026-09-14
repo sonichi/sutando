@@ -213,10 +213,18 @@ def local_state(dest_root: Path, slug: str) -> str:
     return "absent"
 
 
-def applies_to_agent(row: dict, agent_id: str | None) -> bool:
-    """Same scoping as the Marketplace reconcile: unassigned rows are account-wide."""
-    agents = row.get("agents") or []
-    return not agent_id or not agents or agent_id in agents
+def other_agents(row: dict, agent_id: str | None) -> list[str]:
+    """The agents a row is equipped on when THIS agent isn't one of them.
+
+    Rows are never dropped for this: the gateway serves every owned cloud tool
+    regardless of assignment, and a row pinned to an agent id that no longer
+    runs (re-enrollment gives the agent a new mxid) would otherwise vanish from
+    status while still being owned and callable.
+    """
+    agents = [a for a in (row.get("agents") or []) if isinstance(a, str)]
+    if not agent_id or not agents or agent_id in agents:
+        return []
+    return agents
 
 
 def emit(args: argparse.Namespace, payload: dict, text: str) -> None:
@@ -448,7 +456,7 @@ def collect_status(ctx: Context) -> dict:
     inv = ctx.inventory()
     skills = []
     for row in inv.get("installed") or []:
-        if not isinstance(row, dict) or not applies_to_agent(row, ctx.agent_id):
+        if not isinstance(row, dict):
             continue
         slug = row.get("slug") or ""
         try:
@@ -468,12 +476,20 @@ def collect_status(ctx: Context) -> dict:
             status = "disabled"
         else:
             status = "ok"
-        skills.append({"slug": slug, "name": row.get("name"), "status": status, "local_version": local_v, "latest_version": cloud_v})
-    tools = [
-        {"slug": t.get("slug"), "name": t.get("name"), "calls_this_period": t.get("callsThisPeriod")}
-        for t in inv.get("cloudTools") or []
-        if isinstance(t, dict) and applies_to_agent(t, ctx.agent_id)
-    ]
+        entry = {"slug": slug, "name": row.get("name"), "status": status, "local_version": local_v, "latest_version": cloud_v}
+        elsewhere = other_agents(row, ctx.agent_id)
+        if elsewhere:
+            entry["assigned_to_other_agents"] = elsewhere
+        skills.append(entry)
+    tools = []
+    for t in inv.get("cloudTools") or []:
+        if not isinstance(t, dict):
+            continue
+        entry = {"slug": t.get("slug"), "name": t.get("name"), "calls_this_period": t.get("callsThisPeriod")}
+        elsewhere = other_agents(t, ctx.agent_id)
+        if elsewhere:
+            entry["assigned_to_other_agents"] = elsewhere
+        tools.append(entry)
     connectors = [
         {"toolkit": c.get("toolkit"), "name": c.get("name"), "status": c.get("status")}
         for c in inv.get("connectors") or []
@@ -501,13 +517,18 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
         extra = ""
         if s["status"] == "outdated":
             extra = f" ({s['local_version']} → {s['latest_version']})"
+        if s.get("assigned_to_other_agents"):
+            extra += f" (equipped on {', '.join(s['assigned_to_other_agents'])}, not this agent)"
         lines.append(f"- {s['slug']}: {s['status']}{extra}")
     if not st["skills"]:
         lines.append("- none owned")
-    lines.append("Cloud tools: " + (", ".join(t["slug"] for t in st["cloud_tools"]) or "none active"))
+    lines.append("Cloud tools: " + (", ".join(
+        t["slug"] + (f" (equipped on {', '.join(t['assigned_to_other_agents'])}, not this agent — still callable)"
+                     if t.get("assigned_to_other_agents") else "")
+        for t in st["cloud_tools"]) or "none active"))
     if st["connectors"]:
         lines.append("Connectors: " + ", ".join(f"{c['toolkit']} ({c['status']})" for c in st["connectors"]))
-    pending = [s for s in st["skills"] if s["status"] in ("missing", "outdated")]
+    pending = [s for s in st["skills"] if s["status"] in ("missing", "outdated") and not s.get("assigned_to_other_agents")]
     if pending:
         lines.append(f"{len(pending)} skill(s) need updating — run `update --yes` (no charge).")
     if st["cloud_tools"] and st["station_mcp_registered"] is False:
@@ -521,7 +542,8 @@ def cmd_update(ctx: Context, args: argparse.Namespace) -> int:
     wanted = {s.lower() for s in args.slugs}
     pending = [
         s for s in st["skills"]
-        if s["status"] in ("missing", "outdated") and (not wanted or s["slug"].lower() in wanted)
+        if s["status"] in ("missing", "outdated")
+        and (s["slug"].lower() in wanted if wanted else not s.get("assigned_to_other_agents"))
     ]
     if not pending:
         emit(args, {"pending": []}, "All owned skills are up to date.")

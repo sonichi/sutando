@@ -241,10 +241,31 @@ class TestStatusUpdateUninstall(unittest.TestCase):
             {"slug": "gone", "version": "1.0.0"},
             {"slug": "other-agent", "version": "1.0.0", "agents": ["@someone-else:ag2.space"]},
         ]
-        ctx = FakeContext(self.root, inventory=self.inv(*rows))
+        ctx = FakeContext(self.root, inventory=self.inv(*rows, tools=[
+            {"slug": "mine", "agents": []},
+            {"slug": "pinned-elsewhere", "agents": ["@old-identity:ag2.space"]},
+        ]))
         st = marketplace.collect_status(ctx)
         self.assertEqual({s["slug"]: s["status"] for s in st["skills"]},
-                         {"current": "ok", "stale": "outdated", "off": "disabled", "gone": "missing"})
+                         {"current": "ok", "stale": "outdated", "off": "disabled", "gone": "missing",
+                          "other-agent": "missing"})
+        by_slug = {s["slug"]: s for s in st["skills"]}
+        # never silently dropped: owned rows pinned to another (possibly retired) agent id stay visible
+        self.assertEqual(by_slug["other-agent"]["assigned_to_other_agents"], ["@someone-else:ag2.space"])
+        self.assertNotIn("assigned_to_other_agents", by_slug["stale"])
+        tools = {t["slug"]: t for t in st["cloud_tools"]}
+        self.assertEqual(set(tools), {"mine", "pinned-elsewhere"})
+        self.assertEqual(tools["pinned-elsewhere"]["assigned_to_other_agents"], ["@old-identity:ag2.space"])
+
+    def test_update_skips_other_agents_skills_unless_named(self):
+        ctx = FakeContext(self.root, inventory=self.inv(
+            {"slug": "gone", "version": "1"},
+            {"slug": "theirs", "version": "1", "agents": ["@other:ag2.space"]},
+        ))
+        code, out = run(ctx, ["update"])
+        self.assertEqual([p["slug"] for p in out["pending"]], ["gone"])
+        code, out = run(ctx, ["update", "theirs"])
+        self.assertEqual([p["slug"] for p in out["pending"]], ["theirs"])
 
     def test_update_refetches_only_missing_and_outdated(self):
         self.make_skill("current", "1.0.0")
@@ -453,7 +474,7 @@ class TestCoverageEdges(unittest.TestCase):
         cfg.mkdir()
         inv = {
             "installed": [{"slug": "stale", "version": "0.2.0"}, {"slug": "bundled"}, {"slug": "../bad"}, "junk"],
-            "cloudTools": [{"slug": "leads"}],
+            "cloudTools": [{"slug": "leads", "agents": ["@old:ag2.space"]}],
             "connectors": [{"toolkit": "gmail", "status": "ACTIVE"}],
         }
         ctx = FakeContext(self.root, inventory=inv, me={"plan": "max", "walletCredits": 7})
@@ -461,6 +482,7 @@ class TestCoverageEdges(unittest.TestCase):
         code, out = self.text(ctx, ["status"])
         self.assertIn("Plan: max, credits: 7", out)
         self.assertIn("- stale: outdated (0.1.0 → 0.2.0)", out)
+        self.assertIn("leads (equipped on @old:ag2.space, not this agent — still callable)", out)
         self.assertIn("- bundled: bundled", out)
         self.assertIn("Connectors: gmail (ACTIVE)", out)
         self.assertIn("1 skill(s) need updating", out)
