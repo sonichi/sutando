@@ -43,6 +43,7 @@ for _p in (str(_SCRIPTS), str(_SCRIPTS.parents[2] / "src")):
         sys.path.insert(0, _p)
 
 import local_task_protocol as ltp  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
@@ -323,12 +324,11 @@ def replay_reason(workspace, cmd: dict, task_id, results_dir=None) -> "str | Non
     if rec:
         return f"already applied as seq {rec.get('seq')}"
     rd = _results_dir(workspace, results_dir)
-    # Live AND archive: a finished command routinely survives as a live task
-    # with no live result, so a live-only check reads it as never having run.
-    if (rd / f"{task_id}.txt").is_file():
-        return "a delivered result already exists for this task"
-    if ltp.find_archived_result(rd, str(task_id)) is not None:
-        return "an archived result already exists for this task"
+    # The shared contract, never a second implementation: find_result is the
+    # live-then-archive lookup and read_ready_result rejects a placeholder body.
+    found = ltp.find_result(rd, str(task_id))
+    if found is not None and read_ready_result(found) is not None:
+        return f"a completed result already exists for this task ({found.name})"
     return None
 
 

@@ -97,7 +97,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
-def apply_picker(workspace, task_file) -> "dict | None":
+def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     """A pin is live the moment it arrives: applied and published here, at the
     edge, so the bridge ships the new binding without waiting for another
     task. Runs on the probe as well: the watcher probes once and, on DECLINE,
@@ -107,7 +107,8 @@ def apply_picker(workspace, task_file) -> "dict | None":
     Idempotent; a failure is reported, never fatal."""
     try:
         cmd = wpc.authorized_command(task_file)
-        out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem) if cmd else None
+        out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
+                        results_dir=results_dir) if cmd else None
     except (pr.RosterError, OSError, ValueError) as e:
         print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
         return None
@@ -125,7 +126,10 @@ def main(argv=None) -> int:
     p.add_argument("--task-file", required=True)
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
-    for ignored in ("--runtime", "--results-dir", "--repo"):
+    # The watcher passes its RESOLVED results dir; the replay gate reads it, so
+    # it is a real argument here rather than one parsed and thrown away.
+    p.add_argument("--results-dir", default=None)
+    for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
@@ -139,7 +143,7 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
-        apply_picker(ws, args.task_file)
+        apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:

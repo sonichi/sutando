@@ -119,6 +119,32 @@ class TestPickerReplayAcrossRestart(Base):
         self.assertIsNone(self.bindings().get(self.ROOM),
                           "a live result did not block the replay")
 
+    def test_the_replay_gate_reads_the_results_dir_the_watcher_passed(self):
+        """`--results-dir` was parsed and thrown away, so the gate consulted the
+        default directory while the watcher had resolved another one."""
+        alt = self.ws / "elsewhere"
+        (alt / "archive").mkdir(parents=True, exist_ok=True)
+        (alt / "task-old-pin.txt").write_text("done\n")
+        h.main(["--task-file", self.pin, "--workspace", str(self.ws),
+                "--results-dir", str(alt), "--probe"])
+        self.assertIsNone(self.bindings().get(self.ROOM),
+                          "a completed result in the supplied dir did not block the replay")
+
+    def test_a_placeholder_result_is_not_a_completion(self):
+        """Readiness is `delivery.readiness`'s contract: an empty or whitespace
+        body is NOT a delivered result, so treating it as one silently drops the
+        owner's routing choice."""
+        for body in ("", "   \n"):
+            with self.subTest(body=repr(body)):
+                self.setUp()
+                alt = self.ws / "elsewhere"
+                (alt / "archive").mkdir(parents=True, exist_ok=True)
+                (alt / "task-old-pin.txt").write_text(body)
+                h.main(["--task-file", self.pin, "--workspace", str(self.ws),
+                        "--results-dir", str(alt), "--probe"])
+                self.assertEqual(self.bindings().get(self.ROOM), W,
+                                 "a placeholder body blocked the pin as if it were a completion")
+
     def test_control_a_pin_with_no_completed_result_still_applies(self):
         # Without this, refusing every command would satisfy the case above.
         self.probe(self.pin)
