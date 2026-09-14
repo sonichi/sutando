@@ -123,6 +123,58 @@ def is_watcher_argv(argv: str, pid=None, argv_vector: Optional[Callable] = None)
     return classify_argv(argv, pid, argv_vector).watcher
 
 
+def watcher_script_path(argv: str, pid=None, argv_vector: Optional[Callable] = None) -> Optional[str]:
+    """The script path this watcher EXECUTED, or None when argv cannot prove it.
+
+    The executed path is the ownership signal: the script derives its repo from
+    `$0`, and callers launch it by absolute path from an unrelated cwd.
+    """
+    read = argv_vector if argv_vector is not None else proc_argv_vector
+    vec = read(pid) if pid is not None else None
+    if vec is not None and len(vec) >= 2:
+        if (vec[0].rsplit("/", 1)[-1] in WATCHER_SHELLS
+                and not vec[1].startswith("-")
+                and os.path.basename(vec[1]) == WATCHER_SCRIPT_NAME):
+            return vec[1]
+        return None
+    parts = argv.split()
+    # Only the two-token form is authoritative: past it, a spaced pathname and a
+    # script-plus-arguments are the same string.
+    if len(parts) == 2 and parts[0].rsplit("/", 1)[-1] in WATCHER_SHELLS:
+        if os.path.basename(parts[1]) == WATCHER_SCRIPT_NAME:
+            return parts[1]
+    return None
+
+
+def watcher_repo(argv: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd: Optional[str] = None) -> Optional[str]:
+    """The repo owning this watcher, from its executed script, or None if unprovable.
+
+    `cwd` resolves a RELATIVE script operand and nothing else — an absolute path
+    means cwd is irrelevant, which is where inferring ownership from cwd broke.
+    """
+    script = watcher_script_path(argv, pid, argv_vector)
+    if not script:
+        return None
+    if not os.path.isabs(script):
+        if not cwd:
+            return None
+        script = os.path.join(cwd, script)
+    # <repo>/src/watch-tasks-stream.sh -> <repo>
+    parent = os.path.dirname(os.path.normpath(script))
+    return os.path.dirname(parent) or None
+
+
+def owns_watcher(argv: str, repo: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd: Optional[str] = None) -> Optional[bool]:
+    """True/False/None — None means argv could not prove ownership either way, and
+    an unprovable owner must never be treated as a foreign one."""
+    got = watcher_repo(argv, pid, argv_vector, cwd)
+    if got is None or not repo:
+        return None
+    return os.path.normpath(got) == os.path.normpath(repo)
+
+
 class Inspection(NamedTuple):
     """`observed` False: `ps` proved nothing (failed, timed out, non-zero, empty),
     and `watcher` is then None -- an unobserved process is not a proven non-watcher."""
