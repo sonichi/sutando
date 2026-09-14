@@ -175,9 +175,11 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     # The live core owns the payload now; a sentinel left here reads `completed`
     # once it publishes, and `sweep` retires only on a flag.
     if not is_done_flag(done_flag(workspace, recipient, task_id)):
-        sentinel = find(Path(workspace), recipient, task_id)
-        if sentinel is not None:
-            with arbitration(workspace, recipient):
+        # Decide under the lock accept/release rename under; the flag check above is
+        # not synchronized with mark_done, and a flag landing late only retires a finish.
+        with arbitration(workspace, recipient):
+            sentinel = find(workspace, recipient, task_id)
+            if sentinel is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(sentinel)
     return pend
