@@ -39,6 +39,15 @@ HOOK="$REPO/src/check-pending-tasks.sh"
 
 # --- Build and PIN an isolated workspace before resolving anything ----------
 TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest.XXXXXX")"
+
+# The hook now also refuses a turn that ends with no message and no recorded
+# no-send. These cases assert the TASK gate, so satisfy the turn gate first or
+# they measure the wrong refusal.
+record_delivery() {
+  "$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)" \
+    "$REPO/src/turn_ledger.py" --workspace "$TMPWS" no-send "hook unit test" >/dev/null 2>&1 || true
+}
+
 export SUTANDO_TEST_MODE=1
 export SUTANDO_WORKSPACE="$TMPWS"
 
@@ -108,6 +117,7 @@ if [ "$(_real "$LEGACY_DIR")" = "$(_real "$WS/tasks")" ]; then
 else
   mkdir -p "$LEGACY_DIR"
   printf 'id: probe\ntask: legacy\n' > "$LEGACY_DIR/$PROBE"
+  record_delivery
   OUT="$(bash "$HOOK" 2>&1)"
   case "$OUT" in
     '{}') ok "legacy <repo>/tasks/ does not block" ;;
@@ -117,6 +127,7 @@ else
 fi
 
 # 5. Empty queue stays quiet — the control that proves case 1 measured something.
+record_delivery
 OUT="$(bash "$HOOK" 2>&1)"
 case "$OUT" in
   '{}') ok "empty queue emits {}" ;;

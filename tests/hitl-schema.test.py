@@ -7,6 +7,7 @@ revision or a repainted interaction's guard must raise, never execute.
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -54,6 +55,27 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(w["actions"][0], {"id": "reauth", "kind": "authenticate", "label": "Re-authenticate"})
         self.assertEqual(w["device"]["name"], "Qingyun's Air")
         self.assertEqual(WIRE_FIELD, "space.ag2.hitl")
+
+    def test_every_card_names_the_host_at_the_wire(self):
+        # The auth card (detector.auth_requirement) takes its device from a caller that
+        # knows only the session; the wire is where every card gets the machine.
+        import hitl.schema as SCHEMA
+        from hitl.detector import auth_requirement
+        with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
+            w = auth_requirement("g1", {"id": "sutando-core", "name": "sutando-core"}).to_wire()
+            self.assertEqual(w["device"], {"id": "sutando-core", "name": "sutando-core", "host": "Chis-MacBook-Pro"})
+            kept = make_req(device={"id": "d1", "name": "n", "host": "Other-Mac"}).to_wire()["device"]
+            self.assertEqual(kept["host"], "Other-Mac")  # a producer's own value is never overwritten
+            self.assertNotIn("device", make_req(device=None).to_wire())  # no device, no invented one
+        with mock.patch.object(SCHEMA, "device_host", return_value=""):
+            self.assertNotIn("host", make_req(device={"id": "d1"}).to_wire()["device"])  # unknown: no key, not ""
+        calls = []
+        def once():
+            calls.append(1)
+            return "Chis-MacBook-Pro" if len(calls) == 1 else ""
+        with mock.patch.object(SCHEMA, "device_host", side_effect=once):
+            self.assertEqual(make_req(device={"id": "d1"}).to_wire()["device"].get("host"), "Chis-MacBook-Pro")
+        self.assertEqual(len(calls), 1)
 
     def test_unknown_kind_coerces(self):
         self.assertEqual(make_req(kind="martian").kind, "unknown")
