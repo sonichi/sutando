@@ -229,8 +229,25 @@ def ps_watcher_index(ps_output: str, is_watcher: Optional[Callable] = None) -> t
     return parent, live
 
 
-def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable] = None) -> dict:
+def foreign_root(argv: str, repo: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd_of: Optional[Callable] = None) -> bool:
+    """True only when this root is PROVABLY another checkout's.
+
+    Unprovable is not foreign: a tree we cannot attribute is kept, because
+    missing a live watcher starts a second one and every task runs twice, while
+    keeping a foreign one costs a redundant skip.
+    """
+    cwd = cwd_of(pid) if (cwd_of is not None and pid is not None) else None
+    return owns_watcher(argv, repo, pid, argv_vector, cwd) is False
+
+
+def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable] = None,
+                  repo: Optional[str] = None, argv_vector: Optional[Callable] = None,
+                  cwd_of: Optional[Callable] = None) -> dict:
     """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    `repo`: drop trees whose ROOT provably belongs to another checkout, by the
+    script it executed. Omitted, nothing is filtered and the result is unchanged.
 
     Each watcher is several processes (a shell wrapper, the script, a subshell),
     so counting matching lines overcounts. A "root" is a match whose parent is
@@ -256,7 +273,18 @@ def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable
             seen.add(root)
             root = parent[root]
         trees.setdefault(root, set()).add(pid)
-    return trees
+    if not repo:
+        return trees
+    # The SAME snapshot, re-read for argv: a second `ps` could disagree about a
+    # process that exited between them, which is what the index's note warns of.
+    argv_of = {}
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            argv_of[parts[0]] = parts[2]
+    return {root: members for root, members in trees.items()
+            if not foreign_root(argv_of.get(root, ""), repo, as_pid(root),
+                                argv_vector, cwd_of)}
 
 
 def main(argv=None) -> int:
