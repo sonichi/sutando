@@ -12,14 +12,16 @@ honest:
     "worker picker" grants nothing, or anyone who can send a message could
     create workers.
 
-Both rules rest on one mechanism: every field this module trusts is read with
-the STRICT parser, which stops at `task:`, so the body cannot supply any of
-them. `parse_task_headers_lenient` scans the whole file and would let a body
-line supply a key the file legitimately lacks, which is exactly the forgery
-these two rules exist to prevent — it must never be used here. The producer
-side of that bargain: `source` and `channel_id` must be written ABOVE `task:`,
-the slot `requested_worker` and `priority` already occupy, or this reader
-sees neither and refuses.
+Both rules rest on one mechanism: the parser is chosen by WRITER, not by any
+value in the file. A task-last file is read STRICTLY — parsing stops at `task:`,
+so a body cannot supply a header. The remote-gateway bridge is the one writer
+that puts fields below `task:`; it newline-strips every value, which is what
+makes its last-wins scan safe, and it stamps `receiving_instance` above `task:`,
+which is how it is RECOGNISED rather than inferred from a header it also writes.
+Sniffing the writer from a value is the forgery these rules exist to prevent:
+a body line `access_tier: owner` under a last-wins scan is an authorization
+bypass, not a typo. The producer side of the bargain: a task-last writer must
+put `source` and `channel_id` ABOVE `task:`, or this reader refuses.
 
 It returns intent. Acting on one is the caller's, so a misparse cannot spawn.
 """
@@ -255,21 +257,25 @@ def parse_task_file(path) -> "dict | None":
 def authorized_command(path) -> "dict | None":
     """The picker command in one task file, or None unless the OWNER sent it.
 
-    Two writer shapes exist. A task-last writer puts `source:` above `task:`,
-    where the strict parser reads it: if that source is not the picker's, the
-    file is some other channel's and nothing below `task:` may promote it. A
-    gateway writer puts the picker mark and the tier below `task:` and
-    newline-strips every value, which is what makes the last-wins parse safe.
+    Two writer shapes exist, and which one this is decides the parser. A
+    task-last writer puts every header above `task:`; everything below is the
+    sender's text and may promote nothing. The remote-gateway bridge writes the
+    picker mark and the tier below `task:` and newline-strips every value, which
+    is what makes its last-wins parse safe -- and it stamps `receiving_instance`
+    above `task:`, which is how that writer is recognised rather than guessed.
     """
     text = Path(path).read_text(encoding="utf-8", errors="replace")
-    above = ltp.parse_task_headers(text).headers
+    strict = ltp.parse_task_headers(text)
+    above = strict.headers
     if above.get("source") is not None and (above.get("source") or "").strip() != SOURCE:
         return None
-    trusted = ltp.parse_task_headers_trusted(text)
-    if (trusted.headers.get("access_tier") or "").strip() != "owner":
+    # Chosen by WRITER, never by a value: the gateway stamps `receiving_instance`
+    # above `task:`, the one slot a task body cannot reach.
+    parsed = ltp.parse_task_headers_trusted(text) if above.get("receiving_instance") else strict
+    if (parsed.headers.get("access_tier") or "").strip() != "owner":
         return None
-    sentence = (trusted.body or "").split("\n", 1)[0]
-    return parse(trusted.headers, sentence)
+    sentence = (parsed.body or "").split("\n", 1)[0]
+    return parse(parsed.headers, sentence)
 
 
 def applied_path(workspace) -> Path:

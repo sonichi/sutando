@@ -61,7 +61,10 @@ class TestPickerReplayAcrossRestart(Base):
     def picker(self, name, sentence):
         # the gateway writer shape: `task:` first, the picker mark below it.
         p = self.ws / "tasks" / f"{name}.txt"
-        p.write_text(f"id: {name}\ntask: {sentence}\nsource: ag2space\n"
+        # the real gateway writer shape: `receiving_instance` above `task:` is
+        # what marks the writer whose below-task fields are its own.
+        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\n"
+                     f"task: {sentence}\nsource: ag2space\n"
                      f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
                      f"user_id: @q:b\naccess_tier: owner\n")
         return str(p)
@@ -169,7 +172,8 @@ class TestPickerCommandsStayWithTheController(Base):
         # the strict parse never looks.
         p = self.ws / "tasks" / "worker-pin-1.txt"
         tail = "\nsource: ag2space\nwire_source: worker-picker\n" if wire else "\nsource: ag2space\n"
-        p.write_text("id: worker-pin-1\nchannel_id: !room:x\ntask: Pin room !room:x to w (worker picker)" + tail)
+        p.write_text("id: worker-pin-1\nreceiving_instance: @me:ag2.space\nchannel_id: !room:x\n"
+                     "task: Pin room !room:x to w (worker picker)" + tail)
         return str(p)
 
     def test_a_pin_for_a_bound_room_is_not_routed_to_the_bound_worker(self):
@@ -384,7 +388,9 @@ class TestPickerAppliedAtTheEdge(Base):
 
     def picker_file(self, name, sentence, tier="owner"):
         p = self.ws / "tasks" / f"{name}.txt"
-        p.write_text(f"id: {name}\nenvelope_hmac: v1:abc\ntask: {sentence}\n"
+        # `receiving_instance` is the writer stamp the reader keys on; it is in
+        # KNOWN_HEADER_KEYS, which `envelope_hmac` is not.
+        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
                      f"source: ag2space\nwire_source: worker-picker\n"
                      f"channel_id: !other:x\naccess_tier: {tier}\n")
         return str(p)
