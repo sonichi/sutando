@@ -130,7 +130,10 @@ class HumanRequirement:
 
     def wire_device(self) -> Optional[Dict[str, str]]:
         """The device as a reader sees it: the producer's dict plus `host` (this
-        machine's label) when the producer left it out. Every card, one place."""
+        machine's label) when the producer left it out. Every card, one place.
+        Assumes the store is per-host (state/hitl is not vault-carried), so the
+        serializing machine is the one the terminal is on; a producer that knows
+        a remote host must set `host` itself."""
         if not self.device:
             return None
         device = dict(self.device)
