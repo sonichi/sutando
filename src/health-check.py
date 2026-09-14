@@ -6657,7 +6657,8 @@ def check_core_supervisor() -> dict:
     "needs you" line + the prompt excerpt; degraded states (crashed / hung /
     gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
     last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
-    running, or a pre-supervisor install).
+    running, or a pre-supervisor install). File present but unparseable → warn:
+    it can hide a hard blocker, and the relay escalates on it too.
     """
     name = "core-supervisor"
     sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
@@ -6666,7 +6667,12 @@ def check_core_supervisor() -> dict:
     try:
         data = json.loads(sig_path.read_text())
     except Exception as e:
-        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+        data, err = None, str(e)[:60]
+    else:
+        err = f"expected an object, got {type(data).__name__}"
+    if not isinstance(data, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"core-supervisor.json unreadable ({err}) — a blocked core can't be ruled out"}
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
