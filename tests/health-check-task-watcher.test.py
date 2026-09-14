@@ -130,7 +130,7 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     it has unknown parentage. The parent probes are stubbed unconditionally —
     `trees` invents pids, and an unstubbed probe reads the HOST's process table,
     where a fabricated pid may really exist and carry a real parent.
-    
+
     `argv_vectors` maps a fabricated pid to the OS-authoritative argv vector the
     module-wide fabrication reports for it; a pid absent from it has none, so
     the injected flat `argv` decides.
