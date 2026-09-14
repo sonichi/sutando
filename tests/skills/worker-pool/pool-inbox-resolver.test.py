@@ -342,6 +342,79 @@ class TestMainInProcess(Base):
         self.assertIn("deliveries", err)
 
 
+class TestTheseBranchesInProcess(Base):
+    """The wrapper cases prove the shipped path but run in a subprocess, so they
+    earn no coverage. These reach the same branches in-process.
+    """
+
+    def _main(self, *args):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        import resolve_inbox_entry as r
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = r.main(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_workspace_flag_is_accepted_and_stripped(self):
+        want = self.payload()
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", str(self.root))
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out.strip()), want)
+
+    def test_a_workspace_flag_with_no_value_is_a_usage_error(self):
+        rc, out, err = self._main(self.deliver("task-1.txt"), "--workspace")
+        self.assertEqual((rc, out.strip()), (2, ""))
+        self.assertIn("needs a directory", err)
+
+    def test_an_empty_workspace_value_reads_as_not_assigned(self):
+        # The watcher passes "${WORKSPACE_DIR:-}", so an unset one arrives empty
+        # rather than absent; it must mean "no assignment", not "the tree ''".
+        want = self.payload()
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", "  ")
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out.strip()), want)
+
+    def test_a_disagreeing_workspace_returns_one_in_process(self):
+        self.payload()
+        other = self.root / "elsewhere"
+        (other / "deliveries" / "worker-1").mkdir(parents=True)
+        rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", str(other))
+        self.assertEqual((rc, out.strip()), (1, ""))
+
+
+class TestIsRegularFile(Base):
+    """Every rejection branch of the predicate `find` and the payload check rest
+    on. A directory, a symlink and an absent path must each read as "not a file"
+    rather than raising into the caller.
+    """
+
+    def test_a_regular_file_is(self):
+        p = self.root / "plain"; p.write_text("", encoding="utf-8")
+        self.assertTrue(pd.is_regular_file(p))
+
+    def test_absent_is_not(self):
+        self.assertFalse(pd.is_regular_file(self.root / "nope"))
+
+    def test_a_path_under_a_non_directory_is_not(self):
+        f = self.root / "afile"; f.write_text("", encoding="utf-8")
+        self.assertFalse(pd.is_regular_file(f / "under-a-file"))
+
+    def test_a_directory_is_not(self):
+        self.assertFalse(pd.is_regular_file(self.root / "tasks"))
+
+    def test_a_symlink_is_not_even_when_its_target_is_regular(self):
+        # O_NOFOLLOW raises ELOOP here; the predicate answers False rather than
+        # letting a planted link decide which body the caller reads.
+        target = self.root / "real"; target.write_text("", encoding="utf-8")
+        link = self.root / "link"; link.symlink_to(target)
+        self.assertFalse(pd.is_regular_file(link))
+
+    def test_a_broken_symlink_is_not(self):
+        link = self.root / "broken"; link.symlink_to(self.root / "absent")
+        self.assertFalse(pd.is_regular_file(link))
+
+
 class TestItDelegatesRatherThanReimplementing(Base):
     def test_the_entry_contract_is_OBTAINED_from_pool_delivery(self):
         """Behaviourally, not by agreeing numerically: an inverse hand-rolled
