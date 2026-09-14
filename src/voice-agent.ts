@@ -1705,6 +1705,9 @@ async function main() {
 			// (the crash-evidence rule: end-of-session-only flushes lose it).
 			audioHealth.onClientDisconnected();
 			audioHealth.persistTick('final', false);
+			// Leave nothing for the next connect to resume: bodhi replays items.slice(-10)
+			// as a user turn (sendContent's turnComplete=false is realtimeInput here).
+			itemsClear.clear('client-disconnect');
 			scheduleIdleTeardown();
 			// Step 12/A9: client detach is a lifecycle transition (and may
 			// flip upstream backoff→idle now that no client is attached).
