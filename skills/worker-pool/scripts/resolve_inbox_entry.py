@@ -11,6 +11,7 @@ non-zero exit with the reason on stderr and an empty stdout.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,18 +19,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pool_delivery as pd  # noqa: E402
 
 
+def assigned_workspace():
+    """The workspace the WATCHER was assigned, or None when it named none.
+
+    Authoritative there ("whoever named that inbox names the workspace too"), so
+    a resolver deriving its own can answer for a tree the caller is not serving.
+    """
+    v = (os.environ.get("SUTANDO_WORKSPACE_DIR") or "").strip()
+    return Path(v) if v else None
+
+
 def resolve(entry: str, workspace=None) -> Path:
     """The payload `entry` stands for.
 
-    `entry` must be the path the watcher saw: its basename carries the sentinel
-    and its parents carry the workspace, so one argument fixes both. The layout
-    and its validation belong to pool_delivery; this reads the payload it names.
+    The assigned workspace wins when set, and `parse_entry` refuses if the entry
+    does not live in it — a disagreement is two trees, not a redirect to obey.
     """
+    if workspace is None:
+        workspace = assigned_workspace()
     ws, _recipient, task_id, _accepted = pd.parse_entry(entry, workspace)
-    # Accepted and pending spell the same task, so both resolve: the watcher
-    # announces whichever name it saw and neither implies a different body.
-    path = pd.payload_path(ws, task_id).resolve()
-    if not path.is_file():
+    # abspath, NOT resolve(): resolving would follow a symlink at the payload
+    # name, and the caller adopts the returned basename as the task's identity.
+    path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
+    if not pd.is_regular_file(path):
         raise ValueError(f"sentinel {task_id} names no payload at {path}")
     return path
 

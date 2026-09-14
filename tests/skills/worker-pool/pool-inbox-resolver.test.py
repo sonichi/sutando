@@ -149,20 +149,39 @@ class TestItFailsClosed(Base):
 
 
 class TestItResolvesTheAssignedTree(Base):
-    def test_the_workspace_comes_from_the_entry_not_from_the_environment(self):
-        """Two trees cannot diverge if there is only one source: the sentinel's
-        own path. A decoy payload in another tree must not be chosen."""
-        want = self.payload()
+    """`SUTANDO_WORKSPACE_DIR` is the workspace the WATCHER was assigned, and the
+    watcher treats it as authoritative. A resolver that derives its own instead
+    can answer for a tree whose claims, state and results belong elsewhere.
+    """
+
+    def test_an_assigned_workspace_that_disagrees_is_refused_through_the_wrapper(self):
+        # The mismatch case: entry in tree A, the watcher serving tree B. Neither
+        # is authoritative over the other, so the only safe answer is refusal.
+        self.payload()
+        entry = self.deliver("task-1.txt")
         other = self.root / "other"
         (other / "tasks").mkdir(parents=True)
+        (other / "deliveries" / "worker-1").mkdir(parents=True)
         (other / "tasks" / "task-1.txt").write_text("WRONG TREE\n", encoding="utf-8")
-        r = self.run_resolver(self.deliver("task-1.txt"),
-                              env={"SUTANDO_WORKSPACE_DIR": str(other)})
+        r = self.run_resolver(entry, env={"SUTANDO_WORKSPACE_DIR": str(other)})
+        self.assertNotEqual(r.returncode, 0, "the resolver answered across two trees")
+        self.assertEqual(r.stdout.strip(), "", "a mismatch must print no path")
+
+    def test_the_assigned_workspace_agreeing_resolves(self):
+        want = self.payload()
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry, env={"SUTANDO_WORKSPACE_DIR": str(self.root)})
         self.assertEqual(r.returncode, 0, r.stderr)
-        got = Path(r.stdout.strip()).resolve()
-        self.assertEqual(got, want.resolve())
-        # The env var names the decoy and is deliberately ignored.
-        self.assertNotEqual(got, (other / "tasks" / "task-1.txt").resolve())
+        self.assertEqual(Path(r.stdout.strip()), want)
+
+    def test_unset_falls_back_to_the_entrys_own_tree(self):
+        # The control that keeps the two above honest: without an assignment the
+        # entry is the only source, and resolution must still work.
+        want = self.payload()
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry, env={"SUTANDO_WORKSPACE_DIR": ""})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(r.stdout.strip()), want)
 
     def test_an_entry_outside_a_delivery_folder_is_refused(self):
         self.payload()
@@ -183,6 +202,42 @@ class TestItResolvesTheAssignedTree(Base):
         (other / "tasks" / "task-1.txt").write_text("WRONG TREE\n", encoding="utf-8")
         with self.assertRaises(pd.NotDelivered):
             r.resolve(entry, other)
+
+
+class TestItRefusesPlantedPaths(Base):
+    """A delivery entry and a payload are REGULAR files. A directory or symlink
+    at either name lets whoever planted it choose which body the core runs, and
+    the caller adopts the returned basename as the task's identity.
+    """
+
+    def test_a_directory_at_the_sentinel_name_is_not_a_delivery(self):
+        self.payload()
+        d = Path(self.inbox("task-1.txt")); d.parent.mkdir(parents=True, exist_ok=True)
+        d.mkdir()
+        r = self.run_resolver(str(d))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_a_symlink_at_the_sentinel_name_is_not_a_delivery(self):
+        self.payload()
+        real = self.root / "planted"; real.write_text("", encoding="utf-8")
+        link = Path(self.inbox("task-1.txt")); link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        r = self.run_resolver(str(link))
+        self.assertNotEqual(r.returncode, 0, "a symlink authorised a delivery")
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_a_symlinked_payload_cannot_redirect_the_task_identity(self):
+        """The escape kewei measured: the payload name is a link to another
+        task's body, and following it dispatches that body under this name."""
+        other = self.root / "tasks" / "task-other.txt"
+        other.write_text("id: task-other\ntask: NOT THIS ONE\n", encoding="utf-8")
+        link = self.root / "tasks" / "task-1.txt"
+        link.symlink_to(other)
+        entry = self.deliver("task-1.txt")
+        r = self.run_resolver(entry)
+        self.assertNotEqual(r.returncode, 0, "a symlinked payload was accepted")
+        self.assertEqual(r.stdout.strip(), "", "it printed a path into another task")
 
 
 class TestTheWorkersResolvedInterpreter(Base):

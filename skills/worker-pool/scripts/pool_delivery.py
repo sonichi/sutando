@@ -207,13 +207,30 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
                   if (got := parse_sentinel(p.name)) and got[1])
 
 
+def is_regular_file(path) -> bool:
+    """A REGULAR file at that exact name, never followed. `exists()` accepts a
+    directory or a symlink, and authorising delivery on one lets a planted link
+    decide which body the caller reads.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return False  # ELOOP on a symlink: not a delivery, not an error to raise
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
     """The sentinel for `task_id` under either name, or None."""
     d = deliveries_dir(workspace, recipient)
     for name in (task_id + PENDING_SUFFIX, task_id + ACCEPTED_SUFFIX,
                  task_id + LEGACY_ACCEPTED_SUFFIX):
         p = d / name
-        if p.exists():
+        if is_regular_file(p):
             return p
     return None
 
