@@ -67,6 +67,16 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
+`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
+already serialized as a string; the bridge writes it as JSON either way. Both
+are written as trusted pre-body headers, because `worker_picker_commands.py`
+reads them with the parser that stops at `task:`. A command the reader cannot
+honour — an unknown verb, args that are not an object, or arguments that do not
+fit the verb — is refused by name rather than resolved from the sentence, and
+the room always comes from `channel_id`, never from `picker_args`. A broker
+that sends no `picker_command` keeps the prose fallback.
+
 An AG2 Space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
@@ -123,6 +133,52 @@ body: {
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
+
+### `POST /v1/workers` *(optional)*
+
+The worker pool this gateway fronts, pushed when the local advertisement's
+content changes and re-sent every 600 s so a relay that restarted with an empty
+copy heals without an operator. Sent only when the gateway finds a readable
+advertisement; a gateway with no pool never calls it.
+
+```
+body: {
+  "roster_version": <int>,           // monotonic per publisher
+  "live_cores": ["<worker id>", …],  // ids currently serving
+  "dead_cores": ["<worker id>", …],
+  "bindings": { "<room id>": "<worker id>" },  // rooms the owner pinned
+  "ts": <unix seconds>               // when the publisher compiled it
+}
+success: 2xx, body ignored
+```
+
+### `PUT /v1/agents/<mxid>/profile` *(optional)*
+
+The instance's identity card, pushed on the same change signal and cadence as
+the workers snapshot, from the same single read, so the two can never describe
+different revisions. `<mxid>` is percent-encoded as one path segment.
+
+```
+body: {
+  "display": { "name": "<display name>" },
+  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
+             // label always; runtime when the publisher knows it
+}
+success: 2xx, body ignored
+```
+
+The broker REPLACES the profile document, so the gateway sends this only from
+an advertisement it could read in full.
+
+**Unsupported is not an error.** A relay that does not implement either route
+answers `404`, `405` or `501`; the gateway logs once and stops trying for an
+hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
+Neither call can fail the task loop: both are handed to a background thread
+AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
+a slow push is still in flight and an optional push never delays an
+owner-approved publication. A push still running when the next beat arrives is
+left to finish; that beat's push is skipped, not queued.
 
 ## Media markers (optional)
 

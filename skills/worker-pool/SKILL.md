@@ -9,8 +9,10 @@ user-invocable: false
 **Placeholder.** `CONTRIBUTING.md` requires a `SKILL.md` beside `scripts/`; this file
 satisfies that and nothing more.
 
-Three stage-1 modules for the worker pool live in `scripts/`. They have no
-production caller yet — their suites are the only thing that imports them:
+Stage-1 modules for the worker pool live in `scripts/`. Only
+`resolve_inbox_entry.py` has a production caller — the core watcher execs its
+`resolve-inbox-entry` wrapper as `$SUTANDO_INBOX_RESOLVER`; the rest are imported
+only by their suites:
 
 ```
 $ grep -rnE 'pool_roster|worker_identity|pool_delivery' src/ scripts/
@@ -28,7 +30,7 @@ runner already globs.
 The design document these modules implement is **not on `main`** — it lands via
 sonichi/sutando#4041. `pool_delivery.py`'s header cites `docs/worker-pool-design.md`
 by path; that reference is inherited from before this move and is dead until #4041
-merges. Until then the modules' own headers and their three suites are the
+merges. Until then the modules' own headers and their suites are the
 authoritative description.
 
 Describing what each module owns is deliberately left to the PR that wires the pool
