@@ -154,14 +154,27 @@ class CitationCliTests(unittest.TestCase):
         m.assert_called_once_with("hi", ROOM, None, reply_to=None, worker="core-9")
 
     def test_mention_flag_reaches_mention(self):
+        # `handle` is `nargs="+"`, so even a single CLI handle arrives as a list.
         with mock.patch.object(room_ops._mention, "mention",
                                return_value={"ok": True, "room_id": ROOM, "mxid": "@p:hs",
-                                             "event_id": "$e", "candidates": [],
-                                             "reason": None}) as m:
+                                             "mxids": ["@p:hs"], "event_id": "$e",
+                                             "candidates": [], "reason": None,
+                                             "failures": []}) as m:
             with mock.patch("sys.stdout"):
                 rc = room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
         self.assertEqual(rc, 0)
-        m.assert_called_once_with("peer", "ping", ROOM, None, reply_to=EV)
+        m.assert_called_once_with(["peer"], "ping", ROOM, None, reply_to=EV)
+
+    def test_mention_flag_accepts_several_handles(self):
+        with mock.patch.object(room_ops._mention, "mention",
+                               return_value={"ok": True, "room_id": ROOM,
+                                             "mxid": "@p:hs", "mxids": ["@p:hs", "@q:hs"],
+                                             "event_id": "$e", "candidates": [],
+                                             "reason": None, "failures": []}) as m:
+            with mock.patch("sys.stdout"):
+                rc = room_ops._main(["mention", "peer", "queenie", "ping", ROOM])
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with(["peer", "queenie"], "ping", ROOM, None, reply_to=None)
 
     def test_help_says_a_citation_is_not_a_thread(self):
         # The surface a caller reads first must carry the limitation, not only
