@@ -261,6 +261,19 @@ class TestHookRegistration(unittest.TestCase):
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
                 self.assertIn("NOT running the installer's command", out["detail"])
 
+    def test_the_foreign_remedy_scopes_the_omit_flag_to_the_archive_family(self):
+        # Measured by qingyun-wu on the real installer: with the flag SET a non-archive
+        # foreign hook still prunes (removed=1). The flag adds ONE deprecated entry.
+        repo = self._one_hook_repo("nonarch", lambda r: "bash /opt/elsewhere/src/check-pending-tasks.sh")
+        out = self.hc.check_claude_hook_registration(repo_dir=repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        remedy = out.get("remedy", "") or out["detail"]
+        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", remedy)
+        self.assertNotIn("do NOT pass", remedy,
+                         "a NON-archive foreign hook must keep the opt-out: with the flag set it "
+                         "still prunes, and the plain run would install the ~/Desktop archiver "
+                         f"for nothing. got: {remedy}")
+
     def test_a_GENUINE_checkout_is_not_reported_foreign(self):
         # Over-trigger control for the fix above: a warning that fires on healthy hosts is
         # its own defect. Exact path, and the same path reached through a symlink (macOS
@@ -424,6 +437,8 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
                 p=f"{r}/src/check-pending-tasks.sh")}]}],
+            "UserPromptSubmit": [{"hooks": [
+                {"command": f"bash {r}/src/turn-start.sh"}]}],
         }}))
         return r
 
@@ -444,7 +459,7 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         r = self._repo("bash {p}")
         out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
-        self.assertIn("4", out["detail"])
+        self.assertIn("5", out["detail"])
         self._assert_probe_read_the_fixture(r)
 
     def test_decoys_are_rejected_on_the_REAL_installer_shape(self):

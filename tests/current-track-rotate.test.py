@@ -621,5 +621,133 @@ class RotateAndAppend(unittest.TestCase):
         r = Cli(app, stdin="## 2026-09-06T02:30Z — no trailing newline")(self.p); self.assertEqual(r.returncode, 0)
         self.assertTrue(self.p.read_text().endswith("no trailing newline\n"))
 
+
+
+class PinVocabularyDiscriminates(unittest.TestCase):
+    """PIN_DEFAULT must pin a live hold and NOT pin prose that merely says the word.
+
+    The pin is what keeps rotation from archiving an owner hold, so a false positive is
+    not cosmetic: on a real host 4 of 4 sections matched and rotation could free 0 B,
+    while the entries actually holding the budget were a negation and a note *about*
+    this bug. Measured on two hosts: every match was the ordinary lowercase verb.
+    """
+
+    # Each case is (text, should_pin, why) — one table so a new spelling is one row.
+    CASES = [
+        # --- must NOT pin: the word appears, the meaning is absent -------------------
+        ("No live owner hold in this section.", False, "negation"),
+        ("Prior block's facts still hold: CLEAN is not the review bar.", False, "ordinary verb"),
+        ("`gh api --paginate` all still hold — see the block below.", False, "ordinary verb"),
+        ("the bottleneck the recap pointed at, now with a real number. I hold 6.", False,
+         "ordinary verb"),
+        ("3 of 4 sections pinned by the GENUINE authority.json hold; see #4031.", False,
+         "a note ABOUT a hold is not a hold"),
+        # --- must pin: a real, live marker ------------------------------------------
+        ("## HOLD: hands off #3166, in force until 2026-09-08", True, "all-caps status token"),
+        ("state/authority.json github_formal_review=hold (set after an unauthorised APPROVE)",
+         True, "config VALUE — lowercase by construction"),
+        ("do not merge until the owner rules", True, "imperative"),
+        ("hands off this branch", True, "imperative"),
+        ("⛔ blocked pending the owner", True, "explicit marker"),
+        ("awaiting the owner", True, "explicit wait"),
+    ]
+
+    def test_each_spelling_is_classified_by_meaning_not_by_the_bare_word(self):
+        for text, want, why in self.CASES:
+            with self.subTest(why=why, text=text[:48]):
+                got = bool(ct.PIN_DEFAULT.search(text))
+                self.assertEqual(got, want,
+                                 f"{'should' if want else 'should NOT'} pin ({why}): {text!r}")
+
+    def test_a_negation_entry_is_actually_archived_end_to_end(self):
+        """The regex table above is a unit; this is the behaviour it exists to produce."""
+        pre, _ = fixture(0)
+        denial = ("## 2026-01-01T00:00Z — status\nNo live owner hold in this section.\n\n")
+        E = lambda n, c: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + (c * 900) + "\n\n"
+        filler = "".join(E(i, "x") for i in range(2, 29))
+        r = ct.plan(pre + denial + filler, 8 * 1024)
+        self.assertNotIn("No live owner hold", r.head,
+                         "an entry that says there is NO hold was pinned as if there were one")
+        self.assertIn("No live owner hold", r.archived, "it must be archived, never dropped")
+
+    def test_a_config_value_hold_survives_every_budget(self):
+        """The genuine marker on this host is a lowercase config value, not a status token.
+        A case-sensitive-only narrowing would archive it the moment it is not newest."""
+        pre, _ = fixture(0)
+        hold = ("## 2026-01-01T00:00Z — authority\n"
+                "state/authority.json github_formal_review=hold — unruled\n\n")
+        E = lambda n, c: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + (c * 900) + "\n\n"
+        filler = "".join(E(i, "y") for i in range(2, 29))
+        corpus = pre + hold + filler
+        for keep in (1024, 4 * 1024, 8 * 1024, 32 * 1024):
+            with self.subTest(keep=keep):
+                r = ct.plan(corpus, keep)
+                self.assertIn("github_formal_review=hold", r.head,
+                              f"live config-value hold archived at keep={keep}")
+
+    def test_a_hold_line_does_not_pin_its_whole_entry(self):
+        """A pin buys the HOLD LINES a place in the head, not the entry carrying them.
+        Entry-granular pinning kept 15 KB of prose live for one 40-byte hold."""
+        pre, _ = fixture(0)
+        big = ("## 2026-09-01T10:00Z — status\n" + ("filler nobody greps\n" * 900)
+               + "HOLD: do not touch PR #123 until the owner says\n\n")
+        E = lambda n: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + ("y" * 900) + "\n\n"
+        corpus = pre + big + "".join(E(i) for i in range(2, 9))
+        r = ct.plan(corpus, 8 * 1024)
+        self.assertIn("HOLD: do not touch PR #123", r.head,
+                      "the hold line must stay greppable in the head")
+        self.assertNotIn("filler nobody greps", r.head,
+                         "the carrier prose must not ride on the hold")
+        self.assertIn("filler nobody greps", r.archived,
+                      "the full entry must be archived, never dropped")
+        self.assertFalse(r.oversized, "condensing must bring the head under budget")
+
+    def test_the_walk_may_spend_the_bytes_condensing_freed(self):
+        """Charging a pin at its stub is what returns the carrier's bytes to the walk.
+        Charge the whole entry and the head stays far under budget with entries archived."""
+        pre, _ = fixture(0)
+        big = ("## 2026-09-01T10:00Z — status\n" + ("filler\n" * 900)
+               + "HOLD: do not touch PR #123\n\n")
+        E = lambda n: f"## 2026-09-{n:02d}T00:00Z — entry {n}\n" + ("y" * 400) + "\n\n"
+        corpus = pre + big + "".join(E(i) for i in range(2, 30))
+        r = ct.plan(corpus, 8 * 1024)
+        self.assertFalse(r.oversized)
+        used = len(r.head.encode("utf-8"))
+        self.assertGreater(used, int(8 * 1024 * 0.85),
+                           f"head used only {used} B of 8192 — the freed bytes were never spent")
+
+    # A corpus UNDER the cap makes plan() return it unchanged, so every "stayed
+    # whole" assertion passes without rotating. Each case below asserts it rotated.
+    def _pinned_walk_corpus(self):
+        pre, _ = fixture(0)
+        old_pin = ("## 2026-09-02T00:00Z — old\n" + ("y" * 1200) + "\n"
+                   + "HOLD: do not merge #1\n\n")
+        filler = "".join(f"## 2026-09-{i:02d}T00:00Z — mid {i}\n" + ("y" * 900) + "\n\n"
+                         for i in range(3, 12))
+        recent = ("## 2026-09-20T10:00Z — recent\n" + ("context that matters\n" * 8)
+                  + "HOLD: do not merge #9\n\n")
+        return pre + old_pin + filler + recent
+
+    def test_a_pinned_entry_the_walk_reached_stays_whole(self):
+        """Condensing is for entries kept ONLY by their pin; a recent one is not summarised."""
+        corpus = self._pinned_walk_corpus()
+        cap = 8 * 1024
+        self.assertGreater(len(corpus.encode("utf-8")), cap,
+                           "corpus is under the cap, so plan() returns it unrotated")
+        r = ct.plan(corpus, cap)
+        self.assertTrue(r.archived, "nothing was archived — the walk never ran")
+        self.assertIn("context that matters", r.head,
+                      "a recent pinned entry was condensed despite fitting")
+
+    def test_an_old_pin_the_walk_never_reached_is_still_condensed(self):
+        """Discriminating control: the fix must not make every pin whole."""
+        r = ct.plan(self._pinned_walk_corpus(), 8 * 1024)
+        self.assertIn("HOLD: do not merge #1", r.head, "the old hold LINE must survive")
+        self.assertIn(ct.CONDENSED_NOTE.strip(), r.head, "no entry was condensed at all")
+        self.assertNotIn("y" * 1200, r.head, "the old pin kept its whole body")
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

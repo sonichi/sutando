@@ -13,6 +13,12 @@ Only bucketed / categorical **product events**:
 | `core_started` | `interval_s` | Count active installs (OSS + desktop) |
 | `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `skill:<name>`) | Which features matter |
 | `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
+| `core_recovery_attempted` | `trigger` (`wedged` / `dead`) | Confirmed wedge or dead-core restart attempts |
+| `core_restart_result` | `trigger`, `outcome` (`started` / `failed` / `exception`) | Whether the restart command succeeded |
+| `core_recovery_result` | `trigger`, `outcome` (`progress_resumed` / `still_unhealthy`), `duration_bucket` | Evidence of progress after a successful restart |
+| `core_recovery_gave_up` | none | Restart cap reached; deduplicated for one hour even if owner notification fails |
+| `health_fix_started` | none | Health-check `--fix` passes with non-OK checks |
+| `health_fix_result` | `outcome` (`all_resolved` / `partially_resolved` / `unresolved`), `duration_bucket` | Status of those checks at the next health-check invocation |
 
 Skill adoption arrives through `feature_used` as `skill:<name>`, emitted by
 `hooks/skill-usage-telemetry.py` for every skill invoked **through the `Skill`
@@ -90,3 +96,55 @@ use the Privacy toggle in Settings.
 > for skills invoked **through the `Skill` tool**, and only where the hook is
 > registered — see the scoped contract above. Same anonymity and opt-out as any other
 > `feature_used`.
+
+## Recovery metrics
+
+These events cover `src/health-check.py` core wedge/dead-core recovery and `--fix` passes.
+They reuse the existing PostHog project, anonymous install identity, surface
+property, and live opt-out controls. No additional configuration is needed.
+They do not cover repairs performed directly by an agent or individual skills.
+
+In PostHog, use event counts and outcome breakdowns to measure:
+
+- Restart command success rate: `core_restart_result` with `outcome=started`
+  divided by all `core_restart_result` events.
+- Observed recovery rate: `core_recovery_result` with `outcome=progress_resumed`
+  divided by all `core_recovery_result` events.
+- Recovery causes: `core_recovery_attempted` broken down by `trigger`.
+- Manual intervention signals: counts of `core_recovery_gave_up`.
+- Fix-pass effectiveness: `health_fix_result` broken down by `outcome`.
+
+Duration buckets are `<1m`, `1-5m`, `5-30m`, and `>=30m`. Recovery duration is
+from restart initiation to observed progress or a confirmed recurring wedge;
+fix duration is from a fix pass to its next health check. These are observation
+latencies, not exact downtime. Progress means the core is alive and its oldest
+queued task changes/disappears or its status timestamp advances. A successful
+restart command alone is never counted as recovered. Attempts without a later
+observation remain pending and are excluded from the observed recovery rate.
+That rate is conditional on an observation existing: it can look healthier than
+reality when severe failures prevent later observations. Show attempted restarts
+and observed results alongside the rate. `core_restart_result` reports only the
+command outcome; it has no duration field.
+
+Fix results describe the original non-OK checks (including warnings), some of
+which require manual repair. Missing checks count as unresolved. This is a
+before/after signal, not proof that a particular repair caused recovery.
+Healthy polling, confirmation windows, and cooldowns emit no attempt events.
+Check names, task identities, timestamps and check details are never sent.
+
+Recovery sends use the existing bounded synchronous path (one-second network
+timeout per event), so short-lived watchdog processes can deliver their events.
+Failures are swallowed and opt-out is checked for every event. Delivery is best
+effort, with no durable event queue or exactly-once guarantee. A PostHog outage
+can cause missing events. The synchronous attempt event can delay a restart by
+about one network-timeout interval when the endpoint is unreachable; additional
+events add their own send latency. This trades watchdog latency for delivery
+before a short-lived process exits; the network timeout is not an end-to-end
+deadline (for example, DNS resolution can take longer).
+
+Fix-pass state uses a nonblocking exclusive lock and atomic replacement. A
+competing writer skips tracking rather than overwriting an outstanding pass;
+a corrupt record is discarded so the next pass can be tracked. Platforms without
+file locking skip fix-pass metrics. Concurrent watchdogs can still observe a
+pass before all its repairs finish, so this remains a health snapshot, not a
+serialized repair transaction. Core recovery retains its existing exclusive lock.
