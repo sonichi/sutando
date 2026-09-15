@@ -14,7 +14,9 @@ Covers what can be tested without a real agy session + real Google auth:
 Does NOT attempt a real agy CLI + real Google auth — that can't run in CI;
 see docs/... sonichi#4272 for how that was verified by hand instead.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -112,6 +114,44 @@ class OnboardingSeedTests(unittest.TestCase):
             "enterpriseOnboardingComplete",
             "onboardingComplete",
         })
+
+    def test_seed_handles_a_bare_filename_with_no_directory_component(self):
+        # dirname("") is falsy — os.makedirs must be skipped, not called
+        # with an empty string (which would raise).
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        changed = self.seed.seed("onboarding.json")
+        self.assertTrue(changed)
+        data = json.loads(Path("onboarding.json").read_text())
+        for field in self.seed.FIELDS:
+            self.assertIs(data[field], True, field)
+
+    def test_json_top_level_non_dict_is_treated_as_empty(self):
+        # Valid JSON that parses to a list/scalar rather than an object —
+        # distinct from the corrupt-JSON path, which raises instead.
+        path = self._path("onboarding.json")
+        Path(path).write_text(json.dumps([1, 2, 3]))
+        changed = self.seed.seed(path)
+        self.assertTrue(changed)
+        data = json.loads(Path(path).read_text())
+        self.assertIsInstance(data, dict)
+        for field in self.seed.FIELDS:
+            self.assertIs(data[field], True, field)
+
+    def test_main_prints_seeded_then_already_seeded_and_returns_zero(self):
+        path = self._path("onboarding.json")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.seed.main(["onboarding_seed.py", path])
+        self.assertEqual(rc, 0)
+        self.assertIn("seeded: " + path, out.getvalue())
+
+        out2 = io.StringIO()
+        with contextlib.redirect_stdout(out2):
+            rc2 = self.seed.main(["onboarding_seed.py", path])
+        self.assertEqual(rc2, 0)
+        self.assertIn("already seeded: " + path, out2.getvalue())
 
 
 class StartCliHermeticTests(unittest.TestCase):
