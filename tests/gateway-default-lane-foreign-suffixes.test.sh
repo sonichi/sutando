@@ -112,6 +112,31 @@ else
   bad "malformed AGENT_MXID falls back to the convention" "got '$got'"
 fi
 
+# A domain may carry a PORT. `##*:` would return the port and discard the
+# server name, so the lane is fenced against the wrong suffix while every
+# cheap check still reports one.
+mkdir -p "$FIXTURES/port/dev-ag2space"
+printf 'AGENT_MXID=@agent:localhost:8008\n' > "$FIXTURES/port/dev-ag2space/.env"
+got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/port" AG2_REMOTE_TOKEN_DEV=x)"
+if [ "$got" = ":localhost:8008" ]; then
+  ok "a port in the domain keeps the server name"
+else
+  bad "a port in the domain keeps the server name" "got '$got'"
+fi
+
+# An env value may carry quotes, an inline comment or padding. A corrupted but
+# NON-EMPTY suffix passes the fallback test, so the lane quietly unfences.
+for _raw in '"@agent:localhost"' "'@agent:localhost'" '@agent:localhost # note' '  @agent:localhost  '; do
+  mkdir -p "$FIXTURES/dirty/dev-ag2space"
+  printf 'AGENT_MXID=%s\n' "$_raw" > "$FIXTURES/dirty/dev-ag2space/.env"
+  got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/dirty" AG2_REMOTE_TOKEN_DEV=x)"
+  if [ "$got" = ":localhost" ]; then
+    ok "env noise is normalised away: $_raw"
+  else
+    bad "env noise is normalised away: $_raw" "got '$got'"
+  fi
+done
+
 # --- wiring: BOTH launch paths carry the derived value ----------------------
 
 # Assert the claim, not a file-wide count: an `== 1` over the whole file is

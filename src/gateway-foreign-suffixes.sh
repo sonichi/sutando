@@ -32,8 +32,14 @@ derive_foreign_suffixes() {
     _dfs_env="$_dfs_root/${_dfs_inst}-ag2space/.env"
     if [ -n "$_dfs_root" ] && [ -f "$_dfs_env" ]; then
       _dfs_mxid="$(sed -n 's/^AGENT_MXID=//p' "$_dfs_env" | tail -1)"
+      # An env value may carry an inline comment, quotes or padding; a corrupted
+      # but non-empty suffix passes the fallback below and silently unfences.
+      _dfs_mxid="${_dfs_mxid%%#*}"
+      _dfs_mxid="$(printf '%s' "$_dfs_mxid" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")"
       case "$_dfs_mxid" in
-        *:*) _dfs_suffix=":${_dfs_mxid##*:}" ;;
+        # `#*:` not `##*:`: a domain may carry a port, and the longest match
+        # would return the port and discard the server name.
+        *:*) _dfs_suffix=":${_dfs_mxid#*:}" ;;
       esac
     fi
     [ -n "$_dfs_suffix" ] || _dfs_suffix=":${_dfs_inst}.ag2.space"
