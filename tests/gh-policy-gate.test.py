@@ -37,6 +37,22 @@ def _stub(tmpdir, name, rc, stdout=""):
     return p
 
 
+def _echo_argv_stub(tmpdir, name, rc):
+    """Stub that JSON-dumps the argv it received (sys.argv[1:]) then exits `rc` —
+    used to verify WHAT gh-policy-gate passed to MONO_CHECK, not just whether it
+    denied, since a stubbed rc alone can't distinguish 'URL passed through' from
+    'URL silently dropped'."""
+    p = Path(tmpdir) / name
+    p.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, json\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+        f"sys.exit({rc})\n"
+    )
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return p
+
+
 def _words(command):
     """First gh-invoking segment's words (past `gh` itself), or []."""
     segs = G._gh_segments(command)
@@ -147,6 +163,45 @@ class CheckPrComment(unittest.TestCase):
         words = _words('gh pr comment --repo o/r --body "no number here"')
         idx = G._find_subcommand(words, ("pr", "comment"))
         self.assertIsNone(G.check_pr_comment(words, idx))
+
+    def test_a_full_pr_url_is_recognized_without_repo_or_digit(self):
+        """A full PR URL carries no bare-digit word, so the old digit scan
+        found nothing and this shape went ungated (#4268 review). It must
+        reach MONO_CHECK now, with no --repo required."""
+        with tempfile.TemporaryDirectory() as td:
+            G.MONO_CHECK = _echo_argv_stub(td, "mono.py", 1)
+            words = _words('gh pr comment https://github.com/o/r/pull/42 --body "hi"')
+            idx = G._find_subcommand(words, ("pr", "comment"))
+            found = G.check_pr_comment(words, idx)
+            self.assertIsNotNone(found)
+            argv = json.loads(found[1])
+            self.assertEqual(argv[0], "https://github.com/o/r/pull/42")
+            self.assertNotIn("--repo", argv)
+
+    def test_a_url_with_an_explicit_repo_passes_it_through(self):
+        """An explicit --repo alongside the URL must still reach MONO_CHECK,
+        so a disagreeing one hits ITS OWN refusal (exit 2) rather than being
+        silently dropped by the hook."""
+        with tempfile.TemporaryDirectory() as td:
+            G.MONO_CHECK = _echo_argv_stub(td, "mono.py", 1)
+            words = _words(
+                'gh pr comment https://github.com/o/r/pull/42 --repo other/repo --body "hi"')
+            idx = G._find_subcommand(words, ("pr", "comment"))
+            found = G.check_pr_comment(words, idx)
+            argv = json.loads(found[1])
+            self.assertIn("--repo", argv)
+            self.assertEqual(argv[argv.index("--repo") + 1], "other/repo")
+
+    def test_a_url_whose_repo_disagrees_fails_open(self):
+        """MONO_CHECK itself exits 2 ('CANNOT ANSWER: --repo disagrees') for
+        this shape; the hook must treat that the same as any other
+        cannot-answer and allow, not crash or silently deny."""
+        with tempfile.TemporaryDirectory() as td:
+            G.MONO_CHECK = _stub(td, "mono.py", 2, "CANNOT ANSWER: --repo disagrees")
+            words = _words(
+                'gh pr comment https://github.com/o/r/pull/42 --repo other/repo --body "hi"')
+            idx = G._find_subcommand(words, ("pr", "comment"))
+            self.assertIsNone(G.check_pr_comment(words, idx))
 
 
 class EndToEnd(unittest.TestCase):

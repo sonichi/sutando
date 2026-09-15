@@ -41,6 +41,7 @@ parser under-denies against real bash. Scanning per-segment (a `_shell_scan`
 segment is one simple command) also means an `issue create` in one `&&`-ed
 command can never be matched against a `gh` invoked in another.
 """
+import importlib.util
 import json
 import os
 import re
@@ -55,6 +56,19 @@ _HOOKS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _HOOKS_DIR.parent
 DUP_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "gh-duplicate-check.py"
 MONO_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "pr-monologue-check.py"
+
+
+def _load_pr_url_re():
+    """MONO_CHECK's own PR_URL_RE, loaded from the script rather than
+    duplicated — it already derives the repo from a URL and rejects a
+    disagreeing --repo, so the hook must recognize the same shape it does."""
+    spec = importlib.util.spec_from_file_location("_gh_policy_gate_mono", MONO_CHECK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.PR_URL_RE
+
+
+PR_URL_RE = _load_pr_url_re()
 
 EQUALS_FORM = re.compile(r"(--repo|--title|-R)=")
 
@@ -141,27 +155,35 @@ def check_issue_create(words, start):
 
 
 def check_pr_comment(words, start):
-    repo = _flag_value(words, 0, ("--repo", "-R")) or _local_repo()
-    number = None
-    for w in words[start:]:
-        if w.isdigit():
-            number = w
-            break
-    if not repo or not number:
-        print("gh-policy-gate: gh pr comment — could not resolve --repo/PR number, "
-              "not enforcing the monologue check", file=sys.stderr)
-        return None
     me = os.environ.get("SUTANDO_GH_LOGIN") or _my_login()
     if not me:
         print("gh-policy-gate: gh pr comment — could not resolve the caller's own "
               "login (set SUTANDO_GH_LOGIN or ensure `gh api user` works); "
               "not enforcing", file=sys.stderr)
         return None
+    # A full URL has no bare-digit word; MONO_CHECK derives repo from it.
+    url = next((w for w in words[start:] if PR_URL_RE.match(w)), None)
+    if url:
+        argv = [sys.executable, str(MONO_CHECK), url, "--me", me]
+        # Pass an explicit --repo through too, so a disagreeing one still
+        # hits MONO_CHECK's own refusal instead of being silently dropped.
+        explicit_repo = _flag_value(words, 0, ("--repo", "-R"))
+        if explicit_repo:
+            argv += ["--repo", explicit_repo]
+    else:
+        repo = _flag_value(words, 0, ("--repo", "-R")) or _local_repo()
+        number = None
+        for w in words[start:]:
+            if w.isdigit():
+                number = w
+                break
+        if not repo or not number:
+            print("gh-policy-gate: gh pr comment — could not resolve --repo/PR number, "
+                  "not enforcing the monologue check", file=sys.stderr)
+            return None
+        argv = [sys.executable, str(MONO_CHECK), number, "--repo", repo, "--me", me]
     try:
-        r = subprocess.run(
-            [sys.executable, str(MONO_CHECK), number, "--repo", repo, "--me", me],
-            capture_output=True, text=True, timeout=60,
-        )
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     except Exception as e:
         print(f"gh-policy-gate: pr-monologue-check.py did not run ({e}); "
               f"not enforcing", file=sys.stderr)
