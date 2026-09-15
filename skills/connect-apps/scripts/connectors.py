@@ -5,8 +5,11 @@ resume their request once the apps are connected.
   find <query...>                   the catalog app whose slug or name is exactly <query>
   status [slug...] [--room R]       the owner's connections, pending and recently resumed waits
   await <slug...> --room R --reply-to E --task T --owner O (--request TEXT | --request-file PATH|-)
-                                    record a wait (merged into the room's pending waits for the
-                                    same apps and AG2 Cloud account) and start its detached waiter
+        [--private --line TEXT ...]  record a wait (merged into the room's pending waits for the
+                                    same apps and AG2 Cloud account) and start its detached waiter;
+                                    --private shows the card and the lines only to the owner, under
+                                    message E, instead of in the room
+  note <wait-id> TEXT               add a line to the wait's private card
   claim <room> [--force]            claim the room's pending waits whose apps are connected, each
                                     with whether its AG2 Cloud account checks out
   verify-account <wait-id>          is the claimed wait's AG2 Cloud account the one signed in and
@@ -31,11 +34,19 @@ answers with data (outcome `unverified`), and waits of different accounts are
 never merged; a `connected` resume runs `verify-account` and `claim` reports each
 wait's account verdict, because the account signed in, or the one the running
 core's station was started for, may no longer be the wait's.
+
+A private card is the owner-only face of a wait asked from a room with other
+people: one record in `<workspace>/state/connect-cards.json`, which the desktop
+client reads over the engine's loopback media route and draws inside the "Only
+visible to you" card under message `reply_to`. It never becomes a Matrix event,
+so no other member of the room receives it. The record carries the apps, the
+lines the agent says about connecting and the wait's status; never the request.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import functools
 import json
@@ -86,6 +97,15 @@ ORIGIN_SOURCE = "ag2space"
 WAITER_OUTCOMES = ("connected", "timeout", "user_changed", "unverified")
 RESUMED_BY = WAITER_OUTCOMES + ("claim",)
 CLAIM_KEYS = ("claimed_by", "claimed_at")
+# Private cards: the line cap keeps a runaway loop from growing the card; the text cap matches the client's.
+CARDS_VERSION = 1
+MAX_CARD_LINES = 20
+MAX_LINE_CHARS = 300
+MAX_AWAIT_LINES = 3
+CARD_PRUNE_S = 86400
+# claimed_by -> the card's status. `invalid` leaves the card as it was: there is no wait to describe.
+CARD_STATUS = {"connected": "connected", "timeout": "timeout", "user_changed": "user_changed",
+               "unverified": "unverified", "claim": "claimed", "superseded": "superseded", "expired": "expired"}
 
 
 class Setup(Exception):
@@ -285,6 +305,8 @@ def claim(ws: Path, wait_id: str, by: str = "claim", at: float | None = None) ->
         _write_json(claimed_path(ws, wait_id), record)
     except OSError:
         pass  # the rename already decided the claim; only its report is lost
+    if data.get("private") and by in CARD_STATUS:
+        set_card(ws, wait_id, status=CARD_STATUS[by], at=record["claimed_at"])
     return record
 
 
@@ -299,12 +321,118 @@ def release(ws: Path, record: dict) -> bool:
         os.rename(claimed_path(ws, wait_id), marker_path(ws, wait_id))
     except OSError:
         return False
+    if record.get("private"):
+        set_card(ws, wait_id, status="waiting")
     return True
 
 
 def summary(marker: dict) -> dict:
     keys = ("wait_id", "toolkits", "room", "reply_to", "request", "task", "owner", "deadline_at")
-    return {k: marker.get(k) for k in keys}
+    return {**{k: marker.get(k) for k in keys}, "private": bool(marker.get("private"))}
+
+
+# --------------------------------------------------------------------------- private cards
+
+
+def cards_path(ws: Path) -> Path:
+    return ws / "state" / "connect-cards.json"
+
+
+@contextlib.contextmanager
+def cards_locked(ws: Path):
+    """Every reader-modifier-writer of the cards file holds this, so the waiter, `claim`, `await`
+    and `note` never lose each other's change. Blocking: each hold is one small rewrite."""
+    path = cards_path(ws)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name("connect-cards.lock"), "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield path
+
+
+def _valid_card(card: Any) -> bool:
+    return (
+        isinstance(card, dict)
+        and isinstance(card.get("id"), str) and bool(WAIT_ID_RE.match(card["id"]))
+        and isinstance(card.get("room"), str) and bool(ROOM_RE.match(card["room"]))
+        and isinstance(card.get("event"), str) and bool(TOKEN_RE.match(card["event"]))
+        and isinstance(card.get("for"), str) and bool(MXID_RE.match(card["for"]))
+        and isinstance(card.get("toolkits"), list)
+        and isinstance(card.get("lines"), list)
+    )
+
+
+def read_cards(ws: Path) -> list[dict]:
+    """The valid cards on disk; a missing, torn or foreign file reads as none, and is rebuilt on write."""
+    data = _read_json(cards_path(ws))
+    cards = data.get("cards") if isinstance(data, dict) else None
+    return [c for c in cards if _valid_card(c)] if isinstance(cards, list) else []
+
+
+def _write_cards(path: Path, cards: list[dict]) -> None:
+    _write_json(path, {"version": CARDS_VERSION, "cards": cards})
+
+
+def _card_line(text: str, at: float) -> dict:
+    return {"ts": round(at, 3), "text": " ".join(str(text).split())[:MAX_LINE_CHARS]}
+
+
+def put_card(ws: Path, marker: dict, lines: list[str], at: float, into_of: list[str] | None = None) -> None:
+    """Write (or replace) the wait's card; the cards of the waits it absorbed point at it."""
+    card = {
+        "id": marker["wait_id"],
+        "room": marker["room"],
+        "event": marker["reply_to"],
+        "for": marker["owner"],
+        "toolkits": [{"slug": t["slug"], "name": t.get("name") or t["slug"]} for t in marker["toolkits"]],
+        "lines": [_card_line(x, at) for x in lines if str(x).strip()][:MAX_CARD_LINES],
+        "status": "waiting",
+        "created": round(at, 3),
+        "updated": round(at, 3),
+    }
+    with cards_locked(ws) as path:
+        cards = [c for c in read_cards(ws) if c["id"] != card["id"]]
+        for c in cards:
+            if c["id"] in (into_of or []):
+                c.update(status="superseded", into=card["id"], updated=round(at, 3))
+        _write_cards(path, cards + [card])
+
+
+def set_card(ws: Path, wait_id: str, status: str | None = None, line: str | None = None,
+             at: float | None = None) -> dict | None:
+    """Update the wait's card: its status, one more line, or both. None when it has no card."""
+    at = time.time() if at is None else at
+    try:
+        with cards_locked(ws) as path:
+            cards = read_cards(ws)
+            card = next((c for c in cards if c["id"] == wait_id), None)
+            if card is None:
+                return None
+            if status:
+                card["status"] = status
+                if status == "waiting":
+                    card.pop("into", None)  # a released merge gives the card back its own wait
+            if line and line.strip():
+                card["lines"] = (card["lines"] + [_card_line(line, at)])[-MAX_CARD_LINES:]
+            card["updated"] = round(at, 3)
+            _write_cards(path, cards)
+            return card
+    except OSError as exc:
+        # A card that could not be updated must never cost the claim or the resume.
+        print(f"connect-apps: private card {wait_id} not updated: {exc}", file=sys.stderr)
+        return None
+
+
+def prune_cards(ws: Path, now: float) -> int:
+    """Drop cards whose wait is no longer pending and that nothing touched for a day."""
+    if not cards_path(ws).exists():
+        return 0
+    with cards_locked(ws) as path:
+        cards = read_cards(ws)
+        keep = [c for c in cards
+                if marker_path(ws, c["id"]).exists() or now - float(c.get("updated") or 0) < CARD_PRUNE_S]
+        if len(keep) != len(cards):
+            _write_cards(path, keep)
+        return len(cards) - len(keep)
 
 
 def resumed_summary(ws: Path, record: dict) -> dict:
@@ -402,6 +530,8 @@ def waiter_alive(ws: Path, wait_id: str) -> bool:
 
 
 def resume_text(marker: dict, outcome: str) -> str:
+    if marker.get("private"):
+        return private_resume_text(marker, outcome)
     names = [str(t.get("name") or t.get("slug")) for t in marker.get("toolkits") or []]
     apps = join_names(names)
     wait_id, room, reply_to = marker["wait_id"], marker["room"], marker["reply_to"]
@@ -444,6 +574,59 @@ def resume_text(marker: dict, outcome: str) -> str:
             "tell the owner it timed out: tap Connect on the card again and tell me once it's connected. "
             f"Post it with room.message.send (operation_id {wait_id}:timeout), then write the result "
             "[no-send]. Follow the connect-apps skill, Resume."
+        )
+    return confine_user_content(text)
+
+
+def private_resume_text(marker: dict, outcome: str) -> str:
+    """The resume of a wait asked from a room with other people: everything about connecting goes to
+    the owner's private card (`note`), never to the room; only the answer itself is posted there."""
+    names = [str(t.get("name") or t.get("slug")) for t in marker.get("toolkits") or []]
+    apps = join_names(names)
+    wait_id, room, reply_to = marker["wait_id"], marker["room"], marker["reply_to"]
+    origin = f"(wait {wait_id}, from task {marker['task']}, private card)"
+    request = header_safe_value(marker.get("request") or "")
+    is_are = "is" if len(names) == 1 else "are"
+    note = f"connectors.py note {wait_id}"
+    private = (
+        "This wait was asked from a room with other people, so anything about connecting, sign-in or "
+        f"accounts goes only to the owner's private card with `{note} \"<text>\"`, never to the room or the DM. "
+    )
+    if outcome == "connected":
+        text = (
+            f"{apps} {is_are} now connected {origin}. {private}"
+            f"First run the connect-apps helper: connectors.py verify-account {wait_id}. If it exits 0, "
+            f'add the note "{apps} {is_are} connected. On it." and do the owner\'s earlier request "{request}": '
+            f"get it done with composio_exec and reply in room {room} with room.message.send (reply_to "
+            f"{reply_to}, operation_id {wait_id}:answer), except that private content (mail, calendar events, "
+            "files, messages, contacts) goes to the owner's DM with only a one-line pointer in the room, as "
+            "the connect-apps skill says. Any other exit: share no data and post nothing in the room; add the "
+            f"note that you didn't use their {apps} because a different or unconfirmed AG2 Cloud account is "
+            "signed in now, and to ask again once the right account is. "
+            "Either way write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif outcome == "unverified":
+        text = (
+            f"{apps} {is_are} now connected {origin}, but the AG2 Cloud account this wait was made under "
+            f'could not be confirmed, so the owner\'s earlier request "{request}" was not done. {private}'
+            f"Add the note that {apps} {is_are} connected now but you couldn't confirm which AG2 Cloud account "
+            "asked, so you didn't use it: ask again to get it done. Post nothing in the room, share no data, "
+            "and write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif outcome == "user_changed":
+        text = (
+            f"While waiting for {apps} {origin}, the AG2 Cloud account signed in on this Mac changed, "
+            f'so the owner\'s earlier request "{request}" was not done. {private}'
+            f"Add the note that you didn't use their {apps} because a different AG2 Cloud account is signed in "
+            "now, and to ask again once the right account is. Post nothing in the room, share no data from the "
+            "new account, and write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    else:
+        text = (
+            f"Connecting {apps} did not finish within {WAIT_S // 60} minutes {origin}. "
+            f'The owner\'s earlier request was "{request}". {private}'
+            "Add the note that it timed out: tap Connect again and ask me once it's connected. Post nothing in "
+            "the room and write the result [no-send]. Follow the connect-apps skill, Resume."
         )
     return confine_user_content(text)
 
@@ -611,6 +794,8 @@ def cmd_status(
         "all_connected": all(a["connected"] for a in apps),
         "pending_waits": [summary(m) for m in list_markers(ws) if room is None or m.get("room") == room],
         "resumed_waits": recent_claims(ws, room, now()),
+        "private_cards": [{k: c.get(k) for k in ("id", "event", "status", "toolkits")}
+                          for c in read_cards(ws) if room is None or c["room"] == room],
     }
     emit(payload)
     return EXIT_OK if payload["all_connected"] else EXIT_NO
@@ -680,6 +865,12 @@ def cmd_await(
     request = header_safe_value(read_request(args)).strip()[:MAX_REQUEST_CHARS]
     if not request:
         raise Setup("invalid_arguments", "--request is empty")
+    private = bool(args.private)
+    lines = [x for x in (args.line or []) if x.strip()]
+    if lines and not private:
+        raise Setup("invalid_arguments", "--line only goes on a --private card; in the owner's DM, send the lines as messages")
+    if len(lines) > MAX_AWAIT_LINES:
+        raise Setup("invalid_arguments", f"give at most {MAX_AWAIT_LINES} --line")
     if origin_owner(ws, task) != owner:
         raise Setup("not_owner_task", f"--owner is not the user of {task}.")
     if not cloud.signed_in():
@@ -690,8 +881,11 @@ def cmd_await(
     same_room = sorted((m for m in list_markers(ws) if m.get("room") == room), key=lambda m: m.get("task") != task)
     same_task = [m for m in same_room if m.get("task") == task]
     for marker in same_task:
-        if set(slugs) <= {x.get("slug") for x in marker["toolkits"] if isinstance(x, dict)}:
+        if set(slugs) <= {x.get("slug") for x in marker["toolkits"] if isinstance(x, dict)} \
+                and bool(marker.get("private")) == private:
             pid = None if waiter_alive(ws, marker["wait_id"]) else _try_spawn(spawn, ws, marker["wait_id"])
+            if private and not any(c["id"] == marker["wait_id"] for c in read_cards(ws)):
+                put_card(ws, marker, lines, now())
             emit({**summary(marker), "reused": True, "waiter_pid": pid})
             return EXIT_OK
     combined = dict.fromkeys(slugs)
@@ -715,6 +909,8 @@ def cmd_await(
     requests, taken, resumed = [], [], []
     own_handled = False
     for marker in same_room:
+        if bool(marker.get("private")) != private:
+            continue  # a private card is never folded into a room-visible wait, nor the other way round
         mine = {k["slug"] for k in toolkits}
         theirs = [x for x in marker["toolkits"] if isinstance(x, dict)]
         extra = [x for x in theirs if x.get("slug") not in mine]
@@ -760,13 +956,19 @@ def cmd_await(
         "owner": owner,
         "cloud_user_id": cloud_user_id if all(w.get("cloud_user_id") == cloud_user_id for w in taken) else None,
         "superseded": superseded,
+        "private": private,
         "created_at": now_iso(t),
         "deadline": int(t + WAIT_S),
         "deadline_at": now_iso(t + WAIT_S),
     }
     try:
+        if private:
+            # The card first: a waiter must never fire for a wait whose card the owner cannot see yet.
+            put_card(ws, marker, lines, t, into_of=superseded)
         path = write_marker(ws, marker)
     except OSError:
+        if private:
+            set_card(ws, wait_id, status="expired")
         for won in taken:
             release(ws, won)
         raise
@@ -833,6 +1035,21 @@ def cmd_verify_account(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: An
     return EXIT_OK if reason is None else EXIT_NO
 
 
+def cmd_note(ws: Path, cloud: Cloud | None, args: argparse.Namespace, now: Callable[[], float] = time.time,
+             **_: Any) -> int:
+    """One more line on the wait's private card (pending or claimed); exit 1 when it has no card."""
+    wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
+    text = " ".join(" ".join(args.text).split())
+    if not text:
+        raise Setup("invalid_arguments", "the note is empty")
+    if args.status and args.status not in CARD_STATUS.values() and args.status != "waiting":
+        raise Setup("invalid_arguments", f"unknown card status {args.status!r}")
+    card = set_card(ws, wait_id, status=args.status, line=text, at=now())
+    emit({"wait_id": wait_id, "noted": card is not None,
+          "card": {k: card.get(k) for k in ("id", "room", "event", "status")} if card else None})
+    return EXIT_OK if card else EXIT_NO
+
+
 def prune(ws: Path, now: float) -> int:
     removed = 0
     d = waits_dir(ws)
@@ -862,7 +1079,7 @@ def cmd_rearm(
             running.append(wait_id)
         else:
             rearmed.append({"wait_id": wait_id, "waiter_pid": _try_spawn(spawn, ws, wait_id)})
-    emit({"rearmed": rearmed, "running": running, "pruned": prune(ws, now())})
+    emit({"rearmed": rearmed, "running": running, "pruned": prune(ws, now()) + prune_cards(ws, now())})
     return EXIT_OK
 
 
@@ -896,6 +1113,13 @@ def parser() -> argparse.ArgumentParser:
     req = a.add_mutually_exclusive_group(required=True)
     req.add_argument("--request")
     req.add_argument("--request-file", help="read the request from this file; - reads stdin")
+    a.add_argument("--private", action="store_true",
+                   help="asked from a room with other people: show the card only to the owner, under --reply-to")
+    a.add_argument("--line", action="append", help="a line the private card shows above the apps (repeatable)")
+    n = sub.add_parser("note")
+    n.add_argument("wait_id")
+    n.add_argument("text", nargs="+")
+    n.add_argument("--status", help="also set the card's status (e.g. connected)")
     c = sub.add_parser("claim")
     c.add_argument("room")
     c.add_argument("--force", action="store_true", help="claim even when the apps are not connected")
@@ -908,7 +1132,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "claim": cmd_claim,
-            "verify-account": cmd_verify_account}
+            "verify-account": cmd_verify_account, "note": cmd_note}
 
 
 def main(
@@ -922,6 +1146,8 @@ def main(
     try:
         if args.cmd == "rearm":
             return cmd_rearm(ws, spawn)
+        if args.cmd == "note":
+            return cmd_note(ws, None, args)
         cloud = cloud or Cloud(ws)
         if args.cmd == "waiter":
             if not WAIT_ID_RE.match(args.wait_id):
