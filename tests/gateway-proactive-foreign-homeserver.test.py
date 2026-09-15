@@ -148,14 +148,17 @@ def main() -> int:
     check(names(tmp) == ["proactive-1.txt"],
           f"e) post-claim foreign server: handed back as .txt, not parked: {names(tmp)}")
 
-    # the predicate itself
-    check(gb._room_is_deliverable_here("!x:ag2.space") is True or True, "predicate callable")
-    os.environ["AGENT_MXID"] = LOCAL_AGENT
-    check(gb._room_is_deliverable_here("!x:ag2.space") is False, "predicate: prod room not deliverable from local-hs")
-    check(gb._room_is_deliverable_here("!x:ag2space.local") is True, "predicate: own room deliverable")
-    os.environ["AGENT_MXID"] = ""
-    check(gb._own_homeserver() == "", "predicate: no identity -> no homeserver")
-    os.environ.pop("AGENT_MXID", None)
+    # the predicate itself — guarded, so a tree WITHOUT the fix reports the
+    # behavioural failures above instead of aborting here on the missing symbol
+    has_predicate = hasattr(gb, "_room_is_deliverable_here") and hasattr(gb, "_own_homeserver")
+    check(has_predicate, "predicate: _room_is_deliverable_here and _own_homeserver exist")
+    if has_predicate:
+        os.environ["AGENT_MXID"] = LOCAL_AGENT
+        check(gb._room_is_deliverable_here("!x:ag2.space") is False, "predicate: prod room not deliverable from local-hs")
+        check(gb._room_is_deliverable_here("!x:ag2space.local") is True, "predicate: own room deliverable")
+        os.environ["AGENT_MXID"] = ""
+        check(gb._own_homeserver() == "", "predicate: no identity -> no homeserver")
+        os.environ.pop("AGENT_MXID", None)
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}")
