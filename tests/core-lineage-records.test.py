@@ -24,6 +24,8 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import time
+import fcntl
 from unittest import mock
 from pathlib import Path
 
@@ -125,6 +127,32 @@ class CoreLineage(unittest.TestCase):
         self.assertEqual(len(cl.sessions(self.ws, "host-a")), 1)
         self.assertNotEqual(cl.current(self.ws, "host-a")["session_id"],
                             cl.current(self.ws, "host-b")["session_id"])
+
+
+class LineageLockIsBounded(unittest.TestCase):
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+
+    def test_a_held_lock_raises_instead_of_stalling_the_beat(self):
+        """The heartbeat catches a raise but cannot catch a hang, and a beat that
+        stops advancing reads to every peer as a dead core."""
+        p = cl._path(self.ws, "h", "runs.json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lock = p.with_name(p.name + ".lock")
+        with open(lock, "a+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                cl.record_run(self.ws, "h", "s1")
+            waited = time.monotonic() - t0
+        self.assertLess(waited, cl._LOCK_WAIT_S * 3,
+                        "the wait was not bounded by _LOCK_WAIT_S")
+
+    def test_control_an_unheld_lock_still_records(self):
+        """Mutation control: if the acquire were simply broken, the test above
+        would pass for the wrong reason."""
+        cl.record_run(self.ws, "h", "s1")
+        self.assertEqual(len(cl.runs(self.ws, "h")), 1)
 
 
 if __name__ == "__main__":

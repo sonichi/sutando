@@ -63,13 +63,28 @@ def _write(path: Path, payload) -> None:
         raise
 
 
+#: Bounds the beat's worst case; the critical section is a tiny
+#: read-modify-write, so a wait this long already means something is wrong.
+_LOCK_WAIT_S = 2.0
+
+
 @contextlib.contextmanager
 def _appending(path: Path):
     """Serialise read-modify-write; `_write` alone protects only the reader."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_name(path.name + ".lock")
     with open(lock, "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        # LOCK_NB, not a blocking wait: the caller is the heartbeat, and a stuck
+        # holder would stall the beat — which every peer reads as a dead core.
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"lineage lock busy for {_LOCK_WAIT_S}s: {lock}")
+                time.sleep(0.02)
         try:
             yield
         finally:
