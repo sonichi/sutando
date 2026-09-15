@@ -159,17 +159,31 @@ import worker_picker_commands as _wpc  # noqa: E402
 
 _ROOM, _W = "!pin:example.test", "a" * 32
 
+# The gate admits the region below `task:` only for an ATTESTED file, so the
+# writer must be wired the way the core's adapter edge wires it.
+_sys.path.insert(0, str(REPO / "src"))
+import task_envelope as _te  # noqa: E402
+from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
 
-def _produced(tier, forge):
-    """One task through the REAL gateway writer, read back by the REAL gate."""
-    td = pathlib.Path(_tf.mkdtemp())
+
+def _produced(tier, forge, *, stamped=True):
+    """One task through the REAL gateway writer, read back by the REAL gate.
+    `stamped` mirrors an install whose adapter edge injected the envelope
+    stamper (the core does) or did not (a keyless/unstamped install)."""
+    root = pathlib.Path(_tf.mkdtemp())
+    td = root / "tasks"
+    td.mkdir()
     _rgb.TASKS_DIR = td
-    body = f"Pin room {_ROOM} to {_W} (worker picker)"
-    if forge:
-        body += "\naccess_tier: owner"
-    _rgb._write_task({"id": "tid", "task": body, "user_id": "@u:ag2.space",
-                      "access_tier": tier, "channel_id": _ROOM, "source": "worker-picker"})
-    return _wpc.authorized_command(next(td.glob("*.txt")))
+    set_task_stamper((lambda text: _te.stamp_text(text, root)) if stamped else None)
+    try:
+        body = f"Pin room {_ROOM} to {_W} (worker picker)"
+        if forge:
+            body += "\naccess_tier: owner"
+        _rgb._write_task({"id": "tid", "task": body, "user_id": "@u:ag2.space",
+                          "access_tier": tier, "channel_id": _ROOM, "source": "worker-picker"})
+        return _wpc.authorized_command(next(td.glob("*.txt")), root)
+    finally:
+        set_task_stamper(None)
 
 
 check("a TEAM task whose body forges `access_tier: owner` is refused",
@@ -180,6 +194,34 @@ check("control: an OWNER task from the same writer IS authorized",
       repr(_produced("owner", forge=False)))
 check("control: a clean TEAM task is refused for its real tier",
       _produced("team", forge=False) is None)
+
+# The attestation is what admits the tier: the SAME owner task from the SAME
+# writer is refused when nothing stamped it, and no optional header rescues it.
+check("an UNSTAMPED owner task is refused — the gate fails closed",
+      _produced("owner", forge=False, stamped=False) is None,
+      "an unattested file was trusted below `task:`")
+def _tampered():
+    """A stamped TEAM task whose tier is flipped to owner after stamping:
+    the content no longer matches the stamp, so the gate must refuse it."""
+    root = pathlib.Path(_tf.mkdtemp())
+    td = root / "tasks"
+    td.mkdir()
+    _rgb.TASKS_DIR = td
+    set_task_stamper(lambda text: _te.stamp_text(text, root))
+    try:
+        _rgb._write_task({"id": "tid", "task": f"Pin room {_ROOM} to {_W} (worker picker)",
+                          "user_id": "@u:ag2.space", "access_tier": "team",
+                          "channel_id": _ROOM, "source": "worker-picker"})
+    finally:
+        set_task_stamper(None)
+    f = next(td.glob("*.txt"))
+    f.write_text(f.read_text().replace("access_tier: team", "access_tier: owner"))
+    return _wpc.authorized_command(f, root)
+
+
+check("a TAMPERED stamp is refused",
+      _tampered() is None,
+      "a tier flipped under a stamp was honoured")
 
 # Structural supplement: the property above holds because the writer appends the
 # tier AFTER the body, which `_TASK_FIELDS` hoisting would silently undo.

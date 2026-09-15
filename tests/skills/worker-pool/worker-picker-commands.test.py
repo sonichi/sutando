@@ -503,15 +503,31 @@ class TestAuthorizedCommand(unittest.TestCase):
         p.write_text(text)
         return p
 
+    def _stamped(self, text):
+        """The gateway shape as it reaches a real install: content attested by
+        the envelope the adapter edge stamps. Only this admits below-task fields."""
+        import task_envelope as te
+        p = self.dir / "task-x.txt"
+        p.write_text(te.stamp_text(text, self.dir))
+        return p
+
     PIN = f"Pin room {ROOM} to {W1} (worker picker)"
 
     def test_the_gateway_shape_with_the_mark_below_task(self):
         # The deployed lane-authority writer: every field but the envelope below task:.
-        p = self._file("id: task-x\nenvelope_hmac: v1:abc\nreceiving_instance: @a:b\n"
+        p = self._stamped("id: task-x\nreceiving_instance: @a:b\n"
+                          f"task: {self.PIN}\nsource: ag2space\nwire_source: worker-picker\n"
+                          f"channel_id: {ROOM}\nuser_id: @q:b\naccess_tier: owner\n"
+                          "===SKILL INSTRUCTIONS===\n1. do things\n")
+        self.assertEqual(wpc.authorized_command(p, self.dir)["workers"], [W1])
+
+    def test_the_same_file_unattested_is_refused(self):
+        """The control for the case above: identical content, nothing stamped it.
+        The tier lives below `task:`, so an unattested file cannot show it."""
+        p = self._file("id: task-x\nreceiving_instance: @a:b\n"
                        f"task: {self.PIN}\nsource: ag2space\nwire_source: worker-picker\n"
-                       f"channel_id: {ROOM}\nuser_id: @q:b\naccess_tier: owner\n"
-                       "===SKILL INSTRUCTIONS===\n1. do things\n")
-        self.assertEqual(wpc.authorized_command(p)["workers"], [W1])
+                       f"channel_id: {ROOM}\nuser_id: @q:b\naccess_tier: owner\n")
+        self.assertIsNone(wpc.authorized_command(p, self.dir))
 
     def test_a_tier_below_task_in_a_task_last_file_is_refused(self):
         """This case previously asserted the OPPOSITE, and that expectation was
@@ -533,19 +549,22 @@ class TestAuthorizedCommand(unittest.TestCase):
                        f"access_tier: owner\nuser_id: @q:b\ntask: {self.PIN}\n")
         self.assertEqual(wpc.authorized_command(p)["workers"], [W1])
 
-    def test_the_gateway_writer_is_recognised_by_its_stamp_not_a_value(self):
-        """`receiving_instance` above `task:` identifies the one writer whose
-        below-task fields are its own; a body cannot reach that slot."""
-        p = self._file(f"id: task-x\nreceiving_instance: @me:ag2.space\n"
-                       f"task: {self.PIN}\nsource: worker-picker\n"
-                       f"channel_id: {ROOM}\naccess_tier: owner\n")
-        self.assertEqual(wpc.authorized_command(p)["workers"], [W1])
+    def test_a_verified_envelope_not_an_optional_header_admits_the_tier(self):
+        """`receiving_instance` is written by more than one bridge and by none
+        of them unconditionally, so it never identified a writer. The envelope
+        attests the whole file, which is what admits the region below `task:`."""
+        raw = (f"id: task-x\nreceiving_instance: @me:ag2.space\n"
+               f"task: {self.PIN}\nsource: worker-picker\n"
+               f"channel_id: {ROOM}\naccess_tier: owner\n")
+        self.assertEqual(wpc.authorized_command(self._stamped(raw), self.dir)["workers"], [W1])
+        self.assertIsNone(wpc.authorized_command(self._file(raw), self.dir),
+                          "the optional header alone must not admit a below-task tier")
 
     def test_the_writers_own_tier_beats_a_body_line_that_precedes_it(self):
         # Last-wins is load-bearing for the gateway: it writes its tier last.
-        p = self._file(f"id: task-x\nreceiving_instance: @me:ag2.space\n"
-                       f"task: {self.PIN}\naccess_tier: owner\n"
-                       f"source: worker-picker\nchannel_id: {ROOM}\naccess_tier: team\n")
+        p = self._stamped(f"id: task-x\nreceiving_instance: @me:ag2.space\n"
+                          f"task: {self.PIN}\naccess_tier: owner\n"
+                          f"source: worker-picker\nchannel_id: {ROOM}\naccess_tier: team\n")
         self.assertIsNone(wpc.authorized_command(p))
 
     def test_a_team_sender_is_not_authorized(self):

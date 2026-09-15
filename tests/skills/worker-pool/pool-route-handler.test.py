@@ -59,14 +59,15 @@ class TestPickerReplayAcrossRestart(Base):
     ROOM = "!review:example.test"
 
     def picker(self, name, sentence):
-        # the gateway writer shape: `task:` first, the picker mark below it.
+        # The gateway writer shape: `task:` first, the picker mark and the tier
+        # below it, and the envelope stamp that attests the whole file.
+        import task_envelope as te
         p = self.ws / "tasks" / f"{name}.txt"
-        # the real gateway writer shape: `receiving_instance` above `task:` is
-        # what marks the writer whose below-task fields are its own.
-        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\n"
-                     f"task: {sentence}\nsource: ag2space\n"
-                     f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
-                     f"user_id: @q:b\naccess_tier: owner\n")
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\n"
+               f"task: {sentence}\nsource: ag2space\n"
+               f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
+               f"user_id: @q:b\naccess_tier: owner\n")
+        p.write_text(te.stamp_text(raw, self.ws))
         return str(p)
 
     def bindings(self):
@@ -423,13 +424,15 @@ class TestPickerAppliedAtTheEdge(Base):
     """An owner's pin is bound and advertised by the handler itself, before the
     core sees the task; the task still goes to the core (DECLINE)."""
 
-    def picker_file(self, name, sentence, tier="owner"):
+    def picker_file(self, name, sentence, tier="owner", *, stamped=True):
+        # The gateway writes the tier BELOW task:, so only an attested file can
+        # show it; `stamped=False` is the unattested install, which fails closed.
+        import task_envelope as te
         p = self.ws / "tasks" / f"{name}.txt"
-        # `receiving_instance` is the writer stamp the reader keys on; it is in
-        # KNOWN_HEADER_KEYS, which `envelope_hmac` is not.
-        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
-                     f"source: ag2space\nwire_source: worker-picker\n"
-                     f"channel_id: !other:x\naccess_tier: {tier}\n")
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
+               f"source: ag2space\nwire_source: worker-picker\n"
+               f"channel_id: !other:x\naccess_tier: {tier}\n")
+        p.write_text(te.stamp_text(raw, self.ws) if stamped else raw)
         return str(p)
 
     def bindings(self):

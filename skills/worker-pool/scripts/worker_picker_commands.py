@@ -16,7 +16,7 @@ Both rules rest on one mechanism: the parser is chosen by WRITER, not by any
 value in the file. A task-last file is read STRICTLY — parsing stops at `task:`,
 so a body cannot supply a header. The remote-gateway bridge is the one writer
 that puts fields below `task:`; it newline-strips every value, which is what
-makes its last-wins scan safe, and it stamps `receiving_instance` above `task:`,
+makes its last-wins scan safe, and a verified envelope HMAC is what admits it,
 which is how it is RECOGNISED rather than inferred from a header it also writes.
 Sniffing the writer from a value is the forgery these rules exist to prevent:
 a body line `access_tier: owner` under a last-wins scan is an authorization
@@ -255,24 +255,26 @@ def parse_task_file(path) -> "dict | None":
     return parse(parsed.headers, parsed.body or "")
 
 
-def authorized_command(path) -> "dict | None":
+def authorized_command(path, workspace=None) -> "dict | None":
     """The picker command in one task file, or None unless the OWNER sent it.
 
-    Two writer shapes exist, and which one this is decides the parser. A
-    task-last writer puts every header above `task:`; everything below is the
-    sender's text and may promote nothing. The remote-gateway bridge writes the
-    picker mark and the tier below `task:` and newline-strips every value, which
-    is what makes its last-wins parse safe -- and it stamps `receiving_instance`
-    above `task:`, which is how that writer is recognised rather than guessed.
+    A task-last writer puts every header above `task:`; everything below is the
+    sender's text and may promote nothing. The gateway instead writes the picker
+    mark and the tier BELOW `task:`, so reading its tier needs the last-wins
+    parse -- which is only safe on a file whose whole content is attested.
+    The envelope HMAC is that attestation and the only thing consulted here:
+    fail closed on unsigned/invalid/unverifiable, per task_envelope's contract.
     """
+    import task_envelope as te
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     strict = ltp.parse_task_headers(text)
     above = strict.headers
     if above.get("source") is not None and (above.get("source") or "").strip() != SOURCE:
         return None
-    # Chosen by WRITER, never by a value: the gateway stamps `receiving_instance`
-    # above `task:`, the one slot a task body cannot reach.
-    parsed = ltp.parse_task_headers_trusted(text) if above.get("receiving_instance") else strict
+    # Attested content, never a writer guessed from an optional header: only a
+    # verified envelope admits the region below `task:` to the tier decision.
+    verified = te.verify_text(text, workspace).get("verdict") == "verified"
+    parsed = ltp.parse_task_headers_trusted(text) if verified else strict
     if (parsed.headers.get("access_tier") or "").strip() != "owner":
         return None
     sentence = (parsed.body or "").split("\n", 1)[0]

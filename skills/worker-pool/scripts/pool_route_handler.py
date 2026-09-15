@@ -106,7 +106,7 @@ def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     re-probes every retained task, so the replay gate is what makes that safe.
     Idempotent; a failure is reported, never fatal."""
     try:
-        cmd = wpc.authorized_command(task_file)
+        cmd = wpc.authorized_command(task_file, workspace)
         out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
                         results_dir=results_dir) if cmd else None
     except (pr.RosterError, OSError, ValueError) as e:
