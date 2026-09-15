@@ -60,16 +60,17 @@ PATTERN='(\$HOME|~|/Users/[^/]+|/home/[^/]+)/\.sutando/|home\(\)[[:space:]]*/[[:
 # Allowed files — may legitimately reference the install-home literal because
 # they OWN the resolution/install-location, or are migration/legacy scripts
 # that must name the pre-M0 paths they migrate from.
-# NOTE on the "consumer" entries (report-feedback, telemetry, inline-tools):
+# NOTE on the "consumer" entries (cloud_auth, telemetry, inline-tools):
 # these are NOT resolver-owners — they carry a *deliberate* reference to the
-# packaged-app install path (a cross-checkout token probe / a defensive
+# packaged-app install path (the cloud-auth.json token probe that moved from
+# report-feedback into src/cloud_auth.py / a defensive
 # fallback after resolve_workspace() / a doc comment). They're allowed because
 # the reference is intentional and reviewed; a brand-new file copying the
 # literal is what this lint is for.
 # src/runtime-api/rundir.py OWNS the runtime run-dir resolution (daemon + CLI
 # both import it); its ~/.sutando/run is the documented last-resort fallback
 # in that one owner file — exactly the "one place to change" the lint wants.
-ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|skills/report-feedback/report-feedback\.py|src/telemetry\.py|src/runtime-api/rundir\.py|src/inline-tools\.ts|tests/lint-sutando-home-path\.test\.sh|tests/runtime-rundir-resolver\.test\.sh|tests/credential-proxy-refresh\.test\.ts|tests/migration-safety-helpers\.test\.sh|tests/state-paths-adoption\.test\.py|tests/sync-memory-migration\.test\.sh|tests/sync-workspace\.test\.sh|tests/workspace-default\.test\.py|tests/runtime-api-rundir\.test\.py|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|src/cloud_auth\.py|src/telemetry\.py|src/runtime-api/rundir\.py|src/inline-tools\.ts|tests/lint-sutando-home-path\.test\.sh|tests/runtime-rundir-resolver\.test\.sh|tests/credential-proxy-refresh\.test\.ts|tests/migration-safety-helpers\.test\.sh|tests/state-paths-adoption\.test\.py|tests/sync-memory-migration\.test\.sh|tests/sync-workspace\.test\.sh|tests/workspace-default\.test\.py|tests/runtime-api-rundir\.test\.py|packages/ag2-sparrow/.*\.py)$'
 
 if [[ "$mode" == "--diff" ]]; then
   base="${BASE_REF:-origin/main}"

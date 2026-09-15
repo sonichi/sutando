@@ -11,6 +11,7 @@ supplies the results directory.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from enum import Enum
@@ -81,7 +82,11 @@ def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[
         return RestoreOutcome.NOTHING_QUARANTINED, None
     stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
     target = Path(results_dir) / f"{stem}.txt"
-    if target.exists():
+    # os.link fails atomically if target exists; rename would replace it. A
+    # separate exists() check cannot: a producer can write between check and move.
+    try:
+        os.link(found[-1], target)
+    except FileExistsError:
         return RestoreOutcome.LIVE_RESULT_PRESENT, target
-    found[-1].rename(target)
+    os.unlink(found[-1])
     return RestoreOutcome.RESTORED, target

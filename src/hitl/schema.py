@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .host import device_host
+
 WIRE_FIELD = "space.ag2.hitl"
 
 KINDS = frozenset(
@@ -126,6 +128,21 @@ class HumanRequirement:
         self.revision += 1
         self.updated_at = time.time()
 
+    def wire_device(self) -> Optional[Dict[str, str]]:
+        """The device as a reader sees it: the producer's dict plus `host` (this
+        machine's label) when the producer left it out. Every card, one place.
+        Assumes the store is per-host (state/hitl is not vault-carried), so the
+        serializing machine is the one the terminal is on; a producer that knows
+        a remote host must set `host` itself."""
+        if not self.device:
+            return None
+        device = dict(self.device)
+        if not device.get("host"):
+            host = device_host()
+            if host:
+                device["host"] = host
+        return device
+
     def to_wire(self) -> Dict[str, Any]:
         wire: Dict[str, Any] = {
             "id": self.id,
@@ -138,8 +155,9 @@ class HumanRequirement:
         }
         if self.title:
             wire["title"] = self.title
-        if self.device:
-            wire["device"] = dict(self.device)
+        device = self.wire_device()
+        if device:
+            wire["device"] = device
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
         if self.subject:

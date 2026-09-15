@@ -48,7 +48,14 @@ import sys
 
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
-HARD_ESCALATE = {"blocked-human", "logged-out"}
+HARD_ESCALATE = {"blocked-human", "logged-out", "signal-unreadable"}
+# A signal file that exists but can't be parsed may be hiding a hard blocker, so it
+# escalates once like one: a spurious notice costs a message, a suppressed one an outage.
+UNREADABLE_SIGNAL = {
+    "state": "signal-unreadable",
+    "detail": "the core supervisor's status file is unreadable, so a blocked core can't be ruled out",
+    "prompt": "",
+}
 # Gates the monitor answered by itself but the owner should still hear about:
 # the core changed something (its model) without anyone asking.
 SOFT_NOTICE_KINDS = {"fable-limit"}
@@ -98,7 +105,20 @@ def _is_login_class(signal: dict) -> bool:
     clear them (sonichi#2397). Root cause per #2402: a fresh CLAUDE_CONFIG_DIR
     always requires /login; a locked keychain (SSH spawn) only blocks
     completing it — hence the remedy must run from a GUI context."""
-    return signal.get("state") == "logged-out" or signal.get("kind") == "login"
+    return (signal.get("state") == "logged-out" or signal.get("kind") == "login"
+            or (signal.get("kind") == "turn-rejected"
+                and bool(_REFUSED_LOGIN.search(signal.get("prompt") or ""))))
+
+
+# A refused turn (monitor kind `turn-rejected`) carries the CLI's refusal line as its prompt;
+# the line, not the kind, says whether the remedy is the limit wait or a GUI /login.
+_REFUSED_LIMIT = re.compile(r"usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+_REFUSED_LOGIN = re.compile(r"/login|not logged in|OAuth access token", re.I)
+
+
+def _is_refused_limit(signal: dict) -> bool:
+    return (signal.get("kind") == "turn-rejected"
+            and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
 _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
@@ -190,13 +210,20 @@ def compose_message(signal: dict) -> str:
         # The remedy is the actionable half, so it keeps its length; the prompt
         # echo is what gives way to stay inside the message-length bound.
         msg += f": {excerpt[:110]}"
-    if signal.get("kind") == "session-limit":
+    if kind == "turn-rejected":
+        msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
+                " ends in that line, so nothing queued for it runs")
+    if kind == "session-limit" or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
                 " (that could spend credits). Pick the switch at the core's terminal, or"
                 " /usage-credits to stay on Fable.")
+    elif signal.get("state") == "signal-unreadable":
+        host = _core_host_label() or "the host"
+        msg += (f" — check the core on {host}; restarting the engine rewrites the file."
+                " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
@@ -393,10 +420,12 @@ def main(argv=None):
     try:
         with open(a.signal) as f:
             signal = json.load(f)
-        if not isinstance(signal, dict):
-            signal = {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return 0  # no signal yet → nothing to escalate (degrade quietly)
+    except (OSError, ValueError):
+        signal = None
+    if not isinstance(signal, dict):
+        signal = dict(UNREADABLE_SIGNAL)
 
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
                     source=source, channel=channel, dry_run=a.dry_run)

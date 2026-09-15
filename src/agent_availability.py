@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from util_paths import watcher_sentinel_path
 from workspace_default import resolve_workspace
 
 AVAILABILITY = ("available", "busy_accepting", "busy_unavailable", "offline", "unknown")
@@ -36,9 +37,10 @@ WORK_SIGNALS = ("working", "idle", "wedged", "unknown")
 WORK_SIGNAL_MAX_AGE_S = 180.0
 # The CLI wedge detector reads the pane, not the process: its verdict kinds fold to the three the
 # room state acts on. Every warning kind (a wedge in some shape) is "wedged"; unreadable is unknown. Total over every kind cli_wedge emits (a test derives the set).
-_WEDGE_KIND_TO_SIGNAL = {"working": "working", "clock-only": "working", "idle": "idle",
+_WEDGE_KIND_TO_SIGNAL = {"working": "working", "idle": "idle",
                          "static-with-work": "wedged", "retry-loop": "wedged", "provider-limit": "wedged",
-                         "low-novelty": "wedged", "cadence-too-sparse": "unknown", "unknown": "unknown"}
+                         "abnormal": "wedged",
+                         "cadence-too-sparse": "unknown", "unknown": "unknown"}
 
 
 def work_signal_from_verdict(verdict, max_age_s: float = WORK_SIGNAL_MAX_AGE_S) -> str:
@@ -177,7 +179,9 @@ def _session_started_at(ws: Path) -> float | None:
     """When this core session's task watcher started: it dispatches every task that gets a snapshot and
     dies with the session, so its pid file's mtime is the session boundary (the heartbeat writer is not)."""
     try:
-        return (ws / "state" / "watch-tasks-stream.pid").stat().st_mtime
+        # The writer names this path per instance; a literal here reads another
+        # session's sentinel, or none, and resurrects its snapshot as live work.
+        return watcher_sentinel_path(ws / "state").stat().st_mtime
     except OSError:
         return None
 

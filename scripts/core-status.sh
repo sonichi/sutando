@@ -45,4 +45,15 @@ payload = {"status": status, "ts": int(time.time())}
 if step:
     payload["step"] = step
 print(wd.write_status("core-status.json", payload))
+
+# `idle` closes a proactive-loop pass, so stamp the liveness marker
+# check_cron_schedule reads. core-status.json is NOT a substitute: owner turns
+# refresh it, so it stays fresh through a dead schedule.
+if status == "idle":
+    try:
+        m = wd.resolve_workspace() / "state" / "last-loop-ok"
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.touch()
+    except Exception as exc:
+        print(f"core-status: last-loop-ok not stamped: {exc}", file=sys.stderr)
 PY

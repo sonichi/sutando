@@ -22,7 +22,7 @@ description: Re-anchor on the durable record (current-track, live owner thread, 
 
 Then, as the situation needs (pick what's *relevant*; skip what isn't):
 
-- **The live thread** — the channel(s) the owner is actually active on: `python3 src/discord-read.py <channel_id> --serving <task channel_id>` when serving a task (the contextNotFrom gate runs before the fetch), or `--operator` on autonomous passes with no serving context (Discord), telegram task `[Replying to…]` quotes (Telegram has no history fetch). Go **as deep as the thread needs** with `--until <id|iso>` — not a fixed message count. If unsure which channel is live, check the most recent task's `channel_id` / `state/last-owner-activity.json`.
+- **The live thread** — the channel(s) the owner is actually active on: `python3 src/discord-read.py <channel_id> --serving <task channel_id> --limit 50` when serving a task (one page; the reader's default is ten — continue older with `--until <ISO time or message id>` until the message stands on its own, and say where the read ended if you stop short; the contextNotFrom gate runs before the fetch), or `--operator` on autonomous passes with no serving context (Discord), telegram task `[Replying to…]` quotes (Telegram has no history fetch). Go **as deep as the thread needs** with `--until <id|iso>` — not a fixed message count. If unsure which channel is live, check the most recent task's `channel_id` / `state/last-owner-activity.json`.
 - **Open decisions** — per-host `pending-questions.md`.
 - **Recent judgment/decisions** — latest `relay/relay-*.md`.
 - **What's built / next** — `build_log.md` tail.

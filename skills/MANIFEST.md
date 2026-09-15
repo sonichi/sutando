@@ -215,3 +215,12 @@ awesome-list indexes, remain install-disabled: their install procedures and
 runtime permissions are too source-specific for the generic skill installer.
 Writes require `--yes` and replace the destination atomically; omitting it
 performs an inspection-only dry run.
+
+### Marketplace resolver
+
+`skills/marketplace/` is the Superpower Station counterpart: it installs the
+owner's marketplace skills (tar.gz bundles verified against the cloud's
+sha256) and activates cloud tools through the same cloud routes the Marketplace
+UI uses. Both resolvers share `src/skill_install.py` (atomic swap, symlink
+refusal, safe tar extraction) and write `.sutando-source.json`, so `update`
+and `uninstall` can tell whose directory is whose.

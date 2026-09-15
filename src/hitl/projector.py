@@ -46,8 +46,9 @@ _STATUS_LINES = {
 
 def fallback_body(req: HumanRequirement) -> str:
     """Plain-text rendering for clients that ignore the hitl content field."""
-    device = (req.device or {}).get("name", "")
-    where = f" (on {device})" if device else ""
+    device = req.wire_device() or {}
+    name, host = device.get("name", ""), device.get("host", "")
+    where = f" (on {host} · {name})" if host and name else f" (on {host or name})" if (host or name) else ""
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
