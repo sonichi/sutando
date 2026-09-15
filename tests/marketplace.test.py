@@ -815,6 +815,8 @@ class TestMeteredAndStationStamp(unittest.TestCase):
         (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps({**self.stamp(), "version": 2}))
         self.assertIsNone(marketplace.read_station_stamp(self.ws))
         self.assertIsNone(marketplace.read_station_stamp(None))
+        self.assertIs(marketplace.read_station_stamp, sys.modules["station_stamp"].read_station_stamp,
+                      "the stamp has one reader, shared with connect-apps")
 
     def test_me_failure_reads_as_unknown_user(self):
         ctx = self.ctx(stamp=self.stamp(user="u-old"))

@@ -48,13 +48,13 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import cloud_auth  # noqa: E402
 import skill_install  # noqa: E402
 
+from station_stamp import read_station_stamp  # noqa: E402
 from util_paths import claude_home_path  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_CONFIRM = 0, 1, 2, 3
 TIER_RANK = {"free": 0, "plus": 1, "pro": 2, "max": 3}
 BUNDLE_TIMEOUT_S = 60
 STATION_MCP_SERVER = "sutando-station"
-STATION_STAMP = ("state", "station-core-stamp.json")
 METERED_MODELS = ("per_call", "per_unit", "per_result")
 RESTART_HINT = (
     "New cloud tools are active on your account, but I can only use them after an engine "
@@ -574,17 +574,6 @@ def station_mcp_registered(ctx: Context) -> bool | None:
         return STATION_MCP_SERVER in (cfg.get("mcpServers") or {})
     except (OSError, ValueError, AttributeError):
         return False
-
-
-def read_station_stamp(workspace: Path | None) -> dict | None:
-    """The desktop's record of what the running core loaded; None when absent or unusable."""
-    if not workspace:
-        return None
-    try:
-        stamp = json.loads(workspace.joinpath(*STATION_STAMP).read_text())
-    except (OSError, ValueError):
-        return None
-    return stamp if isinstance(stamp, dict) and stamp.get("version") == 1 else None
 
 
 def station_runtime(ctx: Context) -> dict | None:

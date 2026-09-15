@@ -39,6 +39,7 @@ python3 "$C" await googlecalendar --room '<room id>' --reply-to '<source_message
 <the owner request, verbatim>
 SUTANDO_REQUEST
 python3 "$C" claim '<room id>'                 # before answering in a room that may have a wait
+python3 "$C" verify-account '<wait id>'        # a resume: is the wait's AG2 Cloud account the one in use now?
 python3 "$C" rearm                             # restart dead waiters (startup + proactive loop run it)
 ```
 
@@ -47,16 +48,19 @@ argument: their text (an apostrophe, a quote) must never become shell.
 
 | exit | meaning |
 |---|---|
-| 0 | done: a match, all apps connected, a wait recorded, a wait claimed |
-| 1 | a negative answer: no exact match, an app not connected, nothing claimed |
-| 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+| 0 | done: a match, all apps connected, a wait recorded, a wait claimed, the account verified |
+| 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
+| 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
 
 Every command prints one JSON object. A **resumed** entry (`resumed` from `claim` and `await`,
 `resumed_waits` from `status`) is a wait from the last 30 minutes whose request is already handled:
 `resume_task` names the task that answers it (`null` when an owner message task claimed and answered
-it), and `resume_pending: true` means that task hasn't run yet. When a resume task answers, close
-your own task with `[no-send]`, never `[deduped: task-connect-...]`: a resume task's result is itself
-`[no-send]`, so the gateway would read the dedup as unanswered and re-ask your task.
+it), and `resume_pending: true` means that task hasn't run yet. Only `claimed_by` `connected` or
+`claim` answers the request; with `timeout`, `user_changed` or `unverified` that task posts a note
+asking the owner to connect or ask again, so the same request asked again is a fresh one. When a
+resume task answers, close your own task with `[no-send]`, never `[deduped: task-connect-...]`: a
+resume task's result is itself `[no-send]`, so the gateway would read the dedup as unanswered and
+re-ask your task.
 
 ## Step 0: who gets a card
 
@@ -108,10 +112,12 @@ For each app:
 
 - `connected: true`: first run `python3 "$C" claim '<task room>'` (and the DM's room id too when
   you are answering from a shared room):
-  - `claimed` lists a wait: answer its `request` together with this message (see Step 5).
-  - `resumed` lists a wait whose `task` is this task's id (a re-run of the original request), or
-    one with `resume_pending: true` whose `request` is this request: it is answered, or about to be.
-    Write the result `[no-send]` and stop.
+  - `claimed` lists a wait: handle it together with this message as in Step 5 ("The owner writes
+    first"), which answers its `request` only when `account_ok` is true.
+  - `resumed` lists a wait with `claimed_by` `connected` or `claim` whose `task` is this task's id (a
+    re-run of the original request), or one with `resume_pending: true` whose `request` is this
+    request: it is answered, or about to be. Write the result `[no-send]` and stop. A resumed wait
+    with `timeout`, `user_changed` or `unverified` got only a note: answer this message as below.
   - Otherwise: find the action (`composio_find {toolkit, query}`), run `composio_exec`, and answer
     where personal data may go (above). Done.
 - `coming_soon: true`: "<App> isn't available yet."
@@ -160,11 +166,15 @@ the shared-room case use the event id the intro's `room.message.send` returned i
   with `operation_id` `<task id>:connect-outro` and keep the result "I sent you a connect card in our
   DM." The task is closed; do not wait inside it. (`superseded` lists earlier waits this one absorbed;
   `"waiter_pid": null` means the waiter could not start, and the next `rearm` starts it.)
-- **Exit 0 with `"wait_id": null`:** the apps were connected meanwhile and `resumed` names the task
-  answering the earlier request. Same request: result `[no-send]`. A different request: answer it
-  now (step 2), the apps are connected.
-- **Exit 2:** no automatic resume is possible. Result: "Once you've connected Google Calendar, tell me
-  and I'll check."
+- **Exit 0 with `"wait_id": null`:** an earlier wait was handled meanwhile: `resumed` names the task
+  answering its request or posting its note. An entry whose `task` is this task's id, or whose `request` is
+  this request: result `[no-send]`. Otherwise answer it now (step 2), the apps are connected.
+- **Exit 2 with `too_many_apps`:** this task already waits in this room for other apps, and one wait
+  holds at most 5. That wait stays armed and answers its request once its apps connect (`status
+  --room` lists them). Result: "I'll pick this up once <its apps> are connected; for <the other apps>,
+  tell me once they're connected and I'll check."
+- **Any other exit 2:** no automatic resume is possible. Result: "Once you've connected Google
+  Calendar, tell me and I'll check."
 
 ## Step 5: resume
 
@@ -172,13 +182,20 @@ the shared-room case use the event id the intro's `room.message.send` returned i
 apps, the original request (several requests joined by " / " when the owner asked more than once),
 the room and the `reply_to`. It is owner work for that room.
 
-- Connected: run `composio_find` / `composio_exec`, confirm the room is still the owner's DM
+- Connected: first `python3 "$C" verify-account '<wait-id>'`. Any exit but 0 (`account_changed`,
+  `account_unknown`, `not_signed_in`, ...) means a different or unconfirmed AG2 Cloud account is
+  signed in now: share no data, and post "I didn't check your Google Calendar: I couldn't confirm the
+  AG2 Cloud account signed in now is the one you asked from. Ask me again once it is." (`operation_id
+  <wait-id>:account`).
+  Exit 0: run `composio_find` / `composio_exec`, confirm the room is still the owner's DM
   (`room.inspect`, exactly 2 members; otherwise post only "Google Calendar is connected: ask me again
   in our DM."), then post the answer with `room.message.send` (`operation_id <wait-id>:answer`,
   `reply_to` as given): "Your Google Calendar is connected and ready to go. Here's your Friday: ...".
   If `composio_exec` still reports `connect_required`, post "Google Calendar isn't connected yet: tap
   Connect on the card again and tell me when it's done."
-- Timed out, or the cloud account changed: post the note the task describes (its `operation_id`).
+- Timed out, the cloud account changed, or the account the wait was made under could not be confirmed
+  (`unverified`): post the note the task describes (its `operation_id`), and share no data. After an
+  `unverified` note, the owner's next request is a fresh one: answer it as in step 2.
 - Either way the result is `[no-send]`: the answer already went out.
 
 **The owner writes first** in that room ("done", "connected", or the same request again):
@@ -187,12 +204,19 @@ the room and the `reply_to`. It is owner work for that room.
 python3 "$C" claim '<room id>'
 ```
 
-- Exit 0: `claimed` lists the waits whose apps are connected. Answer each `request` in this task's
-  reply, where personal data may go; the waiter can no longer fire.
-- `resumed` lists a wait: its request is already handled. `resume_pending: true`: the resume task
-  answers it; for "done" or the same request write `[no-send]`. Otherwise it was answered already:
-  acknowledge in one short line only if the message needs a reply, and don't repeat the answer unless
-  the owner asks again after seeing it.
+- Exit 0: `claimed` lists the waits whose apps are connected; the waiter can no longer fire. With
+  `account_ok: true`, answer its `request` in this task's reply, where personal data may go. With
+  `account_ok: false` (`account_reason` `account_changed` or `account_unknown`), share no data for it:
+  "I didn't check your Google Calendar for your earlier request: I couldn't confirm the AG2 Cloud
+  account signed in now is the one you asked from. Ask me again once it is." When this message is
+  that request asked again, answer it as a fresh one instead (step 2).
+- `resumed` lists a wait with `claimed_by` `connected` or `claim`: its request is answered.
+  `resume_pending: true`: the resume task answers it; for "done" or the same request write
+  `[no-send]`. Otherwise acknowledge in one short line only if the message needs a reply, and don't
+  repeat the answer unless the owner asks again after seeing it.
+- `resumed` lists a wait with `claimed_by` `timeout`, `user_changed` or `unverified`: it got a note,
+  not an answer. The same request asked again is a fresh one: answer it (step 2), even while
+  `resume_pending` is true.
 - Exit 1 with `pending` not empty: the apps aren't connected yet. Say so ("Google Calendar isn't
   connected yet: tap Connect on the card and I'll pick it up as soon as it is."). The wait stays armed.
 - All three empty: there is no wait; handle the message normally.

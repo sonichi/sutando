@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for skills/connect-apps/scripts/connectors.py: find, status, await, claim, rearm.
+"""Tests for skills/connect-apps/scripts/connectors.py: find, status, await, claim, verify-account, rearm.
 
 The cloud is a scripted fake and the workspace a temp dir; nothing touches the
 network, the Keychain or the real workspace. Waiter behaviour lives in
@@ -45,7 +45,7 @@ class FakeCloud(connectors.Cloud):
         self.items = CATALOG if items is None else items
         self.connections = connections or []
         self.enabled = enabled
-        self.user = user
+        self.users = list(user) if isinstance(user, list) else [user]
         self.paths = []
         self.error = None
 
@@ -58,9 +58,10 @@ class FakeCloud(connectors.Cloud):
         if path == "/api/connectors":
             return {"connections": self.connections}
         if path == "/api/me":
-            if isinstance(self.user, Exception):
-                raise self.user
-            return {"id": self.user}
+            answer = self.users.pop(0) if len(self.users) > 1 else self.users[0]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"id": answer}
         if path.startswith("/api/station/catalog?kind=connector&limit=100&q="):
             q = connectors.urllib.parse.unquote(path.split("q=", 1)[1])
             items = [i for i in self.items if connectors._norm(q) in connectors._norm(i["slug"] + i["name"])]
@@ -124,11 +125,11 @@ class Base(unittest.TestCase):
         return 4343
 
     def marker(self, wait_id="1789000000000-0000abcd", room=ROOM, task="task-abc", slugs=("googlecalendar",),
-               deadline=NOW + 1800):
+               deadline=NOW + 1800, cloud_user_id="u-owner"):
         m = {"version": 1, "wait_id": wait_id, "toolkits": [{"slug": s, "name": s.title()} for s in slugs],
              "room": room, "reply_to": "$evt1", "request": "what's on my calendar", "task": task,
              "owner": OWNER, "created_at": "2026-09-15T00:00:00Z", "deadline": int(deadline),
-             "deadline_at": "2026-09-15T00:30:00Z"}
+             "deadline_at": "2026-09-15T00:30:00Z", "cloud_user_id": cloud_user_id}
         connectors.write_marker(self.ws, m)
         return m
 
@@ -262,6 +263,54 @@ class TestAwait(Base):
         code, other = run(self.ws, await_argv("googlecalendar", task="task-other"), FakeCloud(self.ws), self.spawn)
         self.assertEqual((other["reused"], other["superseded"]), (False, []), "other apps: a wait of its own")
         self.assertEqual(len(connectors.list_markers(self.ws)), 2)
+
+    def test_the_same_task_asking_for_fewer_apps_reuses_the_wait(self):
+        code, first = run(self.ws, await_argv("googlecalendar", "linear"), FakeCloud(self.ws), self.spawn)
+        code, again = run(self.ws, await_argv("linear"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, again["reused"], again["wait_id"]), (connectors.EXIT_OK, True, first["wait_id"]))
+        self.assertEqual([k["slug"] for k in again["toolkits"]], ["googlecalendar", "linear"])
+
+    def test_the_same_task_asking_for_more_apps_gets_one_wait_for_all(self):
+        code, first = run(self.ws, await_argv("linear"), FakeCloud(self.ws), self.spawn)
+        code, more = run(self.ws, await_argv("linear", "googlecalendar"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, more["reused"], more["superseded"]), (connectors.EXIT_OK, False, [first["wait_id"]]))
+        self.assertEqual([m["wait_id"] for m in connectors.list_markers(self.ws)], [more["wait_id"]])
+        self.assertEqual([k["slug"] for k in more["toolkits"]], ["linear", "googlecalendar"])
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        self.assertEqual(connectors.run_waiter(self.ws, first["wait_id"], cloud, now=lambda: NOW, sleep=lambda s: None),
+                         "claimed_elsewhere", "the narrower wait can no longer answer before the new app connects")
+
+    def test_the_same_task_asking_for_other_apps_merges_its_wait(self):
+        code, first = run(self.ws, await_argv("linear"), FakeCloud(self.ws), self.spawn)
+        code, other = run(self.ws, await_argv("googlecalendar", reply="$evt2"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, other["reused"], other["superseded"]), (connectors.EXIT_OK, False, [first["wait_id"]]))
+        [merged] = connectors.list_markers(self.ws)
+        self.assertEqual([k["slug"] for k in merged["toolkits"]], ["googlecalendar", "linear"])
+        self.assertEqual((merged["request"], merged["reply_to"]), ("what's on my calendar", "$evt2"))
+        self.assertEqual(merged["cloud_user_id"], "u-owner", "the same account stays known")
+        self.assertEqual(json.loads(connectors.claimed_path(self.ws, first["wait_id"]).read_text())["claimed_by"],
+                         "superseded")
+
+    def test_the_task_own_wait_is_merged_before_another_task_one(self):
+        self.origin("task-other")
+        items = CATALOG + [{"slug": f"app{i}", "name": f"App {i}"} for i in range(6)]
+        other = self.marker(wait_id="1789000000000-0000aaaa", task="task-other",
+                            slugs=("googlecalendar", "linear", "app0", "app1"))
+        own = self.marker(wait_id="1789000000001-0000bbbb", slugs=("app2", "app3"))
+        code, out = run(self.ws, await_argv("googlecalendar"), FakeCloud(self.ws, items=items), self.spawn)
+        self.assertEqual((code, out["superseded"]), (connectors.EXIT_OK, [own["wait_id"]]))
+        self.assertEqual([k["slug"] for k in out["toolkits"]], ["googlecalendar", "app2", "app3"])
+        self.assertEqual(sorted(m["wait_id"] for m in connectors.list_markers(self.ws)),
+                         sorted([other["wait_id"], out["wait_id"]]), "the other task's wait would pass the app cap")
+
+    def test_the_same_task_over_the_app_cap_is_refused_not_split(self):
+        items = CATALOG + [{"slug": f"app{i}", "name": f"App {i}"} for i in range(6)]
+        code, first = run(self.ws, await_argv("app0", "app1", "app2"), FakeCloud(self.ws, items=items), self.spawn)
+        code, out = run(self.ws, await_argv("app3", "app4", "app5"), FakeCloud(self.ws, items=items), self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "too_many_apps"))
+        self.assertIn("at most 5", out["detail"])
+        self.assertEqual([m["wait_id"] for m in connectors.list_markers(self.ws)], [first["wait_id"]])
+        self.assertEqual(self.spawned, [first["wait_id"]])
 
 
 class TestOriginGate(Base):
@@ -436,6 +485,22 @@ class TestMergeWaits(Base):
                          [(old["wait_id"], f"task-connect-{old['wait_id']}")])
         self.assertEqual((connectors.list_markers(self.ws), self.spawned), ([], []))
 
+    def test_an_answer_for_fewer_apps_lost_to_the_race_still_gets_a_new_wait(self):
+        self.origin("task-two")
+        old = self.marker()
+        real_claim = connectors.claim
+
+        def raced(ws, wait_id, by="claim", at=None):
+            real_claim(ws, wait_id, "connected", time.time())
+            return real_claim(ws, wait_id, by, at)
+
+        with mock.patch.object(connectors, "claim", side_effect=raced):
+            code, out = run(self.ws, await_argv("googlecalendar", "linear", task="task-two"),
+                            FakeCloud(self.ws), self.spawn)
+        self.assertRegex(out["wait_id"], connectors.WAIT_ID_RE)
+        self.assertEqual([k["slug"] for k in out["toolkits"]], ["googlecalendar", "linear"])
+        self.assertEqual(([r["wait_id"] for r in out["resumed"]], out["superseded"]), ([old["wait_id"]], []))
+
     def test_a_timed_out_wait_lost_to_the_race_still_gets_a_new_wait(self):
         self.origin("task-two")
         self.marker()
@@ -450,6 +515,41 @@ class TestMergeWaits(Base):
         self.assertRegex(out["wait_id"], connectors.WAIT_ID_RE)
         self.assertEqual((out["resumed"], out["superseded"]), ([], []))
 
+    def raced(self, outcome, *wait_ids):
+        real_claim = connectors.claim
+
+        def raced(ws, wait_id, by="claim", at=None):
+            if wait_id in wait_ids:
+                real_claim(ws, wait_id, outcome, time.time())
+            return real_claim(ws, wait_id, by, at)
+
+        return mock.patch.object(connectors, "claim", side_effect=raced)
+
+    def test_the_task_own_wait_handled_meanwhile_gets_no_second_wait(self):
+        self.origin("task-two")
+        other = self.marker(wait_id="1789000000009-0000abc9", task="task-two")
+        for i, outcome in enumerate(("connected", "claim", "timeout", "user_changed", "unverified")):
+            with self.subTest(outcome):
+                own = self.marker(wait_id=f"178900000000{i}-0000abc{i}", slugs=("linear",))
+                with self.raced(outcome, own["wait_id"]):
+                    code, out = run(self.ws, await_argv("linear", "googlecalendar"), FakeCloud(self.ws), self.spawn)
+                self.assertEqual((code, out["wait_id"], out["superseded"]), (connectors.EXIT_OK, None, []))
+                self.assertEqual([(r["wait_id"], r["task"], r["claimed_by"]) for r in out["resumed"]],
+                                 [(own["wait_id"], "task-abc", outcome)])
+                self.assertEqual([m["wait_id"] for m in connectors.list_markers(self.ws)], [other["wait_id"]],
+                                 "another task's wait is left alone")
+        self.assertEqual(self.spawned, [])
+
+    def test_waits_taken_before_the_task_own_handled_one_are_given_back(self):
+        first = self.marker(wait_id="1789000000001-0000abc1", slugs=("app0",))
+        handled = self.marker(wait_id="1789000000002-0000abc2", slugs=("app1",))
+        with self.raced("connected", handled["wait_id"]):
+            code, out = run(self.ws, await_argv("googlecalendar"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, out["wait_id"], [r["wait_id"] for r in out["resumed"]]),
+                         (connectors.EXIT_OK, None, [handled["wait_id"]]))
+        self.assertEqual([m["wait_id"] for m in connectors.list_markers(self.ws)], [first["wait_id"]])
+        self.assertFalse(connectors.claimed_path(self.ws, first["wait_id"]).exists())
+
     def test_an_unreadable_wait_is_retired_not_merged(self):
         self.origin("task-two")
         old = self.marker()
@@ -458,14 +558,159 @@ class TestMergeWaits(Base):
         self.assertEqual((out["superseded"], out["request"]), ([], "what's on my calendar"))
         self.assertTrue(connectors.claimed_path(self.ws, old["wait_id"]).exists())
 
-    def test_records_the_cloud_account_best_effort(self):
-        code, out = run(self.ws, await_argv("linear"), FakeCloud(self.ws, user="u-1"), self.spawn)
-        self.assertEqual(json.loads(Path(out["marker"]).read_text())["cloud_user_id"], "u-1")
+
+class TestMergeAccounts(Base):
+    """A request never moves into a wait of another, or an unknown, AG2 Cloud account."""
+
+    def connected(self, user):
+        return FakeCloud(self.ws, user=user,
+                         connections=[{"toolkit": s, "status": "active"} for s in ("googlecalendar", "linear")])
+
+    def another_task_wait_stays_apart(self, account, outcome):
         self.origin("task-two")
-        code, out = run(self.ws, await_argv("googlecalendar", task="task-two"),
-                        FakeCloud(self.ws, user=cloud_auth.CloudError(500, "boom")), self.spawn)
-        self.assertEqual(code, connectors.EXIT_OK)
-        self.assertIsNone(json.loads(Path(out["marker"]).read_text())["cloud_user_id"])
+        old = self.marker(cloud_user_id=account)
+        code, out = run(self.ws, await_argv("googlecalendar", task="task-two", request="my Friday"),
+                        FakeCloud(self.ws, user="u-B"), self.spawn)
+        self.assertEqual((code, out["superseded"], out["request"]), (connectors.EXIT_OK, [], "my Friday"))
+        self.assertEqual(json.loads(Path(out["marker"]).read_text())["cloud_user_id"], "u-B")
+        self.assertEqual(sorted(m["wait_id"] for m in connectors.list_markers(self.ws)),
+                         sorted([old["wait_id"], out["wait_id"]]))
+        waiter = connectors.run_waiter(self.ws, old["wait_id"], self.connected("u-B"), now=lambda: NOW,
+                                       sleep=lambda s: None)
+        self.assertEqual(waiter, outcome, "the old request ends in a note, never in the new account's data")
+
+    def test_another_task_wait_of_an_unknown_account_stays_apart(self):
+        self.another_task_wait_stays_apart(None, "unverified")
+
+    def test_another_task_wait_of_another_account_stays_apart(self):
+        self.another_task_wait_stays_apart("u-A", "user_changed")
+
+    def test_a_wait_whose_own_account_is_unknown_takes_no_other_task_wait(self):
+        self.origin("task-two")
+        old = self.marker()
+        args = connectors.parser().parse_args(await_argv("googlecalendar", task="task-two"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            connectors.cmd_await(self.ws, FakeCloud(self.ws, user=cloud_auth.CloudError(502, "http_502")), args,
+                                 spawn=self.spawn, now=lambda: NOW, sleep=lambda s: None)
+        payload = json.loads(out.getvalue())
+        self.assertEqual((payload["superseded"], json.loads(Path(payload["marker"]).read_text())["cloud_user_id"]),
+                         ([], None))
+        self.assertTrue(connectors.marker_path(self.ws, old["wait_id"]).exists())
+
+    def test_the_task_own_wait_of_another_or_unknown_account_merges_unverified(self):
+        for i, account in enumerate((None, "u-A")):
+            with self.subTest(account=account):
+                own = self.marker(wait_id=f"178900000000{i}-0000abc{i}", slugs=("linear",), cloud_user_id=account)
+                code, out = run(self.ws, await_argv("googlecalendar"), FakeCloud(self.ws, user="u-B"), self.spawn)
+                self.assertEqual((code, out["superseded"]), (connectors.EXIT_OK, [own["wait_id"]]))
+                self.assertIsNone(json.loads(Path(out["marker"]).read_text())["cloud_user_id"])
+                self.assertEqual(connectors.run_waiter(self.ws, out["wait_id"], self.connected("u-B"), now=lambda: NOW,
+                                                       sleep=lambda s: None), "unverified")
+
+
+class TestAwaitAccount(Base):
+    def await_with(self, cloud, sleeps):
+        args = connectors.parser().parse_args(await_argv("linear"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = connectors.cmd_await(self.ws, cloud, args, spawn=self.spawn, now=lambda: NOW, sleep=sleeps.append)
+        payload = json.loads(out.getvalue())
+        return code, payload, json.loads(Path(payload["marker"]).read_text())["cloud_user_id"]
+
+    def test_records_the_signed_in_account(self):
+        sleeps = []
+        code, out, account = self.await_with(FakeCloud(self.ws, user="u-1"), sleeps)
+        self.assertEqual((code, account, sleeps), (connectors.EXIT_OK, "u-1", []))
+
+    def test_a_brief_account_outage_is_retried(self):
+        sleeps = []
+        cloud = FakeCloud(self.ws, user=[cloud_auth.CloudError(502, "http_502"), "", "u-1"])
+        code, out, account = self.await_with(cloud, sleeps)
+        self.assertEqual((code, account, sleeps), (connectors.EXIT_OK, "u-1", list(connectors.ACCOUNT_RETRY_S)))
+
+    def test_an_account_still_unknown_is_recorded_and_the_wait_never_answers_with_data(self):
+        sleeps = []
+        cloud = FakeCloud(self.ws, user=connectors.Setup("not_signed_in", "signed out meanwhile"))
+        code, out, account = self.await_with(cloud, sleeps)
+        self.assertEqual((code, account, sleeps), (connectors.EXIT_OK, None, list(connectors.ACCOUNT_RETRY_S)))
+        self.assertEqual(cloud.paths.count("/api/me"), 1 + len(connectors.ACCOUNT_RETRY_S))
+        up = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        self.assertEqual(connectors.run_waiter(self.ws, out["wait_id"], up, now=lambda: NOW, sleep=lambda s: None),
+                         "unverified")
+        self.assertEqual([(r["wait_id"], r["claimed_by"], r["resume_task"]) for r in
+                          connectors.recent_claims(self.ws, ROOM, NOW + 1)],
+                         [(out["wait_id"], "unverified", f"task-connect-{out['wait_id']}")])
+        code, verdict = run(self.ws, ["verify-account", out["wait_id"]], up)
+        self.assertEqual((code, verdict["reason"]), (connectors.EXIT_NO, "account_unknown"))
+
+
+class TestVerifyAccount(Base):
+    def claimed(self, cloud_user_id="u-owner"):
+        m = self.marker(cloud_user_id=cloud_user_id)
+        connectors.claim(self.ws, m["wait_id"], "connected", NOW)
+        return m["wait_id"]
+
+    def test_the_same_account_verifies(self):
+        wait_id = self.claimed()
+        cloud = FakeCloud(self.ws, user="u-owner")
+        code, out = run(self.ws, ["verify-account", wait_id], cloud)
+        self.assertEqual((code, out), (connectors.EXIT_OK, {"wait_id": wait_id, "ok": True, "reason": None}))
+        self.assertEqual(cloud.paths, ["/api/me"])
+
+    def test_another_or_an_unknown_signed_in_account_does_not(self):
+        wait_id = self.claimed()
+        for user, reason in (("u-someone-else", "account_changed"), ("", "account_unknown")):
+            with self.subTest(reason):
+                code, out = run(self.ws, ["verify-account", wait_id], FakeCloud(self.ws, user=user))
+                self.assertEqual((code, out), (connectors.EXIT_NO, {"wait_id": wait_id, "ok": False, "reason": reason}))
+
+    def test_a_wait_made_without_its_account_never_verifies(self):
+        wait_id = self.claimed(cloud_user_id=None)
+        cloud = FakeCloud(self.ws, user="u-owner")
+        code, out = run(self.ws, ["verify-account", wait_id], cloud)
+        self.assertEqual((code, out["ok"], out["reason"]), (connectors.EXIT_NO, False, "account_unknown"))
+        self.assertEqual(cloud.paths, [], "nothing to compare, so the cloud is not asked")
+
+    def test_an_unclaimed_missing_or_unreadable_wait_is_no_such_wait(self):
+        pending = self.marker()["wait_id"]
+        broken = "1789000000009-0000abc9"
+        (connectors.waits_dir(self.ws) / f"{broken}.claimed").write_text("{broken")
+        for wait_id in (pending, "1789000000005-0000abc5", broken):
+            with self.subTest(wait_id):
+                code, out = run(self.ws, ["verify-account", wait_id], FakeCloud(self.ws))
+                self.assertEqual((code, out["reason"]), (connectors.EXIT_NO, "no_such_wait"))
+
+    def stamp(self, user):
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": user, "spawned_at": "2026-09-15T00:00:00Z"}
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+
+    def test_the_running_core_station_must_act_as_the_wait_account(self):
+        self.assertIs(connectors.read_station_stamp, sys.modules["station_stamp"].read_station_stamp)
+        wait_id = self.claimed()
+        for stamped, code, reason, asked in (("u-owner", connectors.EXIT_OK, None, ["/api/me"]),
+                                             ("u-other", connectors.EXIT_NO, "account_changed", []),
+                                             (None, connectors.EXIT_OK, None, ["/api/me"])):
+            with self.subTest(stamped=stamped):
+                self.stamp(stamped)
+                cloud = FakeCloud(self.ws, user="u-owner")
+                self.assertEqual(run(self.ws, ["verify-account", wait_id], cloud),
+                                 (code, {"wait_id": wait_id, "ok": reason is None, "reason": reason}))
+                self.assertEqual(cloud.paths, asked)
+
+    def test_setup_problems_exit_2(self):
+        wait_id = self.claimed()
+        code, out = run(self.ws, ["verify-account", "../../etc"], FakeCloud(self.ws))
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, out = run(self.ws, ["verify-account", wait_id], FakeCloud(self.ws, token=None))
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "not_signed_in"))
+        cloud = FakeCloud(self.ws)
+        cloud.error = cloud_auth.CloudError(0, "network", "down")
+        code, out = run(self.ws, ["verify-account", wait_id], cloud)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "cloud_error"))
+        reset = connectors.Cloud(self.ws, read_auth=lambda _ws: ("https://sutando.ag2.space", "sutk_test"),
+                                 request=mock.Mock(side_effect=ConnectionResetError("reset by peer")))
+        code, out = run(self.ws, ["verify-account", wait_id], reset)
+        self.assertEqual((code, out["error"], out["code"]), (connectors.EXIT_SETUP, "cloud_error", "network"))
 
 
 class TestResumed(Base):
@@ -551,6 +796,41 @@ class TestClaim(Base):
         self.assertEqual([(r["wait_id"], r["claimed_by"], r["resume_task"], r["resume_pending"]) for r in out["resumed"]],
                          [(m["wait_id"], "claim", None, False)], "a second 'done' sees the wait was answered")
 
+    def test_each_claimed_wait_carries_its_account_verdict(self):
+        expect = {"1789000000001-0000abc1": ("u-owner", True, None),
+                  "1789000000002-0000abc2": (None, False, "account_unknown"),
+                  "1789000000003-0000abc3": ("u-someone-else", False, "account_changed")}
+        for wait_id, (account, _, _) in expect.items():
+            self.marker(wait_id=wait_id, cloud_user_id=account)
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "googlecalendar", "status": "active"}])
+        code, out = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual(code, connectors.EXIT_OK)
+        self.assertEqual({c["wait_id"]: (c["account_ok"], c["account_reason"]) for c in out["claimed"]},
+                         {k: v[1:] for k, v in expect.items()})
+        self.assertEqual(cloud.paths, ["/api/connectors", "/api/me"], "one account read serves every wait")
+        unknown = self.marker(wait_id="1789000000004-0000abc4", cloud_user_id=None)
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "googlecalendar", "status": "active"}])
+        code, out = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual(([c["wait_id"] for c in out["claimed"]], cloud.paths),
+                         ([unknown["wait_id"]], ["/api/connectors"]), "nothing to compare, so no account read")
+
+    def test_a_station_started_for_another_account_fails_the_claimed_wait(self):
+        self.marker()
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": "u-other", "spawned_at": "x"}
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "googlecalendar", "status": "active"}])
+        code, out = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual((code, out["claimed"][0]["account_ok"], out["claimed"][0]["account_reason"]),
+                         (connectors.EXIT_OK, False, "account_changed"))
+
+    def test_an_account_read_that_fails_claims_nothing(self):
+        m = self.marker()
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "googlecalendar", "status": "active"}],
+                          user=cloud_auth.CloudError(502, "http_502"))
+        code, out = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "cloud_error"))
+        self.assertTrue(connectors.marker_path(self.ws, m["wait_id"]).exists())
+
     def test_not_connected_leaves_the_wait_armed(self):
         m = self.marker(slugs=("googlecalendar", "linear"))
         self.marker(wait_id="1789000000001-0000abce", room="!other:ag2.space")
@@ -565,6 +845,8 @@ class TestClaim(Base):
         cloud = FakeCloud(self.ws, token=None)
         code, out = run(self.ws, ["claim", ROOM, "--force"], cloud)
         self.assertEqual((code, out["claimed"][0]["wait_id"]), (connectors.EXIT_OK, m["wait_id"]))
+        self.assertEqual((out["claimed"][0]["account_ok"], out["claimed"][0]["account_reason"]),
+                         (False, "account_unknown"), "an account never read never checks out")
         self.assertEqual(cloud.paths, [])
 
     def test_no_wait_needs_no_cloud_and_cloud_errors_exit_2(self):

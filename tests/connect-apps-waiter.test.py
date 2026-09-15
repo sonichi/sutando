@@ -2,9 +2,10 @@
 """Tests for the connect-apps waiter: exactly one resume task per wait, and none
 once someone else claimed it.
 
-Covers the connected and timeout outcomes, the stale drop, a waiter racing a
-claim or another waiter, the resume task's headers (task-last, parsed with the
-strict task-header parser the core uses) and one real detached spawn.
+Covers the connected, timeout, user_changed and unverified outcomes, the stale
+drop, a waiter racing a claim or another waiter, the resume task's headers
+(task-last, parsed with the strict task-header parser the core uses) and one
+real detached spawn.
 """
 
 import contextlib
@@ -87,7 +88,7 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def marker(self, slugs=(("googlecalendar", "Google Calendar"),), deadline=NOW + 1800, request="what's on my calendar",
-               cloud_user_id=None):
+               cloud_user_id="u-owner"):
         m = {"version": 1, "wait_id": WAIT_ID, "toolkits": [{"slug": s, "name": n} for s, n in slugs],
              "room": ROOM, "reply_to": "$evt1", "request": request, "task": "task-abc", "owner": OWNER,
              "created_at": "x", "deadline": deadline, "deadline_at": "y", "cloud_user_id": cloud_user_id}
@@ -139,6 +140,9 @@ class TestWaiter(Base):
         self.assertIn("Google Calendar is now connected", parsed.body)
         self.assertIn('"what\'s on my calendar"', parsed.body)
         self.assertIn(f"operation_id {WAIT_ID}:answer", parsed.body)
+        self.assertIn(f"connectors.py verify-account {WAIT_ID}. Only if it exits 0", parsed.body)
+        self.assertIn("share no data", parsed.body)
+        self.assertIn(f"operation_id {WAIT_ID}:account", parsed.body)
         self.assertIn("reply_to $evt1", parsed.body)
         self.assertIn("[no-send]", parsed.body)
         self.assertEqual(task_priority.default_priority_for_source(h["source"], h["access_tier"]), h["priority"])
@@ -314,11 +318,33 @@ class TestWaiter(Base):
         cloud = ScriptedCloud(self.ws, [{"googlecalendar"}], users=[connectors.Setup("not_signed_in", "x")])
         self.assertEqual(self.waiter(cloud, Clock()), "timeout")
 
-    def test_no_recorded_account_skips_the_check(self):
-        self.marker()
-        cloud = ScriptedCloud(self.ws, [{"googlecalendar"}], users=["u-anyone"])
-        self.assertEqual(self.waiter(cloud, Clock()), "connected")
-        self.assertEqual(cloud.user_checks, 0)
+    def test_a_wait_without_its_account_fails_closed(self):
+        self.marker(cloud_user_id=None)
+        cloud = ScriptedCloud(self.ws, [{"googlecalendar"}], users=["u-owner"])
+        self.assertEqual(self.waiter(cloud, Clock()), "unverified")
+        self.assertEqual(cloud.user_checks, 0, "an unknown account is never matched to whoever is signed in")
+        body = ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()).body
+        self.assertIn("Google Calendar is now connected", body)
+        self.assertIn("could not be confirmed", body)
+        self.assertIn("ask again", body)
+        self.assertIn(f"operation_id {WAIT_ID}:unverified", body)
+        self.assertIn("[no-send]", body)
+        self.assertNotIn("composio_exec", body)
+        record = json.loads(connectors.claimed_path(self.ws, WAIT_ID).read_text())
+        self.assertEqual(record["claimed_by"], "unverified")
+        [resumed] = connectors.recent_claims(self.ws, ROOM, NOW)
+        self.assertEqual((resumed["claimed_by"], resumed["resume_task"], resumed["resume_pending"]),
+                         ("unverified", f"task-connect-{WAIT_ID}", True))
+
+    def test_a_marker_from_before_the_account_was_recorded_is_unverified(self):
+        m = self.marker()
+        del m["cloud_user_id"]
+        connectors.write_marker(self.ws, m)
+        self.assertEqual(self.waiter(ScriptedCloud(self.ws, [{"linear", "googlecalendar"}]), Clock()), "unverified")
+
+    def test_unverified_still_times_out_while_the_apps_are_missing(self):
+        self.marker(cloud_user_id=None, deadline=NOW + 1)
+        self.assertEqual(self.waiter(ScriptedCloud(self.ws, [set()]), Clock()), "timeout")
 
     def test_cloud_user_id_rereads_auth(self):
         reads = []

@@ -5,15 +5,19 @@ resume their request once the apps are connected.
   find <query...>                   the catalog app whose slug or name is exactly <query>
   status [slug...] [--room R]       the owner's connections, pending and recently resumed waits
   await <slug...> --room R --reply-to E --task T --owner O (--request TEXT | --request-file PATH|-)
-                                    record a wait (merged into the room's pending wait for the
-                                    same apps) and start its detached waiter
-  claim <room> [--force]            claim the room's pending waits whose apps are connected
+                                    record a wait (merged into the room's pending waits for the
+                                    same apps and AG2 Cloud account) and start its detached waiter
+  claim <room> [--force]            claim the room's pending waits whose apps are connected, each
+                                    with whether its AG2 Cloud account checks out
+  verify-account <wait-id>          is the claimed wait's AG2 Cloud account the one signed in and
+                                    the one the running core's station acts as?
   rearm                             restart the waiter of every unclaimed wait that has none
 
 Output is one JSON object on stdout. Exit codes: 0 ok; 1 a negative answer (no
-exact match, not every app connected, nothing claimed); 2 a setup problem to
-relay, not retry (not signed in, connectors disabled, unknown app, bad
-arguments, not the owner's own AG2 Space task, cloud unreachable).
+exact match, not every app connected, nothing claimed, the account not the
+wait's or unknown); 2 a setup problem to relay, not retry (not signed in,
+connectors disabled, unknown app, too many apps, bad arguments, not the owner's
+own AG2 Space task, cloud unreachable).
 
 A wait is `<workspace>/state/connect-waits/<wait-id>.json`. Claiming it is a
 rename to `<wait-id>.claimed`, so exactly one of the waiter, the deadline,
@@ -21,13 +25,19 @@ rename to `<wait-id>.claimed`, so exactly one of the waiter, the deadline,
 record keeps who claimed it and when, so `claim` and `status` can report that a
 room's request is already answered or being answered. The waiter writes one
 resume task, `tasks/task-connect-<wait-id>.txt`, which the core processes like
-any other. Only a live owner-tier AG2 Space task can record a wait.
+any other. Only a live owner-tier AG2 Space task can record a wait, and one task
+has at most one wait per room. A wait whose AG2 Cloud account is unknown never
+answers with data (outcome `unverified`), and waits of different accounts are
+never merged; a `connected` resume runs `verify-account` and `claim` reports each
+wait's account verdict, because the account signed in, or the one the running
+core's station was started for, may no longer be the wait's.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import json
 import os
 import re
@@ -46,6 +56,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import cloud_auth  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
+from station_stamp import read_station_stamp  # noqa: E402
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
 
 EXIT_OK, EXIT_NO, EXIT_SETUP = 0, 1, 2
@@ -61,6 +72,8 @@ RECENT_S = WAIT_S
 MAX_TOOLKITS = 5
 MAX_REQUEST_CHARS = 500
 MAX_REQUEST_READ = 64 * 1024
+# Pauses between the tries of reading the account a new wait is made under.
+ACCOUNT_RETRY_S = (0.5, 1.0)
 SLUG_RE = re.compile(r"^[a-z0-9_]{1,64}\Z")
 WAIT_ID_RE = re.compile(r"^[0-9]{13}-[0-9a-f]{8}\Z")
 # Room ids from room version 12 carry no ":server" part.
@@ -70,7 +83,7 @@ TOKEN_RE = re.compile(r"^\S{1,255}\Z")
 RESUME_SOURCE = "connector-resume"
 ORIGIN_SOURCE = "ag2space"
 # claimed_by values whose request is answered (or the owner told why not).
-WAITER_OUTCOMES = ("connected", "timeout", "user_changed")
+WAITER_OUTCOMES = ("connected", "timeout", "user_changed", "unverified")
 RESUMED_BY = WAITER_OUTCOMES + ("claim",)
 CLAIM_KEYS = ("claimed_by", "claimed_at")
 
@@ -116,6 +129,9 @@ class Cloud:
             if exc.status == 401:
                 self.token = None
             raise
+        except (OSError, ValueError) as exc:
+            # cloud_request leaves errors raised while reading a response (a reset, a read timeout) unwrapped.
+            raise cloud_auth.CloudError(0, "network", str(exc)) from None
         return data if isinstance(data, dict) else {}
 
     def user_id(self) -> str | None:
@@ -391,13 +407,26 @@ def resume_text(marker: dict, outcome: str) -> str:
     wait_id, room, reply_to = marker["wait_id"], marker["room"], marker["reply_to"]
     origin = f"(wait {wait_id}, from task {marker['task']})"
     request = header_safe_value(marker.get("request") or "")
+    is_are = "is" if len(names) == 1 else "are"
     if outcome == "connected":
         text = (
-            f"{apps} {'is' if len(names) == 1 else 'are'} now connected {origin}. "
-            f'Answer the owner\'s earlier request "{request}" in room {room} (reply_to {reply_to}): '
-            f"get the data with composio_exec, post the answer with room.message.send "
-            f"(operation_id {wait_id}:answer), then write the result [no-send]. "
-            "Follow the connect-apps skill, Resume."
+            f"{apps} {is_are} now connected {origin}. "
+            f'Answer the owner\'s earlier request "{request}" in room {room} (reply_to {reply_to}). '
+            f"First run the connect-apps helper: connectors.py verify-account {wait_id}. Only if it exits 0, "
+            f"get the data with composio_exec and post the answer with room.message.send "
+            f"(operation_id {wait_id}:answer). Otherwise share no data: tell the owner you didn't check "
+            f"their {apps} because a different or unconfirmed AG2 Cloud account is signed in now, and to "
+            f"ask again once the right account is (room.message.send, operation_id {wait_id}:account). "
+            "Either way write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif outcome == "unverified":
+        text = (
+            f"{apps} {is_are} now connected {origin}, but the AG2 Cloud account this wait was made under "
+            f'could not be confirmed, so the owner\'s earlier request "{request}" was not answered. '
+            f"In room {room} (reply_to {reply_to}), tell the owner {apps} {is_are} connected now but you "
+            "couldn't confirm which AG2 Cloud account asked, so you didn't check it: ask again to get the "
+            f"answer. Post it with room.message.send (operation_id {wait_id}:unverified), then write the "
+            "result [no-send]. Share no data from any app. Follow the connect-apps skill, Resume."
         )
     elif outcome == "user_changed":
         text = (
@@ -451,11 +480,11 @@ def write_resume_task(ws: Path, marker: dict, outcome: str, now: float) -> Path:
 
 
 def account_outcome(cloud: Cloud, marker: dict) -> str | None:
-    """connected when the signed-in account is the one the wait was made under (or that is
-    unknown), user_changed when it isn't, None when it can't be checked right now."""
+    """connected when the signed-in account is the one the wait was made under, user_changed
+    when it isn't, unverified when the wait never knew its account, None when it can't be checked now."""
     want = marker.get("cloud_user_id")
     if not want:
-        return "connected"
+        return "unverified"
     try:
         current = cloud.user_id()
     except (cloud_auth.CloudError, Setup, OSError, ValueError):
@@ -473,7 +502,7 @@ def run_waiter(
     sleep: Callable[[float], None] = time.sleep,
 ) -> str:
     """Poll until every app is active or the deadline passes, then claim and
-    write the resume task. Returns connected | timeout | user_changed | expired |
+    write the resume task. Returns connected | timeout | user_changed | unverified | expired |
     invalid | claimed_elsewhere | write_failed | busy (another waiter holds the lock)."""
     lock = acquire_lock(ws, wait_id)
     if lock is None:
@@ -615,12 +644,28 @@ def merge_requests(requests: list[str]) -> str:
     return " / ".join(out)[:MAX_REQUEST_CHARS]
 
 
+def account_for_wait(cloud: Cloud, sleep: Callable[[float], None]) -> str | None:
+    """The signed-in account's id, tried a few times; None when it stays unknown."""
+    found = None
+    for pause in (0.0, *ACCOUNT_RETRY_S):
+        if pause:
+            sleep(pause)
+        try:
+            found = cloud.user_id()
+        except (cloud_auth.CloudError, Setup, OSError, ValueError):
+            found = None
+        if found:
+            break
+    return found
+
+
 def cmd_await(
     ws: Path,
     cloud: Cloud,
     args: argparse.Namespace,
     spawn: Callable[[Path, str], int] = spawn_waiter,
     now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
     **_: Any,
 ) -> int:
     slugs = list(dict.fromkeys(s.strip().lower() for s in args.slugs))
@@ -639,13 +684,21 @@ def cmd_await(
         raise Setup("not_owner_task", f"--owner is not the user of {task}.")
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+    cloud_user_id = account_for_wait(cloud, sleep)
 
-    same_room = [m for m in list_markers(ws) if m.get("room") == room]
-    for marker in same_room:
-        if marker.get("task") == task:
+    # This task's own waits in the room come first: always reused or merged, so it has one wait per room.
+    same_room = sorted((m for m in list_markers(ws) if m.get("room") == room), key=lambda m: m.get("task") != task)
+    same_task = [m for m in same_room if m.get("task") == task]
+    for marker in same_task:
+        if set(slugs) <= {x.get("slug") for x in marker["toolkits"] if isinstance(x, dict)}:
             pid = None if waiter_alive(ws, marker["wait_id"]) else _try_spawn(spawn, ws, marker["wait_id"])
             emit({**summary(marker), "reused": True, "waiter_pid": pid})
             return EXIT_OK
+    combined = dict.fromkeys(slugs)
+    for marker in same_task:
+        combined.update(dict.fromkeys(str(x.get("slug")) for x in marker["toolkits"] if isinstance(x, dict)))
+    if len(combined) > MAX_TOOLKITS:
+        raise Setup("too_many_apps", f"{task} would wait for {len(combined)} apps; one card lists at most {MAX_TOOLKITS}.")
 
     toolkits = []
     for slug in slugs:
@@ -657,34 +710,43 @@ def cmd_await(
         toolkits.append({"slug": slug, "name": item.get("name") or slug})
 
     t = now()
-    # A pending wait in this room for any of these apps is folded into this one, so the
-    # owner asking again never gets two answers.
+    # Another task's wait in this room is folded in only when it shares an app and was made under
+    # this same known account, so asking again gets one answer and no request crosses accounts.
     requests, taken, resumed = [], [], []
+    own_handled = False
     for marker in same_room:
         mine = {k["slug"] for k in toolkits}
         theirs = [x for x in marker["toolkits"] if isinstance(x, dict)]
         extra = [x for x in theirs if x.get("slug") not in mine]
-        if len(extra) == len(theirs) or len(toolkits) + len(extra) > MAX_TOOLKITS:
+        own = marker.get("task") == task
+        if not own and (not cloud_user_id or marker.get("cloud_user_id") != cloud_user_id
+                        or len(extra) == len(theirs) or len(toolkits) + len(extra) > MAX_TOOLKITS):
             continue
         won = claim(ws, marker["wait_id"], "superseded", t)
         if won is None:
             record = _read_json(claimed_path(ws, marker["wait_id"]))
-            if _valid_marker(record, marker["wait_id"]) and record.get("claimed_by") in ("connected", "claim"):
+            by = record.get("claimed_by") if _valid_marker(record, marker["wait_id"]) else None
+            if by in (RESUMED_BY if own else ("connected", "claim")):
                 resumed.append(resumed_summary(ws, record))
+                if own:
+                    own_handled = True
+                    break
             continue
         if won.get("invalid"):
             continue
         toolkits += [{"slug": x["slug"], "name": x.get("name") or x["slug"]} for x in extra]
         requests.append(str(won.get("request") or ""))
         taken.append(won)
+    if own_handled:
+        # This task's request already has its answer or note coming: a second wait would answer it twice.
+        for won in taken:
+            release(ws, won)
+        taken = []
     superseded = [w["wait_id"] for w in taken]
-    if resumed and not superseded:
+    answered = {str(x.get("slug")) for r in resumed for x in r.get("toolkits") or [] if isinstance(x, dict)}
+    if own_handled or (resumed and not superseded and set(slugs) <= answered):
         emit({"wait_id": None, "reused": False, "superseded": [], "resumed": resumed, "waiter_pid": None})
         return EXIT_OK
-    try:
-        cloud_user_id = str(cloud.get("/api/me").get("id") or "") or None
-    except cloud_auth.CloudError:
-        cloud_user_id = None
 
     wait_id = f"{int(t * 1000):013d}-{secrets.token_hex(4)}"
     marker = {
@@ -696,7 +758,7 @@ def cmd_await(
         "request": merge_requests(requests + [request]),
         "task": task,
         "owner": owner,
-        "cloud_user_id": cloud_user_id,
+        "cloud_user_id": cloud_user_id if all(w.get("cloud_user_id") == cloud_user_id for w in taken) else None,
         "superseded": superseded,
         "created_at": now_iso(t),
         "deadline": int(t + WAIT_S),
@@ -722,14 +784,19 @@ def cmd_claim(
     claimed, waiting = [], []
     if pending:
         active = None if args.force else cloud.active_toolkits()
+        ready = [m for m in pending
+                 if active is None or all(str(x.get("slug")) in active for x in m.get("toolkits") or [])]
+        current = (lambda: None) if args.force else functools.lru_cache(maxsize=None)(cloud.user_id)
+        # Every verdict before any claim, so a cloud error leaves every wait armed.
+        verdicts = {m["wait_id"]: account_mismatch(ws, m.get("cloud_user_id"), current) for m in ready}
         for marker in pending:
-            slugs = [str(x.get("slug")) for x in marker.get("toolkits") or []]
-            if active is not None and not all(s in active for s in slugs):
+            if marker["wait_id"] not in verdicts:
                 waiting.append(marker)
                 continue
             won = claim(ws, marker["wait_id"], "claim", now())
             if won is not None and not won.get("invalid"):
-                claimed.append(summary(won))
+                reason = verdicts[marker["wait_id"]]
+                claimed.append({**summary(won), "account_ok": reason is None, "account_reason": reason})
     taken = {c["wait_id"] for c in claimed}
     # A wait the waiter claimed meanwhile is no longer pending: it shows under resumed.
     emit({
@@ -738,6 +805,32 @@ def cmd_claim(
         "resumed": [r for r in recent_claims(ws, room, now()) if r["wait_id"] not in taken],
     })
     return EXIT_OK if claimed else EXIT_NO
+
+
+def account_mismatch(ws: Path, want: Any, current: Callable[[], str | None]) -> str | None:
+    """None when the wait's account is known, signed in, and the one the running core's station was
+    started for (when the desktop stamped one); else account_unknown or account_changed."""
+    if not want:
+        return "account_unknown"
+    stamped = (read_station_stamp(ws) or {}).get("cloud_user_id")
+    if stamped and stamped != want:
+        return "account_changed"
+    found = current()
+    if not found:
+        return "account_unknown"
+    return None if found == want else "account_changed"
+
+
+def cmd_verify_account(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
+    """Exit 0 only when the claimed wait's account is known and account_mismatch finds nothing."""
+    wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
+    record = _read_json(claimed_path(ws, wait_id))
+    if _valid_marker(record, wait_id):
+        reason = account_mismatch(ws, record.get("cloud_user_id"), cloud.user_id)
+    else:
+        reason = "no_such_wait"
+    emit({"wait_id": wait_id, "ok": reason is None, "reason": reason})
+    return EXIT_OK if reason is None else EXIT_NO
 
 
 def prune(ws: Path, now: float) -> int:
@@ -806,13 +899,16 @@ def parser() -> argparse.ArgumentParser:
     c = sub.add_parser("claim")
     c.add_argument("room")
     c.add_argument("--force", action="store_true", help="claim even when the apps are not connected")
+    v = sub.add_parser("verify-account")
+    v.add_argument("wait_id")
     sub.add_parser("rearm")
     w = sub.add_parser("waiter", help=argparse.SUPPRESS)
     w.add_argument("wait_id")
     return p
 
 
-COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "claim": cmd_claim}
+COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "claim": cmd_claim,
+            "verify-account": cmd_verify_account}
 
 
 def main(
