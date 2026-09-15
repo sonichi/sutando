@@ -26,6 +26,8 @@ task-watcher a-fallback-hits task-claims codex-task-notifier codex-presence note
 vendored-resolver-env legacy-notes-divergence vault-manifest claude-hooks comm-sweep
 core-model-pin web-client memory-dir tailscale-funnel sutando-app telegram-bridge
 discord-bridge slack-bridge whatsapp-bridge
+agent-api dashboard screen-capture credential-proxy notes-dir voice-config
+CLAUDE.md build_log.md .env conversation-server ngrok
 """.split())
 
 

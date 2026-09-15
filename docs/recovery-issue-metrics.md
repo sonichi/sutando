@@ -19,6 +19,9 @@ Only built-in names in `HEALTH_CAUSES` are exported. User-defined names become
 `custom-check`, dynamic loop names become `dynamic-loop`, and unrecognized names
 become `other-check`. Details, task identities, paths, and custom names stay local.
 Open issues created before this change retain `unknown` (no guessed backfill).
+A check first detected as `warn` keeps that cause even if it later becomes `down`.
+The source inventory test checks literal built-in names, named helper calls, and
+static probe loops against the allowlist without running host-dependent probes.
 Each health check still has its own UUID.
 A partial batch can therefore recover two checks while a third stays open.
 
