@@ -158,6 +158,22 @@ def main() -> int:
         check(gb._room_is_deliverable_here("!x:ag2space.local") is True, "predicate: own room deliverable")
         os.environ["AGENT_MXID"] = ""
         check(gb._own_homeserver() == "", "predicate: no identity -> no homeserver")
+        # the server part is everything after the FIRST colon: ports and IPv6
+        # brackets are part of it (john-the-dev on #4273; fluffy#121's families)
+        table = [
+            ("@a:ag2.space",         "!r:ag2.space",         True,  "plain"),
+            ("@a:example.org:8448",  "!r:example.org:8448",  True,  "ported, same server"),
+            ("@a:example.org:8448",  "!r:other.org:8448",    False, "ported, DIFFERENT server sharing a port"),
+            ("@a:[1234::abcd]",      "!r:[1234::abcd]",      True,  "IPv6, same"),
+            ("@a:[1234::abcd]",      "!r:[9999::ffff]",      False, "IPv6, different"),
+            ("@a:[1234::abcd]:5678", "!r:[1234::abcd]:5678", True,  "IPv6 with port, same"),
+            ("@a:ag2.space",         "!r:dev.ag2.space",     False, "subdomain must not match"),
+            ("@a:ag2.space",         "!malformed-no-colon",  False, "no server part: deliverable nowhere"),
+        ]
+        for mxid, room, want, label in table:
+            os.environ["AGENT_MXID"] = mxid
+            got = gb._room_is_deliverable_here(room)
+            check(got is want, f"table: {label}: {mxid} vs {room} -> {got} (want {want})")
         os.environ.pop("AGENT_MXID", None)
 
     if FAILS:

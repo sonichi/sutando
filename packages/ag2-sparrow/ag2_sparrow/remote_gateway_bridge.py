@@ -3537,7 +3537,8 @@ def _own_homeserver() -> str:
     """The server this lane's agent lives on, from its enrolled identity;
     "" when the identity is unknown (then nothing below can discriminate)."""
     mxid = _reenroll_identity()
-    return mxid.rsplit(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
+    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
 
 
 def _room_is_deliverable_here(room: str) -> bool:
@@ -3547,7 +3548,9 @@ def _room_is_deliverable_here(room: str) -> bool:
     own = _own_homeserver()
     if not own:
         return True  # identity unknown: today's behaviour, deliberately
-    return room.rsplit(":", 1)[-1] == own
+    if ":" not in room:
+        return False  # names no server: deliverable nowhere, strands visibly
+    return room.split(":", 1)[1] == own
 
 
 def _record_proactive_receipt(item_id: str, room: str) -> None:
