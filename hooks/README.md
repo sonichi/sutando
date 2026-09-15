@@ -366,3 +366,31 @@ PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the n
 **Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
 the same login and is outside the subcommand set, as is a body read from stdin
 (`-F -`). Both are deliberate — the guard reads a body it can see.
+
+## `memory-index-guard.py`
+
+Denies an `Edit` or `Write` to `MEMORY.md` that would silently push an already-loading
+index row past the session read-budget cut — via
+`skills/proactive-loop/scripts/memory-index-budget.py`, for **any** caller, not only the
+skills whose own checklist remembers to chain step 7.5.
+
+Same architectural move as `gh-policy-gate.py`: enforcement moves from "a step I remember
+to chain" to the action itself. `context-source-guard.py` already proves file_path-based
+PreToolUse filtering works (live on this host, matched on `Read`); this hook matches on
+`Edit`/`Write` and checks whether `tool_input.file_path` ends in `MEMORY.md`.
+
+What counts as "the addition": an `Edit`'s `new_string` directly (skipped if it's not a
+growth over `old_string` — a shrink is never refused). A `Write` replaces the whole file,
+so there's no single addition in the tool input; the hook reads the file's current
+on-disk content (before the write happens) and diffs it against the incoming `content`,
+treating lines present in the new content but not the old as the addition. A `Write` to a
+path that doesn't exist yet treats the whole `content` as the addition.
+
+Fails open on uncertainty, denies only on a positive finding — same contract as
+`gh-policy-gate.py`.
+
+- `SUTANDO_ALLOW_UNGATED_MEMORY_WRITE=1` — one-shot override.
+
+**Not covered:** a memory file other than `MEMORY.md` itself (the index budget script's
+own target — other memory files have no load-order cap to violate), and an Edit/Write
+whose `file_path` cannot be read from `tool_input` at all.
