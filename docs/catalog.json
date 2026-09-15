@@ -321,6 +321,16 @@
    "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
    "last_verified": "2026-08-21"
   },
+  "docs/task-envelope-hmac.md": {
+   "title": "Task-envelope HMAC — current status and phased plan",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the task-envelope HMAC mechanism, its precise security claim, the four-verdict state machine, and the owner-ratified five-phase mailbox-authority rollout",
+   "last_verified": "2026-08-23"
+  },
   "docs/testing-coverage.md": {
    "title": "Unit-test coverage gate",
    "audience": [
