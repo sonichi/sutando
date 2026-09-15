@@ -24,6 +24,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -82,6 +83,21 @@ class CoreLineage(unittest.TestCase):
         cl.record_run(self.ws, self.host, self.sid, runtime="claude", cwd="/repo")
         self.assertEqual(cl.sessions(self.ws, self.host)[0]["transcript"]["path"], "",
                          "a transcript that does not exist was recorded as if it did")
+
+    def test_a_failed_write_removes_its_temp_file_and_reraises(self):
+        """The atomic writer must not leave a .tmp behind for a reader to find."""
+        d = Path(self.ws) / "state" / "cores"
+        with mock.patch.object(cl.json, "dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cl._write(d / "x.json", {"a": 1})
+        leftovers = [q.name for q in d.glob(".x.json.*")] if d.is_dir() else []
+        self.assertEqual(leftovers, [], f"temp file survived a failed write: {leftovers}")
+
+    def test_an_empty_cwd_or_session_locates_nothing(self):
+        """Empty means "no file", and must not compose a path out of blanks."""
+        self.assertEqual(cl.transcript_path_for(self.ws, "", "abc"), "")
+        self.assertEqual(cl.transcript_path_for(self.ws, "/some/dir", ""), "")
+        self.assertEqual(cl.transcript_path_for(self.ws, "", ""), "")
 
     def test_each_host_keeps_its_own_lineage(self):
         cl.record_run(self.ws, "host-a", self.sid, runtime="claude", cwd="/repo")
