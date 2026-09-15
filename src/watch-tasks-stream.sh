@@ -51,6 +51,16 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
+  # The watcher keeps only the exit code; a handler that died outside its own
+  # logging left no trace, so its stderr and the code land in one file.
+  runner_log="$workspace/logs/task-event-handler-runner.log"
+  mkdir -p "$workspace/logs" 2>/dev/null || true
+  # Opened only when the sink is a REGULAR file: a FIFO here blocks the open,
+  # and a blocked runner holds a worker slot until someone reads the pipe.
+  handler_err=2
+  if [ ! -e "$runner_log" ] || [ -f "$runner_log" ]; then
+    if exec 3>>"$runner_log" 2>/dev/null; then handler_err=3; fi
+  fi
   # `pending` before the result so a result the drain can see always has
   # attribution beside it; an injected-but-broken writer fails the task instead.
   if ! record_worker_done "$filename" pending "$workspace"; then
@@ -61,13 +71,18 @@ if [ "${1:-}" = "--handler-runner" ]; then
       --workspace "$workspace" \
       --task-file "$task_path" \
       --results-dir "$results" \
-      --repo "$repo" >/dev/null; then
+      --repo "$repo" >/dev/null 2>&"$handler_err"; then
     handler_rc=0
     # Promote only after the result is visible: `.flag` is the sole stage the
     # sweep retires on, so it must never precede the thing it attributes.
     record_worker_done "$filename" done "$workspace" || handler_rc=1
   else
     handler_rc=$?
+  fi
+  # The ALREADY-OPEN descriptor, never a reopen: reopening re-enters the block
+  # this guard exists to avoid, after the handler has already run.
+  if [ "$handler_err" = 3 ]; then
+    printf '%s RUNNER rc=%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$handler_rc" "$filename" >&3 2>/dev/null || true
   fi
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
