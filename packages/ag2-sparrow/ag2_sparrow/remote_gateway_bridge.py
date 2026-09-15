@@ -3533,6 +3533,26 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return ("send", None, parsed.body)
 
 
+def _own_homeserver() -> str:
+    """The server this lane's agent lives on, from its enrolled identity;
+    "" when the identity is unknown (then nothing below can discriminate)."""
+    mxid = _reenroll_identity()
+    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
+    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+
+
+def _room_is_deliverable_here(room: str) -> bool:
+    """A gateway posts only to rooms on its own homeserver. Another lane's room
+    must be left for that lane: claiming it here fails at the gateway and the
+    retry budget then parks deliverable work as undeliverable."""
+    own = _own_homeserver()
+    if not own:
+        return True  # identity unknown: today's behaviour, deliberately
+    if ":" not in room:
+        return False  # names no server: deliverable nowhere, strands visibly
+    return room.split(":", 1)[1] == own
+
+
 def _record_proactive_receipt(item_id: str, room: str) -> None:
     """Durable "delivered where" for the proactive leg. The log line naming the
     room rotates; this outlives it. Fail-open: a receipt write must never
@@ -3654,6 +3674,8 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if route == "send" and peek_room is not None and not _room_is_deliverable_here(peek_room):
+            continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and GATEWAY_INSTANCE:
@@ -3690,6 +3712,8 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
+                route == "send" and room_override is not None
+                and not _room_is_deliverable_here(room_override)) or (
                 route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
