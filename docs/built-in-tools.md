@@ -275,6 +275,8 @@ python3 "$C" find "google calendar"     # exact catalog app, connected or not
 python3 "$C" status googlecalendar      # connected? plus pending waits
 python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
 ```
+The owner sees, switches and disconnects connected apps in AG2 Space → Settings → Integrations;
+`await <slug> --switch` arms a wait that resumes only once the app is signed in with a new account.
 
 **App launcher** — open any macOS app:
 ```bash
