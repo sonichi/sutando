@@ -50,6 +50,8 @@ caps this file and refuses date stamps in it).
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
    Bind idle to it too: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
    (1 = a task got no result, so idle does not run).
+1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
+   any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
 2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
    when voice is connected, plus a macOS notification.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the

@@ -56,11 +56,15 @@ class FakeContext(marketplace.Context):
         self.install_responses = {}
         self.install_errors = {}
         self.bundles = {}
+        self.connector_items = [{"id": "gmail", "slug": "gmail", "name": "Gmail", "kind": "connector"},
+                                {"id": "gmail_extra", "slug": "gmail_extra", "name": "Gmail Extra", "kind": "connector"}]
 
     def http(self, method, path, body=None):
         self.calls.append((method, path, body))
+        if path.startswith("/api/station/catalog?kind=connector"):
+            return {"items": self.connector_items, "enabledKinds": {"connector": True}}
         if path.startswith("/api/station/catalog"):
-            return {"items": self.catalog_items, "featuredConnectors": [{"id": "gmail", "slug": "gmail", "name": "Gmail", "kind": "connector"}]}
+            return {"items": self.catalog_items, "featuredConnectors": []}
         if path == "/api/me":
             return self.me_body
         if path == "/api/me/inventory":
@@ -204,7 +208,8 @@ class TestInstall(unittest.TestCase):
         code, out = run(ctx, ["install", "nope", "gmail", "prothing", "bundled"])
         reasons = {i["slug"]: i.get("reason", "") for i in out["plan"]["items"]}
         self.assertIn("not found", reasons["nope"])
-        self.assertIn("connector", reasons["gmail"])
+        self.assertIn("connect-apps skill", reasons["gmail"])
+        self.assertIn(("GET", "/api/station/catalog?kind=connector&limit=100&q=gmail", None), ctx.calls)
         self.assertIn("pro plan", reasons["prothing"])
         self.assertIn("bundled", reasons["bundled"])
         self.assertTrue((self.root / "bundled").is_symlink())
@@ -570,7 +575,8 @@ class TestCoverageEdges(unittest.TestCase):
         ctx = FakeContext(self.root, inventory={"installed": [], "cloudTools": [{"slug": "leads"}]})
         code, out = self.text(ctx, ["uninstall", "leads", "--yes"])
         self.assertEqual(code, 0)
-        self.assertIn("disappear from the core after the next restart", out)
+        self.assertIn("Its tools stop working now", out)
+        self.assertIn("goes away at its next restart", out)
 
         def boom(method, path, body=None):
             if path.endswith("/uninstall"):
@@ -671,6 +677,194 @@ class TestCoverageEdges(unittest.TestCase):
         self.assertIsNone(skill_install.local_version(out))
         self.assertEqual(skill_install.read_provenance(out), {})
         self.assertEqual(skill_install.read_provenance(self.root / "missing"), {})
+
+
+class TestMeteredAndStationStamp(unittest.TestCase):
+    """Metered cloud tools confirm their price; the restart hint follows the desktop's runtime stamp."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ws = self.root / "ws"
+        self.cfg = self.root / "cfg"
+        self.cfg.mkdir()
+        (self.ws / "state").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ctx(self, stamp=None, on_disk=True, me=None, **kw):
+        ctx = FakeContext(self.root / "skills", me=me or {"id": "u1", "plan": "free", "walletCredits": 100}, **kw)
+        ctx.workspace = self.ws
+        ctx.config_dir = self.cfg
+        if on_disk:
+            (self.cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sutando-station": {}}}))
+        if stamp is not None:
+            (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+        return ctx
+
+    @staticmethod
+    def stamp(loaded=True, user="u1"):
+        return {"version": 1, "has_station_entry": loaded, "cloud_user_id": user, "spawned_at": "2026-09-15T00:00:00Z"}
+
+    def metered(self, model, credits, unit=None, acquired=False):
+        price = {"model": model, "credits": credits}
+        if unit:
+            price["unitLabel"] = unit
+        return {**item(TOOL_UUID, "leads", kind="cloud_tool", acquired=acquired), "price": price}
+
+    def test_metered_activation_needs_confirmation_with_its_price(self):
+        for model, credits, unit, label in (
+            ("per_call", 5, "run", "5 credits per run"),
+            ("per_unit", 0.5, "lead", "0.5 credits per lead"),
+            ("per_result", 2, None, "2 credits per result"),
+            ("per_result", 0, None, "charged per result"),
+        ):
+            with self.subTest(model=model, credits=credits):
+                ctx = self.ctx(catalog=[self.metered(model, credits, unit)])
+                code, out = run(ctx, ["install", "leads"])
+                self.assertEqual(code, marketplace.EXIT_CONFIRM)
+                self.assertTrue(out["confirm_required"])
+                self.assertEqual(out["plan"]["metered"], ["leads"])
+                self.assertEqual(out["plan"]["items"][0]["price"], label)
+                self.assertFalse(any(m == "POST" for m, _, _ in ctx.calls), "a plan never activates")
+
+    def test_metered_text_plan_states_the_price(self):
+        ctx = self.ctx(catalog=[self.metered("per_result", 3)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = marketplace.main(["install", "leads"], ctx=ctx)
+        self.assertEqual(code, marketplace.EXIT_CONFIRM)
+        self.assertIn("leads charges per use: 3 credits per result.", out.getvalue())
+        self.assertIn("confirm with the owner", out.getvalue())
+
+    def test_free_or_zero_priced_per_call_and_owned_metered_do_not_confirm(self):
+        for row in (self.metered("per_call", 0), self.metered("per_result", 2, acquired=True)):
+            with self.subTest(row=row["price"]):
+                code, out = run(self.ctx(catalog=[row]), ["install", "leads"])
+                self.assertEqual(code, marketplace.EXIT_OK)
+                self.assertEqual(out["plan"]["metered"], [])
+
+    def activate(self, ctx):
+        ctx.catalog_items = [item(TOOL_UUID, "leads", kind="cloud_tool")]
+        ctx.install_responses[TOOL_UUID] = {"ok": True}
+        return run(ctx, ["install", "leads", "--yes"])
+
+    def test_no_stamp_keeps_the_file_based_restart_hint(self):
+        code, out = self.activate(self.ctx(stamp=None))
+        self.assertTrue(out["restart_required"])
+        self.assertEqual(out["usable_now"], [])
+        self.assertIn("Restart engine", out["restart_hint"])
+
+    def test_core_that_loaded_the_station_needs_no_restart(self):
+        ctx = self.ctx(stamp=self.stamp())
+        code, out = self.activate(ctx)
+        self.assertEqual(code, marketplace.EXIT_OK)
+        self.assertFalse(out["restart_required"])
+        self.assertEqual(out["usable_now"], ["leads"])
+        self.assertNotIn("restart_hint", out)
+        text = io.StringIO()
+        ctx = self.ctx(stamp=self.stamp())
+        ctx.catalog_items = [item(TOOL_UUID, "leads", kind="cloud_tool")]
+        ctx.install_responses[TOOL_UUID] = {"ok": True}
+        with contextlib.redirect_stdout(text):
+            marketplace.main(["install", "leads", "--yes"], ctx=ctx)
+        self.assertIn("Activated cloud tools (usable now through station_call): leads", text.getvalue())
+        self.assertNotIn("RESTART REQUIRED", text.getvalue())
+
+    def test_core_started_without_the_station_needs_a_restart(self):
+        code, out = self.activate(self.ctx(stamp=self.stamp(loaded=False)))
+        self.assertTrue(out["restart_required"])
+        self.assertEqual(out["usable_now"], [])
+
+    def test_changed_cloud_user_needs_a_restart(self):
+        code, out = self.activate(self.ctx(stamp=self.stamp(user="u-old")))
+        self.assertTrue(out["restart_required"])
+        # unknown on either side is not a change
+        code, out = self.activate(self.ctx(stamp=self.stamp(user=None)))
+        self.assertFalse(out["restart_required"])
+        code, out = self.activate(self.ctx(stamp=self.stamp(user="u-old"), me={"plan": "free", "walletCredits": 9}))
+        self.assertFalse(out["restart_required"])
+
+    def test_no_entry_on_disk_and_none_loaded_needs_a_restart_after_sign_in(self):
+        ctx = self.ctx(stamp=self.stamp(loaded=False), on_disk=False)
+        text = io.StringIO()
+        ctx.catalog_items = [item(TOOL_UUID, "leads", kind="cloud_tool")]
+        ctx.install_responses[TOOL_UUID] = {"ok": True}
+        with contextlib.redirect_stdout(text):
+            marketplace.main(["install", "leads", "--yes"], ctx=ctx)
+        self.assertNotIn("RESTART REQUIRED", text.getvalue())
+        self.assertNotIn("usable now", text.getvalue())
+        self.assertIn("hasn't connected the engine to AG2 Cloud yet", text.getvalue())
+        self.assertIn("needs one restart", text.getvalue())
+        code, out = self.activate(self.ctx(stamp=self.stamp(loaded=False), on_disk=False))
+        self.assertEqual((out["restart_after_sign_in"], out["restart_required"], out["usable_now"]), (True, False, []))
+        code, out = self.activate(self.ctx(stamp=self.stamp(loaded=False)))
+        self.assertFalse(out["restart_after_sign_in"], "already on disk: RESTART REQUIRED says it")
+        code, out = self.activate(self.ctx(stamp=self.stamp()))
+        self.assertFalse(out["restart_after_sign_in"])
+
+    def test_unparseable_price_reads_as_free(self):
+        row = {"price": {"model": "per_call", "credits": "lots"}}
+        self.assertEqual(marketplace.price_label(row), "free")
+        self.assertFalse(marketplace.is_metered(row))
+
+    def test_unusable_stamps_read_as_absent(self):
+        (self.ws / "state" / "station-core-stamp.json").write_text("{not json")
+        self.assertIsNone(marketplace.read_station_stamp(self.ws))
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps({**self.stamp(), "version": 2}))
+        self.assertIsNone(marketplace.read_station_stamp(self.ws))
+        self.assertIsNone(marketplace.read_station_stamp(None))
+
+    def test_me_failure_reads_as_unknown_user(self):
+        ctx = self.ctx(stamp=self.stamp(user="u-old"))
+        ctx.me = mock.Mock(side_effect=cloud_auth.CloudError(500, "boom"))
+        self.assertFalse(marketplace.station_runtime(ctx)["user_changed"])
+
+    def test_status_hint_follows_the_stamp(self):
+        inv = {"installed": [], "cloudTools": [{"slug": "leads"}], "connectors": []}
+        for stamp, on_disk, expect in (
+            (self.stamp(), True, None),
+            (self.stamp(loaded=False), True, "aren't reachable from the running engine"),
+            (None, False, "aren't wired into the core yet"),
+        ):
+            with self.subTest(stamp=stamp, on_disk=on_disk):
+                marker = self.ws / "state" / "station-core-stamp.json"
+                marker.unlink(missing_ok=True)
+                (self.cfg / ".claude.json").unlink(missing_ok=True)
+                ctx = self.ctx(stamp=stamp, on_disk=on_disk, inventory=inv)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    marketplace.main(["status"], ctx=ctx)
+                if expect:
+                    self.assertIn(expect, out.getvalue())
+                else:
+                    self.assertNotIn("Restart engine", out.getvalue())
+
+    def test_find_lists_connectors_by_exact_slug_or_kind(self):
+        ctx = self.ctx(catalog=[item(SKILL_UUID, "gmail-helper")])
+        ctx.connector_items[0]["acquired"] = True
+        code, out = run(ctx, ["find", "gmail"])
+        self.assertEqual([(r["slug"], r["kind"]) for r in out["results"]],
+                         [("gmail-helper", "skill"), ("gmail", "connector")])
+        self.assertTrue(out["results"][1]["owned"])
+        ctx.calls.clear()
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            marketplace.main(["find", "gmail", "--kind", "connector"], ctx=ctx)
+        self.assertIn("- gmail [connector] free, tier free — connected", text.getvalue())
+        self.assertIn("gmail_extra", text.getvalue())
+        self.assertIn("connect-apps skill", text.getvalue())
+        self.assertEqual([p for _, p, _ in ctx.calls], ["/api/station/catalog?kind=connector&limit=100&q=gmail"])
+
+    def test_context_carries_the_workspace(self):
+        args = marketplace.parser().parse_args(["--dest-root", str(self.root), "status"])
+        with mock.patch.object(cloud_auth, "read_cloud_auth", return_value=(None, "sutk_x")), \
+                mock.patch.object(marketplace, "_agent_id", return_value=None), \
+                mock.patch.object(marketplace, "_workspace", return_value=self.ws), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            ctx = marketplace.build_context(args)
+        self.assertEqual(ctx.workspace, self.ws)
 
 
 if __name__ == "__main__":
