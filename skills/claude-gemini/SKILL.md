@@ -12,6 +12,8 @@ now. This skill uses whatever authentication `agy` is already configured to use 
 (Gemini API key or signed-in Google auth). It does not copy or export secrets. `agy`'s Gemini-API-key
 path needs BOTH `modelProvider: "gemini"` set in `~/.gemini/antigravity-cli/settings.json` AND the
 `GEMINI_API_KEY` env var — the env var alone does nothing; `gemini-run.sh --check` reports both.
+If `agy` isn't installed but the legacy `gemini` CLI still is, `gemini-run.sh` falls back to it
+automatically, so a gemini-only host keeps working.
 
 **Usage**: `/claude-gemini [prompt]`
 
