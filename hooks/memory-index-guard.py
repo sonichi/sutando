@@ -16,14 +16,20 @@ proves file_path-based PreToolUse filtering works (live on this host, matched
 on `Read`).
 
 WHAT COUNTS AS "THE ADDITION". `memory-index-budget.py --adding TEXT` answers
-"would TEXT, appended, drop something." An Edit call's `new_string` IS that
-text directly. A Write call replaces the whole file, so there is no single
-"addition" in the tool_input — this hook diffs the incoming `content` against
-what is currently on disk (reading BEFORE the write happens, since after is
-too late) and treats the lines present in the new content but not the old as
-the addition. A Write to a file that does not exist yet treats the whole
-`content` as the addition. A **shrink** (new_string/content is not longer, or
-adds no new lines) is never refused — the guard exists to catch growth
+"would TEXT, appended, drop something" — so TEXT must be the file's net
+growth, not raw tool_input. Neither Edit nor Write has that as a single
+field: an Edit's `new_string` is the whole replacement, not the delta over
+`old_string` (sending it directly overstates the growth whenever
+`old_string` is non-trivial), and a Write replaces the whole file with no
+"addition" field at all. Both branches take the same shape: materialise the
+post-edit text (Edit: `old_text.replace(old_string, new_string)`; Write: the
+incoming `content` as-is), read what's currently on disk (BEFORE the write
+happens, since after is too late), and diff — the lines present in the new
+text but not the old are the addition. A Write to a file that does not exist
+yet treats the whole `content` as the addition; an Edit whose pre-state can't
+be read or located fails open (uncertain, not a positive finding). A
+**shrink** (the diffed addition is empty, or an Edit's raw new_string is no
+longer than old_string) is never refused — the guard exists to catch growth
 pushing something out, not edits that remove or merely reorder text.
 
 FAILS OPEN ON UNCERTAINTY, DENIES ONLY ON A POSITIVE FINDING. Same contract as
@@ -73,7 +79,17 @@ def _addition_for(tool_name: str, tool_input: dict) -> "str | None":
         old_string = tool_input.get("old_string") or ""
         if not new_string or len(new_string) <= len(old_string):
             return None
-        return new_string
+        # Diff the materialised post-edit text against disk, same shape as
+        # Write below — the raw new_string overstates growth (see PR body).
+        try:
+            old_text = Path(file_path).read_text(errors="ignore") if Path(file_path).is_file() else ""
+        except OSError:
+            return None
+        if not old_text or old_string not in old_text:
+            return None
+        new_text = old_text.replace(old_string, new_string, 1)
+        addition = _new_lines(old_text, new_text)
+        return addition or None
 
     if tool_name == "Write":
         content = tool_input.get("content") or ""
