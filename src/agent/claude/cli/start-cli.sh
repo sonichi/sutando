@@ -43,15 +43,6 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   PY="$(resolve_python "$REPO")"
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent.
-# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
-bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
-
-# Owned project hooks (handoff, pending-tasks, skill-declared) re-registered BEFORE the core
-# spawns: an engine update replaces .claude/settings.json. Unattended, so no ~/Desktop archiver.
-SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
-  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
-
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -147,9 +138,6 @@ else
 fi
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
-# The interpreter resolve_python validated above, carried across the tmux boundary: a window
-# spawned on an existing server inherits the SERVER's env, which may predate SUTANDO_PY.
-[ -n "$PY" ] && CORE_ENV_ARGS+=(-e "SUTANDO_PY=$PY")
 [ -n "$WORKER_INSTANCE" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$WORKER_INSTANCE")
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
@@ -244,7 +232,14 @@ fi
 
 # Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent. Below
 # the probe exit: --print-core-env is a pure read and must not write settings.
+# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
 bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+
+# Owned project hooks (handoff, pending-tasks, skill-declared) re-registered BEFORE the core
+# spawns: an engine update replaces .claude/settings.json. Unattended, so no ~/Desktop archiver.
+# Same probe-must-not-write invariant as the personal hook above.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1

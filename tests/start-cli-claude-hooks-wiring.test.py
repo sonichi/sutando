@@ -228,11 +228,13 @@ class StartCliRestoresOwnedHooksAfterUpdate(_Fixture):
 
 
 class LauncherForwardsTheValidatedInterpreter(unittest.TestCase):
-    """A tmux window spawned on an EXISTING server inherits the server's environment, which may
-    predate SUTANDO_PY; the launcher must carry the interpreter it validated into every spawn and
-    heal path. `--print-core-env` prints the real CORE_ENV_ARGS without launching anything."""
+    """A worker session's cwd need not be the repo and its PATH python3 may be the CLT stub, so the
+    launcher forwards the interpreter it validated to a WORKER spawn — but a core launch's env must
+    stay byte-identical (see tests/start-cli-worker-absolute-paths.test.sh, #4215's invariance);
+    forwarding it there too was this test's own earlier assumption, superseded on main. `--print-core-env`
+    prints the real CORE_ENV_ARGS without launching anything."""
 
-    def test_print_core_env_carries_an_executable_SUTANDO_PY(self):
+    def test_print_core_env_omits_SUTANDO_PY_for_a_plain_core_launch(self):
         with tempfile.TemporaryDirectory() as td:
             env = {k: v for k, v in os.environ.items() if k not in ("SUTANDO_CLAUDE_WORKING_DIR",)}
             env["HOME"] = td
@@ -241,9 +243,8 @@ class LauncherForwardsTheValidatedInterpreter(unittest.TestCase):
                                capture_output=True, text=True, timeout=120, env=env, cwd=str(REPO))
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = r.stdout.splitlines()
-        idx = [i for i, ln in enumerate(lines) if ln == "SUTANDO_PY=" + sys.executable]
-        self.assertEqual(len(idx), 1, lines)
-        self.assertEqual(lines[idx[0] - 1], "-e", lines)
+        idx = [i for i, ln in enumerate(lines) if ln.startswith("SUTANDO_PY=")]
+        self.assertEqual(idx, [], lines)
 
 
 class RuntimeScopingTest(unittest.TestCase):
