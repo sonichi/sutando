@@ -33,7 +33,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `fetch <ref>` | inbound media → local path | discord inbound `att.save`→inbox |
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
 | `say <room> <text>` | post plain text, pinging **nobody** by design — status lines, an answer to the room; never a hand-off | discord plain channel message |
-| `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → directory narrowed by the room → broker → roster), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
+| `mention <handle> [<handle> ...] <text> <room>` | resolve one or more handles, labels or display names to their mxids (directory → directory narrowed by the room → broker → roster), refuse the WHOLE call on any handle's ambiguity or miss, post ONE `<mxid> [<mxid> ...] — <text>` with all of them in `mentions` — the hand-off tool, and the only one that can address more than one peer in one post | discord `<@id>` ping (repeat for several) |
 | `members <room>` | who is present (mxid, display name, kind) — the roster to pick from when `mention` finds no match | discord member list |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
@@ -50,13 +50,23 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   -> {"ok":true,"state":"confirmed|unconfirmed","event_id":...}. `confirmed` means an
 #   event id came back. `unconfirmed` is a 200 with no proof: the send probably landed, so do
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
-#   Use `mention` instead when a specific agent must be triggered; `say` never pings.
+#   Use `mention` instead when a specific agent must be triggered; `say` never pings —
+#   and on this backend an agent-authored message is ONLY ever routed to another agent
+#   via a structured mention (m.mentions), never by body text, so a `say` "tagging"
+#   several peers by writing their mxids into the body pings none of them. `mention`
+#   with several handles is the one call that can.
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
-#   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
+#   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","mxids":[...],"resolved_by":"directory|directory+room|broker|room",...}
 #   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->
 #   {"ok":false,"candidates":[...],"resolved_by":"<the source that found too many>"} and
 #   NOTHING is posted: pick one from `members` and retry
 #   with its mxid — never guess one.
+python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" qingyun-001 'please review #149' '!room:hs' --agent '@a:hs'
+#   Several handles -> ONE post mentioning all of them: {"ok":true,"mxids":[mxid1,mxid2],...}
+#   and the room gets `<mxid1> <mxid2> — please review #149` with `mentions:[mxid1,mxid2]`.
+#   ANY handle failing to resolve refuses the WHOLE call — nothing posts, not even the
+#   handles that did resolve — with `failures:[{handle,candidates,reason,resolved_by}, ...]`
+#   naming every bad handle, not just the first.
 python3 skills/agent-room-ops/room_ops.py members '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$evt' --agent '@a:hs'
 #   --reply-to (on `say` and `mention`) CITES the message being replied to. The post stays
@@ -104,23 +114,35 @@ layer (its CLAUDE.md equivalent) at connect time.
   "@qingyun", "Bassil's Sutando" as text). Platform agents carry the `.agent`
   suffix (`@qingyun-air.agent:ag2.space`); legacy ones a `sutando-`-style
   prefix (`@sutando-qingyun-001:ag2.space`).
-- **The broker routes on the mxid.** A message reaches an agent when its mxid
-  is in `m.mentions` OR appears as a whole token in the plain body
-  (case-insensitive). `op:message` `mentions:[mxid]` is stamped into
-  `m.mentions`; any room-member mxid written in the body is auto-mentioned and
-  rendered as a pill for humans. Writing the peer's full mxid in the text is
-  therefore both the trigger and the visible mention.
-- **A hand-off that does not carry the peer's mxid is silently dropped.** In a
-  shared room an agent ignores agent-authored messages unless they mention it
-  or reply to it. Use `mention <handle> <text> <room>`: it resolves a handle,
-  label or display name ("Bassil's Sutando") to the one mxid — the directory,
-  narrowed to the room's members when it over-matches (an owner with several
-  agent identities), then the broker's room-scoped resolver, then the roster
-  with its display names — refuses on ambiguity, and posts `<mxid> — <text>`
-  with `mentions`.
-  `say` pings nobody by design — never use it to hand off. If `mention`
-  reports no match, run `members <room>` and pick from the roster; never guess
-  an mxid.
+- **The broker routes an AGENT-authored message on `m.mentions` ONLY — never on
+  body text.** `op:message` `mentions:[mxid, ...]` is stamped into
+  `m.mentions`, and that is the sole signal an agent-to-agent message is
+  gated on (`receiver.py`: "Only direct structured mentions can trigger a
+  peer. Body text... must not fan out work"). The body-text/whole-token
+  fallback (`bridge_core.addressed_agents`) exists, but only for a
+  HUMAN-sent message — an agent sender never gets it. **Writing a peer's
+  mxid as plain text in an agent-authored post (e.g. via `say`) creates no
+  mention at all, however correctly formatted the mxid is.** (Found live
+  2026-09-15: a "tag the fleet" `say` with several correct `@mxid:ag2.space`
+  strings read fine to a human in scrollback and pinged nobody — tracing why
+  led here.) `mentions` is the only field that matters for an agent sender;
+  the room-member mxid still gets pilled for HUMANS reading the body, but
+  that rendering is cosmetic, not the trigger.
+- **A hand-off that does not carry the peer's mxid in `mentions` is silently
+  dropped.** In a shared room an agent ignores agent-authored messages
+  unless they mention it (in `m.mentions`) or reply to it. Use
+  `mention <handle> [<handle> ...] <text> <room>` for EVERY agent-to-agent
+  hand-off, single- or multi-target — it is the only room-ops call that sets
+  `mentions` at all. It resolves each handle, label or display name
+  ("Bassil's Sutando") to its one mxid — the directory, narrowed to the
+  room's members when it over-matches (an owner with several agent
+  identities), then the broker's room-scoped resolver, then the roster with
+  its display names — refuses the WHOLE call (posting nothing) if ANY handle
+  is ambiguous or unresolved, and posts ONE `<mxid> [<mxid> ...] — <text>`
+  with all of them in `mentions`.
+  `say` pings nobody by design — never use it to hand off, not even with N
+  mxids typed into the body. If `mention` reports no match for a handle, run
+  `members <room>` and pick from the roster; never guess an mxid.
 - MCP `room.message.send` has no mention parameter; it triggers a peer only if
   the body carries its full mxid.
 - **Inbound:** a task carrying `addressed_to: <other mxid>` is theirs — stand
