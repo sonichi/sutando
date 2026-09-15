@@ -413,6 +413,140 @@ class TestWaiter(Base):
         self.assertEqual(sum(1 for ln in text.split("\n") if ln.startswith("task:")), 1)
 
 
+OLD_ID = "11111111-1111-4111-8111-111111111111"
+NEW_ID = "22222222-2222-4222-8222-222222222222"
+
+
+class ConnsCloud(ScriptedCloud):
+    """Each poll pops the next {slug: ids} answer, or an exception to raise."""
+
+    def active_connections(self):
+        self.polls += 1
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return {k: set(v) for k, v in answer.items()}
+
+    def active_toolkits(self):
+        raise AssertionError("a switch wait reads connection ids")
+
+
+class TestSwitchWaiter(Base):
+    def switch_marker(self, baseline, private=False, **kw):
+        m = self.marker(slugs=(("linear", "Linear"),), request="switch my linear account", **kw)
+        m = {**m, "switch": baseline, **({"private": True, "room": "!shared:ag2.space"} if private else {})}
+        connectors.write_marker(self.ws, m)
+        if private:
+            connectors.put_card(self.ws, m, ["intro"], NOW, mode="switch")
+        return m
+
+    def body(self):
+        return ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()).body
+
+    def test_the_old_connection_still_active_times_out_at_the_deadline(self):
+        self.switch_marker({"linear": [OLD_ID]}, deadline=NOW + 5)
+        clock = Clock()
+        cloud = ConnsCloud(self.ws, [{"linear": {OLD_ID}}])
+        self.assertEqual(self.waiter(cloud, clock), "timeout")
+        self.assertEqual(cloud.polls, 3)
+        body = self.body()
+        self.assertIn("Switching Linear to another account didn't finish within 30 minutes", body)
+        self.assertIn("tap Switch account again", body)
+        self.assertIn(f"operation_id {WAIT_ID}:timeout", body)
+        self.assertNotIn("tap Connect", body)
+
+    def test_old_gone_then_a_new_connection_resumes_once_with_switch_wording(self):
+        m = self.switch_marker({"linear": [OLD_ID]})
+        cloud = ConnsCloud(self.ws, [{"linear": {OLD_ID}}, {}, {"linear": {NEW_ID}}])
+        self.assertEqual(self.waiter(cloud, Clock()), "connected")
+        self.assertEqual((cloud.polls, self.tasks()), (3, [f"task-connect-{WAIT_ID}.txt"]))
+        body = self.body()
+        self.assertTrue(body.startswith("Linear is now signed in with the new account"))
+        self.assertIn("Redo the owner's earlier request", body)
+        self.assertIn("connectors.py status linear", body)
+        self.assertIn("now signed in as <label>", body)
+        self.assertIn(f"connectors.py verify-account {WAIT_ID}. Only if it exits 0", body)
+        self.assertIn(f"operation_id {WAIT_ID}:answer", body)
+        self.assertEqual(json.loads(connectors.claimed_path(self.ws, WAIT_ID).read_text())
+                         ["switch"], m["switch"], "the claimed record keeps the baseline")
+        self.assertEqual(self.waiter(ConnsCloud(self.ws, [{"linear": {NEW_ID}}]), Clock()), "claimed_elsewhere")
+        self.assertEqual(self.tasks(), [f"task-connect-{WAIT_ID}.txt"])
+
+    def test_the_waiter_never_rewrites_the_marker(self):
+        self.switch_marker({"linear": [OLD_ID]}, deadline=NOW + 5)
+        before = connectors.marker_path(self.ws, WAIT_ID).read_text()
+        writes = []
+        real = connectors._write_json
+        with mock.patch.object(connectors, "_write_json",
+                               side_effect=lambda path, data: writes.append(Path(path).name) or real(path, data)):
+            self.assertEqual(self.waiter(ConnsCloud(self.ws, [{"linear": {OLD_ID}}]), Clock()), "timeout")
+        self.assertNotIn(f"{WAIT_ID}.json", writes)
+        self.assertEqual(json.loads(before)["switch"], {"linear": [OLD_ID]})
+
+    def test_an_empty_baseline_behaves_like_connect(self):
+        self.switch_marker({"linear": []})
+        cloud = ConnsCloud(self.ws, [{}, {"gmail": {"g1"}}, {"linear": {OLD_ID}}])
+        self.assertEqual(self.waiter(cloud, Clock()), "connected")
+        self.assertEqual(cloud.polls, 3)
+
+    def test_cloud_trouble_is_polled_through(self):
+        self.switch_marker({"linear": [OLD_ID]})
+        cloud = ConnsCloud(self.ws, [cloud_auth.CloudError(0, "network", "down"), ValueError("x"),
+                                     {"linear": {OLD_ID, NEW_ID}}])
+        self.assertEqual(self.waiter(cloud, Clock()), "connected")
+
+    def test_a_claim_racing_the_switch_still_yields_one_resume(self):
+        self.switch_marker({"linear": [OLD_ID]})
+
+        class ClaimingConns(ConnsCloud):
+            def active_connections(inner):
+                connectors.claim(self.ws, WAIT_ID)
+                return {"linear": {NEW_ID}}
+
+        self.assertEqual(self.waiter(ClaimingConns(self.ws, [{}]), Clock()), "claimed_elsewhere")
+        self.assertEqual(self.tasks(), [])
+        self.tearDown()
+        self.setUp()
+        self.switch_marker({"linear": [OLD_ID]})
+        self.assertEqual(self.waiter(ConnsCloud(self.ws, [{"linear": {NEW_ID}}]), Clock()), "connected")
+        self.assertIsNone(connectors.claim(self.ws, WAIT_ID), "the owner's claim after the waiter wins nothing")
+        self.assertEqual(self.tasks(), [f"task-connect-{WAIT_ID}.txt"])
+
+    def test_the_other_outcomes_reuse_the_account_wording(self):
+        self.switch_marker({"linear": [OLD_ID]})
+        self.assertEqual(self.waiter(ConnsCloud(self.ws, [{"linear": {NEW_ID}}], users=["u-other"]), Clock()),
+                         "user_changed")
+        self.assertIn("AG2 Cloud account signed in on this Mac changed", self.body())
+
+    def test_a_private_switch_keeps_everything_on_the_card(self):
+        for outcome, answers, deadline in (("connected", [{"linear": {NEW_ID}}], NOW + 1800),
+                                           ("timeout", [{"linear": {OLD_ID}}], NOW)):
+            with self.subTest(outcome=outcome):
+                self.tearDown()
+                self.setUp()
+                self.switch_marker({"linear": [OLD_ID]}, private=True, deadline=deadline)
+                self.assertEqual(self.waiter(ConnsCloud(self.ws, answers), Clock()), outcome)
+                [card] = connectors.read_cards(self.ws)
+                self.assertEqual((card["status"], card["mode"]), (outcome, "switch"))
+                body = self.body()
+                self.assertIn(f"connectors.py note {WAIT_ID}", body)
+                if outcome == "connected":
+                    self.assertIn("now signed in with the new account", body)
+                    self.assertIn("connectors.py status linear", body)
+                    self.assertIn("post nothing in the room", body)
+                else:
+                    self.assertIn("tap Switch account again", body)
+                    self.assertNotIn("room.message.send", body)
+
+    def test_a_plain_wait_still_reads_only_toolkits(self):
+        self.marker()
+        cloud = ScriptedCloud(self.ws, [{"googlecalendar"}])
+        with mock.patch.object(ScriptedCloud, "active_connections", side_effect=AssertionError("ids unused"),
+                               create=True):
+            self.assertEqual(self.waiter(cloud, Clock()), "connected")
+        self.assertNotIn("signed in with the new account", self.body())
+
+
 class TestWaiterProcess(Base):
     def test_main_runs_the_waiter_in_process(self):
         self.marker(deadline=time.time() + 1800)
