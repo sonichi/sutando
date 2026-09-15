@@ -37,8 +37,26 @@ class TestWhenItRuns(unittest.TestCase):
 
     def test_onboarding_trigger_is_the_dm_message(self):
         self.assertIn("import my Claude Code history", self.when)
-        self.assertIn("consented on the onboarding card at <ISO>", self.when)
+        self.assertIn("consented on the onboarding card", self.when)
         self.assertIn("--run-kind onboarding", self.when)
+
+    def test_trigger_does_not_require_the_consent_time(self):
+        """The client emits `(time not recorded)` when no consent time was stored
+        (ag2-space/cinny-webclient#970). A trigger keyed on `at` misses exactly
+        those installs, which are the ones the late-send path exists to serve."""
+        self.assertIn("(time not recorded)", self.when)
+        self.assertRegex(self.when, r"[Mm]atch the phrase, not the `at`")
+
+    def test_trigger_match_is_case_insensitive(self):
+        """The standalone form opens the sentence, so it capitalises "Import".
+        classify.py already lowercases; the documented rule must say so too."""
+        self.assertIn("case-insensitive", self.when)
+
+    def test_standalone_late_request_is_documented(self):
+        """A card consent whose greeting already went out arrives without one."""
+        self.assertIn(
+            "Import my Claude Code history, consented on the onboarding card", self.when
+        )
 
     def test_settings_sentence_is_a_user_ask(self):
         self.assertIn("consented in Settings at <ISO>", self.when)

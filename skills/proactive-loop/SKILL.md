@@ -41,21 +41,26 @@ caps this file and refuses date stamps in it).
    (`python3 src/discord-read.py <channel> --serving <channel>` when serving a task, `--operator` otherwise),
    pending questions, relay, build log. Trust the record over recall; maintain `current-track.md`.
 1. **Tasks.** Process every file in `$WORKSPACE/tasks/`; `access_tier: team|other` → the sandboxed path.
-   Group a thread with `[deduped: task-<latest>]`, then
-   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>"`
+   Group a thread with `[deduped: task-<latest>]`, staged under its FINAL name and gated into
+   place — `results/` is claimed by a poller in under a second, and the checker reads the source
+   id from the BASENAME, so a generic temp name makes it pass everything:
+   `S="$WORKSPACE/state/dedup-staging/<file>"` then
+   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$S" && mv -f "$S" "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
-   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"` (1 = a task got no result).
+   Bind idle to it too: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   (1 = a task got no result, so idle does not run).
 2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
    when voice is connected, plus a macOS notification.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
-3.4. **Zero-result rule.** Before reporting any empty result or telling the owner how the system behaves:
-   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>"`
-   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). Name what a
-   non-zero would look like, run the positive control, suspect scope then shape, never verify in zsh.
+3.4. **Zero-result rule**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>" && <the send>`
+   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). A negative
+   states its population inline — "0 of N matching X" — or nobody, including its author, can falsify it.
+   Name what a non-zero looks like, run the positive control, suspect scope then shape, never in zsh.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
    (0 no candidate · 1 do not file, candidates named · 2 cannot answer).
@@ -91,9 +96,9 @@ caps this file and refuses date stamps in it).
 7. **Build log write.** Append with `O_APPEND` and a random marker; assert `count(MARK) == 1` by reading
    the file back. Never read-modify-replace. Then decide whether a `relay/relay-<ts>.md` note is owed
    (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
-7.5. **Memory index.** Before adding a row to `MEMORY.md`:
-   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>"` (0 safe · 1 refuse,
-   casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+7.5. **Memory index**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
+   (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
 8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
    placed by importance (only the top 5 render anywhere), and assert with the reader:

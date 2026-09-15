@@ -693,8 +693,10 @@ apply_tmux_defaults() {
 # Launched HERE, the one place that knows the canonical TMUX_SOCKET + SESSION —
 # NOT from startup.sh, whose $TMUX is empty in the Sutando.app/background path
 # (so a $TMUX-derived wiring would never start the monitor for the real core).
-# The guard is scoped to THIS socket + out path so a monitor for a different
-# core/socket can never suppress this one.
+# The guard is scoped to THIS socket so a monitor for a different core/socket
+# can never suppress this one. Socket only, not socket + out path: the desktop
+# launcher (launch-sutando.sh) starts the same watcher inside tmux with its own
+# workspace spelling for --out, and matching on that path let both run.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
   [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
@@ -702,7 +704,7 @@ ensure_core_monitor() {
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
-  if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+  if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
       > /tmp/core-input-watch.log 2>&1 &
