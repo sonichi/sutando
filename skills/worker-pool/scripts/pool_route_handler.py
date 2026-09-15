@@ -30,8 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 import local_task_protocol as ltp  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
+import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
+import pool_advertise as pa
 
 DECLINE = 3
 MUST_HANDLE = 4
@@ -95,17 +97,53 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
+def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
+    """A pin is live the moment it arrives: applied and published here, at the
+    edge, so the bridge ships the new binding without waiting for another
+    task. Runs on the probe as well: the watcher probes once and, on DECLINE,
+    hands the task straight to the core, so the probe is the only call a
+    picker task gets -- EXCEPT across a restart, where the startup sweep
+    re-probes every retained task, so the replay gate is what makes that safe.
+    Idempotent; a failure is reported, never fatal."""
+    try:
+        cmd = wpc.authorized_command(task_file, workspace)
+        out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
+                        results_dir=results_dir) if cmd else None
+    except (pr.RosterError, OSError, ValueError) as e:
+        print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
+        return None
+    if out and out.get("action") == "skipped":
+        print(f"pool_route_handler: picker command for {out['room']} not replayed: "
+              f"{out['reason']}", file=sys.stderr)
+    elif out:
+        print(f"pool_route_handler: applied {out['action']} for {out['room']} "
+              f"(roster v{out['roster_version']}, advertisement written)", file=sys.stderr)
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--task-file", required=True)
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
-    for ignored in ("--runtime", "--results-dir", "--repo"):
+    # The watcher passes its RESOLVED results dir; the replay gate reads it, so
+    # it is a real argument here rather than one parsed and thrown away.
+    p.add_argument("--results-dir", default=None)
+    for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    # An inherited roster has no advertisement until something publishes it;
+    # the edge is here, and a failure to publish must never stop routing.
+    try:
+        pa.ensure_advertisement(ws)
+    except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
+        # an escape here routes a BOUND task to the unrestricted live core.
+        print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
+    if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
+        apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:
@@ -139,5 +177,22 @@ def main(argv=None) -> int:
     return 0
 
 
+def guarded_main(argv=None) -> int:
+    """`main` for the watcher, failing CLOSED on anything it did not anticipate.
+
+    A handler that crashed did not settle the task, and any other non-zero code
+    reads as an optional decline — which hands a bound task to the live core.
+    """
+    try:
+        return main(argv)
+    except SystemExit as e:
+        # argparse exits rather than raising, and SystemExit is a BaseException:
+        # an `Exception` floor moves this fail-open instead of closing it.
+        return MUST_HANDLE if (e.code or 0) != 0 else 0
+    except Exception as e:  # noqa: BLE001 — the exit code IS the routing decision
+        print(f"pool_route_handler: unhandled {e!r}", file=sys.stderr)
+        return MUST_HANDLE
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guarded_main())
