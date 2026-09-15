@@ -115,7 +115,7 @@ def main() -> int:
         # Emptiness lives in the shared read_ready_result owner, so assert that
         # spelling: the contract moved, and the assertion follows it rather than loosening.
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
-              "read_ready_result(result_file)" in src
+              "read_ready_result_for_delivery(result_file)" in src
               and "if reply_text is None:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")
 
