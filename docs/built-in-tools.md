@@ -2,9 +2,19 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
-**Calendar** — read Google Calendar events via `gws calendar`:
+**Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
+connector tools, first:
+- `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
+  → whether the app is connected, plus the matching actions with their input schemas;
+- `mcp__sutando-station__composio_exec` `{"toolkit": "googlecalendar", "action": "<from find>", "arguments": {…}}`.
+
+Not connected → follow the `connect-apps` skill: one in-chat Connect card, the task closes, and the
+answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
+Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
+macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
+Google Calendar — say you couldn't read their calendar instead.
 ```bash
-gws calendar +agenda --today            # today's events (table format by default)
+gws calendar +agenda --today            # fallback: today's events (table format by default)
 gws calendar +agenda --week              # this week
 gws calendar +agenda --days 7 --format json   # next 7 days, JSON for parsing
 ```
@@ -44,7 +54,10 @@ tags: [ideas, projects, voice]
 Content here...
 ```
 
-**Email (Gmail)** — use the `gws-gmail` skill (OAuth, no app password needed):
+**Email (Gmail, Outlook)** — the Station connector first: `composio_find` `{"apps": ["gmail"], "query": "<what
+you need>"}`, then `composio_exec` with the action it returns (search, read, draft, send). Not connected →
+the `connect-apps` skill, as for Calendar. Fallback only when the Station tools aren't available: the
+`gws-gmail` skill (OAuth, no app password needed):
 ```bash
 gws gmail +send --to "to@x.com" --subject "subj" --body "body"
 gws gmail +triage                               # unread inbox summary
@@ -246,8 +259,20 @@ python3 "$M" install intent-leads campaign-runner     # plan; exit 3 = spends cr
 python3 "$M" install intent-leads campaign-runner --yes
 python3 "$M" update --yes                             # never charges
 ```
-Skills are usable immediately; newly activated cloud tools need a core restart
-(Agent settings → Runtime → Restart engine), which the owner does.
+Skills are usable immediately, and so is a newly activated cloud tool: reach it through
+`station_find` / `station_call` (state the price first when it is `confirm_before_call`). A restart
+is needed only when `install` prints `RESTART REQUIRED` (the running engine started without the
+Station); the owner does it from Agent settings → Runtime → Restart engine.
+
+**Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
+Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec`. Connecting one is the
+`connect-apps` skill's job (an in-chat Connect card, then an automatic resume); its helper:
+```bash
+C=skills/connect-apps/scripts/connectors.py
+python3 "$C" find "google calendar"     # exact catalog app, connected or not
+python3 "$C" status googlecalendar      # connected? plus pending waits
+python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
+```
 
 **App launcher** — open any macOS app:
 ```bash

@@ -142,6 +142,9 @@ ALLOWLIST = {
     # core_lineage never resolves the workspace — lineage_dir(workspace, host)
     # takes the root from the heartbeat, which owns the resolution.
     "src/core_lineage.py",
+    # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
+    # dir from its caller (marketplace / connect-apps resolve it).
+    "src/station_stamp.py",
     # runtime-api views + registry never resolve the workspace — server.py
     # (the composition root) imports the canonical resolver and injects dirs.
     "src/runtime-api/instance_registry.py",

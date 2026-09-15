@@ -13,7 +13,7 @@ The script lives next to this file. Run it with `python3`:
 
 ```bash
 M="<this skill's directory>/scripts/marketplace.py"
-python3 "$M" find "lead enrichment"              # search (add --kind skill|cloud_tool)
+python3 "$M" find "lead enrichment"              # search (add --kind skill|cloud_tool|connector)
 python3 "$M" status                              # owned vs on this machine
 python3 "$M" install intent-leads campaign-runner   # PLAN only — writes nothing
 python3 "$M" install intent-leads campaign-runner --yes
@@ -35,23 +35,36 @@ cloud tools together; the script works out which is which.
    in a sentence or two (what gets installed or activated, what's already set
    up, what's skipped and why).
 3. **Confirm when it costs something.** Exit code `3` means the plan spends
-   credits: get the owner's explicit OK first. Exit code `0` means it's free:
-   go ahead. Never pass `--yes` to `uninstall` without the owner's OK.
+   credits once, or activates a cloud tool that charges per use (the plan says
+   "leads charges per use: 5 credits per result"): tell the owner the price and
+   get their explicit OK first. Exit code `0` means it's free: go ahead. Never
+   pass `--yes` to `uninstall` without the owner's OK.
 4. **Apply.** Re-run the same command with `--yes`. One failed item doesn't
    stop the rest.
 5. **Report.** Say what's ready and what failed, using the reasons the script
    prints (not enough credits, plan too low, not found…).
-6. **Restart, once, at the end.** If the output says `RESTART REQUIRED`
-   (`restart_required: true` in JSON), tell the owner exactly once, after
-   everything else:
+6. **Use it now; restart only when told.** A newly activated cloud tool is
+   usable at once through `station_find` / `station_call` (the output says
+   "usable now through station_call", `usable_now` in JSON). Only if the output
+   says `RESTART REQUIRED` (`restart_required: true`) did the running engine
+   start without the Station, or for another account; then tell the owner
+   exactly once, after everything else:
 
    > New cloud tools are active on your account, but I can only use them after
    > an engine restart: open **Agent settings** (the bot icon, bottom left),
    > scroll down to **Runtime**, and click **Restart engine**. Restarting ends
    > my current session; your tasks and files are kept.
 
+   When the output says the desktop app hasn't connected the engine to AG2 Cloud
+   yet (`restart_after_sign_in: true`), the tools need that same one restart
+   once the owner signs in; re-check with `status` then.
+
    Never restart the core yourself. Installed **skills** need no restart; they
    are usable right away.
+7. **Price before the first paid call.** `station_find` marks a metered tool
+   `confirm_before_call: true`. Before the first `station_call` to such a tool
+   in a conversation, state its price from `pricing` ("5 credits per result")
+   and wait for the owner's OK.
 
 ## "Are my skills up to date?"
 
@@ -62,8 +75,10 @@ Updating never charges.
 
 ## Things to know
 
-- **Connectors** (Gmail, Slack, …) need a browser sign-in. They're skipped with
-  a note; send the owner to the Marketplace for those.
+- **Connectors** (Gmail, Google Calendar, Slack, …) are not installed here:
+  `install` skips them with a note, and `find` / `install` match them by exact
+  slug. Connect them from chat with the `connect-apps` skill, which sends the
+  owner a Connect card and picks the request up once they sign in.
 - **Paid skills** charge once. Uninstalling one and reinstalling it charges again.
 - Skills install as real directories under `$CLAUDE_CONFIG_DIR/skills/<slug>/`,
   verified against the marketplace's sha256. Unsigned bundles are refused.

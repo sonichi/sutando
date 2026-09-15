@@ -73,6 +73,14 @@ Invoke `/schedule-crons`. This handles:
   a hand-rolled registration leaves that probe reporting the crons as never registered.
 - Ensuring a fallback `/proactive-loop` cron exists at `*/10 * * * *` if `crons.json` doesn't include one (post-#954 belt-and-suspenders)
 
+### Step 2.5 — Re-arm connector waits
+
+```bash
+python3 skills/connect-apps/scripts/connectors.py rearm
+```
+
+Restarts the background waiter of every connect-apps wait that is still pending (an app the owner was asked to connect before this session started), so their request is still answered once they sign in. Idempotent: a wait whose waiter is alive is left alone. Skip silently if `skills/connect-apps/` is absent; a non-zero exit is reported, never retried.
+
 ### Step 3 — Verify, then confirm
 
 **Run the ceremony gate BEFORE claiming completion.** It is health-check's `session-crons` probe
@@ -111,6 +119,8 @@ session start
     │                               ├─► step 2-3 (register crons.json entries)
     │                               ├─► step 4 (proactive-loop fallback if missing)
     │                               └─► step 6 (confirm what was scheduled)
+    │
+    ├─► step 2.5: connect-apps rearm ──► restarts waiters of pending connector waits
     │
     └─► step 3: emit summary
 ```

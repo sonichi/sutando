@@ -184,6 +184,13 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    which is why this is a command and not a reminder. It fires only on tasks older than
    `--min-age-sec` (default 120), so a task still in flight is never flagged.
 
+1.5. **Re-arm connector waits.** When the owner asks for something that needs an app they have not
+   connected, the `connect-apps` skill posts a Connect card, records a wait under
+   `state/connect-waits/` and starts a detached waiter, then closes the task (an open task would
+   trip wedge recovery and the orphan check). The waiter survives a core restart but not a reboot
+   or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
+   an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
+
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.

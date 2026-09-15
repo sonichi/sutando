@@ -462,7 +462,7 @@
    ],
    "status": "canonical",
    "canonical_for": "Recovery issue identity, event lifecycle, and rate query semantics",
-   "last_verified": "2026-09-11"
+   "last_verified": "2026-09-15"
   },
   "docs/worker-pool-design.md": {
    "title": "Worker pool — design (v1)",
