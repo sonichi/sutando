@@ -419,11 +419,17 @@ def resize_image(path: str, maxdim: int | None, quality: int | None) -> bool:
         target = Path(path)
         with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
             output = Path(tmp) / "resized"
-            safe_input = str(target.resolve()).replace("'", "''")
-            safe_output = str(output.resolve()).replace("'", "''")
+            # Paths travel in the environment, never in script source: PowerShell also
+            # treats U+2018-U+201B as single-quote delimiters, so doubling the ASCII
+            # apostrophe alone leaves a path like O’Brien unparseable.
+            resize_env = {
+                **os.environ,
+                "SUTANDO_RESIZE_INPUT": str(target.resolve()),
+                "SUTANDO_RESIZE_OUTPUT": str(output.resolve()),
+            }
             script = (
                 "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Drawing; "
-                f"$src = [System.Drawing.Image]::FromFile('{safe_input}'); "
+                "$src = [System.Drawing.Image]::FromFile($env:SUTANDO_RESIZE_INPUT); "
                 "$dst = $null; $g = $null; $params = $null; try { "
                 f"$limit = {int(maxdim or 0)}; $quality = {int(quality or 0)}; "
                 "$scale = 1.0; if ($limit -gt 0) { "
@@ -440,14 +446,14 @@ def resize_image(path: str, maxdim: int | None, quality: int | None) -> bool:
                 "$params = [System.Drawing.Imaging.EncoderParameters]::new(1); "
                 "$params.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new("
                 "[System.Drawing.Imaging.Encoder]::Quality, [long]$quality); "
-                f"$dst.Save('{safe_output}', $codec, $params) "
-                f"}} else {{ $dst.Save('{safe_output}', $src.RawFormat) }} "
+                "$dst.Save($env:SUTANDO_RESIZE_OUTPUT, $codec, $params) "
+                "} else { $dst.Save($env:SUTANDO_RESIZE_OUTPUT, $src.RawFormat) } "
                 "} finally { if ($params) { $params.Dispose() }; if ($g) { $g.Dispose() }; "
                 "if ($dst) { $dst.Dispose() }; $src.Dispose() }"
             )
             subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                timeout=10, capture_output=True, check=True,
+                timeout=10, capture_output=True, check=True, env=resize_env,
             )
             os.replace(output, target)
         return True
