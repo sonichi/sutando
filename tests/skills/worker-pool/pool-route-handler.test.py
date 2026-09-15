@@ -489,5 +489,56 @@ class TestPickerAppliedAtTheEdge(Base):
         self.assertIsNone(self.bindings())
 
 
+class TestMalformedRosterRowAtTheEdge(Base):
+    """A malformed roster row reaching apply_picker must be reported, never
+    raised out of main() (where it would fall back to unrestricted routing),
+    and must leave no half-applied pin behind."""
+
+    ROOM = "!other:x"
+
+    def corrupt_roster(self):
+        self.roster(bindings={})
+        rp = self.ws / "state" / "roster.json"
+        d = json.loads(rp.read_text())
+        d["workers"][W] = "live"          # a string where an object belongs
+        rp.write_text(json.dumps(d))
+
+    def picker_file(self, name, sentence):
+        import task_envelope as te
+        p = self.ws / "tasks" / f"{name}.txt"
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
+               f"source: ag2space\nwire_source: worker-picker\n"
+               f"channel_id: {self.ROOM}\naccess_tier: owner\n")
+        p.write_text(te.stamp_text(raw, self.ws))
+        return str(p)
+
+    def test_it_is_reported_not_raised(self):
+        self.corrupt_roster()
+        t = self.picker_file("task-m", f"Pin room {self.ROOM} to {W} (worker picker)")
+        self.assertIsNone(h.apply_picker(self.ws, t), "a malformed row escaped as a value")
+
+    def test_nothing_partial_is_written(self):
+        self.corrupt_roster()
+        t = self.picker_file("task-m", f"Pin room {self.ROOM} to {W} (worker picker)")
+        h.apply_picker(self.ws, t)
+        bindings = self.ws / "state" / "bindings.json"
+        bound = json.loads(bindings.read_text()).get("bindings", {}) if bindings.exists() else {}
+        self.assertNotIn(self.ROOM, bound, "a refused pin still wrote its binding")
+        self.assertFalse((self.ws / "state" / "pool-advertisement.json").exists(),
+                         "a refused pin published an advertisement")
+        led = self.ws / "state" / "picker-applied.json"
+        self.assertNotIn("task-m", led.read_text() if led.exists() else "",
+                         "a refused pin was recorded as applied, so the retry is suppressed")
+
+    def test_the_same_pin_succeeds_once_the_row_is_an_object(self):
+        """Control: the refusal above is the malformed row, not the pin."""
+        self.roster(bindings={})
+        t = self.picker_file("task-ok", f"Pin room {self.ROOM} to {W} (worker picker)")
+        out = h.apply_picker(self.ws, t)
+        self.assertEqual((out or {}).get("action"), "pin")
+        bound = json.loads((self.ws / "state" / "bindings.json").read_text())["bindings"]
+        self.assertEqual(bound.get(self.ROOM), W)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

@@ -371,16 +371,20 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
         reason = replay_reason(workspace, cmd, task_id, results_dir)
         if reason:
             return {"action": "skipped", "room": cmd.get("room"), "reason": reason}
+        # Refuse a roster this would fail on part-way: bind writes, then the
+        # advertisement raises, leaving a binding nothing published.
+        pr.validate_current_roster(workspace)
         if action == "pin":
             workers = list(cmd.get("workers") or [])
             if len(workers) != 1:
                 raise pr.RosterError(f"pin names {len(workers)} workers; a room takes one")
-            _record_applied(workspace, cmd, task_id)
             roster = pr.bind_room(workspace, cmd["room"], workers[0])
         else:
-            _record_applied(workspace, cmd, task_id)
             roster = pr.unbind_room(workspace, cmd["room"])
         path = pa.write_advertisement(workspace)
+        # Recorded only once the mutation and its publication both landed, so a
+        # failure leaves no ledger entry to suppress the retry.
+        _record_applied(workspace, cmd, task_id)
     return {"action": action, "room": cmd["room"], "roster_version": roster.get("version"),
             "advertisement": str(path)}
 

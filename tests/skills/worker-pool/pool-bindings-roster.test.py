@@ -329,5 +329,40 @@ class TestBindRoom(Base):
             pr.unbind_room(ws, "!x:ag2.space")
 
 
+class TestRosterRowTypes(Base):
+    """compile_roster is the roster's validation boundary: a row that is not an
+    object must become a RosterError there, not an AttributeError in whichever
+    reader touched it first."""
+
+    def test_every_non_object_row_is_a_roster_error(self):
+        for label, row in (("none", None), ("string", "live"), ("list", ["live"]),
+                           ("int", 7), ("bool", True), ("float", 1.5)):
+            with self.subTest(row=label):
+                with self.assertRaises(pr.RosterError) as caught:
+                    pr.compile_roster(self.ws, {W1: row})
+                self.assertNotIsInstance(caught.exception, AttributeError)
+
+    def test_a_valid_row_is_unchanged(self):
+        out = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(out["workers"][W1]["state"], "live")
+
+    def test_a_valid_row_beside_a_malformed_one_commits_nothing(self):
+        """Partial acceptance would publish half a roster: the valid row lands,
+        the malformed one raises, and the file says the pool is smaller."""
+        pr.compile_roster(self.ws, live(W1))
+        before = pr.roster_path(self.ws).read_text()
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, {**live(W1), W2: "live"})
+        self.assertEqual(pr.roster_path(self.ws).read_text(), before,
+                         "a refused compile rewrote the roster anyway")
+
+    def test_the_validator_is_callable_on_its_own(self):
+        pr.validate_workers(live(W1))
+        with self.assertRaises(pr.RosterError):
+            pr.validate_workers({W1: "live"})
+        with self.assertRaises(pr.RosterError):
+            pr.validate_workers("not-a-map")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

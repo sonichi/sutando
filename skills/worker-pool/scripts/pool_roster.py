@@ -177,16 +177,35 @@ def _load_existing_roster_strict(workspace):
     return raw
 
 
+def validate_workers(workers) -> None:
+    """The roster's type boundary, so every caller refuses the same shapes.
+    A row that is not an object would otherwise surface as an AttributeError
+    from whichever reader touched it first."""
+    if workers is not None and not isinstance(workers, dict):
+        raise RosterError(f"workers must be an object, got {type(workers).__name__}")
+    for wid, row in (workers or {}).items():
+        if wid != CORE and not WORKER_ID_RE.match(wid):
+            raise RosterError(f"worker id must match {WORKER_ID_RE.pattern!r}: {wid!r}")
+        if not isinstance(row, dict):
+            raise RosterError(f"worker {wid!r} row must be an object, got {type(row).__name__}")
+        state = row.get("state")
+        if state not in STATES:
+            raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+
+
+def validate_current_roster(workspace) -> None:
+    """Refuse a stored roster this process would fail on mid-mutation, so a
+    caller validates BEFORE it writes anything rather than part-way through."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is not None:
+        validate_workers(raw.get("workers"))
+
+
 def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
-    for wid, row in (workers or {}).items():
-        if wid != CORE and not WORKER_ID_RE.match(wid):
-            raise RosterError(f"worker id must match {WORKER_ID_RE.pattern!r}: {wid!r}")
-        state = (row or {}).get("state")
-        if state not in STATES:
-            raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+    validate_workers(workers)
 
     known = set(workers or {}) | {CORE}
     for source, bound in bindings.items():
