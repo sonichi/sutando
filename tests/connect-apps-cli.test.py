@@ -530,6 +530,46 @@ class TestPrivateCard(Base):
         _, out = run(self.ws, private_argv("linear"), FakeCloud(self.ws), self.spawn)
         self.assertEqual([c["id"] for c in self.cards()], [out["wait_id"]])
 
+    def test_a_card_write_that_fails_never_costs_the_claim(self):
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        with mock.patch.object(connectors, "_write_cards", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(connectors.set_card(self.ws, out["wait_id"], status="connected", line="x"))
+            code, claimed = run(self.ws, ["claim", SHARED], cloud)
+        self.assertIn("not updated: disk full", err.getvalue())
+        self.assertEqual((code, [c["wait_id"] for c in claimed["claimed"]]), (connectors.EXIT_OK, [out["wait_id"]]))
+        self.assertTrue(connectors.claimed_path(self.ws, out["wait_id"]).exists())
+        self.assertEqual(self.cards()[0]["status"], "waiting", "the card is unchanged, the claim still stands")
+
+    def test_a_marker_that_cannot_be_written_expires_its_card_and_gives_merged_waits_back(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        args = connectors.parser().parse_args(private_argv("linear", "googlecalendar", task="task-two", reply="$evt2"))
+        with mock.patch.object(connectors, "write_marker", side_effect=OSError("read-only")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(OSError):
+                connectors.cmd_await(self.ws, cloud, args, spawn=self.spawn, now=lambda: NOW + 1)
+        cards = {c["id"]: c for c in self.cards()}
+        new = [c for i, c in cards.items() if i != first["wait_id"]]
+        self.assertEqual([c["status"] for c in new], ["expired"], "the new card never shows as waiting")
+        self.assertTrue(connectors.marker_path(self.ws, first["wait_id"]).exists(), "the absorbed wait is released")
+
+    def test_asking_again_restores_a_missing_card_for_the_same_wait(self):
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        connectors.cards_path(self.ws).unlink()
+        _, again = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((again["reused"], again["wait_id"]), (True, first["wait_id"]))
+        [card] = self.cards()
+        self.assertEqual((card["id"], [x["text"] for x in card["lines"]][:1]), (first["wait_id"], ["Linear isn't connected yet."]))
+
+    def test_an_empty_note_is_refused(self):
+        _, out = run(self.ws, private_argv("linear"), FakeCloud(self.ws), self.spawn)
+        code, err = run(self.ws, ["note", out["wait_id"], "   "])
+        self.assertEqual((code, err["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
     def test_rearm_prunes_old_cards_of_finished_waits_only(self):
         cloud = FakeCloud(self.ws)
         _, done = run(self.ws, private_argv("linear"), cloud, self.spawn)

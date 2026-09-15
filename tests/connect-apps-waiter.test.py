@@ -125,6 +125,18 @@ class TestPrivateResume(Base):
                 else:
                     self.assertNotIn("room.message.send", body)
 
+    def test_an_unverified_private_wait_only_notes_the_card(self):
+        m = self.marker(cloud_user_id=None)
+        connectors.write_marker(self.ws, {**m, "room": "!shared:ag2.space", "private": True})
+        connectors.put_card(self.ws, {**m, "room": "!shared:ag2.space"}, ["intro"], NOW)
+        self.assertEqual(self.waiter(ScriptedCloud(self.ws, [{"googlecalendar"}]), Clock()), "unverified")
+        self.assertEqual(connectors.read_cards(self.ws)[0]["status"], "unverified")
+        body = ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()).body
+        self.assertIn(f"connectors.py note {WAIT_ID}", body)
+        self.assertIn("couldn't confirm which AG2 Cloud account", body)
+        self.assertNotIn("room.message.send", body)
+        self.assertIn("[no-send]", body)
+
     def test_a_room_visible_wait_keeps_the_old_resume(self):
         self.marker()
         self.waiter(ScriptedCloud(self.ws, [set()]), Clock(NOW + 1800))
