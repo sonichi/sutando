@@ -93,6 +93,25 @@ class CoreLineage(unittest.TestCase):
         leftovers = [q.name for q in d.glob(".x.json.*")] if d.is_dir() else []
         self.assertEqual(leftovers, [], f"temp file survived a failed write: {leftovers}")
 
+    def test_two_callers_past_the_early_check_open_one_run_not_two(self):
+        """The early return is outside the lock; the newest row must settle it."""
+        with mock.patch.object(cl, "current", return_value={}):
+            cl.record_run(self.ws, self.host, self.sid, runtime="claude", cwd="/x")
+            cl.record_run(self.ws, self.host, self.sid, runtime="claude", cwd="/x")
+        rows = cl.runs(self.ws, self.host)
+        self.assertEqual([r["session_id"] for r in rows], [self.sid],
+                         f"one session opened {len(rows)} runs: {rows}")
+
+    def test_a_failing_cleanup_does_not_replace_the_write_error(self):
+        """The unlink error must not become the exception the caller sees."""
+        d = Path(self.ws) / "state" / "cores"
+        with mock.patch.object(cl.json, "dump", side_effect=OSError("disk full")), \
+             mock.patch.object(cl.os, "unlink", side_effect=OSError("unlink denied")):
+            with self.assertRaises(OSError) as ctx:
+                cl._write(d / "y.json", {"a": 1})
+        self.assertIn("disk full", str(ctx.exception),
+                      f"cleanup error masked the real one: {ctx.exception}")
+
     def test_an_empty_cwd_or_session_locates_nothing(self):
         """Empty means "no file", and must not compose a path out of blanks."""
         self.assertEqual(cl.transcript_path_for(self.ws, "", "abc"), "")

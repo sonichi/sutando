@@ -56,7 +56,10 @@ def _write(path: Path, payload) -> None:
             json.dump(payload, fh, indent=1)
         os.replace(tmp, path)
     except BaseException:
-        os.unlink(tmp)
+        # Suppressed: a failing unlink would replace the write error that
+        # actually explains the failure.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
         raise
 
 
@@ -133,8 +136,13 @@ def record_run(workspace, host: str, session_id: str, *, runtime: str = "",
     rpath = _path(workspace, host, "runs.json")
     with _appending(rpath):
         rows = runs(workspace, host)
-        rows.append(run)
-        _write(rpath, {"runs": rows})
+        # The early return above is a check-then-act OUTSIDE this lock, so two
+        # callers can reach here for one session; the newest row settles it.
+        if not rows or rows[-1].get("session_id") != session_id:
+            rows.append(run)
+            _write(rpath, {"runs": rows})
+        else:
+            run = rows[-1]
 
     _write(_path(workspace, host, "current.json"),
            {"session_id": session_id, "run_id": run["run_id"]})
