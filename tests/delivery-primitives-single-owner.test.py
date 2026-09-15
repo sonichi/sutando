@@ -146,6 +146,9 @@ INSTANTIATION_OWNERS = {
     # The one outbox coordinator for the Discord result leg: return annotation
     # plus the cached construction. A third reference here must fail the gate.
     "src/discord_result_delivery.py::result_backend::DesignAClaimBackend": 2,
+    # The A->C importer constructs C to fence the migrated root: the activate
+    # call plus the post-import verify read. Its whole job is this transition.
+    "packages/ag2-sparrow/ag2_sparrow/delivery_core/migration.py::import_a_state::DesignCClaimBackend": 2,
 }
 viol = instantiation_violations(scan_instantiations(prod_sources),
                                 INSTANTIATION_OWNERS)

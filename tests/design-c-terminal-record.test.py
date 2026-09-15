@@ -572,12 +572,46 @@ with tempfile.TemporaryDirectory() as td:
         r = {"schema": 1, "item_id": "item-b", "outcome": "confirmed",
              "receipt": {"provider": "P", "destination": "D"},
              "completed_ns": 123, "worker": "w0", "attempts": 0,
-             "incarnation": f"{_safe_key('item-b')}{SEP}{_safe_component('w0')}{SEP}1"}
+             "incarnation": SEP.join((_safe_key('item-b'), _safe_component('w0'),
+                                      "1", "2", "3"))}
         r.update(over)
         return r
 
     bv = fresh(td, "bool-valid")
     check(bv._record_is_terminal_proof(rec()) is True, "control: a real record validates")
+    # Arity is policy: 5-part native or 2-part import ONLY. A 3-part
+    # collision passed the validator and satisfied importer membership.
+    _k, _w = _safe_key('item-b'), _safe_component('w0')
+    check(bv._record_is_terminal_proof(
+        rec(incarnation=SEP.join((_k, _w, "1")))) is False,
+        "a 3-part incarnation is rejected — no writer emits it")
+    check(bv._record_is_terminal_proof(
+        rec(incarnation=SEP.join((_k, _w, "notapid", "b", "n")))) is False,
+        "a 5-part incarnation with a non-numeric pid is rejected")
+    # The importer is the only 2-part writer, so the 2-part arm demands its
+    # exact provenance; a bare key+worker JSON is no writer's output.
+    check(bv._record_is_terminal_proof(
+        rec(incarnation=SEP.join((_k, _w)))) is False,
+        "a 2-part shape WITHOUT importer provenance is rejected")
+    _ai = _safe_component("a-import")
+    _imp = dict(worker="a-import", imported=True,
+                a_record_digest="ab" * 32,
+                incarnation=SEP.join((_k, _ai)))
+    check(bv._record_is_terminal_proof(rec(**_imp)) is True,
+          "control: the genuine imported 2-part shape validates")
+    for miss in ("imported", "a_record_digest"):
+        broken = {k: v for k, v in _imp.items() if k != miss}
+        check(bv._record_is_terminal_proof(rec(**broken)) is False,
+              f"a 2-part record missing {miss} is rejected")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "imported": 1})) is False,
+        "imported=1 (not True) is rejected on the 2-part arm")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "a_record_digest": "AB" * 32})) is False,
+        "an uppercase-hex digest is rejected (writer emits lowercase)")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "a_record_digest": "ab" * 31})) is False,
+        "a short digest is rejected")
     for field in ("schema", "completed_ns", "attempts"):
         for val in (True, False):
             check(bv._record_is_terminal_proof(rec(**{field: val})) is False,
