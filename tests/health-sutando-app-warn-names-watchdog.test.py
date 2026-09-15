@@ -61,14 +61,28 @@ ck("checkWatcher() is defined there", "func checkWatcher()" in sw)
 
 # Scope the premise checks to checkWatcher's OWN body. File-wide substring
 # presence would stay green if the guard moved to another function entirely.
+def _isolate(func_sig):
+    start = sw.find(func_sig)
+    if start == -1:
+        return ""
+    nxt = re.search(r"\n    func ", sw[start + 1:])
+    return sw[start:start + 1 + (nxt.start() if nxt else len(sw) - start)]
+
 _start = sw.find("func checkWatcher()")
 _next = re.search(r"\n    func ", sw[_start + 1:]) if _start != -1 else None
 body = sw[_start:_start + 1 + (_next.start() if _next else len(sw))] if _start != -1 else ""
 ck("its body is isolatable (not the whole file)",
    0 < len(body) < len(sw) * 0.5)
 
+# The pgrep call may sit one call deep, in a local helper checkWatcher() calls
+# (e.g. watcherProcessSeen()) — still really pgrep-ing, not detached.
+_pgrep_scope = body
+for _callee in re.findall(r"\b(\w+)\(\)", body):
+    _helper = _isolate(f"func {_callee}()")
+    if _helper:
+        _pgrep_scope += _helper
 ck("and it really pgreps for the watcher",
-   re.search(r'"-f",\s*"watch-tasks"', body) is not None)
+   re.search(r'"-f",\s*"watch-tasks"', _pgrep_scope) is not None)
 ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in the file",
    "if cliIsWorking()" in body)
 # `[^}]*` cannot cross a nested block: add any inner brace before the return and

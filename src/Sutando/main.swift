@@ -567,19 +567,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
-    func checkWatcher() {
-        // pgrep -f watch-tasks
+    /// `pgrep` exits 1 for "no match" and >1 when it cannot enumerate at all
+    /// (sysmond unreachable); only the first means the watcher is gone.
+    func watcherProcessSeen() -> Bool? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
         proc.arguments = ["-f", "watch-tasks"]
-        let pipe = Pipe()
+        let pipe = Pipe(); let errPipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return }
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return nil }
         proc.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return  // watcher alive
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if proc.terminationStatus == 1 && err.isEmpty { return false }
+        logToFile("checkWatcher: pgrep unavailable (rc=\(proc.terminationStatus)): \(err.trimmingCharacters(in: .whitespacesAndNewlines)) — falling back to ps")
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "command"]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        ps.waitUntilExit()
+        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return listing.split(separator: "\n").contains { $0.contains("watch-tasks") && !$0.contains("ps -axo") }
+    }
+
+    func checkWatcher() {
+        switch watcherProcessSeen() {
+        case .some(true): return  // watcher alive
+        case .none:
+            logToFile("checkWatcher: neither pgrep nor ps could answer — not alerting on an unknown")
+            return
+        case .some(false): break
         }
 
         // Read CLI's REAL status BEFORE alerting. If Claude Code is currently
