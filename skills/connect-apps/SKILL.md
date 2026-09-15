@@ -1,6 +1,6 @@
 ---
 name: connect-apps
-description: "Use when the owner asks about their calendar, email, meetings, Linear, Notion, Slack, Google Drive, GitHub or any other third-party app or the data in it ('what's on my calendar', 'any email from Sam', 'my Linear issues', 'find the Drive doc'), asks to connect one, or says 'done' / 'connected' / 'I signed in' after you sent a Connect card. Answers through the Superpower Station connector tools (composio_find, composio_exec). When an app isn't connected yet, posts ONE Connect card to the owner (in their DM as a message; in a room with other people privately, under their message, visible only to them), closes the task, and answers by itself once they sign in, with no engine restart."
+description: "Use when the owner asks about their calendar, email, meetings, Linear, Notion, Slack, Google Drive, GitHub or any other third-party app or the data in it ('what's on my calendar', 'any email from Sam', 'my Linear issues', 'find the Drive doc'), asks to connect one, asks to switch or change their <app> account, reconnect <app> or use a different <app> account, asks which apps they are connected to, asks to disconnect <app>, or says 'done' / 'connected' / 'I signed in' / 'switched' after you sent a Connect or Switch account card. Answers through the Superpower Station connector tools (composio_find, composio_exec). When an app isn't connected yet, posts ONE Connect card to the owner (in their DM as a message; in a room with other people privately, under their message, visible only to them), closes the task, and answers by itself once they sign in, with no engine restart."
 ---
 
 # Connect apps
@@ -38,6 +38,7 @@ Every request gets exactly one answer: the steps below check for a wait before a
 C="<this skill's directory>/scripts/connectors.py"
 python3 "$C" find "google calendar"            # exact catalog app: {"match": {...} | null, "suggestions": [...]}
 python3 "$C" status googlecalendar --room '<room id>'   # connected? plus the room's pending and resumed waits
+python3 "$C" status                            # every connection: id, toolkit, name, status, accountLabel
 python3 "$C" await googlecalendar --room '<room id>' --reply-to '<source_message_id>' \
   --task '<task id>' --owner '<owner mxid>' --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
@@ -46,6 +47,10 @@ python3 "$C" await youtube --room '<shared room id>' --reply-to '<source_message
   --task '<task id>' --owner '<owner mxid>' --private \
   --line "YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on." \
   --line "Once that's done I'll pull up your latest videos." --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
+python3 "$C" await linear --room '<room id>' --reply-to '<source_message_id>' \
+  --task '<task id>' --owner '<owner mxid>' --switch --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
 SUTANDO_REQUEST
 python3 "$C" note '<wait id>' "YouTube is connected. On it." [--status connected]   # a private-card line
@@ -63,6 +68,10 @@ yours, not the owner's: plain sentences, no quotes from their message.
 | 0 | done: a match, all apps connected, a wait recorded, a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
 | 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+
+`--switch` (step 3c) records which connections of the apps are active right now; the wait is ready
+only once each app has an active connection that wasn't, so the old account never answers. A switch
+wait and a plain wait are never merged. Every wait summary carries `switch: true|false`.
 
 Every command prints one JSON object. A **resumed** entry (`resumed` from `claim` and `await`,
 `resumed_waits` from `status`) is a wait from the last 30 minutes whose request is already handled:
@@ -131,6 +140,8 @@ never posted in a shared room: it goes on the private card (step 3b).
 Call `composio_find` with `apps` naming every app the request needs and `query` set to the request.
 For each app:
 
+- `connected: true` and the owner wants a different account for it ("switch my Linear account", "use
+  my other Gmail", "reconnect Notion"): step 3c.
 - `connected: true`: first run `python3 "$C" claim '<task room>'` (and the DM's room id too when
   you are answering from a shared room):
   - `claimed` lists a wait: handle it together with this message as in Step 5 ("The owner writes
@@ -193,6 +204,56 @@ message, no "I sent you a card in our DM", no outro.
    intro ("YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on.") and
    the outro ("Once that's done I'll pull up your latest videos."). The desktop client draws the card
    and the lines under the owner's message.
+
+## Step 3c: switch an app to another account
+
+For a request to sign an app that is already connected in with a different account. Step 0 applies:
+anything but the owner's own AG2 Space task gets text only, "You can switch your Linear account in
+AG2 Space: Settings → Integrations."
+
+1. **The request.** When the owner asked something that needs the other account ("check my work Gmail
+   instead"), that is the request to redo. When they only asked to switch, the request is their
+   switch message itself; the resume then only says "<App> is now signed in as <label>".
+2. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
+3. **In the owner's DM** (see "Which kind of room"): run `await <slugs> --switch` FIRST, as in step 4
+   (the quoted heredoc, `--room`, `--reply-to`, `--task`, `--owner`). It records the account in use
+   before the card exists, so a sign-in that lands right after the card is still seen as the switch.
+   Only on exit 0 with a `wait_id`, send the card with `room.action.execute` / `room.message.send`,
+   `operation_id` `<task id>:switch-card`, `reply_to` the task's `source_message_id`:
+
+   ```json
+   {
+     "body": "Switch your Linear account: tap Switch account on the card, or open Settings → Integrations.",
+     "extra_content": {
+       "space.ag2.connector": {"version": 1, "for": "<owner_id>", "toolkits": [{"slug": "linear"}], "mode": "switch"}
+     }
+   }
+   ```
+
+   Then write the result: "Once you've signed in with the other account I'll carry on." (adapted).
+   `"reused": true` means that switch card is already waiting: say "The Switch account card above still
+   works." instead of sending another. Any exit 2: no card; say "You can switch your Linear account in
+   Settings → Integrations; tell me once it's done."
+4. **In a room with other people:** no messages about it in the room. With a `source_message_id`, run
+   `await <slugs> --private --switch --line "<intro>" --line "<outro>"` (for example "Tap Switch account
+   to sign Linear in with your other account." and "Once that's done I'll carry on."), then write the
+   result `[no-send]`. Without one, handle it as step 3b item 1.
+
+The resume task of a switch wait says "signed in with the new account" and is handled as in step 5:
+`verify-account` first, then redo the request, or for a switch-only request read
+`python3 "$C" status <slug>` and say "<App> is now signed in as <accountLabel>" (no label: "<App> is
+now signed in with the new account."). The label is personal: in a shared room it goes on the private
+card with `note`, never in the room.
+
+## Which apps am I connected to? Disconnect <app>
+
+- **"Which apps am I connected to?"** Run `python3 "$C" status`. List the apps whose `connections`
+  status is `active`, each with its `accountLabel` when there is one, and end with "Manage them in
+  Settings → Integrations." Account labels are personal: answer only where private content may go
+  (the owner's confirmed DM, see "Where the answer may go"); from a shared room, send it to the DM and
+  say only "I sent it to you in our DM."
+- **"Disconnect <app>"**: no action and no card. Say "You can disconnect <App> in Settings →
+  Integrations." You never disconnect an app yourself.
 
 ## Step 4: hand off and close
 
@@ -277,7 +338,9 @@ When the owner's message was only "done" or "connected", the room gets nothing: 
   not an answer. The same request asked again is a fresh one: answer it (step 2), even while
   `resume_pending` is true.
 - Exit 1 with `pending` not empty: the apps aren't connected yet. Say so ("Google Calendar isn't
-  connected yet: tap Connect on the card and I'll pick it up as soon as it is."). The wait stays armed.
+  connected yet: tap Connect on the card and I'll pick it up as soon as it is."). For a pending wait
+  with `switch: true` the app is not switched yet: "Linear isn't switched yet: tap Switch account on
+  the card and I'll carry on once you've signed in with the other account." The wait stays armed.
 - All three empty: there is no wait; handle the message normally.
 
 ## Paid cloud tools
@@ -289,6 +352,10 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 ## Rules
 
 - Never paste a sign-in or OAuth link. The card (or AG2 Space → Marketplace) is the only way to connect.
+- The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
+  Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
+  connecting new apps.
+- Never disconnect an app, and never switch one without the owner's card tap.
 - One card per request, listing every app it needs.
 - Private content (mail, calendar, files, messages, contacts) only in a room confirmed as the owner's DM.
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes

@@ -5,10 +5,13 @@ resume their request once the apps are connected.
   find <query...>                   the catalog app whose slug or name is exactly <query>
   status [slug...] [--room R]       the owner's connections, pending and recently resumed waits
   await <slug...> --room R --reply-to E --task T --owner O (--request TEXT | --request-file PATH|-)
-        [--private --line TEXT ...]  record a wait (merged into the room's pending waits for the
+        [--private --line TEXT ...] [--switch]
+                                    record a wait (merged into the room's pending waits for the
                                     same apps and AG2 Cloud account) and start its detached waiter;
                                     --private shows the card and the lines only to the owner, under
-                                    message E, instead of in the room
+                                    message E, instead of in the room; --switch waits for the apps
+                                    to be signed in with another account (a connection that was not
+                                    active when the wait was made)
   note <wait-id> TEXT               add a line to the wait's private card
   claim <room> [--force]            claim the room's pending waits whose apps are connected, each
                                     with whether its AG2 Cloud account checks out
@@ -41,6 +44,14 @@ client reads over the engine's loopback media route and draws inside the "Only
 visible to you" card under message `reply_to`. It never becomes a Matrix event,
 so no other member of the room receives it. The record carries the apps, the
 lines the agent says about connecting and the wait's status; never the request.
+
+A switch wait (`await --switch`) is the owner moving an app to another account.
+Every sign-in makes a new connection row in the cloud, so the wait records, at
+arm time and before any card exists, the ids of the app's active connections
+(`marker["switch"]`), and it is ready only once every app has an active
+connection that is not one of those. An owner who says "done" before switching
+is told it is not switched yet, never answered with the old account. A switch
+wait is never merged with a plain one: each kind's resume says something else.
 """
 
 from __future__ import annotations
@@ -159,13 +170,13 @@ class Cloud:
         self.token = None
         return str(self.get("/api/me").get("id") or "") or None
 
+    def active_connections(self) -> dict[str, set[str]]:
+        """Lowercased toolkit -> the ids of its active connections, from one read. A toolkit whose
+        active rows carry no id still appears, with no ids."""
+        return active_by_toolkit(self.get("/api/connectors").get("connections") or [])
+
     def active_toolkits(self) -> set[str]:
-        rows = self.get("/api/connectors").get("connections") or []
-        return {
-            str(r.get("toolkit") or "").lower()
-            for r in rows
-            if isinstance(r, dict) and str(r.get("status") or "").lower() == "active"
-        }
+        return set(self.active_connections())
 
     def connector_search(self, query: str) -> list[dict]:
         # q is a substring filter over slug, name and description, so a slug needs a wide page.
@@ -173,6 +184,36 @@ class Cloud:
         if not (data.get("enabledKinds") or {}).get("connector", True):
             raise Setup("connectors_disabled", "Connected apps are not enabled on this AG2 Cloud.")
         return [i for i in data.get("items") or [] if isinstance(i, dict)]
+
+
+def active_by_toolkit(rows: Any) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or str(r.get("status") or "").lower() != "active":
+            continue
+        ids = out.setdefault(str(r.get("toolkit") or "").lower(), set())
+        if isinstance(r.get("id"), str) and r["id"]:
+            ids.add(r["id"])
+    return out
+
+
+def wait_ready(marker: dict, conns: dict[str, set[str]]) -> bool:
+    """Is every app of the wait there? A plain wait needs each app active; a switch wait needs each
+    app to have an active connection that was not active when the wait was made."""
+    slugs = [str(x.get("slug")) for x in marker.get("toolkits") or [] if isinstance(x, dict)]
+    if not slugs:
+        return False
+    baseline = marker.get("switch")
+    if not baseline:
+        return all(s in conns for s in slugs)
+    return all(conns.get(s, set()) - set(baseline.get(s) or []) for s in slugs)
+
+
+def active_for(cloud: "Cloud", markers: list[dict]) -> dict[str, set[str]]:
+    """One /api/connectors read for these waits: the ids only when a switch wait needs them."""
+    if any(m.get("switch") for m in markers):
+        return cloud.active_connections()
+    return {s: set() for s in cloud.active_toolkits()}
 
 
 def _norm(text: str) -> str:
@@ -257,8 +298,11 @@ def _valid_marker(data: Any, wait_id: str) -> bool:
     if not isinstance(data, dict) or data.get("wait_id") != wait_id:
         return False
     toolkits = data.get("toolkits")
+    switch = data.get("switch")
     return (
         all(isinstance(data.get(k), str) and data[k] for k in ("room", "reply_to", "task", "owner"))
+        and (switch is None or (isinstance(switch, dict) and all(
+            isinstance(v, list) and all(isinstance(i, str) for i in v) for v in switch.values())))
         and isinstance(data.get("deadline"), (int, float))
         and isinstance(toolkits, list)
         and bool(toolkits)
@@ -328,7 +372,8 @@ def release(ws: Path, record: dict) -> bool:
 
 def summary(marker: dict) -> dict:
     keys = ("wait_id", "toolkits", "room", "reply_to", "request", "task", "owner", "deadline_at")
-    return {**{k: marker.get(k) for k in keys}, "private": bool(marker.get("private"))}
+    return {**{k: marker.get(k) for k in keys}, "private": bool(marker.get("private")),
+            "switch": bool(marker.get("switch"))}
 
 
 # --------------------------------------------------------------------------- private cards
@@ -376,8 +421,10 @@ def _card_line(text: str, at: float) -> dict:
     return {"ts": round(at, 3), "text": " ".join(str(text).split())[:MAX_LINE_CHARS]}
 
 
-def put_card(ws: Path, marker: dict, lines: list[str], at: float, into_of: list[str] | None = None) -> None:
-    """Write (or replace) the wait's card; the cards of the waits it absorbed point at it."""
+def put_card(ws: Path, marker: dict, lines: list[str], at: float, into_of: list[str] | None = None,
+             mode: str | None = None) -> None:
+    """Write (or replace) the wait's card; the cards of the waits it absorbed point at it.
+    mode "switch" makes the client draw Switch account instead of Connect."""
     card = {
         "id": marker["wait_id"],
         "room": marker["room"],
@@ -389,6 +436,8 @@ def put_card(ws: Path, marker: dict, lines: list[str], at: float, into_of: list[
         "created": round(at, 3),
         "updated": round(at, 3),
     }
+    if mode == "switch":
+        card["mode"] = "switch"
     with cards_locked(ws) as path:
         cards = [c for c in read_cards(ws) if c["id"] != card["id"]]
         for c in cards:
@@ -538,7 +587,22 @@ def resume_text(marker: dict, outcome: str) -> str:
     origin = f"(wait {wait_id}, from task {marker['task']})"
     request = header_safe_value(marker.get("request") or "")
     is_are = "is" if len(names) == 1 else "are"
-    if outcome == "connected":
+    switch = bool(marker.get("switch"))
+    slugs = " ".join(str(t.get("slug")) for t in marker.get("toolkits") or [])
+    if outcome == "connected" and switch:
+        text = (
+            f"{apps} {is_are} now signed in with the new account {origin}. "
+            f'Redo the owner\'s earlier request "{request}" in room {room} (reply_to {reply_to}). '
+            f"First run the connect-apps helper: connectors.py verify-account {wait_id}. Only if it exits 0, "
+            "do the request: when it was only to switch the account, read the new account's label with "
+            f"connectors.py status {slugs} (connections, accountLabel) and say \"{apps} {is_are} now signed in "
+            "as <label>\"; otherwise get the data with composio_exec. Post it with room.message.send "
+            f"(operation_id {wait_id}:answer). Otherwise share no data: tell the owner you didn't check "
+            f"their {apps} because a different or unconfirmed AG2 Cloud account is signed in now, and to "
+            f"ask again once the right account is (room.message.send, operation_id {wait_id}:account). "
+            "Either way write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif outcome == "connected":
         text = (
             f"{apps} {is_are} now connected {origin}. "
             f'Answer the owner\'s earlier request "{request}" in room {room} (reply_to {reply_to}). '
@@ -567,6 +631,14 @@ def resume_text(marker: dict, outcome: str) -> str:
             f"Post it with room.message.send (operation_id {wait_id}:account), then write the result "
             "[no-send]. Share no data from the new account. Follow the connect-apps skill, Resume."
         )
+    elif switch:
+        text = (
+            f"Switching {apps} to another account didn't finish within {WAIT_S // 60} minutes {origin}. "
+            f'The owner\'s earlier request was "{request}". In room {room} (reply_to {reply_to}), '
+            "tell the owner it timed out: tap Switch account again and tell me once it's done. "
+            f"Post it with room.message.send (operation_id {wait_id}:timeout), then write the result "
+            "[no-send]. Follow the connect-apps skill, Resume."
+        )
     else:
         text = (
             f"Connecting {apps} did not finish within {WAIT_S // 60} minutes {origin}. "
@@ -592,7 +664,25 @@ def private_resume_text(marker: dict, outcome: str) -> str:
         "This wait was asked from a room with other people, so anything about connecting, sign-in or "
         f"accounts goes only to the owner's private card with `{note} \"<text>\"`, never to the room or the DM. "
     )
-    if outcome == "connected":
+    switch = bool(marker.get("switch"))
+    slugs = " ".join(str(t.get("slug")) for t in marker.get("toolkits") or [])
+    if outcome == "connected" and switch:
+        text = (
+            f"{apps} {is_are} now signed in with the new account {origin}. {private}"
+            f"First run the connect-apps helper: connectors.py verify-account {wait_id}. If it exits 0, "
+            f"read the new account's label with connectors.py status {slugs} (connections, accountLabel). "
+            f'When the owner\'s earlier request "{request}" was only to switch the account, add the note '
+            f'"{apps} {is_are} now signed in as <label>." and post nothing in the room. Otherwise add the note '
+            f'"{apps} {is_are} now signed in as <label>. On it." and redo the request: get it done with '
+            f"composio_exec and reply in room {room} with room.message.send (reply_to {reply_to}, operation_id "
+            f"{wait_id}:answer), except that private content (mail, calendar events, files, messages, "
+            "contacts) goes to the owner's DM with only a one-line pointer in the room, as the connect-apps "
+            "skill says. Any other exit: share no data and post nothing in the room; add the note that you "
+            f"didn't use their {apps} because a different or unconfirmed AG2 Cloud account is signed in now, "
+            "and to ask again once the right account is. "
+            "Either way write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif outcome == "connected":
         text = (
             f"{apps} {is_are} now connected {origin}. {private}"
             f"First run the connect-apps helper: connectors.py verify-account {wait_id}. If it exits 0, "
@@ -620,6 +710,13 @@ def private_resume_text(marker: dict, outcome: str) -> str:
             f"Add the note that you didn't use their {apps} because a different AG2 Cloud account is signed in "
             "now, and to ask again once the right account is. Post nothing in the room, share no data from the "
             "new account, and write the result [no-send]. Follow the connect-apps skill, Resume."
+        )
+    elif switch:
+        text = (
+            f"Switching {apps} to another account didn't finish within {WAIT_S // 60} minutes {origin}. "
+            f'The owner\'s earlier request was "{request}". {private}'
+            "Add the note that it timed out: tap Switch account again and ask me once it's done. Post nothing "
+            "in the room and write the result [no-send]. Follow the connect-apps skill, Resume."
         )
     else:
         text = (
@@ -684,7 +781,8 @@ def run_waiter(
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Poll until every app is active or the deadline passes, then claim and
+    """Poll until every app is active (for a switch wait: active with a new connection) or the
+    deadline passes, then claim and
     write the resume task. Returns connected | timeout | user_changed | unverified | expired |
     invalid | claimed_elsewhere | write_failed | busy (another waiter holds the lock)."""
     lock = acquire_lock(ws, wait_id)
@@ -706,10 +804,8 @@ def run_waiter(
             deadline = float(marker.get("deadline") or 0)
             if t >= deadline + STALE_GRACE_S:
                 return "expired" if claim(ws, wait_id, "expired", t) is not None else "claimed_elsewhere"
-            slugs = [str(x.get("slug")) for x in marker.get("toolkits") or []]
             try:
-                active = cloud.active_toolkits()
-                connected = bool(slugs) and all(s in active for s in slugs)
+                connected = wait_ready(marker, active_for(cloud, [marker]))
             except (cloud_auth.CloudError, Setup, OSError, ValueError):
                 connected = False
             outcome = account_outcome(cloud, marker) if connected else None
@@ -780,11 +876,12 @@ def cmd_status(
 ) -> int:
     rows = cloud.get("/api/connectors").get("connections") or []
     connections = [
-        {"toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status")}
+        {"id": r.get("id"), "toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status"),
+         "accountLabel": r.get("accountLabel")}
         for r in rows
         if isinstance(r, dict)
     ]
-    active = {str(c["toolkit"]).lower() for c in connections if str(c["status"]).lower() == "active"}
+    active = set(active_by_toolkit(rows))
     wanted = [s.lower() for s in args.slugs]
     room = (args.room or "").strip() or None
     apps = [{"toolkit": s, "connected": s in active} for s in wanted]
@@ -866,6 +963,7 @@ def cmd_await(
     if not request:
         raise Setup("invalid_arguments", "--request is empty")
     private = bool(args.private)
+    switch = bool(args.switch)
     lines = [x for x in (args.line or []) if x.strip()]
     if lines and not private:
         raise Setup("invalid_arguments", "--line only goes on a --private card; in the owner's DM, send the lines as messages")
@@ -882,10 +980,10 @@ def cmd_await(
     same_task = [m for m in same_room if m.get("task") == task]
     for marker in same_task:
         if set(slugs) <= {x.get("slug") for x in marker["toolkits"] if isinstance(x, dict)} \
-                and bool(marker.get("private")) == private:
+                and bool(marker.get("private")) == private and bool(marker.get("switch")) == switch:
             pid = None if waiter_alive(ws, marker["wait_id"]) else _try_spawn(spawn, ws, marker["wait_id"])
             if private and not any(c["id"] == marker["wait_id"] for c in read_cards(ws)):
-                put_card(ws, marker, lines, now())
+                put_card(ws, marker, lines, now(), mode="switch" if switch else None)
             emit({**summary(marker), "reused": True, "waiter_pid": pid})
             return EXIT_OK
     combined = dict.fromkeys(slugs)
@@ -903,14 +1001,23 @@ def cmd_await(
             raise Setup("coming_soon", f"{item.get('name') or slug} is not available yet.")
         toolkits.append({"slug": slug, "name": item.get("name") or slug})
 
+    baseline: dict[str, set[str]] = {}
+    if switch:
+        # Which connections are active before the card exists: only a sign-in after this counts as the
+        # switch. A failed read never records an empty baseline, which would take the old account.
+        try:
+            baseline = cloud.active_connections()
+        except (cloud_auth.CloudError, Setup, OSError, ValueError) as exc:
+            raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
+
     t = now()
     # Another task's wait in this room is folded in only when it shares an app and was made under
     # this same known account, so asking again gets one answer and no request crosses accounts.
     requests, taken, resumed = [], [], []
     own_handled = False
     for marker in same_room:
-        if bool(marker.get("private")) != private:
-            continue  # a private card is never folded into a room-visible wait, nor the other way round
+        if bool(marker.get("private")) != private or bool(marker.get("switch")) != switch:
+            continue  # a private card is never folded into a room-visible wait, nor a switch into a connect
         mine = {k["slug"] for k in toolkits}
         theirs = [x for x in marker["toolkits"] if isinstance(x, dict)]
         extra = [x for x in theirs if x.get("slug") not in mine]
@@ -957,6 +1064,7 @@ def cmd_await(
         "cloud_user_id": cloud_user_id if all(w.get("cloud_user_id") == cloud_user_id for w in taken) else None,
         "superseded": superseded,
         "private": private,
+        **({"switch": {k["slug"]: sorted(baseline.get(k["slug"], set())) for k in toolkits}} if switch else {}),
         "created_at": now_iso(t),
         "deadline": int(t + WAIT_S),
         "deadline_at": now_iso(t + WAIT_S),
@@ -964,7 +1072,7 @@ def cmd_await(
     try:
         if private:
             # The card first: a waiter must never fire for a wait whose card the owner cannot see yet.
-            put_card(ws, marker, lines, t, into_of=superseded)
+            put_card(ws, marker, lines, t, into_of=superseded, mode="switch" if switch else None)
         path = write_marker(ws, marker)
     except OSError:
         if private:
@@ -985,9 +1093,8 @@ def cmd_claim(
     pending = [m for m in list_markers(ws) if m.get("room") == room]
     claimed, waiting = [], []
     if pending:
-        active = None if args.force else cloud.active_toolkits()
-        ready = [m for m in pending
-                 if active is None or all(str(x.get("slug")) in active for x in m.get("toolkits") or [])]
+        conns = None if args.force else active_for(cloud, pending)
+        ready = [m for m in pending if conns is None or wait_ready(m, conns)]
         current = (lambda: None) if args.force else functools.lru_cache(maxsize=None)(cloud.user_id)
         # Every verdict before any claim, so a cloud error leaves every wait armed.
         verdicts = {m["wait_id"]: account_mismatch(ws, m.get("cloud_user_id"), current) for m in ready}
@@ -1116,6 +1223,8 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--private", action="store_true",
                    help="asked from a room with other people: show the card only to the owner, under --reply-to")
     a.add_argument("--line", action="append", help="a line the private card shows above the apps (repeatable)")
+    a.add_argument("--switch", action="store_true",
+                   help="the apps are connected and the owner signs in with another account: wait for a new connection")
     n = sub.add_parser("note")
     n.add_argument("wait_id")
     n.add_argument("text", nargs="+")
