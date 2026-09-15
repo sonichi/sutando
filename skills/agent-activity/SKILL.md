@@ -75,6 +75,9 @@ skill hook. The hook never depends on the agent remembering anything:
   `agent-activity.summaries.jsonl` — `{ts, started, rows, days, line, room, task}` — so the client can
   fold the card of an old message from it after the rows have rotated out, and expand it from the
   `days` archive files. Served like the log, at `/media/state/agent-activity.summaries.jsonl`.
+- **A sibling feed: private Connect cards.** `connect-apps` writes `state/connect-cards.json` (served at
+  `/media/state/connect-cards.json`); the client draws each card inside this activity card under the
+  message in its `event`, so a Connect card asked from a shared room is only visible to the owner.
 - **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
   is never written to, so narration cannot cross rooms. The writer's own calls never become rows.
 - The hook exits 0 on every path; it must not block the tool it observed.

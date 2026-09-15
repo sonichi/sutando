@@ -418,6 +418,133 @@ class TestRequestFile(Base):
             connectors.parser().parse_args(await_argv("linear") + ["--request-file", "-"])
 
 
+SHARED = "!shared:ag2.space"
+
+
+def private_argv(*slugs, task="task-abc", reply="$evt1", lines=("Linear isn't connected yet.", "Once that's done I'll list them.")):
+    argv = await_argv(*slugs, task=task, room=SHARED, reply=reply, request="show my linear issues") + ["--private"]
+    for line in lines:
+        argv += ["--line", line]
+    return argv
+
+
+class TestPrivateCard(Base):
+    def cards(self):
+        return connectors.read_cards(self.ws)
+
+    def test_private_await_writes_the_card_with_its_lines_and_no_request(self):
+        cloud = FakeCloud(self.ws)
+        code, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((code, out["private"]), (connectors.EXIT_OK, True))
+        [card] = self.cards()
+        self.assertEqual({k: card[k] for k in ("id", "room", "event", "for", "status")},
+                         {"id": out["wait_id"], "room": SHARED, "event": "$evt1", "for": OWNER, "status": "waiting"})
+        self.assertEqual(card["toolkits"], [{"slug": "linear", "name": "Linear"}])
+        self.assertEqual([x["text"] for x in card["lines"]],
+                         ["Linear isn't connected yet.", "Once that's done I'll list them."])
+        raw = connectors.cards_path(self.ws).read_text()
+        self.assertNotIn("show my linear issues", raw, "the card never carries the owner's request")
+        self.assertTrue(json.loads(connectors.marker_path(self.ws, out["wait_id"]).read_text())["private"])
+
+    def test_a_room_visible_wait_writes_no_card_and_lines_need_private(self):
+        cloud = FakeCloud(self.ws)
+        code, out = run(self.ws, await_argv("linear"), cloud, self.spawn)
+        self.assertEqual((code, out["private"], self.cards()), (connectors.EXIT_OK, False, []))
+        code, out = run(self.ws, await_argv("googlecalendar") + ["--line", "hi"], cloud, self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, out = run(self.ws, private_argv("googlecalendar", lines=("a", "b", "c", "d")), cloud, self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_note_appends_lines_and_sets_status_and_caps(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        wait_id = out["wait_id"]
+        code, noted = run(self.ws, ["note", wait_id, "Linear", "is", "connected.", "On it.", "--status", "connected"])
+        self.assertEqual((code, noted["noted"], noted["card"]["status"]), (connectors.EXIT_OK, True, "connected"))
+        self.assertEqual(self.cards()[0]["lines"][-1]["text"], "Linear is connected. On it.")
+        for i in range(30):
+            run(self.ws, ["note", wait_id, "x" * 400 + str(i)])
+        lines = self.cards()[0]["lines"]
+        self.assertEqual(len(lines), connectors.MAX_CARD_LINES)
+        self.assertEqual(len(lines[-1]["text"]), connectors.MAX_LINE_CHARS)
+        code, missing = run(self.ws, ["note", "1789000000000-0000ffff", "hello"])
+        self.assertEqual((code, missing["noted"]), (connectors.EXIT_NO, False))
+        code, bad = run(self.ws, ["note", wait_id, "hello", "--status", "bogus"])
+        self.assertEqual((code, bad["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_the_winning_claim_sets_the_status_once(self):
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        code, claimed = run(self.ws, ["claim", SHARED], cloud)
+        self.assertEqual((code, self.cards()[0]["status"]), (connectors.EXIT_OK, "claimed"))
+        connectors.run_waiter(self.ws, out["wait_id"], cloud, now=time.time, sleep=lambda s: None)
+        self.assertEqual(self.cards()[0]["status"], "claimed", "the waiter lost the race and changes nothing")
+
+    def test_a_released_claim_puts_the_card_back_to_waiting(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        won = connectors.claim(self.ws, out["wait_id"], "connected", NOW)
+        self.assertEqual(self.cards()[0]["status"], "connected")
+        self.assertTrue(connectors.release(self.ws, won))
+        self.assertEqual(self.cards()[0]["status"], "waiting")
+
+    def test_asking_again_points_the_old_card_at_the_new_one(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, second = run(self.ws, private_argv("linear", "googlecalendar", task="task-two", reply="$evt2"),
+                        cloud, self.spawn)
+        self.assertEqual(second["superseded"], [first["wait_id"]])
+        cards = {c["id"]: c for c in self.cards()}
+        self.assertEqual((cards[first["wait_id"]]["status"], cards[first["wait_id"]]["into"]),
+                         ("superseded", second["wait_id"]))
+        self.assertEqual(([t["slug"] for t in cards[second["wait_id"]]["toolkits"]], cards[second["wait_id"]]["event"]),
+                         (["linear", "googlecalendar"], "$evt2"))
+
+    def test_a_private_and_a_room_visible_wait_never_merge(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, await_argv("linear", room=SHARED), cloud, self.spawn)
+        _, second = run(self.ws, private_argv("linear", task="task-two", reply="$evt2"), cloud, self.spawn)
+        self.assertEqual(second["superseded"], [])
+        self.assertEqual(len(connectors.list_markers(self.ws)), 2)
+
+    def test_the_same_task_again_reuses_the_wait_and_its_card(self):
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, again = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((again["reused"], len(self.cards())), (True, 1))
+
+    def test_status_lists_the_room_private_cards(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, status = run(self.ws, ["status", "--room", SHARED], cloud)
+        self.assertEqual([c["id"] for c in status["private_cards"]], [out["wait_id"]])
+        _, other = run(self.ws, ["status", "--room", ROOM], cloud)
+        self.assertEqual(other["private_cards"], [])
+
+    def test_a_torn_cards_file_reads_as_none_and_is_rebuilt(self):
+        connectors.cards_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        connectors.cards_path(self.ws).write_text('{"version": 1, "cards": [{"id": "nope"}, 3')
+        self.assertEqual(self.cards(), [])
+        _, out = run(self.ws, private_argv("linear"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual([c["id"] for c in self.cards()], [out["wait_id"]])
+
+    def test_rearm_prunes_old_cards_of_finished_waits_only(self):
+        cloud = FakeCloud(self.ws)
+        _, done = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        connectors.claim(self.ws, done["wait_id"], "connected", NOW)
+        self.origin("task-two")
+        _, live = run(self.ws, private_argv("googlecalendar", task="task-two", reply="$evt2"), cloud, self.spawn)
+        with connectors.cards_locked(self.ws) as path:
+            cards = connectors.read_cards(self.ws)
+            for c in cards:
+                c["updated"] = 0
+            connectors._write_cards(path, cards)
+        self.assertEqual(connectors.prune_cards(self.ws, time.time()), 1)
+        self.assertEqual([c["id"] for c in self.cards()], [live["wait_id"]])
+
+
 class TestMergeWaits(Base):
     def test_asking_again_in_the_room_yields_one_resume_task(self):
         self.origin("task-two")

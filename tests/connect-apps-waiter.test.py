@@ -103,6 +103,36 @@ class Base(unittest.TestCase):
         return connectors.run_waiter(self.ws, WAIT_ID, cloud, now=clock.now, sleep=clock.sleep)
 
 
+class TestPrivateResume(Base):
+    def test_the_private_card_follows_the_outcome_and_the_resume_keeps_notes_off_the_room(self):
+        for outcome, answers, users in (("connected", [{"googlecalendar"}], ("u-owner",)),
+                                        ("user_changed", [{"googlecalendar"}], ("u-other",)),
+                                        ("timeout", [set()], ("u-owner",))):
+            with self.subTest(outcome=outcome):
+                self.tearDown()
+                self.setUp()
+                m = self.marker(deadline=NOW if outcome == "timeout" else NOW + 1800)
+                connectors.write_marker(self.ws, {**m, "room": "!shared:ag2.space", "private": True})
+                connectors.put_card(self.ws, {**m, "room": "!shared:ag2.space"}, ["intro"], NOW)
+                self.assertEqual(self.waiter(ScriptedCloud(self.ws, answers, users), Clock()), outcome)
+                [card] = connectors.read_cards(self.ws)
+                self.assertEqual(card["status"], outcome)
+                body = ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()).body
+                self.assertIn(f"connectors.py note {WAIT_ID}", body)
+                self.assertIn("never to the room or the DM", body)
+                if outcome == "connected":
+                    self.assertIn(f"operation_id {WAIT_ID}:answer", body)
+                else:
+                    self.assertNotIn("room.message.send", body)
+
+    def test_a_room_visible_wait_keeps_the_old_resume(self):
+        self.marker()
+        self.waiter(ScriptedCloud(self.ws, [set()]), Clock(NOW + 1800))
+        body = (self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()
+        self.assertNotIn("connectors.py note", body)
+        self.assertIn(f"operation_id {WAIT_ID}:timeout", body)
+
+
 class TestWaiter(Base):
     def test_claims_once_and_writes_exactly_one_resume_task(self):
         self.marker()

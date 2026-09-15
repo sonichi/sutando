@@ -1,6 +1,6 @@
 ---
 name: connect-apps
-description: "Use when the owner asks about their calendar, email, meetings, Linear, Notion, Slack, Google Drive, GitHub or any other third-party app or the data in it ('what's on my calendar', 'any email from Sam', 'my Linear issues', 'find the Drive doc'), asks to connect one, or says 'done' / 'connected' / 'I signed in' after you sent a Connect card. Answers through the Superpower Station connector tools (composio_find, composio_exec). When an app isn't connected yet, posts ONE in-chat Connect card to the owner, closes the task, and answers by itself once they sign in, with no engine restart."
+description: "Use when the owner asks about their calendar, email, meetings, Linear, Notion, Slack, Google Drive, GitHub or any other third-party app or the data in it ('what's on my calendar', 'any email from Sam', 'my Linear issues', 'find the Drive doc'), asks to connect one, or says 'done' / 'connected' / 'I signed in' after you sent a Connect card. Answers through the Superpower Station connector tools (composio_find, composio_exec). When an app isn't connected yet, posts ONE Connect card to the owner (in their DM as a message; in a room with other people privately, under their message, visible only to them), closes the task, and answers by itself once they sign in, with no engine restart."
 ---
 
 # Connect apps
@@ -15,6 +15,10 @@ When an app isn't connected, the flow looks like this in the owner's chat:
 2. A card: the app's icon and name with a **Connect** button.
 3. You: "Once that's done I'll be able to check what's coming up for you." The task ends here.
 4. After sign-in you continue by yourself: "Your Google Calendar is connected and ready to go. Here's your Friday: ..."
+
+In a room with other people, lines 1 to 3 are not messages: they are a **private card** under the
+owner's message, inside their "Only visible to you" activity card, which no other member receives.
+The room sees nothing about connecting, only your reply once the request is done (step 3b).
 
 Every request gets exactly one answer: the steps below check for a wait before answering.
 
@@ -38,13 +42,21 @@ python3 "$C" await googlecalendar --room '<room id>' --reply-to '<source_message
   --task '<task id>' --owner '<owner mxid>' --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
 SUTANDO_REQUEST
+python3 "$C" await youtube --room '<shared room id>' --reply-to '<source_message_id>' \
+  --task '<task id>' --owner '<owner mxid>' --private \
+  --line "YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on." \
+  --line "Once that's done I'll pull up your latest videos." --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
+python3 "$C" note '<wait id>' "YouTube is connected. On it." [--status connected]   # a private-card line
 python3 "$C" claim '<room id>'                 # before answering in a room that may have a wait
 python3 "$C" verify-account '<wait id>'        # a resume: is the wait's AG2 Cloud account the one in use now?
 python3 "$C" rearm                             # restart dead waiters (startup + proactive loop run it)
 ```
 
 Pass the owner's words only through the quoted heredoc above, never inside a quoted `--request`
-argument: their text (an apostrophe, a quote) must never become shell.
+argument: their text (an apostrophe, a quote) must never become shell. `--line` and `note` text is
+yours, not the owner's: plain sentences, no quotes from their message.
 
 | exit | meaning |
 |---|---|
@@ -92,18 +104,27 @@ you have ToolSearch, `select:mcp__sutando-station__composio_find` returns it. If
 
 Never restart the engine yourself.
 
-## Where personal data may go
+## Which kind of room
 
-Calendar events, mail, files and anything else from a connected app go only to a room where the
-owner and you are the only members. A room counts as that DM only when you can confirm it:
+Everything below depends on whether the task's room is the owner's DM with you. A room counts as
+that DM only when you can confirm it:
 
 1. The task's `room_member_count` is exactly `2`; or
 2. `room.inspect` on the room returns `safe_metadata.joined_member_count` of exactly `2`.
 
-A missing, unparseable or larger count, or a failed `room.inspect`, means **shared**. From a shared
-room, find your DM with the owner with `room.list` and confirm it with `room.inspect` the same way;
-the data, the card and the answer go there, and the shared room gets only "I sent it to you in our
-DM." No confirmed DM: text only, no data ("I can only share your calendar in our DM.").
+A missing, unparseable or larger count, or a failed `room.inspect`, means **shared**.
+
+## Where the answer may go
+
+- **Something the owner asked you to do or find where they asked** (post to Slack, create a Linear
+  issue, search YouTube, summarize a public page): reply in the room they asked in, like any reply.
+- **Private content** (mail, calendar events, files and docs, messages, contacts): only in the
+  owner's DM. From a shared room, find your DM with the owner with `room.list` and confirm it with
+  `room.inspect` as above; the answer goes there, and the shared room gets only "I sent it to you in
+  our DM." No confirmed DM: text only, no data ("I can only share your calendar in our DM.").
+
+Connecting itself (the card, "isn't connected yet", "once that's done", timeouts, account notes) is
+never posted in a shared room: it goes on the private card (step 3b).
 
 ## Step 2: find the apps
 
@@ -119,26 +140,25 @@ For each app:
     request: it is answered, or about to be. Write the result `[no-send]` and stop. A resumed wait
     with `timeout`, `user_changed` or `unverified` got only a note: answer this message as below.
   - Otherwise: find the action (`composio_find {toolkit, query}`), run `composio_exec`, and answer
-    where personal data may go (above). Done.
+    where the answer may go (above). Done.
 - `coming_soon: true`: "<App> isn't available yet."
 - `connected: false`: step 3 (or the text line from step 0 when the task gets no card).
 
 If an app name doesn't match anything, `python3 "$C" find "<name>"` checks the catalog; exit 1 means
 there is no such app, so say so.
 
-## Step 3: one card for everything missing
+## Step 3a: one card for everything missing, in the owner's DM
 
-1. **Which room.** The task's room when it is the owner's DM, else the confirmed DM (see "Where
-   personal data may go"). From a shared room the task's result is "I sent you a connect card in our
-   DM." No confirmed DM: text only, as in step 0.
-2. **A card already waiting?** `python3 "$C" status <slugs> --room '<card room>'`. When
+For a task whose room is the owner's DM (see "Which kind of room"). From a shared room, go to 3b.
+
+1. **Which room.** The task's room.
+2. **A card already waiting?** `python3 "$C" status <slugs> --room '<room>'`. When
    `pending_waits` already lists these apps, skip the intro and the card (items 4 and 5): send "The
    Connect card above still works: tap Connect and I'll pick it up as soon as it's connected." and go
    on to step 4, which folds this request into that wait.
 3. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
 4. **Intro.** `room.action.execute` with action `room.message.send`, `operation_id`
-   `<task id>:connect-intro`, and `reply_to` the task's `source_message_id` when the action accepts it
-   (not in the shared-room case: that event lives in another room):
+   `<task id>:connect-intro`, and `reply_to` the task's `source_message_id` when the action accepts it:
    "Your Google Calendar isn't connected yet, so I can't peek at your schedule. Want to hook it up?"
    (adapt to the app and the request).
 5. **Card.** Same action, `operation_id` `<task id>:connect-card`:
@@ -155,32 +175,66 @@ there is no such app, so say so.
    Several apps: ONE card listing each slug (at most 5), body "Connect Linear and Google Meet: ...".
    If the action is not offered or fails, fall back to the text line from step 0 and skip step 4.
 
+## Step 3b: a private card, in a room with other people
+
+For a task whose room is shared. Nothing about connecting is posted anywhere: no intro, no card
+message, no "I sent you a card in our DM", no outro.
+
+1. **No `source_message_id`** on the task: a private card has nowhere to show. Send the owner's DM
+   (found and confirmed as in "Where the answer may go") the text line from step 0, post nothing in
+   the shared room, write the result `[no-send]`, and stop. No confirmed DM: result `[no-send]`.
+2. **A card already waiting?** `python3 "$C" status <slugs> --room '<task room>'`. When
+   `private_cards` lists one for these apps with `status: waiting`, run `note <its id> "The Connect
+   card on your earlier message still works: tap Connect and I'll carry on."` and go on to step 4:
+   `await` folds this request into that wait, and the new card points at it.
+3. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
+4. Go to step 4 with `--private`, `--room` the task's room, `--reply-to` the task's
+   `source_message_id`, and two `--line`s in your voice, adapted to the app and the request: the
+   intro ("YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on.") and
+   the outro ("Once that's done I'll pull up your latest videos."). The desktop client draws the card
+   and the lines under the owner's message.
+
 ## Step 4: hand off and close
 
 Run `await` exactly as in the Tools block: the owner's request goes in the quoted heredoc, `--room` is
-the card room, `--owner` is `runtime.owner_id`. `--reply-to` is the task's `source_message_id`; in
-the shared-room case use the event id the intro's `room.message.send` returned in the DM.
+the task's room, `--owner` is `runtime.owner_id`, `--reply-to` is the task's `source_message_id`,
+and from step 3b add `--private` and the two `--line`s.
 
-- **Exit 0 with a `wait_id`:** write the task result now: "Once that's done I'll be able to check
-  what's coming up for you." (adapted to the app). In the shared-room case, send that line to the DM
-  with `operation_id` `<task id>:connect-outro` and keep the result "I sent you a connect card in our
-  DM." The task is closed; do not wait inside it. (`superseded` lists earlier waits this one absorbed;
+- **Exit 0 with a `wait_id`:** in the DM (3a), write the task result now: "Once that's done I'll be
+  able to check what's coming up for you." (adapted to the app). From 3b the outro is already on the
+  private card: write the result `[no-send]`. The task is closed; do not wait inside it. (`superseded` lists earlier waits this one absorbed;
   `"waiter_pid": null` means the waiter could not start, and the next `rearm` starts it.)
 - **Exit 0 with `"wait_id": null`:** an earlier wait was handled meanwhile: `resumed` names the task
   answering its request or posting its note. An entry whose `task` is this task's id, or whose `request` is
   this request: result `[no-send]`. Otherwise answer it now (step 2), the apps are connected.
 - **Exit 2 with `too_many_apps`:** this task already waits in this room for other apps, and one wait
   holds at most 5. That wait stays armed and answers its request once its apps connect (`status
-  --room` lists them). Result: "I'll pick this up once <its apps> are connected; for <the other apps>,
-  tell me once they're connected and I'll check."
-- **Any other exit 2:** no automatic resume is possible. Result: "Once you've connected Google
-  Calendar, tell me and I'll check."
+  --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,
+  tell me once they're connected and I'll check." In the DM that is the result; from 3b put it on the
+  waiting card with `note` and write the result `[no-send]`.
+- **Any other exit 2:** no automatic resume is possible. Say: "Once you've connected Google
+  Calendar, tell me and I'll check." In the DM that is the result; from 3b there is no private card
+  to carry it, so send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed
+  DM: `[no-send]` alone). Never in the shared room.
 
 ## Step 5: resume
 
 **A resume task arrives** (`source: connector-resume`, id `task-connect-<wait-id>`). Its text names the
 apps, the original request (several requests joined by " / " when the owner asked more than once),
 the room and the `reply_to`. It is owner work for that room.
+
+**Its text says `private card`** (a wait from step 3b): do what it says. Every word about
+connecting, sign-in or accounts goes on the card with `note`, never in the room or the DM:
+
+- Connected and `verify-account` exits 0: `note '<wait-id>' "YouTube is connected. On it."`, run the
+  request with `composio_exec`, and post the result where the answer may go (above), `reply_to` as
+  given, `operation_id <wait-id>:answer`. If `composio_exec` still reports `connect_required`,
+  `note` "YouTube isn't connected yet: tap Connect again and I'll carry on." and post nothing.
+- `verify-account` exits non-zero, timed out, the account changed, or `unverified`: only the `note`
+  the task describes. Share no data, post nothing.
+- Either way the result is `[no-send]`.
+
+**Otherwise** (a wait from the DM, 3a):
 
 - Connected: first `python3 "$C" verify-account '<wait-id>'`. Any exit but 0 (`account_changed`,
   `account_unknown`, `not_signed_in`, ...) means a different or unconfirmed AG2 Cloud account is
@@ -204,8 +258,13 @@ the room and the `reply_to`. It is owner work for that room.
 python3 "$C" claim '<room id>'
 ```
 
+In a shared room, each wait in `claimed`, `pending` or `resumed` with `"private": true` keeps its
+connect talk on its card: the "isn't connected yet", "didn't check" and "tap Connect" lines below
+become `note '<wait-id>' "..."`, and the room gets only the answer itself, where the answer may go.
+When the owner's message was only "done" or "connected", the room gets nothing: `[no-send]`.
+
 - Exit 0: `claimed` lists the waits whose apps are connected; the waiter can no longer fire. With
-  `account_ok: true`, answer its `request` in this task's reply, where personal data may go. With
+  `account_ok: true`, answer its `request` in this task's reply, where the answer may go. With
   `account_ok: false` (`account_reason` `account_changed` or `account_unknown`), share no data for it:
   "I didn't check your Google Calendar for your earlier request: I couldn't confirm the AG2 Cloud
   account signed in now is the one you asked from. Ask me again once it is." When this message is
@@ -231,7 +290,9 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 
 - Never paste a sign-in or OAuth link. The card (or AG2 Space → Marketplace) is the only way to connect.
 - One card per request, listing every app it needs.
-- Connected-app data only in a room confirmed as the owner's DM.
+- Private content (mail, calendar, files, messages, contacts) only in a room confirmed as the owner's DM.
+- In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
+  on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.
 - No cards and no waits from cron, proactive passes, voice, phone, or any channel other than AG2 Space.
 - Only `connectors.py` writes a resume task. Never write one yourself.
