@@ -124,7 +124,7 @@ class ResumeKeepsIdentity(unittest.TestCase):
         env = t.launches()[-1]
         self.assertEqual(env.get("SUTANDO_CLAUDE_RESUME"), first["runtime_session_id"],
                          "the launcher was not told to resume, so the history is lost")
-        self.assertNotIn("SUTANDO_CLAUDE_SESSION_ID", {k: v for k, v in env.items() if v},
+        self.assertNotIn("SUTANDO_CLAUDE_SESSION_ID", sorted(k for k, v in env.items() if v),
                          "a session id alongside resume: start-cli prefers resume, but "
                          "sending both states two intents")
 
@@ -158,8 +158,10 @@ class ResumeKeepsIdentity(unittest.TestCase):
         a = _spawned(self.ws, self.repo, t)
         b = _spawned(self.ws, self.repo, t)
         self.assertNotEqual(a["worker_id"], b["worker_id"])
+        # KEYS only: assertNotIn prints the container, and the container is a real
+        # spawn environment — a failure would paste every secret it holds.
         self.assertNotIn("SUTANDO_CLAUDE_RESUME",
-                         {k: v for k, v in t.launches()[-1].items() if v},
+                         sorted(k for k, v in t.launches()[-1].items() if v),
                          "a fresh spawn asked the runtime to resume something")
 
 

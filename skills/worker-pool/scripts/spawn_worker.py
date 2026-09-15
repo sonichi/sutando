@@ -259,11 +259,13 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
                                tmux_socket=socket, worker_id=worker_id)
     Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
 
-    # start-cli prefers RESUME over SESSION_ID; sending both would state two
-    # intents, so each spawn sets exactly the one it means.
-    env = {**os.environ, **p["env"],
-           **({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
-              else {"SUTANDO_CLAUDE_SESSION_ID": session_id})}
+    # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
+    # fresh spawn sets: drop both, then state the single intent.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID")}
+    env.update(p["env"])
+    env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
+               else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
     r = runner(p["launcher_argv"], env=env)
     if r.returncode != 0:
         why = (r.stderr or "").strip()
