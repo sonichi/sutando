@@ -21,7 +21,7 @@ import json
 import os
 import platform
 import re
-import subprocess
+import subprocess  # noqa: F401 — tests patch report_feedback.subprocess.run (the Keychain read in cloud_auth)
 import sys
 import time
 import urllib.error
@@ -30,21 +30,22 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+# Cloud session lookup lives in src/cloud_auth.py; the names stay importable
+# here because tests and the redirect guard read them off this module.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+import cloud_auth  # noqa: E402
+
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
-TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+TRUSTED_API_HOSTS = cloud_auth.TRUSTED_API_HOSTS
 
 # Test seam. Empty in production: a redirect that downgrades to plaintext must
 # never replay the bearer token, so http is allowed only where a test opts in.
 INSECURE_REDIRECT_HOSTS: frozenset[str] = frozenset()
 
-DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
-# sutando.ag2.ai 307s to .space and clients drop Authorization across the
-# cross-origin redirect, so a bearer sent there reads back as a bogus 401.
-RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
-# What the desktop host overwrites the Keychain token with on sign-out (its
-# vault CLI has no delete verb); must read as "not signed in".
-SIGNED_OUT_SENTINEL = "__signed_out__"
+DEFAULT_CLOUD_ORIGIN = cloud_auth.DEFAULT_CLOUD_ORIGIN
+RETIRED_CLOUD_ORIGINS = cloud_auth.RETIRED_CLOUD_ORIGINS
+SIGNED_OUT_SENTINEL = cloud_auth.SIGNED_OUT_SENTINEL
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
 # autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
@@ -123,121 +124,24 @@ def resolve_workspace() -> Path:
         return Path(__file__).resolve().parents[2] / "workspace"
 
 
-def _normalize_base(base: str) -> str:
-    """A retired production origin IS the current one — never send a bearer to
-    it (the 307 to the new host drops Authorization → a misleading 401)."""
-    base = (base or "").strip().rstrip("/")
-    if base in RETIRED_CLOUD_ORIGINS or not base:
-        return DEFAULT_CLOUD_ORIGIN
-    return base
-
-
-def _fnv1a64(s: str) -> int:
-    """FNV-1a 64-bit, byte-for-byte the desktop host's (cloud_session.rs)."""
-    h = 0xCBF29CE484222325
-    for b in s.encode():
-        h ^= b
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-
-def origin_vault_key(origin: str) -> str:
-    """Origin-scoped Keychain key, matching cloud_session.rs origin_key_suffix."""
-    slug = "".join(c.upper() if (c.isascii() and c.isalnum()) else "_" for c in origin)
-    return f"AG2_CLOUD_TOKEN_{slug}_{_fnv1a64(origin):016X}"
-
-
-def resolve_cloud_origin() -> str:
-    env = os.environ.get("AG2_CLOUD_ORIGIN", "").strip().rstrip("/")
-    return env or DEFAULT_CLOUD_ORIGIN
+# Wrappers, not aliases: each hands its sibling down as the injected reader, so
+# patching _keychain_get / read_keychain_auth here still steers the chain.
+_normalize_base = cloud_auth.normalize_base
+_fnv1a64 = cloud_auth.fnv1a64
+origin_vault_key = cloud_auth.origin_vault_key
+resolve_cloud_origin = cloud_auth.resolve_cloud_origin
 
 
 def _keychain_get(key: str):
-    """Read one Keychain secret the way the engine vault does; None if absent."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-a", "sutando", "-s", key, "-w"],
-            capture_output=True,
-            timeout=10,
-        )
-        if r.returncode != 0:
-            return None
-        return r.stdout.decode().strip() or None
-    except Exception:
-        return None
+    return cloud_auth.keychain_get(key)
 
 
 def read_keychain_auth():
-    """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
-
-    The desktop host stores the sutk_ ONLY in the Keychain, under a key bound
-    to the cloud origin it was minted against (no cross-origin fallback except
-    the host's own retired-production carry-over, mirrored here).
-    """
-    origin = resolve_cloud_origin()
-    candidates = [origin]
-    if origin == DEFAULT_CLOUD_ORIGIN:
-        candidates.extend(RETIRED_CLOUD_ORIGINS)
-    for o in candidates:
-        tok = _keychain_get(origin_vault_key(o))
-        if tok and tok != SIGNED_OUT_SENTINEL:
-            return origin, tok
-    # Pre-origin-scoping installs stored a bare, unscoped key.
-    tok = _keychain_get("AG2_CLOUD_TOKEN")
-    if tok and tok != SIGNED_OUT_SENTINEL:
-        return origin, tok
-    return None, None
+    return cloud_auth.read_keychain_auth(get=_keychain_get)
 
 
 def read_cloud_auth(ws: Path):
-    """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
-
-    Matches the desktop's readCloudAuth (electron/ipc.cjs). Post-M1 the record
-    lives at ``<workspace>/state/auth/cloud-auth.json``; the pre-M1 root
-    ``<workspace>/cloud-auth.json`` is probed as a 30-day reader fallback. Both
-    packaged-app workspace equivalents are also probed so the skill finds the
-    token even when running from a different checkout. The Tauri desktop writes
-    no auth file at all — its session lives in the Keychain, probed next.
-    Falls back to the metering env the supervisor injects for signed-in runs.
-    """
-    seen: set[str] = set()
-    _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
-    for p in (
-        ws / "state" / "auth" / "cloud-auth.json",  # M1 canonical (state/auth/cloud-auth.json)
-        ws / "cloud-auth.json",  # pre-M1 root fallback (30-day reader window per workspace contract)
-        _app_ws / "state" / "auth" / "cloud-auth.json",  # packaged-app M1 canonical
-        _app_ws / "cloud-auth.json",  # packaged-app pre-M1 fallback
-        Path.home() / "Library" / "Application Support" / "@stando" / "ui" / "cloud-auth.json",  # legacy
-    ):
-        rp = str(p)
-        if rp in seen:
-            continue
-        seen.add(rp)
-        try:
-            if p.exists():
-                d = json.loads(p.read_text())
-                if d.get("token"):  # signed in == has token (matches desktop)
-                    return _normalize_base(d.get("apiBase") or ""), d["token"]
-        except Exception:
-            continue
-
-    base, tok = read_keychain_auth()
-    if tok:
-        return base, tok
-
-    hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
-    if hdrs:
-        try:
-            auth = json.loads(hdrs).get("Authorization", "")
-            tok = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth
-            base = os.environ.get("SUTANDO_METERING_ENDPOINT", "").replace("/api/usage/v2", "")
-            if tok:
-                return _normalize_base(base), tok
-        except Exception:
-            pass
-    return None, None
+    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
 
 
 def why_no_logs(ws: Path) -> str:
