@@ -13818,7 +13818,7 @@ def _recovery_duration(seconds: float) -> str:
 
 
 def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
-    """Observe fix health; names are local correlation data, never telemetry properties."""
+    """Observe fix health; only allowlisted check names leave local correlation state."""
     try:
         if fcntl is None:
             return
@@ -14091,7 +14091,7 @@ def recover_core_if_wedged(
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
         _track_core_issue(state_file, alive=alive, task=cur_key,
-                          status_ts=status_ts, start=True)
+                          status_ts=status_ts, start=True, cause=cur_mode)
         _recovery_metric("core_recovery_attempted", trigger=cur_mode)
         try:
             restart_ok = restart_fn()
