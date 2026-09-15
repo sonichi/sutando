@@ -217,87 +217,32 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    This lives in the loop file rather than only in a memory because a memory loads when RECALLED while this file loads EVERY PASS. The rule already existed, stated sharply, and still failed repeatedly — placement was the defect, not precision.
 
-3.4. **⚠ THE ZERO-RESULT RULE — generalised from step 3, because it is not about warns (added
-   2026-08-28 after NINE instances in ONE session, each confirmed in that night's build_log by a
-   distinctive token, not by a regex over the log).**
+**REMOVED 2026-09-15 (was step 3.4, "the zero-result rule").** Added 2026-08-28 after nine
+   same-night probe mistakes (a dict filtered on the wrong key, `git ls-tree | head -5`, a `git diff`
+   on a staged file, a zsh parameter modifier eating a variable, an alias mistaken for its definition,
+   a regex not matching real exit codes, a truncated function-window read, `ps | grep` matching its
+   own argv, a `git log --name-only` block-split) — each a clean, quotable, WRONG zero, never an
+   error. The mitigation was a token-search of the claim's own nouns against the parking files
+   (`pending-questions.md`, `current-track.md`, `build_log.md`, core memory), via
+   `warn-already-triaged.py --claim`, chained before any claim-to-owner send.
 
-   Step 3 says a zero PQ-grep means "try another token". **The same holds for EVERY probe**, and the
-   nine were: a dict filtered by `startswith('http')` when keys were `repo#N` (-> "0 tracked PRs",
-   there were 26); `git ls-tree | head -5` (-> a file "absent" from a 75-entry dir); `git diff` on a
-   STAGED file (-> 0, vacuously, forever); a zsh `"$H:path"` eaten as a parameter modifier; grepping
-   `def read_gateway_verdict` when it is an ALIAS of `read_verdict`; a regex `return [2-5]` against
-   code that says `refusal_rc or 5`; a 90-line WINDOW read of a function whose wiring was further
-   down; `ps | grep` matching its own argv (-> "5 processes", 3 were the check itself); and a
-   block-split of `git log --name-only` that printed `.gitignore` as a commit header.
-
-   **Every one returned a clean, quotable, WRONG answer.** None errored. Several were published.
-
-   **So, before reporting any empty/zero result as a fact about the world:**
-   - **Name what would have to be true for a NON-zero.** If you cannot, the probe is not a measurement.
-   - **Run the positive control** — the same probe against a case you KNOW is present. A probe that
-     cannot produce a hit scores 0 by construction and certifies nothing.
-   - **Suspect SCOPE first**: a `head`/`tail`/`--limit`, a directory searched non-recursively, a window
-     instead of a file, a single package instead of the tree. Absence inside a bound is a fact about
-     the bound.
-   - **Suspect the SHAPE second**: print one record before filtering a collection (`print(rows[0])`),
-     and check an alias is not the definition.
-   - **Never verify in zsh.** A blank where a number belongs is a SYNTAX result; re-run in python3.
-
-   **⚠ AND IT FIRES BEFORE TELLING THE OWNER SOMETHING IS TRUE OF THE SYSTEM — not only before
-   reporting a zero (added 2026-09-01 after FIVE instances in one night).** Step 3 scopes the grep to
-   health warns and 3.4 scopes it to probes; neither covers *"I noticed X about how this system is
-   wired, worth you knowing"*. That sentence is the highest-cost one to get wrong — it reaches the
-   owner — and it is the one with no gate in front of it.
-
-   Measured the same night: I told the owner `workspace/build_log.md` is outside the vault carrier
-   set and that its backup "depends on a mirror running, worth knowing rather than my quietly
-   assuming." **My own `current-track.md` already carried that claim AND its retraction** — filed
-   2026-08-29, retracted the same day with byte-identical remote proof, plus the reason the root path
-   is excluded ON PURPOSE (it collided across hosts; `sync-workspace.sh:846-853` snapshots it per-host
-   instead). The step-3 grep found all of it in ONE call, the next pass, after I had already said it.
-
-   The other four that night: re-deriving a footer discriminator I authored 5 days earlier; hunting a
-   doc the instrument I was about to run already prints; hunting a `--folder` the memory that failure
-   routes to already documented; and appending a memory section that was already there — caught only
-   because the assertion was `== 1` and returned 2.
-
-   ⇒ **Before any sentence to the owner of the form "X is how this system behaves", run the step-3
-   grep on X's own nouns first.** One call. The record is usually ahead of you, and it often contains
-   your own retraction of exactly what you are about to say.
-
-   **⚠ THAT RULE HAD NO MECHANISM AND FAILED AGAIN 2026-09-01.** I told the owner `hosts/` holds two
-   subtrees and called it host-label drift worth settling — measured, diagnosed and filed since
-   **2026-08-28** under `[host-subtrees-false-red-20260828]`, complete with a prepared patch. She
-   read it twice. The 3.4 clause above was loaded on that pass, as it is on every pass; prose in a
-   file I read is not a gate.
-
-   ⇒ **RUN IT. It is one command and it takes a second:**
-
-   ```bash
-   python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence you are about to say>"
-   # exit 1 = already parked, with file:line -> READ IT, then extend or say nothing is new
-   # exit 0 = NO TOKEN MATCHED. That is not proof of absence -- the tool's own message says
-   #          "OR every token missed". Before proceeding, do step 3's fallback:
-   #          grep -n '^## ' "$H"/*.md  and read the ~25 headings. Enumerating cannot miss
-   #          the way a self-chosen token does, and the suspicion never generates the token
-   #          the answer is filed under.
-   # exit 2 = could not answer (no parking files / empty claim) -> NOT a green light
-   ```
-
-   Same `tokens()` + search the warn path uses, so the two cannot drift. Verified against the
-   failure that produced it: the exact sentence I sent her returns exit 1 pointing at the parked
-   entry. Guarded by `tests/proactive-loop-warn-already-triaged.test.py` (10 tests; the discriminating one asserts
-   the verdict flips when the subject is redacted from **both** parking files — a one-file redaction
-   leaves it firing and reads as insensitivity that is not there).
-
-   This is step 3's rule with the noun changed. It sits here rather than in a memory for the reason
-   step 3 already gives: a memory loads when RECALLED, this file loads EVERY PASS — and all nine
-   happened on a night when the memory existed and was loaded.
+   It genuinely caught things (its own test suite, `tests/proactive-loop-warn-already-triaged.test.py`,
+   still lives and still passes — the script is UNCHANGED, `gh-duplicate-check.py`/step 3.45 still
+   imports its tokenizer). But the clause was itself patched twice in place after recurring — once on
+   2026-09-01 after five same-night instances, and again the same day on a claim that had already been
+   filed AND retracted in `current-track.md`, found only because "prose in a file I read is not a
+   gate" — even a file reread every pass. Owner, 2026-09-15, on being told the check is a token/grep
+   search: "token check? that's not good. we need to improve the triage system systemically." A more structured triage system is under active development in a separate, private project
+   (a ranked queue with answerable per-card contracts). Decision: remove the ad hoc mechanism here now rather than keep patching it;
+   revisit once that system is mature enough to potentially replace this whole class of local-file
+   token-matching. Step 3's own manual "try another token" discipline (a human-run grep, not a chained
+   script) is untouched — it was not what the owner's critique targeted, and removing it here would
+   leave zero investigation guidance for a routine health warn.
 
 3.45. **⚠ BEFORE `gh issue create`, RUN THE DUPLICATE GATE — CHAIN IT, do not just read it.**
-   Step 3.4 guards a claim you are about to make to the owner. This is the same rule for an artifact
-   you are about to file on GitHub, and it needs its own gate because the parking files it searches
-   are not GitHub.
+   This is the same class of rule for an artifact you are about to file on GitHub — checked against
+   live GitHub state, not local parking files, which is why it wasn't removed alongside 3.4 above —
+   and it needs its own gate because the parking files it searches are not GitHub.
 
    ```bash
    python3 skills/proactive-loop/scripts/gh-duplicate-check.py \
