@@ -170,7 +170,9 @@ done
 echo
 echo "Test 3: foreign-host deletion guard survives customized exclude rules"
 setup_fixture "push-guard"
-printf '%s\n' '# operator customization' \
+# A COMMENT is no longer customization for refusal purposes: comments are inert in
+# gitignore, so customize with a real operator RULE. Guard behaviour is unchanged.
+printf '%s\n' '!operator/keeps/this' \
     >> "$FIXTURE_WS/.git/info/exclude"
 set +e
 out="$(
