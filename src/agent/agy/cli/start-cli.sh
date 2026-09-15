@@ -1,12 +1,6 @@
 #!/bin/bash
-# src/agent/agy/cli/start-cli.sh — Slice 1 (sonichi#4272) scaffold: a
-# standalone persistent tmux launcher for `agy` (Google's Antigravity CLI,
-# Gemini-backed), a CANDIDATE third Sutando core runtime.
-#
-# NOT wired into core selection: src/agent/start-cli.sh (the dispatcher every
-# other launch path goes through) does not dispatch to this runtime, and
-# nothing reads tasks/*.txt into the session this starts. This script is only
-# invokable directly. See src/agent/agy/README.md for exact scope.
+# Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
+# Not wired into core selection — see src/agent/agy/README.md for scope.
 #
 # Usage:
 #   bash src/agent/agy/cli/start-cli.sh           # start (or attach if running)
@@ -44,9 +38,8 @@ EOF
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
 
-# `agy` exposes no dedicated auth-status subcommand (checked `agy --help` —
-# see sutando#4272); `agy models` makes one real authenticated round trip and
-# exits immediately, so it doubles as the lightest available auth probe.
+# `agy` exposes no dedicated auth-status subcommand; `agy models` makes one
+# authenticated round trip and doubles as the lightest available probe.
 check_mode() {
   if ! command -v agy >/dev/null 2>&1; then
     echo "agy: not found on PATH"
@@ -54,12 +47,20 @@ check_mode() {
   fi
   echo "agy: $(command -v agy)"
   echo "agy version: $(agy --version 2>/dev/null || echo unknown)"
-  if agy models >/dev/null 2>&1; then
+  local _agy_rc=0
+  agy models >/dev/null 2>&1 || _agy_rc=$?
+  if [ "$_agy_rc" -eq 0 ]; then
     echo "auth: OK (agy models round-trip succeeded)"
     return 0
   fi
-  echo "auth: NOT authenticated (agy models failed) — run agy interactively once to log in"
-  return 1
+  if [ "$_agy_rc" -eq 126 ] || [ "$_agy_rc" -eq 127 ]; then
+    echo "auth: UNKNOWN (agy models could not execute, exit $_agy_rc)"
+    return "$_agy_rc"
+  fi
+  # No documented auth-specific exit code exists for agy models, so a
+  # generic nonzero here is not proof of an unauthenticated session.
+  echo "auth: UNKNOWN — authenticated round trip: FAILED (agy models exited $_agy_rc)"
+  return "$_agy_rc"
 }
 
 case "${1:-}" in
@@ -101,9 +102,8 @@ if session_exists; then
   exit 0
 fi
 
-# Onboarding-skip pre-seed — see src/agent/agy/onboarding_seed.py for why.
-# Non-fatal: a skipped seed means the first launch may hit the wizard once,
-# not that the session can't start.
+# Onboarding-skip pre-seed (see onboarding_seed.py); non-fatal — a skipped
+# seed means the wizard may show once, not that the session can't start.
 if [ -n "$PY" ]; then
   "$PY" "$REPO/src/agent/agy/onboarding_seed.py" "$ONBOARDING_PATH" \
     || echo "  ⚠ onboarding-seed failed (non-fatal): $ONBOARDING_PATH" >&2

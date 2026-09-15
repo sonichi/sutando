@@ -262,7 +262,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/agent/agy/cli/`
 
-- **`start-cli.sh`** — src/agent/agy/cli/start-cli.sh — Slice 1 (sonichi#4272) scaffold: a standalone persistent tmux launcher for `agy` (Google's Antigravity CLI, Gemini-backed), a CANDIDATE third Sutando core runtime.
+- **`start-cli.sh`** — Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
 
 ## `src/agent/claude/cli/`
 

@@ -68,7 +68,7 @@ class OnboardingSeedTests(unittest.TestCase):
                           "a no-op seed must not rewrite the file")
 
     def test_partial_false_fields_are_flipped_true(self):
-        # The real shape observed on disk before seeding (sonichi#4272).
+        # The real shape observed on disk before seeding.
         path = self._path("onboarding.json")
         Path(path).write_text(json.dumps({
             "consumerOnboardingComplete": False,
@@ -105,8 +105,8 @@ class OnboardingSeedTests(unittest.TestCase):
         self.assertFalse(Path(path + ".tmp").exists())
 
     def test_default_path_matches_the_documented_agy_cache_location(self):
-        # Field names + location verified by reading the real file on disk
-        # (sonichi#4272) — pin them so a refactor can't silently drift.
+        # Field names + location verified by reading the real file on disk;
+        # pin them so a refactor can't silently drift.
         self.assertTrue(self.seed.default_path().endswith(
             ".gemini/antigravity-cli/cache/onboarding.json"))
         self.assertEqual(set(self.seed.FIELDS), {
@@ -183,6 +183,25 @@ fi
 exec sleep 300
 ''')
 
+    def _write_fake_agy_models_rc(self, rc, message=None, version="9.9.9-fake"):
+        """agy whose `models` subcommand exits with an arbitrary rc/message —
+        for testing failure shapes that are not an auth signal."""
+        stderr_line = f'echo "{message}" >&2\n' if message else ""
+        self._write_exe("agy", f'''#!/bin/bash
+if [ "${{1:-}}" = --version ]; then echo "{version}"; exit 0; fi
+if [ "${{1:-}}" = models ]; then
+  {stderr_line}exit {rc}
+fi
+exec sleep 300
+''')
+
+    def _write_fake_agy_bad_interpreter(self):
+        """A stub whose shebang names a runtime that doesn't exist — an
+        execution failure, not an auth signal."""
+        path = self.bin / "agy"
+        path.write_text("#!/nonexistent-interpreter-for-agy-test\necho unreachable\n")
+        path.chmod(0o755)
+
     def _write_fake_tmux(self):
         # Minimal stateful stub: has-session reflects whether new-session ran.
         self._write_exe("tmux", f'''#!/bin/bash
@@ -239,11 +258,30 @@ esac
         self.assertIn("agy:", result.stdout)
         self.assertIn("auth: OK", result.stdout)
 
-    def test_check_reports_failure_when_not_authenticated(self):
+    def test_check_reports_unknown_not_unauthenticated_on_generic_failure(self):
+        # `agy models` has no documented auth-specific exit code, so a plain
+        # nonzero must not be reported as a definite auth failure.
         self._write_fake_agy(auth_ok=False)
         result = self.run_launcher("--check")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("NOT authenticated", result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("NOT authenticated", result.stdout)
+        self.assertIn("auth: UNKNOWN", result.stdout)
+        self.assertIn("FAILED", result.stdout)
+
+    def test_check_distinguishes_execution_failure_from_operational_failure(self):
+        # Execution and operational failures must both read as UNKNOWN, never
+        # an auth verdict — but their distinct exit codes must survive.
+        self._write_fake_agy_bad_interpreter()
+        exec_failure = self.run_launcher("--check")
+        self.assertIn(exec_failure.returncode, (126, 127))
+        self.assertIn("could not execute", exec_failure.stdout)
+        self.assertNotIn("NOT authenticated", exec_failure.stdout)
+
+        self._write_fake_agy_models_rc(69, message="network unavailable")
+        op_failure = self.run_launcher("--check")
+        self.assertEqual(op_failure.returncode, 69)
+        self.assertIn("auth: UNKNOWN", op_failure.stdout)
+        self.assertNotIn("NOT authenticated", op_failure.stdout)
 
     def test_check_reports_missing_binary(self):
         # No fake agy written — PATH has no `agy` at all.
