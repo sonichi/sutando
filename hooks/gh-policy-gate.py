@@ -61,11 +61,17 @@ MONO_CHECK = _REPO_ROOT / "skills" / "proactive-loop" / "scripts" / "pr-monologu
 def _load_pr_url_re():
     """MONO_CHECK's own PR_URL_RE, loaded from the script rather than
     duplicated — it already derives the repo from a URL and rejects a
-    disagreeing --repo, so the hook must recognize the same shape it does."""
-    spec = importlib.util.spec_from_file_location("_gh_policy_gate_mono", MONO_CHECK)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.PR_URL_RE
+    disagreeing --repo, so the hook must recognize the same shape it does.
+    Every other path in this file fails open on a problem it cannot resolve;
+    this one used to raise at import instead (yixuan-ag2, PR review
+    2026-09-15) — now it returns None like any other unresolved dependency."""
+    try:
+        spec = importlib.util.spec_from_file_location("_gh_policy_gate_mono", MONO_CHECK)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.PR_URL_RE
+    except Exception:
+        return None
 
 
 PR_URL_RE = _load_pr_url_re()
@@ -87,13 +93,24 @@ def _gh_segments(command):
     return out
 
 
+_GLOBAL_FLAGS_WITH_VALUE = ("--repo", "-R")
+
+
 def _find_subcommand(words, pair):
-    """Index just past `words[i], words[i+1] == pair` in a single gh segment,
-    honouring a global flag (e.g. `-R owner/repo`) before the subcommand."""
+    """Index just past `words[i] == pair[0], ..., pair[1]` in a single gh
+    segment. Honours a global flag+value BEFORE the subcommand (`gh -R o/r
+    issue create`, already adjacency-safe) and, same as real `gh`, BETWEEN
+    the two subcommand words (`gh issue --repo o/r create` — verified against
+    the real binary; yixuan-ag2, PR review 2026-09-15)."""
     a, b = pair
     for i in range(len(words) - 1):
-        if words[i] == a and words[i + 1] == b:
-            return i + 2
+        if words[i] != a:
+            continue
+        j = i + 1
+        while j < len(words) and words[j] in _GLOBAL_FLAGS_WITH_VALUE:
+            j += 2
+        if j < len(words) and words[j] == b:
+            return j + 1
     return None
 
 
@@ -160,6 +177,10 @@ def check_pr_comment(words, start):
         print("gh-policy-gate: gh pr comment — could not resolve the caller's own "
               "login (set SUTANDO_GH_LOGIN or ensure `gh api user` works); "
               "not enforcing", file=sys.stderr)
+        return None
+    if PR_URL_RE is None:
+        print("gh-policy-gate: MONO_CHECK's PR_URL_RE did not load; "
+              "not enforcing the monologue check", file=sys.stderr)
         return None
     # A full URL has no bare-digit word; MONO_CHECK derives repo from it.
     url = next((w for w in words[start:] if PR_URL_RE.match(w)), None)

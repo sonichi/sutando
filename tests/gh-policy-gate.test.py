@@ -70,6 +70,35 @@ class Tokenize(unittest.TestCase):
         idx = G._find_subcommand(words, ("pr", "comment"))
         self.assertIsNotNone(idx)
 
+    def test_a_global_flag_between_the_subcommand_words_is_not_a_bypass(self):
+        """Real `gh` accepts --repo/-R between the two subcommand words, not
+        just before them — verified against the live binary (yixuan-ag2, PR
+        #4268 review 2026-09-15). The old adjacency-only check missed this."""
+        words = _words('gh issue --repo o/r create --title "x"')
+        idx = G._find_subcommand(words, ("issue", "create"))
+        self.assertIsNotNone(idx)
+        self.assertEqual(words[idx:idx + 2], ["--title", "x"])
+
+        words = _words('gh pr --repo o/r comment 42 --body "hi"')
+        idx = G._find_subcommand(words, ("pr", "comment"))
+        self.assertIsNotNone(idx)
+
+    def test_a_between_flag_with_no_value_does_not_crash_or_falsely_match(self):
+        """`gh issue --repo create` (no repo value, "create" consumed as the
+        flag's value) must not be mistaken for a matched subcommand — and
+        must not raise on the missing tokens past it."""
+        words = _words('gh issue --repo create')
+        idx = G._find_subcommand(words, ("issue", "create"))
+        self.assertIsNone(idx)
+
+    def test_a_between_word_that_is_not_a_recognized_flag_still_blocks_the_match(self):
+        """Only the specific global flags this hook knows about are skipped —
+        an arbitrary word between the subcommand words is still a real
+        adjacency miss, not silently bridged."""
+        words = _words('gh issue whatever create --title "x"')
+        idx = G._find_subcommand(words, ("issue", "create"))
+        self.assertIsNone(idx)
+
     def test_a_path_qualified_gh_is_still_gh(self):
         words = _words('/opt/homebrew/bin/gh issue create --title "x"')
         self.assertIsNotNone(G._find_subcommand(words, ("issue", "create")))
@@ -192,6 +221,20 @@ class CheckPrComment(unittest.TestCase):
             self.assertIn("--repo", argv)
             self.assertEqual(argv[argv.index("--repo") + 1], "other/repo")
 
+    def test_an_unresolvable_pr_url_re_fails_open_without_crashing(self):
+        """If MONO_CHECK's PR_URL_RE never loaded (its own module missing at
+        import time — the hook's own live failure mode, PR #4268 review
+        2026-09-15), `check_pr_comment` must degrade to 'cannot answer', not
+        raise AttributeError on `None.match(...)`."""
+        saved = G.PR_URL_RE
+        try:
+            G.PR_URL_RE = None
+            words = _words('gh pr comment https://github.com/o/r/pull/42 --body "hi"')
+            idx = G._find_subcommand(words, ("pr", "comment"))
+            self.assertIsNone(G.check_pr_comment(words, idx))
+        finally:
+            G.PR_URL_RE = saved
+
     def test_a_url_whose_repo_disagrees_fails_open(self):
         """MONO_CHECK itself exits 2 ('CANNOT ANSWER: --repo disagrees') for
         this shape; the hook must treat that the same as any other
@@ -245,6 +288,30 @@ class EndToEnd(unittest.TestCase):
                 capture_output=True, text=True, cwd=td,
             )
             self.assertEqual(r.returncode, 0)
+            self.assertNotIn('"permissionDecision": "deny"', r.stdout)
+
+    def test_a_missing_mono_check_module_does_not_crash_the_hook_at_import(self):
+        """Reproduces the reviewer's exact live repro: a checkout where
+        skills/proactive-loop/scripts/pr-monologue-check.py doesn't exist used
+        to raise FileNotFoundError the moment gh-policy-gate.py was imported
+        (PR #4268 review 2026-09-15). Copy just the hook into an isolated tree
+        with no such sibling and confirm the process still starts and exits
+        cleanly rather than crashing on import."""
+        with tempfile.TemporaryDirectory() as td:
+            isolated_hooks = Path(td) / "hooks"
+            isolated_hooks.mkdir()
+            (isolated_hooks / "gh-policy-gate.py").write_text(HOOK.read_text())
+            (isolated_hooks / "_shell_scan.py").write_text(
+                (HOOK.parent / "_shell_scan.py").read_text())
+            # No skills/proactive-loop/scripts/ tree at all under td.
+            r = subprocess.run(
+                [sys.executable, str(isolated_hooks / "gh-policy-gate.py")],
+                input=json.dumps({"tool_name": "Bash", "tool_input": {
+                    "command": 'gh pr comment https://github.com/o/r/pull/1 --body "hi"'}}),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, msg=f"stderr: {r.stderr}")
+            self.assertNotIn("Traceback", r.stderr)
             self.assertNotIn('"permissionDecision": "deny"', r.stdout)
 
 
