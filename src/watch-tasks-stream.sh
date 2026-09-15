@@ -260,6 +260,37 @@ publish_terminal_failure() {
   return "$rc"
 }
 
+# Only the core's own intake routes bound rooms. A delivery watcher consumes
+# work already assigned to its worker, so refusing there breaks a healthy host.
+serves_routing_intake() {
+  # An unresolvable core inbox is "cannot tell", which must not take the same
+  # branch as "this is a worker": a refusal gate answers that side closed.
+  __core_tasks="$(cd "$WORKSPACE_DIR/tasks" 2>/dev/null && pwd -P)"
+  [ -n "$__core_tasks" ] || return 0
+  [ "$TASKS_DIR_ABS" = "$__core_tasks" ]
+}
+
+# A watcher without the routing handler answers every bound room from this
+# core, silently; refuse unless the declaration is empty or the operator opts in.
+if serves_routing_intake &&
+   { [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; }; then
+  if [ "${SUTANDO_ALLOW_UNROUTED_BINDINGS:-}" != "1" ]; then
+    if ! reason="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_bindings_declared.py" "$WORKSPACE_DIR/state")"; then
+      if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+        why="SUTANDO_TASK_EVENT_HANDLER is set but not executable: $SUTANDO_TASK_EVENT_HANDLER"
+      else
+        why="SUTANDO_TASK_EVENT_HANDLER is unset"
+      fi
+      echo "watch-tasks-stream: REFUSING to start: $reason; $why." >&2
+      echo "  Bound rooms would be answered by this core instead of their workers." >&2
+      echo "  Fix: export SUTANDO_TASK_EVENT_HANDLER=<your pool route handler: pool_route_handler.py," >&2
+      echo "  from the checkout that carries the pool>, then start the watcher again; or set" >&2
+      echo "  SUTANDO_ALLOW_UNROUTED_BINDINGS=1 to run without routing on purpose." >&2
+      exit 78
+    fi
+  fi
+fi
+
 if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
