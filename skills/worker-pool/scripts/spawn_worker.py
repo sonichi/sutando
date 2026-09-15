@@ -198,6 +198,9 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # Same rule, and REQUIRED here: the inbox above holds sentinels,
                 # so without a resolver the watcher hands over the zero-byte one.
                 "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
+                # A core exports this; the launcher reads the INHERITED value
+                # to decide it was invoked from inside one. A worker is not.
+                "SUTANDO_CORE_SESSION": "",
                 # The done-flag writer, so a finished delivery can reach
                 # `finished` instead of being re-reported on every boot.
                 "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},

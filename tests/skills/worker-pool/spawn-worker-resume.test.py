@@ -16,9 +16,11 @@ Run: python3 tests/skills/worker-pool/spawn-worker-resume.test.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -163,6 +165,17 @@ class ResumeKeepsIdentity(unittest.TestCase):
         self.assertNotIn("SUTANDO_CLAUDE_RESUME",
                          sorted(k for k, v in t.launches()[-1].items() if v),
                          "a fresh spawn asked the runtime to resume something")
+
+    def test_a_spawn_does_not_hand_the_worker_the_cores_own_session_flag(self):
+        """A core exports SUTANDO_CORE_SESSION=1 and the launcher reads the
+        INHERITED value, so an unscrubbed one makes a worker's launcher believe
+        it was invoked from inside a core. The guard refuses on the literal "1"
+        alone, so the empty value is what reads as "not a core"."""
+        t = FakeTmux()
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_SESSION": "1"}):
+            _spawned(self.ws, self.repo, t)
+        self.assertEqual(t.launches()[-1].get("SUTANDO_CORE_SESSION"), "",
+                         "the worker inherited the core's session flag")
 
 
 if __name__ == "__main__":
