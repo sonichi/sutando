@@ -32,6 +32,7 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
         sys.path.insert(0, _p)
 
 import pool_delivery as pd  # noqa: E402
+import pool_roster as pr  # noqa: E402
 
 import tmux_probe  # noqa: E402
 
@@ -205,7 +206,7 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
 
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
-          require_sentinel: bool = True) -> dict:
+          require_sentinel: bool = True, resume: str = "") -> dict:
     """Create the four parts, in an order where a failure leaves less behind.
 
     Identity first (a record with no process is inert), then the delivery folder,
@@ -220,11 +221,25 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")
 
-    session_id = str(uuid.uuid4())   # the CLI wants a dashed UUID
+    # Rooms are bound to a worker's id and inbox, so re-minting either would
+    # leave every binding pointing at nothing. Only the run is new.
+    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
+    if resume and not resumed_id:
+        raise SpawnRefused(
+            f"no worker in this workspace has session {resume!r} in its lineage; "
+            "refusing rather than resuming a conversation into a stranger's record")
+    session_id = resume or str(uuid.uuid4())   # the CLI wants a dashed UUID
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
     # minting leaves a worker nothing in the roster knows about.
-    worker_id = wi.new_worker_id()
+    worker_id = resumed_id or wi.new_worker_id()
+    # The ROSTER owns labels (worker_identity records lineage, not naming), so a
+    # resume reads the owner's chosen name from there rather than re-deriving it.
+    if resumed_id and not label:
+        # load_roster answers None when no roster exists yet; a worker with no
+        # roster row simply has no chosen name, which plan() handles.
+        label = ((pr.load_roster(workspace) or {}).get("workers", {})
+                 .get(worker_id, {}).get("label", "") or "")
     p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket,
              label=label, worker_id=worker_id)
     name = p["tmux"]["session_name"]
@@ -234,12 +249,23 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     if state != "absent":
         raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
                            f"({detail}); refusing rather than minting a worker over one")
-    rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
-                           host=os.uname().nodename, session_id=session_id,
-                           tmux_socket=socket, worker_id=worker_id)
+    if resumed_id:
+        wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
+                             tmux_session=name)
+        rec = {"worker_id": worker_id}
+    else:
+        rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
+                               host=os.uname().nodename, session_id=session_id,
+                               tmux_socket=socket, worker_id=worker_id)
     Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
 
-    env = {**os.environ, **p["env"], "SUTANDO_CLAUDE_SESSION_ID": session_id}
+    # start-cli prefers RESUME over SESSION_ID, so an inherited RESUME would beat
+    # the SESSION_ID a fresh spawn sets: drop both before stating the one intent.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID")}
+    env.update(p["env"])
+    env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
+               else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
     r = runner(p["launcher_argv"], env=env)
     if r.returncode != 0:
         why = (r.stderr or "").strip()
@@ -259,8 +285,11 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
                 tmux_session=name, tmux_socket=str(socket))
         # No session: nothing can be pointing at either path, so roll back
         # exactly what this call minted.
-        shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
-        shutil.rmtree(p["delivery_dir"], ignore_errors=True)
+        # A resumed worker existed before this call: its records and inbox are
+        # not ours to remove, only the run we failed to start.
+        if not resumed_id:
+            shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
+            shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
     return {**p, **rec, "runtime_session_id": session_id, "started": True}
@@ -275,12 +304,16 @@ def main(argv=None) -> int:
     ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
+    ap.add_argument("--resume", default="", metavar="SESSION_ID",
+                    help="bring a worker back on a recorded session, keeping its "
+                         "id, label and inbox")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     try:
         fn = plan if a.dry_run else spawn
+        kw = {} if a.dry_run else {"resume": a.resume}
         print(json.dumps(fn(a.workspace, a.repo, runtime=a.runtime or None, cwd=a.folder,
-                            socket=a.socket or None, label=a.label), indent=2))
+                            socket=a.socket or None, label=a.label, **kw), indent=2))
     except SpawnRefused as e:
         print(f"spawn-worker refused: {e}", file=sys.stderr)
         return 2
