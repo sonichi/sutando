@@ -419,9 +419,8 @@ def resize_image(path: str, maxdim: int | None, quality: int | None) -> bool:
         target = Path(path)
         with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
             output = Path(tmp) / "resized"
-            # Paths travel in the environment, never in script source: PowerShell also
-            # treats U+2018-U+201B as single-quote delimiters, so doubling the ASCII
-            # apostrophe alone leaves a path like O’Brien unparseable.
+            # Paths travel in the environment, not script source: PowerShell treats
+            # U+2018-U+201B as quote delimiters too, so escaping ' alone is not enough.
             resize_env = {
                 **os.environ,
                 "SUTANDO_RESIZE_INPUT": str(target.resolve()),
