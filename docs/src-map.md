@@ -256,6 +256,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
+## `src/agent/agy/`
+
+- **`onboarding_seed.py`** — Idempotently pre-seed agy's (Antigravity CLI) onboarding-complete cache.
+
+## `src/agent/agy/cli/`
+
+- **`start-cli.sh`** — src/agent/agy/cli/start-cli.sh — Slice 1 (sonichi#4272) scaffold: a standalone persistent tmux launcher for `agy` (Google's Antigravity CLI, Gemini-backed), a CANDIDATE third Sutando core runtime.
+
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
