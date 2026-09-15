@@ -211,3 +211,6 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - Never restart the engine, and never ask for a restart except the one step 1 case.
 - No cards and no waits from cron, proactive passes, voice, phone, or any channel other than AG2 Space.
 - Only `connectors.py` writes a resume task. Never write one yourself.
+- Report only what an action's result shows. Whose name a message was sent under, who can see it, or
+  whether it went out at all: say it only if the `composio_exec` result says so; otherwise say you don't know.
+  Never guess: the same connector can post as the owner or as an app, depending on how it was connected.
