@@ -117,6 +117,18 @@ exit 0
     $pidFile = Join-Path $workspace 'state\task-dispatcher.pid'
     Set-Content -Path $pidFile -Value $PID -NoNewline
 
+    # Fail closed if workspace isolation did not take. Resolve-SutandoWorkspace
+    # honors $SUTANDO_WORKSPACE only through the Python probe; when that probe is
+    # unusable the resolver silently returns <repo>/workspace, and this test would
+    # then drive the real dispatcher against a developer's live workspace.
+    . (Join-Path $repo 'src/workspace_default.ps1')
+    $resolvedWorkspace = Resolve-SutandoWorkspace
+    if (-not [IO.Path]::GetFullPath($resolvedWorkspace).TrimEnd('\', '/').Equals(
+            [IO.Path]::GetFullPath($workspace).TrimEnd('\', '/'),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Workspace isolation failed: resolver returned '$resolvedWorkspace', expected '$workspace'. Refusing to start the dispatcher."
+    }
+
     & pwsh -NoProfile -File (Join-Path $repo 'src\task-dispatcher.ps1') -Background
     if ($LASTEXITCODE -ne 0) { throw "dispatcher launch exited $LASTEXITCODE" }
 
