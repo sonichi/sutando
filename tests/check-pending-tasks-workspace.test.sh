@@ -160,10 +160,8 @@ case "$OUT" in
   *) bad "empty queue emits {}" "got: ${OUT:0:120}" ;;
 esac
 
-# 6. THE REJECTION PATH. When the resolver refuses an interpreter the hook must
-# not execute a bare `python3` — that is the CLT stub the resolver just declined.
-# scripts/git-binary.sh is COPIED IN and a recording `git` stub proves it ran,
-# so this is a witness to activation, not just to output shape.
+# 6. THE REJECTION PATH. A refused interpreter must not fall back to bare
+# `python3`. A recording `git` stub witnesses resolve_git actually ran.
 REJ="$(mktemp -d)"
 mkdir -p "$REJ/scripts" "$REJ/src" "$REJ/workspace/tasks" "$REJ/workspace/results"
 printf '#!/bin/bash\n[ "$1" = "workspace" ] && { echo "%s/workspace"; exit 0; }\nexit 1\n' "$REJ" \
@@ -213,9 +211,8 @@ else
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
 
-# 6b. THE READINESS-CHECK GAP. A TRULY result-only queue (the earlier
-# no-result $PROBE removed) must reach the turn-ledger gate at line ~105, not
-# stop earlier at the UNPROCESSED check -- both PYBIN call sites must guard.
+# 6b. THE READINESS-CHECK GAP. A TRULY result-only queue must reach the
+# turn-ledger gate, not stop earlier -- both PYBIN call sites must guard.
 rm -f "$REJ/workspace/tasks/$PROBE"
 RESULT_PROBE="task-zz-hooktest-readiness-$$.txt"
 printf 'id: probe\ntask: readiness-gap-probe\n' > "$REJ/workspace/tasks/$RESULT_PROBE"
@@ -231,20 +228,36 @@ case "$RG_OUT" in
   '{}') ok "a truly result-only queue with no interpreter still emits valid JSON" ;;
   *) bad "a truly result-only queue with no interpreter still emits valid JSON" "got: ${RG_OUT:0:120}" ;;
 esac
-# STRUCTURAL: the old and new code are byte-identical in observable output
-# here (both emit `{}`, rc=127 happening to not equal 1 either way), so
-# black-box testing cannot see this regress -- pin the guard's presence instead.
-if grep -qF '[ -z "$PYBIN" ] && continue' "$HOOK" && grep -B4 'turn_ledger.py' "$HOOK" | grep -qF '[ -z "$PYBIN" ]'; then
-  ok "both PYBIN call sites (readiness check, turn-ledger gate) are explicitly guarded"
+# BEHAVIORAL, not source text (a regex passes on a dead/commented guard) --
+# `bash -x` traces the actual command; an empty PYBIN execs as `+ '' ...`.
+(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace.log"
+if grep -qE "^\+ '' " "$REJ/xtrace.log"; then
+  bad "neither PYBIN call site ever execs an empty command" \
+    "$(grep -E "^\+ '' " "$REJ/xtrace.log" | head -1)"
 else
-  bad "both PYBIN call sites (readiness check, turn-ledger gate) are explicitly guarded" \
-    "an empty-PYBIN guard is missing before one of the two \"\$PYBIN\" invocations"
+  ok "neither PYBIN call site ever execs an empty command"
 fi
+rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE" "$REJ/xtrace.log"
+
+# 6c. EXISTENCE IS NOT READINESS (delivery/readiness.py's own contract) -- a
+# GENUINELY EMPTY result file, with no interpreter to check it, must NOT be
+# silently read as done. It must stay UNPROCESSED and surface the honest
+# no-interpreter warning, not vanish into a quiet {}.
+EMPTY_PROBE="task-zz-hooktest-emptyresult-$$.txt"
+printf 'id: probe\ntask: empty-result-probe\n' > "$REJ/workspace/tasks/$EMPTY_PROBE"
+: > "$REJ/workspace/results/$EMPTY_PROBE"
+ER_ERR="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
+if [ "$ER_ERR" = "check-pending-tasks: no usable interpreter; queue not reported" ]; then
+  ok "a genuinely empty result with no interpreter is NOT silently treated as done"
+else
+  bad "a genuinely empty result with no interpreter is NOT silently treated as done" \
+    "expected the no-interpreter warning; got: ${ER_ERR:0:160}"
+fi
+rm -f "$REJ/workspace/tasks/$EMPTY_PROBE" "$REJ/workspace/results/$EMPTY_PROBE"
 rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE"
 rm -rf "$REJ_CWD"
-# 7. THE GUEST CARVE-OUT. A cwd inside a worktree of an UNRELATED repo (its own
-# git-common-dir) must not be held hostage by the core's queue, even with a
-# real pending task sitting in it.
+# 7. THE GUEST CARVE-OUT. A worktree of an UNRELATED repo must not be held
+# hostage by the core's queue, even with a real pending task sitting in it.
 printf 'id: probe\ntask: guest-worktree-probe\n' > "$WS/tasks/$PROBE"
 GUEST_REPO="$(mktemp -d)"
 _git_fixture_repo "$GUEST_REPO"
@@ -292,9 +305,8 @@ case "$BF_OUT" in
 esac
 rm -rf "$BUNDLE_FOREIGN"
 
-# 10. non-Git bundle + a NON-Git cwd -> cannot prove different, fail closed
-# (still gate/block) -- the control that proves case 9 is keyed on "a
-# different repo", not on "the bundle has no .git" alone.
+# 10. non-Git bundle + a NON-Git cwd -> fail closed -- the control proving
+# case 9 is keyed on "a different repo", not on "the bundle has no .git".
 BUNDLE_CLEAN_CWD="$(mktemp -d)"
 BC_OUT="$(cd "$BUNDLE_CLEAN_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
 case "$BC_OUT" in
@@ -353,9 +365,8 @@ elif [ -z "$NR_REPO_ID" ] || [ -z "$NR_CWD_ID" ] || [ "$NR_REPO_ID" != "$NR_CWD_
   bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" \
     "fixture bug: identities don't both resolve equal -- child='$NR_REPO_ID' outer='$NR_CWD_ID', this case tests nothing"
 else
-  # Run from the OUTER repo's root, not the child -- same repo, different dir,
-  # so REPO_COMMON_DIR (resolved by walking up from the child) must equal
-  # CWD_COMMON_DIR (resolved directly at the outer root).
+  # Run from the OUTER root, not the child -- REPO_COMMON_DIR (walked up from
+  # the child) must equal CWD_COMMON_DIR (resolved directly at the outer root).
   NR_OUT="$(cd "$OUTER_REPO" && bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
   case "$NR_OUT" in
     *'"decision":"block"'*) ok "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" ;;
