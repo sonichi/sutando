@@ -11,7 +11,9 @@ cd "$REPO"
 # with the real sutando-core session (claude or codex) on the same host.
 TMUX_SOCKET="${SUTANDO_AGY_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}}"
 SESSION="${SUTANDO_AGY_TMUX_SESSION:-sutando-agy}"
+WATCHER_SESSION="${SESSION}-watcher"
 ONBOARDING_PATH="${SUTANDO_AGY_ONBOARDING_PATH:-$HOME/.gemini/antigravity-cli/cache/onboarding.json}"
+NOTIFIER="${SUTANDO_AGY_NOTIFIER_SCRIPT:-$REPO/src/agent/agy/cli/task-notifier.sh}"
 
 PY=""
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
@@ -33,6 +35,20 @@ EOF
 
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
+watcher_session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null; }
+
+# Starts task-notifier.sh in its own tmux session, once per core session.
+# No crash-restart supervision — a dead watcher is recreated on next launch.
+ensure_task_notifier() {
+  watcher_session_exists && return 0
+  [ -x "$NOTIFIER" ] || { echo "  ⚠ agy task notifier not found/executable: $NOTIFIER — tasks will not reach this session" >&2; return 0; }
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION")
+  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
+  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
+    "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER" \
+    || echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
+}
 
 attach_or_report_existing() {
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
@@ -99,6 +115,7 @@ fi
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.
 if session_exists; then
+  ensure_task_notifier
   attach_or_report_existing
 fi
 
@@ -132,6 +149,8 @@ if ! session_exists; then
   echo "  ⚠ $SESSION did not come up within ~5s." >&2
   exit 1
 fi
+
+ensure_task_notifier
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
