@@ -121,7 +121,9 @@ def _cited_in(entry: dict, id_: str) -> list:
     return hits
 
 
-_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+# The last alternative keeps every non-ASCII letter run as a word: a token the
+# lexer drops is a token no allowlist can refuse.
+_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+|[^\W\d_a-zA-Z]+")
 
 _HUMAN_WORDS = frozenset({"human", "humans", "person"})
 # Words that declare namespace or id-ness without naming an object.
@@ -538,6 +540,7 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
     # the seed is unbacked and the id stays unresolved.
     if src_version < ri.SCHEMA_VERSION:
         return
+    emitted = set()
     for rec in entry.get(ri.UNRESOLVED_FIELD) or []:
         if not isinstance(rec, dict):
             continue
@@ -558,8 +561,9 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
                 continue
             # Ask the PRODUCER, both gates: `_principal_slot` (UNRESOLVED is
             # writer-owned yet states no principal) and the nested-referent read.
+            stated = {v for v, _ in _verdicts_from_field(path)}
             if (not ri.writer_owned_path(path) or not _principal_slot(path)
-                    or verdict not in {v for v, _ in _verdicts_from_field(path)}):
+                    or verdict not in stated):
                 continue
             # Every source, not just `claims`: peers.json and owner_id are
             # stamped later, and a MALFORMED observation states a referent too.
@@ -573,8 +577,15 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
                 continue
             reason = seed.get("reason") or (
                 f"cited in `{path}` before this migration overwrote it")
-            yield str(id_), verdict, reason, {
-                "path": path, "verdict": verdict, "reason": reason}
+            # EVERY verdict the path states, not the one this seed stored: a
+            # seed list missing one record must not pick the other referent.
+            for v in sorted(stated):
+                if (str(id_), path, v) in emitted:
+                    continue
+                emitted.add((str(id_), path, v))
+                r = reason if v == verdict else (
+                    f"cited in `{path}` (field names both referents)")
+                yield str(id_), v, r, {"path": path, "verdict": v, "reason": r}
 
 
 def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:

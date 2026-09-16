@@ -176,6 +176,52 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
         self.assert_H_unpublished(self.three_passes(
             self.carried_seed("human_discord_id..human.id", "human")))
 
+    BOTH = "human_discord_id.secondary_agent.id"
+
+    def test_a_carried_BOTH_referent_path_with_only_the_HUMAN_seed_stays_refused(self):
+        """The path states both referents; one stored seed must not pick one.
+        Measured rc 0 -> 0 -> 0 with `human_discord_id` = H before the fix."""
+        self.assert_H_unpublished(self.three_passes(self.carried_seed(self.BOTH, "human")))
+
+    def test_a_carried_BOTH_referent_path_with_only_the_STAND_seed_stays_refused(self):
+        """Measured rc 0 -> 0 -> 0 with H among the Stands before the fix."""
+        self.assert_H_unpublished(self.three_passes(self.carried_seed(self.BOTH, "stand")))
+
+    def test_CONTROL_a_carried_BOTH_referent_path_with_both_seeds_stays_refused(self):
+        doc = self.carried_seed(self.BOTH, "human")
+        doc["reviewer"]["unresolved_discord_ids"][0]["seeded_by"].append(
+            {"path": self.BOTH, "verdict": "stand", "reason": "unverified carried statement"})
+        self.assert_H_unpublished(self.three_passes(doc))
+
+    def flat_source(self, key):
+        """A v1 roster whose ONLY evidence for H is the flat field `key`."""
+        return {"reviewer": {"stand_status": self.S, key: self.H}}
+
+    def test_a_fresh_NON_ASCII_object_token_in_a_HUMAN_leaf_is_refused(self):
+        """`_WORDS` matched ASCII letters only, so `对象` vanished and the leaf
+        read as `discord_human_id`. Measured rc 0 with `human_discord_id` = H
+        before the fix; the ASCII control below refused all along."""
+        self.assert_H_unpublished(self.three_passes(self.flat_source("discord_human_对象_id")))
+
+    def test_a_fresh_NON_ASCII_object_token_in_a_STAND_leaf_is_refused(self):
+        codes = self.three_passes(self.flat_source("discord_stand_对象_id"))
+        self.assertEqual(codes, [5, 5, 5], codes)
+        e = self.final["reviewer"]
+        self.assertNotIn(self.H, [(s.get("id") if isinstance(s, dict) else s)
+                                  for s in e.get("other_stand_discord_ids") or []])
+
+    def test_a_carried_seed_with_a_NON_ASCII_object_container_stays_refused(self):
+        self.assert_H_unpublished(self.three_passes(
+            self.carried_seed("human_discord_id.human_对象.id", "human")))
+
+    def test_CONTROL_an_ASCII_unknown_object_token_is_refused(self):
+        self.assert_H_unpublished(self.three_passes(self.flat_source("discord_human_integration_id")))
+
+    def test_CONTROL_a_flat_documented_human_leaf_still_resolves(self):
+        codes = self.three_passes(self.flat_source("discord_human_id"))
+        self.assertEqual(codes, [0, 0, 0], codes)
+        self.assertEqual(self.final["reviewer"].get("human_discord_id"), self.H)
+
     def test_CONTROL_the_documented_account_container_still_resolves(self):
         """The fix must refuse the BLANK, not the container: `account` is documented."""
         codes = self.three_passes(self.fresh_source(["account"]))
