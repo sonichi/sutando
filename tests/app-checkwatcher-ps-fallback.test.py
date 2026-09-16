@@ -8,7 +8,15 @@ fallback anchored on the full script name at a path/whitespace boundary, but onl
 pgrep itself failed to run — the loose primary probe still ran first and still fail-opened
 (review #4269, qingyun-wu, 2026-09-16T07:42:53Z, commit 8aa2bcbf6). Fixed by removing the
 pgrep primary probe entirely: the anchored `/bin/ps` check is now the sole, authoritative
-liveness probe, so there is exactly one boundary check to keep correct, not two."""
+liveness probe.
+
+Second instance, same family (review #4269 round 2, john-the-dev, 2026-09-16): the anchored
+boundary check still matched ANY argv containing the full script name at a boundary, including
+`grep watch-tasks-stream.sh`, `vim .../watch-tasks-stream.sh`, and `tail -f
+.../watch-tasks-stream.sh` — none of which EXECUTE the script. Fixed by porting
+`watcher_identity.py`'s flattened-argv predicate: argv[0]'s basename must be a shell, argv[1]
+must not be a flag, and argv[1]'s basename must be the script — exactly two tokens, so a
+mention-as-argument (which adds a third) never qualifies."""
 import pathlib
 import re
 import subprocess
@@ -40,8 +48,12 @@ checks = {
     "the marker is the FULL script name, not the truncated substring the bug matched on":
         match_fn is not None and '"watch-tasks-stream.sh"' in match_fn.group(1)
         and '"watch-tasks"' not in match_fn.group(1),
-    "the marker is anchored at a path/whitespace boundary on BOTH sides (beforeOK/afterOK)":
-        match_fn is not None and "beforeOK" in match_fn.group(1) and "afterOK" in match_fn.group(1),
+    "the matcher requires argv[0]'s basename to be a shell, not just the marker present":
+        match_fn is not None and "watcherShells" in match_fn.group(1),
+    "the matcher rejects a flag in argv[1] position": match_fn is not None
+        and 'hasPrefix("-")' in match_fn.group(1),
+    "the matcher requires EXACTLY two argv tokens (a mention-as-argument adds a third)":
+        match_fn is not None and "parts.count == 2" in match_fn.group(1),
 }
 
 # Behavioral negative control: actually execute the extracted matcher against
@@ -56,6 +68,13 @@ let lines: [(String, String, Bool)] = [
     ("unrelated process whose argv merely CONTAINS watch-tasks", "777 tail -f /var/log/watch-tasks-stream.log", false),
     ("unrelated file merely NAMED watch-tasks-*", "778 /usr/bin/vim workspace/notes/watch-tasks-plan.md", false),
     ("the real watcher, full script name at a path boundary", "3003 /bin/bash src/watch-tasks-stream.sh", true),
+    // #4269 round 2 (john-the-dev): the FULL script name in a non-executing argv
+    // still fail-opened under the boundary-only anchor. These three carry the
+    // exact marker, unlike the three rows above (which use the shorter "watch-tasks").
+    ("grep line carrying the FULL script name, not just the short marker", "601 grep watch-tasks-stream.sh", false),
+    ("editor merely NAMING the full script path (not executing it)", "602 vim /Users/x/src/watch-tasks-stream.sh", false),
+    ("tail of a log file with the full script's exact name", "603 tail -f /var/log/watch-tasks-stream.sh", false),
+    ("the real watcher via an absolute path, no leading /bin", "3004 bash /Users/x/src/watch-tasks-stream.sh", true),
 ]
 var failures = 0
 for (desc, line, want) in lines {
