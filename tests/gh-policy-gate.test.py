@@ -71,9 +71,7 @@ class Tokenize(unittest.TestCase):
         self.assertIsNotNone(idx)
 
     def test_a_global_flag_between_the_subcommand_words_is_not_a_bypass(self):
-        """Real `gh` accepts --repo/-R between the two subcommand words, not
-        just before them — verified against the live binary (yixuan-ag2, PR
-        #4268 review 2026-09-15). The old adjacency-only check missed this."""
+        """Real gh accepts --repo/-R between the two subcommand words, not just before them."""
         words = _words('gh issue --repo o/r create --title "x"')
         idx = G._find_subcommand(words, ("issue", "create"))
         self.assertIsNotNone(idx)
@@ -82,6 +80,31 @@ class Tokenize(unittest.TestCase):
         words = _words('gh pr --repo o/r comment 42 --body "hi"')
         idx = G._find_subcommand(words, ("pr", "comment"))
         self.assertIsNotNone(idx)
+
+    def test_every_global_flag_spelling_before_or_between_is_gated(self):
+        """{before, between} x {--repo v, --repo=v, -R v, -R=v}: real gh accepts all eight; none may bypass."""
+        for flag in ("--repo o/r", "--repo=o/r", "-R o/r", "-R=o/r"):
+            for cmd, pair, tail in (
+                (f"gh {flag} issue create --title x", ("issue", "create"), ["--title", "x"]),
+                (f"gh issue {flag} create --title x", ("issue", "create"), ["--title", "x"]),
+                (f"gh {flag} pr comment 42 --body hi", ("pr", "comment"), ["42", "--body"]),
+                (f"gh pr {flag} comment 42 --body hi", ("pr", "comment"), ["42", "--body"]),
+            ):
+                words = _words(cmd)
+                idx = G._find_subcommand(words, pair)
+                self.assertIsNotNone(idx, cmd)
+                self.assertEqual(words[idx:idx + 2], tail, cmd)
+
+    def test_the_segmenter_normalises_equals_forms_so_the_matcher_never_sees_them(self):
+        """`_gh_segments` splits `--repo=o/r` / `-R=o/r` into flag + value; that, not `_find_subcommand`, is why the `=` spelling cannot bypass the gate."""
+        self.assertEqual(_words('gh issue --repo=o/r create')[:3], ["issue", "--repo", "o/r"])
+        self.assertEqual(_words('gh -R=o/r pr comment 42')[:2], ["-R", "o/r"])
+
+    def test_flag_value_reads_the_equals_form_too(self):
+        for cmd in ('gh issue --repo=o/r create --title x', 'gh -R=o/r issue create --title=x'):
+            words = _words(cmd)
+            self.assertEqual(G._flag_value(words, 0, ("--repo", "-R")), "o/r", cmd)
+        self.assertEqual(G._flag_value(_words('gh issue create --title=x'), 0, ("--title", "-t")), "x")
 
     def test_a_between_flag_with_no_value_does_not_crash_or_falsely_match(self):
         """`gh issue --repo create` (no repo value, "create" consumed as the

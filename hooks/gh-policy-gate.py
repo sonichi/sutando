@@ -97,11 +97,8 @@ _GLOBAL_FLAGS_WITH_VALUE = ("--repo", "-R")
 
 
 def _find_subcommand(words, pair):
-    """Index just past `words[i] == pair[0], ..., pair[1]` in a single gh
-    segment. Honours a global flag+value BEFORE the subcommand (`gh -R o/r
-    issue create`, already adjacency-safe) and, same as real `gh`, BETWEEN
-    the two subcommand words (`gh issue --repo o/r create` — verified against
-    the real binary; yixuan-ag2, PR review 2026-09-15)."""
+    """Index just past `words[i] == pair[0], ..., pair[1]` in one gh segment.
+    A global flag+value may sit before or between the subcommand words, as real gh parses it."""
     a, b = pair
     for i in range(len(words) - 1):
         if words[i] != a:
