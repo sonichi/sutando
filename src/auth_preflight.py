@@ -12,8 +12,9 @@ report, and the easy-restart flow can all call it.
 
 Static checks (default, fast, read-only):
   * `.claude.json` in the target dir carries a non-empty `oauthAccount`
-  * credentials exist: `.credentials.json` on disk OR the macOS Keychain
-    item (`Claude Code-credentials`) — existence only, value never read
+  * credentials exist: `.credentials.json` on disk OR the macOS Keychain item
+    scoped to this config dir, or the vanilla shared item as fallback
+    (`keychain_service.py`) — existence only, value never read
   * SSH context (`$SSH_CONNECTION`) — a locked keychain cannot be unlocked
     from an SSH-spawned process, so completing /login needs a GUI Terminal
 
@@ -35,22 +36,24 @@ import shlex
 import subprocess
 import sys
 
+from keychain_service import resolved_credential_service
+
+# Kept as a constant for anything still importing it directly; the real
+# lookup now also checks the per-config-dir scoped item (see below).
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
-def keychain_has_credentials() -> bool:  # pragma: no cover - external I/O (security CLI)
-    """True when the macOS Keychain holds a Claude Code credentials item.
+def keychain_has_credentials(config_dir: str = "") -> bool:  # pragma: no cover - external I/O (security CLI)
+    """True when the macOS Keychain holds a Claude Code credentials item for
+    this config dir — the scoped per-install item, or the vanilla shared one.
 
-    Existence check only — `-s <service>` lookup, output discarded, the
-    secret value is never requested. Non-macOS (no `security`) → False.
+    Existence check only — the secret value is never requested. Found the hard
+    way (2026-09-11): checking only the vanilla name made a genuinely
+    authenticated, scoped-keychain install (the common case, per
+    credential-proxy.ts's own scopedKeychainService) read as logged-out on
+    every restart, permanently aborting startup on a healthy host.
     """
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE],
-            capture_output=True, timeout=10)
-        return r.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    return bool(resolved_credential_service(config_dir))
 
 
 def _oauth_account_present(config_dir: str) -> bool:
@@ -82,7 +85,7 @@ def check_auth_state(config_dir: str, *, keychain_check=keychain_has_credentials
         reasons.append("no oauthAccount in .claude.json (fresh or never-logged-in config dir)")
 
     creds_file = os.path.isfile(os.path.join(config_dir, ".credentials.json"))
-    creds_keychain = bool(keychain_check())
+    creds_keychain = bool(keychain_check(config_dir))
     if not creds_file and not creds_keychain:
         reasons.append("no credentials: .credentials.json absent and no Keychain item")
 
