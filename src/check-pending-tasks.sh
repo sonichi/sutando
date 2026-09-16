@@ -12,22 +12,16 @@
 # Resolve through the same helper every other service uses, so a configured
 # workspace (sutando.config.local.json) is honored rather than assumed.
 
-# This hook is wired into every Claude Code session with this repo as an
-# ancestor, including sessions whose actual cwd is a worktree of an unrelated
-# repo (e.g. a skill-repo fix branch) that merely inherited this CLAUDE.md.
-# Those sessions are guests, not the core (CLAUDE.md "Chat-path task tracking"
-# guest carve-out) — the core's own task/result queue is not theirs to clear,
-# so the gate must not hold their Stop hostage to it.
+# A session whose cwd is an unrelated repo's worktree that merely inherited
+# this CLAUDE.md is a guest, not the core -- its Stop must not gate on our queue.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # A bare `git` can be the macOS CLT stub (REVIEW.md lesson 7) — resolve
 # through the same rules src/git_binary.py uses, not PATH directly.
 . "$REPO_DIR/scripts/git-binary.sh"
 GIT_BIN="$(resolve_git)"
 if [ -n "$GIT_BIN" ]; then
-  # --path-format=absolute (git >= 2.31) avoids a real quirk: plain
-  # `git -C <dir> rev-parse --git-common-dir`, run from a DIFFERENT cwd, can
-  # print a path relative to <dir> rather than to the caller — resolving that
-  # relative to the wrong base silently misjudges "same repo" in both directions.
+  # --path-format=absolute (git >= 2.31): a plain rev-parse, run from a
+  # different cwd, can print a path relative to <dir> instead of to the caller.
   CWD_COMMON_DIR="$("$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   # Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
@@ -48,9 +42,8 @@ if [ -n "$GIT_BIN" ]; then
     exit 0
   fi
 fi
-# No runnable git (module 3 of select_git: nothing) -- fail closed the same
-# way the pre-fix hook always ran: cannot prove a DIFFERENT repo, so proceed
-# as core rather than raising a CLT dialog or silently skipping every guest.
+# No runnable git -- cannot prove a DIFFERENT repo, so proceed as core rather
+# than raising a CLT dialog or silently skipping every guest.
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently

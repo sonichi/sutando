@@ -57,10 +57,8 @@ if [ -n "$out" ]; then ok "non-Darwin: system git is used (stub rule is macOS-on
 else bad "non-Darwin: system git is used (stub rule is macOS-only)" "got empty"; fi
 
 # --- 6. the REAL stub FIRST on PATH must not hide a real git further along --
-# src/git_binary.py's select_git walks every PATH candidate rather than trusting
-# the first match (@john-the-dev, #2469) — pin the shell twin the same way.
-# /usr/bin genuinely comes first here; a resolver that only checked PATH's
-# first hit would stop at the (undeveloper-tooled) stub and return empty.
+# Walks every PATH candidate rather than trusting the first match: /usr/bin
+# genuinely comes first here, and a first-hit-only resolver would stop there.
 lab6=$(mktemp -d)
 printf '#!/bin/sh\nexit 2\n' > "$lab6/xcode-select"; chmod +x "$lab6/xcode-select"
 out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:$lab/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")

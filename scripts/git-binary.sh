@@ -1,34 +1,13 @@
 #!/usr/bin/env bash
-# Resolve a git that will actually RUN. Shell twin of src/git_binary.py
-# (same stub rules as scripts/python-binary.sh, restated for git so a bash
-# caller isn't forced to shell out to Python just to avoid the CLT dialog).
-#
-# On a Mac without the Xcode Command Line Tools, /usr/bin/git still EXISTS —
-# it is Apple's stub, one inode hardlinked across 78 names (git, python3,
-# swiftc, clang, make, ...). Running it raises a modal "install command line
-# developer tools" dialog before it can fail; `command -v git` and `[ -x ]`
-# both SUCCEED against the stub, so neither is a usable probe. The only safe
-# probe is `xcode-select -p` (a real binary, link count 1).
-#
-# ORDER (matches src/git_binary.py::select_git):
-#   1. PATH git, walked in PATH order, first one that is NOT the stub
-#   2. the system git, but only if the developer tools are installed
-#   3. nothing — caller must degrade, never shell the stub
-#
-# Usage:
-#   . "$REPO/scripts/git-binary.sh"
-#   GIT="$(resolve_git)"
-#   [ -n "$GIT" ] || { echo "no runnable git — skipping X"; }
-#   "$GIT" -C "$dir" rev-parse HEAD
+# Resolve a git that will actually run, without ever executing a candidate to
+# probe it -- shell twin of src/git_binary.py::select_git; same rules, same order.
 
 _sutando_git_developer_tools_installed() {
 	xcode-select -p >/dev/null 2>&1
 }
 
-# Resolve $1 to its final target, following symlinks by hand (no GNU-only
-# `readlink -f`, no shelling to python3). Bounded past macOS's 32-hop
-# SYMLOOP_MAX, and refuses (never echoes an unresolved intermediate) if the
-# chain or a missing `readlink` still can't be fully resolved within that.
+# Resolve $1's final target by hand (no GNU-only `readlink -f`). Bounded past
+# macOS's 32-hop SYMLOOP_MAX; refuses rather than echo an unresolved chain.
 _sutando_git_realpath() {
 	_target="$1"
 	_i=0
@@ -41,11 +20,8 @@ _sutando_git_realpath() {
 		esac
 		_i=$((_i + 1))
 	done
-	# The loop can exit two ways: _target stopped being a symlink (resolved),
-	# or the bound was hit while it still is (unresolved) -- only the first
-	# is success. Silently returning the second was the bug: it hands back
-	# a still-symlinked path that trivially isn't the literal stub, so the
-	# caller wrongly concludes "not the stub".
+	# Loop exit is ambiguous (resolved vs. bound hit while still a symlink);
+	# only the first is success -- an unresolved path is never "not the stub".
 	[ -L "$_target" ] && return 1
 	_rdir="$(cd -P "${_target%/*}" 2>/dev/null && pwd -P)" || _rdir="${_target%/*}"
 	printf '%s/%s' "$_rdir" "${_target##*/}"
@@ -65,9 +41,8 @@ _sutando_git_is_system_stub() {
 # Echo a runnable git, or NOTHING. Never echoes the stub unless the developer
 # tools are present.
 resolve_git() {
-	# The stub is a macOS artifact; elsewhere PATH git is an ordinary binary
-	# and there is no xcode-select, so applying the rule everywhere would
-	# refuse a perfectly good git on Linux/CI.
+	# The stub is macOS-only; elsewhere the rule would refuse a perfectly
+	# good git that has no xcode-select to probe.
 	case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
 		darwin*|Darwin) ;;
 		*)

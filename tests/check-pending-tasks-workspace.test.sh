@@ -37,6 +37,17 @@ set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO/src/check-pending-tasks.sh"
 
+# Fixture setup below needs a REAL git, not whatever a bare `git` resolves to
+# on this box (the macOS CLT stub included) -- go through the same resolver
+# the hook itself uses, so the suite is not exposed to the exact failure mode
+# it tests for.
+. "$REPO/scripts/git-binary.sh"
+TEST_GIT="$(resolve_git)"
+if [ -z "$TEST_GIT" ]; then
+  echo "FAIL: no usable git found to build test fixtures with."
+  exit 1
+fi
+
 # --- Build and PIN an isolated workspace before resolving anything ----------
 TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest.XXXXXX")"
 
@@ -197,8 +208,8 @@ rm -rf "$REJ_CWD"
 # real pending task sitting in it.
 printf 'id: probe\ntask: guest-worktree-probe\n' > "$WS/tasks/$PROBE"
 GUEST_REPO="$(mktemp -d)"
-(cd "$GUEST_REPO" && git init -q && \
-   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+(cd "$GUEST_REPO" && "$TEST_GIT" init -q && \
+   "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
 GUEST_OUT="$(cd "$GUEST_REPO" && bash "$HOOK" 2>&1)"
 case "$GUEST_OUT" in
   '{}') ok "unrelated-repo worktree is not blocked by the core's queue" ;;
@@ -212,13 +223,13 @@ rm -rf "$GUEST_REPO"
 # rather than "a DIFFERENT repo's worktree" would pass case 7 by disabling the
 # gate for every worktree, this repo's own included.
 OWN_WT="$REPO/.claude/worktrees/hooktest-$$"
-if git -C "$REPO" worktree add -q --detach "$OWN_WT" HEAD 2>/dev/null; then
+if "$TEST_GIT" -C "$REPO" worktree add -q --detach "$OWN_WT" HEAD 2>/dev/null; then
   OWN_WT_OUT="$(cd "$OWN_WT" && bash "$HOOK" 2>&1)"
   case "$OWN_WT_OUT" in
     *'"decision":"block"'*) ok "this repo's own worktree is still the core, still blocks" ;;
     *) bad "this repo's own worktree is still the core, still blocks" "got: ${OWN_WT_OUT:0:120}" ;;
   esac
-  git -C "$REPO" worktree remove --force "$OWN_WT" 2>/dev/null || rm -rf "$OWN_WT"
+  "$TEST_GIT" -C "$REPO" worktree remove --force "$OWN_WT" 2>/dev/null || rm -rf "$OWN_WT"
 else
   printf '  skip own-repo worktree control; could not create one here\n'
 fi
@@ -238,8 +249,8 @@ printf 'id: probe\ntask: bundle-matrix-probe\n' > "$BUNDLE/workspace/tasks/$PROB
 
 # 9. non-Git bundle + a genuinely foreign Git cwd -> must SKIP ({}).
 BUNDLE_FOREIGN="$(mktemp -d)"
-(cd "$BUNDLE_FOREIGN" && git init -q && \
-   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+(cd "$BUNDLE_FOREIGN" && "$TEST_GIT" init -q && \
+   "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
 BF_OUT="$(cd "$BUNDLE_FOREIGN" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
 case "$BF_OUT" in
   '{}') ok "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" ;;
@@ -270,8 +281,8 @@ printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n
 chmod +x "$FAILPROBE/scripts/sutando-config.sh"
 printf 'id: probe\ntask: failed-probe-matrix\n' > "$FAILPROBE/workspace/tasks/$PROBE"
 FAILPROBE_FOREIGN="$(mktemp -d)"
-(cd "$FAILPROBE_FOREIGN" && git init -q && \
-   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+(cd "$FAILPROBE_FOREIGN" && "$TEST_GIT" init -q && \
+   "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
 FPO_OUT="$(cd "$FAILPROBE_FOREIGN" && bash "$FAILPROBE/src/$(basename "$HOOK")" 2>&1)"
 case "$FPO_OUT" in
   *'"decision":"block"'*) ok "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" ;;
@@ -281,8 +292,15 @@ rm -rf "$FAILPROBE_FOREIGN" "$FAILPROBE"
 
 # 12. A REAL checkout with NO .git of its OWN (a subdir of a real repo) but a
 # RESOLVED identity equal to the cwd's must still be core -- marker-absence
-# must never override a known, matching identity.
-NESTED_REPO="$(mktemp -d)"
+# must never override a known, matching identity. The hook tree lives in an
+# INNER child with NO .git of its own; the .git lives only in the OUTER
+# parent. (The prior version of this case ran `git init` directly in the
+# hook's own REPO_DIR, which gave it a `.git` after all and made the case
+# indistinguishable from the ordinary same-repo case -- it passed under the
+# OLD marker-first code too, so it was not exercising the new behavior.)
+OUTER_REPO="$(mktemp -d)"
+(cd "$OUTER_REPO" && "$TEST_GIT" init -q && "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+NESTED_REPO="$OUTER_REPO/child"
 mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
 cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
@@ -291,13 +309,20 @@ printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n
   "$NESTED_REPO" "$NR_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
 chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
 printf 'id: probe\ntask: nested-subdir-probe\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-(cd "$NESTED_REPO" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
-NR_OUT="$(cd "$NESTED_REPO" && bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-case "$NR_OUT" in
-  *'"decision":"block"'*) ok "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" ;;
-  *) bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" "got: ${NR_OUT:0:120}" ;;
-esac
-rm -rf "$NESTED_REPO"
+if [ -e "$NESTED_REPO/.git" ]; then
+  bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" \
+    "fixture bug: $NESTED_REPO/.git exists, this case tests nothing"
+else
+  # Run from the OUTER repo's root, not the child -- same repo, different dir,
+  # so REPO_COMMON_DIR (resolved by walking up from the child) must equal
+  # CWD_COMMON_DIR (resolved directly at the outer root).
+  NR_OUT="$(cd "$OUTER_REPO" && bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+  case "$NR_OUT" in
+    *'"decision":"block"'*) ok "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" ;;
+    *) bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" "got: ${NR_OUT:0:120}" ;;
+  esac
+fi
+rm -rf "$OUTER_REPO"
 
 # 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
 # -- `-e` alone would misread a broken checkout as an intentional bundle.
@@ -312,13 +337,52 @@ chmod +x "$DANGLING/scripts/sutando-config.sh"
 printf 'id: probe\ntask: dangling-symlink-probe\n' > "$DANGLING/workspace/tasks/$PROBE"
 ln -s "/nonexistent-target-$$" "$DANGLING/.git"
 DANGLING_FOREIGN="$(mktemp -d)"
-(cd "$DANGLING_FOREIGN" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+(cd "$DANGLING_FOREIGN" && "$TEST_GIT" init -q && "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
 DL_OUT="$(cd "$DANGLING_FOREIGN" && bash "$DANGLING/src/$(basename "$HOOK")" 2>&1)"
 case "$DL_OUT" in
   *'"decision":"block"'*) ok "a dangling .git symlink is marker-present, ambiguous -> still gates" ;;
   *) bad "a dangling .git symlink is marker-present, ambiguous -> still gates" "got: ${DL_OUT:0:120}" ;;
 esac
 rm -rf "$DANGLING_FOREIGN" "$DANGLING"
+
+# 14. RESOLVER-EMPTY, POISON-STUB INTEGRATION CASE. `resolve_git` must refuse
+# every candidate on PATH (a symlink to the real system git, classified as the
+# CLT stub when developer tools are absent) -- so GIT_BIN stays "" and the hook
+# takes the no-runnable-git fail-closed path, never a raw `git` lookup. This is
+# the case a `GIT_BIN="$(resolve_git)"` -> `GIT_BIN=git` bypass slips past: PATH
+# still resolves plain `git` to a WORKING binary (via the symlink), so a bypass
+# would successfully compare identities across two real repos and (wrongly)
+# skip, while the correct hook -- unable to use that candidate -- can't compare
+# and must block instead. The two differ only in whether GIT_BIN honors the
+# refusal, which is exactly the assignment line the mutation targets.
+POISON="$(mktemp -d)"
+mkdir -p "$POISON/src" "$POISON/scripts" "$POISON/workspace/tasks" "$POISON/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$POISON/src/"
+cp "$REPO/scripts/git-binary.sh" "$POISON/scripts/"
+PS_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$POISON" "$PS_PY" > "$POISON/scripts/sutando-config.sh"
+chmod +x "$POISON/scripts/sutando-config.sh"
+printf 'id: probe\ntask: resolver-empty-probe\n' > "$POISON/workspace/tasks/$PROBE"
+(cd "$POISON" && "$TEST_GIT" init -q && "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+POISON_FOREIGN="$(mktemp -d)"
+(cd "$POISON_FOREIGN" && "$TEST_GIT" init -q && "$TEST_GIT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+STUBDIR="$(mktemp -d)"
+ln -s /usr/bin/git "$STUBDIR/git"
+XCS_LOG="$STUBDIR/xcode-select-calls.log"
+printf '#!/bin/sh\necho "$@" >> %s\nexit 2\n' "$XCS_LOG" > "$STUBDIR/xcode-select"
+chmod +x "$STUBDIR/xcode-select"
+PS_OUT="$(cd "$POISON_FOREIGN" && OSTYPE=darwin25 PATH="$STUBDIR:/usr/bin:/bin" bash "$POISON/src/$(basename "$HOOK")" 2>&1)"
+case "$PS_OUT" in
+  *'"decision":"block"'*) ok "resolver-empty (poison stub on PATH): GIT_BIN stays unset, hook still gates" ;;
+  *) bad "resolver-empty (poison stub on PATH): GIT_BIN stays unset, hook still gates" "got: ${PS_OUT:0:160} -- a GIT_BIN=git bypass would see this PATH's git as usable and wrongly skip" ;;
+esac
+if [ -f "$XCS_LOG" ] && [ "$(wc -l < "$XCS_LOG")" -ge 1 ]; then
+  ok "the developer-tools probe actually ran (resolve_git was exercised, not bypassed)"
+else
+  bad "the developer-tools probe actually ran (resolve_git was exercised, not bypassed)" "xcode-select was never invoked"
+fi
+rm -rf "$POISON" "$POISON_FOREIGN" "$STUBDIR"
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
