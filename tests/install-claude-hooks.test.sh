@@ -542,6 +542,98 @@ ok "Phase 3: the operator's hook did not get duplicated" \
    "$([ "$(echo "$CSURV" | grep -c -- '--operator-flag')" = 1 ] && echo 0 || echo 1)"
 rm -rf "$CROOT"
 
+# --- 9. deprecated archive sweep must not eat an operator's own Desktop hook -
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): DEPRECATED_HOOKS swept the
+# two pre-move archiver shapes via a bare `contains("Desktop/sutando-conversations/")`,
+# which also matches ANY operator command that merely targets that directory —
+# reproduced: before the fix, a custom wrapper below is gone after one run.
+DROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks archive-owner.XXXXXX")"
+DREPO="$DROOT/repo with spaces"
+mkdir -p "$DREPO/src" "$DREPO/.claude" "$DREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$DREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$DREPO/src/"
+chmod +x "$DREPO/src/"*.sh
+echo '{}' > "$DREPO/workspace/.claude-sutando/settings.json"
+
+# Normalize through cd+pwd, same as the installer's own $REPO_DIR resolution —
+# $TMPDIR can carry a trailing slash (macOS), and an un-normalized double slash
+# in the fixture would not byte-match the installer's own anchored regex.
+export D_LEGACY="$DREPO/.claude/settings.json" D_REPO="$(cd "$DREPO" && pwd)"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['D_LEGACY'], os.environ['D_REPO']
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # (a) ancient bare-cp archiver, fully static — must be SWEPT.
+    {"type": "command",
+     "command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'},
+    # (b) intermediate archive-transcript.sh-with-Desktop-destination shape,
+    #     this clone's exact historical form — must be SWEPT.
+    {"type": "command",
+     "command": f'bash \'{repo}/src/archive-transcript.sh\' "$HOME/Desktop/sutando-conversations/"'},
+    # (c) operator's OWN differently-shaped command that merely mentions the
+    #     same directory as a substring — must SURVIVE.
+    {"type": "command",
+     "command": 'bash "$HOME/my-custom-archiver.sh" --dest "$HOME/Desktop/sutando-conversations/" --verbose'},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$DREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+DSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$D_LEGACY")"
+ok "archive sweep: operator's own Desktop-targeting wrapper survives" \
+   "$(echo "$DSURV" | grep -q 'my-custom-archiver.sh' && echo 0 || echo 1)"
+ok "archive sweep: the ancient bare-cp form is still removed" \
+   "$(echo "$DSURV" | grep -q 'cp \\"\$TRANSCRIPT_PATH\\"' && echo 1 || echo 0)"
+ok "archive sweep: the intermediate archive-transcript.sh+Desktop form is still removed" \
+   "$(echo "$DSURV" | grep -q 'archive-transcript.sh.*Desktop/sutando-conversations' && echo 1 || echo 0)"
+rm -rf "$DROOT"
+
+# --- 10. an EXISTING but FAILING resolver must not be silently guessed past --
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): with a readable but exit-9
+# sutando-config.sh, the installer previously "succeeded" against a guessed
+# workspace/.claude-sutando path — on a configured clone that can write the
+# wrong file and sweep project hooks with no replacement where the core reads.
+EROOT2="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks resolver-fail.XXXXXX")"
+EREPO2="$EROOT2/repo with spaces"
+mkdir -p "$EREPO2/src" "$EREPO2/scripts" "$EREPO2/.claude" "$EREPO2/workspace/.claude-sutando"
+cp "$INSTALLER" "$EREPO2/src/install-claude-hooks.sh"
+printf '#!/bin/bash\nexit 9\n' > "$EREPO2/scripts/sutando-config.sh"
+chmod +x "$EREPO2/scripts/sutando-config.sh"
+OUT_FAIL="$(bash "$EREPO2/src/install-claude-hooks.sh" 2>&1)"; RC_FAIL=$?
+ok "an existing-but-failing resolver makes the installer exit non-zero" \
+   "$([ "$RC_FAIL" -ne 0 ] && echo 0 || echo 1)"
+ok "it does not silently write the guessed fallback settings file" \
+   "$([ ! -s "$EREPO2/workspace/.claude-sutando/settings.json" ] && echo 0 || echo 1)"
+rm -rf "$EROOT2"
+
+# --- 11. omit flag must not leave a stale archiver visible to GUEST sessions --
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): "the unattended auto-fix can
+# migrate the other hooks while leaving this core-only hook visible to guest
+# sessions." A legacy Desktop-shaped archiver sitting in PROJECT settings (not
+# core settings) must be swept even under omit — it's guest-exposed, unlike the
+# core-scoped case in section "the omit flag the opt-in survives untouched".
+FROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks omit-project.XXXXXX")"
+FREPO="$FROOT/repo with spaces"
+mkdir -p "$FREPO/src" "$FREPO/.claude" "$FREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$FREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/check-pending-tasks.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/archive-transcript.sh"
+chmod +x "$FREPO/src/"*.sh
+echo '{}' > "$FREPO/workspace/.claude-sutando/settings.json"
+python3 - "$FREPO/.claude/settings.json" <<'PY'
+import json, sys
+json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command",
+    "command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'}]}]}},
+    open(sys.argv[1], "w"), indent=2)
+PY
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$FREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+FCMDS="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$FREPO/.claude/settings.json")"
+ok "under omit, a legacy archiver at PROJECT level is still swept (guest-exposed)" \
+   "$(echo "$FCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
+ok "and no successor is installed in its place at project level" \
+   "$(echo "$FCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
+rm -rf "$FROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

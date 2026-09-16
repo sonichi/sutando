@@ -57,14 +57,35 @@ set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Resolve a sutando-config.sh subcommand, falling back to a guessed default
+# ONLY when the helper script itself does not exist (e.g. a bare test fixture
+# with no scripts/ dir) — the one case nothing safe can be compared against.
+# When the helper EXISTS but the command fails, guessing is unsafe: it can
+# write/sweep against the wrong config dir on a configured clone (#4309 review,
+# keweichen/qingyun-wu 2026-09-16, repro: a readable sutando-config.sh exiting
+# 9 still let the installer "succeed" against a guessed path). Fail loud instead.
+resolve_or_die() {  # resolve_or_die <subcommand> <fallback> -> sets RESOLVED
+  local _sub="$1" _fallback="$2" _helper="$REPO_DIR/scripts/sutando-config.sh" _out
+  if [ ! -f "$_helper" ]; then
+    RESOLVED="$_fallback"
+    return 0
+  fi
+  if ! _out="$(bash "$_helper" "$_sub" 2>&1)" || [ -z "$_out" ]; then
+    echo "install-claude-hooks: scripts/sutando-config.sh $_sub failed: $_out" >&2
+    echo "install-claude-hooks: refusing to guess a config/workspace path — fix the resolver first." >&2
+    exit 1
+  fi
+  RESOLVED="$_out"
+}
+
 # These hooks belong to the CORE SESSION, not to the checkout. Project-level
 # `.claude/settings.json` scopes by repo, so every other Claude session with
 # this cwd — a review automation, an ad-hoc owner session, a worktree — also
 # fired them: the Stop hook handed guests the core's task queue to drain, and
 # session-handoff overwrote the core's session-state.md with a guest's tail.
 # The core's own CLAUDE_CONFIG_DIR is read by the core and nothing else.
-CORE_CONFIG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null)"
-[ -n "$CORE_CONFIG_DIR" ] || CORE_CONFIG_DIR="$REPO_DIR/workspace/.claude-sutando"
+resolve_or_die claude-sutando-config-dir "$REPO_DIR/workspace/.claude-sutando"
+CORE_CONFIG_DIR="$RESOLVED"
 SETTINGS="$CORE_CONFIG_DIR/settings.json"
 
 # Pre-move location, swept below so a re-run migrates an existing install.
@@ -73,8 +94,8 @@ LEGACY_PROJECT_SETTINGS="$REPO_DIR/.claude/settings.json"
 # Transcript archives are per-user mutable state, so they live under the
 # workspace (CLAUDE.md "Workspace contract"), not in ~/Desktop. logs/ is also
 # named in vault.sync.exclude, so the archive stays out of the carrier set.
-WORKSPACE_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
-[ -n "$WORKSPACE_DIR" ] || WORKSPACE_DIR="$REPO_DIR/workspace"
+resolve_or_die workspace "$REPO_DIR/workspace"
+WORKSPACE_DIR="$RESOLVED"
 TRANSCRIPT_DIR="$WORKSPACE_DIR/logs/conversations"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
@@ -98,6 +119,12 @@ TRANSCRIPT_DIR="$WORKSPACE_DIR/logs/conversations"
 shq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
+
+# Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
+# Moved up from its former spot below the settings bootstrap so a DEPRECATED_HOOKS
+# entry built below (regex mode) can call it — a function must be defined before
+# its first use in a script executed top-to-bottom.
+re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 
 # Hook specs: each line is "<event>|<marker>|<command>".  Order = install order.
 #
@@ -162,36 +189,56 @@ while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
   HOOK_PRIOR+=("$_prior")
 done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
 
-# Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
-# Matching uses `.command | contains(substring)` so we don't need to track
-# the exact command string an old installer wrote — just a stable token.
-# Add new entries here when removing a hook from `HOOKS=()`; entries can
-# be removed once you're confident the fleet has migrated (months later).
+# Deprecated hooks to uninstall on re-run.  Each line: "<event>|<mode>|<pattern>".
+# mode "sub": `.command | contains(pattern)` — for a marker so distinctive
+# (a pidfile path fragment, say) that no other command could plausibly embed
+# it. mode "regex": `.command | test(pattern)`, pattern pre-anchored (^...$)
+# by the constructor below — for anything an operator's OWN differently-shaped
+# command could otherwise contain as a mid-string substring (#4309 review,
+# keweichen/qingyun-wu 2026-09-16: a wrapper merely targeting the same
+# directory was swept under "sub" mode). Add new entries when removing a hook
+# from `HOOKS=()`; entries can be removed once the fleet has migrated (months).
 DEPRECATED_HOOKS=(
   # #1065 watcher-kill Stop hook — dropped from HOOKS by #1083 (turn-end
   # firing killed the live Monitor watcher every turn). Cleanup-by-re-run
-  # added in #1083 follow-up.
-  "Stop|watch-tasks-stream.pid"
+  # added in #1083 follow-up. Substring is safe: no live hook's command
+  # plausibly embeds this pidfile path fragment.
+  "Stop|sub|watch-tasks-stream.pid"
 )
 
 # This PR changed the archiver's command: phase 0 cannot migrate the old one (it
 # embeds no repo path) and phase 1 matches exactly, so both would fire.
+#
+# Both pre-move forms of OUR archiver, matched by their EXACT historical shape
+# (regex mode, anchored ^...$) rather than a bare directory substring — an
+# operator's own command that merely targets the same directory (a different
+# wrapper, extra flags) does not match an anchored full-command regex the way
+# it matched a loose `contains("Desktop/sutando-conversations/")`. The ancient
+# `cp` form is fully static (no $REPO_DIR — never varied per clone); the
+# archive-transcript.sh form is reconstructed exactly as this clone's OWN
+# prior installer would have written it (git blame 96e2e0ce9^).
+ARCHIVE_LEGACY_SHAPES=(
+  "PreCompact|regex|^$(re_escape "cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\"")\$"
+  "PreCompact|regex|^$(re_escape "bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\"")\$"
+)
+
+# CORE settings: keep this OMIT-gated. "The flag already dropped the archiver
+# from HOOKS, so an ungated removal here would delete a registered hook and
+# install no successor" — a real tradeoff at core scope, where there is no
+# other session to leak to, so leaving an operator's working (if stale-shaped)
+# core-only archiver alone under omit is a legitimate choice, not a bug.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
-  # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
-  # ungated removal here would delete a registered hook and install no successor.
-  # Both pre-move forms of OUR archiver: the ancient inline `cp`, and the
-  # archive-transcript.sh call that still pointed at ~/Desktop. Each is matched
-  # by its exact default shape — the second by the trailing quote that ends a
-  # bare destination argument, which an operator's own `.../$(date ...).jsonl`
-  # command does not have. A looser `Desktop/sutando-conversations/` would eat
-  # that customized hook too. Both must fire: the marker moved to
-  # "logs/conversations/", so phase 0 no longer recognises a Desktop-targeted
-  # entry and would leave it registered beside the new one, archiving twice.
-  DEPRECATED_HOOKS+=(
-    "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
-    "PreCompact|Desktop/sutando-conversations/\""
-  )
+  DEPRECATED_HOOKS+=("${ARCHIVE_LEGACY_SHAPES[@]}")
 fi
+
+# LEGACY PROJECT settings: always swept, never gated on omit (#4309 review,
+# keweichen/qingyun-wu 2026-09-16). "Don't newly enable archiving" (the
+# flag's job, honored above in HOOKS[] and in the core-scope sweep just
+# above) is a different question from "clean up a stale Desktop-scoped
+# PROJECT hook" — that one is visible to every guest session in this repo,
+# exactly the cross-session leak this whole migration exists to close, and
+# leaving it registered under omit is worse than installing no successor.
+DEPRECATED_HOOKS_PROJECT_ONLY=("${ARCHIVE_LEGACY_SHAPES[@]}")
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for atomic settings.json edit" >&2
@@ -209,9 +256,6 @@ fi
 ADDED=0
 SKIPPED=0
 REMOVED=0
-
-# Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
-re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 
 # Ownership test for HOOKS[$1]: sets EVENT/MARKER/CMD/SHAPE/LEGACY_SHAPE, returns
 # 1 when the entry embeds no repo path (nothing safe to shape-match against — see
@@ -335,32 +379,36 @@ for entry in "${HOOKS[@]}"; do
   ADDED=$((ADDED + 1))
 done
 
-# Phase 2: uninstall deprecated hooks (substring match).
-# This walks every hooks group under the event, filters out any command
-# containing the substring, then rewrites the group.  Doing it per-event
-# (vs deleting the whole event key) preserves any sibling hooks the
+# Phase 2: uninstall deprecated hooks (mode "sub" or "regex" per entry — see
+# DEPRECATED_HOOKS above). This walks every hooks group under the event,
+# filters out any matching command, then rewrites the group.  Doing it
+# per-event (vs deleting the whole event key) preserves any sibling hooks the
 # operator may have added manually that aren't in our HOOKS list.
 for entry in "${DEPRECATED_HOOKS[@]}"; do
   EVENT="${entry%%|*}"
-  SUBSTR="${entry#*|}"
+  _rest="${entry#*|}"
+  MODE="${_rest%%|*}"
+  PAT="${_rest#*|}"
+  JQ_TEST='contains($p)'
+  [ "$MODE" = "regex" ] && JQ_TEST='test($p)'
 
   # Skip if no match present — keeps re-runs silent on already-migrated installs.
-  if ! jq -e --arg event "$EVENT" --arg sub "$SUBSTR" \
-      '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | map(contains($sub)) | any' \
+  if ! jq -e --arg event "$EVENT" --arg p "$PAT" \
+      "(.hooks // {})[\$event] // [] | map(.hooks // []) | flatten | map(.command) | map($JQ_TEST) | any" \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
   fi
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
-  jq --arg event "$EVENT" --arg sub "$SUBSTR" '
-    if (.hooks // {})[$event] then
-      .hooks[$event] |= map(
-        .hooks |= map(select((.command // "") | contains($sub) | not))
+  jq --arg event "$EVENT" --arg p "$PAT" "
+    if (.hooks // {})[\$event] then
+      .hooks[\$event] |= map(
+        .hooks |= map(select((.command // \"\") | $JQ_TEST | not))
       )
       # Drop now-empty groups so the structure stays tidy.
-      | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+      | .hooks[\$event] |= map(select((.hooks // []) | length > 0))
     else . end
-  ' "$SETTINGS" > "$TMP" || { echo "error: jq remove failed on $EVENT/$SUBSTR" >&2; rm -f "$TMP"; exit 1; }
+  " "$SETTINGS" > "$TMP" || { echo "error: jq remove failed on $EVENT/$MODE/$PAT" >&2; rm -f "$TMP"; exit 1; }
   mv "$TMP" "$SETTINGS"
   REMOVED=$((REMOVED + 1))
 done
@@ -413,25 +461,29 @@ if [ -f "$LEGACY_PROJECT_SETTINGS" ] && [ "$LEGACY_PROJECT_SETTINGS" != "$SETTIN
     mv "$TMP" "$LEGACY_PROJECT_SETTINGS"
     LEGACY_REMOVED=$((LEGACY_REMOVED + 1))
   done
-  for entry in "${DEPRECATED_HOOKS[@]}"; do
+  for entry in "${DEPRECATED_HOOKS[@]}" "${DEPRECATED_HOOKS_PROJECT_ONLY[@]}"; do
     EVENT="${entry%%|*}"
-    SUBSTR="${entry#*|}"
-    [ -n "$SUBSTR" ] || continue
-    if ! jq -e --arg event "$EVENT" --arg sub "$SUBSTR" \
-        '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | map(contains($sub)) | any' \
+    _rest="${entry#*|}"
+    MODE="${_rest%%|*}"
+    PAT="${_rest#*|}"
+    [ -n "$PAT" ] || continue
+    JQ_TEST='contains($p)'
+    [ "$MODE" = "regex" ] && JQ_TEST='test($p)'
+    if ! jq -e --arg event "$EVENT" --arg p "$PAT" \
+        "(.hooks // {})[\$event] // [] | map(.hooks // []) | flatten | map(.command) | map($JQ_TEST) | any" \
         "$LEGACY_PROJECT_SETTINGS" >/dev/null 2>&1; then
       continue
     fi
     TMP="$(mktemp "${LEGACY_PROJECT_SETTINGS}.XXXXXX")"
-    jq --arg event "$EVENT" --arg sub "$SUBSTR" '
-      if (.hooks // {})[$event] then
-        .hooks[$event] |= map(
-          .hooks |= map(select((.command // "") | contains($sub) | not))
+    jq --arg event "$EVENT" --arg p "$PAT" "
+      if (.hooks // {})[\$event] then
+        .hooks[\$event] |= map(
+          .hooks |= map(select((.command // \"\") | $JQ_TEST | not))
         )
-        | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+        | .hooks[\$event] |= map(select((.hooks // []) | length > 0))
       else . end
-    ' "$LEGACY_PROJECT_SETTINGS" > "$TMP" || {
-      echo "error: jq legacy sweep failed on $EVENT/$SUBSTR" >&2; rm -f "$TMP"; exit 1; }
+    " "$LEGACY_PROJECT_SETTINGS" > "$TMP" || {
+      echo "error: jq legacy sweep failed on $EVENT/$MODE/$PAT" >&2; rm -f "$TMP"; exit 1; }
     mv "$TMP" "$LEGACY_PROJECT_SETTINGS"
     LEGACY_REMOVED=$((LEGACY_REMOVED + 1))
   done
