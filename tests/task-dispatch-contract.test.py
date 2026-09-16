@@ -8,15 +8,19 @@ Pinned regressions, each one a defect the bash copies shipped:
   2. `task-probe-1-other.txt` is NOT an epoch archive of `task-probe`.
   3. `archive-YYYY-MM-DD/<stem>-<epoch>.txt` IS a delivery (the shape Codex's
      bash covered and the shared locator initially did not).
-And the parity that makes this the one truth: on every fixture the answer
-equals what `watch-tasks-stream.sh`'s `handler_result_exists` computes with
-the Python it embeds — asserted against the shipped text, not a copy of it.
+  4. A ready ARCHIVED result IS a delivery even when an empty or
+     whitespace-only live `results/<id>.txt` also exists: the first-existing
+     lookup stopped at the placeholder and requeued a completed task.
+And the parity that makes this the one truth: on every fixture — single-state
+and mixed — the answer equals what `watch-tasks-stream.sh`'s
+`handler_result_exists` computes, running the shipped bash function itself.
 
 Run: python3 tests/task-dispatch-contract.test.py
 """
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,6 +34,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
     _main,
+    find_ready_result,
     has_ready_result,
     next_pending_task,
     pending_candidates,
@@ -68,6 +73,44 @@ EXPECTED_READY = {
     "live-ready", "archive-flat", "archive-month", "archive-flat-epoch",
     "archive-month-epoch", "retention-exact", "retention-epoch",
 }
+
+# Several result locations at once (RESULT_FIXTURES holds one, so it cannot see a placeholder
+# hiding a ready archive). name -> ([(relative path, body), ...], verdict, ready body path or None)
+EMPTY, WS = "", "   \n\n"
+MIXED_FIXTURES = {
+    "archive-plus-empty-live": (
+        [(f"archive/2026-09/{F}", "done\n"), (F, EMPTY)], True, f"archive/2026-09/{F}"),
+    "archive-plus-whitespace-live": (
+        [(f"archive/{F}", "done\n"), (F, WS)], True, f"archive/{F}"),
+    "retention-epoch-plus-empty-live": (
+        [(f"archive-2026-07-26/{TASK}-1784690000.txt", "done\n"), (F, EMPTY)],
+        True, f"archive-2026-07-26/{TASK}-1784690000.txt"),
+    "month-epoch-plus-whitespace-live": (
+        [(f"archive/2026-09/{TASK}-1700000000.txt", "done\n"), (F, WS)],
+        True, f"archive/2026-09/{TASK}-1700000000.txt"),
+    "flat-epoch-behind-empty-live-and-empty-month": (
+        [(F, EMPTY), (f"archive/2026-09/{F}", EMPTY), (f"archive/{TASK}-1700000000.txt", "done\n")],
+        True, f"archive/{TASK}-1700000000.txt"),
+    "live-plus-stale-archive": (
+        [(F, "fresh\n"), (f"archive/{F}", "stale\n")], True, F),
+    "empty-live-only": ([(F, EMPTY)], False, None),
+    "whitespace-live-only": ([(F, WS)], False, None),
+    "empty-live-plus-empty-archive": ([(F, EMPTY), (f"archive/{F}", EMPTY)], False, None),
+    "empty-live-plus-whitespace-retention": (
+        [(F, EMPTY), (f"archive-2026-07-26/{F}", WS)], False, None),
+    "empty-live-plus-decoy-suffix": (
+        [(F, EMPTY), (f"archive/{TASK}-1-other.txt", "done\n")], False, None),
+    "empty-live-plus-decoy-notes": (
+        [(F, EMPTY), (f"archive/{TASK}-notes.txt", "done\n")], False, None),
+    "empty-live-plus-decoy-longer-id": (
+        [(F, EMPTY), (f"archive/{TASK}2.txt", "done\n"), (f"archive/2026-09/{TASK}2.txt", "done\n")],
+        False, None),
+}
+
+
+def _populate(results: Path, entries) -> None:
+    for rel, body in entries:
+        _write(results / rel, body)
 
 
 class HasReadyResultTest(unittest.TestCase):
@@ -132,23 +175,109 @@ class HasReadyResultTest(unittest.TestCase):
         self.assertTrue(has_ready_result(self.results_dir, TASK))
 
 
+class MixedStateTest(unittest.TestCase):
+    """Regression 4: a ready archive behind an empty or whitespace-only live
+    placeholder. The verdict must come from walking every candidate to a READY
+    body, never from the first path that merely exists."""
+
+    def _results(self, fixture):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        results = Path(td.name) / "results"
+        results.mkdir()
+        _populate(results, MIXED_FIXTURES[fixture][0])
+        return results
+
+    def test_every_mixed_fixture_has_the_expected_verdict(self):
+        for fixture, (_, expected, _) in MIXED_FIXTURES.items():
+            with self.subTest(fixture=fixture):
+                self.assertEqual(has_ready_result(self._results(fixture), F), expected, fixture)
+
+    def test_find_ready_result_returns_the_ready_body_not_the_placeholder(self):
+        for fixture, (_, _, ready_rel) in MIXED_FIXTURES.items():
+            with self.subTest(fixture=fixture):
+                results = self._results(fixture)
+                found = find_ready_result(results, TASK)
+                self.assertEqual(found, None if ready_rel is None else results / ready_rel, fixture)
+
+    def test_ready_archive_behind_empty_live_is_a_delivery(self):
+        results = self._results("archive-plus-empty-live")
+        self.assertTrue(has_ready_result(results, F))
+        self.assertEqual(find_ready_result(results, TASK), results / "archive" / "2026-09" / F)
+
+    def test_ready_archive_behind_whitespace_live_is_a_delivery(self):
+        results = self._results("archive-plus-whitespace-live")
+        self.assertTrue(has_ready_result(results, F))
+        self.assertEqual(find_ready_result(results, TASK), results / "archive" / F)
+
+    def test_epoch_rearchive_behind_empty_live_is_a_delivery(self):
+        results = self._results("retention-epoch-plus-empty-live")
+        self.assertTrue(has_ready_result(results, F))
+
+    def test_a_ready_live_result_wins_over_a_stale_archive(self):
+        results = self._results("live-plus-stale-archive")
+        self.assertEqual(find_ready_result(results, TASK), results / F)
+
+    def test_placeholders_everywhere_are_still_not_a_delivery(self):
+        for fixture in ("empty-live-only", "whitespace-live-only",
+                        "empty-live-plus-empty-archive", "empty-live-plus-whitespace-retention"):
+            with self.subTest(fixture=fixture):
+                self.assertFalse(has_ready_result(self._results(fixture), F))
+                self.assertIsNone(find_ready_result(self._results(fixture), TASK))
+
+    def test_decoys_never_rescue_an_empty_live_placeholder(self):
+        for fixture in ("empty-live-plus-decoy-suffix", "empty-live-plus-decoy-notes",
+                        "empty-live-plus-decoy-longer-id"):
+            with self.subTest(fixture=fixture):
+                self.assertFalse(has_ready_result(self._results(fixture), F))
+
+    def test_the_walk_reads_every_candidate_until_one_is_ready(self):
+        # Two placeholders precede the ready flat epoch archive; the injected reader
+        # records the walk, so a first-hit shortcut would show as a one-element list.
+        results = self._results("flat-epoch-behind-empty-live-and-empty-month")
+        seen = []
+
+        def reader(path):
+            seen.append(path)
+            return path.read_text().strip() or None
+
+        found = find_ready_result(results, TASK, reader=reader)
+        self.assertEqual(found, results / "archive" / f"{TASK}-1700000000.txt")
+        self.assertEqual(seen, [results / F, results / "archive" / "2026-09" / F, found])
+
+    def test_a_reader_that_accepts_nothing_yields_none_after_the_full_walk(self):
+        results = self._results("archive-plus-empty-live")
+        seen = []
+        self.assertIsNone(find_ready_result(results, TASK, reader=lambda p: seen.append(p)))
+        self.assertEqual(len(seen), 2)
+
+    def test_traversal_id_yields_no_candidates(self):
+        results = self._results("archive-plus-empty-live")
+        self.assertIsNone(find_ready_result(results, "../" + TASK))
+
+
 class WatcherParityTest(unittest.TestCase):
-    """`handler_result_exists` in watch-tasks-stream.sh embeds its own Python.
-    Run THAT text on every fixture and require the same verdict — one contract,
-    two callers, one truth, checked against the shipped source."""
+    """`handler_result_exists` in watch-tasks-stream.sh is bash. Run THAT
+    function — its shipped text, with the watcher's own variables bound — on
+    every fixture, single-state and mixed, and require the same verdict as
+    `has_ready_result`: one contract, two callers, one truth."""
 
     @classmethod
     def setUpClass(cls):
         text = WATCHER.read_text()
-        m = re.search(
-            r"handler_result_exists\(\) \{.*?<<'PYEOF'[^\n]*\n(.*?)\nPYEOF", text, re.S)
-        assert m, "handler_result_exists heredoc not found in watch-tasks-stream.sh"
-        cls.embedded = m.group(1)
+        m = re.search(r"\nhandler_result_exists\(\) \{\n(.*?)\n\}\n", text, re.S)
+        assert m, "handler_result_exists() not found in watch-tasks-stream.sh"
+        cls.function = m.group(0).strip("\n")
 
     def _watcher_verdict(self, results: Path) -> bool:
-        proc = subprocess.run(
-            [sys.executable, "-", str(REPO), str(results), TASK],
-            input=self.embedded, capture_output=True, text=True, timeout=30)
+        script = "\n".join([
+            f"SUTANDO_PY_BIN={shlex.quote(sys.executable)}",
+            f"__REPO_ROOT={shlex.quote(str(REPO))}",
+            f"RESULTS_DIR={shlex.quote(str(results))}",
+            self.function,
+            f"handler_result_exists {shlex.quote(F)}",
+        ])
+        proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=30)
         self.assertIn(proc.returncode, (0, 1), proc.stderr)
         return proc.returncode == 0
 
@@ -162,6 +291,25 @@ class WatcherParityTest(unittest.TestCase):
                         _write(results / spec[0], spec[1])
                     self.assertEqual(
                         has_ready_result(results, F), self._watcher_verdict(results), fixture)
+
+    def test_same_verdict_on_every_mixed_fixture(self):
+        for fixture, (entries, expected, _) in MIXED_FIXTURES.items():
+            with self.subTest(fixture=fixture):
+                with tempfile.TemporaryDirectory() as td:
+                    results = Path(td) / "results"
+                    results.mkdir()
+                    _populate(results, entries)
+                    watcher = self._watcher_verdict(results)
+                    self.assertEqual(has_ready_result(results, F), watcher, fixture)
+                    self.assertEqual(watcher, expected, fixture)
+
+    def test_the_watcher_delegates_rather_than_looking_up_itself(self):
+        # The shipped function must reach the shared owner; a private
+        # find_result-then-read pair is the first-hit shape being retired.
+        self.assertIn("src/delivery/task_dispatch.py", self.function)
+        self.assertIn("has-result", self.function)
+        self.assertNotIn("find_result", self.function)
+        self.assertNotIn("read_ready_result", self.function)
 
 
 class PendingCandidatesTest(unittest.TestCase):
@@ -193,6 +341,34 @@ class PendingCandidatesTest(unittest.TestCase):
         self._write_task("task-a.txt")
         _write(self.results_dir / "archive-2026-07-26" / "task-a-1784690000.txt")
         self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir))
+
+    def test_ready_archive_behind_empty_live_placeholder_suppresses_the_task(self):
+        # Regression 4: the placeholder was the first hit and the task requeued.
+        self._write_task("task-a.txt")
+        self._write_task("task-b.txt")
+        _write(self.results_dir / "archive" / "2026-09" / "task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-b.txt"])
+        self.assertEqual(next_pending_task(self.tasks_dir, self.results_dir), "task-b.txt")
+
+    def test_ready_archive_behind_whitespace_live_placeholder_suppresses_the_task(self):
+        self._write_task("task-a.txt")
+        _write(self.results_dir / "archive" / "task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("   \n\n")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+        self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir))
+
+    def test_epoch_rearchive_behind_empty_live_placeholder_suppresses_the_task(self):
+        self._write_task("task-a.txt")
+        _write(self.results_dir / "archive-2026-07-26" / "task-a-1784690000.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir))
+
+    def test_empty_live_placeholder_alone_keeps_the_task_pending(self):
+        self._write_task("task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        _write(self.results_dir / "archive" / "task-a.txt", "")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-a.txt"])
 
     def test_urgent_beats_normal(self):
         self._write_task("task-normal.txt", priority="normal")
@@ -276,6 +452,24 @@ class MainDispatchTest(unittest.TestCase):
         (self.results_dir / "task-a.txt").write_text("done\n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-a.txt")[0], 0)
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
+
+    def test_has_result_sees_a_ready_archive_behind_an_empty_live_placeholder(self):
+        # The `has-result` exit code is what every bash caller reads.
+        _write(self.results_dir / "archive" / "2026-09" / "task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        self.assertEqual(self._run("has-result", str(self.results_dir), "task-a.txt")[0], 0)
+        (self.results_dir / "task-b.txt").write_text("   \n")
+        self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
+
+    def test_pending_candidates_omits_a_task_whose_ready_result_is_archived_behind_a_placeholder(self):
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        (self.tasks_dir / "task-b.txt").write_text("task: y\n")
+        _write(self.results_dir / "archive" / "task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        rc, out, _ = self._run("pending-candidates", str(self.tasks_dir), str(self.results_dir))
+        self.assertEqual((rc, out), (0, "task-b.txt\n"))
+        rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir))
+        self.assertEqual((rc, out), (0, "task-b.txt\n"))
 
     def test_has_result_rejects_trailing_args(self):
         rc, _, err = self._run("has-result", str(self.results_dir), "task-a.txt", "--claims-dir", "x")

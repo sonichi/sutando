@@ -352,18 +352,11 @@ handler_result_is_answer() {
 }
 
 handler_result_exists() {
-  # Readiness is delivery/readiness's contract (rejects whitespace-only too) and the
-  # live-then-archive lookup is local_task_protocol's; this must not re-decide either.
-  local filename="$1" task_id="${filename%.txt}"
+  # Completion is delivery/task_dispatch's contract (every archive layout, walked past
+  # empty placeholders to a READY body); a first-hit lookup here would re-decide it.
+  local filename="$1"
   [ -n "$SUTANDO_PY_BIN" ] || return 1
-  "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
-import pathlib, sys
-sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
-from local_task_protocol import find_result
-from delivery.readiness import read_ready_result
-found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
-raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
-PYEOF
+  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$filename" 2>/dev/null
 }
 
 drain_dispatch_queue() {

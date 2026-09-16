@@ -810,6 +810,55 @@ exit 0
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
 
+    def test_notifier_does_not_replay_task_with_archived_result_behind_empty_live_placeholder(self):
+        # The placeholder is the first path that exists; the delivered body is archived.
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive" / "2026-07"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done.txt").write_text("already delivered\n")
+        (workspace / "results" / "task-done.txt").write_text("")
+        # The core session reports alive, so a replay would reach send-keys;
+        # the default stub answers has-session with exit 1 and would hide one.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
+    def test_notifier_does_not_replay_task_with_archived_result_behind_whitespace_live_placeholder(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        (workspace / "results" / "task-done.txt").write_text("   \n\n")
+        # The core session reports alive, so a replay would reach send-keys;
+        # the default stub answers has-session with exit 1 and would hide one.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
     def test_notifier_does_not_replay_task_with_gateway_archived_result(self):
         workspace = self.root / "workspace"
         (workspace / "tasks").mkdir(exist_ok=True)

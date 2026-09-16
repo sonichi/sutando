@@ -10,13 +10,16 @@ them, and the copies were wrong the same way: `[ -f results/<f> ]` read an
 empty placeholder as delivered, and `find -name "<stem>-[0-9]*.txt"` took
 another task's `task-x-1-other.txt` for `task-x`'s epoch archive.
 
-This module is the one owner (CLAUDE.md "Shared adapter policy"). It decides
-nothing itself: completion is `local_task_protocol.find_result` (every archive
-layout, all-digits epoch suffix) plus `delivery.readiness.read_ready_result`
-(whitespace-only is not ready) — the same pair `watch-tasks-stream.sh`'s
-`handler_result_exists` calls — and order is `task_priority`. Runtime-specific
-holds stay in the calling bash: the optional-handler probe and the fallback
-receipt it is gated on (both need `--runtime`), and the receipt cleanup.
+This module is the one owner (CLAUDE.md "Shared adapter policy"). Completion
+is `find_ready_result`: `local_task_protocol.iter_result_candidates` (every
+archive layout, all-digits epoch suffix, live first) walked with
+`delivery.readiness.read_ready_result` (whitespace-only is not ready) until a
+candidate is READY — an existing empty live placeholder must not hide a ready
+archived body. `watch-tasks-stream.sh`'s `handler_result_exists` and every
+notifier call it through `has-result`; order is `task_priority`.
+Runtime-specific holds stay in the calling bash: the optional-handler probe and
+the fallback receipt it is gated on (both need `--runtime`), and the receipt
+cleanup.
 
 CLI, for bash callers with only an interpreter path:
 
@@ -34,23 +37,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import find_result  # noqa: E402
+from local_task_protocol import iter_result_candidates  # noqa: E402
 
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
-__all__ = ["has_ready_result", "pending_candidates", "next_pending_task"]
+__all__ = ["find_ready_result", "has_ready_result", "pending_candidates", "next_pending_task"]
+
+
+def find_ready_result(results_dir: "Path | str", task_id: str, *,
+                      reader=read_ready_result) -> "Path | None":
+    """First result file for `task_id` whose body `reader` accepts, or None.
+
+    Candidates come from `iter_result_candidates` (traversal ids yield none) in
+    its precedence, and EVERY one is read until a body is ready: a live
+    `results/<id>.txt` can exist empty while the delivered answer sits in an
+    archive, and stopping at the first existing path reads that completed task
+    as pending. `reader` is the readiness contract, injected so a test can pin
+    the walk without re-stating what "ready" means.
+    """
+    for candidate in iter_result_candidates(Path(results_dir), task_id):
+        if reader(candidate) is not None:
+            return candidate
+    return None
 
 
 def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
-    `find_result` rejects traversal ids and returns None; a found file must
-    still pass `read_ready_result`, so an empty or whitespace-only file — live
-    or archived — is not a delivery.
+    An empty or whitespace-only file — live or archived — is not a delivery and
+    does not stop the search; `find_ready_result` walks past it.
     """
     task_id = filename[:-4] if filename.endswith(".txt") else filename
-    found = find_result(Path(results_dir), task_id)
-    return found is not None and read_ready_result(found) is not None
+    return find_ready_result(results_dir, task_id) is not None
 
 
 def pending_candidates(
