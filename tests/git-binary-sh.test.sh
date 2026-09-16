@@ -112,10 +112,23 @@ grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
   bad "check-pending-tasks.sh sources git-binary.sh" "source line missing"
 
 # --- 10. the discovered stub candidate is NEVER executed to decide dev-tools -
-# Can't witness this behaviorally (it would raise the real CLT dialog); split
-# on ; && || like the shell would, so "$_stub" as a command (not [ ] or printf) is caught.
-if sed -E 's/(&&|\|\||;)/\n/g' "$REPO/scripts/git-binary.sh" | grep -qE '^[[:space:]]*"?\$_stub"?[[:space:]]+[^]]'; then
-  bad "the stub candidate is never executed to decide" "found \$_stub used as a command, not just tested/printed"
+# BEHAVIORAL, not a source-text regex (REVIEW.md #14: a regex on $_stub misses
+# execution through $_cand, `command "$_stub"`, or `( "$_stub" ... )`). Override
+# the classifier so a REAL RECORDING script can be classified as the stub without
+# needing to resolve to the real /usr/bin/git -- decoupling "is-stub" from
+# "would-raise-the-real-dialog" is what makes this witnessable at all.
+lab10=$(mktemp -d)
+mkdir -p "$lab10/bin"
+printf '#!/bin/sh\necho "RAN $*" >> %s/ran.log\nexit 1\n' "$lab10" > "$lab10/bin/git"
+chmod +x "$lab10/bin/git"
+printf '#!/bin/sh\nexit 2\n' > "$lab10/xcode-select"; chmod +x "$lab10/xcode-select"
+OSTYPE=darwin25 PATH="$lab10/bin:$lab10:$PATH" /bin/bash -c "
+  . '$REPO/scripts/git-binary.sh'
+  _sutando_git_is_system_stub() { return 0; }
+  resolve_git
+" >/dev/null
+if [ -f "$lab10/ran.log" ]; then
+  bad "the stub candidate is never executed to decide" "$(cat "$lab10/ran.log")"
 else
   ok "the stub candidate is never executed to decide"
 fi

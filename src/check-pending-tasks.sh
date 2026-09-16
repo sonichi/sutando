@@ -132,9 +132,12 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
       # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
       # consumer uses; a local re-implementation drifts from what will actually be sent.
-      # No interpreter to judge readiness with -- never run "$PYBIN" empty; the
-      # file's mere presence is the pre-fix signal, not a manufactured "EMPTY" verdict.
+      # No interpreter to ask readiness.py -- existence is not readiness (its own
+      # contract), so this stays UNPROCESSED rather than silently read as done.
       if [ -z "$PYBIN" ]; then
+        UNPROCESSED+="--- $TASK_ID.txt (readiness unknown — no interpreter to check) ---
+
+"
         continue
       fi
       if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$TASK_ID.txt" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then
@@ -162,9 +165,12 @@ else
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
       # consumer uses; a local re-implementation drifts from what will actually be sent.
-      # No interpreter to judge readiness with -- never run "$PYBIN" empty; the
-      # file's mere presence is the pre-fix signal, not a manufactured "EMPTY" verdict.
+      # No interpreter to ask readiness.py -- existence is not readiness (its own
+      # contract), so this stays UNPROCESSED rather than silently read as done.
       if [ -z "$PYBIN" ]; then
+        UNPROCESSED+="--- $BASENAME (readiness unknown — no interpreter to check) ---
+
+"
         continue
       fi
       if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$BASENAME" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then
@@ -208,8 +214,8 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
-# An empty PYBIN must never reach "$PYBIN" here -- that ran as an empty command
-# before, hidden by 2>/dev/null, and relied on rc=127 happening to not be 1.
+# An empty PYBIN must never reach "$PYBIN" as a command -- fail open explicitly
+# rather than lean on an empty command's exit code happening not to equal 1.
 if [ -z "$PYBIN" ]; then
   echo '{}'
   exit 0
