@@ -211,8 +211,18 @@ else
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
 
-# 6b. THE READINESS-CHECK GAP. A TRULY result-only queue must reach the
-# turn-ledger gate, not stop earlier -- both PYBIN call sites must guard.
+# BEHAVIORAL, not source text (a regex passes on a dead/commented guard) --
+# `bash -x` traces an empty PYBIN as one-or-more `+` (a command substitution nests one deeper).
+EMPTY_EXEC_RE="^\+{1,} '' "
+# POSITIVE CONTROL -- a detector never observed matching is unvalidated.
+if ! printf "++ '' /tmp/turn_ledger.py --workspace /tmp stop-gate\n" | grep -qE "$EMPTY_EXEC_RE"; then
+  bad "the empty-command detector regex matches a known-positive nested trace line" "no match"
+else
+  ok "the empty-command detector regex matches a known-positive nested trace line"
+fi
+
+# 6b. THE READINESS-CHECK GAP (first PYBIN site) -- a task WITH a result exits
+# earlier and never reaches the turn-ledger site, isolating this site from that one.
 rm -f "$REJ/workspace/tasks/$PROBE"
 RESULT_PROBE="task-zz-hooktest-readiness-$$.txt"
 printf 'id: probe\ntask: readiness-gap-probe\n' > "$REJ/workspace/tasks/$RESULT_PROBE"
@@ -228,16 +238,30 @@ case "$RG_OUT" in
   '{}') ok "a truly result-only queue with no interpreter still emits valid JSON" ;;
   *) bad "a truly result-only queue with no interpreter still emits valid JSON" "got: ${RG_OUT:0:120}" ;;
 esac
-# BEHAVIORAL, not source text (a regex passes on a dead/commented guard) --
-# `bash -x` traces the actual command; an empty PYBIN execs as `+ '' ...`.
-(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace.log"
-if grep -qE "^\+ '' " "$REJ/xtrace.log"; then
-  bad "neither PYBIN call site ever execs an empty command" \
-    "$(grep -E "^\+ '' " "$REJ/xtrace.log" | head -1)"
+(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" PS4='+ ' bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace-site1.log"
+if grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site1.log"; then
+  bad "readiness-check site (result-present queue) never execs an empty command" \
+    "$(grep -E "$EMPTY_EXEC_RE" "$REJ/xtrace-site1.log" | head -1)"
 else
-  ok "neither PYBIN call site ever execs an empty command"
+  ok "readiness-check site (result-present queue) never execs an empty command"
 fi
-rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE" "$REJ/xtrace.log"
+rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE" "$REJ/xtrace-site1.log"
+
+# 6b2. THE TURN-LEDGER SITE (second PYBIN site) -- only a queue with ZERO
+# task files reaches it; any task (with or without a result) exits earlier.
+TG_OUT="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
+case "$TG_OUT" in
+  '{}') ok "an empty queue with no interpreter still emits valid JSON" ;;
+  *) bad "an empty queue with no interpreter still emits valid JSON" "got: ${TG_OUT:0:120}" ;;
+esac
+(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" PS4='+ ' bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace-site2.log"
+if grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site2.log"; then
+  bad "turn-ledger site (empty queue) never execs an empty command" \
+    "$(grep -E "$EMPTY_EXEC_RE" "$REJ/xtrace-site2.log" | head -1)"
+else
+  ok "turn-ledger site (empty queue) never execs an empty command"
+fi
+rm -f "$REJ/xtrace-site2.log"
 
 # 6c. EXISTENCE IS NOT READINESS (delivery/readiness.py's own contract) -- a
 # GENUINELY EMPTY result file, with no interpreter to check it, must NOT be
