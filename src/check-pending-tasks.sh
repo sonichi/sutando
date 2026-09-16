@@ -12,7 +12,23 @@
 # Resolve through the same helper every other service uses, so a configured
 # workspace (sutando.config.local.json) is honored rather than assumed.
 
+# This hook is wired into every Claude Code session with this repo as an
+# ancestor, including sessions whose actual cwd is a worktree of an unrelated
+# repo (e.g. a skill-repo fix branch) that merely inherited this CLAUDE.md.
+# Those sessions are guests, not the core (CLAUDE.md "Chat-path task tracking"
+# guest carve-out) — the core's own task/result queue is not theirs to clear,
+# so the gate must not hold their Stop hostage to it.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+CWD_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
+REPO_COMMON_DIR="$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>/dev/null)"
+if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ]; then
+  CWD_COMMON_ABS="$(cd "$(dirname "$CWD_COMMON_DIR")" && pwd)/$(basename "$CWD_COMMON_DIR")"
+  REPO_COMMON_ABS="$(cd "$(dirname "$REPO_COMMON_DIR")" && pwd)/$(basename "$REPO_COMMON_DIR")"
+  if [ "$CWD_COMMON_ABS" != "$REPO_COMMON_ABS" ]; then
+    echo '{}'
+    exit 0
+  fi
+fi
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently
