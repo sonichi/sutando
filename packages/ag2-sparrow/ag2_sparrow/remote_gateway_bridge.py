@@ -1740,8 +1740,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total.
-                "room_members", "room_member_count",
+                # a capped one-line mxid list + the true joined total, and the
+                # broker's own dm|room verdict so a skill need not count members.
+                "room_members", "room_member_count", "channel_kind",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).

@@ -12,6 +12,12 @@ resume their request once the apps are connected.
                                     message E, instead of in the room; --switch waits for the apps
                                     to be signed in with another account (a connection that was not
                                     active when the wait was made)
+  card <slug...> --room R --reply-to E --task T (--owner O | --owner-from-task)
+        (--request TEXT | --request-file PATH|-) [--private] [--line TEXT ...] [--switch]
+                                    the one-shot form of status + await for an app that is not
+                                    connected: catalog check, one connections read, one account
+                                    read, then the wait; prints "mode" (dm | private) and, for dm,
+                                    the exact room.message.send payload ("message") to post
   note <wait-id> TEXT               add a line to the wait's private card
   claim <room> [--force]            claim the room's pending waits whose apps are connected, each
                                     with whether its AG2 Cloud account checks out
@@ -52,6 +58,14 @@ arm time and before any card exists, the ids of the app's active connections
 connection that is not one of those. An owner who says "done" before switching
 is told it is not switched yet, never answered with the old account. A switch
 wait is never merged with a plain one: each kind's resume says something else.
+
+`<workspace>/state/connect-cache.json` keeps the last connections read and the
+last catalog lookups for CACHE_TTL_S. Only the read commands (`find`, `status`,
+`card`) and the connect-apps precheck hook read it: a card drawn from a
+30-second-old view is right often enough, and it saves a round trip per turn.
+`claim`, `verify-account`, the waiter and the `--switch` baseline never do:
+each of those decides whether an owner's request runs against an account, so
+each reads the cloud itself.
 """
 
 from __future__ import annotations
@@ -61,11 +75,13 @@ import contextlib
 import fcntl
 import functools
 import json
+import math
 import os
 import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -117,6 +133,13 @@ CARD_PRUNE_S = 86400
 # claimed_by -> the card's status. `invalid` leaves the card as it was: there is no wait to describe.
 CARD_STATUS = {"connected": "connected", "timeout": "timeout", "user_changed": "user_changed",
                "unverified": "unverified", "claim": "claimed", "superseded": "superseded", "expired": "expired"}
+# The read cache: connections and catalog lookups this old are served from disk (see the module doc).
+CACHE_NAME = "connect-cache.json"
+CACHE_TTL_S = 30.0
+CACHE_MAX_QUERIES = 50
+# Commands that may read the cache; every other command reads the cloud itself.
+CACHED_COMMANDS = frozenset(("find", "status", "card"))
+INTEGRATIONS_HINT = "open Settings → Integrations"
 
 
 class Setup(Exception):
@@ -127,12 +150,101 @@ class Setup(Exception):
         self.code = code
 
 
+# --------------------------------------------------------------------------- read cache
+
+
+def cache_path(ws: Path) -> Path:
+    return ws / "state" / CACHE_NAME
+
+
+def _finite(x: Any) -> float | None:
+    """A timestamp out of a mutable state file, or None: never arithmetic on a raw value."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def cache_fresh(entry: Any, now: float, ttl: float = CACHE_TTL_S) -> bool:
+    """Within ttl, and not more than ttl in the future: a skewed clock must not freeze a stale view."""
+    ts = _finite(entry.get("value_ts")) if isinstance(entry, dict) else None
+    if ts is None:
+        return False
+    age = now - ts
+    return -ttl <= age < ttl
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """A unique staging name per writer: two processes may cache at once, and a shared `.tmp`
+    would let one publish the other's half-written bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+class ConnectCache:
+    """The on-disk read cache. Reads of a torn or foreign file are misses; a failed write is lost,
+    never an error: the cloud answer already in hand is what the caller uses."""
+
+    def __init__(self, ws: Path, now: Callable[[], float] = time.time, ttl: float = CACHE_TTL_S) -> None:
+        self.path = cache_path(ws)
+        self.now = now
+        self.ttl = ttl
+
+    def _load(self) -> dict:
+        data = _read_json(self.path)
+        return data if isinstance(data, dict) and data.get("version") == 1 else {"version": 1}
+
+    def _store(self, data: dict) -> None:
+        try:
+            _write_json_atomic(self.path, data)
+        except OSError as exc:
+            print(f"connect-apps: read cache not written: {exc}", file=sys.stderr)
+
+    def connections(self) -> list | None:
+        entry = self._load().get("connectors")
+        if not cache_fresh(entry, self.now(), self.ttl) or not isinstance(entry.get("connections"), list):
+            return None
+        return entry["connections"]
+
+    def put_connections(self, rows: list) -> None:
+        data = self._load()
+        # `active` is the derived view the precheck hook reads, so it never re-derives the status rule.
+        data["connectors"] = {"value_ts": self.now(), "connections": rows, "active": sorted(active_by_toolkit(rows))}
+        self._store(data)
+
+    def catalog(self, query: str) -> list | None:
+        entry = (self._load().get("catalog") or {}).get(query)
+        if not cache_fresh(entry, self.now(), self.ttl) or not isinstance(entry.get("items"), list):
+            return None
+        return entry["items"]
+
+    def put_catalog(self, query: str, items: list) -> None:
+        data = self._load()
+        catalog = data.get("catalog") if isinstance(data.get("catalog"), dict) else {}
+        catalog[query] = {"value_ts": self.now(), "items": items}
+        if len(catalog) > CACHE_MAX_QUERIES:
+            by_age = sorted(catalog, key=lambda q: _finite(catalog[q].get("value_ts")) or 0 if isinstance(catalog[q], dict) else 0)
+            for q in by_age[: len(catalog) - CACHE_MAX_QUERIES]:
+                catalog.pop(q, None)
+        data["catalog"] = catalog
+        self._store(data)
+
+
 # --------------------------------------------------------------------------- cloud
 
 
 class Cloud:
     """The owner's cloud session. Auth is re-read while missing, so a waiter
-    started before a sign-in picks the session up once it exists."""
+    started before a sign-in picks the session up once it exists.
+
+    `cache` is attached by main() for CACHED_COMMANDS only, and a read goes through it only
+    when the caller says `cached=True`: both must hold, so a decision path cannot be served a
+    stale view by accident."""
 
     def __init__(
         self,
@@ -145,6 +257,7 @@ class Cloud:
         self._request = request
         self.base: str | None = None
         self.token: str | None = None
+        self.cache: ConnectCache | None = None
 
     def signed_in(self) -> bool:
         if not self.token:
@@ -170,20 +283,40 @@ class Cloud:
         self.token = None
         return str(self.get("/api/me").get("id") or "") or None
 
+    def connection_rows(self, *, cached: bool = False) -> list:
+        """The owner's connection rows. cached=True serves a fresh cache entry and fills the cache
+        after a cloud read; the default never touches the cache file."""
+        if cached and self.cache is not None:
+            rows = self.cache.connections()
+            if rows is not None:
+                return rows
+        rows = self.get("/api/connectors").get("connections") or []
+        if cached and self.cache is not None:
+            self.cache.put_connections(rows)
+        return rows
+
     def active_connections(self) -> dict[str, set[str]]:
-        """Lowercased toolkit -> the ids of its active connections, from one read. A toolkit whose
-        active rows carry no id still appears, with no ids."""
-        return active_by_toolkit(self.get("/api/connectors").get("connections") or [])
+        """Lowercased toolkit -> the ids of its active connections, from one uncached read (the
+        waiter, `claim` and the `--switch` baseline decide on it). A toolkit whose active rows
+        carry no id still appears, with no ids."""
+        return active_by_toolkit(self.connection_rows())
 
     def active_toolkits(self) -> set[str]:
         return set(self.active_connections())
 
-    def connector_search(self, query: str) -> list[dict]:
+    def connector_search(self, query: str, *, cached: bool = False) -> list[dict]:
+        if cached and self.cache is not None:
+            items = self.cache.catalog(query)
+            if items is not None:
+                return items
         # q is a substring filter over slug, name and description, so a slug needs a wide page.
         data = self.get(f"/api/station/catalog?kind=connector&limit=100&q={urllib.parse.quote(query)}")
         if not (data.get("enabledKinds") or {}).get("connector", True):
             raise Setup("connectors_disabled", "Connected apps are not enabled on this AG2 Cloud.")
-        return [i for i in data.get("items") or [] if isinstance(i, dict)]
+        items = [i for i in data.get("items") or [] if isinstance(i, dict)]
+        if cached and self.cache is not None:
+            self.cache.put_catalog(query, items)
+        return items
 
 
 def active_by_toolkit(rows: Any) -> dict[str, set[str]]:
@@ -864,7 +997,7 @@ def emit(payload: dict) -> None:
 
 def cmd_find(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
     query = " ".join(args.query).strip()
-    items = cloud.connector_search(query)
+    items = cloud.connector_search(query, cached=True)
     match = exact_app(items, query)
     suggestions = [app_row(i) for i in items if i is not match][:5]
     emit({"match": app_row(match) if match else None, "suggestions": suggestions})
@@ -874,7 +1007,7 @@ def cmd_find(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
 def cmd_status(
     ws: Path, cloud: Cloud, args: argparse.Namespace, now: Callable[[], float] = time.time, **_: Any
 ) -> int:
-    rows = cloud.get("/api/connectors").get("connections") or []
+    rows = cloud.connection_rows(cached=True)
     connections = [
         {"id": r.get("id"), "toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status"),
          "accountLabel": r.get("accountLabel")}
@@ -941,6 +1074,50 @@ def account_for_wait(cloud: Cloud, sleep: Callable[[float], None]) -> str | None
     return found
 
 
+def wait_args(args: argparse.Namespace) -> dict:
+    """The validated common arguments of `await` and `card`; owner is None for --owner-from-task."""
+    slugs = list(dict.fromkeys(s.strip().lower() for s in args.slugs))
+    if not 1 <= len(slugs) <= MAX_TOOLKITS or not all(SLUG_RE.match(s) for s in slugs):
+        raise Setup("invalid_arguments", f"give 1-{MAX_TOOLKITS} app slugs (a-z, 0-9, _)")
+    room = _require(args.room, ROOM_RE, "--room")
+    owner = None if getattr(args, "owner_from_task", False) else _require(args.owner, MXID_RE, "--owner")
+    reply_to = _require(args.reply_to, TOKEN_RE, "--reply-to")
+    task = (args.task or "").strip()
+    if not ltp.valid_archive_lookup_id(task):
+        raise Setup("invalid_arguments", f"--task is missing or malformed: {task[:80]!r}")
+    request = header_safe_value(read_request(args)).strip()[:MAX_REQUEST_CHARS]
+    if not request:
+        raise Setup("invalid_arguments", "--request is empty")
+    lines = [" ".join(x.split()) for x in (args.line or []) if x.strip()]
+    if len(lines) > MAX_AWAIT_LINES:
+        raise Setup("invalid_arguments", f"give at most {MAX_AWAIT_LINES} --line")
+    return {"slugs": slugs, "room": room, "owner": owner, "reply_to": reply_to, "task": task,
+            "request": request, "private": bool(args.private), "switch": bool(args.switch), "lines": lines}
+
+
+def resolve_toolkits(cloud: Cloud, slugs: list[str], *, cached: bool = False) -> list[dict]:
+    """[{slug, name}] for each slug from the catalog; unknown_app / coming_soon otherwise."""
+    toolkits = []
+    for slug in slugs:
+        items = cloud.connector_search(slug, cached=True) if cached else cloud.connector_search(slug)
+        item = next((i for i in items if i.get("slug") == slug), None)
+        if item is None:
+            raise Setup("unknown_app", f"No app with the slug {slug!r} in the catalog.")
+        if item.get("comingSoon"):
+            raise Setup("coming_soon", f"{item.get('name') or slug} is not available yet.")
+        toolkits.append({"slug": slug, "name": item.get("name") or slug})
+    return toolkits
+
+
+def read_baseline(cloud: Cloud) -> dict[str, set[str]]:
+    """Which connections are active before a switch card exists: only a sign-in after this counts
+    as the switch. Always an uncached read: an empty or stale baseline would take the old account."""
+    try:
+        return cloud.active_connections()
+    except (cloud_auth.CloudError, Setup, OSError, ValueError) as exc:
+        raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
+
+
 def cmd_await(
     ws: Path,
     cloud: Cloud,
@@ -950,30 +1127,35 @@ def cmd_await(
     sleep: Callable[[float], None] = time.sleep,
     **_: Any,
 ) -> int:
-    slugs = list(dict.fromkeys(s.strip().lower() for s in args.slugs))
-    if not 1 <= len(slugs) <= MAX_TOOLKITS or not all(SLUG_RE.match(s) for s in slugs):
-        raise Setup("invalid_arguments", f"give 1-{MAX_TOOLKITS} app slugs (a-z, 0-9, _)")
-    room = _require(args.room, ROOM_RE, "--room")
-    owner = _require(args.owner, MXID_RE, "--owner")
-    reply_to = _require(args.reply_to, TOKEN_RE, "--reply-to")
-    task = (args.task or "").strip()
-    if not ltp.valid_archive_lookup_id(task):
-        raise Setup("invalid_arguments", f"--task is missing or malformed: {task[:80]!r}")
-    request = header_safe_value(read_request(args)).strip()[:MAX_REQUEST_CHARS]
-    if not request:
-        raise Setup("invalid_arguments", "--request is empty")
-    private = bool(args.private)
-    switch = bool(args.switch)
-    lines = [x for x in (args.line or []) if x.strip()]
-    if lines and not private:
+    a = wait_args(args)
+    if a["lines"] and not a["private"]:
         raise Setup("invalid_arguments", "--line only goes on a --private card; in the owner's DM, send the lines as messages")
-    if len(lines) > MAX_AWAIT_LINES:
-        raise Setup("invalid_arguments", f"give at most {MAX_AWAIT_LINES} --line")
-    if origin_owner(ws, task) != owner:
-        raise Setup("not_owner_task", f"--owner is not the user of {task}.")
+    if origin_owner(ws, a["task"]) != a["owner"]:
+        raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
     cloud_user_id = account_for_wait(cloud, sleep)
+    payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda slugs: resolve_toolkits(cloud, slugs),
+                       baseline=lambda: read_baseline(cloud), spawn=spawn, now=now)
+    emit(payload)
+    return EXIT_OK
+
+
+def arm_wait(
+    ws: Path,
+    a: dict,
+    cloud_user_id: str | None,
+    *,
+    toolkits: Callable[[list[str]], list[dict]],
+    baseline: Callable[[], dict[str, set[str]]],
+    spawn: Callable[[Path, str], int],
+    now: Callable[[], float],
+) -> dict:
+    """Record the wait (or reuse / merge / stand down) and return the payload `await` prints.
+    `toolkits` and `baseline` are read only when a new wait is written, after the reuse check;
+    `card` passes what it already fetched, `await` passes the cloud reads."""
+    slugs, room, task = a["slugs"], a["room"], a["task"]
+    private, switch, lines = a["private"], a["switch"], a["lines"]
 
     # This task's own waits in the room come first: always reused or merged, so it has one wait per room.
     same_room = sorted((m for m in list_markers(ws) if m.get("room") == room), key=lambda m: m.get("task") != task)
@@ -984,31 +1166,17 @@ def cmd_await(
             pid = None if waiter_alive(ws, marker["wait_id"]) else _try_spawn(spawn, ws, marker["wait_id"])
             if private and not any(c["id"] == marker["wait_id"] for c in read_cards(ws)):
                 put_card(ws, marker, lines, now(), mode="switch" if switch else None)
-            emit({**summary(marker), "reused": True, "waiter_pid": pid})
-            return EXIT_OK
+            return {**summary(marker), "reused": True, "waiter_pid": pid}
     combined = dict.fromkeys(slugs)
     for marker in same_task:
         combined.update(dict.fromkeys(str(x.get("slug")) for x in marker["toolkits"] if isinstance(x, dict)))
     if len(combined) > MAX_TOOLKITS:
         raise Setup("too_many_apps", f"{task} would wait for {len(combined)} apps; one card lists at most {MAX_TOOLKITS}.")
 
-    toolkits = []
-    for slug in slugs:
-        item = next((i for i in cloud.connector_search(slug) if i.get("slug") == slug), None)
-        if item is None:
-            raise Setup("unknown_app", f"No app with the slug {slug!r} in the catalog.")
-        if item.get("comingSoon"):
-            raise Setup("coming_soon", f"{item.get('name') or slug} is not available yet.")
-        toolkits.append({"slug": slug, "name": item.get("name") or slug})
-
-    baseline: dict[str, set[str]] = {}
-    if switch:
-        # Which connections are active before the card exists: only a sign-in after this counts as the
-        # switch. A failed read never records an empty baseline, which would take the old account.
-        try:
-            baseline = cloud.active_connections()
-        except (cloud_auth.CloudError, Setup, OSError, ValueError) as exc:
-            raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
+    toolkits = list(toolkits(slugs))
+    # The baseline is read before the card record exists (`put_card` below): a sign-in that lands
+    # right after the card is drawn must already count as the switch.
+    switch_baseline = baseline() if switch else {}
 
     t = now()
     # Another task's wait in this room is folded in only when it shares an app and was made under
@@ -1048,8 +1216,7 @@ def cmd_await(
     superseded = [w["wait_id"] for w in taken]
     answered = {str(x.get("slug")) for r in resumed for x in r.get("toolkits") or [] if isinstance(x, dict)}
     if own_handled or (resumed and not superseded and set(slugs) <= answered):
-        emit({"wait_id": None, "reused": False, "superseded": [], "resumed": resumed, "waiter_pid": None})
-        return EXIT_OK
+        return {"wait_id": None, "reused": False, "superseded": [], "resumed": resumed, "waiter_pid": None}
 
     wait_id = f"{int(t * 1000):013d}-{secrets.token_hex(4)}"
     marker = {
@@ -1057,14 +1224,14 @@ def cmd_await(
         "wait_id": wait_id,
         "toolkits": toolkits,
         "room": room,
-        "reply_to": reply_to,
-        "request": merge_requests(requests + [request]),
+        "reply_to": a["reply_to"],
+        "request": merge_requests(requests + [a["request"]]),
         "task": task,
-        "owner": owner,
+        "owner": a["owner"],
         "cloud_user_id": cloud_user_id if all(w.get("cloud_user_id") == cloud_user_id for w in taken) else None,
         "superseded": superseded,
         "private": private,
-        **({"switch": {k["slug"]: sorted(baseline.get(k["slug"], set())) for k in toolkits}} if switch else {}),
+        **({"switch": {k["slug"]: sorted(switch_baseline.get(k["slug"], set())) for k in toolkits}} if switch else {}),
         "created_at": now_iso(t),
         "deadline": int(t + WAIT_S),
         "deadline_at": now_iso(t + WAIT_S),
@@ -1081,8 +1248,88 @@ def cmd_await(
             release(ws, won)
         raise
     pid = _try_spawn(spawn, ws, wait_id)
-    emit({**summary(marker), "marker": str(path), "reused": False, "superseded": superseded,
-          "resumed": resumed, "waiter_pid": pid})
+    return {**summary(marker), "marker": str(path), "reused": False, "superseded": superseded,
+            "resumed": resumed, "waiter_pid": pid}
+
+
+def card_intro(names: list[str], switch: bool) -> str:
+    apps = join_names(names)
+    if switch:
+        return f"Tap Switch account to sign {apps} in with your other account."
+    return f"{apps} isn't connected yet, so I can't do that. Connect it here and I'll carry on."
+
+
+def card_outro(names: list[str], switch: bool) -> str:
+    apps = join_names(names)
+    if switch:
+        return f"Switch your {apps} account: tap Switch account on the card, or {INTEGRATIONS_HINT}."
+    return f"Connect {apps}: tap Connect on the card, or {INTEGRATIONS_HINT}."
+
+
+def card_message(wait: dict, owner: str, task: str, intro: str, switch: bool) -> dict:
+    """The one room.message.send payload for the owner's DM: the intro as the text above the card."""
+    toolkits = [x for x in wait.get("toolkits") or [] if isinstance(x, dict)]
+    names = [str(x.get("name") or x.get("slug")) for x in toolkits]
+    connector = {"version": 1, "for": owner, "toolkits": [{"slug": str(x["slug"])} for x in toolkits]}
+    if switch:
+        connector["mode"] = "switch"
+    return {
+        "body": f"{intro}\n\n{card_outro(names, switch)}",
+        "extra_content": {"space.ag2.connector": connector},
+        "reply_to": wait["reply_to"],
+        "operation_id": f"{task}:{'switch' if switch else 'connect'}-card",
+    }
+
+
+def cmd_card(
+    ws: Path,
+    cloud: Cloud,
+    args: argparse.Namespace,
+    spawn: Callable[[Path, str], int] = spawn_waiter,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    **_: Any,
+) -> int:
+    """status + await in one process: the catalog and connections reads may come from the cache;
+    the account read and a --switch baseline never do."""
+    a = wait_args(args)
+    task_owner = origin_owner(ws, a["task"])
+    if a["owner"] is None:
+        a["owner"] = task_owner
+    elif a["owner"] != task_owner:
+        raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
+    toolkits = resolve_toolkits(cloud, a["slugs"], cached=True)
+    names = [t["name"] for t in toolkits]
+    switch = a["switch"]
+    if switch:
+        # One fresh read serves both the baseline and the connected view: a cached view could
+        # miss the account the owner signed in with a moment ago, and take it as the switch.
+        baseline = read_baseline(cloud)
+        active = set(baseline)
+    else:
+        baseline = {}
+        active = set(active_by_toolkit(cloud.connection_rows(cached=True)))
+    apps = [{"toolkit": t["slug"], "name": t["name"], "connected": t["slug"] in active} for t in toolkits]
+    mode = "private" if a["private"] else "dm"
+    if not switch and all(x["connected"] for x in apps):
+        emit({"wait_id": None, "all_connected": True, "apps": apps, "mode": mode, "message": None,
+              "owner": a["owner"]})
+        return EXIT_OK
+    if not cloud.signed_in():
+        raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+    cloud_user_id = account_for_wait(cloud, sleep)
+    intro = a["lines"][0] if a["lines"] else card_intro(names, switch)
+    if a["private"]:
+        a["lines"] = a["lines"] or [intro, "Once that's done I'll carry on."]
+    else:
+        a["lines"] = []
+    payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda _slugs: toolkits,
+                       baseline=lambda: baseline, spawn=spawn, now=now)
+    message = None
+    if mode == "dm" and payload.get("wait_id"):
+        # Printed only now, once the marker exists: a card without a wait would never be answered.
+        message = card_message(payload, a["owner"], a["task"], intro, switch)
+    emit({**payload, "all_connected": False, "apps": apps, "mode": mode, "message": message})
     return EXIT_OK
 
 
@@ -1225,6 +1472,22 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--line", action="append", help="a line the private card shows above the apps (repeatable)")
     a.add_argument("--switch", action="store_true",
                    help="the apps are connected and the owner signs in with another account: wait for a new connection")
+    k = sub.add_parser("card")
+    k.add_argument("slugs", nargs="+")
+    k.add_argument("--room", required=True)
+    k.add_argument("--reply-to", required=True)
+    k.add_argument("--task", required=True)
+    who = k.add_mutually_exclusive_group(required=True)
+    who.add_argument("--owner")
+    who.add_argument("--owner-from-task", action="store_true", help="the owner is the task file's user_id")
+    kreq = k.add_mutually_exclusive_group(required=True)
+    kreq.add_argument("--request")
+    kreq.add_argument("--request-file", help="read the request from this file; - reads stdin")
+    k.add_argument("--private", action="store_true",
+                   help="asked from a room with other people: write the private card, print no message")
+    k.add_argument("--line", action="append",
+                   help="the intro (first line) and, for --private, the further card lines (repeatable)")
+    k.add_argument("--switch", action="store_true", help="a Switch account card instead of a Connect card")
     n = sub.add_parser("note")
     n.add_argument("wait_id")
     n.add_argument("text", nargs="+")
@@ -1240,7 +1503,7 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "claim": cmd_claim,
+COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "claim": cmd_claim,
             "verify-account": cmd_verify_account, "note": cmd_note}
 
 
@@ -1258,6 +1521,8 @@ def main(
         if args.cmd == "note":
             return cmd_note(ws, None, args)
         cloud = cloud or Cloud(ws)
+        # The cache exists only for the read commands; the waiter, claim and verify-account never see it.
+        cloud.cache = ConnectCache(ws) if args.cmd in CACHED_COMMANDS else None
         if args.cmd == "waiter":
             if not WAIT_ID_RE.match(args.wait_id):
                 raise Setup("invalid_arguments", f"not a wait id: {args.wait_id[:40]!r}")

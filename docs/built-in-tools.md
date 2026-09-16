@@ -266,17 +266,26 @@ is needed only when `install` prints `RESTART REQUIRED` (the running engine star
 Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
-Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec`. Connecting one is the
-`connect-apps` skill's job (a Connect card, private to the owner in a shared room, then an automatic
-resume); its helper:
+Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
+ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
+payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
+owner-only card and nothing is posted. Its helper:
 ```bash
 C=skills/connect-apps/scripts/connectors.py
-python3 "$C" find "google calendar"     # exact catalog app, connected or not
-python3 "$C" status googlecalendar      # connected? plus pending waits
+python3 "$C" find "google calendar"     # exact catalog app, connected or not (30s read cache)
+python3 "$C" status googlecalendar      # connected? plus pending waits (30s read cache)
+python3 "$C" card googlecalendar --room '<room>' --reply-to '<source_message_id>' --task '<task id>' \
+  --owner-from-task [--private] [--switch] --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
 python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
 ```
-The owner sees, switches and disconnects connected apps in AG2 Space → Settings → Integrations;
-`await <slug> --switch` arms a wait that resumes only once the app is signed in with a new account.
+The skill's precheck hook adds a `connect-apps precheck:` line on your first touch of a task naming an
+app: which apps it needs, which are connected (from the cache), and the room kind from the task's
+`channel_kind:` header. The owner sees, switches and disconnects connected apps in AG2 Space →
+Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
+app is signed in with a new account.
 
 **App launcher** — open any macOS app:
 ```bash
