@@ -364,5 +364,48 @@ class TestRosterRowTypes(Base):
             pr.validate_workers("not-a-map")
 
 
+class TestRequestedWorkerField(Base):
+    """One canonical field with a migration alias. A producer on the old name
+    keeps working and says so; two fields that disagree route neither."""
+
+    def resolve(self, task):
+        said = []
+        got = pr.requested_worker_of(task, warn=said.append)
+        return got, " ".join(said)
+
+    def test_canonical_alone(self):
+        self.assertEqual(self.resolve({"requested_worker": "mars"}), ("mars", ""))
+
+    def test_legacy_alone_maps_and_reports(self):
+        got, said = self.resolve({pr.LEGACY_WORKER_FIELD: "mars"})
+        self.assertEqual(got, "mars")
+        self.assertIn("DEPRECATED", said)
+
+    def test_both_agreeing_is_not_a_conflict(self):
+        got, said = self.resolve({"requested_worker": "mars", pr.LEGACY_WORKER_FIELD: "mars"})
+        self.assertEqual(got, "mars")
+        self.assertEqual(said, "", "agreement must not warn")
+
+    def test_disagreement_routes_neither_and_warns(self):
+        got, said = self.resolve({"requested_worker": "mars", pr.LEGACY_WORKER_FIELD: "sudoo"})
+        self.assertIsNone(got, "a conflict must not silently pick one recipient")
+        self.assertIn("SECURITY", said)
+
+    def test_absent_and_blank_are_unaddressed(self):
+        for task in ({}, {"requested_worker": "  "}, {pr.LEGACY_WORKER_FIELD: ""}):
+            with self.subTest(task=task):
+                self.assertIsNone(self.resolve(task)[0])
+
+    def test_the_binding_still_decides_when_unaddressed(self):
+        roster = pr.compile_roster(self.ws, live(W1), bindings={"!r:x": W1})
+        self.assertEqual(pr.targets_for(roster, "!r:x", pr.requested_worker_of({})), [W1])
+
+    def test_a_conflict_falls_through_to_the_binding(self):
+        roster = pr.compile_roster(self.ws, live(W1), bindings={"!r:x": W1})
+        task = {"requested_worker": W2, pr.LEGACY_WORKER_FIELD: W1}
+        self.assertEqual(pr.targets_for(roster, "!r:x", pr.requested_worker_of(task, warn=lambda m: None)),
+                         [W1], "a conflicting pair must land on the binding, not on either name")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
