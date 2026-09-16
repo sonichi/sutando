@@ -585,14 +585,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logToFile("checkWatcher: pgrep unavailable (rc=\(proc.terminationStatus)): \(err.trimmingCharacters(in: .whitespacesAndNewlines)) — falling back to ps")
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-axo", "command"]
+        // pid,command (not bare command): excluding OUR OWN pid needs it, since
+        // "ugrep ... watch-tasks" is itself a process whose argv mentions the marker.
+        ps.arguments = ["-axo", "pid,command"]
         let psPipe = Pipe()
         ps.standardOutput = psPipe
         ps.standardError = FileHandle.nullDevice
         do { try ps.run() } catch { return nil }
         ps.waitUntilExit()
+        // A failed ps must read as unknown, the same standard pgrep already gets
+        // above -- an empty listing from a non-zero exit is not a clean "no match".
+        if ps.terminationStatus != 0 {
+            logToFile("checkWatcher: ps also unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            return nil
+        }
         let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return listing.split(separator: "\n").contains { $0.contains("watch-tasks") && !$0.contains("ps -axo") }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        return listing.split(separator: "\n").contains { line in watcherLineMatches(line, excluding: selfPID) }
+    }
+
+    /// The SAME anchor `health-check.py`'s `watcher_identity` module uses: the
+    /// full script name at a path/whitespace boundary, never a bare substring.
+    /// `ps -f watch-tasks` (the loose marker this replaced) matched its OWN
+    /// argv, and any grep/editor/tail merely mentioning the shorter string —
+    /// reproduced 2026-09-15 (review #4269): a dead watcher read as alive next
+    /// to the very `ps`-driven check proving it dead.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
+        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let marker = "watch-tasks-stream.sh"
+        var searchStart = command.startIndex
+        while let r = command.range(of: marker, range: searchStart..<command.endIndex) {
+            let beforeOK = r.lowerBound == command.startIndex
+                || command[command.index(before: r.lowerBound)] == " "
+                || command[command.index(before: r.lowerBound)] == "/"
+            let afterOK = r.upperBound == command.endIndex || command[r.upperBound] == " "
+            if beforeOK && afterOK { return true }
+            searchStart = r.upperBound
+        }
+        return false
     }
 
     func checkWatcher() {
