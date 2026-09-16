@@ -256,9 +256,8 @@ class TestMain(Base):
             self.assertEqual(self.run_main(self.payload()), (0, ""))
 
     def test_the_warm_path_is_four_local_reads_and_nothing_else(self):
-        # The budget is not wall-clock (a shared runner jitters) but I/O the code controls: one
-        # read each of the task file, the first-touch ledger, the connect cache and the keyword
-        # table; no network, no subprocess, no other file.
+        # Budget by I/O the code controls, not wall-clock: four local reads, no network, no
+        # subprocess, one write.
         self.task()
         self.warm("linear", at=NOW)
         reads = []
