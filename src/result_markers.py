@@ -451,17 +451,29 @@ _REQUEUE_REASONS = {
 
 def render_skill_prelude(
     channel_id: str, channel_dir: str, tid: str, addressed_to: str = "",
+    reply_to_me: "bool | str | None" = None, reply_to_sender: str = "",
 ) -> "list[str]":
     """The ===SKILL INSTRUCTIONS=== prelude for an owner-tier task, rendered
     from the task's OWN routing fields. Single owner of the template: the
     gateway writes with its live lane values; a dedup requeue re-renders from
     the requeuing adapter (channel_dir = that host's own lane dir, per-lane since the
     lane-authoritative stamping change) so a requeue can never resurrect a
-    superseded prelude."""
+    superseded prelude.
+
+    `addressed_to` (an explicit @-mention of someone else, set by the broker) and
+    `reply_to_me` / `reply_to_sender` (this message's reply-chain target, always
+    present when the task IS a reply) are two independent signals for the same
+    fact — a message replying to someone else with no @-mention at all still has
+    no `addressed_to`, but `reply_to_me` is False and `reply_to_sender` names them.
+    `reply_to_me` arrives as a live bool from the gateway's own task dict, or as
+    the string "True"/"False" when re-read from a requeued task's own header —
+    both are honored so a rebuild sees the same guard the original render did."""
     import shlex as _shlex
     _chan = channel_id or ""
     _chan_q = _shlex.quote(_chan)
     _cdir_q = _shlex.quote(channel_dir)
+    _not_me = reply_to_me is False or reply_to_me == "False"
+    addressed_to = addressed_to or (reply_to_sender if _not_me and reply_to_sender else "")
     _step = 1
     _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
     if addressed_to:
@@ -534,7 +546,7 @@ def build_requeued_task(
             lines.append(f"dedup_requeue_count: {count}")
             seen_count = True
         else:
-            for k in ("channel_id", "source", "addressed_to"):
+            for k in ("channel_id", "source", "addressed_to", "reply_to_me", "reply_to_sender"):
                 if ln.startswith(k + ":") and k not in hdr:
                     hdr[k] = ln[len(k) + 1:].strip()
             lines.append(ln)
@@ -546,7 +558,8 @@ def build_requeued_task(
         # Re-render, never copy; the injected lane dir is the only lane source.
         lines.extend(render_skill_prelude(
             hdr.get("channel_id", ""), channel_dir,
-            new_task_id, hdr.get("addressed_to", "")))
+            new_task_id, hdr.get("addressed_to", ""),
+            hdr.get("reply_to_me", ""), hdr.get("reply_to_sender", "")))
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
         + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(
