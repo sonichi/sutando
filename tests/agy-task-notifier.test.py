@@ -56,6 +56,8 @@ class FakeTmuxHarness(unittest.TestCase):
             d.mkdir(parents=True)
         self.pane_file = self.root / "pane.txt"
         self.pane_file.write_text(IDLE_MARKER + "\n")
+        self.composer_file = self.root / "composer.txt"
+        self.composer_file.write_text("")
         self.session_flag = self.root / "session.flag"
         self.session_flag.write_text("up")
         self.sendkeys_log = self.root / "send-keys.log"
@@ -64,19 +66,36 @@ class FakeTmuxHarness(unittest.TestCase):
         self._write_fake_tmux()
 
     def _write_fake_tmux(self):
-        # -l pastes append to pane.txt (simulating composer echo) unless
-        # swallow-next-paste.flag is set (consumed once) — simulates a drop.
+        # capture-pane renders pane.txt (history) + composer.txt (unsubmitted
+        # input) padded to a FIXED row count, like a real tmux pane; -l concatenates.
         script = self.bin / "tmux"
         script.write_text(f'''#!/bin/bash
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
+FIXED_ROWS=12
 case "$cmd" in
   has-session)
     [ -f "{self.session_flag}" ] && exit 0
     exit 1
     ;;
   capture-pane)
-    cat "{self.pane_file}" 2>/dev/null
+    hist=""
+    [ -f "{self.pane_file}" ] && hist="$(cat "{self.pane_file}")"
+    composer="$(cat "{self.composer_file}" 2>/dev/null)"
+    if [ -n "$hist" ]; then
+      combined="$hist"$'\\n'"$composer"
+    else
+      combined="$composer"
+    fi
+    n=$(printf '%s\\n' "$combined" | wc -l | tr -d ' ')
+    if [ "$n" -gt "$FIXED_ROWS" ]; then
+      printf '%s\\n' "$combined" | tail -n "$FIXED_ROWS"
+    else
+      pad=$((FIXED_ROWS - n))
+      i=0
+      while [ "$i" -lt "$pad" ]; do printf '\\n'; i=$((i + 1)); done
+      printf '%s\\n' "$combined"
+    fi
     exit 0
     ;;
   send-keys)
@@ -89,9 +108,14 @@ case "$cmd" in
       if [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"
       else
-        printf '%s\\n' "$text" >> "{self.pane_file}"
+        printf '%s' "$(cat "{self.composer_file}" 2>/dev/null)$text" > "{self.composer_file}"
       fi
     else
+      if [ -s "{self.composer_file}" ]; then
+        cat "{self.composer_file}" >> "{self.pane_file}"
+        printf '\\n' >> "{self.pane_file}"
+        : > "{self.composer_file}"
+      fi
       printf 'ENTER\\n' >> "{self.sendkeys_log}"
     fi
     exit 0
