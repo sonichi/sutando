@@ -255,20 +255,34 @@ class TestMain(Base):
         with mock.patch.object(hook, "handle", side_effect=RuntimeError("boom")):
             self.assertEqual(self.run_main(self.payload()), (0, ""))
 
-    def test_the_script_runs_in_under_50ms_warm(self):
+    def test_the_warm_path_is_four_local_reads_and_nothing_else(self):
+        # The budget is not wall-clock (a shared runner jitters) but I/O the code controls: one
+        # read each of the task file, the first-touch ledger, the connect cache and the keyword
+        # table; no network, no subprocess, no other file.
         self.task()
-        self.warm("linear", at=time.time())
-        payload = json.dumps(self.payload(sid="warmup"))
-        subprocess.run([sys.executable, str(HOOK)], input=payload, capture_output=True, text=True)
-        best = None
-        for i in range(3):
-            p = json.dumps(self.payload(sid=f"timed-{i}"))
-            t0 = time.perf_counter()
-            r = subprocess.run([sys.executable, str(HOOK)], input=p, capture_output=True, text=True)
-            best = min(best or 9, time.perf_counter() - t0)
-            self.assertEqual(r.returncode, 0)
-            self.assertIn("needs_connect=googlecalendar", r.stdout)
-        self.assertLess(best, 0.05, f"warm run took {best * 1000:.0f} ms")
+        self.warm("linear", at=NOW)
+        reads = []
+        real_read_text = Path.read_text
+
+        def counting_read_text(path, *a, **kw):
+            reads.append(Path(path).name)
+            return real_read_text(path, *a, **kw)
+
+        with mock.patch.object(Path, "read_text", counting_read_text), \
+             mock.patch("socket.socket", side_effect=AssertionError("network from a hook")), \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess from a hook")):
+            line = hook.handle(self.payload(sid="io-budget"), now=NOW)
+        self.assertTrue(line and line.startswith("connect-apps precheck: needs_connect=googlecalendar"), line)
+        self.assertEqual(sorted(reads), sorted(["task-1.txt", hook.SESSIONS_NAME, hook.CACHE_NAME, hook.TABLE_PATH.name]))
+        # The only write is the first-touch ledger.
+        written = sorted(q.name for q in (self.ws / "state").iterdir())
+        self.assertEqual(written, sorted([hook.CACHE_NAME, hook.SESSIONS_NAME, hook.SESSIONS_NAME.replace(".json", ".lock")]))
+        # A second touch of the same task in the same session reads only the ledger path and stops.
+        reads.clear()
+        with mock.patch.object(Path, "read_text", counting_read_text):
+            self.assertIsNone(hook.handle(self.payload(sid="io-budget"), now=NOW))
+        self.assertNotIn(hook.TABLE_PATH.name, reads, "the table is not re-read once the task was handled")
+        self.assertNotIn(hook.CACHE_NAME, reads)
 
 
 class TestRegistration(unittest.TestCase):
