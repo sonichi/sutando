@@ -165,7 +165,7 @@ _WRITER_BELOW_TASK = frozenset((
     "addressed_to", "thread_root", "source_room_id", "room_members", "room_member_count",
     "source_message_id", "user_id", "interaction_type", "platform_card", "collaborator",
     "sensitive_data_filter", "access_tier", "session_scope", "requested_worker", "priority",
-    "hitl_click",
+    "hitl_click", "channel_kind",
 ))
 _BELOW_TASK_FIELD = re.compile(r"^([a-z_]+): ")
 
