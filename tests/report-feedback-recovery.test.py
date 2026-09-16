@@ -210,6 +210,25 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(Path(job['ProgramArguments'][1]).resolve(), SCRIPT.resolve())
         self.assertEqual(job['ProgramArguments'][2], '--apply')
 
+    def test_pending_hold_cannot_be_filed_by_decide_or_stop(self):
+        incident = self.queue()
+        with self.assertRaises(SystemExit) as result:
+            self.run_cli('--decide', incident, 'file')
+        self.assertEqual(result.exception.code, 3)
+        self.clock.return_value = 13600
+        rf.apply_clicks(self.ws, rf.read_prefs(self.ws), 'test', release_automatic=False)
+        self.post.assert_not_called()
+
+    def test_terminal_failure_cannot_restart_or_reset_after_release(self):
+        incident = self.queue()
+        rf.update_recovery(self.ws, incident, 'failed')
+        with self.assertRaisesRegex(ValueError, 'final failed'):
+            rf.update_recovery(self.ws, incident, 'started')
+        self.auth.return_value = (None, None)
+        self.run_cli('--apply')
+        with self.assertRaisesRegex(ValueError, 'already released'):
+            rf.update_recovery(self.ws, incident, 'started')
+
     def test_daily_cap_is_checked_when_releasing(self):
         for i in range(6):
             self.queue(f'failure {i}')

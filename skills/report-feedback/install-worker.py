@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 from pathlib import Path
 import platform
@@ -14,6 +13,8 @@ import sys
 
 SCRIPT = Path(__file__).resolve().with_name("report-feedback.py")
 LABEL = "com.sutando.feedback-recovery"
+sys.path.insert(0, str(SCRIPT.parents[2] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
 
 
 def job(workspace: Path) -> dict:
@@ -33,10 +34,7 @@ def main() -> None:
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
     args = parser.parse_args()
-    spec = importlib.util.spec_from_file_location("report_feedback", SCRIPT)
-    rf = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(rf)
-    workspace = rf.resolve_workspace()
+    workspace = Path(resolve_workspace())
     data = plistlib.dumps(job(workspace))
     if args.render:
         sys.stdout.buffer.write(data)
