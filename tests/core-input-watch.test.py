@@ -698,5 +698,221 @@ class TestMainOnce(unittest.TestCase):
         self.assertEqual(sig["state"], "running")
 
 
+
+class TestCoreStateEmitter(unittest.TestCase):
+    """Every supervisor state TRANSITION is POSTed to the obs collector as a raw
+    `core.state` record; no endpoint means no POST; the prompt text never rides."""
+
+    def test_payload_shape_carries_gate_not_prompt(self):
+        p = _mod.core_state_payload("running", "blocked-human", "awaiting user: login",
+                                    "login", "sutando-core", ts=1700000000.1234)
+        self.assertEqual(p, {"kind": "core.state", "ts": 1700000000.123,
+                             "session": "sutando-core", "from": "running",
+                             "to": "blocked-human", "detail": "awaiting user: login",
+                             "gate": "login"})
+        self.assertNotIn("prompt", p)
+
+    def test_payload_marks_gateway_auth_rejection_only_when_true(self):
+        p = _mod.core_state_payload("running", "gateway-down", "d", None, "s",
+                                    gateway_auth_rejected=True, ts=1.0)
+        self.assertTrue(p["gateway_auth_rejected"])
+        self.assertNotIn("gate", p)
+        q = _mod.core_state_payload("running", "gateway-down", "d", None, "s", ts=1.0)
+        self.assertNotIn("gateway_auth_rejected", q)
+
+    def test_post_is_skipped_without_endpoint(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": ""}):
+            self.assertIsNone(_mod.obs_endpoint())
+            self.assertFalse(_mod.post_core_state({"kind": "core.state"}))
+
+    def test_post_targets_ingest_core_state_and_never_raises(self):
+        from unittest.mock import patch
+        seen = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["body"] = json.loads(req.data.decode("utf-8"))
+            seen["timeout"] = timeout
+            return _Resp()
+        with patch.object(_mod.urllib.request, "urlopen", fake_urlopen):
+            ok = _mod.post_core_state({"kind": "core.state", "to": "running"},
+                                      endpoint="http://localhost:4000/")
+        self.assertTrue(ok)
+        self.assertEqual(seen["url"], "http://localhost:4000/ingest/core-state")
+        self.assertEqual(seen["body"]["to"], "running")
+        self.assertEqual(seen["timeout"], _mod.CORE_STATE_POST_TIMEOUT_S)
+
+        def boom(req, timeout=None):
+            raise OSError("collector down")
+        with patch.object(_mod.urllib.request, "urlopen", boom):
+            self.assertFalse(_mod.post_core_state({"kind": "core.state"},
+                                                  endpoint="http://localhost:4000"))
+
+    def test_gateway_auth_rejected_reads_zero_backoff_disconnect(self):
+        import tempfile
+        import time
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "gateway-status.json")
+            now = time.time()
+            with open(path, "w") as f:
+                json.dump({"ts": now, "connected": False, "last_ok_ts": None,
+                           "backoff_s": 0}, f)
+            self.assertTrue(_mod.gateway_auth_rejected(td))
+            with open(path, "w") as f:
+                json.dump({"ts": now, "connected": False, "last_ok_ts": now - 5,
+                           "backoff_s": 8}, f)
+            self.assertFalse(_mod.gateway_auth_rejected(td), "transport retry is not an auth rejection")
+            with open(path, "w") as f:
+                json.dump({"ts": now, "connected": True, "last_ok_ts": now,
+                           "backoff_s": None}, f)
+            self.assertFalse(_mod.gateway_auth_rejected(td))
+        self.assertFalse(_mod.gateway_auth_rejected(None))
+        self.assertFalse(_mod.gateway_auth_rejected("/nonexistent/dir"))
+
+    def test_transition_is_retried_until_the_collector_acknowledges(self):
+        calls = []
+
+        def flaky(payload, endpoint=None):
+            calls.append(payload)
+            return len(calls) >= 3  # collector comes up on the third tick
+        ep = "http://localhost:4000"
+        # tick 1: first observation, collector down -> not acknowledged
+        last = _mod.note_transition(None, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertIsNone(last)
+        # tick 2: same state, still down -> retried with the same from
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertIsNone(last)
+        # tick 3: accepted -> acknowledged
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertEqual(last, "logged-out")
+        self.assertEqual([(c["from"], c["to"]) for c in calls], [(None, "logged-out")] * 3)
+        # tick 4: no change -> no POST
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertEqual(len(calls), 3)
+
+    def test_transition_skipped_while_down_collapses_into_one_record(self):
+        calls = []
+        ep = "http://localhost:4000"
+        last = _mod.note_transition("running", "logged-out", "d", None, "s", None,
+                                    post=lambda p, endpoint=None: calls.append(p) or False, endpoint=ep)
+        self.assertEqual(last, "running")
+        last = _mod.note_transition(last, "idle-ready", "d", None, "s", None,
+                                    post=lambda p, endpoint=None: calls.append(p) or True, endpoint=ep)
+        self.assertEqual(last, "idle-ready")
+        self.assertEqual((calls[-1]["from"], calls[-1]["to"]), ("running", "idle-ready"))
+
+    def test_transition_without_endpoint_advances_without_posting(self):
+        from unittest.mock import patch
+        calls = []
+        with patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": ""}):
+            last = _mod.note_transition(None, "running", "d", None, "s", None,
+                                        post=lambda p, endpoint=None: calls.append(p) or True)
+        self.assertEqual(last, "running")
+        self.assertEqual(calls, [])
+
+    _REFUSED_PANE = "\n".join([
+        "  ⎿ \xa0Not logged in · Please run /login", "✻ Baked for 0s · done 3:36 PM",
+        "❯ /startup", "  ⎿ \xa03 skills available", "  ⎿ \xa0Not logged in · Please run /login",
+        "✻ Cooked for 0s · done 3:50 PM", "❯ /startup", "  ⎿ \xa0Not logged in · Please run /login",
+        "✻ Worked for 0s · done 3:52 PM", "                          Not logged in · Run /login",
+        "─────────────────────────────────────── sutando-core ─", "❯\xa0",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ←…"])
+
+    def test_last_refused_turn_reads_the_real_pane(self):
+        got = _mod.last_refused_turn(self._REFUSED_PANE)
+        self.assertEqual(got, (("✻ Worked for 0s · done 3:52 PM", 3), "Not logged in · Please run /login"))
+
+    def test_last_refused_turn_identity_changes_with_a_new_turn(self):
+        before = _mod.last_refused_turn(self._REFUSED_PANE)[0]
+        nxt = self._REFUSED_PANE.replace("✻ Worked for 0s · done 3:52 PM",
+                                         "✻ Worked for 0s · done 3:52 PM\n❯ /startup\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked for 0s · done 3:52 PM")
+        after = _mod.last_refused_turn(nxt)[0]
+        self.assertNotEqual(before, after, "same stamp text, one more completed turn → new identity")
+
+    def test_last_refused_turn_controls(self):
+        pane = self._REFUSED_PANE
+        # a newer prompt typed below the completion → the refusal is history
+        self.assertIsNone(_mod.last_refused_turn(pane.replace("❯\xa0", "❯ hello there")))
+        # agent output in the turn → it ran; a tool result quoting the words is the tool's
+        ran = pane.replace("❯ /startup\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked",
+                           "❯ /startup\n● Checking…\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked")
+        self.assertIsNone(_mod.last_refused_turn(ran))
+        # not at the idle footer → None
+        self.assertIsNone(_mod.last_refused_turn(_WORKING))
+        self.assertIsNone(_mod.last_refused_turn(""))
+        # a completed turn without a refusal line → None
+        ok = pane.replace("  ⎿ \xa0Not logged in · Please run /login\n✻ Worked", "  ⎿ \xa0Done.\n✻ Worked")
+        self.assertIsNone(_mod.last_refused_turn(ok))
+
+    def test_core_turn_payload_shape(self):
+        p = _mod.core_turn_payload("logged-out", "Not logged in · Please run /login",
+                                   "✻ Worked for 0s · done 3:52 PM", "sutando-core", ts=1.5)
+        self.assertEqual(p, {"kind": "core.turn_refused", "ts": 1.5, "session": "sutando-core",
+                             "state": "logged-out", "line": "Not logged in · Please run /login",
+                             "turn": "✻ Worked for 0s · done 3:52 PM"})
+
+    def test_main_once_seeds_turn_identity_without_posting_a_refusal(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        posted = []
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "needs_login"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--once"]
+        with patch.object(_mod, "capture", lambda s, sess: self._REFUSED_PANE), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "post_core_state", lambda p, **kw: posted.append(p) or True), \
+                patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": "http://localhost:4000"}), \
+                patch.object(sys, "argv", argv):
+            main()
+        # The refusal already on screen predates the monitor: only the state record ships.
+        self.assertEqual([p["kind"] for p in posted], ["core.state"])
+
+    def test_main_once_posts_the_first_observed_state_from_none(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        posted = []
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "needs_login"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--once"]
+        with patch.object(_mod, "capture", lambda s, sess: _IDLE_LOGGEDOUT), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "post_core_state", lambda p, **kw: posted.append(p) or True), \
+                patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": "http://localhost:4000"}), \
+                patch.object(sys, "argv", argv):
+            main()
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["kind"], "core.state")
+        self.assertIsNone(posted[0]["from"])
+        self.assertEqual(posted[0]["to"], "logged-out")
+        self.assertEqual(posted[0]["session"], "sutando-core")
+        self.assertNotIn("prompt", posted[0])
+
+
 if __name__ == "__main__":
     unittest.main()
