@@ -46,12 +46,30 @@ watcher_session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session 
 ensure_task_notifier() {
   watcher_session_exists && return 0
   [ -x "$NOTIFIER" ] || { echo "  ⚠ agy task notifier not found/executable: $NOTIFIER — tasks will not reach this session" >&2; return 0; }
+  # task-notifier.sh's main loop hard-requires fswatch (via watch-tasks-stream.sh).
+  # Without it the notifier's pane process dies within ~1s of starting — a
+  # tmux new-session that "succeeds" but leaves nothing alive to check for it.
+  if ! command -v fswatch >/dev/null 2>&1; then
+    echo "  ⚠ fswatch not found — required by the agy task notifier (brew install fswatch); tasks will not reach this session" >&2
+    return 0
+  fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION")
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
-    "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER" \
-    || echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
+  if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
+      "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
+    echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
+    return 0
+  fi
+  # new-session rc=0 only means tmux accepted it, same trap as the core
+  # session below — poll for a couple seconds rather than trust a session
+  # that can still die on its first tick (e.g. a notifier crash on launch).
+  for _ in $(seq 1 10); do
+    watcher_session_exists || break
+    sleep 0.2
+  done
+  watcher_session_exists \
+    || echo "  ⚠ agy task notifier exited immediately after starting — tasks will not reach this session" >&2
 }
 
 # `agy` exposes no dedicated auth-status subcommand; `agy models` makes one

@@ -74,6 +74,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/task_archive.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
+            "src/delivery/__init__.py",
+            "src/delivery/readiness.py",
+            "src/delivery/task_dispatch.py",
             # util_paths refuses without these: it can read neither half of
             # the identity, so it will not hand out the shared historic name.
             "src/runtime-api/instance_key.py",
@@ -912,7 +915,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'ok\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
   exit 0
 fi
 if [ "${1:-}" = send-keys ]; then
@@ -992,7 +995,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+  printf 'ok\\n' > "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
 fi
 exit 0
 ''')
@@ -1043,7 +1046,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
-  (sleep 0.12; touch "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
+  (sleep 0.12; printf 'ok\\n' > "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
@@ -1101,7 +1104,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
-  touch "$SUTANDO_RESULTS_DIR/$name"
+  printf 'ok\\n' > "$SUTANDO_RESULTS_DIR/$name"
 fi
 exit 0
 ''')
@@ -1156,7 +1159,7 @@ if [ "${1:-}" = capture-pane ]; then
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'ok\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
 fi
 exit 0
 ''')

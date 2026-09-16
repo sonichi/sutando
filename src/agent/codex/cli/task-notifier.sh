@@ -34,6 +34,7 @@ COMPOSER_READY_TIMEOUT="${SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT:-30}"
 COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
+DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -107,32 +108,17 @@ prepare_workstream_context() {
   fi
 }
 
+# Completion-detection is owned by src/delivery/task_dispatch.py — see its
+# header for why the bash copy this used to be was a defect, not just a
+# duplicate (sonichi#4303 review). The fallback-receipt cleanup below is
+# Codex-specific bookkeeping (an optional task-handler concern), not shared
+# policy, so it stays here rather than in the shared module.
 has_result() {
-  local filename="$1" stem archive_dir
-  if [ -f "$RESULTS_DIR/$filename" ]; then
+  local filename="$1"
+  if "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename"; then
     rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
     return 0
   fi
-  stem="${filename%.txt}"
-  # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
-  # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
-  # archive-YYYY-MM-DD/<task>.txt directories. All are completed deliveries.
-  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
-      -mindepth 1 -maxdepth 2 -type f \
-      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-      | grep -q .; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
-  fi
-  for archive_dir in "$RESULTS_DIR"/archive-*; do
-    [ -d "$archive_dir" ] || continue
-    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
-        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-        | grep -q .; then
-      rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-      return 0
-    fi
-  done
   return 1
 }
 
@@ -186,13 +172,16 @@ wait_for_core_idle() {
   done
 }
 
+# Candidates arrive already priority-sorted and already filtered to those
+# without a delivered result (src/delivery/task_dispatch.py — shared with
+# agy's notifier). This loop applies only Codex-specific holds on top: a
+# Team-tier handler's claim, or its not-yet-published probe.
 next_pending_task() {
   local candidate
   while IFS= read -r candidate; do
     case "$candidate" in
       ""|*/*|*..*) continue ;;
     esac
-    has_result "$candidate" && continue
     [ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue
     if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
         && probe_optional_task_handler "$candidate"; then
@@ -202,20 +191,7 @@ next_pending_task() {
     fi
     printf '%s\n' "$candidate"
     return 0
-  done < <(
-    "$NOTIFIER_PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from task_priority import sort_tasks_by_priority
-
-tasks_dir = Path(sys.argv[2])
-for task in sort_tasks_by_priority(tasks_dir.glob("*.txt")):
-    if task.is_file():
-        print(task.name)
-PY
-  )
+  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR")
   return 1
 }
 

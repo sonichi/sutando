@@ -6,12 +6,27 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 TMUX_SOCKET="${SUTANDO_AGY_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}}"
 SESSION="${SUTANDO_AGY_TMUX_SESSION:-sutando-agy}"
+# agy is not selected in place of the running Claude/Codex core (see
+# src/agent/agy/README.md) — its watcher runs ALONGSIDE the canonical one, not
+# instead of it. Defaulting to the shared workspace/tasks + results dirs would
+# put two independent watchers on the same queue, so every task (including an
+# irreversible one) gets processed twice. Default to a separately-owned agy
+# inbox instead; an explicit SUTANDO_TASKS_DIR/SUTANDO_RESULTS_DIR override
+# (as every test here uses) still works exactly as before.
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
   TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
 else
-  TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
+  TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks-agy"
 fi
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
+if [ -n "${SUTANDO_RESULTS_DIR:-}" ]; then
+  RESULTS_DIR="${SUTANDO_RESULTS_DIR/#\~/$HOME}"
+elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+  # An explicit TASKS_DIR override without an explicit RESULTS_DIR derives the
+  # sibling results/ dir, same convention every other consumer follows.
+  RESULTS_DIR="$(dirname "$TASKS_DIR")/results"
+else
+  RESULTS_DIR="$(dirname "$TASKS_DIR")/results-agy"
+fi
 POLL_INTERVAL="${SUTANDO_AGY_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_AGY_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -55,56 +70,17 @@ log_notifier() {
   printf '%s\n' "$msg" >&2
 }
 
-# Duplicated from Codex's task-notifier.sh has_result() — see header note.
+DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
+
+# Completion-detection and priority-selection are owned by
+# src/delivery/task_dispatch.py — see its header for why the bash copy this
+# used to be was a defect, not just a duplicate (sonichi#4303 review).
 has_result() {
-  local filename="$1" stem archive_dir
-  if [ -f "$RESULTS_DIR/$filename" ]; then
-    return 0
-  fi
-  stem="${filename%.txt}"
-  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
-      -mindepth 1 -maxdepth 2 -type f \
-      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-      | grep -q .; then
-    return 0
-  fi
-  for archive_dir in "$RESULTS_DIR"/archive-*; do
-    [ -d "$archive_dir" ] || continue
-    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
-        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-        | grep -q .; then
-      return 0
-    fi
-  done
-  return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$1"
 }
 
-# Duplicated from Codex's next_pending_task() minus its Team-tier handler
-# probe (out of scope here) — same shared src/task_priority.py call.
 next_pending_task() {
-  local candidate
-  while IFS= read -r candidate; do
-    case "$candidate" in
-      ""|*/*|*..*) continue ;;
-    esac
-    has_result "$candidate" && continue
-    printf '%s\n' "$candidate"
-    return 0
-  done < <(
-    "$NOTIFIER_PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from task_priority import sort_tasks_by_priority
-
-tasks_dir = Path(sys.argv[2])
-for task in sort_tasks_by_priority(tasks_dir.glob("*.txt")):
-    if task.is_file():
-        print(task.name)
-PY
-  )
-  return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR"
 }
 
 # agy's footer shows "esc to cancel" for any in-flight turn (tool or text)
@@ -134,23 +110,36 @@ wait_for_core_idle() {
   done
 }
 
+pane_line_count() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null | wc -l | tr -d ' '
+}
+
 # A wide tail: at the default 80-col pane width our newline-free prompt wraps
 # across several rows, so a narrow tail can miss the marker (verified live).
+#
+# `baseline` (the pane's line count taken right before THIS attempt typed)
+# restricts the match to lines the pane gained since then. The marker text is
+# byte-identical across retries of the same task, so without this a marker
+# left over from an EARLIER successful dispatch of the same filename — still
+# sitting in the last 20 rows as sent history — reads as "staged" even when
+# the current paste was swallowed and nothing new actually landed.
 prompt_is_staged() {
+  local filename="$1" baseline="${2:-0}"
   tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null \
-    | tail -20 | grep -Fq "Sutando task ready: $1"
+    | tail -n "+$((baseline + 1))" | tail -20 | grep -Fq "Sutando task ready: $filename"
 }
 
 # Type + poll for staged (a one-shot check retyped a still-landing paste
 # into a duplicate, verified live), then Enter + verify submitted.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 staged=0 waited=0
+  local filename="$1" prompt="$2" type_tries=0 staged=0 waited=0 baseline
   wait_for_core_idle || true
   while :; do
+    baseline="$(pane_line_count)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" -l -- "$prompt"
     waited=0
     while [ "$waited" -lt "$TYPE_CONFIRM_TIMEOUT_TICKS" ]; do
-      if prompt_is_staged "$filename"; then staged=1; break 2; fi
+      if prompt_is_staged "$filename" "$baseline"; then staged=1; break 2; fi
       sleep "$POLL_INTERVAL"
       waited=$((waited + 1))
     done
