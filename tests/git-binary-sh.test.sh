@@ -35,9 +35,8 @@ else
 fi
 
 # --- 3. the real contract: system dir + no CLT -> EMPTY ---------------------
-# Uses the genuine /usr/bin/git, with only xcode-select faked to fail — the
-# exact scenario keweichen flagged: bare `git` on a toolchain-free host must
-# not run at all, let alone twice per Stop.
+# Uses the genuine /usr/bin/git, with only xcode-select faked to fail: bare
+# `git` on a toolchain-free host must not run at all.
 lab3=$(mktemp -d)
 printf '#!/bin/sh\nexit 2\n' > "$lab3/xcode-select"; chmod +x "$lab3/xcode-select"
 out=$(OSTYPE=darwin25 PATH="$lab3:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
@@ -68,10 +67,7 @@ out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:$lab/bin" /bin/bash -c ". '$REPO/scri
 check "a real stub earlier on PATH does not hide a real git further along" "$out" "$lab/bin/git"
 
 # --- 7. A SYMLINK to the system stub must be refused, not accepted as "real" -
-# keweichen, #4323 round 2: the old check compared only the candidate's
-# DIRECTORY, so $HOME/bin/git -> /usr/bin/git looked like an ordinary PATH
-# git and was returned even with no developer tools -- the hook then executed
-# the actual stub through the symlink.
+# $HOME/bin/git -> /usr/bin/git must not look like an ordinary PATH git.
 lab7=$(mktemp -d)
 mkdir -p "$lab7/bin"
 ln -s /usr/bin/git "$lab7/bin/git"
@@ -86,16 +82,10 @@ out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin" /bin/bash -c ". '$REPO/scripts/git-
 check "a symlink-to-stub is refused even when readlink itself is unavailable" "$out" ""
 
 # --- 7c. a symlink chain LONGER than the internal bound must FAIL, never -----
-# silently return an unresolved intermediate (keweichen, #4323 round 3: the
-# old bound stopped at 20 hops without checking whether the target was still
-# a symlink, so a chain longer than that -- macOS permits up to 32 -- fell
-# through as "resolved" to a mid-chain link that trivially wasn't the stub).
-# Tested directly against _sutando_git_realpath/_sutando_git_is_system_stub,
-# not through resolve_git's outer PATH walk: that walk's own `[ -f ]` gate
-# follows symlinks via the OS's native (and here, LOWER-than-32) ELOOP limit,
-# so a chain built to exceed the code's 40-hop bound can get rejected by the
-# OS before ever reaching the code under test -- a false pass for the wrong
-# reason. Calling the internal functions directly removes that confound.
+# silently return an unresolved intermediate. Tested directly against the
+# realpath/is_system_stub helpers -- resolve_git's outer `[ -f ]` gate follows
+# symlinks via the OS's own (here, lower) ELOOP limit, which would reject an
+# over-long chain before ever reaching the code under test.
 lab7c=$(mktemp -d)
 _prev=/usr/bin/git
 for _n in $(seq 1 45); do
@@ -108,11 +98,9 @@ check "a 45-hop chain (over the internal bound) resolves to NOTHING, not an inte
 [ "$rc" -ne 0 ] && ok "...and reports failure (non-zero), not a false success" || bad "...and reports failure (non-zero), not a false success" "rc=$rc"
 
 # --- 8. a DIRECTORY named "git" on PATH must never be returned as a binary ---
-# `[ -x dir ]` is true for any traversable directory, which is not a git
-# executable; `-f` must gate every candidate. OSTYPE is PINNED to darwin --
-# without it (keweichen, #4323 round 3) this took the non-Darwin branch on
-# CI, which is a bare `command -v git` with NO directory rejection at all,
-# so it "passed" by finding a real /bin/git rather than by testing anything.
+# `[ -x dir ]` is true for any traversable directory; `-f` must gate every
+# candidate. OSTYPE is PINNED -- unpinned, CI takes the non-Darwin branch,
+# which has no directory rejection at all and passes for the wrong reason.
 lab8=$(mktemp -d)
 mkdir -p "$lab8/bin/git"
 printf '#!/bin/sh\nexit 2\n' > "$lab8/xcode-select"; chmod +x "$lab8/xcode-select"
@@ -120,8 +108,7 @@ out=$(OSTYPE=darwin25 PATH="$lab8:$lab8/bin:/usr/bin:/bin" /bin/bash -c ". '$REP
 check "a directory literally named git is never returned" "$out" ""
 
 # --- 8b. POSITIVE CONTROL: a symlink to a REAL non-system git IS accepted --
-# keweichen, #4323 round 3: without this, "reject every symlink" would also
-# pass case 7 above -- the fix must discriminate, not just refuse more.
+# without this, "reject every symlink" would also pass case 7 above.
 lab8b=$(mklab)
 mkdir -p "$lab8b/linkdir"
 ln -s "$lab8b/bin/git" "$lab8b/linkdir/git"
@@ -130,7 +117,9 @@ out=$(OSTYPE=darwin25 PATH="$lab8b:$lab8b/linkdir:/usr/bin:/bin" /bin/bash -c ".
 check "a symlink to a real non-system git is accepted" "$out" "$lab8b/linkdir/git"
 
 # --- 9. check-pending-tasks.sh sources the resolver, not a bare `git` --------
-if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '(^|[^"$])\bgit -C'; then
+# The old pattern only caught the -C'd probe; reverting the OTHER call (no -C)
+# to bare git passed it clean. Match any command-substitution invoking `git`.
+if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '\$\(git[[:space:]]'; then
   bad "check-pending-tasks.sh must not call a bare git" "found an unresolved git invocation"
 else
   ok "check-pending-tasks.sh has no bare git invocation"

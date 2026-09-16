@@ -34,24 +34,18 @@ if [ -n "$GIT_BIN" ]; then
   # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
   [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
   [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
-  # A packaged bundle ships without .git (REPO_COMMON_DIR empty BY DESIGN),
-  # which is why round 2 dropped the "both sides non-empty" requirement. But
-  # an empty REPO_COMMON_DIR is ALSO what a real checkout's FAILED probe
-  # looks like -- same empty string, opposite meaning (keweichen, #4323
-  # round 3). Only trust "intentionally no .git" when the marker itself is
-  # actually absent; otherwise an empty REPO_COMMON_DIR is an unresolved
-  # probe on a real checkout, and the ambiguity must fail closed (gate),
-  # not be read as license to skip.
-  if [ -e "$REPO_DIR/.git" ]; then
-    if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+  # A known identity wins regardless of the marker; marker absence (incl. `-L`,
+  # so a dangling symlink still counts as present) only breaks the empty-probe tie.
+  if [ -n "$REPO_COMMON_DIR" ]; then
+    if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
       echo '{}'
       exit 0
     fi
-  else
-    if [ -n "$CWD_COMMON_DIR" ]; then
-      echo '{}'
-      exit 0
-    fi
+  elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
+    : # marker present, probe still failed -- ambiguous, fall through to gate
+  elif [ -n "$CWD_COMMON_DIR" ]; then
+    echo '{}'
+    exit 0
   fi
 fi
 # No runnable git (module 3 of select_git: nothing) -- fail closed the same

@@ -136,26 +136,62 @@ esac
 
 # 6. THE REJECTION PATH. When the resolver refuses an interpreter the hook must
 # not execute a bare `python3` — that is the CLT stub the resolver just declined.
+# scripts/git-binary.sh is COPIED IN and a recording `git` stub proves it ran,
+# so this is a witness to activation, not just to output shape.
 REJ="$(mktemp -d)"
 mkdir -p "$REJ/scripts" "$REJ/src" "$REJ/workspace/tasks" "$REJ/workspace/results"
 printf '#!/bin/bash\n[ "$1" = "workspace" ] && { echo "%s/workspace"; exit 0; }\nexit 1\n' "$REJ" \
   > "$REJ/scripts/sutando-config.sh"
 chmod +x "$REJ/scripts/sutando-config.sh"
 cp "$HOOK" "$REJ/src/"
+cp "$REPO/scripts/git-binary.sh" "$REJ/scripts/"
 printf 'id: probe\ntask: rejected-interpreter\n' > "$REJ/workspace/tasks/$PROBE"
 # A recording shim: if the hook falls back to PATH python this fires.
 printf '#!/bin/bash\necho FALLBACK_INVOKED >&2\nexit 79\n' > "$REJ/python3"
 chmod +x "$REJ/python3"
-REJ_ERR="$(PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
-REJ_OUT="$(PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
+# A recording git stub, so git-binary.sh's resolve_git() actually has something
+# to resolve to (and its two call sites something to record) rather than the
+# whole block quietly no-opping on an absent/rejected git. Both probes echo
+# the SAME real, existing directory ($REJ), so CWD/REPO canonicalize equal --
+# a deliberate "same identity" case, so the block falls through normally
+# (never skips) into the interpreter-rejection logic this case actually tests.
+printf '#!/bin/bash\necho "GIT_CALLED $*" >> "%s/git-calls.log"\necho "%s"\n' "$REJ" "$REJ" \
+  > "$REJ/git"
+chmod +x "$REJ/git"
+printf '#!/bin/sh\nexit 2\n' > "$REJ/xcode-select"
+chmod +x "$REJ/xcode-select"
+# Run from a NON-Git cwd (never this checkout) so the guest carve-out's own
+# fall-through ("cannot prove different, proceed as core") is what lets
+# execution continue into the interpreter-rejection logic below it, rather
+# than either a real git identity here OR a short-circuiting guest exit
+# masking whether that logic ran at all.
+REJ_CWD="$(mktemp -d)"
+REJ_ERR="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
+rm -f "$REJ/git-calls.log"
+REJ_OUT="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
 case "$REJ_ERR" in
   *FALLBACK_INVOKED*) bad "a refused interpreter is not worked around" "the bare python3 fallback ran" ;;
   *) ok "a refused interpreter is not worked around" ;;
+esac
+# Not "no stderr at all" -- the hook's own deliberate interpreter-refusal
+# message belongs there. Specifically absent: the symptom of git-binary.sh
+# failing to source (a missing file, or calling the then-undefined resolve_git).
+case "$REJ_ERR" in
+  *"No such file or directory"*|*"command not found"*)
+    bad "no source/command-not-found noise (git-binary.sh actually sourced, not silently missing)" "got: ${REJ_ERR:0:160}" ;;
+  *) ok "no source/command-not-found noise (git-binary.sh actually sourced, not silently missing)" ;;
 esac
 case "$REJ_OUT" in
   '{}') ok "a refused interpreter still emits valid JSON" ;;
   *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
 esac
+if [ -f "$REJ/git-calls.log" ] && [ "$(wc -l < "$REJ/git-calls.log")" -ge 2 ]; then
+  ok "the git stub was actually invoked (git-binary.sh's resolve_git activated, not skipped)"
+else
+  bad "the git stub was actually invoked (git-binary.sh's resolve_git activated, not skipped)" \
+    "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
+fi
+rm -rf "$REJ_CWD"
 # 7. THE GUEST CARVE-OUT. A cwd inside a worktree of an UNRELATED repo (its own
 # git-common-dir) must not be held hostage by the core's queue, even with a
 # real pending task sitting in it.
@@ -188,14 +224,8 @@ else
 fi
 rm -f "$WS/tasks/$PROBE"
 
-# 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX (keweichen, #4323 round 2). A
-# shipped app bundle has no .git at all, so REPO_COMMON_DIR is empty by
-# design -- requiring BOTH sides non-empty before comparing let a genuinely
-# foreign Git cwd read as "cannot tell" and fall through to blocking on the
-# BUNDLE's own queue anyway. Build a real non-Git REPO_DIR (hook + resolver,
-# no .git) with a pending task, so a wrongly-skipped case would print {} and
-# a wrongly-blocked case would print the block payload -- either failure mode
-# is directly observable, not inferred.
+# 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX. A shipped app bundle has no
+# .git at all, so REPO_COMMON_DIR is empty by design -- pin both adjacent cases.
 BUNDLE="$(mktemp -d)"
 mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$BUNDLE/src/"
@@ -228,13 +258,8 @@ case "$BC_OUT" in
 esac
 rm -rf "$BUNDLE_CLEAN_CWD" "$BUNDLE"
 
-# 11. A REAL checkout whose repo-side git probe FAILS must still GATE, not
-# read as an intentional non-Git bundle (keweichen, #4323 round 3). Same
-# empty REPO_COMMON_DIR as a packaged bundle, opposite cause and opposite
-# correct answer -- the marker check (`-e "$REPO_DIR/.git"`) is what tells
-# them apart. `.git` here is a plain empty directory: present (so it is NOT
-# "intentionally no .git"), but not a git repo git can parse, so the probe
-# on REPO_DIR genuinely fails.
+# 11. A REAL checkout whose repo-side git probe FAILS must still GATE -- same
+# empty REPO_COMMON_DIR as a packaged bundle, opposite cause, opposite answer.
 FAILPROBE="$(mktemp -d)"
 mkdir -p "$FAILPROBE/src" "$FAILPROBE/scripts" "$FAILPROBE/workspace/tasks" "$FAILPROBE/workspace/results" "$FAILPROBE/.git"
 cp "$REPO/src/check-pending-tasks.sh" "$FAILPROBE/src/"
@@ -253,6 +278,47 @@ case "$FPO_OUT" in
   *) bad "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" "got: ${FPO_OUT:0:120}" ;;
 esac
 rm -rf "$FAILPROBE_FOREIGN" "$FAILPROBE"
+
+# 12. A REAL checkout with NO .git of its OWN (a subdir of a real repo) but a
+# RESOLVED identity equal to the cwd's must still be core -- marker-absence
+# must never override a known, matching identity.
+NESTED_REPO="$(mktemp -d)"
+mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
+cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
+NR_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$NESTED_REPO" "$NR_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
+chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
+printf 'id: probe\ntask: nested-subdir-probe\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
+(cd "$NESTED_REPO" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+NR_OUT="$(cd "$NESTED_REPO" && bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+case "$NR_OUT" in
+  *'"decision":"block"'*) ok "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" ;;
+  *) bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" "got: ${NR_OUT:0:120}" ;;
+esac
+rm -rf "$NESTED_REPO"
+
+# 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
+# -- `-e` alone would misread a broken checkout as an intentional bundle.
+DANGLING="$(mktemp -d)"
+mkdir -p "$DANGLING/src" "$DANGLING/scripts" "$DANGLING/workspace/tasks" "$DANGLING/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$DANGLING/src/"
+cp "$REPO/scripts/git-binary.sh" "$DANGLING/scripts/"
+DL_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$DANGLING" "$DL_PY" > "$DANGLING/scripts/sutando-config.sh"
+chmod +x "$DANGLING/scripts/sutando-config.sh"
+printf 'id: probe\ntask: dangling-symlink-probe\n' > "$DANGLING/workspace/tasks/$PROBE"
+ln -s "/nonexistent-target-$$" "$DANGLING/.git"
+DANGLING_FOREIGN="$(mktemp -d)"
+(cd "$DANGLING_FOREIGN" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+DL_OUT="$(cd "$DANGLING_FOREIGN" && bash "$DANGLING/src/$(basename "$HOOK")" 2>&1)"
+case "$DL_OUT" in
+  *'"decision":"block"'*) ok "a dangling .git symlink is marker-present, ambiguous -> still gates" ;;
+  *) bad "a dangling .git symlink is marker-present, ambiguous -> still gates" "got: ${DL_OUT:0:120}" ;;
+esac
+rm -rf "$DANGLING_FOREIGN" "$DANGLING"
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
