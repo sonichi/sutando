@@ -2,22 +2,6 @@
  "note": "Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.",
  "tools": [
   {
-   "name": "brightness",
-   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Brightness level 0-100"
-   }
-  },
-  {
-   "name": "brightness",
-   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Brightness level 0-100"
-   }
-  },
-  {
    "name": "call_contact",
    "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
@@ -288,26 +272,6 @@
    }
   },
   {
-   "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
-   "execution": "inline",
-   "params": {
-    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
-    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
-    "modifiers": "Modifier keys"
-   }
-  },
-  {
-   "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
-   "execution": "inline",
-   "params": {
-    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
-    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
-    "modifiers": "Modifier keys"
-   }
-  },
-  {
    "name": "query_active_artifact",
    "description": "Search the currently-loaded artifact (see set_active_artifact) for content matching a query. Use for any follow-up question about the same document: sections, keywords, line references. Fast — in-process, no task-bridge round-trip. Returns a relevant excerpt with line range. Error if no artifact is loaded.",
    "execution": "inline",
@@ -577,62 +541,6 @@
    "execution": "inline",
    "params": {
     "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
-   }
-  },
-  {
-   "name": "toggle_tasks",
-   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
-   "execution": "inline",
-   "params": {
-    "action": "\"collapse\" to hide task results, \"expand\" to show them",
-    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
-   }
-  },
-  {
-   "name": "toggle_tasks",
-   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
-   "execution": "inline",
-   "params": {
-    "action": "\"collapse\" to hide task results, \"expand\" to show them",
-    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
-   }
-  },
-  {
-   "name": "type_text",
-   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
-   "execution": "inline",
-   "params": {
-    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
-    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
-    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
-   }
-  },
-  {
-   "name": "type_text",
-   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
-   "execution": "inline",
-   "params": {
-    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
-    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
-    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
-   }
-  },
-  {
-   "name": "volume",
-   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Volume level 0-100. Omit to mute/unmute.",
-    "mute": "true to mute, false to unmute"
-   }
-  },
-  {
-   "name": "volume",
-   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Volume level 0-100. Omit to mute/unmute.",
-    "mute": "true to mute, false to unmute"
    }
   },
   {

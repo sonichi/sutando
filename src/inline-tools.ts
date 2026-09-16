@@ -1375,8 +1375,10 @@ const personalAllTools = (() => {
 // presenter-sentinel conditionals) — exported so behavior-anchor tests can
 // pin the STATIC tool surface portably (CI has no personal skill manifests;
 // see tests/voice-behavior-anchors.test.ts).
+// macOS automation only; other hosts must not be shown tools that cannot run there.
+const MACOS_ONLY_TOOLS = new Set(['press_key', 'type_text', 'volume', 'brightness', 'toggle_tasks', 'slide_control', 'fullscreen']);
 export const envDependentToolNames: ReadonlySet<string> = new Set([
-	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
+	...personalAllTools.map(t => t.name), ...MACOS_ONLY_TOOLS,
 ]);
 // voice-agent invokes each once per session with {session, injectText}.
 // Empty when no skill exports setup().
@@ -1434,7 +1436,11 @@ function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 }
 export const coreDocumentedSkills = loadCoreDocumentedSkills();
 
-export const inlineTools = assertUniqueToolNames([
+export function forHostPlatform<T extends { name: string }>(tools: T[], platform: NodeJS.Platform = process.platform): T[] {
+	return platform === 'darwin' ? tools : tools.filter(t => !MACOS_ONLY_TOOLS.has(t.name));
+}
+
+export const inlineTools = forHostPlatform(assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
@@ -1446,7 +1452,7 @@ export const inlineTools = assertUniqueToolNames([
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	switchVoiceConfigTool,
-	...personalAllTools ]);
+	...personalAllTools ]));
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1456,7 +1462,7 @@ export const anyCallerTools = [
 ];
 
 /** Owner-only tools (require isOwner) */
-export const ownerOnlyTools = [
+export const ownerOnlyTools = forHostPlatform([
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
@@ -1469,7 +1475,7 @@ export const ownerOnlyTools = [
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	switchVoiceConfigTool,
 	...personalTools.owner,
-];
+]);
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
 export const configurableTools = [
