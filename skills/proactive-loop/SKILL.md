@@ -63,9 +63,12 @@ caps this file and refuses date stamps in it).
    (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). A negative
    states its population inline — "0 of N matching X" — or nobody, including its author, can falsify it.
    Name what a non-zero looks like, run the positive control, suspect scope then shape, never in zsh.
-3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
+3.45. **Duplicate issue/PR gate**, chained so a refusal cannot be skipped. It queries
+   `repo:X in:title` with no `is:issue` and no `state:`, so it covers PRs too — including MERGED
+   ones an open-only `gh pr list` cannot see:
    `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
-   (0 no candidate · 1 do not file, candidates named · 2 cannot answer).
+   (0 no candidate · 1 do not file, candidates named · 2 cannot answer). Chain `gh pr create` the
+   same way, and run the gate BARE: a `| tail` reports the pipe's status, not the gate's verdict.
 3.5. **Policy.** `python3 skills/proactive-loop/scripts/self-development-enabled.py` → `disabled` skips
    4–8, 10, 11. Owner-requested tasks, pending questions, health/service recovery and the watcher remain
    active. Manual `/proactive-loop` invocation does not override the policy.

@@ -28,11 +28,22 @@ fi
 
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
+# Ownership is owned by src/delivery/recipients.py, the same policy orphan
+# recovery uses; a local re-implementation drifts and strands a worker's task.
+held_by_another_recipient() {
+  [ -n "$PYBIN" ] || return 1
+  SUTANDO_SRC="$REPO_DIR/src" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.recipients import held_by_another_recipient as h; sys.exit(0 if h(sys.argv[1], sys.argv[2]) else 1)' "$WORKSPACE" "$1"
+}
 
 UNPROCESSED=""
+HELD=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
+  if held_by_another_recipient "$BASENAME"; then
+    HELD+=" $BASENAME"
+    continue
+  fi
   # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
   # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then
@@ -47,6 +58,10 @@ $(cat "$f")
 
 "
 done
+
+# Visible, never silent: a held task is excluded from the block but still named,
+# so a worker parked forever is diagnosable instead of merely quiet.
+[ -n "$HELD" ] && echo "check-pending-tasks: held by another recipient, not this core's backlog:$HELD" >&2
 
 if [ -n "$UNPROCESSED" ] && [ -z "$PYBIN" ]; then
   # Encoding needs an interpreter the resolver would not supply. Say so on stderr

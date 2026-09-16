@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Step 2 of /task-orphan-check, as a script: classify every live task in
-`<workspace>/tasks/` as done / fresh / orphan / import-resume, read-only.
+`<workspace>/tasks/` as done / held / fresh / orphan / import-resume, read-only.
 
 The skill was prose-only ("marker-or-not + age-vs-5min"); its own note said to
 promote the classification to a script once the rules grew past that. They
@@ -20,6 +20,10 @@ Verdicts (first match wins):
                   (`done`, `staged`, `discarded`, `forgot`) — the run this
                   task started reached its end; a staged digest waits on an
                   owner reply, which arrives as a new task.
+  held            a delivery sentinel in `<workspace>/deliveries/<recipient>/`
+                  names this task: that recipient owes the result, so it is not
+                  the core's backlog. Step 3 LEAVES IT ALONE — the sentinel
+                  holds no payload, so archiving strands the recipient.
   import-stalled  an import task whose bound run is at a resumable phase but
                   whose status.json has not moved for IMPORT_STALL_S
                   (3600 s): left in tasks/ (the watcher's sweep still resumes
@@ -83,6 +87,7 @@ if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+from delivery.recipients import holders as delivery_holders  # noqa: E402
 
 FRESH_AGE_S = 300
 IMPORT_FRESH_AGE_S = 1800
@@ -223,6 +228,15 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     marker = completion_marker(workspace / "results", task_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
+        return row
+
+    # Ownership before age: a delivery sentinel holds no payload, it names the
+    # queue file, so archiving one strands the recipient that owes the result.
+    held = delivery_holders(workspace, path.name)
+    if held:
+        row.update(verdict="held", holders=held,
+                   reason=f"delivered to {', '.join(held)}; that recipient owes the result, "
+                          "so this is not the core's backlog and must not be archived")
         return row
 
     intent = import_intent(headers, parsed.body)
