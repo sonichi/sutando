@@ -133,6 +133,32 @@ def resolve_label(roster: dict, name: str) -> str:
     return hits[0] if len(hits) == 1 else name
 
 
+LEGACY_WORKER_FIELD = "target_worker"
+
+
+def requested_worker_of(task: dict, warn=None) -> "str | None":
+    """The route the sender asked for, from the canonical field.
+
+    `target_worker` is accepted for one migration window and reported, so a
+    producer that has not moved keeps working and is visible while it does.
+    Two fields that DISAGREE name two recipients: neither is chosen, because
+    picking one silently routes the owner's message somewhere they can no
+    longer see. The task falls through to its binding instead.
+    """
+    say = warn if warn is not None else (lambda m: print(m, file=sys.stderr))
+    canonical = (task.get("requested_worker") or "").strip() or None
+    legacy = (task.get(LEGACY_WORKER_FIELD) or "").strip() or None
+    if canonical and legacy and canonical != legacy:
+        say(f"pool_roster: SECURITY: requested_worker={canonical!r} disagrees with "
+            f"{LEGACY_WORKER_FIELD}={legacy!r}; ignoring both and using the binding")
+        return None
+    if legacy and not canonical:
+        say(f"pool_roster: DEPRECATED: {LEGACY_WORKER_FIELD} is the old name for "
+            f"requested_worker; the producer of this task should be updated")
+        return legacy
+    return canonical
+
+
 def targets_for(roster: dict, source: str, requested_worker=None) -> list:
     """Resolve one task to its recipients: `requested_worker`, else the binding
     for its source, else the core. A set resolves to its member list.

@@ -418,6 +418,173 @@ class TestRequestFile(Base):
             connectors.parser().parse_args(await_argv("linear") + ["--request-file", "-"])
 
 
+SHARED = "!shared:ag2.space"
+
+
+def private_argv(*slugs, task="task-abc", reply="$evt1", lines=("Linear isn't connected yet.", "Once that's done I'll list them.")):
+    argv = await_argv(*slugs, task=task, room=SHARED, reply=reply, request="show my linear issues") + ["--private"]
+    for line in lines:
+        argv += ["--line", line]
+    return argv
+
+
+class TestPrivateCard(Base):
+    def cards(self):
+        return connectors.read_cards(self.ws)
+
+    def test_private_await_writes_the_card_with_its_lines_and_no_request(self):
+        cloud = FakeCloud(self.ws)
+        code, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((code, out["private"]), (connectors.EXIT_OK, True))
+        [card] = self.cards()
+        self.assertEqual({k: card[k] for k in ("id", "room", "event", "for", "status")},
+                         {"id": out["wait_id"], "room": SHARED, "event": "$evt1", "for": OWNER, "status": "waiting"})
+        self.assertEqual(card["toolkits"], [{"slug": "linear", "name": "Linear"}])
+        self.assertEqual([x["text"] for x in card["lines"]],
+                         ["Linear isn't connected yet.", "Once that's done I'll list them."])
+        raw = connectors.cards_path(self.ws).read_text()
+        self.assertNotIn("show my linear issues", raw, "the card never carries the owner's request")
+        self.assertTrue(json.loads(connectors.marker_path(self.ws, out["wait_id"]).read_text())["private"])
+
+    def test_a_room_visible_wait_writes_no_card_and_lines_need_private(self):
+        cloud = FakeCloud(self.ws)
+        code, out = run(self.ws, await_argv("linear"), cloud, self.spawn)
+        self.assertEqual((code, out["private"], self.cards()), (connectors.EXIT_OK, False, []))
+        code, out = run(self.ws, await_argv("googlecalendar") + ["--line", "hi"], cloud, self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, out = run(self.ws, private_argv("googlecalendar", lines=("a", "b", "c", "d")), cloud, self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_note_appends_lines_and_sets_status_and_caps(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        wait_id = out["wait_id"]
+        code, noted = run(self.ws, ["note", wait_id, "Linear", "is", "connected.", "On it.", "--status", "connected"])
+        self.assertEqual((code, noted["noted"], noted["card"]["status"]), (connectors.EXIT_OK, True, "connected"))
+        self.assertEqual(self.cards()[0]["lines"][-1]["text"], "Linear is connected. On it.")
+        for i in range(30):
+            run(self.ws, ["note", wait_id, "x" * 400 + str(i)])
+        lines = self.cards()[0]["lines"]
+        self.assertEqual(len(lines), connectors.MAX_CARD_LINES)
+        self.assertEqual(len(lines[-1]["text"]), connectors.MAX_LINE_CHARS)
+        code, missing = run(self.ws, ["note", "1789000000000-0000ffff", "hello"])
+        self.assertEqual((code, missing["noted"]), (connectors.EXIT_NO, False))
+        code, bad = run(self.ws, ["note", wait_id, "hello", "--status", "bogus"])
+        self.assertEqual((code, bad["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_the_winning_claim_sets_the_status_once(self):
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        code, claimed = run(self.ws, ["claim", SHARED], cloud)
+        self.assertEqual((code, self.cards()[0]["status"]), (connectors.EXIT_OK, "claimed"))
+        connectors.run_waiter(self.ws, out["wait_id"], cloud, now=time.time, sleep=lambda s: None)
+        self.assertEqual(self.cards()[0]["status"], "claimed", "the waiter lost the race and changes nothing")
+
+    def test_a_released_claim_puts_the_card_back_to_waiting(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        won = connectors.claim(self.ws, out["wait_id"], "connected", NOW)
+        self.assertEqual(self.cards()[0]["status"], "connected")
+        self.assertTrue(connectors.release(self.ws, won))
+        self.assertEqual(self.cards()[0]["status"], "waiting")
+
+    def test_asking_again_points_the_old_card_at_the_new_one(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, second = run(self.ws, private_argv("linear", "googlecalendar", task="task-two", reply="$evt2"),
+                        cloud, self.spawn)
+        self.assertEqual(second["superseded"], [first["wait_id"]])
+        cards = {c["id"]: c for c in self.cards()}
+        self.assertEqual((cards[first["wait_id"]]["status"], cards[first["wait_id"]]["into"]),
+                         ("superseded", second["wait_id"]))
+        self.assertEqual(([t["slug"] for t in cards[second["wait_id"]]["toolkits"]], cards[second["wait_id"]]["event"]),
+                         (["linear", "googlecalendar"], "$evt2"))
+
+    def test_a_private_and_a_room_visible_wait_never_merge(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, await_argv("linear", room=SHARED), cloud, self.spawn)
+        _, second = run(self.ws, private_argv("linear", task="task-two", reply="$evt2"), cloud, self.spawn)
+        self.assertEqual(second["superseded"], [])
+        self.assertEqual(len(connectors.list_markers(self.ws)), 2)
+
+    def test_the_same_task_again_reuses_the_wait_and_its_card(self):
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, again = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((again["reused"], len(self.cards())), (True, 1))
+
+    def test_status_lists_the_room_private_cards(self):
+        cloud = FakeCloud(self.ws)
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        _, status = run(self.ws, ["status", "--room", SHARED], cloud)
+        self.assertEqual([c["id"] for c in status["private_cards"]], [out["wait_id"]])
+        _, other = run(self.ws, ["status", "--room", ROOM], cloud)
+        self.assertEqual(other["private_cards"], [])
+
+    def test_a_torn_cards_file_reads_as_none_and_is_rebuilt(self):
+        connectors.cards_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        connectors.cards_path(self.ws).write_text('{"version": 1, "cards": [{"id": "nope"}, 3')
+        self.assertEqual(self.cards(), [])
+        _, out = run(self.ws, private_argv("linear"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual([c["id"] for c in self.cards()], [out["wait_id"]])
+
+    def test_a_card_write_that_fails_never_costs_the_claim(self):
+        cloud = FakeCloud(self.ws, connections=[{"toolkit": "linear", "status": "active"}])
+        _, out = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        with mock.patch.object(connectors, "_write_cards", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(connectors.set_card(self.ws, out["wait_id"], status="connected", line="x"))
+            code, claimed = run(self.ws, ["claim", SHARED], cloud)
+        self.assertIn("not updated: disk full", err.getvalue())
+        self.assertEqual((code, [c["wait_id"] for c in claimed["claimed"]]), (connectors.EXIT_OK, [out["wait_id"]]))
+        self.assertTrue(connectors.claimed_path(self.ws, out["wait_id"]).exists())
+        self.assertEqual(self.cards()[0]["status"], "waiting", "the card is unchanged, the claim still stands")
+
+    def test_a_marker_that_cannot_be_written_expires_its_card_and_gives_merged_waits_back(self):
+        self.origin("task-two")
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        args = connectors.parser().parse_args(private_argv("linear", "googlecalendar", task="task-two", reply="$evt2"))
+        with mock.patch.object(connectors, "write_marker", side_effect=OSError("read-only")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(OSError):
+                connectors.cmd_await(self.ws, cloud, args, spawn=self.spawn, now=lambda: NOW + 1)
+        cards = {c["id"]: c for c in self.cards()}
+        new = [c for i, c in cards.items() if i != first["wait_id"]]
+        self.assertEqual([c["status"] for c in new], ["expired"], "the new card never shows as waiting")
+        self.assertTrue(connectors.marker_path(self.ws, first["wait_id"]).exists(), "the absorbed wait is released")
+
+    def test_asking_again_restores_a_missing_card_for_the_same_wait(self):
+        cloud = FakeCloud(self.ws)
+        _, first = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        connectors.cards_path(self.ws).unlink()
+        _, again = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        self.assertEqual((again["reused"], again["wait_id"]), (True, first["wait_id"]))
+        [card] = self.cards()
+        self.assertEqual((card["id"], [x["text"] for x in card["lines"]][:1]), (first["wait_id"], ["Linear isn't connected yet."]))
+
+    def test_an_empty_note_is_refused(self):
+        _, out = run(self.ws, private_argv("linear"), FakeCloud(self.ws), self.spawn)
+        code, err = run(self.ws, ["note", out["wait_id"], "   "])
+        self.assertEqual((code, err["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_rearm_prunes_old_cards_of_finished_waits_only(self):
+        cloud = FakeCloud(self.ws)
+        _, done = run(self.ws, private_argv("linear"), cloud, self.spawn)
+        connectors.claim(self.ws, done["wait_id"], "connected", NOW)
+        self.origin("task-two")
+        _, live = run(self.ws, private_argv("googlecalendar", task="task-two", reply="$evt2"), cloud, self.spawn)
+        with connectors.cards_locked(self.ws) as path:
+            cards = connectors.read_cards(self.ws)
+            for c in cards:
+                c["updated"] = 0
+            connectors._write_cards(path, cards)
+        self.assertEqual(connectors.prune_cards(self.ws, time.time()), 1)
+        self.assertEqual([c["id"] for c in self.cards()], [live["wait_id"]])
+
+
 class TestMergeWaits(Base):
     def test_asking_again_in_the_room_yields_one_resume_task(self):
         self.origin("task-two")
@@ -874,6 +1041,157 @@ class TestClaim(Base):
             code, out = run(self.ws, ["claim", ROOM, "--force"], FakeCloud(self.ws))
         self.assertEqual((code, out["claimed"]), (connectors.EXIT_NO, []))
         self.assertFalse(connectors.marker_path(self.ws, m["wait_id"]).exists())
+
+
+OLD_ID = "11111111-1111-4111-8111-111111111111"
+NEW_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def switch_argv(*slugs, **kw):
+    return await_argv(*slugs, **kw) + ["--switch"]
+
+
+def linear_rows(*ids, label="old@example.com"):
+    return [{"id": i, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": label} for i in ids]
+
+
+class TestSwitch(Base):
+    """await --switch: ready only once an app has an active connection that was not active at arm time."""
+
+    def test_the_baseline_is_recorded_and_reported(self):
+        rows = linear_rows(OLD_ID) + [{"id": "33333333-3333-4333-8333-333333333333", "toolkit": "linear",
+                                       "status": "expired"}]
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, switch_argv("linear"), cloud, self.spawn)
+        self.assertEqual((code, out["switch"], out["private"]), (connectors.EXIT_OK, True, False))
+        marker = json.loads(Path(out["marker"]).read_text())
+        self.assertEqual(marker["switch"], {"linear": [OLD_ID]}, "only active rows are the old account")
+        self.assertEqual(cloud.paths.count("/api/connectors"), 1)
+        self.assertEqual(connectors.read_cards(self.ws), [])
+        [pending] = run(self.ws, ["status", "--room", ROOM], cloud)[1]["pending_waits"]
+        self.assertTrue(pending["switch"])
+        code, plain = run(self.ws, await_argv("googlecalendar", task="task-abc", room="!else:ag2.space"),
+                          FakeCloud(self.ws), self.spawn)
+        self.assertFalse(plain["switch"])
+        self.assertNotIn("switch", json.loads(Path(plain["marker"]).read_text()))
+
+    def test_an_app_not_connected_yet_gets_an_empty_baseline(self):
+        code, out = run(self.ws, switch_argv("linear", "googlecalendar"), FakeCloud(self.ws, connections=linear_rows(OLD_ID)),
+                        self.spawn)
+        self.assertEqual(json.loads(Path(out["marker"]).read_text())["switch"],
+                         {"linear": [OLD_ID], "googlecalendar": []})
+
+    def test_a_private_switch_card_carries_the_mode(self):
+        code, out = run(self.ws, private_argv("linear") + ["--switch"], FakeCloud(self.ws, connections=linear_rows(OLD_ID)),
+                        self.spawn)
+        [card] = connectors.read_cards(self.ws)
+        self.assertEqual((code, out["switch"], out["private"], card["mode"], card["id"]),
+                         (connectors.EXIT_OK, True, True, "switch", out["wait_id"]))
+        _, plain = run(self.ws, private_argv("googlecalendar", task="task-abc", reply="$evt9"), FakeCloud(self.ws),
+                       self.spawn)
+        self.assertNotIn("mode", next(c for c in connectors.read_cards(self.ws) if c["id"] == plain["wait_id"]))
+
+    def test_a_failed_baseline_read_exits_2_and_writes_nothing(self):
+        for error in (cloud_auth.CloudError(502, "http_502"), connectors.Setup("not_signed_in", "x"),
+                      ValueError("bad json"), OSError("reset")):
+            with self.subTest(error=repr(error)):
+                class Failing(FakeCloud):
+                    def active_connections(inner):
+                        raise error
+
+                code, out = run(self.ws, private_argv("linear") + ["--switch"], Failing(self.ws), self.spawn)
+                self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "cloud_error"))
+        self.assertEqual((connectors.list_markers(self.ws), connectors.read_cards(self.ws), self.spawned), ([], [], []))
+
+    def test_a_failed_baseline_read_gives_absorbed_waits_back(self):
+        self.origin("task-two")
+        _, first = run(self.ws, switch_argv("linear"), FakeCloud(self.ws, connections=linear_rows(OLD_ID)), self.spawn)
+        cloud = FakeCloud(self.ws)
+        cloud.error = cloud_auth.CloudError(0, "network", "down")
+        cloud.connector_search = lambda q: [i for i in CATALOG if i["slug"] == q]
+        cloud.user_id = lambda: "u-owner"
+        code, out = run(self.ws, switch_argv("linear", task="task-two"), cloud, self.spawn)
+        self.assertEqual((code, out["error"]), (connectors.EXIT_SETUP, "cloud_error"))
+        self.assertEqual([m["wait_id"] for m in connectors.list_markers(self.ws)], [first["wait_id"]])
+
+    def test_claim_waits_for_a_new_connection(self):
+        _, out = run(self.ws, switch_argv("linear"), FakeCloud(self.ws, connections=linear_rows(OLD_ID)), self.spawn)
+        cloud = FakeCloud(self.ws, connections=linear_rows(OLD_ID))
+        code, still = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual((code, still["claimed"], [p["wait_id"] for p in still["pending"]]),
+                         (connectors.EXIT_NO, [], [out["wait_id"]]))
+        self.assertTrue(still["pending"][0]["switch"])
+        self.assertEqual(cloud.paths, ["/api/connectors"])
+        cloud = FakeCloud(self.ws, connections=linear_rows(NEW_ID, OLD_ID))
+        code, done = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual((code, [c["wait_id"] for c in done["claimed"]], done["claimed"][0]["switch"]),
+                         (connectors.EXIT_OK, [out["wait_id"]], True))
+        self.assertEqual(cloud.paths, ["/api/connectors", "/api/me"], "still one connections read per claim")
+
+    def test_claim_of_a_plain_and_a_switch_wait_is_one_read(self):
+        self.marker(wait_id="1789000000001-0000abc1", slugs=("linear",))
+        _, sw = run(self.ws, switch_argv("linear", task="task-abc", room="!dm2:ag2.space"),
+                    FakeCloud(self.ws, connections=linear_rows(OLD_ID)), self.spawn)
+        switch_marker = json.loads(Path(sw["marker"]).read_text())
+        connectors.write_marker(self.ws, {**switch_marker, "room": ROOM})
+        cloud = FakeCloud(self.ws, connections=linear_rows(OLD_ID))
+        code, out = run(self.ws, ["claim", ROOM], cloud)
+        self.assertEqual(([c["wait_id"] for c in out["claimed"]], [p["wait_id"] for p in out["pending"]]),
+                         (["1789000000001-0000abc1"], [sw["wait_id"]]))
+        self.assertEqual(cloud.paths, ["/api/connectors", "/api/me"])
+
+    def test_switch_and_plain_waits_never_merge_or_reuse(self):
+        self.origin("task-two")
+        rows = linear_rows(OLD_ID)
+        _, plain = run(self.ws, await_argv("linear"), FakeCloud(self.ws, connections=rows), self.spawn)
+        _, same_task = run(self.ws, switch_argv("linear"), FakeCloud(self.ws, connections=rows), self.spawn)
+        self.assertEqual((same_task["reused"], same_task["superseded"], same_task["switch"]), (False, [], True))
+        _, other_task = run(self.ws, await_argv("linear", task="task-two"), FakeCloud(self.ws, connections=rows),
+                            self.spawn)
+        self.assertEqual(other_task["superseded"], [plain["wait_id"]], "plain folds into plain only")
+        _, other_switch = run(self.ws, switch_argv("linear", task="task-two"), FakeCloud(self.ws, connections=rows),
+                              self.spawn)
+        self.assertEqual(other_switch["superseded"], [same_task["wait_id"]], "switch folds into switch only")
+        self.assertEqual(sorted((m["wait_id"], bool(m.get("switch"))) for m in connectors.list_markers(self.ws)),
+                         sorted([(other_task["wait_id"], False), (other_switch["wait_id"], True)]))
+        _, again = run(self.ws, switch_argv("linear", task="task-two"), FakeCloud(self.ws, connections=rows), self.spawn)
+        self.assertEqual((again["reused"], again["wait_id"]), (True, other_switch["wait_id"]))
+
+    def test_status_lists_connections_with_their_account(self):
+        rows = linear_rows(NEW_ID, label="new@example.com") + [
+            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None,
+             "iconUrl": "https://x", "connectedAt": "2026-09-01T00:00:00Z"}]
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["status", "linear"], cloud)
+        self.assertEqual(code, connectors.EXIT_OK)
+        self.assertEqual(out["connections"], [
+            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com"},
+            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None}])
+        self.assertEqual(cloud.paths, ["/api/connectors"])
+
+    def test_active_connections_keeps_ids_of_active_rows(self):
+        rows = linear_rows(OLD_ID, NEW_ID) + [{"toolkit": "Gmail", "status": "ACTIVE"},
+                                             {"id": "", "toolkit": "slack", "status": "active"},
+                                             {"id": "x", "toolkit": "notion", "status": "pending"}, "junk"]
+        cloud = FakeCloud(self.ws, connections=rows)
+        self.assertEqual(cloud.active_connections(), {"linear": {OLD_ID, NEW_ID}, "gmail": set(), "slack": set()})
+        self.assertEqual(cloud.active_toolkits(), {"linear", "gmail", "slack"})
+
+    def test_wait_ready(self):
+        m = {"toolkits": [{"slug": "linear"}, {"slug": "gmail"}]}
+        self.assertTrue(connectors.wait_ready(m, {"linear": set(), "gmail": set()}))
+        self.assertFalse(connectors.wait_ready(m, {"linear": {OLD_ID}}))
+        sw = {**m, "switch": {"linear": [OLD_ID], "gmail": []}}
+        self.assertFalse(connectors.wait_ready(sw, {"linear": {OLD_ID}, "gmail": {NEW_ID}}))
+        self.assertFalse(connectors.wait_ready(sw, {"linear": {NEW_ID}}))
+        self.assertTrue(connectors.wait_ready(sw, {"linear": {OLD_ID, NEW_ID}, "gmail": {"g1"}}))
+        self.assertFalse(connectors.wait_ready({"toolkits": []}, {}))
+
+    def test_a_malformed_baseline_is_an_invalid_marker(self):
+        m = self.marker()
+        connectors.write_marker(self.ws, {**m, "switch": ["linear"]})
+        with self.assertRaises(ValueError):
+            connectors.read_marker(self.ws, m["wait_id"])
 
 
 class TestRearm(Base):

@@ -8,8 +8,9 @@ connector tools, first:
   → whether the app is connected, plus the matching actions with their input schemas;
 - `mcp__sutando-station__composio_exec` `{"toolkit": "googlecalendar", "action": "<from find>", "arguments": {…}}`.
 
-Not connected → follow the `connect-apps` skill: one in-chat Connect card, the task closes, and the
-answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
+Not connected → follow the `connect-apps` skill: one Connect card (a message in the owner's DM; in a
+room with other people a private card under their message that only they see), the task closes, and
+the answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
 Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
 macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
@@ -268,13 +269,16 @@ Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
 Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec`. Connecting one is the
-`connect-apps` skill's job (an in-chat Connect card, then an automatic resume); its helper:
+`connect-apps` skill's job (a Connect card, private to the owner in a shared room, then an automatic
+resume); its helper:
 ```bash
 C=skills/connect-apps/scripts/connectors.py
 python3 "$C" find "google calendar"     # exact catalog app, connected or not
 python3 "$C" status googlecalendar      # connected? plus pending waits
 python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
 ```
+The owner sees, switches and disconnects connected apps in AG2 Space → Settings → Integrations;
+`await <slug> --switch` arms a wait that resumes only once the app is signed in with a new account.
 
 **App launcher** — open any macOS app:
 ```bash

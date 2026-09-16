@@ -3,10 +3,23 @@
 metadata: {"metadata": {"worker_id": "core-2"}} -> broker -> the Matrix
 event's content["space.ag2.worker"].id (ag2space-backend#882).
 
-The worker is read from the per-core done-flag the pool already writes
-(state/cores/<core>/done/task-<id>.flag), NOT from the "- core-N" signature
-in the body: that line is for humans, and reformatting it must not silently
-change routing or attribution.
+The worker is read from the per-worker done-flag the pool already writes
+(state/workers/<recipient>/done/task-<id>.flag — the ONE writer is
+skills/worker-pool/scripts/pool_delivery.py::mark_done/done_flag), NOT from
+the "- core-N" signature in the body: that line is for humans, and
+reformatting it must not silently change routing or attribution.
+
+The fixture writes through pool_delivery.done_flag() rather than
+hand-spelling the path: packages/ag2-sparrow is a standalone PyPI package
+and cannot import skills/worker-pool/ in production, so _worker_of()'s own
+path literal in remote_gateway_bridge.py is the only place the convention is
+re-stated — building the fixture from the real writer's path function is
+what makes a future drift between the two show up as a failing test instead
+of a silently-always-empty lookup (sonichi/sutando, 2026-09-16: _worker_of
+globbed "cores" while mark_done wrote "workers", so every result shipped
+with no worker_id and the six tests here never caught it, because the old
+_flag() fixture reimplemented the SAME wrong "cores" path instead of calling
+the real writer).
 
 Run: python3 tests/gateway-result-worker-attribution.test.py
 """
@@ -19,7 +32,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
+_REPO = Path(__file__).resolve().parent.parent
+_SRC = _REPO / "src" / "remote-gateway-bridge.py"
+_POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
+
+sys.path.insert(0, str(_POOL_SCRIPTS))
+import pool_delivery  # noqa: E402
 
 
 def _load():
@@ -38,8 +56,10 @@ class _Captured(Exception):
 class WorkerAttribution(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
-        self.tmp = tempfile.mkdtemp()
-        self.mod._STATE = Path(self.tmp)
+        # self.workspace is the WORKSPACE root pool_delivery expects; _STATE
+        # is production's own state_dir() == <workspace>/state.
+        self.workspace = tempfile.mkdtemp()
+        self.mod._STATE = Path(self.workspace) / "state"
 
         self.seen = {}
 
@@ -53,9 +73,9 @@ class WorkerAttribution(unittest.TestCase):
     def _flag(self, core: str, tid: str):
         # Named exactly as finish_task writes it: the full result stem, prefix
         # included. A bare-id fixture agrees with a prefix bug and hides it.
-        d = Path(self.tmp) / "cores" / core / "done"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{tid}.flag").write_text("")
+        path = pool_delivery.done_flag(Path(self.workspace), core, tid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
 
     def _doc(self, tid: str) -> dict:
         self.seen.clear()
@@ -95,7 +115,7 @@ class WorkerAttribution(unittest.TestCase):
         self.assertEqual(self.mod._worker_of("6bareid00000000000"), "")
 
     def test_worker_of_survives_a_missing_state_tree(self):
-        self.mod._STATE = Path(self.tmp) / "nonexistent"
+        self.mod._STATE = Path(self.workspace) / "nonexistent"
         self.assertEqual(self.mod._worker_of("task-5missingstate0000"), "")
 
 
