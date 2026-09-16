@@ -3,6 +3,14 @@
 # and propagate deletion of a peer's hosts/<label>/ subtree.
 
 set -euo pipefail
+# HERMETICITY (same fix as tests/sync-workspace.test.sh:27): `_host()` resolves
+# ${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}, so on a live Sutando core
+# (which exports SUTANDO_HOST_LABEL) the fixtures' SUTANDO_HOST_OVERRIDE=local-host
+# shim is silently defeated -- own_host resolves to the REAL host label, the
+# hosts/local-host/ -> hosts/*/ widening this suite depends on never fires, and
+# Test 1/2 fail for an environment reason having nothing to do with the code
+# under test (#4309 follow-up investigation, 2026-09-16).
+unset SUTANDO_HOST_LABEL
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -170,7 +178,14 @@ done
 echo
 echo "Test 3: foreign-host deletion guard survives customized exclude rules"
 setup_fixture "push-guard"
-printf '%s\n' '# operator customization' \
+# A REAL rule, not a bare comment (#4309 follow-up, 2026-09-16): a comment is
+# inert to _exclude_rules_only's comparison and to gitignore itself, so once
+# _is_safe_carveout_addition also recognizes hard-deny lines (closing the
+# qingyun-wu/keweichen #4309 gap) a comment-only "customization" no longer
+# blocks the SAME safe hosts/local-host/ -> hosts/*/ widening Test 1 already
+# expects to succeed unprompted -- it was never a meaningful customization to
+# begin with. An operator's own RULE is what this guard must survive.
+printf '%s\n' '!my/operator/rule' \
     >> "$FIXTURE_WS/.git/info/exclude"
 set +e
 out="$(
