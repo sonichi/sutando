@@ -26,19 +26,9 @@ _sutando_git_developer_tools_installed() {
 }
 
 # Resolve $1 to its final target, following symlinks by hand (no GNU-only
-# `readlink -f`, and no shelling to python3 -- that would re-enter the exact
-# stub landmine this file exists to avoid). Bounded to break a symlink cycle --
-# macOS permits chains up to 32 hops deep (SYMLOOP_MAX), so the bound must
-# cover that AND still refuse (never silently return an unresolved
-# intermediate) if the chain somehow runs longer still (keweichen, #4323
-# round 3: the old bound stopped at 20 without checking whether `_target`
-# was still a symlink, so a 21+-hop chain ending at the real stub fell
-# through as "resolved" to a mid-chain link that trivially wasn't the
-# literal stub path). Echoes NOTHING (never the unresolved path) if a
-# symlink can't be followed -- a minimal PATH lacking `readlink` must not
-# silently fall through with a corrupted or unresolved target (the exact
-# "dirname: command not found" shape scripts/python-binary.sh already hit
-# and fixed).
+# `readlink -f`, no shelling to python3). Bounded past macOS's 32-hop
+# SYMLOOP_MAX, and refuses (never echoes an unresolved intermediate) if the
+# chain or a missing `readlink` still can't be fully resolved within that.
 _sutando_git_realpath() {
 	_target="$1"
 	_i=0
@@ -62,11 +52,7 @@ _sutando_git_realpath() {
 }
 
 # True when $1's REAL target (symlinks resolved) is the literal system git --
-# a symlink elsewhere on PATH pointing AT the stub is the stub, not a "real"
-# git (keweichen, #4323 round 2: a directory-only comparison missed exactly
-# this, so a candidate like $HOME/bin/git -> /usr/bin/git passed as safe and
-# the hook then executed the CLT stub anyway). An unresolvable symlink is
-# treated AS the stub -- fail toward refusing, never toward "must be fine".
+# a symlink pointing AT the stub is the stub. Unresolvable -> treated as stub too.
 _sutando_git_is_system_stub() {
 	[ -f "$1" ] || return 1
 	_resolved="$(_sutando_git_realpath "$1")" || return 0
