@@ -214,6 +214,7 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
+
 # An empty PYBIN must never reach "$PYBIN" as a command -- fail open explicitly
 # rather than lean on an empty command's exit code happening not to equal 1.
 if [ -z "$PYBIN" ]; then
