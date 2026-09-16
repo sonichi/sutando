@@ -117,20 +117,51 @@ grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
 # the classifier so a REAL RECORDING script can be classified as the stub without
 # needing to resolve to the real /usr/bin/git -- decoupling "is-stub" from
 # "would-raise-the-real-dialog" is what makes this witnessable at all.
+#
+# ran.log ABSENCE ALONE proves nothing (keweichen, round 12): if the override
+# seam were bypassed -- resolve_git never calling the classifier, or calling a
+# function by a name that no longer matches -- ran.log would ALSO stay absent,
+# for the wrong reason, and this case would report ok without ever exercising
+# the intended branch. So this case now also asserts: the classifier override
+# WAS invoked (its own marker file), the dev-tools probe WAS invoked (xcode-
+# select's own marker file), the resolver's actual stdout is captured and
+# asserted EMPTY (not just discarded), and -- a genuine positive control -- the
+# SAME recording mechanism, called directly outside resolve_git, DOES write
+# ran.log, so an absence elsewhere cannot be blamed on a broken recorder.
 lab10=$(mktemp -d)
 mkdir -p "$lab10/bin"
 printf '#!/bin/sh\necho "RAN $*" >> %s/ran.log\nexit 1\n' "$lab10" > "$lab10/bin/git"
 chmod +x "$lab10/bin/git"
-printf '#!/bin/sh\nexit 2\n' > "$lab10/xcode-select"; chmod +x "$lab10/xcode-select"
+printf '#!/bin/sh\necho "PROBED" >> %s/xcode-probed.log\nexit 2\n' "$lab10" > "$lab10/xcode-select"
+chmod +x "$lab10/xcode-select"
+# POSITIVE CONTROL on the recorder itself, before trusting any absence below.
+"$lab10/bin/git" --version >/dev/null 2>&1
+if [ -f "$lab10/ran.log" ]; then
+  ok "the recording stub itself writes ran.log when actually executed"
+else
+  bad "the recording stub itself writes ran.log when actually executed" "no ran.log after a direct call"
+fi
+rm -f "$lab10/ran.log"
+lab10_out="$lab10/resolve-stdout.txt"
 OSTYPE=darwin25 PATH="$lab10/bin:$lab10:$PATH" /bin/bash -c "
   . '$REPO/scripts/git-binary.sh'
-  _sutando_git_is_system_stub() { return 0; }
+  touch '$lab10/classifier-invoked.log'
+  _sutando_git_is_system_stub() { echo 1 >> '$lab10/classifier-invoked.log'; return 0; }
   resolve_git
-" >/dev/null
+" >"$lab10_out"
 if [ -f "$lab10/ran.log" ]; then
   bad "the stub candidate is never executed to decide" "$(cat "$lab10/ran.log")"
+elif [ ! -s "$lab10/classifier-invoked.log" ]; then
+  bad "the stub candidate is never executed to decide" \
+    "classifier override was never called -- ran.log's absence proves nothing (the seam was bypassed, not exercised)"
+elif [ ! -f "$lab10/xcode-probed.log" ]; then
+  bad "the stub candidate is never executed to decide" \
+    "xcode-select was never probed -- the dev-tools branch this case targets was never reached"
+elif [ -s "$lab10_out" ]; then
+  bad "the stub candidate is never executed to decide" \
+    "resolve_git returned non-empty ($(cat "$lab10_out")) -- a classified stub with no dev tools must refuse, not return a path"
 else
-  ok "the stub candidate is never executed to decide"
+  ok "the stub candidate is never executed to decide (classifier + dev-tools probe both confirmed invoked, resolver confirmed empty)"
 fi
 
 if [ "$fail" -eq 0 ]; then echo "PASS ($pass/$((pass+fail)))"; else echo "FAIL ($fail failed)"; fi
