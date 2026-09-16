@@ -87,7 +87,7 @@ def route(workspace, task: dict, roster=None) -> dict:
         raise RouterRefused("task has no id")
 
     source = task.get("channel_id") or task.get("source") or ""
-    targets = pr.targets_for(r, source, task.get("requested_worker"))
+    targets = pr.targets_for(r, source, pr.requested_worker_of(task))
 
     # A name not on the roster is not a worker: the core takes it. The core is
     # a recipient, not a fallback, and no OTHER worker ever gets the task.
