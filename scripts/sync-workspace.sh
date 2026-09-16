@@ -571,6 +571,14 @@ _compose_exclude_content() {
     echo "*.ppk"
     echo "*.keystore"
     echo "*.jks"
+    # Claude Code transcript archive (#4309 review, keweichen/qingyun-wu
+    # 2026-09-16): the PreCompact archiver writes full conversation JSONL
+    # under logs/conversations/ — the default carrier set never names it, but
+    # nothing STOPPED a broadened vault.sync.include (e.g. "logs/") from
+    # carrying it. Same hard-deny mechanism as the credential globs above:
+    # emitted last, so it wins over any include regardless of config.
+    echo "logs/conversations/"
+    echo "logs/conversations/**"
 }
 
 # Print `existing` with a legacy per-host carrier scope rewritten to the shared

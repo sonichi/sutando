@@ -598,6 +598,129 @@ HOOKS=(
                     sys.modules[mod_name] = saved
         self.assertEqual(out["status"], "ok", out["detail"])
 
+    def test_core_config_dir_warns_rather_than_guessing_when_resolver_ERRORS(self):
+        # Unlike "unimportable" above, the module IS available and its CALL
+        # raises -- must not silently inspect a guessed path (see PR body, #4309).
+        import sys
+        import types
+        fake = types.ModuleType("sutando_config")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("sutando-config.sh exited 9")
+
+        fake.resolve_claude_sutando_config_dir = _boom
+        saved = sys.modules.get("sutando_config")
+        sys.modules["sutando_config"] = fake
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        finally:
+            if saved is None:
+                sys.modules.pop("sutando_config", None)
+            else:
+                sys.modules["sutando_config"] = saved
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("resolve_claude_sutando_config_dir", out["detail"])
+        # Must NOT have fallen through to the guessed path's registration check.
+        self.assertNotIn(str(self.repo / "workspace" / ".claude-sutando"), out["detail"])
+
+    def test_transcript_dir_warns_rather_than_guessing_when_resolver_ERRORS(self):
+        import sys
+        import types
+        (self.repo / "scripts").mkdir(parents=True)
+        (self.repo / "scripts" / "sutando-config.sh").write_text("#!/bin/bash\n")
+        core_cfg = self.repo / "workspace" / ".claude-sutando"
+        core_cfg.mkdir(parents=True)
+        (core_cfg / "settings.json").write_text(json.dumps({"hooks": {
+            "PreCompact": [{"hooks": [{"command":
+                f"bash {self.repo}/src/archive-transcript.sh {self.repo}/workspace/logs/conversations/"}]}],
+        }}))
+        fake = types.ModuleType("workspace_default")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("resolver blew up")
+
+        fake.resolve_workspace = _boom
+        saved_sc = sys.modules.get("sutando_config")
+        saved_wd = sys.modules.get("workspace_default")
+        sys.modules["sutando_config"] = None  # pin the OTHER resolver to its fallback
+        sys.modules["workspace_default"] = fake
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        finally:
+            for mod_name, saved in (("sutando_config", saved_sc), ("workspace_default", saved_wd)):
+                if saved is None:
+                    sys.modules.pop(mod_name, None)
+                else:
+                    sys.modules[mod_name] = saved
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("resolve_workspace", out["detail"])
+
+
+class TestProjectScopedDeadHooksAfterCoreMove(unittest.TestCase):
+    """#4309 review (keweichen/qingyun-wu, 2026-09-16): moving the core-owned
+    hook target to $CORE_CONFIG_DIR made the dead-hook scan blind to families
+    that remain PROJECT-scoped on purpose (install-personal-claude-hook.sh,
+    install-session-start-hook.sh). Paired fixture, same dead entry: before this
+    fix, project-target reported warn/dead=1 while core-target read ok/dead=0."""
+
+    INSTALLER = '''#!/usr/bin/env bash
+SETTINGS="$CORE_CONFIG_DIR/settings.json"
+HOOKS=(
+  "PreCompact|logs/conversations/|bash $REPO_DIR/src/archive-transcript.sh $TRANSCRIPT_DIR/"
+)
+'''
+
+    def setUp(self):
+        self.hc = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "src" / "install-claude-hooks.sh").write_text(self.INSTALLER)
+        (self.repo / "src" / "archive-transcript.sh").write_text("#!/bin/bash\n")
+        core_cfg = self.repo / "workspace" / ".claude-sutando"
+        core_cfg.mkdir(parents=True)
+        (core_cfg / "settings.json").write_text(json.dumps({"hooks": {
+            "PreCompact": [{"hooks": [{"command":
+                f"bash {self.repo}/src/archive-transcript.sh {self.repo}/workspace/logs/conversations/"}]}],
+        }}))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _dead_family(self, family):
+        (self.repo / ".claude").mkdir(parents=True, exist_ok=True)
+        dead_cmd = f'bash "{self.repo}/gone/{family}"'
+        (self.repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": dead_cmd}]}],
+        }}))
+
+    def test_dead_project_scoped_hook_is_now_caught(self):
+        self._dead_family("personal-claude-compact-hint.sh")
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertEqual([r["family"] for r in out["_dead_hooks"]],
+                          ["personal-claude-compact-hint.sh"])
+
+    def test_a_live_project_scoped_hook_is_not_flagged(self):
+        live = self.repo / "src" / "personal-claude-compact-hint.sh"
+        live.write_text("#!/bin/bash\n")
+        (self.repo / ".claude").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": f'bash "{live}"'}]}],
+        }}))
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+
+    def test_no_legacy_project_settings_file_is_not_an_error(self):
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+
+    def test_malformed_legacy_project_settings_does_not_abort_the_core_result(self):
+        (self.repo / ".claude").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".claude" / "settings.json").write_text("{not json")
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+
 
 class TestHookScriptPathFallback(unittest.TestCase):
     """An older checkout without claude_hooks_settings still gets a probe: the fallback parser."""

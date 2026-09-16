@@ -11664,9 +11664,19 @@ def check_claude_hook_registration(
         try:
             sys.path.insert(0, str(repo / "src"))
             from sutando_config import resolve_claude_sutando_config_dir
-            core_cfg = str(resolve_claude_sutando_config_dir(repo))
-        except Exception:
+        except ImportError:
+            # The resolver module genuinely does not exist (e.g. a bare test
+            # fixture) — the only case a guessed default may stand in.
             core_cfg = str(repo / "workspace" / ".claude-sutando")
+        else:
+            try:
+                core_cfg = str(resolve_claude_sutando_config_dir(repo))
+            except Exception as exc:
+                # The resolver IS available here, so a call-time failure means
+                # something is wrong -- do not guess a path (see PR body, #4309).
+                return {"name": name, "status": "warn",
+                        "detail": f"resolve_claude_sutando_config_dir() failed ({exc}) — "
+                                  f"cannot verify hook registration without a real config dir"}
         raw = raw.replace("$CORE_CONFIG_DIR", core_cfg)
     settings = Path(raw.replace("$REPO_DIR", str(repo)))
     if not settings.is_file():
@@ -11700,9 +11710,18 @@ def check_claude_hook_registration(
         try:
             sys.path.insert(0, str(repo / "src"))
             from workspace_default import resolve_workspace
-            _ws = Path(resolve_workspace())
-        except Exception:
+        except ImportError:
+            # Genuinely unimportable (bare fixture) — the fallback above stands.
             pass
+        else:
+            try:
+                _ws = Path(resolve_workspace())
+            except Exception as exc:
+                # Same as the $CORE_CONFIG_DIR resolver above: available but
+                # erroring means don't guess — report it (#4309 review).
+                return {"name": name, "status": "warn",
+                        "detail": f"resolve_workspace() failed ({exc}) — "
+                                  f"cannot verify hook registration without a real transcript dir"}
     transcript_dir = str(_ws / "logs" / "conversations")
 
     missing, foreign = [], []
@@ -11739,32 +11758,52 @@ def check_claude_hook_registration(
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
     # Present-but-dead is invisible to the owned-list check above: a registered hook whose
-    # script is gone fails on every fire. Relative paths resolve against the project.
+    # script is gone fails on every fire. Relative paths resolve against `repo` itself,
+    # not the settings file's own location (unreliable since #4309, see PR body).
     dead: list[str] = []
     dead_records: list[dict] = []
-    project_dir = settings.resolve().parent.parent
+    project_dir = repo
     # Owned families are judged above (present / missing / foreign); the dead scan covers
     # the rest, and only commands that run a script through an interpreter.
     owned_families = {Path(marker).name for _e, marker, _c in owned}
-    for event, groups in hooks.items():
-        for g in _as_list(groups):
-            if not isinstance(g, dict):
-                continue
-            for h in _as_list(g.get("hooks")):
-                if not isinstance(h, dict):
+
+    def _scan_dead(hooks_dict: dict) -> None:
+        for event, groups in hooks_dict.items():
+            for g in _as_list(groups):
+                if not isinstance(g, dict):
                     continue
-                cmd = str(h.get("command", ""))
-                if not _runs_a_script(cmd):
-                    continue
-                script = _hook_script_path(cmd)
-                if not script or Path(script).name in owned_families:
-                    continue
-                target = Path(script) if Path(script).is_absolute() else project_dir / script
-                if not target.exists():
-                    family = Path(script).name
-                    dead.append(f"{event}:{family} -> {script}")
-                    dead_records.append({"event": event, "command": cmd,
-                                         "path": script, "family": family})
+                for h in _as_list(g.get("hooks")):
+                    if not isinstance(h, dict):
+                        continue
+                    cmd = str(h.get("command", ""))
+                    if not _runs_a_script(cmd):
+                        continue
+                    script = _hook_script_path(cmd)
+                    if not script or Path(script).name in owned_families:
+                        continue
+                    target = Path(script) if Path(script).is_absolute() else project_dir / script
+                    if not target.exists():
+                        family = Path(script).name
+                        dead.append(f"{event}:{family} -> {script}")
+                        dead_records.append({"event": event, "command": cmd,
+                                             "path": script, "family": family})
+
+    _scan_dead(hooks)
+
+    # Moving the core-owned target to $CORE_CONFIG_DIR made the scan above blind
+    # to families that stay PROJECT-scoped on purpose; scan that file too (#4309).
+    legacy_settings = repo / ".claude" / "settings.json"
+    try:
+        if legacy_settings.is_file() and legacy_settings.resolve() != settings.resolve():
+            legacy_conf = json.loads(legacy_settings.read_text())
+            legacy_hooks = legacy_conf.get("hooks") if isinstance(legacy_conf, dict) else None
+            if isinstance(legacy_hooks, dict):
+                _scan_dead(legacy_hooks)
+    except (OSError, json.JSONDecodeError):
+        # Same tolerance as the core file above: a malformed/unreadable legacy
+        # settings.json must not abort the probe or hide the core-scoped result.
+        pass
+
     if missing or foreign or dead:
         bits = []
         if missing:
