@@ -27,15 +27,22 @@ _sutando_git_developer_tools_installed() {
 
 # Resolve $1 to its final target, following symlinks by hand (no GNU-only
 # `readlink -f`, and no shelling to python3 -- that would re-enter the exact
-# stub landmine this file exists to avoid). Bounded to break a symlink cycle.
-# Echoes NOTHING (never the unresolved path) if a symlink can't be followed --
-# a minimal PATH lacking `readlink` must not silently fall through with a
-# corrupted or unresolved target (the exact "dirname: command not found"
-# shape scripts/python-binary.sh already hit and fixed).
+# stub landmine this file exists to avoid). Bounded to break a symlink cycle --
+# macOS permits chains up to 32 hops deep (SYMLOOP_MAX), so the bound must
+# cover that AND still refuse (never silently return an unresolved
+# intermediate) if the chain somehow runs longer still (keweichen, #4323
+# round 3: the old bound stopped at 20 without checking whether `_target`
+# was still a symlink, so a 21+-hop chain ending at the real stub fell
+# through as "resolved" to a mid-chain link that trivially wasn't the
+# literal stub path). Echoes NOTHING (never the unresolved path) if a
+# symlink can't be followed -- a minimal PATH lacking `readlink` must not
+# silently fall through with a corrupted or unresolved target (the exact
+# "dirname: command not found" shape scripts/python-binary.sh already hit
+# and fixed).
 _sutando_git_realpath() {
 	_target="$1"
 	_i=0
-	while [ -L "$_target" ] && [ "$_i" -lt 20 ]; do
+	while [ -L "$_target" ] && [ "$_i" -lt 40 ]; do
 		command -v readlink >/dev/null 2>&1 || return 1
 		_link="$(readlink "$_target")" || return 1
 		case "$_link" in
@@ -44,6 +51,12 @@ _sutando_git_realpath() {
 		esac
 		_i=$((_i + 1))
 	done
+	# The loop can exit two ways: _target stopped being a symlink (resolved),
+	# or the bound was hit while it still is (unresolved) -- only the first
+	# is success. Silently returning the second was the bug: it hands back
+	# a still-symlinked path that trivially isn't the literal stub, so the
+	# caller wrongly concludes "not the stub".
+	[ -L "$_target" ] && return 1
 	_rdir="$(cd -P "${_target%/*}" 2>/dev/null && pwd -P)" || _rdir="${_target%/*}"
 	printf '%s/%s' "$_rdir" "${_target##*/}"
 }

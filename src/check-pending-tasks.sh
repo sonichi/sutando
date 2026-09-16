@@ -34,16 +34,24 @@ if [ -n "$GIT_BIN" ]; then
   # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
   [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
   [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
-  # A packaged bundle ships without .git (REPO_COMMON_DIR empty by design), so
-  # requiring BOTH sides non-empty let a genuinely foreign Git cwd read as
-  # "cannot tell" and fall through to blocking the core's queue anyway
-  # (keweichen, #4323 round 2). Only CWD's identity needs to be known: no Git
-  # identity there -> cannot prove different, proceed as core (fail closed,
-  # same direction as "no runnable git" below); a Git identity that isn't
-  # REPO_DIR's (including REPO_DIR having none at all) -> a different repo.
-  if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
-    echo '{}'
-    exit 0
+  # A packaged bundle ships without .git (REPO_COMMON_DIR empty BY DESIGN),
+  # which is why round 2 dropped the "both sides non-empty" requirement. But
+  # an empty REPO_COMMON_DIR is ALSO what a real checkout's FAILED probe
+  # looks like -- same empty string, opposite meaning (keweichen, #4323
+  # round 3). Only trust "intentionally no .git" when the marker itself is
+  # actually absent; otherwise an empty REPO_COMMON_DIR is an unresolved
+  # probe on a real checkout, and the ambiguity must fail closed (gate),
+  # not be read as license to skip.
+  if [ -e "$REPO_DIR/.git" ]; then
+    if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+      echo '{}'
+      exit 0
+    fi
+  else
+    if [ -n "$CWD_COMMON_DIR" ]; then
+      echo '{}'
+      exit 0
+    fi
   fi
 fi
 # No runnable git (module 3 of select_git: nothing) -- fail closed the same
