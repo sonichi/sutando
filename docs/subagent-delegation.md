@@ -25,6 +25,7 @@ ambiguous debugging, security/privacy decisions, code review, synthesis. Escalat
 result to the session model when confidence is low or consequences are material; never silently
 choose a more expensive model.
 
+
 ## When no delegation mechanism is available
 
 The rule in `CLAUDE.md` bans deferring and bans handing the work back, and the "unless you have a

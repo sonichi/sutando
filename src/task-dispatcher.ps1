@@ -408,7 +408,11 @@ function Get-VerifiedDiscordCollaborator($claimedPath) {
 function Process-Task($claimedPath, $taskId) {
     $prompt = Get-TaskPrompt $claimedPath
     if (-not $prompt) {
-        throw "${taskId}: empty prompt"
+        # Nothing ran, so the interrupted notice would be wrong here.
+        Log "${taskId}: empty prompt; nothing to run"
+        Publish-TaskResult $taskId 'This task had no message to act on, so nothing was run. Send it again with the request included.'
+        $null = Complete-TaskClaim $claimedPath $taskId
+        return
     }
 
     # A verified Discord collaborator keeps the complete body and channel rulebook.

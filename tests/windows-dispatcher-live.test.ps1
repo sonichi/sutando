@@ -1,6 +1,7 @@
 #!/usr/bin/env pwsh
 # Real Windows integration path with deterministic Claude and Codex shims:
-# FileSystemWatcher -> atomic claim -> owner result -> archive -> sandbox routing.
+# FileSystemWatcher -> atomic claim -> owner result -> archive -> sandbox routing,
+# plus an archive blocked by a scanner-style open handle and an empty task body.
 [CmdletBinding()]
 param()
 
@@ -14,6 +15,8 @@ $staleModeFile = Join-Path $workspace 'fake-stale-once'
 $codexModeFile = Join-Path $workspace 'fake-codex-mode'
 $blockModeFile = Join-Path $workspace 'fake-block-mode'
 $childPidFile = Join-Path $workspace 'fake-child.pid'
+$callsFile = Join-Path $workspace 'fake-claude-calls'
+$logFile = Join-Path $workspace 'logs\task-dispatcher.log'
 $dispatcherPid = 0
 $oldPath = $env:PATH
 $oldTestMode = $env:SUTANDO_TEST_MODE
@@ -39,6 +42,16 @@ function Wait-ForPath([string]$path, [int]$seconds = 30) {
     throw "Timed out waiting for $path"
 }
 
+function Wait-ForLogLine([string]$needle, [int]$seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $deadline) {
+        $text = if (Test-Path $logFile) { Get-Content $logFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        if ($text -like "*$needle*") { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Timed out waiting for log line: $needle"
+}
+
 function Write-Task([string]$id, [string]$body, [string]$tier, [switch]$Collaborator) {
     $content = @(
         "id: $id"
@@ -62,6 +75,7 @@ try {
     New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
     $shim = @'
 @echo off
+echo call>>"%SUTANDO_FAKE_CALLS_FILE%"
 if exist "%SUTANDO_FAKE_BLOCK_FILE%" (
   pwsh -NoProfile -Command "[IO.File]::WriteAllText($env:SUTANDO_FAKE_CHILD_PID, [string]$PID); Start-Sleep -Seconds 120"
 )
@@ -109,6 +123,7 @@ exit 0
     $env:SUTANDO_FAKE_CODEX_FILE = $codexModeFile
     $env:SUTANDO_FAKE_BLOCK_FILE = $blockModeFile
     $env:SUTANDO_FAKE_CHILD_PID = $childPidFile
+    $env:SUTANDO_FAKE_CALLS_FILE = $callsFile
 
     New-Item -ItemType Directory -Force -Path (Join-Path $workspace 'state') | Out-Null
     Set-Content -Path (Join-Path $workspace 'state\dispatcher-sessions.json') `
@@ -160,6 +175,40 @@ exit 0
         ConvertFrom-Json
     if ($sessionMap.'windows-ci' -eq 'stale-windows-session') {
         throw 'stale session mapping was not rotated'
+    }
+
+    # Defender-style handle: readable, no delete sharing, so the archive rename fails.
+    $stuckId = "task-windows-stuck-archive-$PID"
+    New-Item -ItemType File -Path $blockModeFile | Out-Null
+    Write-Task $stuckId 'Hold the claim open while it is archived.' 'owner'
+    Wait-ForPath $childPidFile
+    $stuckClaim = Join-Path $workspace "tasks\$stuckId.txt.processing"
+    $holder = [IO.File]::Open($stuckClaim, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    Remove-Item $blockModeFile
+    Stop-Process -Id ([int](Get-Content $childPidFile)) -Force
+    Remove-Item $childPidFile
+    $stuckResult = Join-Path $workspace "results\$stuckId.txt"
+    Wait-ForPath $stuckResult
+    Wait-ForLogLine "${stuckId}: archive failed after"
+    if ((Get-Content $stuckResult -Raw).Trim() -ne 'WINDOWS_OWNER_OK') {
+        throw "stuck-archive task lost its result: $(Get-Content $stuckResult -Raw)"
+    }
+    if (-not (Test-Path $stuckClaim)) { throw 'claim was not left in place after the archive failure' }
+    if (Test-Path (Join-Path $workspace "tasks\archive\$stuckId.txt")) { throw 'claim archived despite the open handle' }
+    if (-not (Get-Process -Id $dispatcherPid -ErrorAction SilentlyContinue)) { throw 'dispatcher exited after the archive failure' }
+    $afterStuckId = "task-windows-after-stuck-$PID"
+    Write-Task $afterStuckId 'Serve the next task after a stuck claim.' 'owner'
+    Wait-ForPath (Join-Path $workspace "results\$afterStuckId.txt")
+    $holder.Dispose()
+
+    $emptyId = "task-windows-empty-$PID"
+    Write-Task $emptyId '' 'owner'
+    $emptyResult = Join-Path $workspace "results\$emptyId.txt"
+    Wait-ForPath $emptyResult
+    Wait-ForPath (Join-Path $workspace "tasks\archive\$emptyId.txt")
+    $emptyBody = (Get-Content $emptyResult -Raw).Trim()
+    if ($emptyBody -notlike 'This task had no message to act on*') {
+        throw "empty prompt did not get its own outcome: $emptyBody"
     }
 
     $nonOwnerId = "task-windows-team-$PID"
@@ -231,6 +280,10 @@ exit 0
     if ((Get-Content $interruptedResult -Raw) -notlike 'This task was interrupted.*') {
         throw 'Interrupted task was replayed or did not receive an explicit outcome'
     }
+    Wait-ForPath (Join-Path $workspace "tasks\archive\$stuckId.txt")
+    if ((Get-Content $stuckResult -Raw).Trim() -ne 'WINDOWS_OWNER_OK') {
+        throw 'startup sweep overwrote the published result of the stuck claim'
+    }
     $afterRestartId = "task-windows-after-restart-$PID"
     Write-Task $afterRestartId 'Return the post-restart marker.' 'owner'
     $afterRestartResult = Join-Path $workspace "results\$afterRestartId.txt"
@@ -239,8 +292,16 @@ exit 0
         throw 'Post-restart task did not complete'
     }
 
+    # owner (stale retry = 2) + stuck + after-stuck + error + interrupted + after-restart
+    $claudeCalls = @(Get-Content $callsFile).Count
+    if ($claudeCalls -ne 7) { throw "expected 7 claude invocations, saw $claudeCalls (a stuck or interrupted claim was replayed)" }
+
     [pscustomobject]@{
         interrupted_claim_archived = $true
+        archive_sharing_violation_survived = $true
+        stuck_claim_archived_after_release = $true
+        empty_prompt_result = $emptyBody
+        claude_calls = $claudeCalls
         restart_descendants_stopped = $true
         post_restart_result = 'WINDOWS_OWNER_OK'
         reused_pid_ignored = $true
@@ -270,6 +331,7 @@ exit 0
     Remove-Item Env:SUTANDO_FAKE_CODEX_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_BLOCK_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_CHILD_PID -ErrorAction SilentlyContinue
+    Remove-Item Env:SUTANDO_FAKE_CALLS_FILE -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
     if (Test-Path -LiteralPath $workspace) {
         $resolved = (Resolve-Path -LiteralPath $workspace).Path
