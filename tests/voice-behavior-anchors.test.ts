@@ -141,6 +141,15 @@ test('instructions: injected seams land where tuned', () => {
 	assert.ok(instructions.includes('- Google Search for current-info queries'), 'googleSearch=true line');
 });
 
+test('instructions: anti-fabrication + feedback-routing guardrails present', () => {
+	assert.ok(instructions.includes('NEVER claim you have completed, filed, submitted, sent, opened, or reported anything unless you actually invoked a tool that did it'),
+		'anti-fabrication guardrail line');
+	assert.ok(instructions.includes('never narrate a fake success'),
+		'anti-fabrication: no fake success');
+	assert.ok(instructions.includes('FILE FEEDBACK / REPORT A BUG:') && instructions.includes('the core agent files it via the report-feedback skill'),
+		'feedback requests routed through work');
+});
+
 test('instructions: googleSearch=false omits the search line (capability honesty)', () => {
 	const off = cfg.buildInstructions(ctx({ googleSearch: false }), OVERRIDES);
 	assert.ok(!off.includes('- Google Search for current-info queries'));
