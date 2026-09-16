@@ -567,36 +567,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
-    /// `pgrep` exits 1 for "no match" and >1 when it cannot enumerate at all
-    /// (sysmond unreachable); only the first means the watcher is gone.
+    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
+    /// fail-opened on any argv merely mentioning the substring (review #4269,
+    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
+    /// boundary check (`watcherLineMatches`) to keep correct, not two.
     func watcherProcessSeen() -> Bool? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        proc.arguments = ["-f", "watch-tasks"]
-        let pipe = Pipe(); let errPipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = errPipe
-        do { try proc.run() } catch { return nil }
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
-        if proc.terminationStatus == 1 && err.isEmpty { return false }
-        logToFile("checkWatcher: pgrep unavailable (rc=\(proc.terminationStatus)): \(err.trimmingCharacters(in: .whitespacesAndNewlines)) — falling back to ps")
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
         // pid,command (not bare command): excluding OUR OWN pid needs it, since
-        // "ugrep ... watch-tasks" is itself a process whose argv mentions the marker.
+        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
         ps.arguments = ["-axo", "pid,command"]
         let psPipe = Pipe()
         ps.standardOutput = psPipe
         ps.standardError = FileHandle.nullDevice
         do { try ps.run() } catch { return nil }
         ps.waitUntilExit()
-        // A failed ps must read as unknown, the same standard pgrep already gets
-        // above -- an empty listing from a non-zero exit is not a clean "no match".
+        // A failed ps must read as unknown -- an empty listing from a
+        // non-zero exit is not a clean "no match" (the sysmond-unreachable
+        // case this whole probe exists to not misread as "dead", #4269).
         if ps.terminationStatus != 0 {
-            logToFile("checkWatcher: ps also unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
             return nil
         }
         let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
