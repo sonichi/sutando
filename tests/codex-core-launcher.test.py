@@ -69,6 +69,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
             "src/file_lock.py",
+            "src/delivery/__init__.py",
+            "src/delivery/readiness.py",
+            "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
@@ -913,7 +916,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
   exit 0
 fi
 if [ "${1:-}" = send-keys ]; then
@@ -993,7 +996,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
 fi
 exit 0
 ''')
@@ -1044,7 +1047,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
-  (sleep 0.12; touch "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
+  (sleep 0.12; printf 'done\\n' > "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
@@ -1102,7 +1105,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
-  touch "$SUTANDO_RESULTS_DIR/$name"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/$name"
 fi
 exit 0
 ''')
@@ -1157,7 +1160,7 @@ if [ "${1:-}" = capture-pane ]; then
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
 fi
 exit 0
 ''')
