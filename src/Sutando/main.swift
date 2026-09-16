@@ -591,27 +591,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        return listing.split(separator: "\n").contains { line in watcherLineMatches(line, excluding: selfPID) }
+        // A definite match short-circuits alive; an undecidable line must not
+        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
+        var sawUndecidable = false
+        for line in listing.split(separator: "\n") {
+            switch watcherLineMatches(line, excluding: selfPID) {
+            case .some(true): return true
+            case .none: sawUndecidable = true
+            case .some(false): continue
+            }
+        }
+        return sawUndecidable ? nil : false
     }
 
-    /// The SAME predicate `src/watcher_identity.py`'s `classify_argv` makes on its
-    /// flattened-argv path: argv[0] must be a shell and argv[1] the script — not
-    /// just the script name appearing anywhere in the line. A boundary-anchored
-    /// substring search (the prior form of this function) still matched
-    /// `grep watch-tasks-stream.sh`, `vim .../watch-tasks-stream.sh`, and
-    /// `tail -f .../watch-tasks-stream.sh` — none of which EXECUTE the script
-    /// (review #4269 round 2, john-the-dev, 2026-09-16).
-    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool {
+    /// True when `s` contains the watcher script's name at a path/whitespace
+    /// boundary on both sides.
+    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
+        let marker = "watch-tasks-stream.sh"
+        var searchRange = s.startIndex..<s.endIndex
+        while let r = s.range(of: marker, range: searchRange) {
+            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
+            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
+            if before && after { return true }
+            searchRange = r.upperBound..<s.endIndex
+        }
+        return false
+    }
+
+    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
+    /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
         let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
         guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
         let command = trimmed[trimmed.index(after: spaceIdx)...]
         let parts = command.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count == 2 else { return false }
+        guard parts.count >= 2 else { return false }
         guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
         guard !parts[1].hasPrefix("-") else { return false }
-        return (parts[1].split(separator: "/").last ?? parts[1]) == "watch-tasks-stream.sh"
+        // A match here is definite only at exactly 2 tokens -- more tokens could
+        // be a real pathname continuing past a space, so that's undecidable.
+        if matchesWatcherScriptAtBoundary(parts[1]) {
+            return parts.count == 2 ? true : nil
+        }
+        if parts.count == 2 { return false }
+        // A spaced script path is indistinguishable from a script plus arguments.
+        return matchesWatcherScriptAtBoundary(command) ? nil : false
     }
 
     func checkWatcher() {

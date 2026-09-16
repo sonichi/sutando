@@ -15,8 +15,18 @@ boundary check still matched ANY argv containing the full script name at a bound
 `grep watch-tasks-stream.sh`, `vim .../watch-tasks-stream.sh`, and `tail -f
 .../watch-tasks-stream.sh` — none of which EXECUTE the script. Fixed by porting
 `watcher_identity.py`'s flattened-argv predicate: argv[0]'s basename must be a shell, argv[1]
-must not be a flag, and argv[1]'s basename must be the script — exactly two tokens, so a
-mention-as-argument (which adds a third) never qualifies."""
+must not be a flag, and argv[1]'s basename must be the script — exactly two tokens.
+
+Third instance (review #4269 round 3, john-the-dev, 2026-09-16): requiring EXACTLY two tokens
+turned every legitimate EXTRA-token invocation of the real watcher into a false DEAD instead of
+an honest UNKNOWN — worker mode passes a positional tasks-dir operand, and the default macOS
+install path contains a space (`~/Library/Application Support/...`), which alone splits a
+no-operand launch into 3+ whitespace tokens. Ported `classify_argv`'s full flattened-argv
+predicate, including its UNDECIDABLE (`None`) outcome: `watcherLineMatches` now returns `Bool?`,
+and a boundary match at a token other than exactly parts[1]-with-count-2 returns `nil`, never
+`false`. `watcherProcessSeen` now aggregates tri-state: any `true` line short-circuits alive; a
+`nil` line, absent a `true`, makes the overall result `nil` (unknown) rather than being
+overridden by a later definite-`false` line."""
 import pathlib
 import re
 import subprocess
@@ -25,7 +35,8 @@ import sys
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "Sutando" / "main.swift"
 text = SRC.read_text()
 fn = re.search(r"func watcherProcessSeen\(\) -> Bool\? \{(.*?)\n    \}\n", text, re.S)
-match_fn = re.search(r"func watcherLineMatches\(.*?\{(.*?)\n    \}\n", text, re.S)
+match_fn = re.search(r"func watcherLineMatches\(.*?-> Bool\? \{(.*?)\n    \}\n", text, re.S)
+boundary_fn = re.search(r"func matchesWatcherScriptAtBoundary\(.*?\{(.*?)\n    \}\n", text, re.S)
 
 checks = {
     "watcherProcessSeen exists and returns an optional (unknown is a third state)": fn is not None,
@@ -43,27 +54,37 @@ checks = {
     "checkWatcher treats nil as unknown and does not alert": "case .none:" in text and "not alerting on an unknown" in text,
     "checkWatcher alerts only on an explicit false": "case .some(false): break" in text,
     "the matcher is a separate, testable function": match_fn is not None,
+    "the matcher's signature is tri-state (Bool?), not a plain Bool":
+        re.search(r"func watcherLineMatches\(.*?\)\s*->\s*Bool\?", text) is not None,
     "the matcher excludes the checking process's OWN pid": match_fn is not None
         and "linePID != selfPID" in match_fn.group(1),
+    "the boundary helper is a separate, testable function": boundary_fn is not None,
     "the marker is the FULL script name, not the truncated substring the bug matched on":
-        match_fn is not None and '"watch-tasks-stream.sh"' in match_fn.group(1)
-        and '"watch-tasks"' not in match_fn.group(1),
+        boundary_fn is not None and '"watch-tasks-stream.sh"' in boundary_fn.group(1)
+        and '"watch-tasks"' not in boundary_fn.group(1),
     "the matcher requires argv[0]'s basename to be a shell, not just the marker present":
         match_fn is not None and "watcherShells" in match_fn.group(1),
     "the matcher rejects a flag in argv[1] position": match_fn is not None
         and 'hasPrefix("-")' in match_fn.group(1),
-    "the matcher requires EXACTLY two argv tokens (a mention-as-argument adds a third)":
-        match_fn is not None and "parts.count == 2" in match_fn.group(1),
+    "a boundary match is DEFINITE only at exactly two tokens; more tokens are UNDECIDABLE (nil), never a false dead":
+        match_fn is not None and "parts.count == 2 ? true : nil" in match_fn.group(1),
+    "the aggregator does not let a later definite-false line override an earlier undecidable one":
+        fn is not None and "sawUndecidable" in fn.group(1) and "sawUndecidable ? nil : false" in fn.group(1),
 }
 
 # Behavioral negative control: actually execute the extracted matcher against
-# synthetic ps rows, incl. an argv that merely CONTAINS "watch-tasks" (see PR body).
-if match_fn is not None:
+# synthetic ps rows. `want` is Bool? -- nil rows assert the UNDECIDABLE case.
+if match_fn is not None and boundary_fn is not None:
+    def _as_private(m):
+        body = m.group(0)
+        name = re.match(r"func (\w+)", body).group(1)
+        return "private func " + name + body[len("func " + name):]
     harness = '''
 import Foundation
 %s
+%s
 
-let lines: [(String, String, Bool)] = [
+let lines: [(String, String, Bool?)] = [
     ("grep line (own pid, must be excluded even if it matched)", "501 grep --color=auto watch-tasks", false),
     ("unrelated process whose argv merely CONTAINS watch-tasks", "777 tail -f /var/log/watch-tasks-stream.log", false),
     ("unrelated file merely NAMED watch-tasks-*", "778 /usr/bin/vim workspace/notes/watch-tasks-plan.md", false),
@@ -75,18 +96,25 @@ let lines: [(String, String, Bool)] = [
     ("editor merely NAMING the full script path (not executing it)", "602 vim /Users/x/src/watch-tasks-stream.sh", false),
     ("tail of a log file with the full script's exact name", "603 tail -f /var/log/watch-tasks-stream.sh", false),
     ("the real watcher via an absolute path, no leading /bin", "3004 bash /Users/x/src/watch-tasks-stream.sh", true),
+    // #4269 round 3 (john-the-dev): requiring EXACTLY two tokens turned every
+    // legitimate extra-token invocation of the REAL watcher into a false DEAD.
+    // The correct answer for all three is UNDECIDABLE (nil), matching what
+    // watcher_identity.py's own classify_argv returns for the identical shapes
+    // -- the fix is not to make Swift somehow know it's alive, it's to stop it
+    // from confidently declaring it dead.
+    ("worker mode: real watcher + a positional tasks-dir operand", "4001 bash /Users/x/src/watch-tasks-stream.sh /Users/x/workspace/tasks", nil),
+    ("real watcher under the default macOS install path, which itself contains a space, NO operand", "4002 bash /Users/x/Library/Application Support/Sutando/src/watch-tasks-stream.sh", nil),
+    ("real watcher, space-free path PLUS an operand (both hazards independently)", "4003 bash /opt/s/watch-tasks-stream.sh /opt/tasks", nil),
 ]
 var failures = 0
 for (desc, line, want) in lines {
     let got = watcherLineMatches(Substring(line), excluding: 501)
     let ok = got == want
-    print((ok ? "ok   " : "FAIL ") + desc + " (got \\(got), want \\(want))")
+    print((ok ? "ok   " : "FAIL ") + desc + " (got \\(String(describing: got)), want \\(String(describing: want)))")
     if !ok { failures += 1 }
 }
 exit(failures == 0 ? 0 : 1)
-''' % (("private func watcherLineMatches" + match_fn.group(0)[len("func watcherLineMatches"):])
-       if match_fn.group(0).startswith("func watcherLineMatches")
-       else match_fn.group(0))
+''' % (_as_private(match_fn), _as_private(boundary_fn))
     tmp = pathlib.Path("/tmp/_watcherline_negative_control.swift")
     tmp.write_text(harness)
     try:
