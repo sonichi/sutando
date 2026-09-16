@@ -28,7 +28,8 @@ import sys
 import time
 from pathlib import Path
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
+# The skill's own folder (for precheck_apps.json), not the workspace.
+SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 TABLE_PATH = SKILL_DIR / "precheck_apps.json"
 SCRIPT = SKILL_DIR / "scripts" / "connectors.py"
 # Mirrors connectors.py (CACHE_NAME / CACHE_TTL_S); the CLI test pins them equal.

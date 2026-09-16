@@ -34,7 +34,7 @@ TABLE = hook.load_table()
 
 def task_text(text="what's on my calendar tomorrow?", channel_kind="dm", member_count=None, source="ag2space",
               tier="owner", collaborator=None, event="$evt1"):
-    head = [f"id: task-1", f"source: {source}", f"channel_id: {ROOM}", f"task: {text}"]
+    head = ["id: task-1", f"source: {source}", f"channel_id: {ROOM}", f"task: {text}"]
     tail = {"channel_kind": channel_kind, "room_member_count": member_count, "source_message_id": event,
             "user_id": "@owner:ag2.space", "access_tier": tier, "collaborator": collaborator}
     return "\n".join(head + [f"{k}: {v}" for k, v in tail.items() if v is not None]) + "\n"
