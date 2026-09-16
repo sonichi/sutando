@@ -259,7 +259,9 @@ def _principal_slot(field: str) -> bool:
     slots qualify by construction; everything else must declare an id and name no
     other object.
     """
-    segments = [p.strip() for p in _path_split(field) if p.strip()]
+    # Blank segments are KEPT so the container test refuses them: dropping
+    # them re-spelled `human..account.id` as the eligible `human.account.id`.
+    segments = [p.strip() for p in _path_split(field)]
     if not segments:
         return False
     # Eligibility is a property of the PATH: reading only the leaf discarded

@@ -154,6 +154,38 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
         self.assert_H_unpublished(self.three_passes(
             self.carried_seed("human_discord_id.room.stand.id", "stand")))
 
+    def fresh_source(self, keys):
+        """A v1 roster whose ONLY evidence for H sits under `human.<keys>.id`."""
+        leaf = {"id": self.H}
+        for k in reversed(keys):
+            leaf = {k: leaf}
+        return {"reviewer": {"stand_status": self.S, "human": leaf}}
+
+    def test_a_fresh_BLANK_segment_between_principal_and_id_is_refused(self):
+        """`_principal_slot` dropped blank segments before checking ancestors, so
+        `human..account.id` was judged as `human.account.id`. Measured rc 0 with
+        `human_discord_id` = H before the fix."""
+        self.assert_H_unpublished(self.three_passes(self.fresh_source(["", "account"])))
+
+    def test_a_fresh_WHITESPACE_segment_between_principal_and_id_is_refused(self):
+        self.assert_H_unpublished(self.three_passes(self.fresh_source(["   ", "account"])))
+
+    def test_a_carried_seed_with_a_BLANK_segment_stays_refused(self):
+        """The consumer asks the same gate, so the same blank laundered a carried
+        seed. Measured rc 0 -> 0 -> 0 with `human_discord_id` = H before the fix."""
+        self.assert_H_unpublished(self.three_passes(
+            self.carried_seed("human_discord_id..human.id", "human")))
+
+    def test_CONTROL_the_documented_account_container_still_resolves(self):
+        """The fix must refuse the BLANK, not the container: `account` is documented."""
+        codes = self.three_passes(self.fresh_source(["account"]))
+        self.assertEqual(codes, [0, 0, 0])
+        self.assertEqual(self.final["reviewer"].get("human_discord_id"), self.H)
+
+    def test_CONTROL_an_unknown_container_is_still_refused(self):
+        self.assert_H_unpublished(self.three_passes(
+            self.fresh_source(["zzz_unheard_of", "account"])))
+
     def test_CONTROL_a_single_referent_slot_still_migrates_cleanly(self):
         """Without this the fix could pass by refusing everything forever."""
         self.assertEqual(
