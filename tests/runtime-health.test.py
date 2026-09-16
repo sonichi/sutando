@@ -51,6 +51,23 @@ WORKING_PANE = """\
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
 
+# 2b) Incidental mentions must NOT fire: the phrase is three common words, so an
+#      unanchored match escalated a healthy core. Anchor = line start, or /login nearby.
+for _incidental in (
+    "  ⎿  gh: not logged in to github.com",
+    "  ⎿  wacli auth status: not logged in",
+    "  src/auth.py:42: raise RuntimeError('not logged in')",
+    "  shown to a visitor who is not logged in",
+):
+    check("needs_login: false on incidental %r" % _incidental.strip()[:28],
+          rh.needs_login(_incidental) is False)
+# ...while every real form still fires.
+for _real in ("Not logged in", "You are not logged in",
+              "  ⎿  Not logged in · Please run /login",
+              "not logged in — run /login to continue"):
+    check("needs_login: true on real %r" % _real.strip()[:28],
+          rh.needs_login(_real) is True)
+
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
 env = dict(os.environ)
 env["SUTANDO_TMUX_SOCKET"] = "/tmp/rh-test-nonexistent-%d.sock" % os.getpid()

@@ -27,6 +27,7 @@ observer; it starts nothing and kills nothing.
 import json
 import math
 import os
+import re
 import tempfile
 import socket
 import subprocess
@@ -166,7 +167,6 @@ def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
 # staring at an unresponsive agent, so a false "needs_login" (rare) is far less
 # costly than missing a real one.
 _LOGIN_MARKERS = (
-    "not logged in",
     "please run /login",
     "run `claude login`",
     "run 'claude login'",
@@ -174,6 +174,12 @@ _LOGIN_MARKERS = (
     "invalid api key",
     "authentication_error",
 )
+# Three common words: unanchored, this fires on any pane that merely QUOTES them.
+# Require the CLI's own line-start form, or adjacency to a /login token.
+_NOT_LOGGED_IN = re.compile(
+    r"^[\s⎿·|>]*(?:you(?:'re| are) )?not logged in\b"
+    r"|not logged in\b.{0,60}/login\b"
+    r"|/login\b.{0,60}not logged in\b", re.I)
 
 
 def _run(cmd):
@@ -479,7 +485,10 @@ def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision."""
     low = pane_text.lower()
-    return any(m in low for m in _LOGIN_MARKERS)
+    if any(m in low for m in _LOGIN_MARKERS):
+        return True
+    # Per LINE: the anchored form must bind to a line start, not to the pane's.
+    return any(_NOT_LOGGED_IN.search(line) for line in pane_text.splitlines())
 
 
 def _core_status(workspace):
