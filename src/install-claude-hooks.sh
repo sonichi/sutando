@@ -257,11 +257,63 @@ ADDED=0
 SKIPPED=0
 REMOVED=0
 
-# Ownership test for HOOKS[$1]: sets EVENT/MARKER/CMD/SHAPE/LEGACY_SHAPE, returns
-# 1 when the entry embeds no repo path (nothing safe to shape-match against — see
-# Phase 0's comment on this exact tradeoff). ONE owner for this test: Phase 0 and
-# Phase 3 both migrate hooks WE wrote, and a second hand-rolled copy is exactly
-# how Phase 3 shipped the bare-substring bug this function replaces.
+# Real shell-word tokenizer: quotes honored, backslash escapes the next
+# character (single- and double-quoted spans, exactly like shq()'s own
+# escaping), NEVER expands $vars or `cmd`/$(cmd) substitutions — nothing here
+# EXECUTES anything, it only finds argv BOUNDARIES. Sets the global array
+# TOKENIZE_RESULT; returns 1 on unterminated quote (the text is not valid
+# shell at all). Exists because THREE rounds of the ownership test below
+# tried to approximate this with a regex wildcard and each round shipped a
+# new argv-boundary shape the wildcard didn't cover (#4309 review,
+# keweichen/qingyun-wu, 2026-09-16) — real tokenization has no such shape,
+# because it isn't inferring a boundary, it's finding the one a shell would.
+tokenize_argv() {
+  local s="$1" n=${#1} i=0 c cur="" in_word=0
+  TOKENIZE_RESULT=()
+  while [ "$i" -lt "$n" ]; do
+    c="${s:i:1}"
+    case "$c" in
+      ' '|$'\t')
+        if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
+        i=$((i+1)) ;;
+      "'")
+        in_word=1; i=$((i+1))
+        while :; do
+          [ "$i" -ge "$n" ] && return 1
+          c="${s:i:1}"
+          [ "$c" = "'" ] && { i=$((i+1)); break; }
+          cur="$cur$c"; i=$((i+1))
+        done ;;
+      '"')
+        in_word=1; i=$((i+1))
+        while :; do
+          [ "$i" -ge "$n" ] && return 1
+          c="${s:i:1}"
+          [ "$c" = '"' ] && { i=$((i+1)); break; }
+          if [ "$c" = '\' ]; then
+            i=$((i+1)); [ "$i" -ge "$n" ] && return 1
+            cur="$cur${s:i:1}"; i=$((i+1)); continue
+          fi
+          cur="$cur$c"; i=$((i+1))
+        done ;;
+      '\')
+        in_word=1; i=$((i+1))
+        [ "$i" -ge "$n" ] && return 1
+        cur="$cur${s:i:1}"; i=$((i+1)) ;;
+      *)
+        in_word=1; cur="$cur$c"; i=$((i+1)) ;;
+    esac
+  done
+  [ "$in_word" = 1 ] && TOKENIZE_RESULT+=("$cur")
+  return 0
+}
+
+# Ownership test for HOOKS[$1]: sets EVENT/MARKER/CMD/CMD_WORD/CMD_TAIL/
+# HOOK_PRIOR_CUR, returns 1 when the entry embeds no repo path (nothing safe
+# to shape-match against — see Phase 0's comment on this exact tradeoff).
+# ONE owner for this test: Phase 0 and Phase 3 both migrate hooks WE wrote,
+# and a second hand-rolled copy is exactly how Phase 3 shipped the
+# bare-substring bug this function replaces.
 owned_hook_shape() {
   local i="$1" entry rest
   entry="${HOOKS[$i]}"
@@ -269,30 +321,116 @@ owned_hook_shape() {
   rest="${entry#*|}"
   MARKER="${rest%%|*}"
   CMD="${rest#*|}"
-  local esc
-  esc="$(shq "$REPO_DIR")"; esc="${esc#\'}"; esc="${esc%\'}"
+  REPO_DIR_TEXT="$(shq "$REPO_DIR")"; REPO_DIR_TEXT="${REPO_DIR_TEXT#\'}"; REPO_DIR_TEXT="${REPO_DIR_TEXT%\'}"
   case "$CMD" in
-    *"$esc"*) ;;
+    *"$REPO_DIR_TEXT"*) ;;
     *) return 1 ;;
   esac
-  local cmd_word cmd_tail
-  cmd_word="${CMD%% *}"
-  cmd_tail="${CMD#*"$MARKER"}"
-  cmd_tail="${cmd_tail#[\"\']}"       # drop shq's closing quote, if present
-  # A new shell argument starts wherever a quote sits directly against a
-  # space — closing quote + space (an argument ending) or space + opening
-  # quote (an argument beginning). Either shape crossed into a wrapper's
-  # SEPARATE argument and got misread as installer-owned, in order: an
-  # unbounded `.*` matched across close-quote+space (#4309 review
-  # 2026-09-16); a lookahead excluding only THAT direction still matched
-  # across space+open-quote — `bash /op/wrap.sh '<repo>/...' ...`, no quote
-  # before the space at all (qingyun-wu 2026-09-16, reproduced on bd2ddd51).
-  # A bare quote with NO adjacent space (an apostrophe inside an unquoted
-  # legacy path, #8 below) is not a boundary either way and must stay
-  # matchable — this excludes both directions, nothing more.
-  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -](?:(?![\"'] | [\"']).)*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
-  LEGACY_SHAPE=""
-  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  CMD_WORD="${CMD%% *}"
+  CMD_TAIL="${CMD#*"$MARKER"}"
+  CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
+  HOOK_PRIOR_CUR="${HOOK_PRIOR[$i]:-}"
+  return 0
+}
+
+# Decide whether $1 (a raw candidate .command string read from settings.json)
+# is a stale/foreign variant of the entry owned_hook_shape() last set up
+# (uses EVENT/MARKER/CMD/CMD_WORD/CMD_TAIL/HOOK_PRIOR_CUR from that call).
+# $2: "any" (Phase 0 — our own current exact command is never a "stale
+# variant" of itself) or "all" (Phase 3 — the current exact command counts
+# too, since none of this installer's shapes belong at project level).
+#
+# Real argv tokenization, not pattern inference: tokenize the candidate and
+# require the marker to sit in argv[1] — the ONE argument right after the
+# command word, wherever the real shell would draw that boundary. An
+# operator wrapper's script-as-argument (`bash /op/wrap.sh '<repo>/...' ...`,
+# quoted or not) puts the marker in argv[2+], never argv[1], so it is
+# rejected by construction — no wildcard exists to leak a new shape through.
+#
+# Two buckets fall through to the narrower textual check (starts like our
+# command word plus a path, ends with the marker followed by the exact known
+# tail) instead of the tokenized argv[1] check — and each is gated on
+# something KNOWN and EXACT, never a shape inferred from the candidate text
+# alone, which is what let three different wildcards leak:
+#
+#   A. tokenize_argv fails (unterminated quote) — not valid shell at all, so
+#      a WORKING operator command cannot be in this bucket, only a genuinely
+#      broken legacy string (e.g. an un-shq'd path with a literal apostrophe,
+#      #8 below).
+#   B. tokenize_argv succeeds but argv[1] alone doesn't reach the marker
+#      because embedded SPACES split our own unquoted legacy path across
+#      several argv slots — gated on the text right after the command word
+#      being an EXACT PREFIX MATCH for THIS clone's own $REPO_DIR (known
+#      already, not inferred), so an operator's differently-named wrapper
+#      path can't collide with it by accident.
+candidate_is_owned() {
+  local cand="$1" include_exact="$2"
+  case "$cand" in *"$MARKER"*) ;; *) return 1 ;; esac
+  if [ "$cand" = "$CMD" ]; then
+    [ "$include_exact" = "all" ] && return 0
+    return 1
+  fi
+  if [ -n "$HOOK_PRIOR_CUR" ] && [ "$cand" = "$HOOK_PRIOR_CUR" ]; then
+    return 0
+  fi
+  local after
+  case "$cand" in
+    "$CMD_WORD "?*) after="${cand#"$CMD_WORD" }" ;;
+    *) return 1 ;;
+  esac
+  if tokenize_argv "$cand" && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
+     && [ "${TOKENIZE_RESULT[0]}" = "$CMD_WORD" ]; then
+    case "${TOKENIZE_RESULT[1]}" in
+      *"$MARKER"*) ;;                                    # bucket: clean argv[1] match
+      *)                                                  # bucket B
+        # Collapse doubled slashes before comparing: mktemp -d can hand back
+        # a path containing "//", and this clone's OWN resolved $REPO_DIR
+        # (via `cd ... && pwd`) always normalizes that away — a candidate
+        # built from the raw (un-normalized) path is still ours, just
+        # spelled with an extra slash. (`${v//\/\//\/}` looks right but
+        # isn't: bash does not unescape `\/` on the REPLACEMENT side of
+        # `${var//pat/rep}`, only in the pattern, so that form inserts a
+        # literal backslash — route the "/" through a plain variable.)
+        local _sl=/
+        case "${after//${_sl}${_sl}/${_sl}}" in "${REPO_DIR_TEXT//${_sl}${_sl}/${_sl}}"*) ;; *) return 1 ;; esac ;;
+    esac
+  else
+    case "${after:0:1}" in ' '|'-') return 1 ;; esac      # bucket A
+  fi
+  # Mirror CMD_TAIL's own derivation onto the candidate — text after the
+  # marker, with one leading close-quote stripped if present — then compare
+  # by EXACT equality (no glob involved). A candidate whose repo-path
+  # argument is quoted has a closing quote sitting right after the marker
+  # that a plain `*"$MARKER$CMD_TAIL"` suffix check does not expect, since
+  # CMD_TAIL was computed with that same quote already stripped off ours.
+  local cand_tail
+  cand_tail="${cand#*"$MARKER"}"
+  cand_tail="${cand_tail#[\"\']}"
+  [ "$cand_tail" = "$CMD_TAIL" ] || return 1
+  return 0
+}
+
+# Remove, from $1's .hooks[$2], every hook whose .command EXACTLY matches one
+# of the strings in the caller's TO_REMOVE array (populated via
+# candidate_is_owned()). No wildcard at the removal step either — the
+# ownership DECISION already happened in bash against real argv boundaries;
+# jq -R/-s builds the removal set as properly-escaped JSON strings, so an
+# arbitrary command (quotes, backslashes, anything) is compared as literal
+# data, never as a pattern.
+remove_exact_commands() {
+  local settings_file="$1" event="$2" remove_json
+  [ "${#TO_REMOVE[@]}" -gt 0 ] || return 0
+  remove_json="$(printf '%s\n' "${TO_REMOVE[@]}" | jq -R . | jq -s .)"
+  TMP="$(mktemp "${settings_file}.XXXXXX")"
+  jq --arg event "$event" --argjson remove "$remove_json" '
+    if (.hooks // {})[$event] then
+      .hooks[$event] |= map(
+        .hooks |= map(select((((.command // "") as $c | $remove | index($c)) == null)))
+      )
+      | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+    else . end
+  ' "$settings_file" > "$TMP" || { echo "error: jq removal failed on $event" >&2; rm -f "$TMP"; exit 1; }
+  mv "$TMP" "$settings_file"
   return 0
 }
 
@@ -313,9 +451,10 @@ owned_hook_shape() {
 #
 #   1. the hook must EMBED THE REPO PATH at all — otherwise nothing about it can
 #      go stale, so there is nothing to migrate (see the skip below);
-#   2. the region between the command word and the marker must START LIKE A PATH
-#      — optional quote, then a non-space, non-`-` character — so a flag or
-#      wrapper before the path (`bash -x …`) is not swallowed by the wildcard;
+#   2. the marker must sit in the ONE argv slot right after the command word —
+#      determined by real tokenization (candidate_is_owned()), not a regex
+#      wildcard, so a flag or wrapper before the path (`bash -x …`, `bash
+#      /op/wrap.sh <path> …`) is never swallowed;
 #   3. the text after the marker must match EXACTLY, so customization after the
 #      path fails the trailing anchor.
 #
@@ -335,33 +474,17 @@ for i in "${!HOOKS[@]}"; do
   # the transcript-archive hook (b21d2bf) before this skip existed.
   owned_hook_shape "$i" || continue
 
-  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
-      '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-       | map(contains($marker) and (. != $cmd)
-             and (test($shape) or ($legacy != "" and test($legacy))))
-       | any' \
-      "$SETTINGS" >/dev/null 2>&1; then
-    continue
-  fi
+  CANDIDATES="$(jq -r --arg event "$EVENT" \
+    '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "") | .[]' \
+    "$SETTINGS" 2>/dev/null)"
+  TO_REMOVE=()
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    candidate_is_owned "$cand" "any" && TO_REMOVE+=("$cand")
+  done <<< "$CANDIDATES"
+  [ "${#TO_REMOVE[@]}" -gt 0 ] || continue
 
-  TMP="$(mktemp "${SETTINGS}.XXXXXX")"
-  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
-    if (.hooks // {})[$event] then
-      .hooks[$event] |= map(
-        .hooks |= map(select(
-          ((.command // "") | contains($marker))
-          and ((.command // "") != $cmd)
-          and ((.command // "")
-               | test($shape) or ($legacy != "" and test($legacy)))
-          | not
-        ))
-      )
-      | .hooks[$event] |= map(select((.hooks // []) | length > 0))
-    else . end
-  ' "$SETTINGS" > "$TMP" || { echo "error: jq stale-variant sweep failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
-  mv "$TMP" "$SETTINGS"
+  remove_exact_commands "$SETTINGS" "$EVENT"
   REMOVED=$((REMOVED + 1))
 done
 
@@ -444,32 +567,17 @@ LEGACY_REMOVED=0
 if [ -f "$LEGACY_PROJECT_SETTINGS" ] && [ "$LEGACY_PROJECT_SETTINGS" != "$SETTINGS" ]; then
   for i in "${!HOOKS[@]}"; do
     owned_hook_shape "$i" || continue
-    if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-             --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
-        '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-         | map(contains($marker)
-               and (. == $cmd or test($shape) or ($legacy != "" and test($legacy))))
-         | any' \
-        "$LEGACY_PROJECT_SETTINGS" >/dev/null 2>&1; then
-      continue
-    fi
-    TMP="$(mktemp "${LEGACY_PROJECT_SETTINGS}.XXXXXX")"
-    jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-       --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
-      if (.hooks // {})[$event] then
-        .hooks[$event] |= map(
-          .hooks |= map(select(
-            ((.command // "") | contains($marker))
-            and ((.command // "")
-                 | . == $cmd or test($shape) or ($legacy != "" and test($legacy)))
-            | not
-          ))
-        )
-        | .hooks[$event] |= map(select((.hooks // []) | length > 0))
-      else . end
-    ' "$LEGACY_PROJECT_SETTINGS" > "$TMP" || {
-      echo "error: jq legacy sweep failed on $EVENT/$MARKER" >&2; rm -f "$TMP"; exit 1; }
-    mv "$TMP" "$LEGACY_PROJECT_SETTINGS"
+    CANDIDATES="$(jq -r --arg event "$EVENT" \
+      '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "") | .[]' \
+      "$LEGACY_PROJECT_SETTINGS" 2>/dev/null)"
+    TO_REMOVE=()
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      candidate_is_owned "$cand" "all" && TO_REMOVE+=("$cand")
+    done <<< "$CANDIDATES"
+    [ "${#TO_REMOVE[@]}" -gt 0 ] || continue
+
+    remove_exact_commands "$LEGACY_PROJECT_SETTINGS" "$EVENT"
     LEGACY_REMOVED=$((LEGACY_REMOVED + 1))
   done
   for entry in "${DEPRECATED_HOOKS[@]}" "${DEPRECATED_HOOKS_PROJECT_ONLY[@]}"; do

@@ -217,13 +217,18 @@ ok "and ours is still the one that actually executes" \
 
 # A stale INSTALLER-SHAPED entry from a different clone must still be swept —
 # the fix must not be "stop sweeping", it must be "sweep only our own shapes".
+# Properly quoted (shq() has quoted every installer-written path for a long
+# time now, on any clone) — an UNQUOTED path containing literal spaces is a
+# different, narrower scenario (this clone's own pre-shq legacy form, covered
+# by the "unquoted stale variant" checks above via its known $REPO_DIR), not
+# a realistic shape for a different clone's installer output.
 python3 - "$SETTINGS" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 d["hooks"]["SessionEnd"][0]["hooks"].append(
     {"type": "command",
-     "command": 'bash /a different clone/src/session-handoff.sh "$TRANSCRIPT_PATH"'})
+     "command": "bash '/a different clone/src/session-handoff.sh' \"$TRANSCRIPT_PATH\""})
 json.dump(d, open(p, "w"), indent=2)
 PY
 bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
@@ -670,6 +675,15 @@ json.dump({"hooks": {
         # 2026-09-16, reproduced live on bd2ddd51).
         {"type": "command",
          "command": f'bash /tmp/operator-wrapper-unquoted.sh \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # BOTH wrapper and marker path unquoted, no space-adjacent quote at
+        # all anywhere in the command — must also SURVIVE. This is the third
+        # round on the same defect class: `bd2ddd51` closed the quoted-wrapper
+        # crossing, `88edc83f` closed the unquoted-wrapper-into-quoted-marker
+        # crossing, and qingyun-wu reproduced THIS shape live against
+        # `88edc83f` (2026-09-16) — a plain space + slash separator, no quote
+        # on either side of it to key off of.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper-bothunquoted.sh {repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
     ]}],
     "PreCompact": [{"matcher": "", "hooks": [
         # same shape, the archive destination as the wrapper's argument — SURVIVE.
@@ -678,6 +692,9 @@ json.dump({"hooks": {
         # unquoted-wrapper-path variant of the same, for the archive hook.
         {"type": "command",
          "command": f'bash /tmp/archive-wrapper-unquoted.sh \'{repo}/workspace/logs/conversations/\''},
+        # both-unquoted variant of the same, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper-bothunquoted.sh {repo}/workspace/logs/conversations/'},
     ]}],
 }}, open(p, "w"), indent=2)
 PY
@@ -688,12 +705,16 @@ ok "wrapper-before-marker: operator's session-handoff wrapper survives" \
    "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper.sh' && echo 0 || echo 1)"
 ok "wrapper-before-marker: UNQUOTED session-handoff wrapper path survives" \
    "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper-unquoted.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: BOTH-UNQUOTED session-handoff wrapper path survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper-bothunquoted.sh' && echo 0 || echo 1)"
 ok "wrapper-before-marker: today's canonical session-handoff shape is still swept" \
    "$(echo "$GSURV_SE" | grep -qxF "bash '$GREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
 ok "wrapper-before-marker: operator's archive-destination wrapper survives" \
    "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper.sh' && echo 0 || echo 1)"
 ok "wrapper-before-marker: UNQUOTED archive-destination wrapper path survives" \
    "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-unquoted.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: BOTH-UNQUOTED archive-destination wrapper path survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-bothunquoted.sh' && echo 0 || echo 1)"
 rm -rf "$GROOT"
 
 rm -rf "$ROOT"
