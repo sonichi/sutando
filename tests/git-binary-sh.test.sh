@@ -112,10 +112,7 @@ grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
   bad "check-pending-tasks.sh sources git-binary.sh" "source line missing"
 
 # --- 10. the discovered stub candidate is NEVER executed to decide dev-tools -
-# BEHAVIORAL: override the classifier so a REAL RECORDING script can be
-# classified as the stub without resolving to the real /usr/bin/git.
-# ran.log absence alone proves nothing if the override seam were bypassed, so
-# this also asserts the classifier and dev-tools probe were both invoked.
+# activated classifier/dev-tools witnesses: ran.log absence alone can't tell a refusal from a bypassed seam.
 lab10=$(mktemp -d)
 mkdir -p "$lab10/bin"
 printf '#!/bin/sh\necho "RAN $*" >> %s/ran.log\nexit 1\n' "$lab10" > "$lab10/bin/git"

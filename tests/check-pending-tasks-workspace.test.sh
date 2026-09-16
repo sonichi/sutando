@@ -173,10 +173,8 @@ printf 'id: probe\ntask: rejected-interpreter\n' > "$REJ/workspace/tasks/$PROBE"
 # A recording shim: if the hook falls back to PATH python this fires.
 printf '#!/bin/bash\necho FALLBACK_INVOKED >&2\nexit 79\n' > "$REJ/python3"
 chmod +x "$REJ/python3"
-# A recording stub, so resolve_git has something to resolve to; both probes
-# echo the SAME dir ($REJ), falling through to the case below.
-# Records argc + one arg per line, not "$*" -- "$*" joins with a space, so
-# 3 separate args and 1 quoted arg with a space would log identically.
+# Boundary-aware recording stub (both probes echo $REJ, falling through below):
+# argc + one arg per line, not "$*", which would log 3 args and 1 with a space identically.
 printf '#!/bin/bash\n{ printf "GIT_CALLED argc=%%s\\n" "$#"; for a in "$@"; do printf "ARG<%%s>\\n" "$a"; done; } >> %s\necho %s\n' \
   "$REJ/git-calls.log" "$REJ" > "$REJ/git"
 chmod +x "$REJ/git"
@@ -212,10 +210,8 @@ else
   bad "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)" \
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
-# POSITIVE CONTROL, ISOLATED (own logs): the fixture's own args never contain
-# a space, so only this control proves the recording distinguishes them.
-# EACH invocation writes its OWN file, compared as a whole -- a shared-log
-# line-range slice assumes a fixed line count per record and can be fooled.
+# Isolated positive control, separate whole-file controls: the fixture's own
+# args never contain a space, and a shared-log line-range slice can be fooled.
 _argv_lab="$(mktemp -d)"
 # $1 is the log path, consumed via shift BEFORE argc/$@ are recorded -- it must
 # never itself be counted as one of the args under test.
@@ -240,10 +236,8 @@ rm -rf "$_argv_lab"
 # BEHAVIORAL, not source text (a regex passes on a dead/commented guard) --
 # `bash -x` traces an empty PYBIN as one-or-more `+` (a command substitution nests one deeper).
 EMPTY_EXEC_RE="^\+{1,} '' "
-# POSITIVE CONTROL THROUGH THE REAL CAPTURE PATH -- a fabricated string fed
-# straight to grep only proves the regex, not that -x/PS4/redirect still work.
-# Drives a KNOWN-BAD script through that same real capture, both nesting
-# depths, so a broken pipeline fails this control instead of agreeing with it.
+# Real xtrace capture positive control -- a fabricated string only proves the
+# regex; drives a known-bad script through the real -x/PS4/redirect instead.
 _pc_lab="$(mktemp -d)"
 cat > "$_pc_lab/probe.sh" <<'EOF'
 BAD_PYBIN=""
