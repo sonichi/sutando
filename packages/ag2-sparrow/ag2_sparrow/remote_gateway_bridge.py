@@ -3925,10 +3925,20 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
 
 
 def _worker_of(task_id: str) -> str:
-    """Which pool worker finished this task, read from the per-core done-flag.
-    `task_id` is the result stem, which already carries the `task-` prefix."""
+    """Which pool worker finished this task, read from the per-worker
+    done-flag. `task_id` is the result stem, which already carries the
+    `task-` prefix.
+
+    Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
+    by skills/worker-pool/scripts/pool_delivery.py's done_flag()/mark_done()
+    — the ONE writer — and re-stated here only because packages/ag2-sparrow
+    is a standalone PyPI package that cannot import a sutando skill. Keep
+    the two in step by hand; tests/gateway-result-worker-attribution.test.py
+    builds its fixtures through pool_delivery.done_flag() itself so a future
+    drift between the two fails a test instead of silently returning "".
+    """
     try:
-        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
+        hits = sorted((_STATE / "workers").glob(f"*/done/{task_id}.flag"))
     except OSError:
         return ""
     return hits[0].parent.parent.name if len(hits) == 1 else ""
