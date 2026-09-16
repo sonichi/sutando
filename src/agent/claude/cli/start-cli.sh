@@ -232,7 +232,14 @@ fi
 
 # Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent. Below
 # the probe exit: --print-core-env is a pure read and must not write settings.
+# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
 bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+
+# Owned project hooks (handoff, pending-tasks, skill-declared) re-registered BEFORE the core
+# spawns: an engine update replaces .claude/settings.json. Unattended, so no ~/Desktop archiver.
+# Same probe-must-not-write invariant as the personal hook above.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1
@@ -298,11 +305,12 @@ core_claude_running() {
 # hang at the trust prompt. Expand a leading ~, create the dir (fail loud with a
 # scoped message if we can't — better than chdir'ing into the wrong place under
 # set -e's raw error), then resolve via `cd … && pwd -P`.
+# The resolver is shared with the settings installers (scripts/core-working-dir.sh), so the
+# dir the core launches from is the dir the hooks were written to — or the launch refuses.
 CWD_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+  . "$REPO/scripts/core-working-dir.sh"
+  SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
   export SUTANDO_CLAUDE_WORKING_DIR
   CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
   echo "  ✓ core working dir: $SUTANDO_CLAUDE_WORKING_DIR"
