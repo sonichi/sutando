@@ -3929,19 +3929,47 @@ def _worker_of(task_id: str) -> str:
     done-flag. `task_id` is the result stem, which already carries the
     `task-` prefix.
 
-    Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
-    by the pool's own done_flag()/mark_done() writer, in an optional local
-    skill this standalone PyPI package cannot import or name (see
+    Path convention (state/workers/<recipient>/done/<task_id>.{pending,flag})
+    is owned by the pool's own done_flag()/mark_done() writer, in an optional
+    local skill this standalone PyPI package cannot import or name (see
     docs/architecture-boundaries.md, "Optional adapter capabilities"). Keep
     the two in step by hand; tests/gateway-result-worker-attribution.test.py
     builds its fixtures through that writer's own path function so a future
     drift between the two fails a test instead of silently returning "".
+
+    BOTH stages count. The writer lays `.pending` BEFORE the handler publishes
+    the result and promotes it to `.flag` only after the handler returns, so a
+    ready result is routinely visible to this drain while only `.pending`
+    exists; reading `.flag` alone loses attribution for that whole window.
+
+    FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
+    with another worker's identity — so anything this cannot read or does not
+    recognise as the writer's own record shape (regular file, never a symlink
+    or directory) yields "" rather than a guess. `Path.glob` is deliberately
+    not used: it reports an unreadable subtree as absent, which would let one
+    unreadable claimant hand the answer to another.
     """
+    root = _STATE / "workers"
     try:
-        hits = sorted((_STATE / "workers").glob(f"*/done/{task_id}.flag"))
-    except OSError:
+        recipients = sorted(p.name for p in root.iterdir())
+    except FileNotFoundError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    except OSError:
+        return ""  # unreadable root: no reading, not "nobody claimed it"
+    claimants = set()
+    for name in recipients:
+        for stage in ("flag", "pending"):
+            try:
+                st = os.lstat(root / name / "done" / f"{task_id}.{stage}")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return ""  # unreadable claim tree: abstain, never fall through
+            if not stat.S_ISREG(st.st_mode):
+                return ""  # malformed record the writer would itself refuse
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,

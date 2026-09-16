@@ -26,6 +26,7 @@ Run: python3 tests/gateway-result-worker-attribution.test.py
 from __future__ import annotations
 
 import importlib.util
+import os
 import json
 import sys
 import tempfile
@@ -117,6 +118,73 @@ class WorkerAttribution(unittest.TestCase):
     def test_worker_of_survives_a_missing_state_tree(self):
         self.mod._STATE = Path(self.workspace) / "nonexistent"
         self.assertEqual(self.mod._worker_of("task-5missingstate0000"), "")
+
+    # --- the writer's PENDING stage (keweichen, #4302) -------------------
+    # mark_done(published=False) lays `.pending` BEFORE the handler publishes
+    # the result and promotes to `.flag` only after it returns, so a ready
+    # result is routinely delivered while only `.pending` exists.
+
+    def test_pending_alone_still_attributes(self):
+        tid = "task-pendingwindow00001"
+        pend = pool_delivery.mark_done(Path(self.workspace), "worker-1", tid, published=False)
+        self.assertTrue(str(pend).endswith(".pending"), pend)
+        self.assertEqual(self.mod._worker_of(tid), "worker-1")
+
+    def test_the_delivered_payload_is_attributed_during_the_pending_window(self):
+        # The end-to-end shape of the defect: publish-then-promote, with the
+        # POST built in between. Before the fix this payload had no metadata.
+        tid = "task-pendingwindow00002"
+        pool_delivery.mark_done(Path(self.workspace), "worker-2", tid, published=False)
+        self.assertEqual(self._doc(tid)["metadata"], {"worker_id": "worker-2"})
+        pool_delivery.mark_done(Path(self.workspace), "worker-2", tid, published=True)
+        self.assertEqual(self._doc(tid)["metadata"], {"worker_id": "worker-2"})
+
+    def test_promotion_does_not_double_count_its_own_worker(self):
+        # Belt and braces: if a `.pending` ever outlived its `.flag`, one
+        # worker holding both stages is still ONE claimant, not ambiguity.
+        tid = "task-bothstages00000001"
+        d = pool_delivery.done_flag(Path(self.workspace), "worker-3", tid).parent
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.flag").write_text("")
+        (d / f"{tid}.pending").write_text("")
+        self.assertEqual(self.mod._worker_of(tid), "worker-3")
+
+    # --- fail closed rather than stamp the wrong worker ------------------
+
+    def test_a_directory_at_the_record_name_is_refused(self):
+        # The writer's own predicate (pool_delivery.is_done_flag) accepts only
+        # a regular file; anything else is malformed state, not a finish.
+        tid = "task-dirrecord000000001"
+        pool_delivery.done_flag(Path(self.workspace), "worker-4", tid).mkdir(parents=True)
+        self.assertEqual(self.mod._worker_of(tid), "")
+
+    def test_a_symlink_at_the_record_name_is_refused(self):
+        tid = "task-symlinkrecord00001"
+        real = pool_delivery.done_flag(Path(self.workspace), "worker-5", tid)
+        real.parent.mkdir(parents=True, exist_ok=True)
+        target = real.parent / "elsewhere"
+        target.write_text("")
+        real.symlink_to(target)
+        self.assertEqual(self.mod._worker_of(tid), "")
+
+    def test_an_unreadable_claim_tree_abstains_instead_of_naming_the_other(self):
+        # The Path.glob trap: an unreadable subtree reads as "absent", which
+        # would hand the answer to the only claimant it could still see.
+        tid = "task-unreadable00000001"
+        a = pool_delivery.done_flag(Path(self.workspace), "worker-a", tid)
+        a.parent.mkdir(parents=True, exist_ok=True)
+        a.write_text("")
+        b = pool_delivery.done_flag(Path(self.workspace), "worker-b", tid)
+        b.parent.mkdir(parents=True, exist_ok=True)
+        b.write_text("")
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the mode bits this case depends on")
+        mode = b.parent.stat().st_mode
+        os.chmod(b.parent, 0o000)
+        try:
+            self.assertEqual(self.mod._worker_of(tid), "")
+        finally:
+            os.chmod(b.parent, mode)
 
 
 if __name__ == "__main__":
