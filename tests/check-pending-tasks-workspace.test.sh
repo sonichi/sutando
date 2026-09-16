@@ -175,8 +175,14 @@ printf '#!/bin/bash\necho FALLBACK_INVOKED >&2\nexit 79\n' > "$REJ/python3"
 chmod +x "$REJ/python3"
 # A recording stub, so resolve_git has something to resolve to. Both probes
 # echo the SAME dir ($REJ) -- same identity, so it falls through to the case below.
-printf '#!/bin/bash\necho "GIT_CALLED $*" >> "%s/git-calls.log"\necho "%s"\n' "$REJ" "$REJ" \
-  > "$REJ/git"
+# Records argc + one line per argument, NOT "$*" -- "$*" joins with a space, so
+# three separate args (-C, /a, b) and one quoted arg ("/a b") serialize
+# IDENTICALLY ("GIT_CALLED -C /a b" either way). A caller mistake that drops a
+# quote around a path containing a space would be invisible to a $*-based log
+# and to a real `git` alike -- this stub must not silently agree with a bug a
+# real git would reject. Per-arg recording makes the boundary visible.
+printf '#!/bin/bash\n{ printf "GIT_CALLED argc=%%s\\n" "$#"; for a in "$@"; do printf "ARG<%%s>\\n" "$a"; done; } >> %s\necho %s\n' \
+  "$REJ/git-calls.log" "$REJ" > "$REJ/git"
 chmod +x "$REJ/git"
 printf '#!/bin/sh\nexit 2\n' > "$REJ/xcode-select"
 chmod +x "$REJ/xcode-select"
@@ -201,25 +207,73 @@ case "$REJ_OUT" in
   '{}') ok "a refused interpreter still emits valid JSON" ;;
   *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
 esac
-# EXACT whole-file equality, not grep -qF -- a substring search would also pass
-# a call carrying EXTRA argv beyond what's expected on the same log line.
-GIT_CALLS_EXPECTED="$(printf 'GIT_CALLED rev-parse --path-format=absolute --git-common-dir\nGIT_CALLED -C %s rev-parse --path-format=absolute --git-common-dir\n' "$REJ")"
+# EXACT whole-file equality over argc + one line per argument -- this is what
+# actually proves argv boundaries, not just character content: 3 separate args
+# and 1 quoted arg that joins to the same string produce DIFFERENT argc here,
+# where they would have been indistinguishable under "$*".
+GIT_CALLS_EXPECTED="$(printf 'GIT_CALLED argc=3\nARG<rev-parse>\nARG<--path-format=absolute>\nARG<--git-common-dir>\nGIT_CALLED argc=5\nARG<-C>\nARG<%s>\nARG<rev-parse>\nARG<--path-format=absolute>\nARG<--git-common-dir>\n' "$REJ")"
 if [ -f "$REJ/git-calls.log" ] && [ "$(cat "$REJ/git-calls.log")" = "$GIT_CALLS_EXPECTED" ]; then
-  ok "the git stub was invoked exactly twice, with the two expected argv records"
+  ok "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)"
 else
-  bad "the git stub was invoked exactly twice, with the two expected argv records" \
+  bad "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)" \
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
+# POSITIVE CONTROL for the recording stub itself, run in ISOLATION (a separate
+# log, never touching git-calls.log above): 3 separate args and 1 quoted arg
+# that joins to the identical string MUST be distinguishable in the recorded
+# log -- without this, a regression back to "$*" recording would still pass
+# the equality check above on THIS fixture's own args (none contain spaces),
+# because the fixture never exercises the ambiguous case that broke it.
+_argv_lab="$(mktemp -d)"
+printf '#!/bin/bash\n{ printf "GIT_CALLED argc=%%s\\n" "$#"; for a in "$@"; do printf "ARG<%%s>\\n" "$a"; done; } >> %s\necho ok\n' \
+  "$_argv_lab/calls.log" > "$_argv_lab/git"
+chmod +x "$_argv_lab/git"
+"$_argv_lab/git" -C /a b c >/dev/null      # 3 separate args
+"$_argv_lab/git" -C "/a b c" >/dev/null    # 1 quoted arg, joins to the same string
+GCL_A="$(sed -n '1,4p' "$_argv_lab/calls.log")"
+GCL_B="$(sed -n '5,7p' "$_argv_lab/calls.log")"
+if [ "$GCL_A" = "$GCL_B" ]; then
+  bad "the stub's own recording distinguishes 3 args from 1 quoted arg joining to the same string" \
+    "both logged identically: $(cat "$_argv_lab/calls.log")"
+else
+  ok "the stub's own recording distinguishes 3 args from 1 quoted arg joining to the same string"
+fi
+rm -rf "$_argv_lab"
 
 # BEHAVIORAL, not source text (a regex passes on a dead/commented guard) --
 # `bash -x` traces an empty PYBIN as one-or-more `+` (a command substitution nests one deeper).
 EMPTY_EXEC_RE="^\+{1,} '' "
-# POSITIVE CONTROL -- a detector never observed matching is unvalidated.
-if ! printf "++ '' /tmp/turn_ledger.py --workspace /tmp stop-gate\n" | grep -qE "$EMPTY_EXEC_RE"; then
-  bad "the empty-command detector regex matches a known-positive nested trace line" "no match"
+# POSITIVE CONTROL, THROUGH THE REAL CAPTURE PATH -- feeding a fabricated
+# "++ '' ..." string straight to grep only proves the regex is well-formed; it
+# is fully decoupled from `bash -x` / PS4 / the file redirect the real checks
+# below depend on. If `-x` were dropped, PS4 unset, or the redirect broken, the
+# real xtrace-site logs would come back EMPTY -- and the real negative checks
+# (grep finds nothing -> "ok, no bad exec") would misread that as a clean pass
+# while this hardcoded-string control kept reporting green regardless.
+# Reproduced directly: dropping `-x` from an otherwise-identical capture still
+# printed "ok" here, on a genuinely empty trace file.
+# So drive a KNOWN-BAD script through the exact same PS4 + `bash -x` + stderr
+# capture used at both real sites (one direct exec, one via $(...) command
+# substitution, covering both nesting depths) and assert the REAL trace file
+# matches -- a broken capture pipeline now fails this control instead of
+# silently agreeing with it.
+_pc_lab="$(mktemp -d)"
+cat > "$_pc_lab/probe.sh" <<'EOF'
+BAD_PYBIN=""
+"$BAD_PYBIN" /tmp/direct-site-probe.py --x
+OUT="$("$BAD_PYBIN" /tmp/nested-site-probe.py --y)"
+EOF
+(cd "$_pc_lab" && PS4='+ ' bash -x probe.sh) >/dev/null 2>"$_pc_lab/trace.log"
+_pc_direct=$(grep -cE '^\+ '"'"''"'"' /tmp/direct-site-probe\.py' "$_pc_lab/trace.log")
+_pc_nested=$(grep -cE '^\+\+ '"'"''"'"' /tmp/nested-site-probe\.py' "$_pc_lab/trace.log")
+if [ -s "$_pc_lab/trace.log" ] && grep -qE "$EMPTY_EXEC_RE" "$_pc_lab/trace.log" \
+   && [ "$_pc_direct" -eq 1 ] && [ "$_pc_nested" -eq 1 ]; then
+  ok "a real bash -x/PS4/redirect capture of a known-bad script produces a trace the detector matches, at both nesting depths"
 else
-  ok "the empty-command detector regex matches a known-positive nested trace line"
+  bad "a real bash -x/PS4/redirect capture of a known-bad script produces a trace the detector matches, at both nesting depths" \
+    "trace bytes=$(wc -c < "$_pc_lab/trace.log" 2>/dev/null || echo 0), direct-hits=$_pc_direct, nested-hits=$_pc_nested"
 fi
+rm -rf "$_pc_lab"
 
 # 6b. THE READINESS-CHECK GAP (first PYBIN site) -- a task WITH a result exits
 # earlier and never reaches the turn-ledger site, isolating this site from that one.
@@ -239,11 +293,20 @@ case "$RG_OUT" in
   *) bad "a truly result-only queue with no interpreter still emits valid JSON" "got: ${RG_OUT:0:120}" ;;
 esac
 (cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" PS4='+ ' bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace-site1.log"
-if grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site1.log"; then
+# TRACE-IS-ALIVE sentinel, checked BEFORE trusting the absence below -- a
+# missing `-x`, an unset PS4, or a broken redirect all produce the same empty
+# file as "genuinely no bad exec", and a reproduction confirmed this exact
+# false-green (dropping -x here left every other check reporting ok). A line
+# that must appear whenever the hook genuinely ran under -x, unconditional on
+# which branch it takes, tells a dead capture from a clean one.
+if ! grep -qF "TASKS_DIR=" "$REJ/xtrace-site1.log"; then
+  bad "site-1 trace capture is alive (not silently empty/broken)" \
+    "no TASKS_DIR= line -- trace bytes=$(wc -c < "$REJ/xtrace-site1.log")"
+elif grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site1.log"; then
   bad "readiness-check site (result-present queue) never execs an empty command" \
     "$(grep -E "$EMPTY_EXEC_RE" "$REJ/xtrace-site1.log" | head -1)"
 else
-  ok "readiness-check site (result-present queue) never execs an empty command"
+  ok "readiness-check site (result-present queue) never execs an empty command (trace confirmed alive)"
 fi
 rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE" "$REJ/xtrace-site1.log"
 
@@ -255,11 +318,15 @@ case "$TG_OUT" in
   *) bad "an empty queue with no interpreter still emits valid JSON" "got: ${TG_OUT:0:120}" ;;
 esac
 (cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" PS4='+ ' bash -x "$REJ/src/$(basename "$HOOK")") >/dev/null 2>"$REJ/xtrace-site2.log"
-if grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site2.log"; then
+# TRACE-IS-ALIVE sentinel -- see the matching comment at site 1 above.
+if ! grep -qF "TASKS_DIR=" "$REJ/xtrace-site2.log"; then
+  bad "site-2 trace capture is alive (not silently empty/broken)" \
+    "no TASKS_DIR= line -- trace bytes=$(wc -c < "$REJ/xtrace-site2.log")"
+elif grep -qE "$EMPTY_EXEC_RE" "$REJ/xtrace-site2.log"; then
   bad "turn-ledger site (empty queue) never execs an empty command" \
     "$(grep -E "$EMPTY_EXEC_RE" "$REJ/xtrace-site2.log" | head -1)"
 else
-  ok "turn-ledger site (empty queue) never execs an empty command"
+  ok "turn-ledger site (empty queue) never execs an empty command (trace confirmed alive)"
 fi
 rm -f "$REJ/xtrace-site2.log"
 
