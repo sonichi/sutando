@@ -609,6 +609,10 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
         candidate = Path(results_dir) / day / fname
         if candidate.is_file():
             return candidate
+        # Same epoch-suffix fallback as the month scan: exact name first, then re-archives.
+        suffixed = _epoch_suffixed(Path(results_dir) / day, task_id)
+        if suffixed:
+            return suffixed[-1]
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
