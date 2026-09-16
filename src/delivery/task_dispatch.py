@@ -31,9 +31,8 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
-# Bash callers shell out to this file directly (not `-m`) — same
-# self-sufficient sys.path bootstrap task_priority.py uses.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Same self-sufficient sys.path bootstrap task_priority.py uses (reaches src/, not the workspace).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspace-resolution: allow-repo-root
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
