@@ -19,20 +19,29 @@
 # guest carve-out) — the core's own task/result queue is not theirs to clear,
 # so the gate must not hold their Stop hostage to it.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# --path-format=absolute (git >= 2.31) avoids a real quirk: plain
-# `git -C <dir> rev-parse --git-common-dir`, run from a DIFFERENT cwd, can
-# print a path relative to <dir> rather than to the caller — resolving that
-# relative to the wrong base silently misjudges "same repo" in both directions.
-CWD_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-REPO_COMMON_DIR="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-# Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
-# --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
-[ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
-[ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
-if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
-  echo '{}'
-  exit 0
+# A bare `git` can be the macOS CLT stub (REVIEW.md lesson 7) — resolve
+# through the same rules src/git_binary.py uses, not PATH directly.
+. "$REPO_DIR/scripts/git-binary.sh"
+GIT_BIN="$(resolve_git)"
+if [ -n "$GIT_BIN" ]; then
+  # --path-format=absolute (git >= 2.31) avoids a real quirk: plain
+  # `git -C <dir> rev-parse --git-common-dir`, run from a DIFFERENT cwd, can
+  # print a path relative to <dir> rather than to the caller — resolving that
+  # relative to the wrong base silently misjudges "same repo" in both directions.
+  CWD_COMMON_DIR="$("$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
+  # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
+  [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
+  [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
+  if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+    echo '{}'
+    exit 0
+  fi
 fi
+# No runnable git (module 3 of select_git: nothing) -- fail closed the same
+# way the pre-fix hook always ran: cannot prove a DIFFERENT repo, so proceed
+# as core rather than raising a CLT dialog or silently skipping every guest.
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently
