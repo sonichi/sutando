@@ -634,6 +634,54 @@ ok "and no successor is installed in its place at project level" \
    "$(echo "$FCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
 rm -rf "$FROOT"
 
+# --- 12. a WRAPPER before the marker must survive, not just a flag -----------
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): the SHAPE's middle wildcard
+# used to be `.*` (unbounded) after the "starts like a path" check — it could
+# cross a CLOSING quote + space into a SECOND shell argument, so an operator
+# wrapper that merely PASSES our script as an argument
+# (`bash '/op/wrap.sh' '<repo>/src/session-handoff.sh' ...`) matched the shape
+# and got deleted. Reproduced live: before the fix, both survivor lines below
+# read 0. Same class for the archive destination as a later argument.
+GROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks wrapper-before-marker.XXXXXX")"
+GREPO="$GROOT/repo with spaces"
+mkdir -p "$GREPO/src" "$GREPO/.claude" "$GREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$GREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$GREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$GREPO/src/check-pending-tasks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$GREPO/src/"
+chmod +x "$GREPO/src/"*.sh
+
+export G_LEGACY="$GREPO/.claude/settings.json" G_REPO="$GREPO"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['G_LEGACY'], os.environ['G_REPO']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        # canonical, pre-move — must be SWEPT (this is a Phase 3 migration fixture).
+        {"type": "command",
+         "command": f'bash \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # operator's OWN wrapper, our script passed as its argument — must SURVIVE.
+        {"type": "command",
+         "command": f'bash \'/tmp/operator-wrapper.sh\' \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+    ]}],
+    "PreCompact": [{"matcher": "", "hooks": [
+        # same shape, the archive destination as the wrapper's argument — SURVIVE.
+        {"type": "command",
+         "command": f'bash \'/tmp/archive-wrapper.sh\' \'{repo}/workspace/logs/conversations/\''},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$GREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+GSURV_SE="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+GSURV_PC="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+ok "wrapper-before-marker: operator's session-handoff wrapper survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: today's canonical session-handoff shape is still swept" \
+   "$(echo "$GSURV_SE" | grep -qxF "bash '$GREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
+ok "wrapper-before-marker: operator's archive-destination wrapper survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper.sh' && echo 0 || echo 1)"
+rm -rf "$GROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
