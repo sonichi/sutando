@@ -208,6 +208,12 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
+# An empty PYBIN must never reach "$PYBIN" here -- that ran as an empty command
+# before, hidden by 2>/dev/null, and relied on rc=127 happening to not be 1.
+if [ -z "$PYBIN" ]; then
+  echo '{}'
+  exit 0
+fi
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
 STOP_RC=$?
 

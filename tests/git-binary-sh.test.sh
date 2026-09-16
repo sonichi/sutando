@@ -29,9 +29,7 @@ else
   ok "resolver never executed the candidate"
 fi
 
-# --- 3. the real contract: system dir + no CLT -> EMPTY ---------------------
-# Uses the genuine /usr/bin/git, with only xcode-select faked to fail: bare
-# `git` on a toolchain-free host must not run at all.
+# --- 3. system dir + no CLT -> EMPTY -- genuine /usr/bin/git, xcode-select faked to fail.
 lab3=$(mktemp -d)
 printf '#!/bin/sh\nexit 2\n' > "$lab3/xcode-select"; chmod +x "$lab3/xcode-select"
 out=$(OSTYPE=darwin25 PATH="$lab3:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
@@ -51,9 +49,8 @@ out=$(OSTYPE=linux-gnu PATH="$lab5:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts
 if [ -n "$out" ]; then ok "non-Darwin: system git is used (stub rule is macOS-only)"
 else bad "non-Darwin: system git is used (stub rule is macOS-only)" "got empty"; fi
 
-# --- 6. the REAL stub FIRST on PATH must not hide a real git further along --
-# Walks every PATH candidate rather than trusting the first match: /usr/bin
-# genuinely comes first here, and a first-hit-only resolver would stop there.
+# --- 6. a real stub FIRST on PATH must not hide a real git further along --
+# /usr/bin comes first here; a first-hit-only resolver would stop there.
 lab6=$(mktemp -d)
 printf '#!/bin/sh\nexit 2\n' > "$lab6/xcode-select"; chmod +x "$lab6/xcode-select"
 out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:$lab/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
@@ -68,9 +65,8 @@ printf '#!/bin/sh\nexit 2\n' > "$lab7/xcode-select"; chmod +x "$lab7/xcode-selec
 out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
 check "a symlink to the system stub is refused like the stub itself" "$out" ""
 
-# --- 7b. same case, but with readlink UNAVAILABLE -- must still refuse, ------
-# never fall through with an unresolved/corrupted path (the exact "dirname:
-# command not found" shape python-binary.sh already hit and fixed).
+# --- 7b. same case, readlink UNAVAILABLE -- must still refuse, never fall
+# through with an unresolved/corrupted path.
 out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git" 2>/dev/null)
 check "a symlink-to-stub is refused even when readlink itself is unavailable" "$out" ""
 
@@ -104,9 +100,8 @@ printf '#!/bin/sh\nexit 2\n' > "$lab8b/xcode-select"; chmod +x "$lab8b/xcode-sel
 out=$(OSTYPE=darwin25 PATH="$lab8b:$lab8b/linkdir:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
 check "a symlink to a real non-system git is accepted" "$out" "$lab8b/linkdir/git"
 
-# --- 9. check-pending-tasks.sh sources the resolver, not a bare `git` --------
-# The old pattern only caught the -C'd probe; reverting the OTHER call (no -C)
-# to bare git passed it clean. Match any command-substitution invoking `git`.
+# --- 9. check-pending-tasks.sh sources the resolver, not a bare `git` -- match
+# any command-substitution invoking `git`, not just a -C'd probe.
 if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '\$\(git[[:space:]]'; then
   bad "check-pending-tasks.sh must not call a bare git" "found an unresolved git invocation"
 else
@@ -115,6 +110,15 @@ fi
 grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
   ok "check-pending-tasks.sh sources git-binary.sh" || \
   bad "check-pending-tasks.sh sources git-binary.sh" "source line missing"
+
+# --- 10. the discovered stub candidate is NEVER executed to decide dev-tools -
+# Can't witness this behaviorally (it would raise the real CLT dialog); split
+# on ; && || like the shell would, so "$_stub" as a command (not [ ] or printf) is caught.
+if sed -E 's/(&&|\|\||;)/\n/g' "$REPO/scripts/git-binary.sh" | grep -qE '^[[:space:]]*"?\$_stub"?[[:space:]]+[^]]'; then
+  bad "the stub candidate is never executed to decide" "found \$_stub used as a command, not just tested/printed"
+else
+  ok "the stub candidate is never executed to decide"
+fi
 
 if [ "$fail" -eq 0 ]; then echo "PASS ($pass/$((pass+fail)))"; else echo "FAIL ($fail failed)"; fi
 exit "$fail"

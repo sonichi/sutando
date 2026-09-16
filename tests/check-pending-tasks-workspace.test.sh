@@ -37,14 +37,21 @@ set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO/src/check-pending-tasks.sh"
 
-# Fixture setup below needs a REAL git, not whatever a bare `git` resolves to
-# on this box (the macOS CLT stub included) -- go through the same resolver
-# the hook itself uses, so the suite is not exposed to the exact failure mode
-# it tests for.
+# Fixture setup needs a REAL git, not whatever bare `git` resolves to here --
+# go through the same resolver the hook uses, or the suite risks its own failure mode.
 . "$REPO/scripts/git-binary.sh"
 TEST_GIT="$(resolve_git)"
 if [ -z "$TEST_GIT" ]; then
   echo "FAIL: no usable git found to build test fixtures with."
+  exit 1
+fi
+
+# Same reasoning, same fix, for python3 -- a bare `|| echo python3` fallback is
+# exactly the CLT-stub risk this suite exists to catch, just in its own setup.
+. "$REPO/scripts/python-binary.sh"
+TEST_PY="$(resolve_python "$REPO")"
+if [ -z "$TEST_PY" ]; then
+  echo "FAIL: no usable python3 found to build test fixtures with."
   exit 1
 fi
 
@@ -63,7 +70,7 @@ TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest.XXXXXX")"
 # no-send. These cases assert the TASK gate, so satisfy the turn gate first or
 # they measure the wrong refusal.
 record_delivery() {
-  "$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)" \
+  "$TEST_PY" \
     "$REPO/src/turn_ledger.py" --workspace "$TMPWS" no-send "hook unit test" >/dev/null 2>&1 || true
 }
 
@@ -168,22 +175,15 @@ printf 'id: probe\ntask: rejected-interpreter\n' > "$REJ/workspace/tasks/$PROBE"
 # A recording shim: if the hook falls back to PATH python this fires.
 printf '#!/bin/bash\necho FALLBACK_INVOKED >&2\nexit 79\n' > "$REJ/python3"
 chmod +x "$REJ/python3"
-# A recording git stub, so git-binary.sh's resolve_git() actually has something
-# to resolve to (and its two call sites something to record) rather than the
-# whole block quietly no-opping on an absent/rejected git. Both probes echo
-# the SAME real, existing directory ($REJ), so CWD/REPO canonicalize equal --
-# a deliberate "same identity" case, so the block falls through normally
-# (never skips) into the interpreter-rejection logic this case actually tests.
+# A recording stub, so resolve_git has something to resolve to. Both probes
+# echo the SAME dir ($REJ) -- same identity, so it falls through to the case below.
 printf '#!/bin/bash\necho "GIT_CALLED $*" >> "%s/git-calls.log"\necho "%s"\n' "$REJ" "$REJ" \
   > "$REJ/git"
 chmod +x "$REJ/git"
 printf '#!/bin/sh\nexit 2\n' > "$REJ/xcode-select"
 chmod +x "$REJ/xcode-select"
-# Run from a NON-Git cwd (never this checkout) so the guest carve-out's own
-# fall-through ("cannot prove different, proceed as core") is what lets
-# execution continue into the interpreter-rejection logic below it, rather
-# than either a real git identity here OR a short-circuiting guest exit
-# masking whether that logic ran at all.
+# A NON-Git cwd (never this checkout) so the guest fall-through, not a real
+# identity or a short-circuiting guest exit, is what reaches the logic below.
 REJ_CWD="$(mktemp -d)"
 REJ_ERR="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
 rm -f "$REJ/git-calls.log"
@@ -192,46 +192,54 @@ case "$REJ_ERR" in
   *FALLBACK_INVOKED*) bad "a refused interpreter is not worked around" "the bare python3 fallback ran" ;;
   *) ok "a refused interpreter is not worked around" ;;
 esac
-# Not "no stderr at all" -- the hook's own deliberate interpreter-refusal
-# message belongs there. Specifically absent: the symptom of git-binary.sh
-# failing to source (a missing file, or calling the then-undefined resolve_git).
-case "$REJ_ERR" in
-  *"No such file or directory"*|*"command not found"*)
-    bad "no source/command-not-found noise (git-binary.sh actually sourced, not silently missing)" "got: ${REJ_ERR:0:160}" ;;
-  *) ok "no source/command-not-found noise (git-binary.sh actually sourced, not silently missing)" ;;
-esac
-# The EXACT message, not just "some stderr" -- an empty or unrelated stderr must not pass.
-case "$REJ_ERR" in
-  *"check-pending-tasks: no usable interpreter; queue not reported"*)
-    ok "the exact rejection warning is emitted" ;;
-  *) bad "the exact rejection warning is emitted" "got: ${REJ_ERR:0:160}" ;;
-esac
+# EXACT equality, not a substring -- extra noise alongside the good message
+# (git-binary.sh failing to source, a stray command-not-found) must not pass.
+if [ "$REJ_ERR" = "check-pending-tasks: no usable interpreter; queue not reported" ]; then
+  ok "stderr is exactly the one deliberate rejection message, nothing else"
+else
+  bad "stderr is exactly the one deliberate rejection message, nothing else" "got: ${REJ_ERR:0:160}"
+fi
 case "$REJ_OUT" in
   '{}') ok "a refused interpreter still emits valid JSON" ;;
   *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
 esac
-# EXACTLY 2 calls (the two rev-parse probes), not ">= 2" -- and each argv record
-# must be one of the two we expect, not merely present in some quantity.
-if [ -f "$REJ/git-calls.log" ] && [ "$(wc -l < "$REJ/git-calls.log")" -eq 2 ] \
-   && grep -qF "GIT_CALLED rev-parse --path-format=absolute --git-common-dir" "$REJ/git-calls.log" \
-   && grep -qF "GIT_CALLED -C $REJ rev-parse --path-format=absolute --git-common-dir" "$REJ/git-calls.log"; then
+# EXACT whole-file equality, not grep -qF -- a substring search would also pass
+# a call carrying EXTRA argv beyond what's expected on the same log line.
+GIT_CALLS_EXPECTED="$(printf 'GIT_CALLED rev-parse --path-format=absolute --git-common-dir\nGIT_CALLED -C %s rev-parse --path-format=absolute --git-common-dir\n' "$REJ")"
+if [ -f "$REJ/git-calls.log" ] && [ "$(cat "$REJ/git-calls.log")" = "$GIT_CALLS_EXPECTED" ]; then
   ok "the git stub was invoked exactly twice, with the two expected argv records"
 else
   bad "the git stub was invoked exactly twice, with the two expected argv records" \
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
 
-# 6b. THE READINESS-CHECK GAP. An existing result file must not feed an empty
-# PYBIN into a command substitution -- that misreports a real result as "EMPTY".
+# 6b. THE READINESS-CHECK GAP. A TRULY result-only queue (the earlier
+# no-result $PROBE removed) must reach the turn-ledger gate at line ~105, not
+# stop earlier at the UNPROCESSED check -- both PYBIN call sites must guard.
+rm -f "$REJ/workspace/tasks/$PROBE"
 RESULT_PROBE="task-zz-hooktest-readiness-$$.txt"
 printf 'id: probe\ntask: readiness-gap-probe\n' > "$REJ/workspace/tasks/$RESULT_PROBE"
 printf 'a real, well-formed reply\n' > "$REJ/workspace/results/$RESULT_PROBE"
 RG_ERR="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
+RG_OUT="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
 case "$RG_ERR" in
   *"command not found"*|*": : "*)
-    bad "an existing result file with no interpreter produces no stray command-not-found noise" "got: ${RG_ERR:0:160}" ;;
-  *) ok "an existing result file with no interpreter produces no stray command-not-found noise" ;;
+    bad "a truly result-only queue with no interpreter produces no stray command-not-found noise" "got: ${RG_ERR:0:160}" ;;
+  *) ok "a truly result-only queue with no interpreter produces no stray command-not-found noise" ;;
 esac
+case "$RG_OUT" in
+  '{}') ok "a truly result-only queue with no interpreter still emits valid JSON" ;;
+  *) bad "a truly result-only queue with no interpreter still emits valid JSON" "got: ${RG_OUT:0:120}" ;;
+esac
+# STRUCTURAL: the old and new code are byte-identical in observable output
+# here (both emit `{}`, rc=127 happening to not equal 1 either way), so
+# black-box testing cannot see this regress -- pin the guard's presence instead.
+if grep -qF '[ -z "$PYBIN" ] && continue' "$HOOK" && grep -B4 'turn_ledger.py' "$HOOK" | grep -qF '[ -z "$PYBIN" ]'; then
+  ok "both PYBIN call sites (readiness check, turn-ledger gate) are explicitly guarded"
+else
+  bad "both PYBIN call sites (readiness check, turn-ledger gate) are explicitly guarded" \
+    "an empty-PYBIN guard is missing before one of the two \"\$PYBIN\" invocations"
+fi
 rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE"
 rm -rf "$REJ_CWD"
 # 7. THE GUEST CARVE-OUT. A cwd inside a worktree of an UNRELATED repo (its own
@@ -247,11 +255,8 @@ case "$GUEST_OUT" in
 esac
 rm -rf "$GUEST_REPO"
 
-# 8. CONTROL FOR CASE 7. A cwd inside a worktree OF THIS SAME REPO shares its
-# git-common-dir, so it is still the core, not a guest — the same pending task
-# must still block there. Without this, a carve-out keyed on "any worktree"
-# rather than "a DIFFERENT repo's worktree" would pass case 7 by disabling the
-# gate for every worktree, this repo's own included.
+# 8. CONTROL FOR CASE 7. A worktree of THIS repo shares its git-common-dir --
+# still core, still blocks -- proving case 7 is keyed on a DIFFERENT repo, not "any worktree".
 OWN_WT="$REPO/.claude/worktrees/hooktest-$$"
 if "$TEST_GIT" -C "$REPO" worktree add -q --detach "$OWN_WT" HEAD 2>/dev/null; then
   OWN_WT_OUT="$(cd "$OWN_WT" && bash "$HOOK" 2>&1)"
@@ -271,7 +276,7 @@ BUNDLE="$(mktemp -d)"
 mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$BUNDLE/src/"
 cp "$REPO/scripts/git-binary.sh" "$BUNDLE/scripts/"
-BUNDLE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+BUNDLE_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$BUNDLE" "$BUNDLE_PY" > "$BUNDLE/scripts/sutando-config.sh"
 chmod +x "$BUNDLE/scripts/sutando-config.sh"
@@ -304,7 +309,7 @@ FAILPROBE="$(mktemp -d)"
 mkdir -p "$FAILPROBE/src" "$FAILPROBE/scripts" "$FAILPROBE/workspace/tasks" "$FAILPROBE/workspace/results" "$FAILPROBE/.git"
 cp "$REPO/src/check-pending-tasks.sh" "$FAILPROBE/src/"
 cp "$REPO/scripts/git-binary.sh" "$FAILPROBE/scripts/"
-FP_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+FP_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$FAILPROBE" "$FP_PY" > "$FAILPROBE/scripts/sutando-config.sh"
 chmod +x "$FAILPROBE/scripts/sutando-config.sh"
@@ -334,7 +339,7 @@ NESTED_REPO="$OUTER_REPO/child"
 mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
 cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-NR_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+NR_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$NESTED_REPO" "$NR_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
 chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
@@ -365,7 +370,7 @@ DANGLING="$(mktemp -d)"
 mkdir -p "$DANGLING/src" "$DANGLING/scripts" "$DANGLING/workspace/tasks" "$DANGLING/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$DANGLING/src/"
 cp "$REPO/scripts/git-binary.sh" "$DANGLING/scripts/"
-DL_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+DL_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$DANGLING" "$DL_PY" > "$DANGLING/scripts/sutando-config.sh"
 chmod +x "$DANGLING/scripts/sutando-config.sh"
@@ -392,7 +397,7 @@ POISON="$(mktemp -d)"
 mkdir -p "$POISON/src" "$POISON/scripts" "$POISON/workspace/tasks" "$POISON/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$POISON/src/"
 cp "$REPO/scripts/git-binary.sh" "$POISON/scripts/"
-PS_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+PS_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$POISON" "$PS_PY" > "$POISON/scripts/sutando-config.sh"
 chmod +x "$POISON/scripts/sutando-config.sh"
