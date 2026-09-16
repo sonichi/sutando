@@ -406,6 +406,10 @@ export const workTool: ToolDefinition = {
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
+		const notchOpen = /(?:\b(?:open|show|display|load)\b.{0,80}\bnotch\b|\bnotch\b.{0,80}\b(?:open|show|display|load)\b|(?:打开|显示|放到).{0,24}(?:notch|刘海))/i;
+		if (notchOpen.test(task)) {
+			return { status: 'rejected', message: 'Use show_web_in_notch inline tool directly for notch opening.' };
+		}
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.

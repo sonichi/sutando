@@ -75,6 +75,16 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		assert.doesNotMatch(content, /^reminder:/m, 'reminder field was dropped');
 	});
 
+	it('rejects notch-opening requests instead of creating an asynchronous task', async () => {
+		const before = new Set(listTaskFiles());
+		const result = await (workTool.execute as any)({ task: 'find PR 3760 and open it in the notch' }, null);
+		assert.deepEqual(result, {
+			status: 'rejected',
+			message: 'Use show_web_in_notch inline tool directly for notch opening.',
+		});
+		assert.deepEqual(new Set(listTaskFiles()), before);
+	});
+
 	it('uses SUTANDO_DM_OWNER_ID when set, falls back to voice-local sentinel', async () => {
 		// Case 1: default (env unset) → voice-local
 		const fn1 = await invokeWorkTool('default fallback');
