@@ -25,6 +25,10 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # relative to the wrong base silently misjudges "same repo" in both directions.
 CWD_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 REPO_COMMON_DIR="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+# Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
+# --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
+[ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
+[ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
 if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
   echo '{}'
   exit 0
