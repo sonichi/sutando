@@ -260,20 +260,29 @@ REMOVED=0
 # Real shell-word tokenizer: quotes honored, backslash escapes the next
 # character (single- and double-quoted spans, exactly like shq()'s own
 # escaping), NEVER expands $vars or `cmd`/$(cmd) substitutions — nothing here
-# EXECUTES anything, it only finds argv BOUNDARIES. Sets the global array
-# TOKENIZE_RESULT; returns 1 on unterminated quote (the text is not valid
-# shell at all). Exists because THREE rounds of the ownership test below
-# tried to approximate this with a regex wildcard and each round shipped a
-# new argv-boundary shape the wildcard didn't cover (#4309 review,
-# keweichen/qingyun-wu, 2026-09-16) — real tokenization has no such shape,
-# because it isn't inferring a boundary, it's finding the one a shell would.
+# EXECUTES anything, it only finds argv BOUNDARIES. UNQUOTED whitespace and
+# every POSIX shell control/redirection operator (`;` `&` `|` `<` `>` `(` `)`
+# and newline) end the current word exactly like a space does — a compound
+# command (`bash /op/wrap.sh;<repo>/src/session-handoff.sh ...`,
+# `bash /op/wrap.sh&&<repo>/... ...`) is two shell commands glued by an
+# operator with no space at all, and the earlier version of this function
+# only knew about whitespace, so it fused the operator's own wrapper word
+# onto the marker's word instead of ending the boundary there (qingyun-wu
+# 2026-09-16, reproduced live on 46132a6d with `;` and `&&`). Sets the
+# global array TOKENIZE_RESULT; returns 1 on unterminated quote (the text
+# is not valid shell at all). Exists because FOUR rounds of the ownership
+# test below tried to approximate this with a regex wildcard and each round
+# shipped a new argv-boundary shape the wildcard didn't cover (#4309
+# review, keweichen/qingyun-wu, 2026-09-16) — real tokenization has no such
+# shape, because it isn't inferring a boundary, it's finding the one a
+# shell would.
 tokenize_argv() {
   local s="$1" n=${#1} i=0 c cur="" in_word=0
   TOKENIZE_RESULT=()
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
     case "$c" in
-      ' '|$'\t')
+      ' '|$'\t'|$'\n'|';'|'&'|'|'|'<'|'>'|'('|')')
         if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
         i=$((i+1)) ;;
       "'")

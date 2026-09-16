@@ -717,6 +717,68 @@ ok "wrapper-before-marker: BOTH-UNQUOTED archive-destination wrapper path surviv
    "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-bothunquoted.sh' && echo 0 || echo 1)"
 rm -rf "$GROOT"
 
+# --- 13. a COMPOUND command joined by a shell control operator, no space --
+# `;` `&&` `||` `|` and friends separate shell commands exactly like a space
+# separates argv words — but the round-12 tokenizer only knew about
+# whitespace, so `bash /op/wrap.sh;<repo>/src/session-handoff.sh ...` (no
+# space anywhere near the `;`) fused the wrapper's word onto the marker's
+# word into ONE argv[1] that contains the marker, and got deleted
+# (qingyun-wu 2026-09-16, reproduced live on 46132a6d).
+#
+# Deliberately a SPACE-FREE repo path here (unlike every other fixture in
+# this file, which uses "repo with spaces" on purpose) — a repo path
+# containing spaces ALSO forces the tokenizer into the bucket-B fallback for
+# an unrelated reason (the wrapper's own unquoted word already splits on
+# those spaces), which happens to reject the same candidate for the wrong
+# reason and would silently pass this check even without the fix. Confirmed
+# by mutation: the round-12 fixture (spaces-in-path) fixture did NOT
+# reproduce this bug; only a clean, space-free path does.
+KROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-compound-op.XXXXXX")"
+KREPO="$KROOT/repo-no-spaces"
+mkdir -p "$KREPO/src" "$KREPO/.claude" "$KREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$KREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$KREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$KREPO/src/check-pending-tasks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$KREPO/src/"
+chmod +x "$KREPO/src/"*.sh
+
+export K_LEGACY="$KREPO/.claude/settings.json" K_REPO="$KREPO"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['K_LEGACY'], os.environ['K_REPO']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": f'bash \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # SEMICOLON-joined compound command — must SURVIVE.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper.sh;{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        # ANDAND-joined compound command — must SURVIVE.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper.sh&&{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+    "PreCompact": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": f'bash \'/tmp/archive-wrapper.sh\' \'{repo}/workspace/logs/conversations/\''},
+        # SEMICOLON-joined variant, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper.sh;{repo}/workspace/logs/conversations/'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$KREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+KSURV_SE="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_LEGACY")"
+KSURV_PC="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_LEGACY")"
+ok "compound-op (space-free repo): today's canonical shape is still swept" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash '$KREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
+ok "compound-op: SEMICOLON-joined command survives" \
+   "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh;' && echo 0 || echo 1)"
+ok "compound-op: ANDAND-joined command survives" \
+   "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh&&' && echo 0 || echo 1)"
+ok "compound-op: SEMICOLON-joined archive-destination command survives" \
+   "$(echo "$KSURV_PC" | grep -qF 'archive-wrapper.sh;' && echo 0 || echo 1)"
+rm -rf "$KROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
