@@ -3,7 +3,7 @@
 # Sends /model through the shared sender and records only after the CLI accepts THAT model; the CLI's own
 # file (Claude settings.json, Codex config.toml) is the CLI's to write.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; EFFORT=""
+MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; EFFORT=""; EFFORT_SEEN=""
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;; --effort) EFFORT="${2:?}"; shift;;
   --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
@@ -62,13 +62,18 @@ fi
 LOCK="$STATE_DIR/.model-switch.lock"; mkdir -p "$STATE_DIR" 2>/dev/null
 if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open the switch lock ($LOCK) — nothing changed" >&2; exit 1; fi
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
+# The pane lock every pane writer flocks is held here for the WHOLE transaction (preflight, /model,
+# both pickers, acceptance), so no other writer's line can land mid-picker; the sender borrows fd 8.
+PANELOCK="$(bash "$REPO/scripts/tmux-pane-lock.sh" "$SOCK" "$SESSION")" || { echo "switch-model: could not derive the pane lock — nothing changed" >&2; exit 7; }
+if ! { exec 8>"$PANELOCK"; } 2>/dev/null; then echo "switch-model: could not open the pane lock ($PANELOCK) — nothing changed" >&2; exit 7; fi
+"$PY" -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX)' || { echo "switch-model: could not take the pane lock — nothing changed" >&2; exit 7; }
 # Preflight the live pane before any write through the ONE sender
 # (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the
 # socket lock and refuses (5) on pending text, (7) on a failed inspection.
 SENDER="$REPO/scripts/tmux-send-line.sh"
 LIVE=""
 if [ -x "$SENDER" ] || [ -f "$SENDER" ]; then
-  bash "$SENDER" "$SESSION" "$LINE" --socket "$SOCK" --runtime "$RUNTIME" --refuse-if-pending --dry-run > /dev/null 2> "$STATE_DIR/.send-preflight.err"; PRC=$?
+  bash "$SENDER" "$SESSION" "$LINE" --socket "$SOCK" --runtime "$RUNTIME" --refuse-if-pending --lock-fd 8 --dry-run > /dev/null 2> "$STATE_DIR/.send-preflight.err"; PRC=$?
   case $PRC in
     0) LIVE=1;;
     3) LIVE="";;
@@ -102,14 +107,15 @@ PYEOF
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
 BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --count)"; BRC=$?
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
-bash "$SENDER" "$SESSION" "$LINE" --socket "$SOCK" --runtime "$RUNTIME" --refuse-if-pending > /dev/null || { echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
+bash "$SENDER" "$SESSION" "$LINE" --socket "$SOCK" --runtime "$RUNTIME" --refuse-if-pending --lock-fd 8 > /dev/null || { echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
 CONFIRMED=false
 if [ "$RUNTIME" = codex ]; then
   # The observer drives both pickers (model row, then reasoning level) and waits for the acceptance line.
   VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" ${EFFORT:+--effort "$EFFORT"} --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" 2> "$STATE_DIR/.observe.err")"
   case "$VERDICT" in
-    ACCEPTED) ;;
+    ACCEPTED|"ACCEPTED "*) EFFORT_SEEN="${VERDICT#ACCEPTED}"; EFFORT_SEEN="${EFFORT_SEEN# }";;
     NOT-OFFERED) echo "switch-model: $(cat "$STATE_DIR/.observe.err") Nothing recorded" >&2; exit 9;;
+    "EFFORT-MISMATCH"*) echo "switch-model: $(cat "$STATE_DIR/.observe.err") Nothing recorded" >&2; exit 10;;
     *) echo "switch-model: sent '/model' and picked $MODEL but saw no 'Model changed to $MODEL' within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8;;
   esac
 else
@@ -127,8 +133,8 @@ case "$VERDICT" in
   *) echo "switch-model: sent '/model $MODEL' but saw no acceptance OF THAT MODEL within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8;;
 esac
 fi
-# Record only now, with the previous model snapshotted before the send.
-OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" "$RUNTIME" "$EFFORT" <<'PYEOF'
+# Record only now, with the previous model snapshotted before the send and the effort the CLI applied.
+OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" "$RUNTIME" "$EFFORT_SEEN" <<'PYEOF'
 import json, os, sys, time, tempfile
 cfg, model, state_dir, confirmed, prev, src, runtime, effort = sys.argv[1:9]
 rec = {"model": model, "previous": prev or None, "previous_source": src, "accepted": True, "confirmed": confirmed == "true",
@@ -150,5 +156,5 @@ case "$OUT" in
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
-echo "switched: model=$MODEL${EFFORT:+ effort=$EFFORT} (was ${OUT#OK }); accepted by the CLI$([ "$CONFIRMED" = true ] && echo ' after confirming its dialog'); record: $STATE_DIR/model-switch.json"
+echo "switched: model=$MODEL${EFFORT_SEEN:+ effort=$EFFORT_SEEN} (was ${OUT#OK }); accepted by the CLI$([ "$CONFIRMED" = true ] && echo ' after confirming its dialog'); record: $STATE_DIR/model-switch.json"
 exit 0

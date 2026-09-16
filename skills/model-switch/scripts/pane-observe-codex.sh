@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pane-observe-codex.sh <session> --socket PATH --model M [--effort low|medium|high|xhigh] (--count | --wait --baseline N [--timeout S] | --cancel)
-# Codex's bare /model opens two pickers; a digit key selects AND confirms a row. Acceptance =
-# a "Model changed to <M> <effort>" line for the REQUESTED id; another id's line does not count.
-# Exit: 0 ACCEPTED · 11 TIMEOUT · 12 capture failed · 13 model not offered (picker cancelled) · 14 effort not offered.
+# Codex's bare /model opens two pickers; a digit key selects AND confirms a row. Acceptance = a new
+# "Model changed to <M> <effort>" line for the REQUESTED id, whose effort word must equal --effort when given.
+# Exit: 0 "ACCEPTED <effort>" · 11 TIMEOUT · 12 capture failed · 13 model not offered (picker cancelled) · 14 effort not offered · 15 "EFFORT-MISMATCH <seen>".
 set -u
 SESSION="${1:?session}"; shift
 SOCK=""; MODE=""; BASE=0; TIMEOUT=20; REQ=""; EFFORT=""
@@ -63,9 +63,16 @@ else
   fi
   tmux -S "$SOCK" send-keys -t "$SESSION" -l "$digit"
 fi
-# A NEW matching line (count above baseline) is the switch.
+# The NEWEST matching line (count above baseline) is the switch; its effort word is what the CLI applied.
 while :; do
-  if text="$(cap)"; then n=$(printf '%s\n' "$text" | grep -Ec -- "$ACCEPT"); [ "$n" -gt "$BASE" ] && { echo ACCEPTED; exit 0; }; fi
+  if text="$(cap)" && [ "$(printf '%s\n' "$text" | grep -Ec -- "$ACCEPT")" -gt "$BASE" ]; then
+    seen="$(printf '%s\n' "$text" | grep -E -- "$ACCEPT" | tail -1 | sed -E "s/.*Model changed to ${ESC} ?([[:alnum:]_-]*).*/\\1/")"
+    if [ -n "$EFFORT" ] && [ "$seen" != "$EFFORT" ]; then
+      echo "pane-observe-codex: requested effort '$EFFORT' but the CLI applied '${seen:-none}' (Model changed to $REQ ${seen}); not accepted." >&2
+      echo "EFFORT-MISMATCH $seen"; exit 15
+    fi
+    echo "ACCEPTED${seen:+ $seen}"; exit 0
+  fi
   [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }
   sleep 0.3
 done

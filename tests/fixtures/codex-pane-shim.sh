@@ -28,7 +28,7 @@ if grep -q -- '-l /model$' "$TMUX_LOG" && ! printf '%s' "$picks" | grep -q Escap
   if [ "$k" -eq 0 ]; then body="  Select Model and Effort\n$ROWS\n"
   elif [ "$k" -eq 1 ]; then body="  Select Reasoning Level for $(model_of "$p1")\n$EFFORTS\n"
   elif [ -z "${TMUX_NO_ACCEPT:-}" ]; then
-    m="$(model_of "$p1")"; e="$(effort_of "$p2")"; body="• Model changed to $m $e\n"
+    m="$(model_of "$p1")"; e="${TMUX_ACCEPT_EFFORT_AS:-$(effort_of "$p2")}"; body="• Model changed to $m $e\n"
     [ -n "${TMUX_CODEX_CONFIG:-}" ] && printf 'model = "%s"\nmodel_reasoning_effort = "%s"\n' "$m" "$e" > "$TMUX_CODEX_CONFIG"
   fi
 fi

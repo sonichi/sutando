@@ -61,7 +61,9 @@ rc=$(runx gpt-5.6-luna --effort xhigh); R=$(python3 -c "import json;d=json.load(
   && ok "12a codex: the BARE /model goes through the sender with --runtime codex (-e capture), row 2 then Extra high (4) are pressed, the record names model/previous(config.toml)/effort/runtime" || fail "12a codex switch" "rc=$rc keys='$(xkeys)' R=$R $(cat "$T/err")"
 [ "$(cat "$T/codexhome/config.toml")" = "$TOML_BEFORE" ] && ok "12b ...and config.toml is byte-identical: the script never writes it" || fail "12b toml written" "$(cat "$T/codexhome/config.toml")"
 rc=$(runx gpt-5.5); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['effort'])" 2>/dev/null)
-[ "$rc" = 0 ] && [ "$(xkeys)" = "/model Enter 4 Enter" ] && [ "$R" = None ] && ok "12c codex without --effort: Enter takes the reasoning picker's default, effort recorded as null" || fail "12c" "rc=$rc keys='$(xkeys)' R=$R"
+[ "$rc" = 0 ] && [ "$(xkeys)" = "/model Enter 4 Enter" ] && [ "$R" = medium ] && grep -q "effort=medium" "$T/out" && ok "12c codex without --effort: Enter takes the reasoning picker's default; the effort RECORDED is the one the CLI printed (medium), not invented" || fail "12c observed effort" "rc=$rc keys='$(xkeys)' R=$R"
+rc=$(TMUX_ACCEPT_EFFORT_AS=medium runx gpt-5.5 --effort high); [ "$rc" = 10 ] && [ ! -e "$T/state/model-switch.json" ] && [ "$(xkeys)" = "/model Enter 4 3" ] && grep -q "requested effort 'high' but the CLI applied 'medium'" "$T/err" \
+  && ok "12c2 --effort high requested, pane prints 'Model changed to gpt-5.5 medium': exit 10, NO record, requested vs observed named" || fail "12c2 effort mismatch" "rc=$rc keys='$(xkeys)' R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
 rc=$(TMUX_CODEX_CONFIG="$T/codexhome/config.toml" runx gpt-5.6-sol --effort low); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous'])" 2>/dev/null); NOW=$(sed -n 's/^model = "\(.*\)"/\1/p' "$T/codexhome/config.toml")
 [ "$rc" = 0 ] && [ "$R" = gpt-5.5 ] && [ "$NOW" = gpt-5.6-sol ] && ok "12d the CLI rewrote config.toml on acceptance; previous still records the model BEFORE the send" || fail "12d previous read after acceptance" "rc=$rc R=$R now=$NOW"
 printf '%s\n' "$TOML_BEFORE" > "$T/codexhome/config.toml"
@@ -91,6 +93,14 @@ case "$SEQ" in "lit:sonnet enter lit:haiku enter "|"lit:haiku enter lit:sonnet e
 (bash "$HERE/scripts/tmux-send-line.sh" sutando-core watcher --socket "$T/x.sock" --skip-if-queued watcher >/dev/null 2>&1) & wait
 SEQ="$(grep send-keys "$TMUX_LOG" | sed -E 's/.*-l \/model sonnet$/lit:model/; s/.*-l watcher$/lit:watcher/; s/.*Enter$/enter/' | tr '\n' ' ')"
 case "$SEQ" in "lit:model enter lit:watcher enter "|"lit:watcher enter lit:model enter ") ok "18 cross-sender: a switch and an app watcher line serialize through one lock";; *) fail "18" "$SEQ";; esac
+# codex picker transaction: the app's watcher sender (exact shape of main.swift's tmuxSendLine: no --runtime, no --refuse-if-pending)
+# fires the moment /model is typed and must NOT reach the pane until the switch has been accepted.
+: > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps" "$T/state/model-switch.json" "$T/rc"
+(SUTANDO_CORE_RUNTIME=codex TMUX_CODEX=1 TMUX_CAP_DELAY=0.4 "$HERE/scripts/switch-model.sh" gpt-5.5 --effort high --accept-timeout 6 --state-dir "$T/state" --brain "$T/codexhome" > "$T/out" 2> "$T/err"; echo $? > "$T/rc") &
+(i=0; until grep -q -- '-l /model$' "$TMUX_LOG" 2>/dev/null || [ $i -ge 200 ]; do sleep 0.05; i=$((i+1)); done
+ TMUX_CODEX=1 bash "$HERE/scripts/tmux-send-line.sh" sutando-core watcher --socket "$SUTANDO_TMUX_SOCKET" --skip-if-queued watcher > /dev/null 2>&1) & wait
+[ "$(cat "$T/rc")" = 0 ] && [ "$(xkeys)" = "/model Enter 4 3 watcher Enter" ] && [ -e "$T/state/model-switch.json" ] \
+  && ok "18b codex: a watcher line sent mid-picker waits for the whole /model->pickers->acceptance transaction (keys: $(xkeys)); the switch completes" || fail "18b picker collision" "rc=$(cat "$T/rc") keys='$(xkeys)' $(cat "$T/err")"
 settings_untouched && ok "19 after every case above, settings.json is byte-identical to the start" || fail "19 settings" "$(cat "$T/cfg/settings.json")"
 # --- the runtime gate fails closed: bogus / empty resolver output refuses before any record
 rm -f "$T/state/model-switch.json"; : > "$T/tmux.log"
@@ -143,4 +153,4 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 43 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 45 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run] [--lock-fd N]
 # The ONE sender for a line typed into a Sutando core pane: has-session, read
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
-# Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused).
+# Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused) · 8 --lock-fd is not this pane's lock.
 set -u -o pipefail
 SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME=claude
-SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""
+SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""; LOCKFD=""
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --refuse-if-pending) REFUSE=1;; --skip-if-queued) SKIPWORD="${2:?}"; shift;;
-  --runtime) RUNTIME="${2:?}"; shift;; --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+  --runtime) RUNTIME="${2:?}"; shift;; --dry-run) DRY=1;; --lock-fd) LOCKFD="${2:?}"; shift;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+case "$LOCKFD" in ""|[0-9]|[0-9][0-9]) ;; *) echo "tmux-send-line: --lock-fd takes a small integer fd, got '$LOCKFD'" >&2; exit 2;; esac
 case "$RUNTIME" in claude|codex) ;; *) echo "tmux-send-line: unknown --runtime '$RUNTIME' (claude|codex)" >&2; exit 2;; esac
 # A launchd-launched caller (the menu-bar app) has a bare PATH; path_helper
 # restores /etc/paths.d, where Homebrew registers itself — no literal prefix.
@@ -20,8 +21,16 @@ PY="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" python-
 [ -x "$PY" ] || { echo "tmux-send-line: python interpreter not found ($PY) — cannot inspect the prompt, not sending" >&2; exit 7; }
 # One sender at a time per socket+session: inspection and both send-keys run
 # under a lock, so two callers cannot interleave payloads before either Enter.
-LOCK="${TMPDIR:-/tmp}/tmux-send-line.$(printf '%s' "$SOCK:$SESSION" | "$PY" -c 'import sys,hashlib;print(hashlib.sha1(sys.stdin.read().encode()).hexdigest()[:12])').lock"
-exec 9>"$LOCK"
+LOCK="$(bash "$(cd "$(dirname "$0")" && pwd)/tmux-pane-lock.sh" "$SOCK" "$SESSION")" || { echo "tmux-send-line: could not derive the pane lock — not sending" >&2; exit 7; }
+if [ -n "$LOCKFD" ]; then
+  # A caller holding this pane's lock across a transaction lends its fd; any other file is refused.
+  "$PY" -c 'import os,sys
+a=os.fstat(int(sys.argv[1])); b=os.stat(sys.argv[2]); sys.exit(0 if (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino) else 1)' "$LOCKFD" "$LOCK" 2>/dev/null \
+    || { echo "tmux-send-line: --lock-fd $LOCKFD is not the pane lock for '$SESSION' on $SOCK ($LOCK) — refused" >&2; exit 8; }
+  eval "exec 9>&$LOCKFD"
+else
+  exec 9>"$LOCK"
+fi
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
 # The current prompt is the LAST line starting with the runtime's glyph (Claude ❯,
 # Codex ›; scrollback holds old ones); its input is what follows the glyph and one
