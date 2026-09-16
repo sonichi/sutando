@@ -218,23 +218,35 @@ else
   bad "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)" \
     "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
 fi
-# POSITIVE CONTROL for the recording stub itself, run in ISOLATION (a separate
-# log, never touching git-calls.log above): 3 separate args and 1 quoted arg
+# POSITIVE CONTROL for the recording stub itself, run in ISOLATION (separate
+# logs, never touching git-calls.log above): 3 separate args and 1 quoted arg
 # that joins to the identical string MUST be distinguishable in the recorded
 # log -- without this, a regression back to "$*" recording would still pass
 # the equality check above on THIS fixture's own args (none contain spaces),
 # because the fixture never exercises the ambiguous case that broke it.
+# EACH invocation writes to its OWN file, and the comparison is EXACT WHOLE-FILE
+# equality -- NOT a line-range slice of one shared log. A shared-log slice
+# (e.g. `sed -n '1,4p'` / `'5,7p'`) assumes each record occupies a fixed number
+# of lines; under a regression to "$*" (one line per call, two lines total),
+# the first slice silently swallows BOTH lines and the second is empty, so the
+# two slices differ trivially and the control reports "ok" without ever
+# comparing the calls to each other. Reproduced directly (keweichen, round 12).
 _argv_lab="$(mktemp -d)"
-printf '#!/bin/bash\n{ printf "GIT_CALLED argc=%%s\\n" "$#"; for a in "$@"; do printf "ARG<%%s>\\n" "$a"; done; } >> %s\necho ok\n' \
-  "$_argv_lab/calls.log" > "$_argv_lab/git"
+# $1 is the log path, consumed via shift BEFORE argc/$@ are recorded -- it must
+# never itself be counted as one of the args under test.
+printf '#!/bin/bash\n_log="$1"; shift\n{ printf "GIT_CALLED argc=%%s\\n" "$#"; for a in "$@"; do printf "ARG<%%s>\\n" "$a"; done; } >> "$_log"\n' \
+  > "$_argv_lab/git"
 chmod +x "$_argv_lab/git"
-"$_argv_lab/git" -C /a b c >/dev/null      # 3 separate args
-"$_argv_lab/git" -C "/a b c" >/dev/null    # 1 quoted arg, joins to the same string
-GCL_A="$(sed -n '1,4p' "$_argv_lab/calls.log")"
-GCL_B="$(sed -n '5,7p' "$_argv_lab/calls.log")"
-if [ "$GCL_A" = "$GCL_B" ]; then
+"$_argv_lab/git" "$_argv_lab/log-a" -C /a b c >/dev/null      # 3 separate args
+"$_argv_lab/git" "$_argv_lab/log-b" -C "/a b c" >/dev/null    # 1 quoted arg, joins to the same string
+GCL_A="$(cat "$_argv_lab/log-a" 2>/dev/null)"
+GCL_B="$(cat "$_argv_lab/log-b" 2>/dev/null)"
+if [ -z "$GCL_A" ] || [ -z "$GCL_B" ]; then
   bad "the stub's own recording distinguishes 3 args from 1 quoted arg joining to the same string" \
-    "both logged identically: $(cat "$_argv_lab/calls.log")"
+    "one or both invocations produced no log at all -- A=[$GCL_A] B=[$GCL_B]"
+elif [ "$GCL_A" = "$GCL_B" ]; then
+  bad "the stub's own recording distinguishes 3 args from 1 quoted arg joining to the same string" \
+    "both logged identically: A=[$GCL_A] B=[$GCL_B]"
 else
   ok "the stub's own recording distinguishes 3 args from 1 quoted arg joining to the same string"
 fi
