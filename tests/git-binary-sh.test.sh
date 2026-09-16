@@ -112,22 +112,10 @@ grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
   bad "check-pending-tasks.sh sources git-binary.sh" "source line missing"
 
 # --- 10. the discovered stub candidate is NEVER executed to decide dev-tools -
-# BEHAVIORAL, not a source-text regex (REVIEW.md #14: a regex on $_stub misses
-# execution through $_cand, `command "$_stub"`, or `( "$_stub" ... )`). Override
-# the classifier so a REAL RECORDING script can be classified as the stub without
-# needing to resolve to the real /usr/bin/git -- decoupling "is-stub" from
-# "would-raise-the-real-dialog" is what makes this witnessable at all.
-#
-# ran.log ABSENCE ALONE proves nothing (keweichen, round 12): if the override
-# seam were bypassed -- resolve_git never calling the classifier, or calling a
-# function by a name that no longer matches -- ran.log would ALSO stay absent,
-# for the wrong reason, and this case would report ok without ever exercising
-# the intended branch. So this case now also asserts: the classifier override
-# WAS invoked (its own marker file), the dev-tools probe WAS invoked (xcode-
-# select's own marker file), the resolver's actual stdout is captured and
-# asserted EMPTY (not just discarded), and -- a genuine positive control -- the
-# SAME recording mechanism, called directly outside resolve_git, DOES write
-# ran.log, so an absence elsewhere cannot be blamed on a broken recorder.
+# BEHAVIORAL: override the classifier so a REAL RECORDING script can be
+# classified as the stub without resolving to the real /usr/bin/git.
+# ran.log absence alone proves nothing if the override seam were bypassed, so
+# this also asserts the classifier and dev-tools probe were both invoked.
 lab10=$(mktemp -d)
 mkdir -p "$lab10/bin"
 printf '#!/bin/sh\necho "RAN $*" >> %s/ran.log\nexit 1\n' "$lab10" > "$lab10/bin/git"
