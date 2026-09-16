@@ -45,5 +45,8 @@ print(last)' "$RUNTIME")" || { echo "tmux-send-line: prompt parse failed — not
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
-"$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" && "$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+"$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+# Codex reads an Enter within 120ms of a typed burst as a pasted newline (PASTE_ENTER_SUPPRESS_WINDOW), not a submit.
+[ "$RUNTIME" = codex ] && sleep 0.25
+"$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
 echo "sent '$LINE' to $SESSION"
