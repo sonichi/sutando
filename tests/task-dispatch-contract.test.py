@@ -17,11 +17,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
+    _main,
     has_ready_result,
     next_pending_task,
     pending_candidates,
@@ -76,6 +78,9 @@ class HasReadyResultTest(unittest.TestCase):
         (month / "task-probe.txt").write_text("done\n")
         self.assertTrue(has_ready_result(self.results_dir, "task-probe.txt"))
 
+    def test_a_path_traversal_filename_is_never_ready(self):
+        self.assertFalse(has_ready_result(self.results_dir, "../../etc/passwd.txt"))
+
 
 class PendingCandidatesTest(unittest.TestCase):
     def setUp(self):
@@ -117,6 +122,24 @@ class PendingCandidatesTest(unittest.TestCase):
             list(pending_candidates(self.tasks_dir, self.results_dir)),
             ["task-urgent.txt", "task-normal.txt"],
         )
+
+    def test_a_directory_matching_the_glob_is_skipped_not_yielded(self):
+        # `*.txt` glob matches by name only — a directory shaped like a task
+        # filename must not be treated as one.
+        (self.tasks_dir / "task-a.txt").mkdir()
+        self._write_task("task-b.txt")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-b.txt"])
+
+    def test_a_name_carrying_a_traversal_sentinel_is_never_yielded(self):
+        # Defensive guard: never trust a name from the sort step, real glob or not.
+        self._write_task("task-real.txt")
+        real = list(Path(self.tasks_dir).glob("*.txt"))
+        fake = mock.Mock(spec=Path)
+        fake.is_file.return_value = True
+        fake.name = "../escaped.txt"
+        with mock.patch("delivery.task_dispatch.sort_tasks_by_priority", return_value=[fake, *real]):
+            self.assertEqual(
+                list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-real.txt"])
 
 
 class CliTest(unittest.TestCase):
@@ -160,6 +183,43 @@ class CliTest(unittest.TestCase):
         result = self._run("pending-candidates", str(self.tasks_dir), str(self.results_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "task-b.txt")
+
+
+class MainDispatchTest(unittest.TestCase):
+    """In-process `_main` calls — coverage can't see into `CliTest`'s subprocess."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tasks_dir = Path(self.tmp.name) / "tasks"
+        self.results_dir = Path(self.tmp.name) / "results"
+        self.tasks_dir.mkdir()
+        self.results_dir.mkdir()
+
+    def test_too_few_args_prints_usage_and_exits_2(self):
+        with mock.patch("sys.stderr"):
+            self.assertEqual(_main(["has-result", str(self.results_dir)]), 2)
+        self.assertEqual(_main([]), 2)
+
+    def test_has_result_both_outcomes(self):
+        (self.results_dir / "task-a.txt").write_text("done\n")
+        self.assertEqual(_main(["has-result", str(self.results_dir), "task-a.txt"]), 0)
+        self.assertEqual(_main(["has-result", str(self.results_dir), "task-b.txt"]), 1)
+
+    def test_pending_candidates_both_outcomes(self):
+        self.assertEqual(_main(["pending-candidates", str(self.tasks_dir), str(self.results_dir)]), 1)
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        self.assertEqual(_main(["pending-candidates", str(self.tasks_dir), str(self.results_dir)]), 0)
+
+    def test_next_pending_both_outcomes(self):
+        self.assertEqual(_main(["next-pending", str(self.tasks_dir), str(self.results_dir)]), 1)
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        self.assertEqual(_main(["next-pending", str(self.tasks_dir), str(self.results_dir)]), 0)
+
+    def test_unknown_command_exits_2(self):
+        with mock.patch("sys.stderr"):
+            rc = _main(["bogus-command", str(self.tasks_dir), str(self.results_dir)])
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":
