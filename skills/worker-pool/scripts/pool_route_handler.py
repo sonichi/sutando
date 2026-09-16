@@ -43,8 +43,8 @@ PICKER_WIRE = "worker-picker"
 def read_task(task_file: str) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
-    `requested_worker` is read only from ABOVE `task:`, so a body cannot forge
-    it. `channel_id`/`source` are read leniently: the gateway stamps them
+    `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
+    so a body cannot forge it. `channel_id`/`source` are read leniently: the gateway stamps them
     below `task:`, where the strict parse never looks.
     """
     text = Path(task_file).read_text(encoding="utf-8", errors="replace")
@@ -53,7 +53,8 @@ def read_task(task_file: str) -> dict:
         if line.startswith("task:"):
             break
         key, _, value = line.partition(":")
-        if _ and key.strip() in ("id", "channel_id", "source", "requested_worker"):
+        if _ and key.strip() in ("id", "channel_id", "source", "requested_worker",
+                                 pr.LEGACY_WORKER_FIELD):
             task[key.strip()] = value.strip()
     if not task.get("channel_id") or not task.get("source") or "wire_source" not in task:
         lenient = ltp.parse_task_headers_lenient(text).headers
@@ -87,7 +88,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     if roster is None:
         return DECLINE, [], None
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
-                             task.get("requested_worker"))
+                             pr.requested_worker_of(task))
     # One question only: is every target on the roster? Anything else -- no
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
