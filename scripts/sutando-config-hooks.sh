@@ -62,13 +62,24 @@ fi
 # everywhere), project hooks are PROJECT-level (fire only when Claude runs in
 # this repo). The migration target is USER-level CLAUDE_CONFIG_DIR.
 
+# install-claude-hooks.sh owns the command strings; this script asks it for them.
+# A second declaration here drifted into a duplicate registration of the same
+# SessionEnd hook, differing only in how TRANSCRIPT_PATH was written.
+_installer_hook_command() {  # $1 = event, $2 = marker
+  local repo="${SUTANDO_REPO_DIR:-$REPO_DIR}" line
+  [ -f "$repo/src/install-claude-hooks.sh" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$1|$2|"*) printf '%s\n' "${line#*|*|}"; return 0 ;;
+    esac
+  done < <(bash "$repo/src/install-claude-hooks.sh" --print-hooks 2>/dev/null)
+  return 1
+}
+
 _catchup_hook_command() {
-  # Mirror skills/catchup-after-startup/scripts/install-hook.sh logic.
-  if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
-    echo "bash \"$SUTANDO_REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
-  else
-    echo "bash \"$REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
-  fi
+  local repo="${SUTANDO_REPO_DIR:-$REPO_DIR}"
+  _installer_hook_command SessionEnd "src/session-handoff.sh" \
+    || echo "bash \"$repo/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\""
 }
 
 _sutando_hook_manifest() {
@@ -227,9 +238,13 @@ cmd_install() {
     # Project hooks installation. These belong in REPO/.claude/settings.json,
     # not user-level settings.json. The flag exists for callers that want
     # one-stop install of both classes; for migration use, default-off.
-    local pre1="cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
-    local pre2="bash \"$REPO_DIR/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\""
-    local stop1="bash \"$REPO_DIR/src/check-pending-tasks.sh\""
+    local pre1 pre2 stop1
+    pre1="$(_installer_hook_command PreCompact "logs/conversations/")" \
+      || pre1="bash \"$REPO_DIR/src/archive-transcript.sh\" \"$REPO_DIR/workspace/logs/conversations/\""
+    pre2="$(_installer_hook_command PreCompact "src/session-handoff.sh")" \
+      || pre2="bash \"$REPO_DIR/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\""
+    stop1="$(_installer_hook_command Stop "src/check-pending-tasks.sh")" \
+      || stop1="bash \"$REPO_DIR/src/check-pending-tasks.sh\""
     for spec in "PreCompact|$pre1" "PreCompact|$pre2" "Stop|$stop1"; do
       local event="${spec%%|*}"
       local cmd="${spec#*|}"
