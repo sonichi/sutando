@@ -297,6 +297,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
+- **`task_dispatch.py`** — Consumer-side dispatch policy shared by every external task-notifier.
 
 ## `src/hitl/`
 
