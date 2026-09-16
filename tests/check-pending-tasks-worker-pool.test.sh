@@ -132,7 +132,25 @@ case "$OUT" in
   '{}') ok "worker's block clears once its result is ready" ;;
   *) bad "worker's block clears once its result is ready" "got: ${OUT:0:160}" ;;
 esac
-rm -f "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/results/$PROBE.txt" "$WS/tasks/$PROBE.txt"
+rm -f "$WS/results/$PROBE.txt"
+
+# 7. THE ARCHIVE-RACE CASE (regression: this exact bug shipped and blocked a
+#    live worker within the hour). The delivery poller claims results/<id>.txt
+#    into results/archive/<id>-<ts>.txt in under a second, and the sentinel in
+#    deliveries/<worker>/ is NEVER cleaned up (mark_done()'s done-flag has no
+#    production caller today) — so a worker whose reply already went out, and
+#    whose stale sentinel from that finished task is still sitting in its own
+#    folder, must not be told the task is still open just because
+#    results/<id>.txt itself is gone.
+mkdir -p "$WS/results/archive"
+: > "$WS/results/archive/$PROBE-1789600000.txt"
+record_delivery
+OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "worker's block clears once its result is archived (not just present)" ;;
+  *) bad "worker's block clears once its result is archived (not just present)" "got: ${OUT:0:160}" ;;
+esac
+rm -f "$WS/results/archive/$PROBE-1789600000.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
 record_delivery
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
