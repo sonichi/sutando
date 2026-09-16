@@ -110,23 +110,18 @@ wait_for_core_idle() {
   done
 }
 
-pane_line_count() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null | wc -l | tr -d ' '
+pane_capture() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null
 }
 
-# A wide tail: at the default 80-col pane width our newline-free prompt wraps
-# across several rows, so a narrow tail can miss the marker (verified live).
-#
-# `baseline` (the pane's line count taken right before THIS attempt typed)
-# restricts the match to lines the pane gained since then. The marker text is
-# byte-identical across retries of the same task, so without this a marker
-# left over from an EARLIER successful dispatch of the same filename — still
-# sitting in the last 20 rows as sent history — reads as "staged" even when
-# the current paste was swallowed and nothing new actually landed.
+# `capture-pane -p` returns the pane's fixed row count regardless of typed
+# content, so a line-count offset can't isolate new lines — diff the TEXT.
 prompt_is_staged() {
-  local filename="$1" baseline="${2:-0}"
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null \
-    | tail -n "+$((baseline + 1))" | tail -20 | grep -Fq "Sutando task ready: $filename"
+  local filename="$1" baseline="$2" current added
+  current="$(pane_capture)"
+  [ "$current" = "$baseline" ] && return 1
+  added="$(diff <(printf '%s' "$baseline") <(printf '%s' "$current") 2>/dev/null || true)"
+  printf '%s\n' "$added" | grep '^>' | grep -Fq "Sutando task ready: $filename"
 }
 
 # Type + poll for staged (a one-shot check retyped a still-landing paste
@@ -135,7 +130,7 @@ deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 staged=0 waited=0 baseline
   wait_for_core_idle || true
   while :; do
-    baseline="$(pane_line_count)"
+    baseline="$(pane_capture)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" -l -- "$prompt"
     waited=0
     while [ "$waited" -lt "$TYPE_CONFIRM_TIMEOUT_TICKS" ]; do
