@@ -498,8 +498,9 @@ for test_shell in sh dash; do
     _sutando_safe_path_pythons() { :; }
     _sutando_safe_path_python
     resolve_python_for_module /nonexistent sutando_missing_module
+    echo sourced-ok
   ' resolver "$REPO")
-  check "$test_shell handles no candidates" "$out" ""
+  check "$test_shell handles no candidates" "$out" "sourced-ok"
 done
 
 printf "\npassed=%d failed=%d\n" "$pass" "$fail"

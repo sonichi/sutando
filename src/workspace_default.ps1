@@ -43,7 +43,7 @@ print(resolve_workspace(), end="")
         # Workspace paths must survive both Python's stdout encoding and PowerShell's decoding.
         $env:PYTHONIOENCODING = 'utf-8'
         $env:PYTHONUTF8 = '1'
-        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
         $candidates = @()
         $python = Get-Command python -ErrorAction SilentlyContinue
         if ($python) { $candidates += ,@($python.Source) }
@@ -79,6 +79,6 @@ print(resolve_workspace(), end="")
         $env:SUTANDO_RESOLVE_REPO = $previousRepo
         $env:PYTHONIOENCODING = $previousPythonEncoding
         $env:PYTHONUTF8 = $previousPythonUtf8
-        [Console]::OutputEncoding = $previousOutputEncoding
+        try { [Console]::OutputEncoding = $previousOutputEncoding } catch {}
     }
 }
