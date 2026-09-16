@@ -29,7 +29,7 @@ def _load():
 INSTALLER = '''#!/usr/bin/env bash
 SETTINGS="$REPO_DIR/.claude/settings.json"
 HOOKS=(
-  "PreCompact|sutando-conversations/|cp \\"\\$TRANSCRIPT_PATH\\" \\"\\$HOME/Desktop/sutando-conversations/\\$(date +%Y).jsonl\\""
+  "PreCompact|logs/conversations/|cp \\"\\$TRANSCRIPT_PATH\\" \\"\\$WORKSPACE/logs/conversations/\\$(date +%Y).jsonl\\""
   "PreCompact|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
   "SessionEnd|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
   "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"
@@ -58,7 +58,7 @@ class TestHookRegistration(unittest.TestCase):
     def _all_registered(self, repo_path=None):
         r = str(repo_path or self.repo)
         return {
-            "PreCompact": [{"hooks": [{"command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
+            "PreCompact": [{"hooks": [{"command": 'cp "$TRANSCRIPT_PATH" "$WORKSPACE/logs/conversations/x.jsonl"'},
                                       {"command": f"bash {r}/src/session-handoff.sh"}]}],
             "SessionEnd": self._entry(f"bash {r}/src/session-handoff.sh"),
             "Stop": self._entry(f"bash {r}/src/check-pending-tasks.sh"),
@@ -341,15 +341,20 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
     def _repo(self, stop_command, archive_command=None):
         r = Path(self._tmp.name) / f"repo{abs(hash((stop_command, archive_command))) % 99999}"
         (r / "src").mkdir(parents=True)
-        (r / ".claude").mkdir(parents=True)
+        # The real installer targets the CORE's config dir; with no scripts/ in
+        # this fixture its resolver falls back to <repo>/workspace/.claude-sutando.
+        core_cfg = r / "workspace" / ".claude-sutando"
+        core_cfg.mkdir(parents=True)
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
+        # The archive hook is validated for existence like any other owned script.
+        (r / "src" / "archive-transcript.sh").write_text("#!/bin/bash\n:\n")
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
-        (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+        (core_cfg / "settings.json").write_text(json.dumps({"hooks": {
             # Must track the installer's CURRENT archive shape: a literal here made
             # all three over-trigger controls fail on the shape change itself.
             "PreCompact": [{"hooks": [
                 {"command": archive_command or
-                 f'bash {r}/src/archive-transcript.sh "$HOME/Desktop/sutando-conversations/"'},
+                 f"bash '{r}/src/archive-transcript.sh' '{r}/workspace/logs/conversations/'"},
                 {"command": handoff}]}],
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
@@ -387,15 +392,15 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         # second is the one that settles it, because a destructive command
         # certified as a working archive hook inverts the probe's whole purpose.
         for label, cmd in {
-            "echo": "echo sutando-conversations/",
-            "rm -rf": "rm -rf sutando-conversations/",
-            "a different copier": "rsync x sutando-conversations/",
+            "echo": "echo logs/conversations/",
+            "rm -rf": "rm -rf logs/conversations/",
+            "a different copier": "rsync x logs/conversations/",
         }.items():
             with self.subTest(decoy=label):
                 out = self.hc.check_claude_hook_registration(
                     repo_dir=self._repo("bash {p}", archive_command=cmd))
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("sutando-conversations/", out["detail"])
+                self.assertIn("logs/conversations/", out["detail"])
 
     def test_a_cp_that_carries_the_marker_but_archives_the_WRONG_THING(self):
         # Program-only validation left these two: both are `cp`, both carry the
@@ -409,23 +414,23 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         # installer ADDS its own alongside. They coexist — meaning the installer's
         # own command IS present on any host where it ran, and the probe can say so.
         cases = {
-            "wrong source": 'cp /tmp/not-the-transcript "$HOME/Desktop/sutando-conversations/x.jsonl"',
-            "wrong destination": 'cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/not-desktop.jsonl',
+            "wrong source": 'cp /tmp/not-the-transcript "$WORKSPACE/logs/conversations/x.jsonl"',
+            "wrong destination": 'cp "$TRANSCRIPT_PATH" /tmp/logs/conversations/not-desktop.jsonl',
             # Three-operand cp: the owned prefix IS present, just not in the
             # destination position. cp reads this as two sources plus a target and
             # fails at runtime unless the last path is a directory — so nothing is
             # archived. Accepting the prefix in "any token" certified it.
             "extra operand, prefix not in dest position":
-                'cp "$TRANSCRIPT_PATH" /tmp/not-the-archive "$HOME/Desktop/sutando-conversations/x.jsonl"',
+                'cp "$TRANSCRIPT_PATH" /tmp/not-the-archive "$WORKSPACE/logs/conversations/x.jsonl"',
             # Same shape, fewer operands than the installer writes.
-            "too few operands": 'cp "$HOME/Desktop/sutando-conversations/x.jsonl"',
+            "too few operands": 'cp "$WORKSPACE/logs/conversations/x.jsonl"',
         }
         for label, cmd in cases.items():
             with self.subTest(case=label):
                 out = self.hc.check_claude_hook_registration(
                     repo_dir=self._repo("bash {p}", archive_command=cmd))
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("sutando-conversations/", out["detail"])
+                self.assertIn("logs/conversations/", out["detail"])
 
     def test_the_installer_template_parses_into_CLEAN_tokens(self):
         # The genuine case regressed to `warn` twice while I was fixing the above,
@@ -436,7 +441,7 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         src = (REPO / "src" / "install-claude-hooks.sh").read_text()
         body = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S).group(1)
         line = [l.strip() for l in body.split("\n")
-                if l.strip().startswith('"') and "sutando-conversations" in l][0]
+                if l.strip().startswith('"') and "logs/conversations" in l][0]
         _ev, _marker, cmd = line.strip('"').split("|", 2)
         toks = self.hc._shell_tokens(self.hc._unwrap_installer_command(cmd))
         self.assertEqual(len(toks), 3, f"archive template did not tokenize cleanly: {toks}")
@@ -491,6 +496,107 @@ class TestDeadHookPaths(TestHookRegistration):
         self._settings(hooks)
         got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(got["status"], "ok", got["detail"])
+
+
+class TestConfigAndTranscriptDirFallbacks(unittest.TestCase):
+    """$CORE_CONFIG_DIR and $TRANSCRIPT_DIR must resolve exactly as the installer
+    resolves them, or a registered hook never compares equal to what it wrote —
+    every owned hook then reads as unregistered on an otherwise-healthy host. Both
+    resolutions degrade to a hardcoded fallback when their resolver module cannot
+    be imported; nothing exercised either fallback until now."""
+
+    INSTALLER = '''#!/usr/bin/env bash
+SETTINGS="$CORE_CONFIG_DIR/settings.json"
+HOOKS=(
+  "PreCompact|logs/conversations/|bash $REPO_DIR/src/archive-transcript.sh $TRANSCRIPT_DIR/"
+)
+'''
+
+    def setUp(self):
+        self.hc = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "src" / "install-claude-hooks.sh").write_text(self.INSTALLER)
+        (self.repo / "src" / "archive-transcript.sh").write_text("#!/bin/bash\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_core_config_dir_falls_back_when_sutando_config_unimportable(self):
+        import sys
+        saved = sys.modules.get("sutando_config")
+        sys.modules["sutando_config"] = None  # importing a None entry raises ImportError
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        finally:
+            if saved is None:
+                sys.modules.pop("sutando_config", None)
+            else:
+                sys.modules["sutando_config"] = saved
+        fallback_settings = self.repo / "workspace" / ".claude-sutando" / "settings.json"
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(str(fallback_settings), out["detail"])
+
+    def test_transcript_dir_falls_back_when_workspace_default_unimportable(self):
+        import sys
+        # Enter the resolution branch at all: without scripts/sutando-config.sh it
+        # is skipped entirely and _ws already defaults to repo/workspace.
+        (self.repo / "scripts").mkdir(parents=True)
+        (self.repo / "scripts" / "sutando-config.sh").write_text("#!/bin/bash\n")
+        core_cfg = self.repo / "workspace" / ".claude-sutando"
+        core_cfg.mkdir(parents=True)
+        fallback_transcript_dir = self.repo / "workspace" / "logs" / "conversations"
+        registered = f"bash {self.repo}/src/archive-transcript.sh {fallback_transcript_dir}/"
+        (core_cfg / "settings.json").write_text(json.dumps({"hooks": {
+            "PreCompact": [{"hooks": [{"command": registered}]}],
+        }}))
+        saved_sc = sys.modules.get("sutando_config")
+        saved_wd = sys.modules.get("workspace_default")
+        # Pin CORE_CONFIG_DIR to the same fallback too, so only workspace_default's
+        # failure is under test here.
+        sys.modules["sutando_config"] = None
+        sys.modules["workspace_default"] = None
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        finally:
+            for mod_name, saved in (("sutando_config", saved_sc), ("workspace_default", saved_wd)):
+                if saved is None:
+                    sys.modules.pop(mod_name, None)
+                else:
+                    sys.modules[mod_name] = saved
+        self.assertEqual(out["status"], "ok", out["detail"])
+
+    def test_transcript_dir_uses_resolve_workspace_when_it_succeeds(self):
+        # Counterpart to the fallback test: a fake module makes the SUCCESS path
+        # deterministic too, independent of any real resolver on this host.
+        import sys
+        import types
+        (self.repo / "scripts").mkdir(parents=True)
+        (self.repo / "scripts" / "sutando-config.sh").write_text("#!/bin/bash\n")
+        core_cfg = self.repo / "workspace" / ".claude-sutando"
+        core_cfg.mkdir(parents=True)
+        resolved_ws = self.repo / "elsewhere" / "workspace"
+        resolved_transcript_dir = resolved_ws / "logs" / "conversations"
+        registered = f"bash {self.repo}/src/archive-transcript.sh {resolved_transcript_dir}/"
+        (core_cfg / "settings.json").write_text(json.dumps({"hooks": {
+            "PreCompact": [{"hooks": [{"command": registered}]}],
+        }}))
+        fake = types.ModuleType("workspace_default")
+        fake.resolve_workspace = lambda *a, **kw: str(resolved_ws)
+        saved_sc = sys.modules.get("sutando_config")
+        saved_wd = sys.modules.get("workspace_default")
+        sys.modules["sutando_config"] = None
+        sys.modules["workspace_default"] = fake
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        finally:
+            for mod_name, saved in (("sutando_config", saved_sc), ("workspace_default", saved_wd)):
+                if saved is None:
+                    sys.modules.pop(mod_name, None)
+                else:
+                    sys.modules[mod_name] = saved
+        self.assertEqual(out["status"], "ok", out["detail"])
 
 
 class TestHookScriptPathFallback(unittest.TestCase):
