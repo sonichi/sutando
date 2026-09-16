@@ -156,7 +156,37 @@ case "$REJ_OUT" in
   '{}') ok "a refused interpreter still emits valid JSON" ;;
   *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
 esac
-rm -rf "$REJ"
+# 7. THE GUEST CARVE-OUT. A cwd inside a worktree of an UNRELATED repo (its own
+# git-common-dir) must not be held hostage by the core's queue, even with a
+# real pending task sitting in it.
+printf 'id: probe\ntask: guest-worktree-probe\n' > "$WS/tasks/$PROBE"
+GUEST_REPO="$(mktemp -d)"
+(cd "$GUEST_REPO" && git init -q && \
+   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+GUEST_OUT="$(cd "$GUEST_REPO" && bash "$HOOK" 2>&1)"
+case "$GUEST_OUT" in
+  '{}') ok "unrelated-repo worktree is not blocked by the core's queue" ;;
+  *) bad "unrelated-repo worktree is not blocked by the core's queue" "got: ${GUEST_OUT:0:120}" ;;
+esac
+rm -rf "$GUEST_REPO"
+
+# 8. CONTROL FOR CASE 7. A cwd inside a worktree OF THIS SAME REPO shares its
+# git-common-dir, so it is still the core, not a guest — the same pending task
+# must still block there. Without this, a carve-out keyed on "any worktree"
+# rather than "a DIFFERENT repo's worktree" would pass case 7 by disabling the
+# gate for every worktree, this repo's own included.
+OWN_WT="$REPO/.claude/worktrees/hooktest-$$"
+if git -C "$REPO" worktree add -q --detach "$OWN_WT" HEAD 2>/dev/null; then
+  OWN_WT_OUT="$(cd "$OWN_WT" && bash "$HOOK" 2>&1)"
+  case "$OWN_WT_OUT" in
+    *'"decision":"block"'*) ok "this repo's own worktree is still the core, still blocks" ;;
+    *) bad "this repo's own worktree is still the core, still blocks" "got: ${OWN_WT_OUT:0:120}" ;;
+  esac
+  git -C "$REPO" worktree remove --force "$OWN_WT" 2>/dev/null || rm -rf "$OWN_WT"
+else
+  printf '  skip own-repo worktree control; could not create one here\n'
+fi
+rm -f "$WS/tasks/$PROBE"
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
