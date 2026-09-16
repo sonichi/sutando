@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# tmux-send-line.sh <session> <line> [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
 # The ONE sender for a line typed into a Sutando core pane: has-session, read
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
 # Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused).
 set -u -o pipefail
-SESSION="${1:?session}"; LINE="${2:?line}"; shift 2
+SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME="${RUNTIME:-claude}"
 SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --refuse-if-pending) REFUSE=1;; --skip-if-queued) SKIPWORD="${2:?}"; shift;;
-  --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+  --runtime) RUNTIME="${2:?}"; shift;; --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+case "$RUNTIME" in claude|codex) ;; *) echo "tmux-send-line: unknown --runtime '$RUNTIME' (claude|codex)" >&2; exit 2;; esac
 # A launchd-launched caller (the menu-bar app) has a bare PATH; path_helper
 # restores /etc/paths.d, where Homebrew registers itself — no literal prefix.
 TMUX="$(command -v tmux 2>/dev/null)"
@@ -22,19 +23,25 @@ PY="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" python-
 LOCK="${TMPDIR:-/tmp}/tmux-send-line.$(printf '%s' "$SOCK:$SESSION" | "$PY" -c 'import sys,hashlib;print(hashlib.sha1(sys.stdin.read().encode()).hexdigest()[:12])').lock"
 exec 9>"$LOCK"
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
-# The current prompt is the LAST line starting with ❯ (scrollback holds old
-# ones); its input is what follows the glyph and one optional space/nbsp.
+# The current prompt is the LAST line starting with the runtime's glyph (Claude ❯,
+# Codex ›; scrollback holds old ones); its input is what follows the glyph and one
+# optional space/nbsp. Codex draws a DIM placeholder hint on the empty composer, so
+# its pane is read with -e and dim-wrapped text is dropped before deciding "pending".
 # A failed capture or parse is UNKNOWN, never "empty": refuse rather than send.
-CAP="$("$TMUX" -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
-PENDING="$(printf '%s\n' "$CAP" | "$PY" -c 'import sys
+CAPFLAGS="-p"; [ "$RUNTIME" = codex ] && CAPFLAGS="-e -p"
+CAP="$("$TMUX" -S "$SOCK" capture-pane $CAPFLAGS -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
+PENDING="$(printf '%s\n' "$CAP" | "$PY" -c 'import sys,re
+rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
+SGR=re.compile(r"\x1b\[[0-9;]*m"); DIM=re.compile(r"\x1b\[2m.*?\x1b\[0m")
 last=""
 for l in sys.stdin.read().splitlines():
-    s=l.lstrip(" \t")
-    if s.startswith("\u276f"):
+    if rt=="codex": l=DIM.sub("",l)
+    s=SGR.sub("",l).lstrip(" \t")
+    if s.startswith(glyph):
         r=s[1:]
         if r[:1] in (" ", "\u00a0"): r=r[1:]
         last=r.rstrip()
-print(last)')" || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
+print(last)' "$RUNTIME")" || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
