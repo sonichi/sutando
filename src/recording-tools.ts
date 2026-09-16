@@ -14,7 +14,7 @@ import { z } from 'zod';
 import { PLAYBACK_PATH, VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
-import { isMacOS, macOSOnlyError } from './platform.js';
+import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -372,13 +372,10 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
-		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
-		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
+		// Windows paths reach PowerShell through the environment, so only the sips argv is sanitized.
+		const safePath = isWindows() ? imagePath : imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
 		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
-		try {
-			execFileSync('sips', ['-Z', '800', '-s', 'format', 'jpeg', safePath, '--out', resized], { timeout: 2_000, stdio: 'ignore' });
-		} catch { /* use original if resize fails */ }
-		const actualPath = existsSync(resized) ? resized : imagePath;
+		const actualPath = resizeImage(safePath, resized, 800, 2_000) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
 		const imageData = readFileSync(actualPath).toString('base64');
 		// Issue #189: when continuing a narration, the vision model should build

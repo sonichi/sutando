@@ -275,6 +275,40 @@ export function openWithDefault(target: string): void {
  *
  * Keeps the failure message uniform across the tool surface.
  */
+/**
+ * Downscale an image so its longest side is at most `maxDim`, writing a JPEG to
+ * `dest`. Returns whether `dest` was produced; callers keep the original otherwise.
+ */
+export function resizeImage(src: string, dest: string, maxDim: number, timeoutMs = 4_000): boolean {
+	try {
+		if (isMacOS()) {
+			execFileSync('sips', ['-Z', String(maxDim), '-s', 'format', 'jpeg', src, '--out', dest], { timeout: timeoutMs, stdio: 'ignore' });
+		} else if (isWindows()) {
+			// Paths travel in the environment: PowerShell reads U+2018-U+201B as quotes too.
+			const script = '$ErrorActionPreference = "Stop"; Add-Type -AssemblyName System.Drawing; ' +
+				'$src = [System.Drawing.Image]::FromFile($env:SUTANDO_RESIZE_INPUT); try { ' +
+				'$limit = [int]$env:SUTANDO_RESIZE_MAXDIM; ' +
+				'$scale = [Math]::Min(1.0, $limit / [double][Math]::Max($src.Width, $src.Height)); ' +
+				'$w = [Math]::Max(1, [int][Math]::Floor($src.Width * $scale)); ' +
+				'$h = [Math]::Max(1, [int][Math]::Floor($src.Height * $scale)); ' +
+				'$dst = [System.Drawing.Bitmap]::new($w, $h); $g = [System.Drawing.Graphics]::FromImage($dst); ' +
+				'$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; ' +
+				'$g.DrawImage($src, 0, 0, $w, $h); ' +
+				'$dst.Save($env:SUTANDO_RESIZE_OUTPUT, [System.Drawing.Imaging.ImageFormat]::Jpeg); ' +
+				'$g.Dispose(); $dst.Dispose() } finally { $src.Dispose() }';
+			execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+				timeout: Math.max(timeoutMs, 10_000), windowsHide: true, stdio: 'ignore',
+				env: { ...process.env, SUTANDO_RESIZE_INPUT: src, SUTANDO_RESIZE_OUTPUT: dest, SUTANDO_RESIZE_MAXDIM: String(maxDim) },
+			});
+		} else {
+			return false;
+		}
+	} catch {
+		return false;
+	}
+	return existsSync(dest);
+}
+
 export function macOSOnlyError(toolName: string): { error: string } {
 	return {
 		error:
