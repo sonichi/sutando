@@ -756,6 +756,18 @@ json.dump({"hooks": {
         # ANDAND-joined compound command — must SURVIVE.
         {"type": "command",
          "command": f'bash /tmp/operator-wrapper.sh&&{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        # the operator sits DIRECTLY after the command word, no wrapper word
+        # at all — `bash` alone is one (no-op) command, and the marker's own
+        # path is argv[0] of a SEPARATE second command, never an argument to
+        # `bash`. Flattening argv into one array without segment boundaries
+        # still read the marker as argv[1] of the first command (qingyun-wu
+        # 2026-09-16, reproduced live on 16a1c6a8: this exact repro deleted
+        # both variants below even though the round-4 fix already handled
+        # the wrapper-plus-operator shape correctly). Must SURVIVE.
+        {"type": "command",
+         "command": f'bash ;{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        {"type": "command",
+         "command": f'bash &&{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
     ]}],
     "PreCompact": [{"matcher": "", "hooks": [
         {"type": "command",
@@ -763,6 +775,9 @@ json.dump({"hooks": {
         # SEMICOLON-joined variant, for the archive hook.
         {"type": "command",
          "command": f'bash /tmp/archive-wrapper.sh;{repo}/workspace/logs/conversations/'},
+        # operator directly after the command word, for the archive hook.
+        {"type": "command",
+         "command": f'bash ;{repo}/workspace/logs/conversations/'},
     ]}],
 }}, open(p, "w"), indent=2)
 PY
@@ -775,8 +790,14 @@ ok "compound-op: SEMICOLON-joined command survives" \
    "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh;' && echo 0 || echo 1)"
 ok "compound-op: ANDAND-joined command survives" \
    "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh&&' && echo 0 || echo 1)"
+ok "compound-op: bare SEMICOLON right after command word survives" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash ;$KREPO/src/session-handoff.sh \"\$TRANSCRIPT_PATH\"" && echo 0 || echo 1)"
+ok "compound-op: bare ANDAND right after command word survives" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash &&$KREPO/src/session-handoff.sh \"\$TRANSCRIPT_PATH\"" && echo 0 || echo 1)"
 ok "compound-op: SEMICOLON-joined archive-destination command survives" \
    "$(echo "$KSURV_PC" | grep -qF 'archive-wrapper.sh;' && echo 0 || echo 1)"
+ok "compound-op: bare SEMICOLON archive-destination command survives" \
+   "$(echo "$KSURV_PC" | grep -qxF "bash ;$KREPO/workspace/logs/conversations/" && echo 0 || echo 1)"
 rm -rf "$KROOT"
 
 rm -rf "$ROOT"
