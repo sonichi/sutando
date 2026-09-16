@@ -4,7 +4,7 @@
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
 # Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused).
 set -u -o pipefail
-SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME="${RUNTIME:-claude}"
+SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME=claude
 SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --refuse-if-pending) REFUSE=1;; --skip-if-queued) SKIPWORD="${2:?}"; shift;;

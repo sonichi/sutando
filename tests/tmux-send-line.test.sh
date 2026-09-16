@@ -22,12 +22,11 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 case " $* " in
   *" has-session "*) [ -n "${TMUX_NO_SESSION:-}" ] && exit 1;;
   *" capture-pane "*) [ -n "${TMUX_CAP_FAIL:-}" ] && exit 1; [ -n "${TMUX_CAP_DELAY:-}" ] && sleep "$TMUX_CAP_DELAY"; printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";;
-  *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY"; [ -n "${TMUX_TIME:-}" ] && python3 -c 'import time;print(time.time())' >> "$TMUX_LOG.t";;
+  *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";;
 esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
-gap(){ python3 -c 'import sys;t=[float(x) for x in open(sys.argv[1])];print(t[1]-t[0])' "$TMUX_LOG.t"; }
 rc=$(run probe hello --socket "$T/s.sock"); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "S1 shim: clear prompt → literal line then Enter" || fail "S1" "rc=$rc $(cat "$TMUX_LOG")"
 rc=$(TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S2 shim: pending text → 5, nothing sent" || fail "S2" "rc=$rc"
 rc=$(TMUX_PANE_TEXT='❯ watcher\n' run probe watcher --socket "$T/s.sock" --skip-if-queued watcher); [ "$rc" = 6 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S3 shim: queued word → 6" || fail "S3" "rc=$rc"
@@ -39,8 +38,24 @@ rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m half typed\n' run probe x --socket "$T/s.
 rc=$(TMUX_PANE_TEXT='  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven previous-generation model\n' run probe x --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "C3 codex: an open picker's selected › row reads as pending → 5" || fail "C3 codex picker" "rc=$rc"
 rc=$(TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 0 ] && ok "C4 codex: a Claude ❯ line is not the Codex prompt (the runtime picks the glyph)" || fail "C4 glyph is per-runtime" "rc=$rc"
 rc=$(run probe hello --socket "$T/s.sock"); grep -q -- "capture-pane -p -t probe" "$TMUX_LOG" && ! grep -q -- "capture-pane -e" "$TMUX_LOG" && ok "C5 claude (default): capture unchanged, no -e" || fail "C5 claude capture unchanged" "$(cat "$TMUX_LOG")"
-rm -f "$TMUX_LOG.t"; rc=$(TMUX_TIME=1 run probe hello --socket "$T/s.sock" --runtime codex); g=$(gap); python3 -c "import sys;sys.exit(0 if $g >= 0.12 else 1)" && [ "$rc" = 0 ] && ok "C7 codex: the Enter follows the literal line by >= 120ms (Codex's paste-burst window would otherwise read it as a newline), gap=${g:0:5}s" || fail "C7 codex enter gap" "rc=$rc gap=$g"
+# the delay between the literal line and Enter: a PATH-shimmed `sleep` logs its argument in sequence with the
+# tmux calls instead of sleeping, so the check reads the script's own pause, not process-launch latency
+cat > "$T/bin/sleep" <<'SH'
+#!/bin/sh
+printf 'sleep %s\n' "$*" >> "$TMUX_LOG"
+SH
+chmod +x "$T/bin/sleep"
+seq(){ grep -E '^sleep |send-keys' "$TMUX_LOG" | sed -E 's/^-S [^ ]+ //' | tr '\n' '|'; }
+rc=$(run probe hello --socket "$T/s.sock" --runtime codex); SEQ="$(seq)"
+[ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|sleep 0.25|send-keys -t probe Enter|" ] && ok "C7 codex: literal line, sleep 0.25, then Enter (an Enter inside Codex's 120ms paste-burst window reads as a newline)" || fail "C7 codex enter delay" "rc=$rc seq=$SEQ"
+rc=$(run probe hello --socket "$T/s.sock"); SEQ="$(seq)"
+[ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|send-keys -t probe Enter|" ] && ok "C8 claude (default): no sleep between the literal line and Enter (the no-delay control)" || fail "C8 claude no delay" "rc=$rc seq=$SEQ"
+rm -f "$T/bin/sleep"
 rc=$(run probe x --socket "$T/s.sock" --runtime bogus); [ "$rc" = 2 ] && ! grep -q -- "capture-pane\|send-keys" "$TMUX_LOG" && ok "C6 unknown --runtime → 2 before any tmux call" || fail "C6 bogus runtime" "rc=$rc"
+# the runtime is chosen by --runtime only: an ambient RUNTIME variable (callers that pass no flag inherit whatever
+# the environment holds) must not switch the glyph, or a Claude draft reads as empty and gets written into
+rc=$(RUNTIME=codex TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "A1 ambient RUNTIME=codex is ignored: Claude ❯ pending text → 5, nothing sent" || fail "A1 ambient RUNTIME=codex" "rc=$rc $(cat "$T/err")"
+rc=$(RUNTIME=bogus TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "A2 ambient RUNTIME=bogus is ignored: still the Claude default → 5, not 2" || fail "A2 ambient RUNTIME=bogus" "rc=$rc $(cat "$T/err")"
 printf '#!/bin/sh\nexit 1\n' > "$T/bin/python3"; chmod +x "$T/bin/python3"
 rc=$(PATH="$T/bin:$PATH" SUTANDO_PY="$T/bin/python3" bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$T/s.sock" --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
 rm -f "$T/bin/python3"
