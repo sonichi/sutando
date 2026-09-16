@@ -262,27 +262,38 @@ REMOVED=0
 # escaping), NEVER expands $vars or `cmd`/$(cmd) substitutions — nothing here
 # EXECUTES anything, it only finds argv BOUNDARIES. UNQUOTED whitespace and
 # every POSIX shell control/redirection operator (`;` `&` `|` `<` `>` `(` `)`
-# and newline) end the current word exactly like a space does — a compound
-# command (`bash /op/wrap.sh;<repo>/src/session-handoff.sh ...`,
-# `bash /op/wrap.sh&&<repo>/... ...`) is two shell commands glued by an
-# operator with no space at all, and the earlier version of this function
-# only knew about whitespace, so it fused the operator's own wrapper word
-# onto the marker's word instead of ending the boundary there (qingyun-wu
-# 2026-09-16, reproduced live on 46132a6d with `;` and `&&`). Sets the
-# global array TOKENIZE_RESULT; returns 1 on unterminated quote (the text
-# is not valid shell at all). Exists because FOUR rounds of the ownership
-# test below tried to approximate this with a regex wildcard and each round
-# shipped a new argv-boundary shape the wildcard didn't cover (#4309
-# review, keweichen/qingyun-wu, 2026-09-16) — real tokenization has no such
-# shape, because it isn't inferring a boundary, it's finding the one a
-# shell would.
+# and newline) end the current word exactly like a space does, AND set the
+# global flag TOKENIZE_HAS_OPERATOR — candidate_is_owned() rejects outright
+# whenever that flag is set, REGARDLESS of what argv[1] contains. Merely
+# treating an operator as a word boundary (this function's prior revision)
+# still flattens everything into one array with no memory of which command
+# segment a word belongs to, so `bash ;<repo>/src/session-handoff.sh ...`
+# tokenized to argv=[bash, <repo>/.../session-handoff.sh, ...] — argv[1]
+# holds the marker even though it is actually argv[0] of a SEPARATE command
+# after the `;`, not an argument to `bash` at all (qingyun-wu 2026-09-16,
+# reproduced live on 16a1c6a8: our OWN commands never contain an unquoted
+# control operator at all, so the safe, sufficient rule is simply "any
+# unquoted operator anywhere in the candidate disqualifies it," full stop —
+# no need to track segments once nothing we write can ever have one). Sets
+# the global array TOKENIZE_RESULT; returns 1 on unterminated quote (the
+# text is not valid shell at all). Exists because FIVE rounds of the
+# ownership test below tried to approximate this with a regex wildcard and
+# each round shipped a new argv-boundary shape the wildcard didn't cover
+# (#4309 review, keweichen/qingyun-wu, 2026-09-16) — real tokenization has
+# no such shape, because it isn't inferring a boundary, it's finding the
+# one a shell would.
 tokenize_argv() {
   local s="$1" n=${#1} i=0 c cur="" in_word=0
   TOKENIZE_RESULT=()
+  TOKENIZE_HAS_OPERATOR=0
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
     case "$c" in
-      ' '|$'\t'|$'\n'|';'|'&'|'|'|'<'|'>'|'('|')')
+      ' '|$'\t')
+        if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
+        i=$((i+1)) ;;
+      $'\n'|';'|'&'|'|'|'<'|'>'|'('|')')
+        TOKENIZE_HAS_OPERATOR=1
         if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
         i=$((i+1)) ;;
       "'")
@@ -387,7 +398,18 @@ candidate_is_owned() {
     "$CMD_WORD "?*) after="${cand#"$CMD_WORD" }" ;;
     *) return 1 ;;
   esac
-  if tokenize_argv "$cand" && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
+  local tokenize_rc=0
+  tokenize_argv "$cand" || tokenize_rc=1
+  # Our own commands never contain an unquoted control operator anywhere —
+  # so ANY unquoted `;`/`&`/`|`/`<`/`>`/`(`/`)`/newline in the candidate
+  # disqualifies it outright, before either bucket below gets a say. This
+  # is what actually closes the compound-command class: flattening argv
+  # into one array (this function's prior revision) loses which command
+  # segment a word came from, so a word right after the operator can still
+  # look like argv[1] of the FIRST command when it is really argv[0] of a
+  # SEPARATE one (qingyun-wu 2026-09-16, reproduced on 16a1c6a8).
+  [ "$TOKENIZE_HAS_OPERATOR" = 1 ] && return 1
+  if [ "$tokenize_rc" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
      && [ "${TOKENIZE_RESULT[0]}" = "$CMD_WORD" ]; then
     case "${TOKENIZE_RESULT[1]}" in
       *"$MARKER"*) ;;                                    # bucket: clean argv[1] match
