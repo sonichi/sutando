@@ -19,15 +19,15 @@
 # guest carve-out) — the core's own task/result queue is not theirs to clear,
 # so the gate must not hold their Stop hostage to it.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CWD_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
-REPO_COMMON_DIR="$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>/dev/null)"
-if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ]; then
-  CWD_COMMON_ABS="$(cd "$(dirname "$CWD_COMMON_DIR")" && pwd)/$(basename "$CWD_COMMON_DIR")"
-  REPO_COMMON_ABS="$(cd "$(dirname "$REPO_COMMON_DIR")" && pwd)/$(basename "$REPO_COMMON_DIR")"
-  if [ "$CWD_COMMON_ABS" != "$REPO_COMMON_ABS" ]; then
-    echo '{}'
-    exit 0
-  fi
+# --path-format=absolute (git >= 2.31) avoids a real quirk: plain
+# `git -C <dir> rev-parse --git-common-dir`, run from a DIFFERENT cwd, can
+# print a path relative to <dir> rather than to the caller — resolving that
+# relative to the wrong base silently misjudges "same repo" in both directions.
+CWD_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+REPO_COMMON_DIR="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+  echo '{}'
+  exit 0
 fi
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
