@@ -164,6 +164,72 @@ rm -rf "$T15"
 rm -rf "$T"
 echo
 
+# Tests 16-18: #4309 review round 6 (keweichen, 2026-09-16) — _installer_hook_command
+# collapsed "installer absent" / "installer present but failed" / "hook
+# intentionally omitted" into one signal, so callers guessed a fallback command
+# in all three cases, defeating SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE and
+# masking real resolver failures as quiet success.
+
+# Test 16: installer GENUINELY ABSENT — fallback is used, and the fallback's
+# archive path comes from the workspace RESOLVER, not a hardcoded
+# $REPO_DIR/workspace guess (a relocated workspace must not be silently ignored).
+T16="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-absent.XXXXXX")"
+# Normalize through cd+pwd — macOS resolves /tmp (and some /var/folders
+# paths) through a /private symlink, and Python's Path.resolve() (inside
+# resolve_workspace) follows it while a raw mktemp string does not.
+T16="$(cd "$T16" && pwd)"
+mkdir -p "$T16/scripts" "$T16/src" "$T16/.claude"
+cp "$SCRIPT" "$T16/scripts/"
+cp "$REPO_DIR/scripts/sutando-config.sh" "$T16/scripts/"
+cp "$REPO_DIR/scripts/python-binary.sh" "$T16/scripts/" 2>/dev/null || true
+cp "$REPO_DIR/src/sutando_config.py" "$T16/src/"
+cp "$REPO_DIR/sutando.config.json" "$T16/"
+echo "{\"workspace\":{\"path\":\"$T16/custom-ws\"}}" > "$T16/sutando.config.local.json"
+echo '{}' > "$T16/.claude/settings.json"
+# Deliberately no src/install-claude-hooks.sh — genuinely absent installer.
+( cd "$T16" && bash scripts/sutando-config-hooks.sh install "$T16/.claude/settings.json" --no-catchup-hook --with-project-hooks >/dev/null 2>&1 )
+rc16=$?
+[ "$rc16" = "0" ]; report "$?" "absent installer: install --with-project-hooks still succeeds (fallback)"
+archive_cmd="$(jq -r '.hooks.PreCompact[0].hooks[0].command' "$T16/.claude/settings.json" 2>/dev/null)"
+echo "$archive_cmd" | grep -qF "$T16/custom-ws/logs/conversations/"
+report "$?" "absent installer: archive fallback path comes from the workspace RESOLVER"
+echo "$archive_cmd" | grep -qF "$T16/workspace/logs/conversations/"
+[ "$?" != "0" ]; report "$?" "absent installer: archive fallback does NOT hardcode \$REPO_DIR/workspace"
+rm -rf "$T16"
+
+# Test 17: installer PRESENT but FAILS (--print-hooks exits non-zero) — must
+# PROPAGATE (exit non-zero, write nothing), never silently guess a fallback.
+T17="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-resolver-fail.XXXXXX")"
+mkdir -p "$T17/scripts" "$T17/src" "$T17/.claude"
+cp "$SCRIPT" "$T17/scripts/"
+printf '#!/bin/bash\necho "boom: resolver failed" >&2\nexit 1\n' > "$T17/src/install-claude-hooks.sh"
+chmod +x "$T17/src/install-claude-hooks.sh"
+echo '{}' > "$T17/.claude/settings.json"
+err17="$(cd "$T17" && bash scripts/sutando-config-hooks.sh install "$T17/.claude/settings.json" --no-catchup-hook --with-project-hooks 2>&1)"
+rc17=$?
+[ "$rc17" != "0" ]; report "$?" "failing installer: install --with-project-hooks propagates (non-zero exit)"
+echo "$err17" | grep -q "refusing to guess"
+report "$?" "failing installer: error names the refusal to guess"
+pc_count17="$(jq '[.hooks.PreCompact // [] | .[] | .hooks // [] | .[]] | length' "$T17/.claude/settings.json" 2>/dev/null || echo 0)"
+[ "${pc_count17:-0}" = "0" ]; report "$?" "failing installer: no PreCompact hook was written"
+rm -rf "$T17"
+
+# Test 18: INTENTIONAL OMISSION (SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1) —
+# the archive hook must be skipped silently (no fallback, no failure), while
+# the other two project hooks still install normally.
+T18="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-omit.XXXXXX")"
+mkdir -p "$T18/.claude"
+echo '{}' > "$T18/.claude/settings.json"
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$SCRIPT" install "$T18/.claude/settings.json" --no-catchup-hook --with-project-hooks >/dev/null 2>&1
+rc18=$?
+[ "$rc18" = "0" ]; report "$?" "omit flag: install --with-project-hooks still succeeds"
+archive_count18="$(jq '[.hooks.PreCompact // [] | .[] | .hooks // [] | .[] | select(.command | contains("archive-transcript.sh"))] | length' "$T18/.claude/settings.json" 2>/dev/null || echo 0)"
+[ "${archive_count18:-0}" = "0" ]; report "$?" "omit flag: no archive hook (real or fallback) was written"
+stop_count18="$(jq '[.hooks.Stop // [] | .[] | .hooks // []] | flatten | length' "$T18/.claude/settings.json" 2>/dev/null || echo 0)"
+[ "${stop_count18:-0}" -ge 1 ]; report "$?" "omit flag: the OTHER project hook (Stop) still installs"
+rm -rf "$T18"
+
 # Test 19-21: both installers own ONE command string per hook. They used to carry
 # separate copies, and a SessionEnd handoff written two ways registered twice.
 # Pin the repo both sides resolve against: $SCRIPT asks ${SUTANDO_REPO_DIR:-$REPO_DIR}

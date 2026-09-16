@@ -237,6 +237,27 @@ ok "another clone's installer-shaped entry is still swept" \
 ok "sweeping it did not take the operator hooks with it" \
    "$([ "$(cmds SessionEnd | grep -cE -- '--verbose|echo custom|env FOO=1')" = 3 ] && echo 0 || echo 1)"
 
+# An operator's OWN hook using an unexpanded shell-variable path prefix must
+# survive — its double-quoted argv[1] contains our marker as a plain substring
+# even though nothing here wrote it. #4309 review round 6 (keweichen,
+# 2026-09-16): candidate_is_owned() accepted any argv[1] containing the
+# marker with no check that it is shaped like something WE could have
+# written; repro `bash "$CUSTOM_ROOT/src/session-handoff.sh" "$TRANSCRIPT_PATH"`.
+python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["SessionEnd"][0]["hooks"].append(
+    {"type": "command",
+     "command": 'bash "$CUSTOM_ROOT/src/session-handoff.sh" "$TRANSCRIPT_PATH"'})
+json.dump(d, open(p, "w"), indent=2)
+PY
+bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "operator's own \$VAR-prefixed hook survives the sweep" \
+   "$(cmds SessionEnd | grep -qF 'CUSTOM_ROOT' && echo 0 || echo 1)"
+ok "and our own hook is still the one that actually executes" \
+   "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$(cmds SessionEnd | grep session-handoff | grep -vE -- '--verbose|echo custom|env FOO=1|CUSTOM_ROOT')" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
+
 # --- 8. a checkout path containing an APOSTROPHE ----------------------------
 # An apostrophe is legal in a path, and `shq` escapes it as '\'' — so any
 # matching scheme that "normalizes" by deleting quote characters leaves a stray
@@ -799,6 +820,46 @@ ok "compound-op: SEMICOLON-joined archive-destination command survives" \
 ok "compound-op: bare SEMICOLON archive-destination command survives" \
    "$(echo "$KSURV_PC" | grep -qxF "bash ;$KREPO/workspace/logs/conversations/" && echo 0 || echo 1)"
 rm -rf "$KROOT"
+
+# --- 14. RELOCATED CHECKOUT — the archiver hook a prior installer run wrote
+# at the OLD checkout path must still be swept after the checkout moved.
+# #4309 review round 6 (keweichen, 2026-09-16): ARCHIVE_LEGACY_SHAPES baked
+# the CURRENT $REPO_DIR into its regex at construction time, so a relocated
+# checkout's own pre-move hook (OLD path baked in) never matched a freshly
+# built regex using the NEW path.
+LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks relocated-checkout.XXXXXX")"
+LREPO="$LROOT/repo with spaces"
+mkdir -p "$LREPO/src" "$LREPO/.claude" "$LREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$LREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$LREPO/src/"
+chmod +x "$LREPO/src/"*.sh
+echo '{}' > "$LREPO/workspace/.claude-sutando/settings.json"
+
+# The old path is a DIFFERENT, nonexistent location — simulating a checkout
+# that was later moved to where $LREPO now lives.
+export L_LEGACY="$LREPO/.claude/settings.json" \
+       L_OLDREPO="$LROOT/an old checkout path that no longer exists"
+python3 - <<'PY'
+import json, os
+p, old_repo = os.environ['L_LEGACY'], os.environ['L_OLDREPO']
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # written by a PRIOR run of this installer at the OLD checkout path,
+    # before the checkout moved to where it lives now — must be SWEPT.
+    {"type": "command",
+     "command": f'bash \'{old_repo}/src/archive-transcript.sh\' "$HOME/Desktop/sutando-conversations/"'},
+    # operator's own differently-shaped command mentioning the same
+    # directory as a substring — must SURVIVE.
+    {"type": "command",
+     "command": 'bash "$HOME/my-custom-archiver.sh" --dest "$HOME/Desktop/sutando-conversations/" --verbose'},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$LREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+LSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$L_LEGACY")"
+ok "relocated checkout: pre-move archiver hook (OLD path baked in) is swept" \
+   "$(echo "$LSURV" | grep -q 'archive-transcript.sh.*Desktop/sutando-conversations' && echo 1 || echo 0)"
+ok "relocated checkout: operator's own Desktop-targeting wrapper still survives" \
+   "$(echo "$LSURV" | grep -q 'my-custom-archiver.sh' && echo 0 || echo 1)"
+rm -rf "$LROOT"
 
 rm -rf "$ROOT"
 echo "---"
