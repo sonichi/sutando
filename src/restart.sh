@@ -83,6 +83,12 @@ pkill -f "remote-gateway-bridge" 2>/dev/null
 pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
+# Every other stopped service is relaunched below or by startup.sh. This one
+# cannot be: the watcher is armed by the AGENT via the Monitor tool, so a
+# shell cannot restore it and the caller is the only thing that can.
+echo "  ⚠ task watcher STOPPED — nothing here re-arms it; the agent must:"
+echo "      Monitor  bash src/watch-tasks-stream.sh  (persistent)"
+echo "      until then tasks/ is not drained."
 pkill -f "conversation-server" 2>/dev/null
 pkill -f "ngrok" 2>/dev/null
 # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
