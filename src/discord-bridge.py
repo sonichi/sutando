@@ -1355,7 +1355,8 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     except Exception:
         return ""
     try:
-        argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-o", out_path]
+        argv = ["codex", "exec", "--sandbox", "read-only", "--disable=apps",
+                "--skip-git-repo-check", "-o", out_path]
         if model:
             argv.extend(["-m", model])
         argv.extend(["--", prompt])
@@ -4094,7 +4095,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
             "1. RUN CODEX — for genuine requests (code review, bug report, technical question, analysis).\n"
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
-            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
+            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --disable=apps --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
             f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.' with <rc> the actual status; exit 0 but staging empty/missing: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. These are DIFFERENT failures and 'exit 0' must never appear in the first form. Neither is a refusal.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
@@ -4119,7 +4120,7 @@ async def _handle_discord_message(message, force=False):
         "guest": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
             "This task is from a GUEST tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
-            f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
+            f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --disable=apps --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
             f"  Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move).\n"
             f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.'; exit 0 with empty/missing staging: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'.\n\n"
             "Rules:\n"
