@@ -113,9 +113,13 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
             {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
         )
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, reason=degrade_reason(e.code),
+                       state=_receipt.http_error_state(e.code))
     except (URLError, TimeoutError) as e:
-        return _result(False, room_id=room_id, reason=f"network error: {e}")
+        # Ambiguous, not failed: the POST may have committed before the socket
+        # died, so settling it licenses a duplicate re-send. receipt.py owns this.
+        return _result(False, room_id=room_id, reason=f"network error: {e}",
+                       state=_receipt.UNKNOWN)
     # Shared with mention via receipt.classify — one reading of the envelope.
     # UNCONFIRMED stays ok:true so a caller does not re-send a delivered message.
     state, event_id, reason = _receipt.classify(parsed)
