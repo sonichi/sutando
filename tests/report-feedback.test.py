@@ -400,6 +400,7 @@ class TestAskFirst(unittest.TestCase):
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=AssertionError("nothing is posted")), \
                     mock.patch.object(report_feedback, "read_cloud_auth", side_effect=AssertionError("must not file")):
                 self._run(["--title", "gateway dropped the relay", "--auto"])
+                self._run(["--recovery", report_feedback.list_drafts(ws)[0]["id"], "failed"])
             drafts = report_feedback.list_drafts(ws)
             self.assertEqual(len(drafts), 1)
             reqs = self._hitl(ws).active()
@@ -413,6 +414,7 @@ class TestAskFirst(unittest.TestCase):
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     self.assertRaises(SystemExit) as cm:
                 self._run(["--title", "gateway dropped the relay", "--auto"])
+                self._run(["--recovery", report_feedback.list_drafts(ws)[0]["id"], "failed"])
             self.assertEqual(cm.exception.code, 3, "an identical ask is deduped")
             self.assertEqual(len(self._hitl(ws).active()), 1, "no second card")
 
@@ -485,6 +487,7 @@ class TestAskFirst(unittest.TestCase):
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.dict(os.environ, {"SPARROW_HA_OWNER": owner}):
                 self._run(["--title", "relay down", "--body", "details", "--severity", "high", "--auto"])
+                self._run(["--recovery", report_feedback.list_drafts(ws)[0]["id"], "failed"])
                 req = self._hitl(ws).active()[0]
                 click = {"id": "task-click1", "channel_id": "!dm:ag2.space", "user_id": owner, "source_message_id": "$c",
                          "task": "File this bug report",
@@ -552,11 +555,12 @@ class TestAskFirst(unittest.TestCase):
                 "import importlib.util, sys; from pathlib import Path\n"
                 f"spec = importlib.util.spec_from_file_location('rf', {str(script)!r}); rf = importlib.util.module_from_spec(spec); spec.loader.exec_module(rf)\n"
                 f"rf.resolve_workspace = lambda: Path({td!r})\n"
-                "sys.argv = ['report-feedback.py', '--title', 'clean run', '--auto']; rf.main()"
+                "sys.argv = ['report-feedback.py', '--title', 'clean run', '--auto']; rf.main()\n"
+                "sys.argv = ['report-feedback.py', '--recovery', rf.list_drafts(rf.resolve_workspace())[0]['id'], 'failed']; rf.main()"
             )
             r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("ASKED:", r.stdout)
+            self.assertIn("RECOVERY:", r.stdout)
             self.assertEqual(len(self._hitl(ws).active()), 1, "the card exists after one clean ask")
 
     def test_a_retry_after_the_post_landed_does_not_post_again(self):
@@ -1079,6 +1083,7 @@ class TestMain(unittest.TestCase):
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
                 self._run(["--title", "engine crash", "--auto", "--no-logs"])
+                self._run(["--recovery", report_feedback.list_drafts(ws)[0]["id"], "failed"])
                 with self.assertRaises(SystemExit) as cm:
                     self._run(["--title", "engine crash", "--auto", "--no-logs"])
         self.assertEqual(cm.exception.code, 3)
@@ -1105,6 +1110,7 @@ class TestMain(unittest.TestCase):
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
                 self._run(["--title", "engine crash", "--auto", "--no-logs"])
+                self._run(["--recovery", report_feedback.list_drafts(ws)[0]["id"], "failed"])
         payload = json.loads(uo.call_args.args[0].data.decode())
         self.assertIs(payload["context"]["auto"], True)
 
