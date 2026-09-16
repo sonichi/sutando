@@ -263,6 +263,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/agy/cli/`
 
 - **`start-cli.sh`** — Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
+- **`task-notifier.sh`** — External task-file-injection notifier for the agy (Antigravity CLI) core.
 
 ## `src/agent/claude/cli/`
 
