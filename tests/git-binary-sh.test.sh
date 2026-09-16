@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Contract test for scripts/git-binary.sh — the shell twin of src/git_binary.py,
-# restated for bash callers (src/check-pending-tasks.sh) that must not shell the
-# macOS CLT stub. Same rule as tests/python-binary-sh.test.sh: NEVER execute a
-# candidate to decide whether it is usable; only `xcode-select -p` is a safe probe.
-#
-# Run: bash tests/git-binary-sh.test.sh
-# Exit: 0 = all pass, 1 = failure
+# Contract test for scripts/git-binary.sh: never execute a candidate to decide
+# whether it is usable; only `xcode-select -p` is a safe probe. Exit 0 = pass.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0; fail=0
@@ -79,11 +74,8 @@ check "a symlink to the system stub is refused like the stub itself" "$out" ""
 out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git" 2>/dev/null)
 check "a symlink-to-stub is refused even when readlink itself is unavailable" "$out" ""
 
-# --- 7c. a symlink chain LONGER than the internal bound must FAIL, never -----
-# silently return an unresolved intermediate. Tested directly against the
-# realpath/is_system_stub helpers -- resolve_git's outer `[ -f ]` gate follows
-# symlinks via the OS's own (here, lower) ELOOP limit, which would reject an
-# over-long chain before ever reaching the code under test.
+# --- 7c. a chain LONGER than the internal bound must FAIL, never return an
+# unresolved intermediate -- tested directly, past resolve_git's own ELOOP gate.
 lab7c=$(mktemp -d)
 _prev=/usr/bin/git
 for _n in $(seq 1 45); do
@@ -95,10 +87,8 @@ rc=$?
 check "a 45-hop chain (over the internal bound) resolves to NOTHING, not an intermediate" "$out" ""
 [ "$rc" -ne 0 ] && ok "...and reports failure (non-zero), not a false success" || bad "...and reports failure (non-zero), not a false success" "rc=$rc"
 
-# --- 8. a DIRECTORY named "git" on PATH must never be returned as a binary ---
-# `[ -x dir ]` is true for any traversable directory; `-f` must gate every
-# candidate. OSTYPE is PINNED -- unpinned, CI takes the non-Darwin branch,
-# which has no directory rejection at all and passes for the wrong reason.
+# --- 8. a DIRECTORY named "git" must never return as a binary -- OSTYPE pinned,
+# since CI's non-Darwin branch has no directory rejection and would pass wrongly.
 lab8=$(mktemp -d)
 mkdir -p "$lab8/bin/git"
 printf '#!/bin/sh\nexit 2\n' > "$lab8/xcode-select"; chmod +x "$lab8/xcode-select"
