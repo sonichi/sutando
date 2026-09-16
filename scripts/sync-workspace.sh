@@ -510,13 +510,8 @@ _normalize_include_path() {
 # `.git/info/exclude` lives INSIDE `.git/` which outer treats as opaque,
 # so identical un-ignore rules here cannot cross the inner/outer boundary.
 #
-# Lines _compose_exclude_content() ALWAYS emits, regardless of vault.sync.*
-# config — never operator-editable, so an upgrade may add them freely. Its own
-# function so _is_safe_carveout_addition() (the upgrade-migration recognizer)
-# can accept these as safe generated-file additions too, instead of via a
-# second list that drifts from what the composer actually ships (#4309 review,
-# qingyun-wu/keweichen 2026-09-16 — exactly what happened to the
-# logs/conversations/ lines the first version of this fix added).
+# Lines _compose_exclude_content() ALWAYS emits, never operator-editable — its
+# own function so _is_safe_carveout_addition() recognizes them without a second list that can drift from what the composer actually ships.
 _hard_deny_lines() {
     echo ".env*"
     echo "*.heartbeat"
@@ -639,13 +634,8 @@ _is_safe_carveout_addition() {
     _widen_legacy_host_scope "$existing" > "$widened"
     existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    # Compare against what the composer EMITS, not the raw config value: a
-    # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
-    # Hard-deny lines (never operator-editable — see _hard_deny_lines) are ADDED
-    # to the shipped set regardless of whether the config-driven list resolved,
-    # so an empty/unreadable vault.sync.exclude does not also block them (#4309
-    # review, qingyun-wu 2026-09-16 — the config-only set left logs/conversations/
-    # unrecognized on every already-generated exclude file).
+    # Compare against what the composer EMITS (a directory yields both `p/`
+    # and `p/**`), and always ADD the hard-deny lines regardless of whether the config-driven list resolved — they are never operator-editable.
     shipped_rules=""
     while IFS= read -r path; do
         [ -n "$path" ] || continue

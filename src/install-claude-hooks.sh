@@ -57,13 +57,8 @@ set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Resolve a sutando-config.sh subcommand, falling back to a guessed default
-# ONLY when the helper script itself does not exist (e.g. a bare test fixture
-# with no scripts/ dir) — the one case nothing safe can be compared against.
-# When the helper EXISTS but the command fails, guessing is unsafe: it can
-# write/sweep against the wrong config dir on a configured clone (#4309 review,
-# keweichen/qingyun-wu 2026-09-16, repro: a readable sutando-config.sh exiting
-# 9 still let the installer "succeed" against a guessed path). Fail loud instead.
+# Guess the fallback only when the helper script itself is absent (nothing to
+# compare against); if it exists but fails, fail loud — guessing risks the wrong config dir on a configured clone.
 resolve_or_die() {  # resolve_or_die <subcommand> <fallback> -> sets RESOLVED
   local _sub="$1" _fallback="$2" _helper="$REPO_DIR/scripts/sutando-config.sh" _out
   if [ ! -f "$_helper" ]; then
@@ -189,15 +184,8 @@ while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
   HOOK_PRIOR+=("$_prior")
 done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
 
-# Deprecated hooks to uninstall on re-run.  Each line: "<event>|<mode>|<pattern>".
-# mode "sub": `.command | contains(pattern)` — for a marker so distinctive
-# (a pidfile path fragment, say) that no other command could plausibly embed
-# it. mode "regex": `.command | test(pattern)`, pattern pre-anchored (^...$)
-# by the constructor below — for anything an operator's OWN differently-shaped
-# command could otherwise contain as a mid-string substring (#4309 review,
-# keweichen/qingyun-wu 2026-09-16: a wrapper merely targeting the same
-# directory was swept under "sub" mode). Add new entries when removing a hook
-# from `HOOKS=()`; entries can be removed once the fleet has migrated (months).
+# Deprecated hooks to uninstall on re-run. Each line: "<event>|<mode>|<pattern>".
+# mode "sub" is a bare contains() for a marker too distinctive to collide; mode "regex" anchors (^...$) for anything a differently-shaped command could otherwise substring-match.
 DEPRECATED_HOOKS=(
   # #1065 watcher-kill Stop hook — dropped from HOOKS by #1083 (turn-end
   # firing killed the live Monitor watcher every turn). Cleanup-by-re-run
@@ -206,38 +194,21 @@ DEPRECATED_HOOKS=(
   "Stop|sub|watch-tasks-stream.pid"
 )
 
-# This PR changed the archiver's command: phase 0 cannot migrate the old one (it
-# embeds no repo path) and phase 1 matches exactly, so both would fire.
-#
-# Both pre-move forms of OUR archiver, matched by their EXACT historical shape
-# (regex mode, anchored ^...$) rather than a bare directory substring — an
-# operator's own command that merely targets the same directory (a different
-# wrapper, extra flags) does not match an anchored full-command regex the way
-# it matched a loose `contains("Desktop/sutando-conversations/")`. The ancient
-# `cp` form is fully static (no $REPO_DIR — never varied per clone); the
-# archive-transcript.sh form is reconstructed exactly as this clone's OWN
-# prior installer would have written it (git blame 96e2e0ce9^).
+# Exact anchored shape (not substring), so an operator's own differently-shaped
+# command can't match; entry 2 accepts any quoted absolute path, so relocating the checkout doesn't hide its pre-move hook.
 ARCHIVE_LEGACY_SHAPES=(
   "PreCompact|regex|^$(re_escape "cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\"")\$"
-  "PreCompact|regex|^$(re_escape "bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\"")\$"
+  "PreCompact|regex|^bash '/[^']*$(re_escape "/src/archive-transcript.sh")' $(re_escape "\"\$HOME/Desktop/sutando-conversations/\"")\$"
 )
 
-# CORE settings: keep this OMIT-gated. "The flag already dropped the archiver
-# from HOOKS, so an ungated removal here would delete a registered hook and
-# install no successor" — a real tradeoff at core scope, where there is no
-# other session to leak to, so leaving an operator's working (if stale-shaped)
-# core-only archiver alone under omit is a legitimate choice, not a bug.
+# Core-scope sweep stays OMIT-gated — removing a registered hook with no
+# successor is only a legitimate tradeoff where no other session can see it.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
   DEPRECATED_HOOKS+=("${ARCHIVE_LEGACY_SHAPES[@]}")
 fi
 
-# LEGACY PROJECT settings: always swept, never gated on omit (#4309 review,
-# keweichen/qingyun-wu 2026-09-16). "Don't newly enable archiving" (the
-# flag's job, honored above in HOOKS[] and in the core-scope sweep just
-# above) is a different question from "clean up a stale Desktop-scoped
-# PROJECT hook" — that one is visible to every guest session in this repo,
-# exactly the cross-session leak this whole migration exists to close, and
-# leaving it registered under omit is worse than installing no successor.
+# Legacy PROJECT-level entries are swept regardless of the omit flag — that
+# flag governs new archiving, not cleanup of a stale hook visible to every guest session in this repo.
 DEPRECATED_HOOKS_PROJECT_ONLY=("${ARCHIVE_LEGACY_SHAPES[@]}")
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -257,31 +228,8 @@ ADDED=0
 SKIPPED=0
 REMOVED=0
 
-# Real shell-word tokenizer: quotes honored, backslash escapes the next
-# character (single- and double-quoted spans, exactly like shq()'s own
-# escaping), NEVER expands $vars or `cmd`/$(cmd) substitutions — nothing here
-# EXECUTES anything, it only finds argv BOUNDARIES. UNQUOTED whitespace and
-# every POSIX shell control/redirection operator (`;` `&` `|` `<` `>` `(` `)`
-# and newline) end the current word exactly like a space does, AND set the
-# global flag TOKENIZE_HAS_OPERATOR — candidate_is_owned() rejects outright
-# whenever that flag is set, REGARDLESS of what argv[1] contains. Merely
-# treating an operator as a word boundary (this function's prior revision)
-# still flattens everything into one array with no memory of which command
-# segment a word belongs to, so `bash ;<repo>/src/session-handoff.sh ...`
-# tokenized to argv=[bash, <repo>/.../session-handoff.sh, ...] — argv[1]
-# holds the marker even though it is actually argv[0] of a SEPARATE command
-# after the `;`, not an argument to `bash` at all (qingyun-wu 2026-09-16,
-# reproduced live on 16a1c6a8: our OWN commands never contain an unquoted
-# control operator at all, so the safe, sufficient rule is simply "any
-# unquoted operator anywhere in the candidate disqualifies it," full stop —
-# no need to track segments once nothing we write can ever have one). Sets
-# the global array TOKENIZE_RESULT; returns 1 on unterminated quote (the
-# text is not valid shell at all). Exists because FIVE rounds of the
-# ownership test below tried to approximate this with a regex wildcard and
-# each round shipped a new argv-boundary shape the wildcard didn't cover
-# (#4309 review, keweichen/qingyun-wu, 2026-09-16) — real tokenization has
-# no such shape, because it isn't inferring a boundary, it's finding the
-# one a shell would.
+# Real argv tokenizer (quotes/backslash honored, never expands $vars/`cmd`).
+# Sets TOKENIZE_RESULT + TOKENIZE_HAS_OPERATOR; returns 1 on an unterminated quote.
 tokenize_argv() {
   local s="$1" n=${#1} i=0 c cur="" in_word=0
   TOKENIZE_RESULT=()
@@ -353,6 +301,15 @@ owned_hook_shape() {
   return 0
 }
 
+# Does $1 look like something THIS installer could have written — an absolute
+# path, or the legacy `$HOME/Desktop/sutando` literal — not an operator's own unexpanded `$VAR` prefix that merely contains our marker as a substring.
+_is_installer_path_shape() {
+  case "$1" in
+    /*|'$HOME/Desktop/sutando'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Decide whether $1 (a raw candidate .command string read from settings.json)
 # is a stale/foreign variant of the entry owned_hook_shape() last set up
 # (uses EVENT/MARKER/CMD/CMD_WORD/CMD_TAIL/HOOK_PRIOR_CUR from that call).
@@ -407,12 +364,12 @@ candidate_is_owned() {
   # into one array (this function's prior revision) loses which command
   # segment a word came from, so a word right after the operator can still
   # look like argv[1] of the FIRST command when it is really argv[0] of a
-  # SEPARATE one (qingyun-wu 2026-09-16, reproduced on 16a1c6a8).
+  # SEPARATE one.
   [ "$TOKENIZE_HAS_OPERATOR" = 1 ] && return 1
   if [ "$tokenize_rc" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
      && [ "${TOKENIZE_RESULT[0]}" = "$CMD_WORD" ]; then
     case "${TOKENIZE_RESULT[1]}" in
-      *"$MARKER"*) ;;                                    # bucket: clean argv[1] match
+      *"$MARKER"*) _is_installer_path_shape "${TOKENIZE_RESULT[1]}" || return 1 ;;  # bucket: clean argv[1] match
       *)                                                  # bucket B
         # Collapse doubled slashes before comparing: mktemp -d can hand back
         # a path containing "//", and this clone's OWN resolved $REPO_DIR
@@ -427,6 +384,7 @@ candidate_is_owned() {
     esac
   else
     case "${after:0:1}" in ' '|'-') return 1 ;; esac      # bucket A
+    _is_installer_path_shape "$after" || return 1
   fi
   # Mirror CMD_TAIL's own derivation onto the candidate — text after the
   # marker, with one leading close-quote stripped if present — then compare
