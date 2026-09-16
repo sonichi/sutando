@@ -407,8 +407,12 @@ check "the widening is a shared helper, not duplicated awk" \
     test "$(grep -c '_widen_legacy_host_scope' <<< "$SYNC_CODE")" -ge 3
 check "the carve-out recognizer runs on the WIDENED content" \
     grep -qF '_widen_legacy_host_scope "$existing" > "$widened"' <<< "$SYNC_CODE"
+# #4309 follow-up (qingyun-wu 2026-09-16): the empty-shipped early-return this
+# used to count (`rm -f "$widened"; return 1`) is gone -- hard-deny lines make
+# an empty config-driven list no longer a refusal, so there is exactly one
+# exit that ever holds the temp file, and it is the one below.
 check "the widened temp file is removed on every return path" \
-    test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
+    test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 1
 
 # 6. #4309 review's explicit ask (keweichen/qingyun-wu, 2026-09-16): a
 # BROADENED vault.sync.include that names logs/ must still not carry the
@@ -443,6 +447,32 @@ check "...and its contents too" \
 check "the deny is emitted AFTER the broadened include (order the rule depends on)" \
     test "$(grep -n '^!logs/\*\*$' <<< "$LOG_RULES" | cut -d: -f1)" \
       -lt "$(grep -n '^logs/conversations/$' <<< "$LOG_RULES" | cut -d: -f1)"
+
+# 7. THE REAL UPGRADE PATH for the transcript hard-deny (qingyun-wu 2026-09-16,
+# blocking on the first version of this fix): _compose_exclude_content() adding
+# logs/conversations/ is not enough on its own -- an EXISTING generated exclude
+# file only gets new lines through generate_exclude()'s own refusal-or-refresh
+# gate, and until _is_safe_carveout_addition() recognized hard-denies too, this
+# specific addition failed that gate and needed --force-gitignore, leaving
+# upgraded hosts exposed exactly as the original review described.
+UPG_LOG="$TEST_ROOT/upgrade-transcript-denylist"
+seed_older_install "$UPG_LOG" 'logs/conversations/'
+check "an older install starts without the transcript deny" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG/.git/info/exclude")" -eq 0
+check "...the real generate_exclude accepts the refresh with NO --force-gitignore (rc=0)" \
+    test "$(upgrade_rc "$UPG_LOG")" -eq 0
+check "...and both transcript deny lines now land" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG/.git/info/exclude")" -eq 2
+
+UPG_LOG_OP="$TEST_ROOT/upgrade-transcript-denylist-operator"
+seed_older_install "$UPG_LOG_OP" 'logs/conversations/'
+echo '!my/operator/rule' >> "$UPG_LOG_OP/.git/info/exclude"
+check "an operator rule ON TOP of the missing transcript deny is still REFUSED (rc=1)" \
+    test "$(upgrade_rc "$UPG_LOG_OP")" -eq 1
+check "...and that operator rule survives" \
+    grep -qxF '!my/operator/rule' "$UPG_LOG_OP/.git/info/exclude"
+check "...and the transcript deny was NOT force-added behind the refusal" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG_OP/.git/info/exclude")" -eq 0
 
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
