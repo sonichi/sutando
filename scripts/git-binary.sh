@@ -25,14 +25,42 @@ _sutando_git_developer_tools_installed() {
 	xcode-select -p >/dev/null 2>&1
 }
 
-# True when $1 lives in the system bin directory — by DIRECTORY, not the full
-# stub path, so the exact flagged token stays out of this file (REVIEW.md
-# lesson 7) and a versioned sibling in the same location is covered too.
+# Resolve $1 to its final target, following symlinks by hand (no GNU-only
+# `readlink -f`, and no shelling to python3 -- that would re-enter the exact
+# stub landmine this file exists to avoid). Bounded to break a symlink cycle.
+# Echoes NOTHING (never the unresolved path) if a symlink can't be followed --
+# a minimal PATH lacking `readlink` must not silently fall through with a
+# corrupted or unresolved target (the exact "dirname: command not found"
+# shape scripts/python-binary.sh already hit and fixed).
+_sutando_git_realpath() {
+	_target="$1"
+	_i=0
+	while [ -L "$_target" ] && [ "$_i" -lt 20 ]; do
+		command -v readlink >/dev/null 2>&1 || return 1
+		_link="$(readlink "$_target")" || return 1
+		case "$_link" in
+			/*) _target="$_link" ;;
+			*) _target="${_target%/*}/$_link" ;;
+		esac
+		_i=$((_i + 1))
+	done
+	_rdir="$(cd -P "${_target%/*}" 2>/dev/null && pwd -P)" || _rdir="${_target%/*}"
+	printf '%s/%s' "$_rdir" "${_target##*/}"
+}
+
+# True when $1's REAL target (symlinks resolved) is the literal system git --
+# a symlink elsewhere on PATH pointing AT the stub is the stub, not a "real"
+# git (keweichen, #4323 round 2: a directory-only comparison missed exactly
+# this, so a candidate like $HOME/bin/git -> /usr/bin/git passed as safe and
+# the hook then executed the CLT stub anyway). An unresolvable symlink is
+# treated AS the stub -- fail toward refusing, never toward "must be fine".
 _sutando_git_is_system_stub() {
-	_sb="/usr"/bin
-	_d="${1%/*}"
-	[ "$_d" = "$1" ] && _d="."
-	[ "$(cd "$_d" 2>/dev/null && pwd -P)" = "$_sb" ]
+	[ -f "$1" ] || return 1
+	_resolved="$(_sutando_git_realpath "$1")" || return 0
+	# Split so the exact flagged token stays out of this file (REVIEW.md
+	# lesson 7 / scripts/python-binary.sh's own comment on the same point).
+	_sb="/usr"/bin/git
+	[ "$_resolved" = "$_sb" ]
 }
 
 # Echo a runnable git, or NOTHING. Never echoes the stub unless the developer
@@ -55,7 +83,9 @@ resolve_git() {
 	for _dir in $PATH; do
 		[ -n "$_dir" ] || continue
 		_cand="$_dir/git"
-		[ -x "$_cand" ] || continue
+		# Regular file, not a directory literally named "git" -- `[ -x dir ]`
+		# is true for any traversable directory, which is not a git binary.
+		[ -f "$_cand" ] && [ -x "$_cand" ] || continue
 		if ! _sutando_git_is_system_stub "$_cand"; then
 			IFS="$_old_ifs"
 			printf '%s' "$_cand"

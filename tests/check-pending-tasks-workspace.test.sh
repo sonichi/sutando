@@ -188,5 +188,45 @@ else
 fi
 rm -f "$WS/tasks/$PROBE"
 
+# 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX (keweichen, #4323 round 2). A
+# shipped app bundle has no .git at all, so REPO_COMMON_DIR is empty by
+# design -- requiring BOTH sides non-empty before comparing let a genuinely
+# foreign Git cwd read as "cannot tell" and fall through to blocking on the
+# BUNDLE's own queue anyway. Build a real non-Git REPO_DIR (hook + resolver,
+# no .git) with a pending task, so a wrongly-skipped case would print {} and
+# a wrongly-blocked case would print the block payload -- either failure mode
+# is directly observable, not inferred.
+BUNDLE="$(mktemp -d)"
+mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$BUNDLE/src/"
+cp "$REPO/scripts/git-binary.sh" "$BUNDLE/scripts/"
+BUNDLE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$BUNDLE" "$BUNDLE_PY" > "$BUNDLE/scripts/sutando-config.sh"
+chmod +x "$BUNDLE/scripts/sutando-config.sh"
+printf 'id: probe\ntask: bundle-matrix-probe\n' > "$BUNDLE/workspace/tasks/$PROBE"
+
+# 9. non-Git bundle + a genuinely foreign Git cwd -> must SKIP ({}).
+BUNDLE_FOREIGN="$(mktemp -d)"
+(cd "$BUNDLE_FOREIGN" && git init -q && \
+   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+BF_OUT="$(cd "$BUNDLE_FOREIGN" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+case "$BF_OUT" in
+  '{}') ok "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" ;;
+  *) bad "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" "got: ${BF_OUT:0:120}" ;;
+esac
+rm -rf "$BUNDLE_FOREIGN"
+
+# 10. non-Git bundle + a NON-Git cwd -> cannot prove different, fail closed
+# (still gate/block) -- the control that proves case 9 is keyed on "a
+# different repo", not on "the bundle has no .git" alone.
+BUNDLE_CLEAN_CWD="$(mktemp -d)"
+BC_OUT="$(cd "$BUNDLE_CLEAN_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+case "$BC_OUT" in
+  *'"decision":"block"'*) ok "non-Git bundle + non-Git cwd -> still gates (fail closed)" ;;
+  *) bad "non-Git bundle + non-Git cwd -> still gates (fail closed)" "got: ${BC_OUT:0:120}" ;;
+esac
+rm -rf "$BUNDLE_CLEAN_CWD" "$BUNDLE"
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
