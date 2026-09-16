@@ -663,11 +663,21 @@ json.dump({"hooks": {
         # operator's OWN wrapper, our script passed as its argument — must SURVIVE.
         {"type": "command",
          "command": f'bash \'/tmp/operator-wrapper.sh\' \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # same, but the wrapper's OWN path is UNQUOTED (no spaces in it, so
+        # it's syntactically valid unquoted) — must also SURVIVE. This is the
+        # exact counterexample that broke the quote+space-only lookahead: no
+        # quote precedes the argv-separating space at all (qingyun-wu,
+        # 2026-09-16, reproduced live on bd2ddd51).
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper-unquoted.sh \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
     ]}],
     "PreCompact": [{"matcher": "", "hooks": [
         # same shape, the archive destination as the wrapper's argument — SURVIVE.
         {"type": "command",
          "command": f'bash \'/tmp/archive-wrapper.sh\' \'{repo}/workspace/logs/conversations/\''},
+        # unquoted-wrapper-path variant of the same, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper-unquoted.sh \'{repo}/workspace/logs/conversations/\''},
     ]}],
 }}, open(p, "w"), indent=2)
 PY
@@ -676,10 +686,14 @@ GSURV_SE="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map
 GSURV_PC="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
 ok "wrapper-before-marker: operator's session-handoff wrapper survives" \
    "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: UNQUOTED session-handoff wrapper path survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper-unquoted.sh' && echo 0 || echo 1)"
 ok "wrapper-before-marker: today's canonical session-handoff shape is still swept" \
    "$(echo "$GSURV_SE" | grep -qxF "bash '$GREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
 ok "wrapper-before-marker: operator's archive-destination wrapper survives" \
    "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: UNQUOTED archive-destination wrapper path survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-unquoted.sh' && echo 0 || echo 1)"
 rm -rf "$GROOT"
 
 rm -rf "$ROOT"

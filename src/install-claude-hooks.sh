@@ -279,15 +279,18 @@ owned_hook_shape() {
   cmd_word="${CMD%% *}"
   cmd_tail="${CMD#*"$MARKER"}"
   cmd_tail="${cmd_tail#[\"\']}"       # drop shq's closing quote, if present
-  # The middle wildcard used to be `.*` (any text, unbounded) — it could cross a
-  # CLOSING quote + space into a SECOND shell argument, so an operator wrapper
-  # that merely passes our script as an argument (`bash '/op/wrap.sh'
-  # '<repo>/src/session-handoff.sh' ...`) matched as if it WERE our command
-  # (#4309 review, keweichen/qingyun-wu 2026-09-16, real repro + deletion). A
-  # negative-lookahead excludes `' ` / `" ` (a quote immediately followed by a
-  # space — the only way a NEW argument starts in a shq-quoted command) from the
-  # matched span, so the marker must stay inside the SAME first argument.
-  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -](?:(?![\"'] ).)*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
+  # A new shell argument starts wherever a quote sits directly against a
+  # space — closing quote + space (an argument ending) or space + opening
+  # quote (an argument beginning). Either shape crossed into a wrapper's
+  # SEPARATE argument and got misread as installer-owned, in order: an
+  # unbounded `.*` matched across close-quote+space (#4309 review
+  # 2026-09-16); a lookahead excluding only THAT direction still matched
+  # across space+open-quote — `bash /op/wrap.sh '<repo>/...' ...`, no quote
+  # before the space at all (qingyun-wu 2026-09-16, reproduced on bd2ddd51).
+  # A bare quote with NO adjacent space (an apostrophe inside an unquoted
+  # legacy path, #8 below) is not a boundary either way and must stay
+  # matchable — this excludes both directions, nothing more.
+  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -](?:(?![\"'] | [\"']).)*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
   LEGACY_SHAPE=""
   [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
   return 0
