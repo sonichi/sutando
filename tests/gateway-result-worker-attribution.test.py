@@ -56,10 +56,8 @@ class _Captured(Exception):
 class WorkerAttribution(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
-        # self.workspace plays the WORKSPACE root (what pool_delivery's
-        # done_flag() expects); _STATE is production's own state_dir(),
-        # i.e. <workspace>/state — the two must share that relationship or
-        # the fixture and the code under test silently disagree on depth.
+        # self.workspace is the WORKSPACE root pool_delivery expects; _STATE
+        # is production's own state_dir() == <workspace>/state.
         self.workspace = tempfile.mkdtemp()
         self.mod._STATE = Path(self.workspace) / "state"
 
@@ -75,8 +73,6 @@ class WorkerAttribution(unittest.TestCase):
     def _flag(self, core: str, tid: str):
         # Named exactly as finish_task writes it: the full result stem, prefix
         # included. A bare-id fixture agrees with a prefix bug and hides it.
-        # Goes through the real writer's own path function (pool_delivery
-        # .done_flag), not a re-spelled literal — see module docstring.
         path = pool_delivery.done_flag(Path(self.workspace), core, tid)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
