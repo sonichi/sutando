@@ -6,6 +6,7 @@
 #   2. install is idempotent (re-run doesn't duplicate the entry)
 #   3. install --with-project-hooks adds PreCompact + Stop entries
 #   4. migration-notice flags non-Sutando hooks while filtering Sutando-owned
+#   5. the two installers agree on the command string, so neither double-registers
 #
 # Run: bash tests/sutando-config-hooks.test.sh
 # Exit: 0 = all pass, 1 = failure
@@ -162,5 +163,27 @@ rm -rf "$T15"
 
 rm -rf "$T"
 echo
+
+# Test 19-21: both installers own ONE command string per hook. They used to carry
+# separate copies, and a SessionEnd handoff written two ways registered twice.
+D="$(mktemp -d)"
+mkdir -p "$D/workspace/.claude-sutando"
+CORE_SETTINGS="$D/workspace/.claude-sutando/settings.json"
+INSTALLER_SE="$(bash "$REPO_DIR/src/install-claude-hooks.sh" --print-hooks 2>/dev/null \
+  | grep '^SessionEnd|src/session-handoff.sh|')"
+INSTALLER_SE="${INSTALLER_SE#*|*|}"
+[ -n "$INSTALLER_SE" ]; report "$?" "install-claude-hooks.sh --print-hooks emits the SessionEnd command"
+
+echo '{}' > "$D/s.json"
+bash "$SCRIPT" install "$D/s.json" >/dev/null 2>&1
+CONFIG_SE="$(jq -r '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh")) | .command] | .[0] // ""' "$D/s.json")"
+[ "$CONFIG_SE" = "$INSTALLER_SE" ]; report "$?" "sutando-config-hooks.sh writes the installer's exact command"
+
+# Run BOTH against one settings file: the shapes must collapse to a single entry.
+bash "$SCRIPT" install "$D/s.json" --with-project-hooks >/dev/null 2>&1
+SE_COUNT="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$D/s.json")"
+[ "$SE_COUNT" = "1" ]; report "$?" "one SessionEnd handoff entry after both install paths, not two"
+rm -rf "$D"
+
 echo "Results: $pass passed, $fail failed"
 [ "$fail" = "0" ]

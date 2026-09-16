@@ -140,6 +140,14 @@ if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   HOOKS=("${_kept[@]}")
 fi
 
+# One owner for the command strings. scripts/sutando-config-hooks.sh used to
+# re-declare its own copies, which drifted three ways (an archiver form this
+# script now sweeps as deprecated, and two quoting variants that double-register).
+if [ "${1:-}" = "--print-hooks" ]; then
+  for _h in "${HOOKS[@]}"; do printf '%s\n' "$_h"; done
+  exit 0
+fi
+
 # Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
 # `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
 HOOK_PRIOR=()
