@@ -223,6 +223,34 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(type_calls, 2,
                           "a paste that never staged must be retyped exactly once more")
 
+    def test_stale_history_marker_does_not_count_as_staged(self):
+        # A prior dispatch of the SAME filename left its marker in pane
+        # history — the marker text is byte-identical across dispatches.
+        self.write_task("task-stale.txt")
+        self.pane_file.write_text(
+            IDLE_MARKER + "\nSutando task ready: task-stale.txt\n" + IDLE_MARKER + "\n"
+        )
+        self.swallow_flag.write_text("1")  # this attempt's paste vanishes, unstaged
+
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-stale.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-stale.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-stale.txt")
+        self.assertEqual(
+            type_calls, 2,
+            "a swallowed paste must still be retyped even though an earlier "
+            "dispatch's marker for the same task is already in pane history",
+        )
+
     def test_unconfirmed_submit_is_re_pressed(self):
         # This stub's ENTER never clears the staged marker, so deliver_prompt
         # must re-press Enter once after the confirm timeout elapses.
@@ -319,6 +347,7 @@ class StartCliNotifierWiringTest(unittest.TestCase):
         self.tmux_log = self.root / "tmux.log"
         self.tmux_log.write_text("")
         self._write_fake_agy()
+        self._write_fake_fswatch()
         self._write_fake_tmux()
 
     def _write_fake_agy(self):
@@ -328,6 +357,13 @@ if [ "${1:-}" = --version ]; then echo "9.9.9-fake"; exit 0; fi
 if [ "${1:-}" = models ]; then echo "fake-model"; exit 0; fi
 exec sleep 300
 ''')
+        path.chmod(0o755)
+
+    def _write_fake_fswatch(self):
+        # This stub tmux never execs the notifier, so only PRESENCE matters
+        # here — see agy-notifier-dependency-gate.test.py for real liveness.
+        path = self.bin / "fswatch"
+        path.write_text("#!/bin/bash\nexit 0\n")
         path.chmod(0o755)
 
     def _write_fake_tmux(self):
