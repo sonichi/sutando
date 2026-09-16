@@ -172,18 +172,16 @@ def main(argv=None) -> int:
     # Emitted on every path: the run verdict is about the THREAD, so a caller who
     # reads only it can act on a PR it is itself blocking. No review, no head call.
     _mine = my_review_state(reviews, args.me)
-    standing = describe_my_review(
-        _mine, fetch_head_sha(args.repo, args.number)) if _mine else ""
+    if _mine:
+        # A gating review IS an event, so this can never coexist with an empty
+        # thread — printing it here covers both branches without a dead one.
+        print(describe_my_review(_mine, fetch_head_sha(args.repo, args.number)))
 
     events = merge_events(comments, reviews, keep_bots=args.count_bots)
     run, span = trailing_run(events, args.me)
     if not events:
         print(f"{args.repo}#{args.number}: no comment/review activity yet — safe to post")
-        if standing:
-            print(standing)
         return 0
-    if standing:
-        print(standing)
     if run >= args.threshold:
         print(
             f"REFUSE {args.repo}#{args.number}: your last {run} events on this thread are ALL yours, "

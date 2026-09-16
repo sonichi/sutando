@@ -2,7 +2,9 @@
 """Contract for the PR monologue guard: refuse to post into a thread that is only me."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import re
 import sys
 import unittest
@@ -401,6 +403,63 @@ class TestDescribeMyReview(unittest.TestCase):
 
 
 class TestHeadFetchIsAdditiveOnly(unittest.TestCase):
+    def test_a_successful_head_fetch_returns_the_sha(self):
+        real = g._gh_json
+        seen = []
+
+        def fake(path, paginate=True):
+            seen.append((path, paginate))
+            return {"head": {"sha": HEAD}}
+
+        g._gh_json = fake
+        try:
+            self.assertEqual(g.fetch_head_sha("o/r", 42), HEAD)
+        finally:
+            g._gh_json = real
+        # Unpaginated: the PR endpoint is one object, not a list.
+        self.assertEqual(seen, [("repos/o/r/pulls/42", False)])
+
+    def test_a_head_the_payload_does_not_carry_reads_as_empty_not_a_crash(self):
+        real = g._gh_json
+        for payload in ({}, {"head": None}, {"head": {}}, None):
+            g._gh_json = lambda path, paginate=True, _p=payload: _p
+            try:
+                self.assertEqual(g.fetch_head_sha("o/r", 1), "", payload)
+            finally:
+                g._gh_json = real
+
+    def test_a_standing_review_is_itself_an_event_so_the_thread_is_never_empty(self):
+        # Why there is no standing-print in the no-events branch: merge_events
+        # counts reviews, so a gating review guarantees a non-empty timeline.
+        real_fetch, real_head = g.fetch, g.fetch_head_sha
+        g.fetch = lambda repo, number: ([], [gr(T(1), ME, "CHANGES_REQUESTED", OLD)])
+        g.fetch_head_sha = lambda repo, number: HEAD
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = g.main(["1", "--me", ME, "--repo", REPO])
+        finally:
+            g.fetch, g.fetch_head_sha = real_fetch, real_head
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("YOUR REVIEW BLOCKS THIS PR", out)
+        self.assertNotIn("no comment/review activity yet", out)
+
+    def test_an_empty_thread_still_prints_its_verdict_and_no_standing_line(self):
+        real_fetch, real_head = g.fetch, g.fetch_head_sha
+        g.fetch = lambda repo, number: ([], [])
+        g.fetch_head_sha = lambda repo, number: HEAD
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = g.main(["1", "--me", ME, "--repo", REPO])
+        finally:
+            g.fetch, g.fetch_head_sha = real_fetch, real_head
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("no comment/review activity yet", out)
+        self.assertNotIn("BLOCKS THIS PR", out)
+
     def test_a_failing_head_fetch_returns_empty_rather_than_raising(self):
         real = g._gh_json
 
