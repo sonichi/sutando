@@ -152,7 +152,10 @@ def main(argv=None):
         if args.jsonl:
             print(json.dumps({
                 "id": str(msg.get("id", "")), "ts": ts, "author": author,
+                "author_id": str((msg.get("author") or {}).get("id") or ""),
                 "text": _render(msg, clip), "reply": ctx or "",
+                # Who the reply answers, as an id: `reply` names them by username only.
+                "reply_author_id": str(((msg.get("referenced_message") or {}).get("author") or {}).get("id") or ""),
                 # `reply` is clipped at REPLY_CLIP, so matching its text picks
                 # the wrong parent silently once a parent is longer. A key cannot.
                 "reply_to_id": _reply_to_id(msg),

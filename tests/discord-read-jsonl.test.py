@@ -36,10 +36,11 @@ LONG_PARENT = "x" * 400   # > REPLY_CLIP (110): the rendered `reply` is truncate
 # mode output the guard above pins, which is exactly what that test is for.
 REPLY_MESSAGES = [
     {"id": "2000", "timestamp": "2026-09-12T18:00:01.000Z", "content": "second",
-     "author": {"username": "Sutando-Pro"}, "type": 19,
+     "author": {"username": "Sutando-Pro", "id": "555"}, "type": 19,
      "message_reference": {"message_id": "1000", "channel_id": "123"},
      "referenced_message": {"id": "1000", "timestamp": "2026-09-12T17:59:59.000Z",
-                            "content": LONG_PARENT, "author": {"username": "susanliu_"}}},
+                            "content": LONG_PARENT,
+                            "author": {"username": "susanliu_", "id": "1025785494862315690"}}},
     {"id": "1000", "timestamp": "2026-09-12T17:59:59.000Z", "content": LONG_PARENT,
      "author": {"username": "susanliu_"}},
 ]
@@ -67,6 +68,17 @@ class JsonlMode(unittest.TestCase):
         self.assertEqual(rows[0]["reply"], "")
         self.assertEqual(rows[0]["url"], "https://discord.com/channels/9001/123/1000")
         rg.assert_called_once_with("123", "tok")
+
+    def test_ids_ride_beside_the_names_and_are_empty_when_absent(self):
+        _, out, _ = _run(["123", "--operator", "--jsonl"])
+        rows = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual([(r["author_id"], r["reply_author_id"]) for r in rows], [("", ""), ("", "")])
+
+    def test_a_reply_names_whom_it_answers_by_id(self):
+        _, out, _ = _run(["123", "--operator", "--jsonl"], messages=REPLY_MESSAGES)
+        reply = [json.loads(line) for line in out.splitlines()][-1]
+        self.assertEqual(reply["author_id"], "555")
+        self.assertEqual(reply["reply_author_id"], "1025785494862315690")
 
     def test_a_dm_channel_links_through_at_me(self):
         _, out, _ = _run(["123", "--operator", "--jsonl"], guild=None)
