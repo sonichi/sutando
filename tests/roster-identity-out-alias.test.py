@@ -90,6 +90,7 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
                   / "skills" / "collaboration-intelligence" / "scripts"
                   / "migrate_roster_identity.py")
         codes = []
+        self.final = None
         for n in range(1, 4):
             out = td / f"sidecar{n}.json"
             r = subprocess.run([sys.executable, str(script), "--roster", str(cur),
@@ -97,8 +98,27 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
             codes.append(r.returncode)
             if not out.is_file():
                 break
+            self.final = json.loads(out.read_text())
             cur = out
         return codes
+
+    def carried_seed(self, path, verdict):
+        """A v2 sidecar whose ONLY evidence for H is a seed under `path`."""
+        return {"_schema": {"name": "reviewer-identity", "version": 2},
+                "reviewer": {"stand_status": self.S, "unresolved_discord_ids": [
+                    {"id": self.H, "reason": "unclassified legacy id",
+                     "seeded_by": [{"path": path, "verdict": verdict,
+                                    "reason": "unverified carried statement"}]}]}}
+
+    def assert_H_unpublished(self, codes):
+        self.assertEqual(codes, [5, 5, 5],
+                         f"a re-migration authorized an unbacked id: {codes}")
+        e = self.final["reviewer"]
+        self.assertNotEqual(e.get("human_discord_id"), self.H)
+        self.assertNotIn(self.H, [(s.get("id") if isinstance(s, dict) else s)
+                                  for s in e.get("other_stand_discord_ids") or []])
+        self.assertIn(self.H, [(u.get("id") if isinstance(u, dict) else u)
+                               for u in e.get("unresolved_discord_ids") or []])
 
     def test_a_nested_both_referent_path_under_a_STAND_root_stays_refused(self):
         codes = self.three_passes({"reviewer": {
@@ -116,6 +136,23 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
         }})
         self.assertEqual(codes, [5, 5, 5],
                          f"re-migration resolved a real disagreement: {codes}")
+
+    def test_a_carried_HUMAN_seed_under_the_UNRESOLVED_root_stays_refused(self):
+        """Writer-owned is not eligible: `unresolved_discord_ids` is writer-owned
+        and states no principal, yet its seed was consumed and H became the human.
+        Measured rc 0 -> 0 -> 0 with `human_discord_id` = H before the fix."""
+        self.assert_H_unpublished(self.three_passes(
+            self.carried_seed("unresolved_discord_ids.human.id", "human")))
+
+    def test_a_carried_STAND_seed_under_the_UNRESOLVED_root_stays_refused(self):
+        self.assert_H_unpublished(self.three_passes(
+            self.carried_seed("unresolved_discord_ids.stand.id", "stand")))
+
+    def test_a_carried_seed_under_an_INELIGIBLE_nested_container_stays_refused(self):
+        """Excluding only the unresolved root is too narrow: `room` is refused by
+        the producer's container policy and must be refused by the consumer too."""
+        self.assert_H_unpublished(self.three_passes(
+            self.carried_seed("human_discord_id.room.stand.id", "stand")))
 
     def test_CONTROL_a_single_referent_slot_still_migrates_cleanly(self):
         """Without this the fix could pass by refusing everything forever."""
