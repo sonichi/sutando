@@ -166,6 +166,11 @@ echo
 
 # Test 19-21: both installers own ONE command string per hook. They used to carry
 # separate copies, and a SessionEnd handoff written two ways registered twice.
+# Pin the repo both sides resolve against: $SCRIPT asks ${SUTANDO_REPO_DIR:-$REPO_DIR}
+# internally, but the install-claude-hooks.sh call below always asks $REPO_DIR — an
+# inherited SUTANDO_REPO_DIR pointing at another checkout diverges the two commands
+# and this check measures the host's environment, not the code (qingyun-wu 2026-09-16).
+unset SUTANDO_REPO_DIR
 D="$(mktemp -d)"
 mkdir -p "$D/workspace/.claude-sutando"
 CORE_SETTINGS="$D/workspace/.claude-sutando/settings.json"

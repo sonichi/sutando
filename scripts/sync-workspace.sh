@@ -510,6 +510,42 @@ _normalize_include_path() {
 # `.git/info/exclude` lives INSIDE `.git/` which outer treats as opaque,
 # so identical un-ignore rules here cannot cross the inner/outer boundary.
 #
+# Lines _compose_exclude_content() ALWAYS emits, regardless of vault.sync.*
+# config — never operator-editable, so an upgrade may add them freely. Its own
+# function so _is_safe_carveout_addition() (the upgrade-migration recognizer)
+# can accept these as safe generated-file additions too, instead of via a
+# second list that drifts from what the composer actually ships (#4309 review,
+# qingyun-wu/keweichen 2026-09-16 — exactly what happened to the
+# logs/conversations/ lines the first version of this fix added).
+_hard_deny_lines() {
+    echo ".env*"
+    echo "*.heartbeat"
+    echo "*.alive"
+    echo "*.sentinel"
+    echo "*.pid"
+    # Secret material — name-pattern deny (M3). The deny list above caught
+    # transient state + .env*; it did NOT cover SSH private keys or
+    # cert/key material, which would be carried if they ever landed in a
+    # synced path. Public keys (*.pub) are intentionally NOT denied.
+    echo "id_rsa"
+    echo "id_dsa"
+    echo "id_ecdsa"
+    echo "id_ed25519"
+    echo "*.pem"
+    echo "*.key"
+    echo "*.p12"
+    echo "*.pfx"
+    echo "*.ppk"
+    echo "*.keystore"
+    echo "*.jks"
+    # Claude Code transcript archive: the PreCompact archiver writes full
+    # conversation JSONL under logs/conversations/ — the default carrier set
+    # never names it, but nothing stopped a broadened vault.sync.include
+    # (e.g. "logs/") from carrying it.
+    echo "logs/conversations/"
+    echo "logs/conversations/**"
+}
+
 # Carrier set driven by vault.sync.{include,exclude} in
 # sutando.config.{json,local.json} (PR-3). Edit those to customize.
 _compose_exclude_content() {
@@ -549,36 +585,8 @@ _compose_exclude_content() {
     fi
 
     echo ""
-    echo "# Hard-deny credentials regardless of carrier set"
-    echo ".env*"
-    echo "*.heartbeat"
-    echo "*.alive"
-    echo "*.sentinel"
-    echo "*.pid"
-    # Secret material — name-pattern deny (M3). The deny list above caught
-    # transient state + .env*; it did NOT cover SSH private keys or
-    # cert/key material, which would be carried if they ever landed in a
-    # synced path. These are gitignore-style globs composed into
-    # .git/info/exclude. Public keys (*.pub) are intentionally NOT denied.
-    echo "id_rsa"
-    echo "id_dsa"
-    echo "id_ecdsa"
-    echo "id_ed25519"
-    echo "*.pem"
-    echo "*.key"
-    echo "*.p12"
-    echo "*.pfx"
-    echo "*.ppk"
-    echo "*.keystore"
-    echo "*.jks"
-    # Claude Code transcript archive (#4309 review, keweichen/qingyun-wu
-    # 2026-09-16): the PreCompact archiver writes full conversation JSONL
-    # under logs/conversations/ — the default carrier set never names it, but
-    # nothing STOPPED a broadened vault.sync.include (e.g. "logs/") from
-    # carrying it. Same hard-deny mechanism as the credential globs above:
-    # emitted last, so it wins over any include regardless of config.
-    echo "logs/conversations/"
-    echo "logs/conversations/**"
+    echo "# Hard-deny credentials + transcript archive regardless of carrier set"
+    _hard_deny_lines
 }
 
 # Print `existing` with a legacy per-host carrier scope rewritten to the shared
@@ -631,14 +639,19 @@ _is_safe_carveout_addition() {
     _widen_legacy_host_scope "$existing" > "$widened"
     existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
     # Compare against what the composer EMITS, not the raw config value: a
     # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
+    # Hard-deny lines (never operator-editable — see _hard_deny_lines) are ADDED
+    # to the shipped set regardless of whether the config-driven list resolved,
+    # so an empty/unreadable vault.sync.exclude does not also block them (#4309
+    # review, qingyun-wu 2026-09-16 — the config-only set left logs/conversations/
+    # unrecognized on every already-generated exclude file).
     shipped_rules=""
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
+    shipped_rules+="$(_hard_deny_lines)"$'\n'
     shipped="$shipped_rules"
     rc=0
     # Refuse if the refresh would DROP any rule the existing file carries.
