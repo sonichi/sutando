@@ -67,7 +67,33 @@ printf '#!/bin/sh\nexit 2\n' > "$lab6/xcode-select"; chmod +x "$lab6/xcode-selec
 out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:$lab/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
 check "a real stub earlier on PATH does not hide a real git further along" "$out" "$lab/bin/git"
 
-# --- 7. check-pending-tasks.sh sources the resolver, not a bare `git` --------
+# --- 7. A SYMLINK to the system stub must be refused, not accepted as "real" -
+# keweichen, #4323 round 2: the old check compared only the candidate's
+# DIRECTORY, so $HOME/bin/git -> /usr/bin/git looked like an ordinary PATH
+# git and was returned even with no developer tools -- the hook then executed
+# the actual stub through the symlink.
+lab7=$(mktemp -d)
+mkdir -p "$lab7/bin"
+ln -s /usr/bin/git "$lab7/bin/git"
+printf '#!/bin/sh\nexit 2\n' > "$lab7/xcode-select"; chmod +x "$lab7/xcode-select"
+out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+check "a symlink to the system stub is refused like the stub itself" "$out" ""
+
+# --- 7b. same case, but with readlink UNAVAILABLE -- must still refuse, ------
+# never fall through with an unresolved/corrupted path (the exact "dirname:
+# command not found" shape python-binary.sh already hit and fixed).
+out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git" 2>/dev/null)
+check "a symlink-to-stub is refused even when readlink itself is unavailable" "$out" ""
+
+# --- 8. a DIRECTORY named "git" on PATH must never be returned as a binary ---
+# `[ -x dir ]` is true for any traversable directory, which is not a git
+# executable; `-f` must gate every candidate.
+lab8=$(mktemp -d)
+mkdir -p "$lab8/bin/git"
+out=$(PATH="$lab8/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+check "a directory literally named git is never returned" "$out" ""
+
+# --- 9. check-pending-tasks.sh sources the resolver, not a bare `git` --------
 if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '(^|[^"$])\bgit -C'; then
   bad "check-pending-tasks.sh must not call a bare git" "found an unresolved git invocation"
 else

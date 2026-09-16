@@ -34,7 +34,14 @@ if [ -n "$GIT_BIN" ]; then
   # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
   [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
   [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
-  if [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+  # A packaged bundle ships without .git (REPO_COMMON_DIR empty by design), so
+  # requiring BOTH sides non-empty let a genuinely foreign Git cwd read as
+  # "cannot tell" and fall through to blocking the core's queue anyway
+  # (keweichen, #4323 round 2). Only CWD's identity needs to be known: no Git
+  # identity there -> cannot prove different, proceed as core (fail closed,
+  # same direction as "no runnable git" below); a Git identity that isn't
+  # REPO_DIR's (including REPO_DIR having none at all) -> a different repo.
+  if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
     echo '{}'
     exit 0
   fi
