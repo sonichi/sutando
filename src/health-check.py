@@ -9705,9 +9705,10 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
-# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
-_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
-_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
+# Copies whole transcripts; excluded from unattended repair — a timer should not
+# start duplicating full conversation logs, wherever they land.
+_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:logs/conversations/"
+_TRANSCRIPT_ARCHIVE_FAMILY = "logs/conversations/"
 
 
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
@@ -9722,8 +9723,7 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
     than assumed repaired — a fixer's self-report is not evidence of the result.
 
-    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
-    leaves the workspace, and the dominant caller of `--fix` is an unattended
+    Scoped: the transcript archiver copies entire conversations, and the dominant caller of `--fix` is an unattended
     30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
     routine timer must not make that egress decision, so it is left to explicit
     opt-in and its absence keeps warning.
@@ -9762,7 +9762,7 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
         scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
         if not scoped:
             print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
-                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
+                  f"transcripts to <workspace>/logs/conversations/. Opt in with `bash src/{installer.name}`",
                   file=out)
             continue
         print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
@@ -11657,7 +11657,18 @@ def check_claude_hook_registration(
                           f"cannot verify skill-declared hooks"}
 
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    raw = sm.group(1) if sm else "$CORE_CONFIG_DIR/settings.json"
+    # Resolve $CORE_CONFIG_DIR as the installer does: a probe reading a different
+    # file than the installer writes reports on nothing.
+    if "$CORE_CONFIG_DIR" in raw:
+        try:
+            sys.path.insert(0, str(repo / "src"))
+            from sutando_config import resolve_claude_sutando_config_dir
+            core_cfg = str(resolve_claude_sutando_config_dir(repo))
+        except Exception:
+            core_cfg = str(repo / "workspace" / ".claude-sutando")
+        raw = raw.replace("$CORE_CONFIG_DIR", core_cfg)
+    settings = Path(raw.replace("$REPO_DIR", str(repo)))
     if not settings.is_file():
         return {"name": name, "status": "warn",
                 "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
@@ -11681,6 +11692,18 @@ def check_claude_hook_registration(
         return {"name": name, "status": "warn",
                 "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
                           f"cannot verify {len(owned)} hook(s)"}
+
+    # $TRANSCRIPT_DIR must resolve as the installer resolves it, or the stored
+    # command never compares equal. resolve_workspace() always answers for the LIVE repo.
+    _ws = repo / "workspace"
+    if (repo / "scripts" / "sutando-config.sh").is_file():
+        try:
+            sys.path.insert(0, str(repo / "src"))
+            from workspace_default import resolve_workspace
+            _ws = Path(resolve_workspace())
+        except Exception:
+            pass
+    transcript_dir = str(_ws / "logs" / "conversations")
 
     missing, foreign = [], []
     for event, marker, owned_cmd in owned:
@@ -11707,7 +11730,7 @@ def check_claude_hook_registration(
             _hook_command_targets(
                 c,
                 (repo / marker) if marker.startswith("src/") else None,
-                owned_cmd.replace("$REPO_DIR", str(repo)),
+                owned_cmd.replace("$REPO_DIR", str(repo)).replace("$TRANSCRIPT_DIR", transcript_dir),
                 marker,
             )
             for c in hit
@@ -11756,7 +11779,7 @@ def check_claude_hook_registration(
         # The bare installer registers the opt-in-only transcript archiver, so the remedy
         # must not prescribe it when that hook is the only thing missing.
         only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
-        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
+        remedy = ("that hook copies full transcripts to <workspace>/logs/conversations/ and is left to explicit opt-in — "
                   "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
                   "you intend to enable it"
                   if only_archive else
@@ -11771,13 +11794,13 @@ def check_claude_hook_registration(
                 remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
                           "— that flag is what adds the legacy archive form to the prune list, so with "
                           f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
-                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
+                          "src/install-claude-hooks.sh` plain, which also REGISTERS the transcript "
                           "archiver: if this host does not want it, delete that one PreCompact entry "
                           "afterwards")
             else:
                 remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
                           "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
-                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
+                          f"so {', '.join(foreign)} is still pruned and the transcript archiver is not "
                           "installed. If an entry is genuinely foreign (another program or checkout) "
                           "the installer cannot own it — remove that one by hand")
         if dead and not missing and not foreign:

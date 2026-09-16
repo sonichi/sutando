@@ -1,14 +1,17 @@
 #!/bin/bash
-# install-claude-hooks.sh — idempotent install of Sutando-owned project-level
-# Claude Code hooks (PreCompact + Stop).
+# install-claude-hooks.sh — idempotent install of Sutando-owned core-session
+# Claude Code hooks (PreCompact + SessionEnd + Stop).
 #
-# Per `feedback_claude_code_hook_scoping`: sutando hooks belong at PROJECT-level
-# `.claude/settings.json` (gitignored, per-machine), NOT user-level
-# `~/.claude/settings.json` — they only fire when Claude runs in this project
-# context, not in unrelated sessions.
+# Scope: these hooks are CORE-ONLY, so they install into the core's own
+# CLAUDE_CONFIG_DIR (`<workspace>/.claude-sutando/settings.json`), which no
+# other session reads. `feedback_claude_code_hook_scoping` ruled out user-level
+# `~/.claude/settings.json` because it fires in unrelated repos; project-level
+# `.claude/settings.json` fixes the repo axis but not the session one — it fires
+# for every Claude session with this cwd, which is how guests were handed the
+# core's task queue to drain and how a guest's tail overwrote session-state.md.
 #
 # Hooks installed (4):
-#   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
+#   PreCompact  → src/archive-transcript.sh <workspace>/logs/conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -53,7 +56,26 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SETTINGS="$REPO_DIR/.claude/settings.json"
+
+# These hooks belong to the CORE SESSION, not to the checkout. Project-level
+# `.claude/settings.json` scopes by repo, so every other Claude session with
+# this cwd — a review automation, an ad-hoc owner session, a worktree — also
+# fired them: the Stop hook handed guests the core's task queue to drain, and
+# session-handoff overwrote the core's session-state.md with a guest's tail.
+# The core's own CLAUDE_CONFIG_DIR is read by the core and nothing else.
+CORE_CONFIG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null)"
+[ -n "$CORE_CONFIG_DIR" ] || CORE_CONFIG_DIR="$REPO_DIR/workspace/.claude-sutando"
+SETTINGS="$CORE_CONFIG_DIR/settings.json"
+
+# Pre-move location, swept below so a re-run migrates an existing install.
+LEGACY_PROJECT_SETTINGS="$REPO_DIR/.claude/settings.json"
+
+# Transcript archives are per-user mutable state, so they live under the
+# workspace (CLAUDE.md "Workspace contract"), not in ~/Desktop. logs/ is also
+# named in vault.sync.exclude, so the archive stays out of the carrier set.
+WORKSPACE_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
+[ -n "$WORKSPACE_DIR" ] || WORKSPACE_DIR="$REPO_DIR/workspace"
+TRANSCRIPT_DIR="$WORKSPACE_DIR/logs/conversations"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
 # $REPO_DIR is expanded HERE, at install time, so the command written into
@@ -93,7 +115,7 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\""
+  "PreCompact|logs/conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") $(shq "$TRANSCRIPT_DIR/")"
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
@@ -111,7 +133,7 @@ if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()
   for _h in "${HOOKS[@]}"; do
     case "$_h" in
-      "PreCompact|sutando-conversations/|"*) ;;
+      "PreCompact|logs/conversations/|"*) ;;
       *) _kept+=("$_h") ;;
     esac
   done
@@ -149,8 +171,17 @@ DEPRECATED_HOOKS=(
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
   # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
   # ungated removal here would delete a registered hook and install no successor.
+  # Both pre-move forms of OUR archiver: the ancient inline `cp`, and the
+  # archive-transcript.sh call that still pointed at ~/Desktop. Each is matched
+  # by its exact default shape — the second by the trailing quote that ends a
+  # bare destination argument, which an operator's own `.../$(date ...).jsonl`
+  # command does not have. A looser `Desktop/sutando-conversations/` would eat
+  # that customized hook too. Both must fire: the marker moved to
+  # "logs/conversations/", so phase 0 no longer recognises a Desktop-targeted
+  # entry and would leave it registered beside the new one, archiving twice.
   DEPRECATED_HOOKS+=(
     "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+    "PreCompact|Desktop/sutando-conversations/\""
   )
 fi
 
@@ -159,10 +190,10 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$REPO_DIR/.claude"
+mkdir -p "$CORE_CONFIG_DIR"
 # The PreCompact archive hook is a bare `cp`, which cannot create its own
 # destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
+mkdir -p "$TRANSCRIPT_DIR"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -173,6 +204,34 @@ REMOVED=0
 
 # Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
 re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
+
+# Ownership test for HOOKS[$1]: sets EVENT/MARKER/CMD/SHAPE/LEGACY_SHAPE, returns
+# 1 when the entry embeds no repo path (nothing safe to shape-match against — see
+# Phase 0's comment on this exact tradeoff). ONE owner for this test: Phase 0 and
+# Phase 3 both migrate hooks WE wrote, and a second hand-rolled copy is exactly
+# how Phase 3 shipped the bare-substring bug this function replaces.
+owned_hook_shape() {
+  local i="$1" entry rest
+  entry="${HOOKS[$i]}"
+  EVENT="${entry%%|*}"
+  rest="${entry#*|}"
+  MARKER="${rest%%|*}"
+  CMD="${rest#*|}"
+  local esc
+  esc="$(shq "$REPO_DIR")"; esc="${esc#\'}"; esc="${esc%\'}"
+  case "$CMD" in
+    *"$esc"*) ;;
+    *) return 1 ;;
+  esac
+  local cmd_word cmd_tail
+  cmd_word="${CMD%% *}"
+  cmd_tail="${CMD#*"$MARKER"}"
+  cmd_tail="${cmd_tail#[\"\']}"       # drop shq's closing quote, if present
+  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
+  LEGACY_SHAPE=""
+  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  return 0
+}
 
 # Phase 0: remove STALE VARIANTS of hooks we own. This is what makes a re-run a
 # real migration rather than an add-only pass:
@@ -205,77 +264,13 @@ re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 # Sweeping a *different clone's* entry is intended — that shape is
 # installer-generated, just not by this checkout.
 for i in "${!HOOKS[@]}"; do
-  entry="${HOOKS[$i]}"
-  EVENT="${entry%%|*}"
-  REST="${entry#*|}"
-  MARKER="${REST%%|*}"
-  CMD="${REST#*|}"
-
-  # PHASE 0 ONLY APPLIES TO HOOKS THAT EMBED THE REPO PATH.
-  #
-  # The whole point of the sweep is migrating entries whose *path* is stale — a
-  # legacy $HOME/Desktop clone, an unquoted form, another checkout. A hook with no
-  # repo path in it has nothing that can go stale, so there is nothing to migrate
-  # and sweeping can only ever destroy someone else's command.
-  #
-  # The transcript-archive hook is exactly that case: its marker is only
-  # `sutando-conversations/` and its command is all $HOME. With a wildcard shape,
-  # the `.*` spans the SOURCE ARGUMENT rather than a path, so an operator's
-  #     cp "$CUSTOM_TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/…"
-  # differed from ours only inside the wildcard and was deleted and replaced on
-  # re-run — silently discarding their archival policy. Reproduced on b21d2bf.
-  #
-  # An earlier revision of this file handled this with an explicit "no repo path
-  # → exact match" branch. Rewriting the shape structurally dropped that branch
-  # and applied the wildcard uniformly; this restores the case as a skip, which
-  # states the intent instead of encoding it as an unreachable pattern.
-  # Compare against the ESCAPED body, not the raw path. `shq` wraps in single
-  # quotes and rewrites an internal `'` as `'\''`, so on a checkout at
-  # /repo'quote the command embeds `/repo'\''quote` and a raw `$REPO_DIR` test
-  # never matches — the guard would then skip the sweep for the very hooks it
-  # must run on. That is the same raw-vs-escaped confusion that produced the
-  # apostrophe bug this file already fixed once; it is a property of shq, so
-  # every comparison against an embedded path has to go through it.
-  ESC="$(shq "$REPO_DIR")"; ESC="${ESC#\'}"; ESC="${ESC%\'}"
-  case "$CMD" in
-    *"$ESC"*) ;;
-    *) continue ;;
-  esac
-
-  # Build the shape from the command's STRUCTURE, never by stripping quotes.
-  #
-  # Quote-stripping was lossy and wrong: `shq` escapes an apostrophe in the repo
-  # path as `'\''`, so deleting quote characters leaves a stray backslash. On a
-  # checkout at `/repo'quote` the stripped command and the stripped repo path
-  # then disagree, the split finds nothing, SHAPE collapses to an exact match,
-  # and the stale unquoted entry is never swept — both hooks keep firing. An
-  # apostrophe is legal in a path, so this is a real checkout, not a curiosity.
-  #
-  # Instead: anchor on the command word, the marker (already the stable
-  # structural token), and the literal tail that follows the marker.
-  #
-  # The region between the command word and the marker is THE PATH AND NOTHING
-  # ELSE. A bare `.*` there was too permissive in one direction: customization
-  # *after* the path fails the trailing anchor and survives, but customization
-  # *before* it — `bash -x <path>/src/session-handoff.sh "$TRANSCRIPT_PATH"` —
-  # was swallowed by the wildcard and swept as installer-owned. Reproduced:
-  # before rerun 2, after rerun 1, operator's `-x` hook gone.
-  #
-  # So the path region must START like a path: an optional opening quote, then a
-  # character that is neither a space nor `-`. That admits every form we write or
-  # have written — `/abs/...`, `'/quoted path/...'`, `'/repo'\''quote/...'`, and
-  # the legacy `$HOME/Desktop/...` — while a flag or wrapper token before the
-  # path fails immediately. Requiring a literal `/` would have been wrong: it
-  # rejects the legacy `$HOME/...` entries this sweep exists to migrate.
-  CMD_WORD="${CMD%% *}"
-  CMD_TAIL="${CMD#*"$MARKER"}"
-  CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
-  SHAPE="^$(re_escape "$CMD_WORD") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
-
-  # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
-  # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
-  LEGACY_SHAPE=""
-  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  # PHASE 0 ONLY APPLIES TO HOOKS THAT EMBED THE REPO PATH — see
+  # owned_hook_shape() above. The whole point of the sweep is migrating entries
+  # whose *path* is stale (a legacy $HOME/Desktop clone, an unquoted form,
+  # another checkout); a hook with no repo path has nothing that can go stale,
+  # so sweeping it can only ever destroy someone else's command. Reproduced on
+  # the transcript-archive hook (b21d2bf) before this skip existed.
+  owned_hook_shape "$i" || continue
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
            --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
@@ -362,6 +357,80 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
   REMOVED=$((REMOVED + 1))
 done
 
+# Phase 3 — migrate an install that predates the move: the same hooks registered
+# at project level fire for every session in this cwd, so leaving them behind
+# would double-register the core and keep conscripting guests. Only entries this
+# script owns are removed; anything the operator added by hand stays.
+#
+# HOOKS entries are removed by SHAPE, via owned_hook_shape() — the same
+# ownership test Phase 0 uses, not a bare substring. A bare `contains($sub)`
+# here deleted an operator's OWN customized command whenever it happened to
+# mention our marker too: `bash -x .../session-handoff.sh "$TRANSCRIPT_PATH"
+# --operator-flag` matches the marker and was swept alongside the canonical
+# entry it sits beside. Unlike Phase 0, no `. != $cmd` exclusion — at this
+# location EVERY installer-owned shape (today's exact command included) must
+# go, since the whole point is that none of it belongs at project level
+# anymore. DEPRECATED_HOOKS entries keep the substring match Phase 2 already
+# uses for them: those markers name a fully-retired hook family with no
+# current command to preserve the shape of.
+LEGACY_REMOVED=0
+if [ -f "$LEGACY_PROJECT_SETTINGS" ] && [ "$LEGACY_PROJECT_SETTINGS" != "$SETTINGS" ]; then
+  for i in "${!HOOKS[@]}"; do
+    owned_hook_shape "$i" || continue
+    if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+             --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
+        '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
+         | map(contains($marker)
+               and (. == $cmd or test($shape) or ($legacy != "" and test($legacy))))
+         | any' \
+        "$LEGACY_PROJECT_SETTINGS" >/dev/null 2>&1; then
+      continue
+    fi
+    TMP="$(mktemp "${LEGACY_PROJECT_SETTINGS}.XXXXXX")"
+    jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+       --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
+      if (.hooks // {})[$event] then
+        .hooks[$event] |= map(
+          .hooks |= map(select(
+            ((.command // "") | contains($marker))
+            and ((.command // "")
+                 | . == $cmd or test($shape) or ($legacy != "" and test($legacy)))
+            | not
+          ))
+        )
+        | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+      else . end
+    ' "$LEGACY_PROJECT_SETTINGS" > "$TMP" || {
+      echo "error: jq legacy sweep failed on $EVENT/$MARKER" >&2; rm -f "$TMP"; exit 1; }
+    mv "$TMP" "$LEGACY_PROJECT_SETTINGS"
+    LEGACY_REMOVED=$((LEGACY_REMOVED + 1))
+  done
+  for entry in "${DEPRECATED_HOOKS[@]}"; do
+    EVENT="${entry%%|*}"
+    SUBSTR="${entry#*|}"
+    [ -n "$SUBSTR" ] || continue
+    if ! jq -e --arg event "$EVENT" --arg sub "$SUBSTR" \
+        '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | map(contains($sub)) | any' \
+        "$LEGACY_PROJECT_SETTINGS" >/dev/null 2>&1; then
+      continue
+    fi
+    TMP="$(mktemp "${LEGACY_PROJECT_SETTINGS}.XXXXXX")"
+    jq --arg event "$EVENT" --arg sub "$SUBSTR" '
+      if (.hooks // {})[$event] then
+        .hooks[$event] |= map(
+          .hooks |= map(select((.command // "") | contains($sub) | not))
+        )
+        | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+      else . end
+    ' "$LEGACY_PROJECT_SETTINGS" > "$TMP" || {
+      echo "error: jq legacy sweep failed on $EVENT/$SUBSTR" >&2; rm -f "$TMP"; exit 1; }
+    mv "$TMP" "$LEGACY_PROJECT_SETTINGS"
+    LEGACY_REMOVED=$((LEGACY_REMOVED + 1))
+  done
+  [ "$LEGACY_REMOVED" -gt 0 ] && \
+    echo "install-claude-hooks: removed $LEGACY_REMOVED core-only hook(s) from $LEGACY_PROJECT_SETTINGS (moved to the core config dir)"
+fi
+
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
 
 # Register hooks in the sutando-hook-manifest so migration-notice can identify
@@ -369,6 +438,6 @@ echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $
 HOOKS_SCRIPT="$REPO_DIR/scripts/sutando-config-hooks.sh"
 if [ -f "$HOOKS_SCRIPT" ]; then
   bash "$HOOKS_SCRIPT" write-manifest "project-pre-compact-handoff" "src/session-handoff.sh" "src/install-claude-hooks.sh" 2>/dev/null || true
-  bash "$HOOKS_SCRIPT" write-manifest "project-pre-compact-archive" "sutando-conversations/" "src/install-claude-hooks.sh" 2>/dev/null || true
+  bash "$HOOKS_SCRIPT" write-manifest "project-pre-compact-archive" "logs/conversations/" "src/install-claude-hooks.sh" 2>/dev/null || true
   bash "$HOOKS_SCRIPT" write-manifest "project-stop-pending-tasks" "src/check-pending-tasks.sh" "src/install-claude-hooks.sh" 2>/dev/null || true
 fi
