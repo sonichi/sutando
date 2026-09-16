@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -320,6 +321,120 @@ class RepoMustBeNamed(unittest.TestCase):
 
     def test_a_non_number_non_url_cannot_answer(self):
         self.assertEqual(g.main(["not-a-pr", "--me", ME, "--repo", REPO]), 2)
+
+
+def gr(ts, login, state, commit):
+    """A review carrying the fields the gate reads (the `r` helper above carries none)."""
+    return {"submitted_at": ts, "user": {"login": login},
+            "state": state, "commit_id": commit}
+
+
+HEAD = "b" * 40
+OLD = "a" * 40
+
+
+class TestMyReviewState(unittest.TestCase):
+    """`reviewDecision` names the PR's gate, never whose review holds it."""
+
+    def test_my_changes_requested_is_found(self):
+        got = g.my_review_state([gr(T(1), ME, "CHANGES_REQUESTED", OLD)], ME)
+        self.assertEqual(got["state"], "CHANGES_REQUESTED")
+        self.assertEqual(got["commit"], OLD)
+
+    def test_someone_elses_block_is_not_mine(self):
+        self.assertIsNone(g.my_review_state([gr(T(1), "peer", "CHANGES_REQUESTED", OLD)], ME))
+
+    def test_no_reviews_at_all(self):
+        self.assertIsNone(g.my_review_state([], ME))
+
+    def test_latest_gating_review_wins_regardless_of_list_order(self):
+        got = g.my_review_state([gr(T(5), ME, "APPROVED", HEAD),
+                                 gr(T(1), ME, "CHANGES_REQUESTED", OLD)], ME)
+        self.assertEqual(got["state"], "APPROVED")
+
+    def test_a_later_COMMENTED_does_not_supersede_a_standing_block(self):
+        # The discriminator: COMMENTED carries no gate. If it counted, a block
+        # would silently read as cleared by my own follow-up chatter.
+        got = g.my_review_state([gr(T(1), ME, "CHANGES_REQUESTED", OLD),
+                                 gr(T(9), ME, "COMMENTED", HEAD)], ME)
+        self.assertEqual(got["state"], "CHANGES_REQUESTED")
+
+    def test_a_review_without_a_timestamp_is_skipped(self):
+        bad = {"user": {"login": ME}, "state": "CHANGES_REQUESTED", "commit_id": OLD}
+        self.assertIsNone(g.my_review_state([bad], ME))
+
+
+class TestDescribeMyReview(unittest.TestCase):
+    def test_no_review_says_nothing(self):
+        self.assertEqual(g.describe_my_review(None, HEAD), "")
+
+    def test_stale_block_is_named_as_blocking_AND_stale(self):
+        line = g.describe_my_review(
+            g.my_review_state([gr(T(1), ME, "CHANGES_REQUESTED", OLD)], ME), HEAD)
+        self.assertIn("YOUR REVIEW BLOCKS THIS PR", line)
+        self.assertIn("STALE", line)
+        self.assertIn(OLD[:8], line)
+        self.assertIn(HEAD[:8], line)
+
+    def test_block_at_head_is_blocking_but_NOT_called_stale(self):
+        line = g.describe_my_review(
+            g.my_review_state([gr(T(1), ME, "CHANGES_REQUESTED", HEAD)], ME), HEAD)
+        self.assertIn("YOUR REVIEW BLOCKS THIS PR", line)
+        self.assertIn("at head", line)
+        self.assertNotIn("STALE", line)
+
+    def test_a_stale_approval_is_a_note_not_a_block(self):
+        line = g.describe_my_review(
+            g.my_review_state([gr(T(1), ME, "APPROVED", OLD)], ME), HEAD)
+        self.assertNotIn("BLOCKS THIS PR", line)
+        self.assertIn("APPROVED", line)
+        self.assertIn("STALE", line)
+
+    def test_an_unreadable_head_never_claims_at_head(self):
+        # Match the CLAIM ("at head <sha>"), not the bare words — the advice
+        # sentence says "Re-verify at head" on every blocking line.
+        line = g.describe_my_review(
+            g.my_review_state([gr(T(1), ME, "CHANGES_REQUESTED", OLD)], ME), "")
+        self.assertIn("staleness unknown", line)
+        self.assertIsNone(re.search(r"at head [0-9a-f]", line))
+        self.assertNotIn("but head is", line)
+
+
+class TestHeadFetchIsAdditiveOnly(unittest.TestCase):
+    def test_a_failing_head_fetch_returns_empty_rather_than_raising(self):
+        real = g._gh_json
+
+        def boom(path, paginate=True):
+            raise RuntimeError("gh api failed")
+
+        g._gh_json = boom
+        try:
+            self.assertEqual(g.fetch_head_sha("o/r", 1), "")
+        finally:
+            g._gh_json = real
+
+    def test_the_gate_still_answers_when_the_head_cannot_be_read(self):
+        # Regression guard: this context is additive, so it must never turn a
+        # working 0/1 verdict into a 2.
+        real_fetch, real_head = g.fetch, g.fetch_head_sha
+        g.fetch = lambda repo, number: ([], [gr(T(1), ME, "CHANGES_REQUESTED", OLD)])
+        g.fetch_head_sha = lambda repo, number: ""
+        try:
+            rc = g.main(["1", "--me", ME, "--repo", REPO])
+        finally:
+            g.fetch, g.fetch_head_sha = real_fetch, real_head
+        self.assertEqual(rc, 0)
+
+    def test_no_standing_review_means_no_head_call_at_all(self):
+        real_fetch, real_head = g.fetch, g.fetch_head_sha
+        called = []
+        g.fetch = lambda repo, number: ([c(T(1), "peer")], [])
+        g.fetch_head_sha = lambda repo, number: called.append(1) or ""
+        try:
+            g.main(["1", "--me", ME, "--repo", REPO])
+        finally:
+            g.fetch, g.fetch_head_sha = real_fetch, real_head
+        self.assertEqual(called, [])
 
 
 if __name__ == "__main__":
