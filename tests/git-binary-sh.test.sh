@@ -85,13 +85,49 @@ check "a symlink to the system stub is refused like the stub itself" "$out" ""
 out=$(OSTYPE=darwin25 PATH="$lab7:$lab7/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git" 2>/dev/null)
 check "a symlink-to-stub is refused even when readlink itself is unavailable" "$out" ""
 
+# --- 7c. a symlink chain LONGER than the internal bound must FAIL, never -----
+# silently return an unresolved intermediate (keweichen, #4323 round 3: the
+# old bound stopped at 20 hops without checking whether the target was still
+# a symlink, so a chain longer than that -- macOS permits up to 32 -- fell
+# through as "resolved" to a mid-chain link that trivially wasn't the stub).
+# Tested directly against _sutando_git_realpath/_sutando_git_is_system_stub,
+# not through resolve_git's outer PATH walk: that walk's own `[ -f ]` gate
+# follows symlinks via the OS's native (and here, LOWER-than-32) ELOOP limit,
+# so a chain built to exceed the code's 40-hop bound can get rejected by the
+# OS before ever reaching the code under test -- a false pass for the wrong
+# reason. Calling the internal functions directly removes that confound.
+lab7c=$(mktemp -d)
+_prev=/usr/bin/git
+for _n in $(seq 1 45); do
+  ln -s "$_prev" "$lab7c/l$_n"
+  _prev="$lab7c/l$_n"
+done
+out=$(bash -c ". '$REPO/scripts/git-binary.sh'; _sutando_git_realpath '$lab7c/l45'" 2>/dev/null)
+rc=$?
+check "a 45-hop chain (over the internal bound) resolves to NOTHING, not an intermediate" "$out" ""
+[ "$rc" -ne 0 ] && ok "...and reports failure (non-zero), not a false success" || bad "...and reports failure (non-zero), not a false success" "rc=$rc"
+
 # --- 8. a DIRECTORY named "git" on PATH must never be returned as a binary ---
 # `[ -x dir ]` is true for any traversable directory, which is not a git
-# executable; `-f` must gate every candidate.
+# executable; `-f` must gate every candidate. OSTYPE is PINNED to darwin --
+# without it (keweichen, #4323 round 3) this took the non-Darwin branch on
+# CI, which is a bare `command -v git` with NO directory rejection at all,
+# so it "passed" by finding a real /bin/git rather than by testing anything.
 lab8=$(mktemp -d)
 mkdir -p "$lab8/bin/git"
-out=$(PATH="$lab8/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+printf '#!/bin/sh\nexit 2\n' > "$lab8/xcode-select"; chmod +x "$lab8/xcode-select"
+out=$(OSTYPE=darwin25 PATH="$lab8:$lab8/bin:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
 check "a directory literally named git is never returned" "$out" ""
+
+# --- 8b. POSITIVE CONTROL: a symlink to a REAL non-system git IS accepted --
+# keweichen, #4323 round 3: without this, "reject every symlink" would also
+# pass case 7 above -- the fix must discriminate, not just refuse more.
+lab8b=$(mklab)
+mkdir -p "$lab8b/linkdir"
+ln -s "$lab8b/bin/git" "$lab8b/linkdir/git"
+printf '#!/bin/sh\nexit 2\n' > "$lab8b/xcode-select"; chmod +x "$lab8b/xcode-select"
+out=$(OSTYPE=darwin25 PATH="$lab8b:$lab8b/linkdir:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+check "a symlink to a real non-system git is accepted" "$out" "$lab8b/linkdir/git"
 
 # --- 9. check-pending-tasks.sh sources the resolver, not a bare `git` --------
 if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '(^|[^"$])\bgit -C'; then

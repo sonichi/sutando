@@ -228,5 +228,31 @@ case "$BC_OUT" in
 esac
 rm -rf "$BUNDLE_CLEAN_CWD" "$BUNDLE"
 
+# 11. A REAL checkout whose repo-side git probe FAILS must still GATE, not
+# read as an intentional non-Git bundle (keweichen, #4323 round 3). Same
+# empty REPO_COMMON_DIR as a packaged bundle, opposite cause and opposite
+# correct answer -- the marker check (`-e "$REPO_DIR/.git"`) is what tells
+# them apart. `.git` here is a plain empty directory: present (so it is NOT
+# "intentionally no .git"), but not a git repo git can parse, so the probe
+# on REPO_DIR genuinely fails.
+FAILPROBE="$(mktemp -d)"
+mkdir -p "$FAILPROBE/src" "$FAILPROBE/scripts" "$FAILPROBE/workspace/tasks" "$FAILPROBE/workspace/results" "$FAILPROBE/.git"
+cp "$REPO/src/check-pending-tasks.sh" "$FAILPROBE/src/"
+cp "$REPO/scripts/git-binary.sh" "$FAILPROBE/scripts/"
+FP_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$FAILPROBE" "$FP_PY" > "$FAILPROBE/scripts/sutando-config.sh"
+chmod +x "$FAILPROBE/scripts/sutando-config.sh"
+printf 'id: probe\ntask: failed-probe-matrix\n' > "$FAILPROBE/workspace/tasks/$PROBE"
+FAILPROBE_FOREIGN="$(mktemp -d)"
+(cd "$FAILPROBE_FOREIGN" && git init -q && \
+   git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+FPO_OUT="$(cd "$FAILPROBE_FOREIGN" && bash "$FAILPROBE/src/$(basename "$HOOK")" 2>&1)"
+case "$FPO_OUT" in
+  *'"decision":"block"'*) ok "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" ;;
+  *) bad "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" "got: ${FPO_OUT:0:120}" ;;
+esac
+rm -rf "$FAILPROBE_FOREIGN" "$FAILPROBE"
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"
