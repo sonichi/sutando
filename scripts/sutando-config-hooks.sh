@@ -91,17 +91,25 @@ _catchup_hook_command() {
 # Resolves the workspace via the shared config helper, not a hardcoded
 # $REPO_DIR/workspace guess — sutando.config.local.json can relocate it.
 _workspace_dir() {
-  local dir helper out
+  local dir helper out err
   dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   helper="$dir/sutando-config.sh"
   if [ ! -f "$helper" ]; then
     printf '%s\n' "$REPO_DIR/workspace"
     return 0
   fi
-  if ! out="$(bash "$helper" workspace 2>&1)" || [ -z "$out" ]; then
-    echo "sutando-config-hooks: workspace resolution failed: $out" >&2
+  # Stdout is the value, stderr is warnings — a success-plus-warning run
+  # must not bake the warning into the resolved path (resolver contract).
+  err="$(mktemp)"
+  out="$(bash "$helper" workspace 2>"$err")"
+  local rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "sutando-config-hooks: workspace resolution failed: $(cat "$err")" >&2
+    rm -f "$err"
     return 1
   fi
+  [ -s "$err" ] && cat "$err" >&2
+  rm -f "$err"
   printf '%s\n' "$out"
 }
 
