@@ -13,6 +13,10 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$HERE/../src/install-claude-hooks.sh"
 
+# Same shq() the installer uses (src/install-claude-hooks.sh) — a fixture that
+# quotes a path its own way tests a shape the installer never actually emits.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 pass=0; fail=0
 ok() {  # ok <name> <condition-rc>
     if [ "$2" = 0 ]; then echo "ok   $1"; pass=$((pass+1))
@@ -836,17 +840,30 @@ chmod +x "$LREPO/src/"*.sh
 echo '{}' > "$LREPO/workspace/.claude-sutando/settings.json"
 
 # The old path is a DIFFERENT, nonexistent location — simulating a checkout
-# that was later moved to where $LREPO now lives.
+# that was later moved to where $LREPO now lives. One old path is plain; the
+# other carries a legal apostrophe (#4309 review round 7, keweichen), which
+# shq() spells `'\''` mid-string — a shape the OLD regex's `'/[^']*` could
+# never match, since it assumes zero apostrophes between the quotes.
+# shq()-quote the apostrophe path the way the REAL installer would (Python's
+# shlex.quote uses a different, also-valid escaping — '"'"' — that this
+# fixture must NOT use, or it tests a shape shq() never actually produces).
 export L_LEGACY="$LREPO/.claude/settings.json" \
-       L_OLDREPO="$LROOT/an old checkout path that no longer exists"
+       L_OLDREPO="$LROOT/an old checkout path that no longer exists" \
+       L_OLDREPO_APOS_QUOTED="$(shq "$LROOT/an old'checkout path that no longer exists/src/archive-transcript.sh")" \
+       L_OLDREPO_APOS="$LROOT/an old'checkout path that no longer exists"
 python3 - <<'PY'
 import json, os
-p, old_repo = os.environ['L_LEGACY'], os.environ['L_OLDREPO']
+p = os.environ['L_LEGACY']
+old_repo, old_repo_apos_quoted = os.environ['L_OLDREPO'], os.environ['L_OLDREPO_APOS_QUOTED']
 json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
     # written by a PRIOR run of this installer at the OLD checkout path,
     # before the checkout moved to where it lives now — must be SWEPT.
     {"type": "command",
      "command": f'bash \'{old_repo}/src/archive-transcript.sh\' "$HOME/Desktop/sutando-conversations/"'},
+    # same, but the OLD path itself contains an apostrophe, shq()-quoted the
+    # way the real installer spells it — must ALSO be SWEPT.
+    {"type": "command",
+     "command": f'bash {old_repo_apos_quoted} "$HOME/Desktop/sutando-conversations/"'},
     # operator's own differently-shaped command mentioning the same
     # directory as a substring — must SURVIVE.
     {"type": "command",
@@ -856,10 +873,57 @@ PY
 bash "$LREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 LSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$L_LEGACY")"
 ok "relocated checkout: pre-move archiver hook (OLD path baked in) is swept" \
-   "$(echo "$LSURV" | grep -q 'archive-transcript.sh.*Desktop/sutando-conversations' && echo 1 || echo 0)"
+   "$(echo "$LSURV" | grep -qF "$L_OLDREPO/src/archive-transcript.sh" && echo 1 || echo 0)"
+# Search for the shq()-QUOTED value, not the raw path: shq() rewrites the
+# apostrophe itself as `'\''`, so the raw (unescaped) path is never a literal
+# substring of the stored, quoted command — only its quoted form is.
+ok "relocated checkout: pre-move archiver hook (OLD path WITH APOSTROPHE) is swept" \
+   "$(echo "$LSURV" | grep -qF "$L_OLDREPO_APOS_QUOTED" && echo 1 || echo 0)"
 ok "relocated checkout: operator's own Desktop-targeting wrapper still survives" \
    "$(echo "$LSURV" | grep -q 'my-custom-archiver.sh' && echo 0 || echo 1)"
 rm -rf "$LROOT"
+
+# --- 15. RELOCATED CHECKOUT — a skill-declared hook (src/skill_hooks.py) left
+# behind at project scope must also be swept after the checkout moved.
+# #4309 review round 7 (keweichen, 2026-09-16): its `[ -f Q ] || exit 0; exec
+# RUNNER Q` guard command carries an unquoted `||`/`;`, which candidate_is_owned()
+# rejects outright for every OTHER shape — so this one, alone, never matched.
+SROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks skill-relocated.XXXXXX")"
+SREPO="$SROOT/repo with spaces"
+mkdir -p "$SREPO/src" "$SREPO/.claude" "$SREPO/workspace/.claude-sutando" \
+         "$SREPO/skills/testhook"
+cp "$INSTALLER" "$SREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$SREPO/src/"
+echo '{}' > "$SREPO/workspace/.claude-sutando/settings.json"
+cat > "$SREPO/skills/testhook/manifest.json" <<'JSON'
+{"hooks": [{"event": "PreToolUse", "command": "hook.sh"}]}
+JSON
+printf '#!/bin/bash\ntrue\n' > "$SREPO/skills/testhook/hook.sh"
+chmod +x "$SREPO/skills/testhook/hook.sh"
+
+# The OLD path is a different, nonexistent location — the hook file only
+# exists at the NEW ($SREPO) path, exactly like a checkout that moved.
+export S_LEGACY="$SREPO/.claude/settings.json" \
+       S_OLDREPO="$SROOT/an old checkout path that no longer exists"
+python3 - <<'PY'
+import json, os, shlex
+p, old_repo = os.environ['S_LEGACY'], os.environ['S_OLDREPO']
+old_hook = f"{old_repo}/skills/testhook/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    # written by a PRIOR run at the OLD checkout path — must be SWEPT.
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+    # operator's own command that merely mentions the same filename — must SURVIVE.
+    {"type": "command", "command": "bash /Users/dev/my-own-hook.sh --target hook.sh"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$SREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+SSURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$S_LEGACY")"
+ok "relocated checkout: pre-move SKILL hook (guard shape, OLD path baked in) is swept" \
+   "$(echo "$SSURV" | grep -qF "old checkout path that no longer exists" && echo 1 || echo 0)"
+ok "relocated checkout: operator's own hook.sh-mentioning command still survives" \
+   "$(echo "$SSURV" | grep -qF 'my-own-hook.sh' && echo 0 || echo 1)"
+rm -rf "$SROOT"
 
 rm -rf "$ROOT"
 echo "---"

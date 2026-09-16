@@ -16,12 +16,8 @@
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
 #
-# The SessionEnd → session-handoff.sh hook fires session-state.md on a clean
-# exit (⌘Q / crash) too, not just on PreCompact — so the last session's tail
-# isn't lost when no compaction happened before close. It was previously
-# installed (user-level) by catchup-after-startup's install-hook.sh; that skill
-# was removed (#1737-equivalent), so the install moves here, at the correct
-# PROJECT-level scope (per feedback_claude_code_hook_scoping).
+# SessionEnd → session-handoff.sh also fires on a clean exit, not just
+# PreCompact, so the last session's tail isn't lost when no compaction ran.
 #
 # Historical note: a 4th hook (`Stop` → watcher-cleanup PID kill, the #1065
 # fix) was removed 2026-05-24.  Claude Code's `Stop` event fires on
@@ -60,16 +56,24 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Guess the fallback only when the helper script itself is absent (nothing to
 # compare against); if it exists but fails, fail loud — guessing risks the wrong config dir on a configured clone.
 resolve_or_die() {  # resolve_or_die <subcommand> <fallback> -> sets RESOLVED
-  local _sub="$1" _fallback="$2" _helper="$REPO_DIR/scripts/sutando-config.sh" _out
+  local _sub="$1" _fallback="$2" _helper="$REPO_DIR/scripts/sutando-config.sh" _out _err
   if [ ! -f "$_helper" ]; then
     RESOLVED="$_fallback"
     return 0
   fi
-  if ! _out="$(bash "$_helper" "$_sub" 2>&1)" || [ -z "$_out" ]; then
-    echo "install-claude-hooks: scripts/sutando-config.sh $_sub failed: $_out" >&2
+  # Stdout is the value, stderr is warnings (resolver contract) — keep them
+  # apart, or a success-plus-warning run bakes the warning INTO the path.
+  _err="$(mktemp)"
+  _out="$(bash "$_helper" "$_sub" 2>"$_err")"
+  local _rc=$?
+  if [ "$_rc" -ne 0 ] || [ -z "$_out" ]; then
+    echo "install-claude-hooks: scripts/sutando-config.sh $_sub failed: $(cat "$_err")" >&2
     echo "install-claude-hooks: refusing to guess a config/workspace path — fix the resolver first." >&2
+    rm -f "$_err"
     exit 1
   fi
+  [ -s "$_err" ] && cat "$_err" >&2
+  rm -f "$_err"
   RESOLVED="$_out"
 }
 
@@ -146,11 +150,8 @@ HOOKS=(
   "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
 
-# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
-# The location is not what keeps transcripts out of the vault: sync is a whitelist
-# (see .git/info/exclude -- `*` then the include list), so a workspace path is
-# unsynced until vault.sync.include names it. Omitting it
-# drops it from HOOKS, which every phase iterates, so a registered one is untouched.
+# The archiver writes under logs/, excluded from vault sync by default.
+# Omitting it here drops it from HOOKS, which every phase iterates.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()
   for _h in "${HOOKS[@]}"; do
@@ -195,10 +196,11 @@ DEPRECATED_HOOKS=(
 )
 
 # Exact anchored shape (not substring), so an operator's own differently-shaped
-# command can't match; entry 2 accepts any quoted absolute path, so relocating the checkout doesn't hide its pre-move hook.
+# command can't match; entry 2 accepts any shq()-quoted absolute path — including
+# one containing an apostrophe, which shq() spells `'\''` mid-string, not `'`.
 ARCHIVE_LEGACY_SHAPES=(
   "PreCompact|regex|^$(re_escape "cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\"")\$"
-  "PreCompact|regex|^bash '/[^']*$(re_escape "/src/archive-transcript.sh")' $(re_escape "\"\$HOME/Desktop/sutando-conversations/\"")\$"
+  "PreCompact|regex|^bash '([^']|'\\\\'')*$(re_escape "/src/archive-transcript.sh")' $(re_escape "\"\$HOME/Desktop/sutando-conversations/\"")\$"
 )
 
 # Core-scope sweep stays OMIT-gated — removing a registered hook with no
@@ -310,36 +312,27 @@ _is_installer_path_shape() {
   esac
 }
 
-# Decide whether $1 (a raw candidate .command string read from settings.json)
-# is a stale/foreign variant of the entry owned_hook_shape() last set up
-# (uses EVENT/MARKER/CMD/CMD_WORD/CMD_TAIL/HOOK_PRIOR_CUR from that call).
-# $2: "any" (Phase 0 — our own current exact command is never a "stale
-# variant" of itself) or "all" (Phase 3 — the current exact command counts
-# too, since none of this installer's shapes belong at project level).
-#
-# Real argv tokenization, not pattern inference: tokenize the candidate and
-# require the marker to sit in argv[1] — the ONE argument right after the
-# command word, wherever the real shell would draw that boundary. An
-# operator wrapper's script-as-argument (`bash /op/wrap.sh '<repo>/...' ...`,
-# quoted or not) puts the marker in argv[2+], never argv[1], so it is
-# rejected by construction — no wildcard exists to leak a new shape through.
-#
-# Two buckets fall through to the narrower textual check (starts like our
-# command word plus a path, ends with the marker followed by the exact known
-# tail) instead of the tokenized argv[1] check — and each is gated on
-# something KNOWN and EXACT, never a shape inferred from the candidate text
-# alone, which is what let three different wildcards leak:
-#
-#   A. tokenize_argv fails (unterminated quote) — not valid shell at all, so
-#      a WORKING operator command cannot be in this bucket, only a genuinely
-#      broken legacy string (e.g. an un-shq'd path with a literal apostrophe,
-#      #8 below).
-#   B. tokenize_argv succeeds but argv[1] alone doesn't reach the marker
-#      because embedded SPACES split our own unquoted legacy path across
-#      several argv slots — gated on the text right after the command word
-#      being an EXACT PREFIX MATCH for THIS clone's own $REPO_DIR (known
-#      already, not inferred), so an operator's differently-named wrapper
-#      path can't collide with it by accident.
+# Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard exactly
+# (Q identical in both slots, RUNNER one of the two it emits) and prints the
+# unquoted, un-tokenized Q. Anything else — including a near-miss — is rc 1.
+_skill_hook_guard_path() {
+  local cand="$1" mid=' ] || exit 0; exec '
+  case "$cand" in '[ -f '*"$mid"*) ;; *) return 1 ;; esac
+  local rest="${cand#'[ -f '}" guard tail runner exec_arg
+  guard="${rest%%"$mid"*}"
+  tail="${rest#*"$mid"}"
+  runner="${tail%% *}"
+  exec_arg="${tail#* }"
+  case "$runner" in bash|python3) ;; *) return 1 ;; esac
+  [ "$guard" = "$exec_arg" ] || return 1
+  tokenize_argv "$guard" || return 1
+  [ "$TOKENIZE_HAS_OPERATOR" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -eq 1 ] || return 1
+  printf '%s\n' "${TOKENIZE_RESULT[0]}"
+}
+
+# Is $1 (a raw .command string) a stale/foreign variant of the current entry
+# (EVENT/MARKER/CMD/... from owned_hook_shape())? Real argv tokenization, not
+# substring/pattern inference — the marker must sit in argv[1] exactly.
 candidate_is_owned() {
   local cand="$1" include_exact="$2"
   case "$cand" in *"$MARKER"*) ;; *) return 1 ;; esac
@@ -350,6 +343,17 @@ candidate_is_owned() {
   if [ -n "$HOOK_PRIOR_CUR" ] && [ "$cand" = "$HOOK_PRIOR_CUR" ]; then
     return 0
   fi
+  # src/skill_hooks.py's guard shape (`[ -f Q ] || exit 0; exec RUNNER Q`) is
+  # legitimately ours despite its unquoted `||`/`;`, and its CMD_WORD is "["
+  # — not a repo path — so the argv[1]-marker logic below can't judge it.
+  # Recognize the complete shape here and decide from the guarded path alone.
+  local guard_path
+  if guard_path="$(_skill_hook_guard_path "$cand")"; then
+    case "$guard_path" in
+      *"$MARKER"*) _is_installer_path_shape "$guard_path" && return 0 ;;
+    esac
+    return 1
+  fi
   local after
   case "$cand" in
     "$CMD_WORD "?*) after="${cand#"$CMD_WORD" }" ;;
@@ -357,14 +361,8 @@ candidate_is_owned() {
   esac
   local tokenize_rc=0
   tokenize_argv "$cand" || tokenize_rc=1
-  # Our own commands never contain an unquoted control operator anywhere —
-  # so ANY unquoted `;`/`&`/`|`/`<`/`>`/`(`/`)`/newline in the candidate
-  # disqualifies it outright, before either bucket below gets a say. This
-  # is what actually closes the compound-command class: flattening argv
-  # into one array (this function's prior revision) loses which command
-  # segment a word came from, so a word right after the operator can still
-  # look like argv[1] of the FIRST command when it is really argv[0] of a
-  # SEPARATE one.
+  # Past the recognized guard shape above, an unquoted control operator
+  # anywhere disqualifies the candidate — it can hide a second command.
   [ "$TOKENIZE_HAS_OPERATOR" = 1 ] && return 1
   if [ "$tokenize_rc" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
      && [ "${TOKENIZE_RESULT[0]}" = "$CMD_WORD" ]; then
@@ -536,22 +534,9 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
   REMOVED=$((REMOVED + 1))
 done
 
-# Phase 3 — migrate an install that predates the move: the same hooks registered
-# at project level fire for every session in this cwd, so leaving them behind
-# would double-register the core and keep conscripting guests. Only entries this
-# script owns are removed; anything the operator added by hand stays.
-#
-# HOOKS entries are removed by SHAPE, via owned_hook_shape() — the same
-# ownership test Phase 0 uses, not a bare substring. A bare `contains($sub)`
-# here deleted an operator's OWN customized command whenever it happened to
-# mention our marker too: `bash -x .../session-handoff.sh "$TRANSCRIPT_PATH"
-# --operator-flag` matches the marker and was swept alongside the canonical
-# entry it sits beside. Unlike Phase 0, no `. != $cmd` exclusion — at this
-# location EVERY installer-owned shape (today's exact command included) must
-# go, since the whole point is that none of it belongs at project level
-# anymore. DEPRECATED_HOOKS entries keep the substring match Phase 2 already
-# uses for them: those markers name a fully-retired hook family with no
-# current command to preserve the shape of.
+# Phase 3 — migrate an install that predates the move: sweep every
+# installer-owned shape (via owned_hook_shape(), no `!= $cmd` exclusion)
+# out of the legacy project-level settings, since none of it belongs there.
 LEGACY_REMOVED=0
 if [ -f "$LEGACY_PROJECT_SETTINGS" ] && [ "$LEGACY_PROJECT_SETTINGS" != "$SETTINGS" ]; then
   for i in "${!HOOKS[@]}"; do
