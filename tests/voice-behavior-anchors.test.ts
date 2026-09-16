@@ -93,6 +93,7 @@ function stableInstructions(text: string): string {
 	return text.split('\n').filter(l =>
 		!(l.startsWith('- ') && l.endsWith(' — call these directly, not through work. Instant.'))
 		&& !(l.startsWith('- ') && l.endsWith('. Instant.'))
+		&& !l.startsWith('You run entirely on the owner\'s local ')
 	).join('\n');
 }
 
