@@ -1,6 +1,9 @@
 /**
  * Recording, video playback, and scroll-and-describe tools.
  * Extracted from browser-tools.ts for readability.
+ *
+ * macOS-only: every tool here drives QuickTime Player or Google Chrome via
+ * AppleScript. On Windows the tools degrade to a `macOSOnly` error.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -8,8 +11,10 @@ import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
+import { PLAYBACK_PATH, VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
+import { isMacOS, macOSOnlyError } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -179,7 +184,6 @@ export function isRecordingMuted(): boolean {
 // Symlink points to the active call's transcript (phone or voice agent)
 const LIVE_TRANSCRIPT_SYMLINK = '/tmp/sutando-live-transcript.txt';
 const LIVE_TRANSCRIPT_SRT_PATH = '/tmp/sutando-live-transcript-subtitle.srt';
-const VOICE_TRANSCRIPT_PATH = '/tmp/sutando-live-transcript-voice.txt';
 let liveTranscriptRecordingStart = 0;
 let liveTranscriptBaselineLines = 0;
 
@@ -464,6 +468,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
+		if (!isMacOS()) return macOSOnlyError('scroll_and_describe');
 		const MAX_DURATION = 60;
 		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
 		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
@@ -495,7 +500,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const subtitledPath = recordingPath ? recordingPath.replace('.mov', '-narrated-subtitled.mov') : '';
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
-			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
+			const voiceTranscript = VOICE_TRANSCRIPT_PATH;
 			let phoneTranscript = '';
 			try { phoneTranscript = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch {}
 			if (existsSync(voiceTranscript) && phoneTranscript && existsSync(phoneTranscript)) {
@@ -560,7 +565,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				// (no longer falls back to findRecording).
 				const recommended = subtitledPath || (narrated && isReadableFile(narrated) ? narrated : (stopResult?.path || ''));
 				if (recommended) {
-					try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+					try { writeFileSync(PLAYBACK_PATH, recommended); } catch {}
 				}
 				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoStateRef.value = 'done';
@@ -599,7 +604,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
 	let recPath: string | null = null;
-	try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
+	try { recPath = readFileSync(PLAYBACK_PATH, 'utf8').trim() || null; } catch {}
 	if (!recPath) recPath = findRecording();
 	if (!recPath) return { status: 'error', error: 'No video to play. Open a video first with open_video.' };
 	let alreadyOpen = false;
@@ -685,6 +690,7 @@ export const playVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('play_video');
 		console.log(`${ts()} [PlayVideo] called`);
 		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
 		endPlaybackAuthorization();
@@ -698,6 +704,7 @@ export const resumeVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('resume_video');
 		console.log(`${ts()} [ResumeVideo] called`);
 		// Only resume if user said "resume"/"continue"/"go on"/"play" in recent transcript.
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
@@ -736,6 +743,7 @@ export const replayVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('replay_video');
 		console.log(`${ts()} [ReplayVideo] called`);
 		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
@@ -751,6 +759,7 @@ export const pauseVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('pause_video');
 		console.log(`${ts()} [PauseVideo] called`);
 		// Block pause for 8s after play/resume to prevent Gemini from hearing video audio and auto-pausing
 		const sinceLast = Date.now() - lastResumeTime;
@@ -786,11 +795,12 @@ export const closeVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('close_video');
 		console.log(`${ts()} [CloseVideo] called`);
 		endPlaybackAuthorization();
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+		try { unlinkSync(PLAYBACK_PATH); } catch {}
 		return { status: 'closed' };
 	},
 };
@@ -816,6 +826,7 @@ export const screenRecordTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
+		if (!isMacOS()) return macOSOnlyError('screen_record');
 		const { action, duration_seconds, subtitle } = args as { action: 'start' | 'stop'; duration_seconds?: number; subtitle?: boolean };
 		// Hard block: if already recording, refuse to start again
 		if (action === 'start' && demoStateRef.value === 'recording') {
@@ -856,7 +867,7 @@ export const screenRecordTool: ToolDefinition = {
 							// depending on open_file (which is now generic / not recording-specific).
 							const recommended = burnedSubtitled || (isReadableFile(narrated) ? narrated : stopParsed.path);
 							if (recommended) {
-								try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+								try { writeFileSync(PLAYBACK_PATH, recommended); } catch {}
 							}
 						}
 					} catch {}
@@ -889,7 +900,7 @@ export const screenRecordTool: ToolDefinition = {
 					// Persist playback-path so play_video can find this recording without
 					// depending on open_file (which is now generic / not recording-specific).
 					if (files.recommended) {
-						try { writeFileSync('/tmp/sutando-playback-path', files.recommended); } catch {}
+						try { writeFileSync(PLAYBACK_PATH, files.recommended); } catch {}
 					}
 					// Probe duration once here so open_file (now generic) doesn't need to.
 					try {

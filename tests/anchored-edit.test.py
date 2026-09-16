@@ -13,6 +13,7 @@ Run: python3 tests/anchored-edit.test.py
 import contextlib
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 import time
@@ -57,8 +58,9 @@ class AnchoredEdit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "f.txt"
             f.write_text(text)
+            env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
             p = subprocess.run([sys.executable, str(TOOL), str(f), *argv],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env=env)
             return p.returncode, p.stdout, p.stderr, f.read_text()
 
     def test_the_cli_exits_2_and_writes_nothing_when_the_anchor_drifted(self):
@@ -139,6 +141,8 @@ class AtomicReplacement(unittest.TestCase):
         self.assertEqual(f.read_text(), "alpha gamma")
 
     def test_mode_is_preserved_across_the_replace(self):
+        if os.name == "nt":
+            self.skipTest("POSIX mode bits are not meaningful on Windows")
         f = self._tmp("alpha beta")
         f.chmod(0o640)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -220,6 +224,8 @@ class AtomicWriteDirect(unittest.TestCase):
     this the helper the review asked for is the one thing never run."""
 
     def test_it_replaces_content_and_preserves_mode(self):
+        if os.name == "nt":
+            self.skipTest("POSIX mode bits are not meaningful on Windows")
         f = Path(tempfile.mkdtemp()) / "t.txt"
         f.write_text("old")
         f.chmod(0o600)
@@ -309,10 +315,10 @@ class IntegrityContract(unittest.TestCase):
             lock = Path(str(f) + ae.LOCK_SUFFIX)
             fd = ae.os.open(str(lock), ae.os.O_CREAT | ae.os.O_RDWR, 0o644)
             try:
-                ae.fcntl.flock(fd, ae.fcntl.LOCK_EX | ae.fcntl.LOCK_NB)
+                ae.lock_fd(fd, blocking=False)
                 seen["held"] = False          # got in -> the window is OPEN
-                ae.fcntl.flock(fd, ae.fcntl.LOCK_UN)
-            except BlockingIOError:
+                ae.unlock_fd(fd)
+            except OSError:
                 seen["held"] = True           # refused -> the window is CLOSED
             finally:
                 ae.os.close(fd)
@@ -335,9 +341,11 @@ class IntegrityContract(unittest.TestCase):
         f.write_text("alpha beta")
         holder = subprocess.Popen(
             [sys.executable, "-c", textwrap.dedent(f"""
-                import fcntl, os, sys, time
+                import os, sys, time
+                sys.path.insert(0, {str(REPO / "src")!r})
+                from file_lock import lock_fd
                 fd = os.open({str(f) + ".anchored-lock"!r}, os.O_CREAT | os.O_RDWR, 0o644)
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                lock_fd(fd)
                 sys.stdout.write("held"); sys.stdout.flush()
                 time.sleep(1.5)
             """)], stdout=subprocess.PIPE, text=True)
@@ -346,6 +354,7 @@ class IntegrityContract(unittest.TestCase):
         rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
         waited = time.monotonic() - started
         holder.wait()
+        holder.stdout.close()
         self.assertEqual(rc, 0)
         self.assertGreater(waited, 0.5,
                            "the edit did not wait for the lock — exclusion is not real")

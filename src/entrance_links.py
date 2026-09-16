@@ -9,6 +9,7 @@ discovered → provider_verified → stand_linked → active → revoked.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ import secrets
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from file_lock import lock_fd, unlock_fd
 
 LINKS_FILE = "entrance-links.json"
 
@@ -58,22 +61,18 @@ def active_link(state_dir: str | Path, provider: str) -> "dict | None":
     return None
 
 
-import contextlib
-import fcntl
-
-
 @contextlib.contextmanager
 def _ledger_lock(state_dir: str | Path):
     # One writer contract for the whole load->validate->mutate->save
-    # transaction; flock is held on a sibling lock file, never the ledger.
+    # transaction; the lock is held on a sibling file, never the ledger.
     path = links_path(state_dir).with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        lock_fd(fh.fileno())
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            unlock_fd(fh.fileno())
 
 
 def _save_links(state_dir: str | Path, links: list) -> None:
