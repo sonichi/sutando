@@ -279,7 +279,15 @@ owned_hook_shape() {
   cmd_word="${CMD%% *}"
   cmd_tail="${CMD#*"$MARKER"}"
   cmd_tail="${cmd_tail#[\"\']}"       # drop shq's closing quote, if present
-  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
+  # The middle wildcard used to be `.*` (any text, unbounded) — it could cross a
+  # CLOSING quote + space into a SECOND shell argument, so an operator wrapper
+  # that merely passes our script as an argument (`bash '/op/wrap.sh'
+  # '<repo>/src/session-handoff.sh' ...`) matched as if it WERE our command
+  # (#4309 review, keweichen/qingyun-wu 2026-09-16, real repro + deletion). A
+  # negative-lookahead excludes `' ` / `" ` (a quote immediately followed by a
+  # space — the only way a NEW argument starts in a shq-quoted command) from the
+  # matched span, so the marker must stay inside the SAME first argument.
+  SHAPE="^$(re_escape "$cmd_word") [\"']?[^ -](?:(?![\"'] ).)*$(re_escape "$MARKER")[\"']?$(re_escape "$cmd_tail")\$"
   LEGACY_SHAPE=""
   [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
   return 0
