@@ -26,7 +26,7 @@ A pool worker is an instance, not the canonical core. It shares the host's works
 
    It answers about THIS instance's sentinel (`util_paths.watcher_sentinel_path`, the same file the watcher stamps) in the assigned workspace — read from the `SUTANDO_WORKSPACE_DIR` variable the spawner sets and the watcher honours, so gate and watcher can never inspect two trees — and prints one word: `start`, `skip`, or `unknown`.
 
-2. On `start` only, start the streaming watcher via the `Monitor` tool — `command: 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'`, `persistent: true`. Both are absolute and come from the launcher, because this session's cwd is the spawner's `--cwd` and need not be the repo — a relative `src/watch-tasks-stream.sh` exits 127 there. If `$SUTANDO_WATCHER_CMD` is unset you were not launched as a worker: stop and say so rather than guessing a path.
+2. On `start` only, start the streaming watcher via the `Monitor` tool — `command: 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'`, `timeout_ms: 1800000` (re-arm on every expiry notice). Both are absolute and come from the launcher, because this session's cwd is the spawner's `--cwd` and need not be the repo — a relative `src/watch-tasks-stream.sh` exits 127 there. If `$SUTANDO_WATCHER_CMD` is unset you were not launched as a worker: stop and say so rather than guessing a path.
 
 3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>`; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
 

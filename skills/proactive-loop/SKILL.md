@@ -17,8 +17,10 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
+2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `timeout_ms: 1800000`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   The harness caps a Monitor at 30 min: on its expiry notice re-arm it at once, in that turn, whatever
+   else is paused (CLAUDE.md "Task bridge").
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
 
@@ -81,6 +83,7 @@ caps this file and refuses date stamps in it).
    per `PERSONAL_CLAUDE.md`. Skip this step only for: MINIMAL tier; owner active in the last ~5 min;
    `state/presenter-mode.sentinel` (`bash scripts/presenter-mode.sh`); `state/loop-paused-until.sentinel`;
    `python3 src/shutdown.py check` exiting 0 (finish in hand, write idle, do not relaunch).
+   None of these skip step 9: a paused loop still keeps the inbox open.
 6.5. **Idle surface.** Record the pass:
    `python3 skills/proactive-loop/scripts/idle-surface-hash.py --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop`.
    The held set is edited only through
@@ -109,8 +112,9 @@ caps this file and refuses date stamps in it).
    Then pivot; never block.
 9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
    owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
-   is UNKNOWN, not dead; never hand-roll a process check.
+   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` with `timeout_ms: 1800000`.
+   A missing sentinel is UNKNOWN, not dead; never hand-roll a process check. This step runs on every
+   pass, including passes the owner paused or asked to skip — the watcher is not proactive work.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
