@@ -2,13 +2,8 @@
 # install-claude-hooks.sh — idempotent install of Sutando-owned core-session
 # Claude Code hooks (PreCompact + SessionEnd + Stop).
 #
-# Scope: these hooks are CORE-ONLY, so they install into the core's own
-# CLAUDE_CONFIG_DIR (`<workspace>/.claude-sutando/settings.json`), which no
-# other session reads. `feedback_claude_code_hook_scoping` ruled out user-level
-# `~/.claude/settings.json` because it fires in unrelated repos; project-level
-# `.claude/settings.json` fixes the repo axis but not the session one — it fires
-# for every Claude session with this cwd, which is how guests were handed the
-# core's task queue to drain and how a guest's tail overwrote session-state.md.
+# CORE-ONLY hooks install into the core's own CLAUDE_CONFIG_DIR, not
+# project-level -- project scope fires for every session with this cwd.
 #
 # Hooks installed (4):
 #   PreCompact  → src/archive-transcript.sh <workspace>/logs/conversations/
@@ -311,9 +306,8 @@ _is_installer_path_shape() {
   esac
 }
 
-# Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard exactly
-# (Q identical in both slots; RUNNER must equal $2 when given) and prints the
-# unquoted, un-tokenized Q. Anything else — including a near-miss — is rc 1.
+# Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard
+# exactly (both Q's identical); anything else, including a near-miss, is rc 1.
 _skill_hook_guard_path() {
   local cand="$1" want_runner="${2:-}" mid=' ] || exit 0; exec '
   case "$cand" in '[ -f '*"$mid"*) ;; *) return 1 ;; esac
