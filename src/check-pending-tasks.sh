@@ -24,6 +24,12 @@ if [ -n "$GIT_BIN" ]; then
   # different cwd, can print a path relative to <dir> instead of to the caller.
   CWD_COMMON_DIR="$("$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # A `-C DIR` probe and an actually-`cd`'d one can disagree in ways neither
+  # side's stdout reveals; retry via `cd` before trusting an empty result.
+  [ -z "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_DIR" 2>/dev/null && "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # Kept PRE-canonicalization -- a path that then fails to `cd` must not
+  # read the same as no identity ever being found (see the elif below).
+  REPO_COMMON_DIR_RAW="$REPO_COMMON_DIR"
   # Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
   # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
   [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
@@ -35,6 +41,8 @@ if [ -n "$GIT_BIN" ]; then
       echo '{}'
       exit 0
     fi
+  elif [ -n "$REPO_COMMON_DIR_RAW" ]; then
+    : # a real answer that then failed to canonicalize -- ambiguous, fall through to gate
   elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
     : # marker present, probe still failed -- ambiguous, fall through to gate
   elif [ -n "$CWD_COMMON_DIR" ]; then

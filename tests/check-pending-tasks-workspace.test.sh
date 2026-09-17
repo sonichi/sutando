@@ -441,6 +441,72 @@ else
 fi
 rm -rf "$OUTER_REPO"
 
+# 12b. The SAME no-own-.git subdir as case 12, but the `-C DIR` probe itself
+# fails while a plain `cd`'d probe would still succeed -- must still block.
+OUTER_REPO="$(mktemp -d)"
+_git_fixture_repo "$OUTER_REPO"
+NESTED_REPO="$OUTER_REPO/child"
+mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
+cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
+chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
+printf 'id: probe\ntask: nested-subdir-failed-c-probe\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
+FCP_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+FCP_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -e "$NESTED_REPO/.git" ] || [ -z "$FCP_REPO_ID" ] || [ -z "$FCP_CWD_ID" ] || [ "$FCP_REPO_ID" != "$FCP_CWD_ID" ]; then
+  bad "no-own-.git subdir + failed -C probe -> still core, still blocks" \
+    "fixture bug: child='$FCP_REPO_ID' outer='$FCP_CWD_ID', this case tests nothing"
+else
+  # Fails only a bare `-C` invocation; a real script, not a symlink, so
+  # resolve_git() treats it as a real git rather than the macOS CLT stub.
+  STUBDIR="$(mktemp -d)"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "-C" ] && exit 1; done\nexec "%s" "$@"\n' "$TEST_GIT" > "$STUBDIR/git"
+  chmod +x "$STUBDIR/git"
+  FCP_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+  case "$FCP_OUT" in
+    *'"decision":"block"'*) ok "no-own-.git subdir + failed -C probe -> still core, still blocks" ;;
+    *) bad "no-own-.git subdir + failed -C probe -> still core, still blocks" "got: ${FCP_OUT:0:160}" ;;
+  esac
+  rm -rf "$STUBDIR"
+fi
+rm -rf "$OUTER_REPO"
+
+# 12c. A repo-side probe that RESOLVES but then fails to canonicalize must
+# be as ambiguous as an outright probe failure, never read as no identity.
+OUTER_REPO="$(mktemp -d)"
+_git_fixture_repo "$OUTER_REPO"
+NESTED_REPO="$OUTER_REPO/child"
+mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
+cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
+chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
+printf 'id: probe\ntask: nested-subdir-dead-canon\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
+DC_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+DC_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -e "$NESTED_REPO/.git" ] || [ -z "$DC_REPO_ID" ] || [ -z "$DC_CWD_ID" ] || [ "$DC_REPO_ID" != "$DC_CWD_ID" ]; then
+  bad "resolved-but-uncanonicalizable repo probe -> still core, still blocks" \
+    "fixture bug: child='$DC_REPO_ID' outer='$DC_CWD_ID', this case tests nothing"
+else
+  # A wrapper that answers the -C probe with a path it then DELETES, so the
+  # canonicalizing `cd` in the hook fails on a value that was real a moment ago.
+  STUBDIR="$(mktemp -d)"
+  DEAD_ALIAS="$(mktemp -d)"; rmdir "$DEAD_ALIAS"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "-C" ] && { echo "%s"; exit 0; }; done\nexec "%s" "$@"\n' \
+    "$DEAD_ALIAS" "$TEST_GIT" > "$STUBDIR/git"
+  chmod +x "$STUBDIR/git"
+  DC_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+  case "$DC_OUT" in
+    *'"decision":"block"'*) ok "resolved-but-uncanonicalizable repo probe -> still core, still blocks" ;;
+    *) bad "resolved-but-uncanonicalizable repo probe -> still core, still blocks" "got: ${DC_OUT:0:160}" ;;
+  esac
+  rm -rf "$STUBDIR"
+fi
+rm -rf "$OUTER_REPO"
+
 # 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
 # -- `-e` alone would misread a broken checkout as an intentional bundle.
 DANGLING="$(mktemp -d)"
