@@ -569,6 +569,47 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
 
+    def test_leading_redirect_before_the_command_word_does_not_false_green_through_the_consumer_path(self):
+        """keweichen round 22: a redirect can precede the command word,
+        so its uncertainty must survive until the full word list --
+        including the command name -- is known."""
+        wf = ("steps:\n  - run: |\n"
+              "      EMPTY=\n"
+              "      set -o pipefail\n"
+              '      >"$EMPTY" set +o pipefail\n'
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_a_delimiter_less_heredoc_halts_the_program_through_the_consumer_path(self):
+        """keweichen round 22: a delimiter-less heredoc is a PARSE error,
+        not a no-op line -- everything later in the program is
+        unreachable. Starts pipefail OFF so "no state change" and
+        "parsing terminates" diverge observably."""
+        wf = ("steps:\n  - run: |\n"
+              "      set +o pipefail\n"
+              "      set -o pipefail <<\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_ordinary_prefix_glued_to_process_substitution_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 22: a non-flag-shaped prefix (`x`) already
+        guarantees a positional word on its own and needs no expandable-
+        marking -- round 20's over-broad `if val:` survived round 21
+        unfixed too."""
+        wf = ("steps:\n  - run: |\n"
+              "      set +o pipefail\n"
+              "      set x<(true) -o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

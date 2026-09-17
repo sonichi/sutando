@@ -360,21 +360,28 @@ def _shell_words(text: str):
     its source text, so this returns the literal string `"unknown"`
     instead of a list in that case (round 20: `>"$EMPTY"` is exactly as
     fatal as `>""` once $EMPTY expands, and looks nothing like it
-    statically) -- BUT only when the command so far is `set` (round 21:
-    `printf x >"$OUT"` isn't, and an uncertain redirect on any OTHER
-    command must not poison the caller's result before the command name
-    is even known). `<<`/`<<-` heredocs are exempt from the empty-target
-    rule entirely -- an empty DELIMITER WORD is ordinary, valid heredoc
-    syntax, not a failed open (round 20: `<<""` is not `<""`) -- but NO
-    delimiter word at all (round 21: `<<` at end of line) is still a
-    syntax error and returns None, the same "word started, not merely
-    non-empty" distinction round 18 needed for empty argv words.
-    `<(cmd)`/`>(cmd)`
+    statically) -- BUT only when the command turns out to be `set`, decided
+    only once the WHOLE word list is built (round 22: a redirect can
+    precede the command word, so `words` may still be empty at the moment
+    the redirect itself is seen -- round 21's earlier check at that point
+    read a leading redirect's uncertainty as irrelevant and discarded it).
+    `<<`/`<<-` heredocs are exempt from the empty-target rule entirely --
+    an empty DELIMITER WORD is ordinary, valid heredoc syntax, not a failed
+    open (round 20: `<<""` is not `<""`) -- but NO delimiter word at all
+    (`<<` at end of line) is a real Bash PARSE error: the sentinel string
+    `"fatal"` signals that nothing in the rest of the program ever runs,
+    not merely that this command didn't (round 22: round 21's `return
+    None` modeled it as "no state change", indistinguishable from a
+    genuinely inert line). `<(cmd)`/`>(cmd)`
     process substitution is not a redirect at all; its word is marked
-    expandable rather than copied in literally, since the real `/dev/fd/N`
-    text is unknowable and a literal copy can smuggle an option-shaped
-    character (`o`) into a cluster scan that never should have seen it
-    (round 20: `<(echo o)`'s inner `o` was mistaken for a real `+o`).
+    expandable rather than copied in literally when glued to a
+    flag-shaped prefix (round 22: an ORDINARY prefix like the `x` in
+    `x<(true)` already guarantees a positional word via the option-scan
+    stop rule below and needs no expandable-marking at all), since the
+    real `/dev/fd/N` text is unknowable and a literal copy can smuggle an
+    option-shaped character (`o`) into a cluster scan that never should
+    have seen it (round 20: `<(echo o)`'s inner `o` was mistaken for a
+    real `+o`).
 
     Brace expansion runs per accumulated word at flush time, tracked via a
     per-character quoted mask (round 18, `_split_unquoted_braces`) -- a
@@ -382,6 +389,7 @@ def _shell_words(text: str):
     quoted character elsewhere in the same split-quoted word."""
     words, val, qmask, expandable, any_quoted = [], [], [], False, False
     quote, i, n = None, 0, len(text)
+    redirect_uncertain = False
 
     def flush():
         nonlocal val, qmask, expandable, any_quoted
@@ -417,9 +425,9 @@ def _shell_words(text: str):
         elif ch in " \t\n":
             flush(); i += 1
         elif ch in "<>" and i + 1 < n and text[i + 1] == "(":
-            # Process substitution (see docstring) -- glued to prior flag
-            # text in the same word, mark expandable; standing alone stays literal (safe as-is).
-            if val:
+            # Process substitution (see docstring) -- expandable only when
+            # glued to a flag-shaped prefix, never a plain positional one.
+            if val and val[0] in "-+":
                 expandable = True
             start = i; i += 2; depth = 1; pq = None
             while i < n and depth > 0:
@@ -481,13 +489,13 @@ def _shell_words(text: str):
                     target.append(text[i]); i += 1
             if is_heredoc:
                 if i == target_start:
-                    # NO delimiter word at all (not `<<""`) is a syntax error (see docstring).
-                    return None
+                    # NO delimiter word at all is a real syntax error --
+                    # nothing in the rest of the PROGRAM runs (see docstring).
+                    return "fatal"
                 # else: any delimiter WORD, including an empty one, is valid heredoc syntax (round 20)
             elif target_expandable:
-                # Only `set` can change pipefail -- gate on the command name (see docstring).
-                if words and words[0][0] == "set":
-                    return "unknown"
+                # Deferred until the full word list is known (see docstring).
+                redirect_uncertain = True
             elif not target:
                 # An empty redirect target aborts the WHOLE command before
                 # it runs (see docstring) -- so does this function.
@@ -503,6 +511,10 @@ def _shell_words(text: str):
                 expandable = True
             val.append(ch); qmask.append(False); i += 1
     flush()
+    # Decided only now that the complete word list exists (round 22): a
+    # leading redirect leaves `words` empty at the point it's seen.
+    if redirect_uncertain and words and words[0][0] == "set":
+        return "unknown"
     return words
 
 
@@ -519,7 +531,8 @@ _SET_O_NAMES = frozenset((
 
 def _sets_pipefail(text: str) -> "bool | str | None":
     """The pipefail state a `set` invocation leaves ON, "unknown" when a
-    toggle's value cannot be resolved statically, or None when `text` is
+    toggle's value cannot be resolved statically, "fatal" when `text` is
+    itself an unparseable syntax error (round 22), or None when `text` is
     not `set`, or is `set` with nothing pipefail-relevant at all.
 
     `o` anywhere in a `-`/`+` short-opt cluster ALWAYS consumes the next
@@ -559,6 +572,8 @@ def _sets_pipefail(text: str) -> "bool | str | None":
     words = _shell_words(text)
     if words == "unknown":
         return "unknown"
+    if words == "fatal":
+        return "fatal"
     if not words or words[0][0] != "set":
         return None
     result, i = None, 1
@@ -625,7 +640,12 @@ def _raw_segments(line: str):
 
     Multi-line input is one program: an unquoted newline ends an open command
     the way `;` does, but a line that ended right after `&&`/`||` leaves the
-    next line's command under that guard, and backslash-newline joins."""
+    next line's command under that guard, and backslash-newline joins.
+
+    A `set` line reporting `"fatal"` (a delimiter-less heredoc, round 22) is
+    a real Bash PARSE error: once seen, nothing anywhere later in the WHOLE
+    program is reachable, not merely the rest of its own AND-OR list -- so
+    it latches a sticky flag that blocks every later append to `out`."""
     # Named above: &&/|| gate on pending_op/chain_status; the open pipe on
     # last_runs/pipe_group/pipe_entered; pipefail_on is the sticky `set` toggle.
     out, cur, quote, i = [], [], None, 0
@@ -636,10 +656,11 @@ def _raw_segments(line: str):
     pipe_entered = True
     pipe_negate = False
     pipefail_on = False
+    fatal = False
 
     def transition(sep):
         nonlocal cur, chain_status, pending_op, last_runs
-        nonlocal pipe_group, pipe_entered, pipe_negate, pipefail_on
+        nonlocal pipe_group, pipe_entered, pipe_negate, pipefail_on, fatal
 
         _FLIP = {"true": "false", "false": "true", "unknown": "unknown"}
 
@@ -685,13 +706,17 @@ def _raw_segments(line: str):
                 want = "true" if pending_op == "&&" else "false"
                 runs = chain_status == want
                 maybe = not runs and chain_status == "unknown"
-            if runs:
-                out.append(s)
             # A pipe stage other than a lone command runs in a SUBSHELL, so
             # its `set` never reaches the parent shell -- keweichen round 12.
             pipe_scoped = pending_op == "|" or sep == "|"
             pf = _sets_pipefail(text)
-            if pf is not None and not pipe_scoped:
+            if pf == "fatal":
+                # A real Bash parse error: this segment never actually runs
+                # either, and nothing later in the program does (round 22).
+                fatal = True
+            elif runs and not fatal:
+                out.append(s)
+            if pf is not None and pf != "fatal" and not pipe_scoped:
                 if runs:
                     pipefail_on = pf
                 elif maybe:

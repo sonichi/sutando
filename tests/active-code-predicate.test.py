@@ -794,6 +794,49 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "false | true && python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_a_leading_expandable_redirect_still_poisons_pipefail_on_set(self):
+        """`>"$EMPTY" set +o pipefail`: the redirect precedes the command
+        word, so `words` is empty at the moment it's seen -- confirmed by
+        direct execution: Bash rejects the expanded-empty target (rc=1),
+        `set +o` never runs, pipefail (already on) stays on, dead.py never
+        runs. Deciding at the redirect (round 21's gate) reads a leading
+        redirect's uncertainty as not-yet-`set` and discards it forever."""
+        self.assertEqual(
+            program_python_args(
+                "EMPTY=\n"
+                "set -o pipefail\n"
+                '>"$EMPTY" set +o pipefail\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_delimiter_less_heredoc_halts_the_whole_program_not_just_its_line(self):
+        """`set -o pipefail <<` with nothing after the operator: a real
+        Bash PARSE error, confirmed by direct execution (rc=2, nothing
+        after it ever runs). Starting pipefail OFF (not on) makes this
+        discriminating -- modeling the line as merely "no state change"
+        (round 21's `None`) leaves pipefail off, the pipe's off-status
+        succeeds, and dead.py wrongly runs; only "parsing terminates"
+        blocks it."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                "set -o pipefail <<\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_an_ordinary_prefix_glued_to_process_substitution_is_already_positional(self):
+        """`set x<(true) -o pipefail`: Bash's option scan stops at the
+        leading `x` the instant it sees it -- confirmed by direct
+        execution: pipefail (already off) stays off, dead.py runs. `x` is
+        not `-`/`+`-shaped, so it is already a guaranteed positional word
+        without any expandable-marking at all; marking it expandable
+        anyway (round 20's over-broad `if val:`) wrongly poisoned it into
+        "unknown" and stopped crediting dead.py."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                "set x<(true) -o pipefail\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
