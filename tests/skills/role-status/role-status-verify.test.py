@@ -532,6 +532,40 @@ with tempfile.TemporaryDirectory() as td:
     rsv.write_atomic(str(target), "é✓\n".encode("utf-8"))
     check(target.read_bytes() == "é✓\n".encode("utf-8") and sorted(q.name for q in Path(td).iterdir()) == ["v.json"],
           "write_atomic takes the UTF-8 bytes as given, no temp file left")
+    # the replace fails after the temp file has vanished: the OSError still propagates, no error on cleanup
+    real_replace = os.replace
+    def replace_after_tmp_vanished(src_path, dst, *a, **k):
+        os.unlink(src_path)
+        raise OSError(28, "No space left on device", dst)
+    os.replace = replace_after_tmp_vanished
+    try:
+        try:
+            rsv.write_atomic(str(Path(td) / "w.json"), b"x\n")
+            raised = None
+        except OSError as e:
+            raised = e
+    finally:
+        os.replace = real_replace
+    check(raised is not None and raised.errno == 28 and not (Path(td) / "w.json").exists()
+          and sorted(q.name for q in Path(td).iterdir()) == ["v.json"],
+          "write_atomic when the temp file vanished before cleanup: the replace error propagates, nothing left")
+# a stdout with a byte buffer (a real terminal or pipe, not a redirected StringIO): the stats line
+# goes through the text layer, the array is written as UTF-8 bytes beneath it, in that order
+with tempfile.TemporaryDirectory() as td:
+    task = Path(td) / "task-role-status-v1-0000-a1.txt"
+    task.write_text(TASK_BLOCKS)
+    jpath = Path(td) / "judgment.json"
+    jpath.write_text(json.dumps(UNI))
+    raw = io.BytesIO()
+    wrapped = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+    se_buf = io.StringIO()
+    with contextlib.redirect_stdout(wrapped), contextlib.redirect_stderr(se_buf):
+        rc = rsv.main([str(task), str(jpath)])
+    wrapped.flush()
+    text = raw.getvalue().decode("utf-8")
+    check(rc == 0 and text.startswith("rows=3 distinct_actors=3 actors=4")
+          and json.loads(text.split("\n", 1)[1]) == UNI and se_buf.getvalue() == "",
+          "stdout with a buffer: stats line first, then the array as UTF-8 bytes past an ASCII text layer")
 vsrc = SCRIPT.read_text()
 check('fdopen(fd, "w")' not in vsrc and 'fdopen(fd, "wb")' in vsrc,
       "verify.py writes bytes it encoded as UTF-8 itself, never a locale-default text writer")

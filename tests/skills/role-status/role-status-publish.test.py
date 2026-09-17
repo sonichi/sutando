@@ -324,6 +324,27 @@ with tempfile.TemporaryDirectory() as td:
     check(fd2 is not None and pub.claim_body(fd2) == "/r/x.txt" and os.path.getsize(c) == len("/r/x.txt\n"),
           "claim_open on a released committed claim: reopens without truncating")
     os.close(fd2)
+    # the commit write itself fails: the error text comes back, nothing raised, the claim untouched
+    ro = os.open(c, os.O_RDONLY)
+    try:
+        err = pub.claim_commit(ro, "/r/y.txt")
+    finally:
+        os.close(ro)
+    check(isinstance(err, str) and err and Path(c).read_text() == "/r/x.txt\n",
+          "claim_commit on an unwritable descriptor: returns the OSError text, the claim body is unchanged")
+    # the staged temp file is already gone when link_exclusive cleans up: no error, the link stood
+    real_link = os.link
+    def link_then_drop_tmp(src_path, dst, *a, **k):
+        real_link(src_path, dst, *a, **k)
+        os.unlink(src_path)
+    os.link = link_then_drop_tmp
+    try:
+        linked = pub.link_exclusive(str(Path(td) / "g.txt"), b"gone")
+    finally:
+        os.link = real_link
+    check(linked is True and (Path(td) / "g.txt").read_bytes() == b"gone"
+          and sorted(p.name for p in Path(td).iterdir()) == ["c", "g.txt", "n.txt", "r.txt"],
+          "link_exclusive when the temp file vanished before cleanup: True, written, no error")
 check("write_atomic" not in src and "os.replace" not in src,
       "publish.py's production write is the exclusive one, never a replace")
 
@@ -555,6 +576,22 @@ with tempfile.TemporaryDirectory() as td:
     rc, so, se = publish_in(ws, task, j)
     check(rc == 2 and "recovered from %s" % live in se and claim_of(ws).read_text() == str(live) + "\n",
           "the retry recovers: exit 2, the claim committed against the live result")
+# the commit fails AND the claim is already gone when the rollback drops it: still rc 0, no traceback
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    real_commit = pub.claim_commit
+    def commit_after_claim_vanished(fd, note):
+        os.unlink(str(claim_of(ws)))
+        return "No space left on device"
+    pub.claim_commit = commit_after_claim_vanished
+    try:
+        rc, so, se = publish_in(ws, task, j)
+    finally:
+        pub.claim_commit = real_commit
+    check(rc == 0 and live.is_file() and "published " in so and "warning: claim not committed" in se
+          and not claim_of(ws).exists() and "Traceback" not in se,
+          "commit fails with the claim already unlinked: rc 0, result stands, the missing claim is not an error")
 
 # (10c) no `fcntl`, as on Windows: a fake `msvcrt` with real in-process lock semantics
 # drives the claim state machine. Windows filesystem semantics are NOT exercised here.
