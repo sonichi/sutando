@@ -15,8 +15,9 @@ choosing it is visible in the invocation, not a silent default.
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env or env var.
 
---jsonl prints one JSON object per message (id, ts, author, text, reply, reply_to_id, url) instead of the
-text lines, for a consumer that needs to link back to the message (the owner's triage card).
+--jsonl prints one JSON object per message (id, ts, author, author_id, text, reply, reply_to_id,
+reply_to_author_id, url) instead of the text lines, for a consumer that needs to link back to the
+message (the owner's triage card) or tell who a reply was addressed to, not just what it quotes.
 """
 import argparse
 import json
@@ -58,7 +59,7 @@ def _parse_args(argv):
                         help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
     parser.add_argument("--jsonl", action="store_true",
-                        help="One JSON object per message (id, ts, author, text, reply, reply_to_id, url) instead of the text lines. url is the message's jump link; it costs one channel lookup for the guild id.")
+                        help="One JSON object per message (id, ts, author, author_id, text, reply, reply_to_id, reply_to_author_id, url) instead of the text lines. url is the message's jump link; it costs one channel lookup for the guild id.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--serving", default=None,
                       help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
@@ -92,6 +93,20 @@ def _reply_to_id(msg):
         return ""
     mid = ref.get("message_id") or (msg.get("referenced_message") or {}).get("id") or ""
     return str(mid)
+
+
+def _reply_to_author_id(msg):
+    """The parent message's author id, for a REPLY whose parent Discord actually sent us.
+
+    ``referenced_message`` is omitted when unfetched and null when the parent was deleted —
+    both mean "unknown author", not "no author", so this returns "" rather than guessing.
+    Consumers that need "was this addressed to X" from a reply, not just a same-text mention,
+    read this alongside the mentions already in the body.
+    """
+    if not _reply_to_id(msg):
+        return ""
+    referenced = msg.get("referenced_message") or {}
+    return str((referenced.get("author") or {}).get("id") or "")
 
 
 def main(argv=None):
@@ -146,16 +161,21 @@ def main(argv=None):
         if args.until and _strictly_older_than_boundary(msg, args.until):
             continue
         author = msg.get("author", {}).get("username", "?")
+        author_id = str(msg.get("author", {}).get("id") or "")
         ts = msg.get("timestamp", "")[:19]
         clip = None if args.full else CLIP
         ctx = _reply_context(msg, None if args.full else REPLY_CLIP)
         if args.jsonl:
             print(json.dumps({
                 "id": str(msg.get("id", "")), "ts": ts, "author": author,
+                "author_id": author_id,
                 "text": _render(msg, clip), "reply": ctx or "",
                 # `reply` is clipped at REPLY_CLIP, so matching its text picks
                 # the wrong parent silently once a parent is longer. A key cannot.
                 "reply_to_id": _reply_to_id(msg),
+                # Who the reply is TO, not just what it says: a reply's own text can
+                # @-mention someone else entirely while still answering the owner.
+                "reply_to_author_id": _reply_to_author_id(msg),
                 "url": f"https://discord.com/channels/{guild or '@me'}/{args.channel_id}/{msg.get('id', '')}",
             }, ensure_ascii=False))
             continue

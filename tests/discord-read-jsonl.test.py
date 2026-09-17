@@ -24,9 +24,9 @@ except SystemExit:
 
 MESSAGES = [
     {"id": "2000", "timestamp": "2026-09-12T18:00:01.000Z", "content": "second",
-     "author": {"username": "Sutando-Pro"}},
+     "author": {"username": "Sutando-Pro", "id": "9999"}},
     {"id": "1000", "timestamp": "2026-09-12T17:59:59.000Z", "content": "first é",
-     "author": {"username": "susanliu_"}},
+     "author": {"username": "susanliu_", "id": "1025785494862315690"}},
 ]
 
 
@@ -36,12 +36,13 @@ LONG_PARENT = "x" * 400   # > REPLY_CLIP (110): the rendered `reply` is truncate
 # mode output the guard above pins, which is exactly what that test is for.
 REPLY_MESSAGES = [
     {"id": "2000", "timestamp": "2026-09-12T18:00:01.000Z", "content": "second",
-     "author": {"username": "Sutando-Pro"}, "type": 19,
+     "author": {"username": "Sutando-Pro", "id": "9999"}, "type": 19,
      "message_reference": {"message_id": "1000", "channel_id": "123"},
      "referenced_message": {"id": "1000", "timestamp": "2026-09-12T17:59:59.000Z",
-                            "content": LONG_PARENT, "author": {"username": "susanliu_"}}},
+                            "content": LONG_PARENT,
+                            "author": {"username": "susanliu_", "id": "1025785494862315690"}}},
     {"id": "1000", "timestamp": "2026-09-12T17:59:59.000Z", "content": LONG_PARENT,
-     "author": {"username": "susanliu_"}},
+     "author": {"username": "susanliu_", "id": "1025785494862315690"}},
 ]
 
 
@@ -62,6 +63,7 @@ class JsonlMode(unittest.TestCase):
         rows = [json.loads(line) for line in out.splitlines()]
         self.assertEqual([r["id"] for r in rows], ["1000", "2000"])
         self.assertEqual(rows[0]["author"], "susanliu_")
+        self.assertEqual(rows[0]["author_id"], "1025785494862315690")
         self.assertEqual(rows[0]["text"], "first é")
         self.assertEqual(rows[0]["ts"], "2026-09-12T17:59:59")
         self.assertEqual(rows[0]["reply"], "")
@@ -171,6 +173,51 @@ class ReplyReferenceMetadata(unittest.TestCase):
         row = self._row(root)
         self.assertIn("reply_to_id", row)
         self.assertEqual(row["reply_to_id"], "")
+
+
+class ReplyToAuthorId(unittest.TestCase):
+    """Who a reply is addressed TO, not who wrote it or what it quotes — a reply's own
+    body can @-mention someone else entirely while still answering this person."""
+
+    def _row(self, msg):
+        rc, out, _ = _run(["123", "--operator", "--jsonl"], messages=[msg])
+        self.assertEqual(rc, 0)
+        return json.loads(out.strip().splitlines()[0])
+
+    def _reply(self, **over):
+        m = {"id": "2000", "timestamp": "2026-09-12T18:00:01.000Z", "content": "child",
+             "author": {"username": "Sutando-Pro", "id": "9999"}, "type": 19,
+             "message_reference": {"message_id": "1000", "channel_id": "123"}}
+        m.update(over)
+        return m
+
+    def test_a_present_embedded_parent_gives_its_author_id(self):
+        row = self._row(self._reply(referenced_message={
+            "id": "1000", "timestamp": "2026-09-12T17:59:59.000Z",
+            "content": "parent", "author": {"username": "susanliu_", "id": "1025785494862315690"}}))
+        self.assertEqual(row["reply_to_author_id"], "1025785494862315690")
+
+    def test_an_omitted_embedded_parent_gives_no_author(self):
+        # Discord omits referenced_message when it was not fetched: the id names the
+        # message, but not who wrote it.
+        self.assertEqual(self._row(self._reply())["reply_to_author_id"], "")
+
+    def test_a_deleted_parent_gives_no_author(self):
+        self.assertEqual(
+            self._row(self._reply(referenced_message=None))["reply_to_author_id"], "")
+
+    def test_a_non_reply_carries_an_empty_key_not_a_missing_one(self):
+        root = {"id": "3000", "timestamp": "2026-09-12T18:00:02.000Z", "content": "root",
+                "author": {"username": "susanliu_", "id": "1025785494862315690"}}
+        row = self._row(root)
+        self.assertIn("reply_to_author_id", row)
+        self.assertEqual(row["reply_to_author_id"], "")
+
+    def test_a_forward_is_not_a_reply_so_no_author(self):
+        fwd = self._reply(message_reference={"message_id": "1000", "type": 1},
+                          referenced_message={"id": "1000", "author": {"username": "x", "id": "1"}})
+        self.assertEqual(self._row(fwd)["reply_to_author_id"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
