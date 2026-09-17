@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -497,6 +498,52 @@ class TestApply(unittest.TestCase):
         before = pa.advertisement_path(self.ws).read_bytes()
         self.assertIsNone(wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add"))
         self.assertEqual(pa.advertisement_path(self.ws).read_bytes(), before)
+
+
+class TestApplyAdd(TestApply):
+    """`add` creates when the caller names the repo to spawn from; the ledger
+    keys the create on the task id so a replay makes nothing."""
+    NEW = "c" * 32
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="", socket=None):
+            self.calls.append(label)
+            return {"worker_id": self.NEW, "delivery_dir": "d", "tmux": {}, "roster_version": 9,
+                    "advertisement": "published", "unrostered_records": []}
+        real = wpc.cw.create
+        wpc.cw.create = fake_create
+        self.addCleanup(lambda: setattr(wpc.cw, "create", real))
+
+    def test_add_with_a_repo_creates_and_records_the_worker(self):
+        out = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
+        self.assertEqual(out["action"], "add")
+        self.assertEqual(out["worker_id"], self.NEW)
+        log = json.loads(wpc.applied_path(self.ws).read_text())
+        self.assertEqual(log["applied"]["task-add-9"]["worker_id"], self.NEW)
+        self.assertEqual(self.calls, [""])
+
+    def test_add_replays_as_skipped(self):
+        wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
+        out = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
+        self.assertEqual(out["action"], "skipped")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_add_without_a_task_id_is_refused_by_the_gate(self):
+        out = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id=None, repo="/r")
+        self.assertEqual(out["action"], "skipped")
+        self.assertEqual(self.calls, [])
+
+    def test_a_refused_create_raises_and_records_nothing(self):
+        def refuse(*a, **k):
+            raise wpc.cw.sw.SpawnRefused("tmux session exists")
+        wpc.cw.create = refuse
+        with self.assertRaises(wpc.AddRefused):
+            wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-10", repo="/r")
+        self.assertFalse(wpc.applied_path(self.ws).exists()
+                         and "task-add-10" in json.loads(wpc.applied_path(self.ws).read_text()).get("applied", {}))
 
 
 class TestAuthorizedCommand(unittest.TestCase):

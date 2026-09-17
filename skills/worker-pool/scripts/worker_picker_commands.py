@@ -45,6 +45,7 @@ for _p in (str(_SCRIPTS), str(_SCRIPTS.parents[2] / "src")):
 import local_task_protocol as ltp  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
 
+import create_worker as cw  # noqa: E402
 import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
@@ -346,7 +347,8 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
     seq = int(log.get("seq") or 0) + 1
     log["seq"] = seq
     log.setdefault("applied", {})[str(task_id)] = {
-        "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq}
+        "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq,
+        **({"worker_id": cmd["worker_id"]} if cmd.get("worker_id") else {})}
     if cmd.get("room"):
         log.setdefault("rooms", {})[cmd["room"]] = {
             "seq": seq, "task_id": str(task_id), "action": cmd.get("action")}
@@ -354,15 +356,45 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
     return seq
 
 
-def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | None":
-    """Apply a parsed pin or unpin: binding, roster and (through the roster's
-    own writer) the advertisement, so the new binding is on the wire without
-    waiting for another task. `add` is create_worker's and returns None.
+class AddRefused(RuntimeError):
+    """`add` could not create a worker here; the live core keeps the task."""
 
-    `task_id` is required for a pin or unpin: without it the call cannot be
-    replay-gated, and an ungated door is how this defect returns.
+
+def _apply_add(workspace, cmd: dict, *, task_id, results_dir, repo, runtime) -> dict:
+    # One critical section for gate, creation and record: the startup sweep
+    # re-runs a retained task, and an ungated second run is a second worker.
+    with _applied_locked(workspace):
+        reason = replay_reason(workspace, cmd, task_id, results_dir)
+        if reason:
+            return {"action": "skipped", "room": None, "reason": reason}
+        try:
+            made = cw.create(workspace, repo, label=cmd.get("label") or "", runtime=runtime)
+        except (cw.Refused, cw.sw.SpawnRefused, cw.CreatedUnrostered) as e:
+            raise AddRefused(str(e)) from e
+        _record_applied(workspace, {**cmd, "worker_id": made["worker_id"]}, task_id)
+    return {"action": "add", "room": None, "worker_id": made["worker_id"],
+            "label": cmd.get("label") or "",
+            "roster_version": made["roster_version"], "advertisement": made["advertisement"],
+            "delivery_dir": str(made.get("delivery_dir") or ""), "tmux": made.get("tmux") or {}}
+
+
+def apply(workspace, cmd: dict, *, task_id=None, results_dir=None,
+          repo=None, runtime=None) -> "dict | None":
+    """Apply a parsed picker command. A pin or unpin binds, recompiles and
+    (through the roster's own writer) publishes, so the binding is on the wire
+    without waiting for another task. An `add` creates the worker when the
+    caller names the `repo` to spawn from; without one it returns None and the
+    live core does it.
+
+    `task_id` is required: without it the call cannot be replay-gated, and an
+    ungated door is how this defect returns.
     """
     action = (cmd or {}).get("action")
+    if action == "add":
+        if repo is None:
+            return None
+        return _apply_add(workspace, cmd, task_id=task_id, results_dir=results_dir,
+                          repo=repo, runtime=runtime)
     if action not in ("pin", "unpin"):
         return None
     # ONE critical section for gate, record and mutation: split, two probes can
