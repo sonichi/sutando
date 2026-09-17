@@ -3960,6 +3960,44 @@ def _assigned_worker(task_id: str) -> str:
     return value if _is_worker_id(value) else ""
 
 
+def _delivery_recipient(task_id: str) -> str:
+    """Which worker this task was DELIVERED to, read from the pool's delivery
+    sentinel. Used ONLY to tell "this was a worker's task" from "this was the
+    core's" when attribution is missing — never as an attribution source.
+
+    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted}) is owned
+    by the pool's own delivery writer, an optional local skill this standalone
+    package cannot import or name; the test builds its fixtures through that
+    writer so a drift fails there instead of silently reading nothing.
+
+    Fails closed like its siblings: unreadable, non-regular, or claimed by more
+    than one recipient yields "".
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return ""
+    root = _STATE.parent / "deliveries"
+    try:
+        recipients = sorted(p.name for p in root.iterdir())
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    claimants = set()
+    for name in recipients:
+        for suffix in (".txt", ".accepted"):
+            try:
+                st = os.lstat(root / name / f"{task_id}{suffix}")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return ""
+            if not stat.S_ISREG(st.st_mode):
+                return ""
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
+
+
 def _result_worker(task_id: str) -> str:
     """Attribution for one result: assignment truth first, completion residue
     only as the migration fallback.
@@ -3978,7 +4016,16 @@ def _result_worker(task_id: str) -> str:
         _log(f"attribution: {task_id} has no assignment record; using "
              f"completion residue ({residue}). Assignment-time recording "
              f"did not run for this task.")
-    return residue
+        return residue
+    # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
+    # so silence here would relay it as if the core had produced it.
+    delivered = _delivery_recipient(task_id)
+    if delivered:
+        _log(f"attribution: {task_id} was DELIVERED to {delivered} but has no "
+             f"assignment record and no completion residue - refusing to stamp "
+             f"rather than attribute it to the core. The record is written under "
+             f"the same lock as the sentinel, so this is an invariant violation.")
+    return ""
 
 
 def _worker_of(task_id: str) -> str:

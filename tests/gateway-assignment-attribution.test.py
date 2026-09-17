@@ -82,6 +82,13 @@ class AssignmentAttribution(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
 
+    def _sentinel(self, recipient: str, tid: str):
+        """Through pool_delivery's own path function: the convention the bridge
+        re-states is the one the pool writes, or this test cannot catch drift."""
+        d = pool_delivery.deliveries_dir(Path(self.workspace), recipient)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}{pool_delivery.PENDING_SUFFIX}").write_text("")
+
     def _doc(self, tid: str) -> dict:
         self.seen.clear()
         with self.assertRaises(_Captured):
@@ -139,6 +146,36 @@ class AssignmentAttribution(unittest.TestCase):
         not an empty string a consumer might render."""
         doc = self._doc("task-ff66001122334455")
         self.assertNotIn("metadata", doc)
+
+    # --- a delivered task with no attribution must not pass silently -----
+
+    def test_delivered_without_record_refuses_and_says_so(self):
+        """THE GUARD. A delivery sentinel proves this was a worker's task, so
+        returning nothing silently would relay it as if the core produced it."""
+        tid = "task-5566778899001122"
+        self._sentinel(W1, tid)
+        doc = self._doc(tid)
+        self.assertNotIn("metadata", doc)
+        self.assertTrue(
+            any("refusing to stamp" in m for m in self.logs),
+            f"expected a loud refusal, got {self.logs}",
+        )
+
+    def test_core_result_stays_quiet(self):
+        """Control: no sentinel, no record, no residue is an ORDINARY core
+        result. If this fired, every core reply would log an anomaly."""
+        self._doc("task-6677889900112233")
+        self.assertEqual(
+            [m for m in self.logs if "refusing to stamp" in m], [])
+
+    def test_a_recorded_delivery_does_not_warn(self):
+        """Control: sentinel AND record present is the normal worker path."""
+        tid = "task-7788990011223344"
+        self._assign(tid, W1)
+        self._sentinel(W1, tid)
+        self.assertEqual(self._doc(tid)["metadata"], {"worker_id": W1})
+        self.assertEqual(
+            [m for m in self.logs if "refusing to stamp" in m], [])
 
     # --- fails closed ----------------------------------------------------
 
