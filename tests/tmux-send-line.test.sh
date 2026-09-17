@@ -117,6 +117,15 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
   [ "$rc" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ok "R9 real tmux: a stale matching prompt with a NEW gate below it withholds Enter (keweichen/qingyun-wu live repro)" || fail "R9 real stale-gate" "rc=$rc $(cat "$T/err")"
   tmux -S "$SOCKW" kill-server 2>/dev/null
+  # A REAL python interpreter that succeeds through smoke/hash/lock (those never decode
+  # multi-byte pane text) but fails INSIDE _pending/_after's stdin decode: PYTHONIOENCODING=ascii
+  # against a real UTF-8 glyph in the pane. S6 only covers the interpreter failing outright
+  # (caught at the flock step, before _pending/_after ever run) -- this is the gap keweichen
+  # found live: the parser subprocess itself failing was trusted as "no pending text".
+  tmux -S "$SOCKW" new-session -d -s probe 'printf "\xe2\x9d\xaf half typed"; sleep 30'; sleep 0.5
+  rc=$(PYTHONIOENCODING=ascii bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" > "$T/out" 2> "$T/err"; echo $?)
+  [ "$rc" = 7 ] && grep -q "prompt parse failed" "$T/err" && [ "$(tmux -S "$SOCKW" capture-pane -p -t probe 2>/dev/null | head -1)" = "❯ half typed" ] && ok "R10 real tmux: a parser subprocess failure (forced ascii decode of a real UTF-8 glyph) refuses rather than treating it as empty (keweichen live repro, review 5232068159)" || fail "R10 parser-failure fail-closed" "rc=$rc $(cat "$T/err")"
+  tmux -S "$SOCKW" kill-server 2>/dev/null
 else
   echo "  skip real-tmux leg: no real tmux on this host"
 fi

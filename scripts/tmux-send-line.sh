@@ -66,8 +66,10 @@ print("\n".join(SGR.sub("",x).strip() for x in lines[last_i+1:]) if last_i>=0 el
 }
 CAP="$(_capture)"; RC=$?
 [ $RC -eq 0 ] || { echo "tmux-send-line: capture failed — prompt unknown, not sending" >&2; exit 7; }
-PENDING="$(_pending "$CAP")"
-AFTER_BASELINE="$(_after "$CAP")"
+PENDING="$(_pending "$CAP")"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
+AFTER_BASELINE="$(_after "$CAP")"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: after-prompt parse failed — not sending" >&2; exit 7; }
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
@@ -80,11 +82,13 @@ if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carr
 if [ "$RUNTIME" = codex ]; then
   RECAP="$(_capture)"; RC=$?
   [ $RC -eq 0 ] || { echo "tmux-send-line: capture failed during the delay — Enter withheld" >&2; exit 7; }
-  RECHECK="$(_pending "$RECAP")"
+  RECHECK="$(_pending "$RECAP")"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
   if [ "$RECHECK" != "$LINE" ]; then echo "tmux-send-line: pane changed during the paste-burst delay (composer now '${RECHECK:0:60}', expected '$LINE') — Enter withheld" >&2; exit 5; fi
   # A matching prompt LINE is not proof the composer is still live: it can be a stale line
   # from before a gate/dialog appeared beneath it. Nothing may have changed below it either.
-  AFTER_NOW="$(_after "$RECAP")"
+  AFTER_NOW="$(_after "$RECAP")"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: after-prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
   if [ "$AFTER_NOW" != "$AFTER_BASELINE" ]; then echo "tmux-send-line: pane state changed below the prompt during the delay (was '${AFTER_BASELINE:0:60}', now '${AFTER_NOW:0:60}') — Enter withheld" >&2; exit 5; fi
 fi
 "$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
