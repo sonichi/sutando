@@ -36,15 +36,32 @@ for one actor of nine — the verifier strips the first two and refuses the thir
 3. **The result** is `[no-send]` followed by the verified JSON array (UTF-8,
    whatever the locale), written create-if-absent (temp file in `results/` +
    hard link, which fails when the name exists) to
-   `<workspace>/results/<task-id>.txt`. Before that link the publisher takes a
-   **durable claim**, `<workspace>/state/role-status/claims/<task-id>`
-   (created `O_EXCL`; its body is the result path). The bridge moves the
-   result into `results/archive/`, so the result name alone would let a second
-   publisher through; the claim is the record of truth and is **never removed
-   by the publisher or the consumer** — it is a few bytes per task and the
-   archive already keeps the result. If a publish must genuinely be redone,
-   the owner removes that claim file by hand; there is no force flag. Nothing
-   else is written; the bridge archives the task without a user-visible reply.
+   `<workspace>/results/<task-id>.txt`. The bridge moves the result into
+   `results/archive/`, so the result name alone would let a second publisher
+   through; the record of truth is a **durable claim**,
+   `<workspace>/state/role-status/claims/<task-id>`, in two phases:
+   - **in progress** — created empty (create-if-absent) and `flock`ed by the
+     publisher until the result has linked; a second publisher meeting the
+     lock exits 2 `cannot answer: publication in progress (claim <path>)`.
+   - **committed** — after the link the body becomes the result path (one
+     write under the lock). A committed claim is permanent — **never removed
+     by the publisher or the consumer** (a few bytes per task; the archive
+     keeps the result) — and always refuses, whether or not the live result
+     was since archived. If a publish must genuinely be redone, the owner
+     removes that claim file by hand; there is no force flag.
+   - **rolled back** — any failure between creation and commit (the link
+     refused for a reason other than an existing target, a result already
+     present at the live path) removes the claim before exit 2, so the task is
+     retryable; the exit reports the actual error.
+   - **abandoned** — an empty claim found unlocked is a crash between creation
+     and commit (the kernel releases the lock with the process). The retry
+     recovers it: if a result exists live or under `results/archive/*/`, the
+     claim is committed with that path and the retry exits 2
+     `… already published (claim <path>) -- recovered from <result>`;
+     otherwise the empty claim is reused and the publish proceeds.
+
+   Nothing else is written; the bridge archives the task without a
+   user-visible reply.
 4. **Exit codes:**
    - `0` — published.
    - `1` — refused on coverage: fewer distinct verified actors than
@@ -55,11 +72,11 @@ for one actor of nine — the verifier strips the first two and refuses the thir
      `EVIDENCE_JSON`, event ids present but none resolvable to an owner
      (`cannot answer: no event ownership resolvable`), a verified array that
      cannot be encoded (`cannot answer: result not serializable`), a result
-     already published — the claim exists (`cannot answer: result already
-     published (claim <path>)`, also when the result was since archived or is
-     missing) or the result name exists. **Nothing written**, any existing
-     result and claim untouched. Do not retry the model; surface the task to
-     the owner.
+     already published — a committed claim (`cannot answer: result already
+     published (claim <path>)`, also when the result was since archived), a
+     result present at the live path, or another publisher holding the claim.
+     **Nothing written**, any existing result and committed claim untouched.
+     Do not retry the model; surface the task to the owner.
 
 `publish.py` delegates every judgment decision to `scripts/verify.py`
 (`verify.verify(task_text, judgment, min_coverage)`); the verifier remains

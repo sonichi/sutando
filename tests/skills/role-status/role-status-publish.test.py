@@ -143,9 +143,12 @@ with tempfile.TemporaryDirectory() as td:
     so_buf, se_buf = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
-    check(rc == 2 and "result already published: " in se_buf.getvalue()
-          and (ws / "results" / "task-role-status-v1-0000-a2.txt").read_text() == "[no-send]\n[]\n",
-          "a result already published (no claim on file) is never overwritten: exit 2")
+    out = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    check(rc == 2 and "result already published (claim %s) -- recovered from %s" % (claim_of(ws), out) in se_buf.getvalue()
+          and out.read_text() == "[no-send]\n[]\n",
+          "a result already published with no claim on file is never overwritten: exit 2")
+    check(claim_of(ws).read_text() == str(out) + "\n",
+          "a result already published with no claim on file: the claim is committed against it")
 # results/ unwritable: a regular file sits where the directory should be
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td)
@@ -228,14 +231,17 @@ check("bash skills/role-status/scripts/publish.sh <task-file> <judgment.json>" i
 check(not re.search(r"(^|[\s`(])python3\s", skill_md, re.M), "SKILL.md invokes no bare python3")
 check("state/role-status/claims/<task-id>" in skill_md and "never removed" in skill_md
       and "by hand" in skill_md, "SKILL.md names the claim path, its retention and hand removal")
+check(all(w in skill_md for w in ("**in progress**", "**committed**", "**rolled back**", "**abandoned**", "flock"))
+      and "publication in progress" in skill_md and "recovered from" in skill_md,
+      "SKILL.md documents the claim state machine and its two refusal messages")
 check(all(re.search(r"^\s*- `%s` — " % code, skill_md, re.M) for code in ("0", "1", "2")),
       "SKILL.md lists the three exit codes")
 check("tasks/task-role-status-v1-" in skill_md and "[no-send]" in skill_md
       and "results/<task-id>.txt" in skill_md, "SKILL.md names the task pattern, the [no-send] result and its path")
 check("bare JSON array" in skill_md.replace("**", ""), "SKILL.md asks the delegate for a bare JSON array")
 
-# (9) exclusive publication: two publishers past every check race at the writer's
-# commit point (the O_EXCL claim); exactly one wins, the loser never touches the result.
+# (9) exclusive publication: two publishers past every check race at the claim lock;
+# exactly one wins and commits, the loser exits 2 and never touches the result.
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td) / "ws"
     (ws / "tasks").mkdir(parents=True)
@@ -265,14 +271,14 @@ with tempfile.TemporaryDirectory() as td:
     rcs.clear()
 
     barrier = threading.Barrier(2, timeout=10)
-    real_claim = pub.claim_exclusive
+    real_open = pub.claim_open
 
-    def claim_after_barrier(path, note):
-        barrier.wait()                      # both temp files written, neither claimed yet
-        return real_claim(path, note)
+    def open_after_barrier(path):
+        barrier.wait()                      # both past every check, neither holds the claim yet
+        return real_open(path)
 
     so_buf, se_buf = io.StringIO(), io.StringIO()
-    pub.claim_exclusive = claim_after_barrier
+    pub.claim_open = open_after_barrier
     try:
         with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
             threads = [threading.Thread(target=go, args=("a", j1)), threading.Thread(target=go, args=("b", j2))]
@@ -281,33 +287,43 @@ with tempfile.TemporaryDirectory() as td:
             for th in threads:
                 th.join()
     finally:
-        pub.claim_exclusive = real_claim
+        pub.claim_open = real_open
     winners = [n for n, rc in rcs.items() if rc == 0]
     check(sorted(rcs.values()) == [0, 2], "raced: exactly one rc 0 and one rc 2 (%r)" % rcs)
+    check(len(winners) == 1 and claim_of(ws).read_text() == str(out) + "\n",
+          "raced: the winner's claim is committed with the result path")
     check(len(winners) == 1 and out.read_text()
           == "[no-send]\n" + json.dumps(payload_of[winners[0]], indent=2, ensure_ascii=False) + "\n",
           "raced: the result is the winner's payload, untouched by the loser")
-    check(so_buf.getvalue().count("published ") == 1
-          and se_buf.getvalue().count("cannot answer: result already published") == 1,
-          "raced: one `published` line, one `result already published` refusal")
+    check(so_buf.getvalue().count("published ") == 1 and se_buf.getvalue().count("cannot answer:") == 1
+          and re.search(r"cannot answer: (publication in progress|result already published) \(claim ", se_buf.getvalue()),
+          "raced: one `published` line, one refusal on the claim (in progress or already published)")
     check(sorted(p.name for p in (ws / "results").iterdir()) == ["task-role-status-v1-0000-a2.txt"],
           "raced: no stray temp file left in results/")
-# the writer itself: an existing claim or target is never replaced, the temp file never lingers
+# the writers themselves: an existing target is never replaced, the temp file never lingers;
+# the claim lock is exclusive across descriptors and its body is one write.
 with tempfile.TemporaryDirectory() as td:
     target = Path(td) / "r.txt"
     target.write_text("first")
-    c1, c2 = str(Path(td) / "c1"), str(Path(td) / "c2")
-    check(pub.create_exclusive(str(target), b"second", c1) == "exists" and target.read_text() == "first"
-          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "r.txt"],
-          "create_exclusive on an existing target: 'exists', content kept, no temp file")
-    check(pub.create_exclusive(str(Path(td) / "n.txt"), b"new", c2) == "published"
+    check(pub.link_exclusive(str(target), b"second") is False and target.read_text() == "first"
+          and sorted(p.name for p in Path(td).iterdir()) == ["r.txt"],
+          "link_exclusive on an existing target: False, content kept, no temp file")
+    check(pub.link_exclusive(str(Path(td) / "n.txt"), b"new") is True
           and (Path(td) / "n.txt").read_bytes() == b"new"
-          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "c2", "n.txt", "r.txt"],
-          "create_exclusive on a fresh target: 'published', written, no temp file")
-    check(pub.create_exclusive(str(Path(td) / "m.txt"), b"m", c2) == "claimed"
-          and not (Path(td) / "m.txt").exists()
-          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "c2", "n.txt", "r.txt"],
-          "create_exclusive under an existing claim: 'claimed', the target is never created")
+          and sorted(p.name for p in Path(td).iterdir()) == ["n.txt", "r.txt"],
+          "link_exclusive on a fresh target: True, written, no temp file")
+    c = str(Path(td) / "c")
+    fd = pub.claim_open(c)
+    check(fd is not None and os.path.getsize(c) == 0 and pub.claim_body(fd) == "",
+          "claim_open creates the claim empty and holds it")
+    check(pub.claim_open(c) is None, "claim_open on a held claim: None (the lock is exclusive across descriptors)")
+    check(pub.claim_commit(fd, "/r/x.txt") is None and Path(c).read_text() == "/r/x.txt\n" and pub.claim_body(fd) == "/r/x.txt",
+          "claim_commit writes the result path; claim_body reads it back")
+    os.close(fd)
+    fd2 = pub.claim_open(c)
+    check(fd2 is not None and pub.claim_body(fd2) == "/r/x.txt" and os.path.getsize(c) == len("/r/x.txt\n"),
+          "claim_open on a released committed claim: reopens without truncating")
+    os.close(fd2)
 check("write_atomic" not in src and "os.replace" not in src,
       "publish.py's production write is the exclusive one, never a replace")
 
@@ -346,8 +362,8 @@ with tempfile.TemporaryDirectory() as td:
     check(rc3 == 0 and (ws / "results" / "task-role-status-v1-0000-a3.txt").is_file()
           and claim_of(ws, "task-role-status-v1-0000-a3.txt").is_file(),
           "a fresh task id with no claim publishes; the a2 claim does not bar a3")
-# (d) a stale claim with no result anywhere still refuses: the claim is the record of
-# truth (the result may have been archived or removed); recovery is removing it by hand.
+# (d) a COMMITTED stale claim with no result anywhere still refuses: the claim is the
+# record of truth (the result was archived or removed); recovery is removing it by hand.
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td) / "ws"
     (ws / "tasks").mkdir(parents=True)
@@ -362,14 +378,133 @@ with tempfile.TemporaryDirectory() as td:
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
     check(rc == 2 and "result already published (claim " in se_buf.getvalue()
           and sorted(p.name for p in (ws / "results").iterdir()) == [],
-          "a stale claim with no result anywhere: exit 2, nothing written (results/ empty, no temp file)")
-    check(claim_of(ws).read_text() == "stale\n", "a stale claim is left exactly as found")
+          "a committed stale claim with no result anywhere: exit 2, nothing written (results/ empty, no temp file)")
+    check(claim_of(ws).read_text() == "stale\n", "a committed stale claim is left exactly as found")
     claim_of(ws).unlink()                            # the documented hand recovery
     so_buf, se_buf = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
     check(rc == 0 and (ws / "results" / "task-role-status-v1-0000-a2.txt").is_file(),
           "positive control: with the claim removed by hand the same publish lands")
+
+# (10b) crash consistency of the two-phase claim, against the production writer.
+def fresh_ws(td, judgment=FULL):
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(judgment))
+    return ws, task, j
+
+
+def publish_in(ws, task, j):
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc = pub.main([str(task), str(j), "--workspace", str(ws)])
+    return rc, so_buf.getvalue(), se_buf.getvalue()
+
+
+# (a) the link fails for a reason other than an existing target: rolled back, retryable
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    real_link = os.link
+
+    def link_denied(src, dst, *a, **k):
+        os.link = real_link                          # once
+        raise PermissionError(13, "Permission denied", dst)
+
+    os.link = link_denied
+    try:
+        rc, so, se = publish_in(ws, task, j)
+    finally:
+        os.link = real_link
+    check(rc == 2 and "cannot answer: results/ unwritable: [Errno 13] Permission denied" in se and not live.exists(),
+          "link raises PermissionError: exit 2 with the actual error, no result")
+    check(not claim_of(ws).exists() and sorted(p.name for p in (ws / "results").iterdir()) == [],
+          "link raises PermissionError: the claim is rolled back, no temp file")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 0 and live.is_file() and claim_of(ws).read_text() == str(live) + "\n",
+          "positive control: the plain retry publishes and commits the claim")
+# the link finds a result that appeared after the lookup: rolled back, the result kept
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    real_link = os.link
+
+    def link_exists(src, dst, *a, **k):
+        os.link = real_link
+        live.write_text("[no-send]\n[]\n")           # a hand-written result lands mid-flight
+        raise FileExistsError(17, "File exists", dst)
+
+    os.link = link_exists
+    try:
+        rc, so, se = publish_in(ws, task, j)
+    finally:
+        os.link = real_link
+    check(rc == 2 and "cannot answer: result already present at %s" % live in se
+          and live.read_text() == "[no-send]\n[]\n" and not claim_of(ws).exists(),
+          "link meets an existing target: exit 2, that result kept, the claim rolled back")
+# (b) crash simulation: an empty, unlocked claim and no result anywhere is abandoned -> reused
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    claim_of(ws).parent.mkdir(parents=True)
+    claim_of(ws).touch()
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 0 and live.is_file() and se == "" and claim_of(ws).read_text() == str(live) + "\n",
+          "an empty unlocked claim with no result anywhere: the publish proceeds and commits it")
+# (c) crash simulation: an empty claim while the result already sits in the archive
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td, FULL[::-1])
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    archived = ws / "results" / "archive" / "2026-09" / "task-role-status-v1-0000-a2.txt"
+    archived.parent.mkdir(parents=True)
+    archived.write_text("[no-send]\n[]\n")
+    claim_of(ws).parent.mkdir(parents=True)
+    claim_of(ws).touch()
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 2 and "result already published (claim %s) -- recovered from %s" % (claim_of(ws), archived) in se
+          and not live.exists() and archived.read_text() == "[no-send]\n[]\n",
+          "an empty claim with the result in the archive: exit 2, nothing written, archive untouched")
+    check(claim_of(ws).read_text() == str(archived) + "\n", "the abandoned claim is committed naming the archived result")
+    # an archive copy carrying an epoch suffix is found too
+    archived.rename(archived.with_name("task-role-status-v1-0000-a2.1758130000.txt"))
+    claim_of(ws).write_text("")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 2 and "recovered from " in se and "a2.1758130000.txt" in se and not live.exists(),
+          "an archive copy with an epoch suffix is found by the recovery")
+# another publisher holds the claim: refused without touching it
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    claim_of(ws).parent.mkdir(parents=True)
+    holder = pub.claim_open(str(claim_of(ws)))
+    try:
+        rc, so, se = publish_in(ws, task, j)
+    finally:
+        os.close(holder)
+    check(rc == 2 and "cannot answer: publication in progress (claim %s)" % claim_of(ws) in se
+          and claim_of(ws).exists() and os.path.getsize(str(claim_of(ws))) == 0
+          and sorted(p.name for p in (ws / "results").iterdir()) == [],
+          "a held claim: exit 2 `publication in progress`, the claim left in place, nothing written")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 0, "positive control: once released, the same publish lands")
+# the commit write fails after the link: the result stands, the claim is dropped, a retry recovers
+with tempfile.TemporaryDirectory() as td:
+    ws, task, j = fresh_ws(td)
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    real_commit = pub.claim_commit
+    pub.claim_commit = lambda fd, note: "No space left on device"
+    try:
+        rc, so, se = publish_in(ws, task, j)
+    finally:
+        pub.claim_commit = real_commit
+    check(rc == 0 and live.is_file() and "published " in so and "warning: claim not committed" in se
+          and not claim_of(ws).exists(), "commit fails after the link: rc 0, result stands, the claim is dropped, warned")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 2 and "recovered from %s" % live in se and claim_of(ws).read_text() == str(live) + "\n",
+          "the retry recovers: exit 2, the claim committed against the live result")
 
 # (11) UTF-8 output whatever the locale: a verifier-accepted non-ASCII subject_id and
 # row detail survive LC_ALL=C PYTHONUTF8=0 through the real entry point.
