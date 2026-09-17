@@ -493,6 +493,11 @@ class TestHeartbeatWrite(unittest.TestCase):
             self.assertTrue(core_heartbeat._is_writer_argv(
                 f"/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python {script} --interval 60", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"bash {script}", script))
+            # An unrelated command whose LATER operand is `python3 <script>` is not the writer.
+            self.assertFalse(core_heartbeat._is_writer_argv(f"observer.py python3 {script}", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"/usr/bin/env observer python3 {script}", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(
+                f"/Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python {script}", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"python3 {script}x", script))
         finally:
             for pr in (old, bystander):

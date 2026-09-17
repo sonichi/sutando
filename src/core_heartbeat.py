@@ -673,8 +673,9 @@ def _is_writer_argv(args: str, script: str) -> bool:
     i = m.start(1)
     prefix = args[:i].rstrip()
     after = args[m.end(1):]
-    # Apple's framework interpreter reports itself as `.../Python.app/Contents/MacOS/Python`.
-    return (bool(re.search(r"python[0-9.]*$", prefix, re.IGNORECASE)) and " -c" not in f" {prefix}"
+    # The prefix must be the interpreter TOKEN alone (Apple's framework one ends in
+    # `.../MacOS/Python`): `observer.py python3 <script>` carries the script as data.
+    return (bool(re.fullmatch(r"\S*python[0-9.]*", prefix, re.IGNORECASE))
             and (after == "" or after[0] == " "))
 
 
