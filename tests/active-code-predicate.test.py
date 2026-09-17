@@ -208,6 +208,15 @@ class GluedBranchCommand(unittest.TestCase):
             "if true; then if false; then python3 packages/x/dead.py; "
             "else python3 packages/x/live.py; fi; fi\n"), ["packages/x/live.py"])
 
+    def test_a_sibling_after_a_dead_nested_if_stays_dead(self):
+        """keweichen's round-4 finding: skipping dispatch for a DEAD glued
+        remainder never pushed the nested if's own frame, so its `fi`
+        popped the OUTER frame instead -- a sibling command right after
+        read as reachable again though the outer condition is still false."""
+        self.assertEqual(program_python_args(
+            "if false; then if true; then python3 packages/x/dead1.py; fi; "
+            "python3 packages/x/dead2.py; fi\n"), [])
+
 
 class MultiLinePrograms(unittest.TestCase):
     """keweichen's third [P2] on #4202: the AND-OR state `_segments()` tracks
@@ -285,6 +294,17 @@ class PythonArgsScriptOperand(unittest.TestCase):
                           ["packages/x/test_real.py"])
         self.assertEqual(python_args("python3 -Xtracemalloc packages/x/test_real.py"),
                           ["packages/x/test_real.py"])
+
+    def test_a_clustered_prefix_before_w_or_x_still_takes_a_separate_value(self):
+        """keweichen's round-4 finding: `-uW` ends in W just like bare `-W`,
+        so its value is the NEXT token too, not attached to `-uW` itself."""
+        self.assertEqual(python_args("python3 -uW ignore packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
+    def test_a_clustered_prefix_before_x_then_a_real_dash_c_names_nothing(self):
+        """The clustered `-uX`'s value is the next token (`dev.py`, never a
+        script); the real `-c` right after still consumes everything else."""
+        self.assertEqual(python_args("python3 -uX dev.py -c pass"), [])
 
 
 if __name__ == "__main__":

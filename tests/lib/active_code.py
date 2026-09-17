@@ -136,8 +136,8 @@ def _segment_python_arg(seg: str):
     while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
         if _consumes_script(rest[i]):
             return None  # no script operand exists in this shape
-        # -W/-X take a separate value token; skip it too, not the script.
-        i += 2 if rest[i] in ("-W", "-X") else 1
+        # A separate value token follows only when W/X is the LAST char (bare or clustered, e.g. -uW).
+        i += 2 if rest[i][-1] in "WX" else 1
     if i < len(rest) and rest[i].endswith(".py"):
         return rest[i]
     return None
@@ -211,9 +211,11 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
     than discarding the whole segment (measured false negative: qingyun-wu +
     keweichen, 2026-09-17, both `then` and `else` glued forms). A glued
     remainder can itself open a NESTED `if` on the same split ('then if
-    false; ...') -- re-dispatch it through this same loop rather than
-    crediting it as a plain command, or the nested branch's own drop state
-    is never computed (measured: keweichen, 2026-09-17)."""
+    false; ...'); ALWAYS re-dispatch it, live or dead, so a nested `if`'s
+    own `fi` pops ITS frame and not the outer one -- skipping the dispatch
+    while dead left a later sibling command read as reachable again
+    (measured: keweichen, 2026-09-17, both the never-pushed-frame and the
+    reachable-sibling-after-a-dead-nested-if shapes)."""
     out, stack, pending = [], [], list(segments)
     while pending:
         seg = pending.pop(0)
@@ -229,13 +231,13 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
             stack[-1] = {"kind": "other", "drop": stack[-2]["drop"] if len(stack) > 1 else False}
             continue
         if head == "then" and stack:
-            if rest and not stack[-1]["drop"]:
+            if rest:
                 pending.insert(0, rest)
             continue
         if head == "else" and stack:
             frame, parent_drop = stack[-1], (stack[-2]["drop"] if len(stack) > 1 else False)
             frame["drop"] = True if frame["kind"] == "true" else parent_drop
-            if rest and not frame["drop"]:
+            if rest:
                 pending.insert(0, rest)
             continue
         if head == "fi" and stack:
