@@ -119,10 +119,8 @@ class WorkerAttribution(unittest.TestCase):
         self.mod._STATE = Path(self.workspace) / "nonexistent"
         self.assertEqual(self.mod._worker_of("task-5missingstate0000"), "")
 
-    # --- the writer's PENDING stage (keweichen, #4302) -------------------
-    # mark_done(published=False) lays `.pending` BEFORE the handler publishes
-    # the result and promotes to `.flag` only after it returns, so a ready
-    # result is routinely delivered while only `.pending` exists.
+    # A ready result is routinely delivered while only `.pending` exists, so
+    # reading `.flag` alone loses attribution for that whole window.
 
     def test_pending_alone_still_attributes(self):
         tid = "task-pendingwindow00001"
