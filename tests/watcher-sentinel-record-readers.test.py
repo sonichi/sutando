@@ -576,6 +576,33 @@ def case_argv_vector_reader(box: Path) -> None:
                          capture_output=True, text=True)
     check("  ...and the CLI prints nothing and fails for it",
           cli.returncode == 1 and cli.stdout == "", f"rc={cli.returncode} out={cli.stdout!r}")
+    # In-process, so the module's own branches are measured, not only its subprocess.
+    import contextlib
+    import io
+    real_linux = proc_argv._linux_vector
+    try:
+        def boom(pid):
+            raise RuntimeError("injected")
+        proc_argv._linux_vector = boom
+        got = proc_argv.argv_vector(os.getpid())
+        check("a non-OSError from the /proc reader is swallowed, never raised",
+              got is None or isinstance(got, list), f"got {got!r}")
+    finally:
+        proc_argv._linux_vector = real_linux
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        check("main(): no argument is a usage error, rc 2", proc_argv.main([]) == 2)
+        check("main(): a non-pid is a usage error, rc 2", proc_argv.main(["nope"]) == 2)
+        check("main(): pid 0 is a usage error, rc 2", proc_argv.main(["0"]) == 2)
+    check("  ...and each printed the usage line", err.getvalue().count("usage:") == 3)
+    check("main(): a dead pid is rc 1", proc_argv.main([str(proc.pid)]) == 1)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = proc_argv.main([str(os.getpid())])
+    printed = json.loads(out.getvalue() or "null")
+    check("main(): a live pid prints the JSON vector and exits 0",
+          rc == 0 and isinstance(printed, list) and printed[-len(sys.argv):] == sys.argv,
+          f"rc={rc} printed={printed!r}")
     cli = subprocess.run([sys.executable, str(REPO / "src" / "proc_argv.py"), "nope"],
                          capture_output=True, text=True)
     check("a non-pid argument is a usage error, rc 2", cli.returncode == 2)
