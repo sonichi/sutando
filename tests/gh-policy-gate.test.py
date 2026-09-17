@@ -338,5 +338,90 @@ class EndToEnd(unittest.TestCase):
             self.assertNotIn('"permissionDecision": "deny"', r.stdout)
 
 
+class InProcess(unittest.TestCase):
+    """The branches a subprocess run cannot show coverage for: fail-open paths,
+    `evaluate()` and `main()` driven with a fake stdin."""
+
+    def _run(self, payload, env=None):
+        import contextlib
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                contextlib.redirect_stdout(out):
+            rc = G.main([])
+        return rc, out.getvalue()
+
+    def test_a_non_string_command_yields_no_segments(self):
+        self.assertEqual(G._gh_segments(None), [])
+
+    def test_local_repo_and_my_login_read_gh_and_fail_open(self):
+        from unittest import mock
+        ok = mock.Mock(stdout="o/r\n")
+        with mock.patch.object(G.subprocess, "run", return_value=ok):
+            self.assertEqual(G._local_repo(), "o/r")
+            self.assertEqual(G._my_login(), "o/r")
+        with mock.patch.object(G.subprocess, "run", side_effect=OSError("no gh")):
+            self.assertIsNone(G._local_repo())
+            self.assertIsNone(G._my_login())
+
+    def test_a_checker_that_does_not_run_fails_open(self):
+        from unittest import mock
+        words = _words('gh issue create --repo o/r --title "x"')
+        idx = G._find_subcommand(words, ("issue", "create"))
+        with mock.patch.object(G.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(G.check_issue_create(words, idx))
+        words = _words("gh pr comment 7 --repo o/r --body x")
+        idx = G._find_subcommand(words, ("pr", "comment"))
+        with mock.patch.dict(os.environ, {"SUTANDO_GH_LOGIN": "me"}), \
+                mock.patch.object(G.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(G.check_pr_comment(words, idx))
+
+    def test_pr_comment_without_a_resolvable_login_fails_open(self):
+        from unittest import mock
+        words = _words("gh pr comment 7 --repo o/r --body x")
+        idx = G._find_subcommand(words, ("pr", "comment"))
+        with mock.patch.dict(os.environ, {"SUTANDO_GH_LOGIN": ""}), \
+                mock.patch.object(G, "_my_login", return_value=None):
+            self.assertIsNone(G.check_pr_comment(words, idx))
+
+    def test_pr_url_re_fails_open_when_mono_check_is_missing(self):
+        from unittest import mock
+        with mock.patch.object(G, "MONO_CHECK", Path("/nonexistent/mono.py")):
+            self.assertIsNone(G._load_pr_url_re())
+
+    def test_evaluate_walks_every_segment_and_returns_the_first_denial(self):
+        with tempfile.TemporaryDirectory() as td:
+            G.DUP_CHECK = _stub(td, "dup.py", 0, "clear")
+            G.MONO_CHECK = _stub(td, "mono.py", 1, "MONOLOGUE: 3 in a row")
+            self.assertIsNone(G.evaluate("git status"))
+            self.assertIsNone(G.evaluate('gh issue create --repo o/r --title "t"'))
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"SUTANDO_GH_LOGIN": "me"}):
+                found = G.evaluate('gh issue create --repo o/r --title "t" && gh pr comment 7 --repo o/r --body x')
+            self.assertEqual(found[0], "pr comment")
+            self.assertIn("MONOLOGUE", found[1])
+            G.DUP_CHECK = _stub(td, "dup.py", 1, "REFUSE: #9")
+            self.assertEqual(G.evaluate('gh issue create --repo o/r --title "t"')[0], "issue create")
+
+    def test_main_denies_with_the_gate_reason_and_allows_everything_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            G.DUP_CHECK = _stub(td, "dup.py", 1, "REFUSE: #9")
+            rc, out = self._run(json.dumps({"tool_name": "Bash", "tool_input": {
+                "command": 'gh issue create --repo o/r --title "t"'}}), {"SUTANDO_ALLOW_UNGATED_GH": ""})
+            self.assertEqual(rc, 0)
+            self.assertIn('"permissionDecision": "deny"', out)
+            self.assertIn("#9", out)
+            rc, out = self._run(json.dumps({"tool_name": "Read", "tool_input": {"command": "gh issue create"}}))
+            self.assertEqual((rc, out), (0, ""))
+            rc, out = self._run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}))
+            self.assertEqual((rc, out), (0, ""))
+            rc, out = self._run("not json")
+            self.assertEqual((rc, out), (0, ""))
+            rc, out = self._run(json.dumps({"tool_name": "Bash", "tool_input": {
+                "command": 'gh issue create --repo o/r --title "t"'}}), {"SUTANDO_ALLOW_UNGATED_GH": "1"})
+            self.assertEqual((rc, out), (0, ""))
+
 if __name__ == "__main__":
     unittest.main()
