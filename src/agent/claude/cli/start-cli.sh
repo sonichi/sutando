@@ -43,10 +43,6 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   PY="$(resolve_python "$REPO")"
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent.
-# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
-bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
-
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -151,9 +147,30 @@ fi
 # go. Derived in-session they become deliveries/results, which no bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+# Third half of that seam: without the resolver a worker reads the sentinel
+# itself, so an unforwarded one is the zero-byte read, not a missing option.
+[ -n "${SUTANDO_INBOX_RESOLVER:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER=$SUTANDO_INBOX_RESOLVER")
+[ -n "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER_TIMEOUT=$SUTANDO_INBOX_RESOLVER_TIMEOUT")
 # The worker gate `/startup --worker` runs, named by the spawner: this launcher
 # is the core's, so it forwards the path and never knows which skill owns it.
 [ -n "${SUTANDO_WORKER_BOOTSTRAP:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKER_BOOTSTRAP=$SUTANDO_WORKER_BOOTSTRAP")
+# The done-flag writer, same seam: tmux hands a new session the SERVER's env, so
+# an unforwarded writer leaves the hook complete but never reached.
+[ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_POOL_DELIVERY_SCRIPT=$SUTANDO_POOL_DELIVERY_SCRIPT")
+# A worker session's cwd is the spawner's --cwd, which need not be the repo, and
+# its PATH python3 may be the CLT stub: name both absolutely from here instead.
+if [ -n "$WORKER_INSTANCE" ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+  # Canonical + executable, or EMPTY: a relative/`..` path resolves against the
+  # worker's cwd, and only an explicit -e overrides a stale server-global value.
+  WORKER_PY=""
+  if [ -n "$PY" ] && [ -x "$PY" ]; then
+    _pyd="${PY%/*}"; [ "$_pyd" = "$PY" ] && _pyd="."
+    _pyd="$(cd "$_pyd" 2>/dev/null && pwd -P)" && WORKER_PY="$_pyd/${PY##*/}"
+    [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
+  fi
+  CORE_ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
+fi
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -212,6 +229,10 @@ if [ "${1:-}" = "--print-core-env" ]; then
   printf '%s\n' ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"}
   exit 0
 fi
+
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent. Below
+# the probe exit: --print-core-env is a pure read and must not write settings.
+bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1
@@ -672,8 +693,10 @@ apply_tmux_defaults() {
 # Launched HERE, the one place that knows the canonical TMUX_SOCKET + SESSION —
 # NOT from startup.sh, whose $TMUX is empty in the Sutando.app/background path
 # (so a $TMUX-derived wiring would never start the monitor for the real core).
-# The guard is scoped to THIS socket + out path so a monitor for a different
-# core/socket can never suppress this one.
+# The guard is scoped to THIS socket so a monitor for a different core/socket
+# can never suppress this one. Socket only, not socket + out path: the desktop
+# launcher (launch-sutando.sh) starts the same watcher inside tmux with its own
+# workspace spelling for --out, and matching on that path let both run.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
   [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
@@ -681,7 +704,7 @@ ensure_core_monitor() {
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
-  if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+  if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
       > /tmp/core-input-watch.log 2>&1 &

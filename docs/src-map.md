@@ -25,6 +25,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`archive-transcript.sh`** — Archive the conversation transcript on PreCompact.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
+- **`atomic_replace.py`** — Atomic publication with bounded retries for Windows sharing violations.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
@@ -44,6 +45,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
+- **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
@@ -66,6 +68,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
+- **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
 - **`discord_context_policy.py`** — Alias of `policy.context.discord` (phase-1a restructure); one transition window.
@@ -80,6 +83,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
+- **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
@@ -88,10 +92,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
+- **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
-- **`inline-tools.ts`** — Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
+- **`inline-tools.ts`** — Inline tools — lightweight platform actions that execute instantly without going through the core agent.
 - **`install-channel-bridge-launchd.sh`** — Install / uninstall / inspect a launchd-supervised channel bridge.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
@@ -122,7 +127,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
+- **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -153,7 +160,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
-- **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
+- **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
@@ -166,6 +173,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
+- **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
@@ -174,9 +182,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
+- **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
+- **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
@@ -191,8 +201,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
+- **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
+- **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
+- **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
 - **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
@@ -225,6 +238,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
 - **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
+- **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
@@ -287,6 +301,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`__init__.py`** — _(no header comment)_
 - **`detector.py`** — Claude readiness detector — the Requirement Detector half of the runtime supervisor, and the one-state ClaudeTuiDriver v0 (AUTH_REQUIRED only).
 - **`events.py`** — Ingest RuntimeEvents dropped by the runtime drivers (the desktop watchdog's `hitl_events.rs`) into the HumanRequirement Manager.
+- **`host.py`** — The machine a requirement's terminal is on: the per-host label, "" when unreadable.
 - **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
 - **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
 - **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.

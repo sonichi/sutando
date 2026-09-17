@@ -17,6 +17,8 @@ before any task exists.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -40,6 +42,16 @@ STATES = ("live", "recovering", "abandoned", "retired")
 
 class RosterError(Exception):
     """A declaration the roster cannot represent, refused at compile time."""
+
+
+class PublishError(OSError):
+    """The roster was written but its advertisement was not: the router will
+    follow the new roster, the picker will not until a publish succeeds."""
+
+    def __init__(self, roster: dict, cause: OSError):
+        super().__init__(getattr(cause, "errno", None),
+                         f"roster v{roster.get('version')} written, advertisement not: {cause}")
+        self.roster = roster
 
 
 def _root(workspace) -> Path:
@@ -66,6 +78,29 @@ def _write_atomic(path: Path, payload) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _lock_path(workspace) -> Path:
+    return _root(workspace) / "state" / ".roster.lock"
+
+
+@contextlib.contextmanager
+def _locked(workspace):
+    """Two `register_worker` calls that each read before either writes end
+    with only the later write surviving; the lock closes that window."""
+    p = _lock_path(workspace)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def save_bindings(workspace, bindings: dict) -> None:
+    """Persist the owner's declaration in the shape `load_bindings` reads."""
+    _write_atomic(bindings_path(workspace), {"bindings": dict(bindings)})
 
 
 def load_bindings(workspace) -> dict:
@@ -108,6 +143,32 @@ def resolve_label(roster: dict, name: str) -> str:
     return hits[0] if len(hits) == 1 else name
 
 
+LEGACY_WORKER_FIELD = "target_worker"
+
+
+def requested_worker_of(task: dict, warn=None) -> "str | None":
+    """The route the sender asked for, from the canonical field.
+
+    `target_worker` is accepted for one migration window and reported, so a
+    producer that has not moved keeps working and is visible while it does.
+    Two fields that DISAGREE name two recipients: neither is chosen, because
+    picking one silently routes the owner's message somewhere they can no
+    longer see. The task falls through to its binding instead.
+    """
+    say = warn if warn is not None else (lambda m: print(m, file=sys.stderr))
+    canonical = (task.get("requested_worker") or "").strip() or None
+    legacy = (task.get(LEGACY_WORKER_FIELD) or "").strip() or None
+    if canonical and legacy and canonical != legacy:
+        say(f"pool_roster: SECURITY: requested_worker={canonical!r} disagrees with "
+            f"{LEGACY_WORKER_FIELD}={legacy!r}; ignoring both and using the binding")
+        return None
+    if legacy and not canonical:
+        say(f"pool_roster: DEPRECATED: {LEGACY_WORKER_FIELD} is the old name for "
+            f"requested_worker; the producer of this task should be updated")
+        return legacy
+    return canonical
+
+
 def targets_for(roster: dict, source: str, requested_worker=None) -> list:
     """Resolve one task to its recipients: `requested_worker`, else the binding
     for its source, else the core. A set resolves to its member list.
@@ -130,16 +191,57 @@ def unknown_targets(roster: dict, targets) -> list:
     return [t for t in targets if t not in known]
 
 
+def _load_existing_roster_strict(workspace):
+    """The writer's own read of the roster it is about to replace.
+
+    Absent is a valid starting point. Unreadable or malformed is not — treating
+    either as absent would silently overwrite whatever it is hiding.
+    """
+    p = roster_path(workspace)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise RosterError(f"roster unreadable, refusing to touch it: {p}: {e}") from e
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        raise RosterError(f"roster is not valid JSON, refusing to touch it: {p}: {e}") from e
+    if not isinstance(raw, dict) or "workers" not in raw:
+        raise RosterError(f"roster is missing 'workers', refusing to touch it: {p}")
+    return raw
+
+
+def validate_workers(workers) -> None:
+    """The roster's type boundary, so every caller refuses the same shapes.
+    A row that is not an object would otherwise surface as an AttributeError
+    from whichever reader touched it first."""
+    if workers is not None and not isinstance(workers, dict):
+        raise RosterError(f"workers must be an object, got {type(workers).__name__}")
+    for wid, row in (workers or {}).items():
+        if wid != CORE and not WORKER_ID_RE.match(wid):
+            raise RosterError(f"worker id must match {WORKER_ID_RE.pattern!r}: {wid!r}")
+        if not isinstance(row, dict):
+            raise RosterError(f"worker {wid!r} row must be an object, got {type(row).__name__}")
+        state = row.get("state")
+        if state not in STATES:
+            raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+
+
+def validate_current_roster(workspace) -> None:
+    """Refuse a stored roster this process would fail on mid-mutation, so a
+    caller validates BEFORE it writes anything rather than part-way through."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is not None:
+        validate_workers(raw.get("workers"))
+
+
 def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
-    for wid, row in (workers or {}).items():
-        if wid != CORE and not WORKER_ID_RE.match(wid):
-            raise RosterError(f"worker id must match {WORKER_ID_RE.pattern!r}: {wid!r}")
-        state = (row or {}).get("state")
-        if state not in STATES:
-            raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+    validate_workers(workers)
 
     known = set(workers or {}) | {CORE}
     for source, bound in bindings.items():
@@ -157,9 +259,78 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
                 f"binding {source!r} names {missing} which are not workers — "
                 "a binding to a nonexistent target fails every task from that source")
 
-    prev = load_roster(workspace) or {}
+    prev = _load_existing_roster_strict(workspace) or {}
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
     _write_atomic(roster_path(workspace), roster)
+    _publish(workspace, roster)
     return roster
+
+
+def _publish(workspace, roster: dict) -> None:
+    """The advertisement is derived from the roster, so it is published where the
+    roster is written: a direct `bind_room` is then harmless by construction."""
+    import pool_advertise as pa  # sibling; it imports this module, so bound late
+    try:
+        pa.write_advertisement(workspace)
+    except OSError as e:
+        raise PublishError(roster, e) from e
+
+
+def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
+    """Add a worker to the roster and, if given, bind its room — the one
+    production writer for this transaction.
+
+    Read-merge-write (existing workers, then bindings, then both durable
+    publications) runs under `_locked` so two callers registering different
+    workers at once cannot each read before either writes, which is what
+    drops one of them from the result.
+    """
+    with _locked(workspace):
+        workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
+        workers[worker_id] = {"state": "live", "label": label or worker_id}
+        if runtime:
+            workers[worker_id]["runtime"] = str(runtime)
+        bindings = dict(load_bindings(workspace))
+        if room:
+            bindings[room] = worker_id
+            # The next registration reloads bindings.json, not the roster: a
+            # binding held only in the compiled roster is discarded by it.
+            save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)
+
+
+def bind_room(workspace, room: str, target: str) -> dict:
+    """Bind one room to one worker, named by id or by a unique label — the one
+    production writer for a pin, and it publishes: the compile it ends in writes
+    the advertisement too. Same locked read-merge-write as `register_worker`; an
+    unknown or ambiguous name is refused BEFORE the declaration is saved, so
+    bindings.json never names a target the roster would reject on its next
+    compile."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to bind to")
+        workers = dict(raw.get("workers") or {})
+        wid = resolve_label(raw, target)
+        if wid != CORE and wid not in workers:
+            raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        bindings = dict(load_bindings(workspace))
+        bindings[room] = wid
+        save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)
+
+
+def unbind_room(workspace, room: str) -> dict:
+    """Drop a room's binding; its tasks go to the core again. Absent is not an
+    error: an unpin of an unbound room is the state the owner asked for."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to unbind")
+        workers = dict(raw.get("workers") or {})
+        bindings = dict(load_bindings(workspace))
+        bindings.pop(room, None)
+        save_bindings(workspace, bindings)
+        return compile_roster(workspace, workers, bindings)

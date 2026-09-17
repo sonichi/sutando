@@ -1,0 +1,16 @@
+{
+  "name": "marketplace",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Install marketplace skills, activate cloud tools, update and remove them from the agent — the Marketplace UI's install flow, driven by the owner's request or a use-case doc.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": ["AG2_CLOUD_TOKEN"]
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

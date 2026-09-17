@@ -11,9 +11,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -85,24 +85,39 @@ class Classifier(unittest.TestCase):
         v = w.classify([IDLE] * 6, False, 30)
         self.assertEqual((v["kind"], v["warn"], v["raw_static"]), ("idle", False, True))
 
-    def test_case1_is_pure_raw_static_with_work(self):
-        low = w.classify([IDLE] * 6, True, 60, "core-status running")
-        high = w.classify([IDLE] * 6, True, 900, "core-status running")
-        self.assertEqual((low["kind"], low["warn"], low["confidence"]), ("static-with-work", True, "low"))
-        self.assertEqual(high["confidence"], "high")
-        self.assertIn("core-status running", high["reason"])
+    def test_the_work_queue_does_not_decide_a_verdict(self):
+        # This module reads the CLI (Chi). A static pane is idle whatever is queued
+        # elsewhere; `static-with-work` rested on the queue and is gone.
+        for work in (False, True):
+            v = w.classify([IDLE] * 6, work, 900, "core-status running")
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
 
-    def test_clock_only_pane_is_not_case1(self):
-        # Spec: case 1 is pure static, no normalization. A ticking clock is motion.
+    def test_idle_reason_does_not_claim_nothing_outstanding_when_something_is(self):
+        # qingyun-wu, #4131 review: the verdict correctly ignores the queue (Chi's
+        # design), but the reason text must not then assert the queue is empty.
+        v = w.classify([IDLE] * 6, True, 900, "core-status running")
+        self.assertNotIn("nothing outstanding", v["reason"])
+        self.assertIn("core-status running", v["reason"])
+        v2 = w.classify([IDLE] * 6, False, 900, "")
+        self.assertIn("nothing outstanding", v2["reason"])
+
+    def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
+        for frame in ("❯ \n⏵⏵ APIError: 500 Internal Server Error\n",
+                      "❯ \n⏵⏵ Network error: could not reach the API\n",
+                      "❯ \n⏵⏵ fetch failed\n"):
+            v = w.classify([frame] * 6, False, 300)
+            self.assertEqual((v["kind"], v["warn"]), ("abnormal", True), frame)
+
+    def test_a_clock_ticking_pane_is_not_case1_and_never_warns(self):
+        # A ticking clock is motion, so this pane is alive and never a warning.
+        # It has no kind of its own: `clock-only` only suppressed low-novelty.
         frames = [idle_with_clock(i) for i in range(6)]
         v = w.classify(frames, True, 900)
         self.assertNotEqual(v["kind"], "static-with-work")
         self.assertFalse(v["raw_static"])
-        self.assertTrue(v["clock_only"])
-        # A clock-only pane is ALIVE (Chi): never a warning, with or without work, however long
         for work in (False, True):
             q = w.classify([idle_with_clock(i) for i in range(12)], work, 900)
-            self.assertEqual((q["kind"], q["warn"]), ("clock-only", False), work)
+            self.assertEqual((q["kind"], q["warn"]), ("working", False), work)
         # ...unless retry text says otherwise: counters-only motion WITH retry text is still case 2
         r = w.classify([retry_frame(i) for i in range(12)], True, 60)
         self.assertEqual(r["kind"], "retry-loop")
@@ -119,9 +134,9 @@ class Classifier(unittest.TestCase):
                 f"* {verb} for 1s · done 5:{17 + i // 3:02d} PM · 1 monitor still running\n"
             )
         v = w.classify([frame(i) for i in range(12)], True, 300)
-        # A provider-blocked CLI is its own kind (owner review), not forced into "retry loop".
+        # A provider-abnormal CLI is its own kind (owner review), not forced into "retry loop".
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("provider-limit", True, "high"))
-        self.assertIn("quota-limit", v["current_patterns"])
+        self.assertIn("quota-limit", v["current_abnormal"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
 
     def test_codex_idle_banner_is_not_a_provider_limit(self):
@@ -135,7 +150,7 @@ class Classifier(unittest.TestCase):
                 "› \n"
             )
         v = w.classify([frame(i) for i in range(20)], False, 60)
-        self.assertNotIn("quota-limit", v["matched_patterns"], v)
+        self.assertNotIn("quota-limit", v["matched_patterns"] + v.get("matched_abnormal", []), v)
         self.assertNotEqual(v["kind"], "provider-limit", v)
         # Positive controls: the phrasings that DO mean a limit was hit still match.
         for line in ("You've hit your usage limit · resets 6pm",
@@ -143,7 +158,35 @@ class Classifier(unittest.TestCase):
                      "Session limit reached. Try again at 6pm",
                      "usage limit exceeded for this plan",
                      "/usage-credits to finish what you're working on."):
-            self.assertIn("quota-limit", w.matched_patterns([line]), line)
+            self.assertIn("quota-limit", w.matched_abnormal([line]), line)
+
+    def test_an_abnormal_pane_whose_clock_moves_is_not_clock_only(self):
+        """The clock-only exemption ("a live CLI, not a wedge") swallowed every
+        abnormal state whose pane ticked: #4015 sat 70 min refusing each turn."""
+        def moving(msg):
+            return [f"{msg}\n  idle · 5:{17 + i // 3:02d} PM · nothing running\n> "
+                    for i in range(12)]
+        for msg, want in (("You are out of usage credits", "provider-limit"),
+                          ("Please log in to continue", "abnormal"),
+                          ("Compacting conversation", "abnormal")):
+            v = w.classify(moving(msg), False, 4200)
+            self.assertEqual(v["kind"], want, msg)
+            self.assertTrue(v["warn"], msg)
+
+    def test_abnormal_is_reached_without_any_retry_text(self):
+        """Every abnormal verdict used to be gated on retry text, which is why
+        quota-limit had to live in RETRY_PATTERNS to work at all."""
+        v = w.classify(["Please log in to continue"] * 8, True, 600)
+        self.assertEqual(v["matched_patterns"], [])
+        self.assertIn("needs-login", v["matched_abnormal"])
+        self.assertEqual(v["kind"], "abnormal")
+
+    def test_the_two_families_are_disjoint(self):
+        self.assertFalse({n for n, _ in w.RETRY_PATTERNS} & {n for n, _ in w.ABNORMAL_PATTERNS})
+
+    def test_ordinary_work_still_does_not_warn(self):
+        v = w.classify([f"Thinking... step {i}" for i in range(8)], True, 600)
+        self.assertEqual((v["kind"], v["warn"]), ("working", False))
 
     def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
         # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
@@ -193,15 +236,19 @@ class Classifier(unittest.TestCase):
         v = w.classify([retry_frame(0), retry_frame(0)], True, 1)
         self.assertEqual((v["kind"], v["warn"]), ("unknown", False))
         self.assertIn("too short", v["reason"])
-        self.assertEqual(w.classify([IDLE] * 3, True, 30)["kind"], "unknown")          # would warn → too short
-        self.assertEqual(w.classify([IDLE] * 3, True, 60)["kind"], "static-with-work")
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 30)["kind"], "unknown")  # would warn → too short
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 60)["kind"], "retry-loop")
         self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
-    def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
+    def test_repetition_alone_no_longer_warns_retry_is_read_from_the_text(self):
+        # Novelty measured repetition; retry is a cause. It reached neither the
+        # constant-text retry (text catches it) nor the varying one (novelty 1.00).
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
-        v = w.classify(frames, True, 60)
-        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
-        self.assertEqual(w.classify(frames, False, 60)["kind"], "working")
+        self.assertEqual((w.classify(frames, True, 60)["kind"], w.classify(frames, True, 60)["warn"]),
+                         ("working", False))
+        # ...while the retry the TEXT can see still warns, with or without constant text.
+        r = w.classify([retry_frame(i) for i in range(12)], True, 60)
+        self.assertEqual((r["kind"], r["warn"]), ("retry-loop", True))
 
     def test_working_is_not_a_warning(self):
         v = w.classify([working_frame(i) for i in range(20)], True, 60)
@@ -220,11 +267,11 @@ class Classifier(unittest.TestCase):
 
     def test_thresholds_are_reported_and_overridable(self):
         v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
-                       thresholds={"min_samples": 4, "low_novelty_rate": 0.5})
-        self.assertEqual(v["kind"], "low-novelty")
+                       thresholds={"min_samples": 4})
         self.assertEqual(v["thresholds"]["min_samples"], 4)
-        # the same frames under the provisional thresholds read as working (2/6 = 0.33 > 0.25)
-        self.assertEqual(w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60)["kind"], "working")
+        # pattern_min_consecutive still gates: a retry seen once is not yet a loop.
+        one = [retry_frame(0)] + [working_frame(i) for i in range(11)]
+        self.assertEqual(w.classify(one, True, 60, thresholds={"pattern_min_consecutive": 5})["warn"], False)
         self.assertTrue(v["advisory"])
         self.assertIn("not a health guarantee", v["note"])
 
@@ -270,10 +317,9 @@ class IoEdge(unittest.TestCase):
             v = w.classify_window(entries, w.work_outstanding(ws, now=1500.0), 1500.0)
             # the static run started at 1100 (the working frame before it does not count)
             self.assertEqual(v["duration"], 400.0)
-            self.assertEqual(v["kind"], "static-with-work")
+            self.assertEqual(v["kind"], "idle")
             self.assertEqual(v["trailing_static_samples"], 2)
             self.assertEqual(v["sample_count"], 3)  # the run is still reported whole
-            self.assertEqual(v["confidence"], "low")  # 2 samples: one gap, however long (TustinOC)
             self.assertEqual((v["observation_runs"], v["median_gap_s"]), (1, 300.0))
             # a clock-only trailing run is NOT a static run (raw ids differ)
             for i in range(3):
@@ -297,7 +343,7 @@ class IoEdge(unittest.TestCase):
         # three samples within the continuity limit ARE a run, and the duration is the run's
         entries = [e(0.0), e(600.0), e(1200.0)]
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1230.0)
-        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("static-with-work", "high", 1230.0, 1))
+        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("idle", "high", 1230.0, 1))
         # a window whose newest sample is itself older than the limit has no current observation
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1200.0 + 5000)
         self.assertEqual(v["kind"], "unknown")
@@ -314,7 +360,7 @@ class IoEdge(unittest.TestCase):
         self.assertIn("cannot be observed at this rate", v["reason"])
         # the same pane sampled inside the limit is a plain case-1 warning
         dense = [e(1800.0 * i) for i in range(6)]
-        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "static-with-work")
+        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "idle")
 
     def test_a_cadence_change_is_judged_on_the_recent_gaps_not_the_window_median(self):
         # Codex on 8ada45a: 15 half-hourly samples then 5 hourly ones kept the window median
@@ -380,7 +426,12 @@ class IoEdge(unittest.TestCase):
         junk = lambda *a, **k: SimpleNamespace(returncode=0, stdout="garbage\n")
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=junk, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[4242]))
         self.assertEqual(w._pid_ancestors(pid=777, runner=boom), [777])
-        self.assertIn(os.getppid(), w._pid_ancestors())
+        snapshot = "PID PPID ARGS\n777 4242 child\n4242 1 parent\n"
+        with patch.object(w, "is_windows", return_value=True), \
+                patch.object(w, "process_snapshot", return_value=snapshot):
+            self.assertEqual(w._pid_ancestors(pid=777), [777, 4242])
+        if os.name != "nt":
+            self.assertIn(os.getppid(), w._pid_ancestors())
 
     def test_pane_identity_probe(self):
         ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
@@ -392,7 +443,7 @@ class IoEdge(unittest.TestCase):
 
 def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     """A stand-in tmux binary: each capture-pane prints the next frame from a file."""
-    script = dir_ / "tmux"
+    script = dir_ / ("tmux.py" if os.name == "nt" else "tmux")
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import sys, pathlib\n"
@@ -405,7 +456,28 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
         "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        wrapper = dir_ / "tmux.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        return wrapper
     return script
+
+
+def _append_window_worker(workspace: str, barrier, index: int) -> None:
+    barrier.wait(timeout=20)
+    w.append_window(Path(workspace), working_frame(index), 10.0 + index)
+
+
+def _racy_window_worker(workspace: str, barrier, index: int) -> None:
+    path = w.window_path(Path(workspace))
+    entries = w.load_window(path)
+    barrier.wait(timeout=20)
+    (Path(workspace) / f"racy-{index}.attempted").write_text("1")
+    entries.append({"ts": 10.0 + index, "state": "s", "raw_state": "r", "patterns": []})
+    try:
+        w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+    except OSError:
+        pass
 
 
 class Identity(unittest.TestCase):
@@ -753,8 +825,9 @@ class Cli(unittest.TestCase):
         path = w.record(args, lambda: IDLE, clock=clock, sleep=lambda s: None)
         first = json.loads(path.read_text().splitlines()[0])
         self.assertEqual(sorted(first), ["patterns", "raw_state", "state", "ts"])
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
         args2 = SimpleNamespace(**{**vars(args), "keep_normalized": True})
         path2 = w.record(args2, lambda: IDLE, clock=clock, sleep=lambda s: None)
         self.assertIn("normalized", json.loads(path2.read_text().splitlines()[0]))
@@ -779,14 +852,11 @@ class ConcurrentWriters(unittest.TestCase):
             # Every worker holds the lock only inside append_window; a barrier lines them up
             # at the door so they contend for the same read/modify/write.
             n = 6
-            barrier = mp.Barrier(n)
-
-            def worker(i):
-                barrier.wait(timeout=20)
-                w.append_window(ws, working_frame(i), 10.0 + i)
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=worker, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_append_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
@@ -795,7 +865,8 @@ class ConcurrentWriters(unittest.TestCase):
             entries = w.load_window(w.window_path(ws))
             self.assertEqual(len(entries), 1 + n)
             self.assertEqual(sorted(e["ts"] for e in entries), [1.0] + [10.0 + i for i in range(n)])
-            self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
+            if os.name != "nt":
+                self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
 
     def test_without_the_lock_the_same_race_loses_a_sample(self):
         # Negative control: the pre-fix shape — load, then append+replace after every
@@ -805,22 +876,18 @@ class ConcurrentWriters(unittest.TestCase):
             ws = Path(d)
             w.append_window(ws, IDLE, 1.0)
             n = 3
-            barrier = mp.Barrier(n)
-
-            def racy(i):
-                path = w.window_path(ws)
-                entries = w.load_window(path)
-                barrier.wait(timeout=20)  # everyone has loaded the same 1 entry
-                entries.append({"ts": 10.0 + i, "state": "s", "raw_state": "r", "patterns": []})
-                w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=racy, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_racy_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
                 pr.join(30)
-            self.assertEqual(len(w.load_window(w.window_path(ws))), 2)  # 1 + one survivor, not 4
+            self.assertEqual([pr.exitcode for pr in procs], [0] * n)
+            self.assertEqual(len(list(ws.glob("racy-*.attempted"))), n)
+            self.assertLess(len(w.load_window(w.window_path(ws))), 1 + n)
 
 
 class Confidentiality(unittest.TestCase):
@@ -829,11 +896,23 @@ class Confidentiality(unittest.TestCase):
     def test_window_entries_carry_hashes_and_patterns_only(self):
         with tempfile.TemporaryDirectory() as d:
             entries = w.append_window(Path(d), retry_frame(1), 1.0)
-            self.assertEqual(sorted(entries[-1]), ["patterns", "raw_state", "state", "ts"])
+            self.assertEqual(sorted(entries[-1]), ["abnormal", "patterns", "raw_state", "state", "ts"])
             text = w.window_path(Path(d)).read_text()
             self.assertNotIn("Retrying", text)
             self.assertNotIn("attempt", text)
 
+    def test_persisted_pattern_fields_hold_NAMES_from_the_known_vocabulary(self):
+        # `abnormal` joined `patterns` in the window; both must stay a closed set of
+        # pattern names, never a snippet of the pane that matched.
+        vocab = {n for n, _ in w.RETRY_PATTERNS} | {n for n, _ in w.ABNORMAL_PATTERNS}
+        with tempfile.TemporaryDirectory() as d:
+            e = w.append_window(Path(d), "❯ \n⏵⏵ please log in to continue · run /login\n", 1.0)
+            self.assertTrue(e[-1]["abnormal"], "the fixture must match, or this proves nothing")
+            for key in ("patterns", "abnormal"):
+                self.assertLessEqual(set(e[-1][key]), vocab, key)
+            self.assertNotIn("/login", w.window_path(Path(d)).read_text())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not meaningful on Windows")
     def test_files_are_owner_only_under_a_permissive_umask(self):
         old = os.umask(0o022)
         try:
@@ -879,6 +958,120 @@ class FailureBoundary(unittest.TestCase):
             w.window_path(ws).mkdir(parents=True)
             with self.assertRaises(OSError):
                 w.append_window(ws, IDLE, 1.0)
+
+
+
+class ProseMentioningAStateIsNotThatState(unittest.TestCase):
+    """One negative control per abnormal pattern.
+
+    These panes are agent CLIs whose transcripts are English prose about their
+    own work, so an unanchored substring search is SELF-HITTING: a session
+    discussing compaction classified itself `abnormal` at high confidence
+    (measured on 12 prose-only frames of an idle pane). The matcher anchors to
+    the start of a line after stripping banner decoration — a banner leads its
+    line, prose buries the phrase mid-sentence.
+    """
+
+    PROSE = [
+        ("compacting", "I am compacting the summary of what we discussed"),
+        ("compacting", "reviewing the compacting patterns in cli_wedge"),
+        ("needs-login", "we fixed the bug where it says please log in to continue"),
+        ("needs-login", "a session expired bug we already fixed"),
+        ("awaiting-input", "the draft is waiting for your input before it sends"),
+        ("out-of-credits", "the ticket says the user was out of usage credits last week"),
+        ("quota-limit", "the docs explain what happens when you hit your weekly limit"),
+        # Markdown decoration must not unmask prose as a banner.
+        ("compacting", "- compacting the transcript is what the hook does"),
+        ("compacting", "**compaction** is the thing that lost the context"),
+        ("compacting", "> compacting conversation"),
+        ("compacting", "  - compaction happens at 90%"),
+        ("awaiting-input", "- waiting for your approval before I merge"),
+        ("awaiting-input", "**Waiting for input** on the developer-mode question"),
+        ("needs-login", "- authentication failed on the dev lane, per the log"),
+    ]
+    BANNERS = [
+        ("compacting", "Compacting conversation"),
+        ("compacting", "\u273b Compacting conversation"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired"),
+        ("awaiting-input", "Waiting for your input"),
+        ("out-of-credits", "You are out of usage credits"),
+    ]
+
+    def test_prose_mentioning_a_state_does_not_match(self):
+        for name, line in self.PROSE:
+            self.assertEqual(w.matched_abnormal([line]), [],
+                             f"{name}: prose matched as a banner -> {line!r}")
+
+    def test_real_banners_still_match(self):
+        """The other half. Anchoring alone would drop a true positive --
+        'You are out of usage credits' does not START with the pattern -- so each
+        pattern also carries the banner's leading form. Without this test the
+        anchor could be tightened until nothing fires and every prose case passes."""
+        for name, line in self.BANNERS:
+            self.assertIn(name, w.matched_abnormal([line]),
+                          f"{name}: real banner stopped matching -> {line!r}")
+
+    def test_a_prose_only_idle_pane_does_not_warn(self):
+        frames = [f"I am reviewing the compacting patterns\n  \u00b7 5:{17 + i // 3:02d} PM\n> "
+                  for i in range(12)]
+        v = w.classify(frames, False, 600)
+        self.assertFalse(v["warn"], f"a prose-only idle pane warned: {v}")
+        self.assertNotEqual(v["kind"], "abnormal", v)
+
+    def test_the_internal_marker_does_not_ride_in_the_verdict(self):
+        v = w.classify(["x"], False, 60)
+        self.assertNotIn("_abnormal", v,
+                         "the marker duplicates the flattened abnormal_* keys already spread in")
+
+
+class IdleAbnormalSubcases(unittest.TestCase):
+    """Chi, 2026-09-10: "in idle + abnormal, there are more subcases not mentioned".
+    All five, measured -- four named by text, one by the absence of it."""
+
+    def test_every_idle_abnormal_subcase_is_idle_and_warns(self):
+        for name, frame, work in (
+            ("quota-limit", "❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n", True),
+            ("out-of-credits", "❯ \n⏵⏵ you are out of usage credits\n", True),
+            ("needs-login", "❯ \n⏵⏵ please log in to continue · run /login\n", True),
+            ("awaiting-input", "❯ \n⏵⏵ waiting for your approval to run a command\n", True),
+            ("compacting-frozen", "Compacting conversation…\n", True),
+            ("api-error", "❯ \n⏵⏵ APIError: 500 Internal Server Error\n", True),
+            ("network-error", "❯ \n⏵⏵ Network error: could not reach the API\n", True),
+        ):
+            v = w.classify([frame] * 6, work, 900, "core-status running")
+            self.assertTrue(v["raw_static"], f"{name} must be idle")
+            self.assertTrue(v["warn"], f"{name} must warn, got {v['kind']}")
+
+    def test_a_static_pane_with_no_abnormal_text_is_healthy_idle(self):
+        # Every subcase is named by text now, so a pane with none is idle -- and
+        # stays idle whether or not work is queued elsewhere.
+        for work in (False, True):
+            v = w.classify(["❯ \n⏵⏵ bypass permissions on · 1 monitor\n"] * 6, work, 900)
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
+
+
+class FourCasesFold(unittest.TestCase):
+    """Chi, 2026-09-10: "retry loop is under moving + abnormal". Every kind is a
+    cell of the 2x2, never a fifth case. This pins the FOLD, not the kind names."""
+
+    CELLS = {
+        "idle": ("idle", "healthy"), "static-with-work": ("idle", "abnormal"),
+        "abnormal": ("moving", "abnormal"), "provider-limit": ("idle", "abnormal"),
+        "retry-loop": ("moving", "abnormal"), "working": ("moving", "healthy"),
+    }
+
+    def test_every_warning_kind_sits_in_an_abnormal_cell(self):
+        for kind, (_, health) in self.CELLS.items():
+            warns = kind not in ("idle", "working")
+            self.assertEqual(warns, health == "abnormal", kind)
+
+    def test_retry_is_the_moving_abnormal_cell_not_a_fifth_case(self):
+        r = w.classify([retry_frame(i) for i in range(12)], True, 300)
+        self.assertEqual(r["kind"], "retry-loop")
+        self.assertFalse(r["raw_static"], "moving")
+        self.assertTrue(r["warn"], "abnormal")
+        self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
 
 
 if __name__ == "__main__":

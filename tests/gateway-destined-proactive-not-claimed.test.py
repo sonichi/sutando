@@ -45,6 +45,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            print("mock gateway: poll client disconnected during restart", file=sys.stderr)
+
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
         self.send_response(code)
@@ -75,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["room_posts"].append(json.loads(raw))
             except ValueError:
                 pass
-        self._json({"ok": True})
+        self._json({"ok": True, "event_id": "$mock"})
 
 
 srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -105,10 +111,17 @@ env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
             "AGENT_MXID": "@mock-agent:example.org"})
 env.pop("GATEWAY_INSTANCE", None)
 
-proc = subprocess.Popen(
-    [sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
-    cwd=str(REPO), env=env,
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def start_bridge():
+    return subprocess.Popen(
+        [sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
+        cwd=str(REPO), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(90)"])
+live_claim = rdir / f"proactive-102.sending.{holder.pid}"
+live_claim.write_text("live owner's in-flight body", encoding="utf-8")
+proc = start_bridge()
 
 try:
     deadline = time.monotonic() + 25
@@ -121,6 +134,7 @@ try:
             break
         if proc.poll() is not None:
             break
+        time.sleep(0.05)
     check(proc.poll() is None, "bridge process is alive (main() actually ran)")
     check(delivered_control,
           "positive control: undestined proactive IS delivered to /v1/room")
@@ -133,9 +147,47 @@ try:
           "destined .to-discord body never reaches the gateway's room")
     check((rdir / "proactive-101.to-discord.txt").exists(),
           "destined file remains on disk under its original name")
-finally:
+    check(holder.poll() is None and live_claim.exists(),
+          "startup does not signal a live claim owner or reclaim its body")
+
     proc.kill()
-    out = proc.stdout.read().decode(errors="replace")[-1500:]
+    proc.communicate(timeout=10)
+    # Expire the crashed bridge's heartbeat lease without waiting 90 seconds.
+    lock = sdir / "locks" / "gateway-bridge.lock"
+    lease = json.loads(lock.read_text(encoding="utf-8"))
+    lease["heartbeat_at"] = 0
+    lock.write_text(json.dumps(lease), encoding="utf-8")
+    orphan = rdir / f"proactive-103.sending.{proc.pid}"
+    orphan.write_text("recovered after restart", encoding="utf-8")
+    proc = start_bridge()
+    deadline = time.monotonic() + 25
+    recovered = []
+    while time.monotonic() < deadline and proc.poll() is None:
+        with LOCK:
+            recovered = [p for p in STATE["room_posts"]
+                         if p.get("body") == "recovered after restart"]
+        if recovered:
+            break
+        time.sleep(0.05)
+    time.sleep(2)
+    with LOCK:
+        recovered = [p for p in STATE["room_posts"]
+                     if p.get("body") == "recovered after restart"]
+    check(proc.poll() is None and len(recovered) == 1
+          and recovered[0]["room_id"] == "!mock:example.org"
+          and not orphan.exists() and not (rdir / "proactive-103.txt").exists(),
+          "post-restart orphan reaches the gateway owner DM exactly once")
+    check(holder.poll() is None and live_claim.exists(),
+          "live claim ownership survives both service startups")
+finally:
+    if proc.poll() is None:
+        proc.kill()
+    out = proc.communicate(timeout=10)[0].decode(errors="replace")[-1500:]
+    if holder.poll() is None:
+        holder.terminate()
+    holder.wait(timeout=10)
+    srv.shutdown()
+    srv.server_close()
 
 if failures:
     print("--- bridge output tail ---")
