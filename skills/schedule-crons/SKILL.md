@@ -25,6 +25,7 @@ Each entry has:
 - `artifact` (optional string) — the filename STEM of the dated output this job produces, e.g. `"fleet-growth"` for `fleet-growth-2026-08-18.mp4`. Read by `health-check.py`'s `daily-cron-punctuality` probe. Without it the probe infers a stem from the last hyphenated token of the job name, so `talk-events-nightly` looks for `nightly-<date>.*`, never observes the real artifact, and reports the job UNCHECKED forever. Declare it whenever the name does not already equal the stem.
 - `conditional` (optional bool) — set `true` when the job runs on schedule but produces output only if there is new input (a nightly render with no new beats). The punctuality probe then treats "no artifact today" as evidence of nothing rather than a miss; lateness is still measured from the artifacts that do exist.
   On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
+- `owner` (optional string) — which session's `CronCreate` registration this entry belongs to: absent means the core (today's only behavior, unchanged). A worker-pool worker's bare id (the same id `pool_roster.py`/`worker_identity.py` use, e.g. `"d1fc9b10050b490d894947f96627447f"`) pins the entry to that worker instead — that worker's own `/startup` registers it (see `skills/startup/SKILL.md`'s worker section), and step 3 below must skip it here so the two registrations never double-fire the same job. Set this by hand when moving a job that a pinned room's cron output belongs to from the core onto its worker, per `src/cron_ownership.py` (the one shared filter both registration passes call — see `docs/architecture-boundaries.md` "Shared adapter policy").
 
 ### Durable Codex schedules
 
@@ -102,7 +103,16 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      authoritative for this routed core. This is a registration
      override only; never rewrite `crons.json`, because that configured value is the restoration
      target after quota resets. Codex keeps using its own quota telemetry and durable scheduler.
-3. For each job in the config:
+3. **Filter to entries the core owns before iterating.** This step always runs as the core, never a worker (workers never call `/schedule-crons`; see `skills/startup/SKILL.md`'s worker section). Skip any entry whose `owner` names a worker — it belongs to that worker's own registration, and registering it here too double-fires it (this closed a real incident: a room's `event-mining-hourly` posted from both the core and its pinned worker until the entry was marked `owner`-pinned). Absent `owner` is unaffected — that is still every entry today.
+   ```bash
+   python3 -c "
+   import json, sys
+   sys.path.insert(0, 'src')
+   from cron_ownership import entries_for_owner, CORE
+   cfg = json.load(open('$CF'))
+   print(json.dumps(entries_for_owner(cfg, CORE)))"
+   ```
+   Iterate the filtered list below, not the raw file.
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).

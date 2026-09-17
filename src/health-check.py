@@ -77,6 +77,7 @@ from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # n
 import process_pins  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
@@ -1265,6 +1266,10 @@ def check_session_cron_registration(
 
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry_owner(entry) != CRON_CORE:
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
             return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
@@ -6820,16 +6825,18 @@ def check_gateway_bridge() -> "dict | None":
     if not configured:
         return None
     try:
-        gw = subprocess.run(
-            # remote-relay-bridge.py is a shipped compat stub running the same
-            # client, so an instance under the old name is a real duplicate.
-            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+        # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
+        # apart. The relay name is a compat stub, so it is a real duplicate.
+        pids, probe_ok = probe_pids(r"remote-(gateway|relay)-bridge\.py$")
     except Exception:
-        pids = []
+        pids, probe_ok = [], False
     if not pids:
+        if not probe_ok:
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": "process probe failed — gateway bridge state unknown",
+            }
         return {
             "name": "gateway-bridge",
             "status": "warn",

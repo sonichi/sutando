@@ -139,6 +139,9 @@ ALLOWLIST = {
     # cloud_auth never resolves the workspace — read_cloud_auth(ws) takes the
     # dir from its caller (report-feedback / marketplace resolve it).
     "src/cloud_auth.py",
+    # core_lineage never resolves the workspace — lineage_dir(workspace, host)
+    # takes the root from the heartbeat, which owns the resolution.
+    "src/core_lineage.py",
     # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
     # dir from its caller (marketplace / connect-apps resolve it).
     "src/station_stamp.py",
