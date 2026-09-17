@@ -222,6 +222,70 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
         self.assertEqual(codes, [0, 0, 0], codes)
         self.assertEqual(self.final["reviewer"].get("human_discord_id"), self.H)
 
+    SHAPE = "id_shape_failures"
+
+    def three_passes_with_triage(self, roster_doc, triage):
+        td = pathlib.Path(tempfile.mkdtemp())
+        (td / "triage.json").write_text(json.dumps(triage))
+        cur = td / "in0.json"
+        cur.write_text(json.dumps(roster_doc, indent=1))
+        codes = []
+        self.final = None
+        for n in range(1, 4):
+            out = td / f"sidecar{n}.json"
+            r = subprocess.run([sys.executable, str(SCRIPT), "--roster", str(cur),
+                                "--triage-config", str(td / "triage.json"), "--out", str(out)],
+                               capture_output=True, text=True)
+            codes.append(r.returncode)
+            if not out.is_file():
+                break
+            self.final = json.loads(out.read_text())
+            cur = out
+        return codes
+
+    def pathless_shape(self, kind, states, ids=None):
+        """A v2 sidecar whose ONLY record of H is a pathless shape finding."""
+        rec = {"path": None, "kind": kind, "reason": "carried contest",
+               "arbitrated_ids": [self.H] if ids is None else ids,
+               "arbitrated_states": states}
+        return {"_schema": {"name": "reviewer-identity", "version": 2},
+                "reviewer": {"stand_status": self.S, self.SHAPE: [rec]}}
+
+    TRIAGE_HUMAN = {"people": {"reviewer": {"discord": "1400000000000000001"}}}
+    TRIAGE_BOT = {"people": {"reviewer": {"bots": ["1400000000000000001"]}}}
+
+    def test_a_pathless_identity_record_is_kept_and_the_triage_HUMAN_stays_contested(self):
+        """`_still_unresolved` kept only two named kinds and dropped every other
+        pathless record, so a `list` finding naming H as a Stand vanished and the
+        triage config then published H as the human. Measured rc 0 -> 0 -> 0 with
+        `human_discord_id` = H and the record deleted before the fix."""
+        codes = self.three_passes_with_triage(self.pathless_shape("list", ["stand"]), self.TRIAGE_HUMAN)
+        self.assertEqual(codes, [5, 5, 5], codes)
+        e = self.final["reviewer"]
+        self.assertNotEqual(e.get("human_discord_id"), self.H)
+        self.assertEqual(len(e.get(self.SHAPE) or []), 1, "the identity record was erased")
+
+    def test_a_pathless_identity_record_is_kept_and_the_triage_STAND_stays_contested(self):
+        codes = self.three_passes_with_triage(self.pathless_shape("list", ["human"]), self.TRIAGE_BOT)
+        self.assertEqual(codes, [5, 5, 5], codes)
+        e = self.final["reviewer"]
+        self.assertNotIn(self.H, [(s.get("id") if isinstance(s, dict) else s)
+                                  for s in e.get("other_stand_discord_ids") or []])
+        self.assertEqual(len(e.get(self.SHAPE) or []), 1)
+
+    def test_CONTROL_the_overflow_kind_was_always_kept(self):
+        codes = self.three_passes_with_triage(
+            self.pathless_shape("arbitration-overflow", ["stand"]), self.TRIAGE_HUMAN)
+        self.assertEqual(codes, [5, 5, 5], codes)
+
+    def test_CONTROL_a_pathless_diagnostic_with_no_ids_is_still_dropped(self):
+        """The predicate is identity-bearing, not carry-everything."""
+        codes = self.three_passes_with_triage(self.pathless_shape("list", [], ids=[]), self.TRIAGE_HUMAN)
+        self.assertEqual(codes, [0, 0, 0], codes)
+        e = self.final["reviewer"]
+        self.assertEqual(e.get("human_discord_id"), self.H)
+        self.assertEqual(len(e.get(self.SHAPE) or []), 0)
+
     def test_CONTROL_the_documented_account_container_still_resolves(self):
         """The fix must refuse the BLANK, not the container: `account` is documented."""
         codes = self.three_passes(self.fresh_source(["account"]))

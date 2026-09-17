@@ -597,14 +597,10 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
     again — otherwise a repair stays latched behind a stale record.
     """
     path = rec.get("path")
-    if rec.get("kind") in (ri.INVALID_KIND, ri.OVERFLOW_KIND):
-        # Pathless BY DESIGN and blocking: no path exists to re-check, so the
-        # pathless-evidence rule below would silently discard the refusal.
-        return True
     if not path:
-        # Derived from a source this pass re-reads (the triage config), so the
-        # fresh pass re-raises it if it still holds. Carrying it latches it.
-        return False
+        # Pathless: nothing to re-check. Blocking kinds and any record naming
+        # contested ids stay (the schema owner's predicate); diagnostics drop.
+        return ri.must_keep(rec)
     if path in fresh_paths:
         return True
     if ri.writer_owned_path(path):
