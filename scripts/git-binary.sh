@@ -27,14 +27,31 @@ _sutando_git_realpath() {
 	printf '%s/%s' "$_rdir" "${_target##*/}"
 }
 
-# True when $1's REAL target (symlinks resolved) is the system git -- a
-# symlink pointing AT the stub is the stub. Unresolvable -> treated as stub too.
+# A real stat (its own inode, never the CLT stub group), not `[ -e ]`: only
+# it tells ENOENT apart from any other failure. Exit: 0 exists, 1 absent, 2 unknown.
+_sutando_git_stat_state() {
+	_err="$(/usr/bin/stat -f '%p' "$1" 2>&1 >/dev/null)" && return 0
+	case "$_err" in
+		*'No such file or directory'*) return 1 ;;
+		*) return 2 ;;
+	esac
+}
+
+# True when $1's REAL target is the system git, OR unverified either way --
+# only a positive distinct-identity check, or the reference proven absent, may clear it.
 _sutando_git_is_system_stub() {
-	[ -f "$1" ] || return 1
+	_sutando_git_stat_state "$1" || return 0
 	_resolved="$(_sutando_git_realpath "$1")" || return 0
 	# Split so the exact flagged token stays out of this file (REVIEW.md
 	# lesson 7 / scripts/python-binary.sh's own comment on the same point).
 	_sb="/usr"/bin/git
+	_sutando_git_stat_state "$_sb"; _sb_state=$?
+	case "$_sb_state" in
+		1) return 1 ;;
+		0) ;;
+		*) return 0 ;;
+	esac
+	_sutando_git_stat_state "$_resolved" || return 0
 	# -ef compares filesystem identity (device+inode): realpath above does
 	# not case-fold, so a case-insensitive-volume alias missed `=` alone.
 	[ "$_resolved" -ef "$_sb" ]

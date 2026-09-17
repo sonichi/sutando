@@ -165,5 +165,33 @@ else
   echo "  skip case-variant-alias test (host filesystem is case-sensitive)"
 fi
 
+# --- 12. a CANDIDATE that vanished since resolve_git's own -f/-x check (a
+# TOCTOU race) must be UNKNOWN, never handed back as a proven-safe non-stub.
+bash -c ". '$REPO/scripts/git-binary.sh'; _sutando_git_is_system_stub '/definitely/does/not/exist/git-19'"
+rc12=$?
+check "a candidate that fails its own stat is treated as unknown, not distinct" "$rc12" "0"
+
+# --- 13. a REFERENCE-side failure that is NOT genuine absence (permission,
+# I/O) must also stay UNKNOWN -- only ENOENT (case 3) proves nothing matches.
+lab13=$(mktemp -d)
+touch "$lab13/git"
+bash -c "
+  . '$REPO/scripts/git-binary.sh'
+  _sutando_git_stat_state() { [ \"\$1\" = /usr/bin/git ] && return 2; return 0; }
+  _sutando_git_is_system_stub '$lab13/git'
+"
+rc13=$?
+check "a reference-side non-absence failure must not clear the candidate as verified-distinct" "$rc13" "0"
+
+# Positive control, same seam: reference genuinely ABSENT still resolves to
+# "not the stub" -- proves the mock and the branching both discriminate.
+bash -c "
+  . '$REPO/scripts/git-binary.sh'
+  _sutando_git_stat_state() { [ \"\$1\" = /usr/bin/git ] && return 1; return 0; }
+  _sutando_git_is_system_stub '$lab13/git'
+"
+rc13b=$?
+check "...while a genuinely absent reference still resolves to not-the-stub" "$rc13b" "1"
+
 if [ "$fail" -eq 0 ]; then echo "PASS ($pass/$((pass+fail)))"; else echo "FAIL ($fail failed)"; fi
 exit "$fail"
