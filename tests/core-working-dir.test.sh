@@ -67,12 +67,17 @@ t = m._hook_settings_target(pathlib.Path(sys.argv[1]))
 print("REFUSED" if t is None else str(t))
 PY
 mkdir -p "$ROOT/abs dir" "$ROOT/default"  # the default exists too, so every path compares physically
-for shape in "-unset-" "$ROOT/abs dir" "~/core home" "~someoneelse/core" "relative/dir"; do
+for shape in "-unset-" "$ROOT/abs dir" "~/core home" "~someoneelse/core" "relative/dir" \
+             " $ROOT/abs dir" "$ROOT/abs dir " "  "; do
   S="$(sh_target "$shape")"; P="$(py_target "$shape")"
   # bash prints the physical path; python resolves too — compare physically when both are paths.
   if [ "$S" != REFUSED ] && [ "$P" != REFUSED ]; then S="$(cd "$S" 2>/dev/null && pwd -P || echo "$S")"; P="$(cd "$P" 2>/dev/null && pwd -P || echo "$P")"; fi
   ok "agreement on '$shape': bash='$S' python='$P'" "$([ "$S" = "$P" ] && echo 0 || echo 1)"
 done
+# Whitespace is not trimmed on either side. A stripping mirror made "  " REFUSED in bash and
+# the repo default in python — "refused there, repo here", which is a false green.
+ok "whitespace-only override is REFUSED on BOTH sides, never the repo default" \
+   "$([ "$(sh_target '  ')" = REFUSED ] && [ "$(py_target '  ')" = REFUSED ] && echo 0 || echo 1)"
 ok "the refused forms are refused on BOTH sides (not repo on one)" \
    "$([ "$(sh_target '~someoneelse/core')" = REFUSED ] && [ "$(py_target '~someoneelse/core')" = REFUSED ] && [ "$(sh_target 'relative/dir')" = REFUSED ] && [ "$(py_target 'relative/dir')" = REFUSED ] && echo 0 || echo 1)"
 

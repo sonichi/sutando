@@ -11561,7 +11561,9 @@ def _hook_settings_target(repo: Path) -> Optional[Path]:
     here it is None: the installer wrote nothing for that launch, so no file can stand for it.
     tests/core-working-dir.test.sh runs both implementations over one input table.
     """
-    override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
+    # No .strip(): the bash resolver this mirrors does not strip, so stripping here
+    # made "  " refused there and the repo default here — the one shape the contract forbids.
+    override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
     if not override:
         return repo
     if override.startswith("~/"):
