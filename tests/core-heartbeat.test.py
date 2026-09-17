@@ -445,6 +445,11 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIn("has-session -t =<session>", doc)
         self.assertNotIn("answers with the **server's own socket path and that session name**", doc)
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
+        claude = (ROOT / "src" / "agent" / "claude" / "cli" / "start-cli.sh").read_text()
+        stop = claude.index('"$PY" "$REPO/src/core_heartbeat.py" --stop')
+        self.assertLess(claude.index('log_restart_attempt "begin'), stop)
+        self.assertLess(stop, claude.index('log_restart_attempt "kill-complete; creating fresh core"'))
+        self.assertIn('log_restart_attempt "heartbeat handoff: ', claude)
 
     def test_recording_the_writer_pid_never_creates_the_cores_dir(self):
         # An EMPTY state/cores reads as "every core offline" to signal_room_tasks.core_is_alive, so a
@@ -677,6 +682,9 @@ class TestBeatOnlyWhenObserved(unittest.TestCase):
         here = "/Users/x/github/sutando-core-main/src/core_heartbeat.py"
         other = "/usr/bin/python3 /Users/x/github/sutando/src/core_heartbeat.py --interval 30"
         self.assertTrue(core_heartbeat._is_writer_argv(other, here))
+        # step 5.5 starts it by a repo-relative path; a restart's --stop must still see it
+        self.assertTrue(core_heartbeat._is_writer_argv("python3 src/core_heartbeat.py", here))
+        self.assertFalse(core_heartbeat._is_writer_argv("python3 notsrc/core_heartbeat.py", here))
         self.assertFalse(core_heartbeat._is_writer_argv("python3 -c 'import x' /a/src/core_heartbeat.py", here))
         self.assertFalse(core_heartbeat._is_writer_argv("bash -c sleep 60", here))
 

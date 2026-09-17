@@ -658,7 +658,8 @@ def _recorded_writer_pids() -> list[int]:
     return pids
 
 
-_WRITER_SCRIPT_RE = re.compile(r"(?:^|\s)(\S*/src/core_heartbeat\.py)(?=\s|$)")
+# Relative too: the skill's step 5.5 starts `python3 src/core_heartbeat.py` from the repo.
+_WRITER_SCRIPT_RE = re.compile(r"(?:^|\s)((?:\S*/)?src/core_heartbeat\.py)(?=\s|$)")
 
 
 def _is_writer_argv(args: str, script: str) -> bool:
@@ -678,6 +679,11 @@ def _is_writer_argv(args: str, script: str) -> bool:
 
 
 def stop_other_writers(timeout_s: float = 5.0) -> int:
+    """How many writers `stop_writers` ended."""
+    return len(stop_writers(timeout_s))
+
+
+def stop_writers(timeout_s: float = 5.0) -> list[int]:
     """SIGTERM the heartbeat writer(s) this host's records name — after proving each pid is an
     interpreter running a core_heartbeat.py — and wait for exit (SIGKILL past the timeout). Nothing
     is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
@@ -709,7 +715,7 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    return len(pids)
+    return pids
 
 
 def mark_stopped() -> None:
@@ -744,7 +750,8 @@ def main(argv: list[str] | None = None) -> int:
         mark_stopped()
         return 0
     if args.stop:
-        print(f"core_heartbeat: stopped {stop_other_writers()} writer(s)", flush=True)
+        pids = stop_writers()
+        print(f"core_heartbeat: stopped {len(pids)} writer(s)" + (": " + " ".join(map(str, pids)) if pids else ""), flush=True)
         return 0
     if args.once:
         write_beat(status=args.status)
