@@ -212,6 +212,48 @@ class AssignmentAttribution(unittest.TestCase):
                                side_effect=PermissionError("denied")):
             self.assertEqual(self.mod._assigned_worker(tid), "")
 
+    def test_delivery_traversal_is_refused(self):
+        self.assertEqual(self.mod._delivery_recipient("../../etc/passwd"), "")
+
+    def test_unreadable_deliveries_root_is_refused(self):
+        """An unreadable root is NO READING, not "never delivered" — the whole
+        point of the discriminator is that those differ."""
+        tid = "task-8899001122334455"
+        self._sentinel(W1, tid)
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError("x")):
+            self.assertEqual(self.mod._delivery_recipient(tid), "")
+
+    def test_another_tasks_sentinel_is_not_ours(self):
+        """A populated recipient dir holding somebody else's sentinel must not
+        claim this task — both suffixes miss and the loop falls through."""
+        self._sentinel(W1, "task-9900112233445566")
+        self.assertEqual(self.mod._delivery_recipient("task-0011223344556677x"), "")
+
+    def test_unreadable_sentinel_is_refused(self):
+        tid = "task-1122334455667780"
+        self._sentinel(W1, tid)
+        with mock.patch.object(self.mod.os, "lstat",
+                               side_effect=PermissionError("x")):
+            self.assertEqual(self.mod._delivery_recipient(tid), "")
+
+    def test_non_regular_sentinel_is_refused(self):
+        """A directory named like a sentinel is malformed; the writer would
+        never make one, so the reader refuses to believe it."""
+        tid = "task-2233445566778890"
+        d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}{pool_delivery.PENDING_SUFFIX}").mkdir()
+        self.assertEqual(self.mod._delivery_recipient(tid), "")
+
+    def test_accepted_stage_counts_too(self):
+        """Positive control for the second suffix: a task already accepted is
+        still evidence it was delivered."""
+        tid = "task-3344556677889901"
+        d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}{pool_delivery.ACCEPTED_SUFFIX}").write_text("")
+        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+
     def test_traversal_is_refused(self):
         self.assertEqual(self.mod._assigned_worker("../../etc/passwd"), "")
 
