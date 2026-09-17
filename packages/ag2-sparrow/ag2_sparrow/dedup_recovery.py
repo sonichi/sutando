@@ -16,7 +16,7 @@ from pathlib import Path
 # This file is bundled verbatim into ag2_sparrow, where its siblings are
 # package submodules; in src/ they are flat modules. Support both.
 try:  # pragma: no cover - exercised by whichever context imports it
-    from .local_task_protocol import find_result, valid_archive_lookup_id
+    from .local_task_protocol import resolve_result, valid_archive_lookup_id
     from .result_markers import (
         build_requeued_task,
         dedup_cross_sender_target,
@@ -26,7 +26,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
     )
     from .task_archive import find_task_file
 except ImportError:  # pragma: no cover - flat src/ import path
-    from local_task_protocol import find_result, valid_archive_lookup_id
+    from local_task_protocol import resolve_result, valid_archive_lookup_id
     from result_markers import (
         build_requeued_task,
         dedup_cross_sender_target,
@@ -42,12 +42,17 @@ __all__ = [
     "REPORT_TEMPLATE",
     "CROSS_SENDER_TEMPLATE",
     "MALFORMED_TEMPLATE",
+    "DEFER",
 ]
 
 MALFORMED_TEMPLATE = (
     "⚠️ This was folded into another task, but the holder id on the marker is "
     "unusable, so it could not be recovered. It needs a direct answer."
 )
+
+# Adapters compare against this rather than the literal: a defer that an
+# adapter cannot name is one it archives through, losing route and result.
+DEFER = "defer"
 
 REPORT_TEMPLATE = (
     "⚠️ This was folded into `{holder}`, which delivered nothing, and "
@@ -60,13 +65,46 @@ CROSS_SENDER_TEMPLATE = (
 )
 
 
-def _read(path) -> str | None:
+# Present-but-unreadable is not missing: an answer may land a moment later, so
+# a terminal decision now would re-ask a question that is about to be answered.
+UNREADABLE = object()
+
+
+def _read(path):
     if path is None:
         return None
     try:
-        return path.read_text()
-    except OSError:
-        return None
+        body = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError, so a torn holder escaped `except
+        # OSError`; errors="replace" would decode it into a false non-skip answer.
+        return UNREADABLE if path.exists() else None
+    return body
+
+
+def _holder_result(results_dir: Path, holder: str):
+    """The holder's delivered body, UNREADABLE while it may still land, or None.
+
+    Readiness belongs to `resolve_result`, which calls an empty or whitespace-only
+    body pending. Location decides what that means: a LIVE empty body may be a
+    write in flight, so deferring lets it land; an ARCHIVED one was consumed
+    having delivered nothing, and deferring on it would wait forever.
+    """
+    results_dir = Path(results_dir)
+    state, path, body = resolve_result(results_dir, holder)
+    if state == "ready":
+        return body
+    if state == "pending":
+        # Only a real file can be a write in flight; a directory in its place
+        # never resolves, so deferring on one would wait forever.
+        if path is None or not path.is_file():
+            return None
+        if path.parent == results_dir:
+            return UNREADABLE
+        # Archived: `_read` still separates torn (undecodable, defer) from an
+        # empty body, which is a consumed holder that answered nothing.
+        return _read(path)
+    return None
 
 
 def plan_dedup_recovery(
@@ -93,12 +131,16 @@ def plan_dedup_recovery(
     and the next pass would add another.
     """
     holder = (holder_id or "").strip()
-    # `find_result` refuses a malformed id, so recovery would read "delivered
-    # nothing" and carry these bytes into the re-ask. Reject; never echo them.
+    # The readiness owner refuses a malformed id, so recovery would read
+    # "delivered nothing" and carry these bytes into the re-ask. Never echo them.
     if holder and not valid_archive_lookup_id(holder):
         return "report", MALFORMED_TEMPLATE
     orig_text = _read(find_task_file(Path(tasks_dir), task_id))
-    holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
+    # The holder is a RESULT, so its readiness is the result owner's call, not a
+    # second definition here: present-but-empty is pending, exactly like torn.
+    holder_text = _holder_result(Path(results_dir), holder) if holder else None
+    if orig_text is UNREADABLE or holder_text is UNREADABLE:
+        return "defer", None
 
     decision = dedup_decision(holder_text, orig_text)
     # "honour" asks whether the holder replied, never WHO it replied to: across

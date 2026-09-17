@@ -70,6 +70,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/restart-guard.sh",
             "src/file_lock.py",
             "src/local_task_protocol.py",
+            # local_task_protocol resolves results through the readiness owner, so
+            # the fake repo must carry it or the workstream lookup fails closed.
+            "src/delivery/__init__.py",
+            "src/delivery/readiness.py",
             "src/result_markers.py",
             "src/task_priority.py",
             "src/task_archive.py",
