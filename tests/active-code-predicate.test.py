@@ -535,6 +535,84 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "set -o pipefail\nset - +o pipefail\n"
                 "false | true && python3 packages/x/dead.py"), [])
 
+    def test_quote_provenance_is_per_word_not_a_whole_command_search(self):
+        """keweichen round 17: `set -o "$OPT" '$OPT'` -- the FIRST occurrence
+        (double-quoted, expandable) is the one `-o` actually consumes and
+        really enables pipefail; the second (single-quoted) is just a
+        positional leftover. A whole-command substring search for a
+        literal copy of "$OPT" finds the SECOND one and wrongly calls the
+        FIRST occurrence literal too -- confirmed by direct execution:
+        pipefail goes on, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "OPT=pipefail\n"
+                "set -o \"$OPT\" '$OPT'\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_dollar_escaped_inside_double_quotes_is_still_a_literal(self):
+        """`set -o "\\$OPT"`: the backslash escapes `$` INSIDE double
+        quotes too, so this never expands and Bash rejects it as a literal
+        invalid option name -- confirmed by direct execution: dead.py runs
+        (pipefail never gets enabled)."""
+        self.assertEqual(
+            program_python_args(
+                'set -o "\\$OPT"\n'
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_split_quoting_of_the_dollar_sign_is_also_a_literal(self):
+        """`set -o '$'OPT`: adjacent quoted/unquoted spans concatenate into
+        ONE word (`'$'` + `OPT` = the literal string `$OPT`, no space
+        between them) -- confirmed by direct execution: Bash rejects it,
+        dead.py runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o '$'OPT\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_an_unrecognized_option_name_aborts_the_whole_set_invocation(self):
+        """`set -o pipefail; set -o invalid +o pipefail`: Bash's `set`
+        validates each `-o` NAME and aborts the instant it sees one it
+        doesn't recognize -- the trailing `+o pipefail` in the SAME
+        invocation is never reached, so pipefail (enabled earlier) stays
+        on -- confirmed by direct execution: dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set -o invalid +o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_tab_after_bang_still_negates_the_pipeline(self):
+        """`!<TAB>false | true`: `_command_tokens` already peeled a
+        tab-separated `!`; `_raw_segments`'s own negation check required a
+        literal space and missed the tab form -- confirmed by direct
+        execution: dead.py runs (pipefail's real exit gets negated)."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "!\tfalse | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_bare_brace_expansion_of_the_o_value_is_resolved(self):
+        """`set -o pipe{fail,foo}`: Bash brace-expands this to two words,
+        `pipefail` and `pipefoo`, and `-o` consumes the first -- confirmed
+        by direct execution: pipefail goes on, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipe{fail,foo}\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_quoted_brace_expansion_is_suppressed_and_stays_literal(self):
+        """Control for the case above: quoting suppresses brace expansion
+        entirely -- confirmed by direct execution: Bash rejects the
+        literal string and dead.py runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o 'pipe{fail,foo}'\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

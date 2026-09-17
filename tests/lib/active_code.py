@@ -295,74 +295,148 @@ def _segments(line: str):
     return _filter_dead_branches(_raw_segments(line))
 
 
+def _shell_words(text: str):
+    """`text` as (value, expandable, any_quoted) triples. `expandable` is
+    True iff the word carries a `$`/backtick that occurs unquoted or inside
+    double quotes without an escaping backslash. `any_quoted` is True iff
+    ANY part of the word was inside quotes at all -- brace expansion is
+    suppressed by quoting entirely (confirmed by direct execution: both
+    `'pipe{fail,foo}'` and the double-quoted form stay the literal,
+    rejected string), so a value carrying no `$` still needs this to gate
+    it. Adjacent quoted/unquoted spans concatenate into ONE word (Bash's
+    own split-quoting rule, e.g. `'$'OPT` is one word). Exists because
+    shlex.split() erases exactly the quoting distinction -- `'$OPT'`,
+    `\\$OPT`, `"$OPT"` and bare `$OPT` all become the identical resolved
+    token, though only the last two are ever expanded by Bash (keweichen
+    rounds 15-17, confirmed by direct execution)."""
+    words, val, expandable, any_quoted = [], [], False, False
+    quote, i, n = None, 0, len(text)
+
+    def flush():
+        nonlocal val, expandable, any_quoted
+        if val:
+            words.append(("".join(val), expandable, any_quoted))
+        val, expandable, any_quoted = [], False, False
+
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            any_quoted = True
+            if ch == "'":
+                quote = None
+            else:
+                val.append(ch)
+            i += 1
+        elif quote == '"':
+            any_quoted = True
+            if ch == '"':
+                quote = None
+                i += 1
+            elif ch == "\\" and i + 1 < n and text[i + 1] in "\"\\$`":
+                val.append(text[i + 1]); i += 2  # escaped -- literal, not expandable
+            else:
+                if ch in "$`":
+                    expandable = True
+                val.append(ch); i += 1
+        elif ch in " \t\n":
+            flush(); i += 1
+        elif ch == "'":
+            quote = "'"; i += 1
+        elif ch == '"':
+            quote = '"'; i += 1
+        elif ch == "\\" and i + 1 < n:
+            val.append(text[i + 1]); i += 2  # unquoted escape -- literal
+        else:
+            if ch in "$`":
+                expandable = True
+            val.append(ch); i += 1
+    flush()
+    return words
+
+
+_BRACE_RE = __import__("re").compile(r"^([^{}]*)\{([^{}]*)\}([^{}]*)$")
+
+
+def _brace_candidates(raw_word: str) -> list:
+    """One-level Bash brace expansion of a BARE (unquoted) word -- `Bash
+    quoting suppresses it entirely, confirmed by direct execution: `set -o
+    'pipe{fail,foo}'` and the double-quoted form both stay the literal,
+    rejected string, never expanding. `{x}` with no comma is not brace
+    syntax at all and stays literal too."""
+    m = _BRACE_RE.match(raw_word)
+    if not m or "," not in m.group(2):
+        return [raw_word]
+    pre, mid, post = m.groups()
+    return [pre + part + post for part in mid.split(",")]
+
+
+# Bash's own `set -o`/`+o` names (3.2 ∪ 5.x); an unrecognized value ABORTS
+# the whole `set` before a later `-o`/`+o` in it is ever reached (round 17).
+_SET_O_NAMES = frozenset((
+    "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace",
+    "hashall", "histexpand", "history", "ignoreeof", "keyword", "monitor",
+    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd",
+    "physical", "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+))
+
+
 def _sets_pipefail(text: str) -> "bool | str | None":
     """The pipefail state a `set` invocation leaves ON, "unknown" when a
     toggle's value cannot be resolved statically, or None when `text` is
     not `set`, or is `set` with nothing pipefail-relevant at all.
 
     `o` anywhere in a `-`/`+` short-opt cluster ALWAYS consumes the next
-    whole token as its value, regardless of the cluster's other letters --
+    whole word as its value, regardless of the cluster's other letters --
     keweichen round 12, confirmed by direct execution: `set -oe pipefail`
-    and `set -euo pipefail` both enable it exactly like `-o`/`-eo` do, so
-    scanning for a trailing `o` (round 11's regex) missed the leading-`o`
-    form. Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
-    re-evaluates each left to right -- so the LAST one found wins.
+    and `set -euo pipefail` both enable it exactly like `-o`/`-eo` do.
+    Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
+    re-evaluates each left to right -- so the LAST one found wins, UNLESS
+    an earlier one names an unrecognized option: that aborts the whole
+    invocation before any later toggle is reached (round 17).
 
     Scanning stops at `--` OR a lone `-` (both are Bash's own end-of-options
-    markers for `set`) OR at the first token that isn't `-`/`+`-shaped at
-    all (`set -o pipefail positional +o pipefail` leaves it ON: Bash's own
-    `set` ends option processing there too, so the trailing `+o pipefail`
-    is just $2/$3) -- and a quoted value (`set -o 'pipefail'`) is the same
-    value shell-quoted -- keweichen rounds 13/15/16, confirmed by direct
-    execution. A value containing `$`/backtick may resolve to "pipefail" at
-    runtime and we cannot know without a real shell (`OPT=pipefail; set -o
-    "$OPT"` really enables it) -- "unknown" propagates that honestly rather
-    than silently asserting the toggle did nothing. But shlex has ALREADY
-    erased single-quoting/escaping by the time a token exists, so `set -o
-    '$OPT'`/`set -o \\$OPT` produce the identical token "$OPT" as the
-    expandable bare/double-quoted form, though Bash rejects both as a
-    literal invalid option name and leaves pipefail untouched (round 16) --
-    checked against the untokenized text, the same fix as `!`'s. And the
-    cluster/option SLOT itself can be an expansion (`FLAG=-o; set "$FLAG"
-    pipefail` really enables it) -- once we can't even tell if a token is
-    an option or the end of options, "unknown" is the only honest answer
-    and nothing after it is safe to interpret either (round 16)."""
-    import re
-    import shlex
-    try:
-        toks = shlex.split(text)
-    except ValueError:
-        toks = text.split()
-    if not toks or toks[0] != "set":
+    markers for `set`) OR at the first word that isn't `-`/`+`-shaped at
+    all (`set -o pipefail positional +o pipefail` leaves it ON) -- and a
+    value containing `$`/backtick may resolve to "pipefail" at runtime and
+    we cannot know without a real shell -- "unknown" propagates that
+    honestly, checked per-WORD via `_shell_words()` rather than by a
+    whole-command substring search, which cannot tell two occurrences of
+    the identical resolved text apart when only one of them is the value a
+    `-o` actually consumed (round 17: `set -o "$OPT" '$OPT'` enables
+    pipefail from the FIRST, expandable occurrence; a substring check for
+    a literal copy of "$OPT" anywhere in the command found the SECOND one
+    and wrongly called the whole thing literal). Bare brace expansion
+    (`set -o pipe{fail,foo}`) is also resolved, since Bash performs it."""
+    words = _shell_words(text)
+    if not words or words[0][0] != "set":
         return None
-
-    def literally_quoted(val: str) -> bool:
-        """True when `val`'s occurrence in `text` was single-quoted or
-        backslash-escaped -- a literal argument, never expanded, though
-        shlex's OWN token for it is identical to the expandable forms."""
-        return f"'{val}'" in text or ("\\" + val) in text
-
     result, i = None, 1
-    while i < len(toks):
-        tok = toks[i]
-        # An expansion HERE could be an option or the end of options -- we
-        # cannot even tell which, so nothing past it is safe to interpret.
-        if re.search(r"[$`]", tok):
-            if not literally_quoted(tok):
-                result = "unknown"
+    while i < len(words):
+        val, expandable, quoted = words[i]
+        if expandable:
+            result = "unknown"
             break
-        if tok in ("--", "-"):
+        if val in ("--", "-"):
             break
-        if not tok or tok[0] not in "-+":
+        if not val or val[0] not in "-+":
             break
-        if len(tok) > 1 and not tok.startswith("--") and "o" in tok[1:]:
+        if len(val) > 1 and not val.startswith("--") and "o" in val[1:]:
             i += 1
-            if i < len(toks):
-                val = toks[i]
-                if val == "pipefail":
-                    result = tok[0] == "-"
-                elif re.search(r"[$`]", val) and not literally_quoted(val):
+            if i < len(words):
+                vval, vexpandable, vquoted = words[i]
+                if vexpandable:
                     result = "unknown"
+                elif vval == "pipefail":
+                    result = val[0] == "-"
+                else:
+                    candidates = _brace_candidates(vval) if not vquoted else [vval]
+                    for cand in candidates:
+                        if cand == "pipefail":
+                            result = val[0] == "-"
+                            break
+                    else:
+                        if vval not in _SET_O_NAMES:
+                            break  # unrecognized name -- Bash aborts here
                 i += 1
             continue
         i += 1
@@ -454,7 +528,7 @@ def _raw_segments(line: str):
         cur = []
         text = s.strip()
         if text:
-            if pending_op != "|" and (text == "!" or text.startswith("! ")):
+            if pending_op != "|" and (text == "!" or text[:2] in ("! ", "!\t")):
                 pipe_negate = True
                 text = text[1:].strip()
             elif pending_op != "|":

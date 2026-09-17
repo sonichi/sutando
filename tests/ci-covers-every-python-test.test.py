@@ -393,6 +393,41 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_per_word_quote_provenance_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 17: two occurrences of the identical resolved
+        text, only the first (expandable) is the value `-o` consumes."""
+        wf = ("steps:\n  - run: |\n"
+              "      OPT=pipefail\n"
+              "      set -o \"$OPT\" '$OPT'\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_unrecognized_option_name_abort_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 17: an unrecognized -o NAME aborts the whole
+        set invocation before a later toggle in the same command is ever
+        reached."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set -o invalid +o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_brace_expansion_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 17: bare brace expansion of the -o value."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipe{fail,foo}\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
