@@ -1340,7 +1340,9 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
                                   ri.SHAPE_FIELD: [{"path": "p", "kind": "str",
                                                     "reason": "r",
                                                     "arbitrated_ids": HUMAN}]})
-        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [], err)
+        # One contested id, never one per character; and the dispute blocks.
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [HUMAN], err)
+        self.assertEqual(rc, 5, err)
 
     def test_a_non_dict_carried_record_does_not_crash_the_run(self):
         # Corrupt carried state is not evidence that no refusal existed, so

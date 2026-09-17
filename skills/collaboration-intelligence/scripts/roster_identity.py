@@ -152,7 +152,10 @@ def is_snowflake(v) -> bool:
 
 def _snowflake_list(value) -> list:
     """Whole snowflakes only. A bare string is NOT iterated — doing so wrote
-    one fake id per character into `unresolved_discord_ids`."""
+    one fake id per character into `unresolved_discord_ids` — but a bare
+    string that IS one snowflake is that one contested id, not nothing."""
+    if isinstance(value, str):
+        return [value] if is_snowflake(value) else []
     if not isinstance(value, (list, tuple)):
         return []
     return [v for v in value if is_snowflake(v)]
@@ -181,6 +184,10 @@ def canonical_shape_failure(rec) -> "dict | None":
     ids = _snowflake_list(rec.get("arbitrated_ids"))
     if ids:
         out["arbitrated_ids"] = sorted(set(ids))
+    elif rec.get("arbitrated_ids"):
+        # Present but unusable: a refusal whose ids cannot be read is still a
+        # refusal (schema), so it blocks rather than degrading to a diagnostic.
+        out["kind"] = INVALID_KIND
     st = rec.get("arbitrated_states")
     st = [st] if isinstance(st, str) else st
     st = [v for v in st if v in _REFERENTS] if isinstance(st, (list, tuple)) else []

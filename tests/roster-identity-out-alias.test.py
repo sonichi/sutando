@@ -286,6 +286,30 @@ class ReMigrationKeepsARefusal(unittest.TestCase):
         self.assertEqual(e.get("human_discord_id"), self.H)
         self.assertEqual(len(e.get(self.SHAPE) or []), 0)
 
+    def test_a_SCALAR_snowflake_in_arbitrated_ids_is_one_contested_id_HUMAN_direction(self):
+        """`_snowflake_list` turned a whole scalar snowflake into [], so the
+        record lost its identity fact and was dropped; the triage config then
+        published H. Measured rc 0 -> 0 -> 0 with `human_discord_id` = H before."""
+        codes = self.three_passes_with_triage(self.pathless_shape("list", ["stand"], ids=self.H), self.TRIAGE_HUMAN)
+        self.assertEqual(codes, [5, 5, 5], codes)
+        e = self.final["reviewer"]
+        self.assertNotEqual(e.get("human_discord_id"), self.H)
+        self.assertEqual([r.get("arbitrated_ids") for r in e.get(self.SHAPE) or []], [[self.H]])
+
+    def test_a_SCALAR_snowflake_in_arbitrated_ids_is_one_contested_id_STAND_direction(self):
+        codes = self.three_passes_with_triage(self.pathless_shape("list", ["human"], ids=self.H), self.TRIAGE_BOT)
+        self.assertEqual(codes, [5, 5, 5], codes)
+        e = self.final["reviewer"]
+        self.assertNotIn(self.H, [(s.get("id") if isinstance(s, dict) else s)
+                                  for s in e.get("other_stand_discord_ids") or []])
+
+    def test_a_PRESENT_but_unreadable_arbitrated_ids_blocks_instead_of_vanishing(self):
+        """Present-but-unusable is a refusal, never an absence (schema)."""
+        codes = self.three_passes_with_triage(self.pathless_shape("list", ["stand"], ids="not-an-id"), self.TRIAGE_HUMAN)
+        self.assertEqual(codes, [5, 5, 5], codes)
+        kinds = [r.get("kind") for r in self.final["reviewer"].get(self.SHAPE) or []]
+        self.assertIn("invalid", kinds, kinds)
+
     def test_CONTROL_the_documented_account_container_still_resolves(self):
         """The fix must refuse the BLANK, not the container: `account` is documented."""
         codes = self.three_passes(self.fresh_source(["account"]))
