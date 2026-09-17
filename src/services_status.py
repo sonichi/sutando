@@ -159,18 +159,25 @@ def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
     name a process GROUP to os.kill, which succeeds and reads falsely running).
     """
     from util_paths import read_sentinel_record
-    try:
-        if not path.exists():
-            return ("offline", "no pidfile", None)
-        if not path.read_text().strip():
-            return ("offline", "empty pidfile", None)
-    except OSError as e:
-        return ("unknown", f"unreadable pidfile: {e}", None)
+    # No private decode ahead of the reader: a strict read raised on one bad
+    # byte, so a corrupt sentinel aborted the whole status refresh.
     rec = read_sentinel_record(path)
-    pid, head = rec.get("pid"), rec.get("pid_line", "")
+    if "pid_line" not in rec:
+        try:
+            if not path.exists():
+                return ("offline", "no pidfile", None)
+        except OSError:
+            pass
+        return ("unknown", "unreadable pidfile", None)
+    pid, head = rec.get("pid"), rec["pid_line"]
     if pid is None:
-        if head.isascii() and (head.isdigit() or (head[:1] == "-" and head[1:].isdigit())):
-            return ("unknown", f"non-positive pid {head} in pidfile", None)
+        if not head and len(rec) == 1:
+            return ("offline", "empty pidfile", None)
+        digits = head[1:] if head[:1] == "-" else head
+        if head.isascii() and digits.isdigit():
+            if head[:1] == "-" or not digits.strip("0"):
+                return ("unknown", f"non-positive pid {head} in pidfile", None)
+            return ("unknown", f"out-of-range pid {head[:40]} in pidfile", None)
         return ("unknown", f"unreadable pidfile: no pid on line 1 ({head[:40]!r})", None)
     if pid_alive(pid):
         return ("running", f"pid {pid}", None)

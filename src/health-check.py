@@ -9560,7 +9560,9 @@ def fix_task_watcher_sentinel(check: dict) -> str:
         try:
             # Read-then-unlink, NOT arbitrated the way the write above is:
             # POSIX has no conditional unlink, so a claim landing here is lost.
-            if pid_file.read_text().strip() == pid:
+            rec = read_sentinel_record(pid_file)
+            # The shared reader: a strict decode raised past `except OSError`.
+            if rec.get("pid_line") == pid and set(rec) <= {"pid", "pid_line"}:
                 pid_file.unlink()
         except OSError as e:
             # Reporting a withdrawal that did not happen is the same class of

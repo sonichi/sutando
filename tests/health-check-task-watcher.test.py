@@ -32,6 +32,7 @@ Covers:
   u3) a pid that stops being the watcher mid-write has its stamp withdrawn —
      the pre-write probe is a snapshot, so publication is re-validated
   u4) ...and a withdrawal the OS denied is reported as such, never as done
+  u5) ...and a corrupt re-claim in that window is left alone, never a raise
   v) a check with no repairable pid is declined, not stamped with junk
   w) an unwritable state dir is reported, never raised into the caller
   w2) ...including when it is the exclusive create, not the mkdir, that fails
@@ -325,6 +326,39 @@ def case_u3_pid_stale_after_publication_is_withdrawn() -> list[str]:
             fails.append(f"u3) left a stamp for a dead watcher: {pid_file.read_text()!r}")
         if "withdrawn" not in msg:
             fails.append(f"u3) should report the withdrawal, got {msg!r}")
+    return fails
+
+
+def case_u5_a_corrupt_reclaim_mid_write_does_not_crash_the_fix() -> list[str]:
+    """(u3) where the re-claim that lands in the withdrawal window is bytes the
+    strict read-back could not decode. The fixer must neither raise nor unlink
+    a file that is not its own stamp."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        pid_file = ws / "state" / "watch-tasks-stream.pid"
+        seen = {"n": 0}
+
+        def _argv_then_exit_and_reclaim(pid):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return "bash src/watch-tasks-stream.sh"
+            pid_file.write_bytes(b"9999\ninstance=\xff\n")
+            return "zsh -l"
+
+        hc._proc_argv = _argv_then_exit_and_reclaim
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        except Exception as e:  # noqa: BLE001
+            return [f"u5) the fix raised on a corrupt re-claim: {type(e).__name__}: {e}"]
+        finally:
+            hc._proc_argv = _REAL_PROC_ARGV
+        if seen["n"] < 2:
+            fails.append(f"u5) the post-write probe never ran ({seen['n']} call(s))")
+        if not pid_file.exists() or pid_file.read_bytes() != b"9999\ninstance=\xff\n":
+            fails.append("u5) a re-claimed sentinel that was not our stamp was unlinked or altered")
+        if not msg:
+            fails.append("u5) the fix returned nothing to report")
     return fails
 
 
@@ -861,6 +895,7 @@ def main() -> int:
         ("u2", case_u2_competing_claim_inside_the_write_window_survives),
         ("u3", case_u3_pid_stale_after_publication_is_withdrawn),
         ("u4", case_u4_a_withdrawal_that_failed_is_not_reported_as_done),
+        ("u5", case_u5_a_corrupt_reclaim_mid_write_does_not_crash_the_fix),
         ("v", case_v_fix_declines_without_a_pid),
         ("w", case_w_fix_reports_a_write_failure),
         ("w2", case_w2_unwritable_state_dir_is_reported),

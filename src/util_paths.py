@@ -592,6 +592,13 @@ def watcher_sentinel_paths(state_dir) -> "list[Path]":
     return found + rest
 
 
+# pid_t is a signed 32-bit int on macOS and Linux; a longer digit string is
+# corruption, and int() itself refuses >4300 digits (ValueError).
+_PID_T_MAX = 2**31 - 1
+_PID_MAX_DIGITS = len(str(_PID_T_MAX))
+_SENTINEL_PARSER_KEYS = frozenset({"pid", "pid_line"})
+
+
 def read_sentinel_record(path) -> dict:
     """The watcher sentinel `src/watcher_sentinel.sh:sentinel_write_record` wrote.
 
@@ -604,26 +611,29 @@ def read_sentinel_record(path) -> dict:
 
     `{}` when the file is absent or unreadable, and no `pid` key when line 1 is
     not a usable pid: an unknown must not render as a value (REVIEW.md 13).
-    `pid_line` carries line 1 verbatim whenever the file has one, so a consumer
-    can say WHY a sentinel is unusable without re-deriving line 1 for itself.
-    Never raises — a probe is not the place to learn the file is corrupt.
+    `pid_line` carries line 1 verbatim (stripped; "" for an empty file) whenever
+    the file could be read, so a consumer can say WHY a sentinel is unusable
+    without re-deriving line 1 for itself. `pid` and `pid_line` are the parser's
+    own: a claim line can never set them, so a malformed line 1 stays pid-less
+    whatever the lines below say. Never raises — a probe is not the place to
+    learn the file is corrupt.
     """
     try:
         lines = Path(path).read_text(errors="replace").splitlines()
     except (OSError, ValueError):
         return {}
-    out: dict = {}
-    if lines:
-        head = lines[0].strip()
-        out["pid_line"] = head
-        # 0/negatives name a process GROUP to os.kill/ps, so they are corruption
-        # here; `isascii` too, since "²".isdigit() is True and int("²") raises.
-        if head.isascii() and head.isdigit() and int(head) > 0:
-            out["pid"] = int(head)
+    head = lines[0].strip() if lines else ""
+    out: dict = {"pid_line": head}
+    # 0/negatives name a process GROUP to os.kill/ps, so they are corruption
+    # here; `isascii` too, since "²".isdigit() is True and int("²") raises.
+    if (head.isascii() and head.isdigit() and len(head) <= _PID_MAX_DIGITS
+            and 0 < int(head) <= _PID_T_MAX):
+        out["pid"] = int(head)
     for line in lines[1:]:
         key, sep, value = line.partition("=")
-        if sep and key.strip():
-            out.setdefault(key.strip(), value)
+        key = key.strip()
+        if sep and key and key not in _SENTINEL_PARSER_KEYS:
+            out.setdefault(key, value)
     return out
 
 

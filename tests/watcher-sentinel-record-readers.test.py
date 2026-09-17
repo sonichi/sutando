@@ -122,6 +122,51 @@ def case_reader(state: Path) -> None:
     check("a junk sentinel's record carries no pid key", "pid" not in jrec, f"got {jrec!r}")
     check("  ...but DOES carry line 1, so a consumer can say why it is unusable",
           jrec.get("pid_line") == "not-a-pid", f"got {jrec!r}")
+    # A claim line can never supply what line 1 failed to: `pid=` under a
+    # malformed line 1 used to land the STRING "12345" under the reserved key.
+    forged = state / "bad-forged.pid"
+    forged.write_bytes(b"broken\npid=12345\n")
+    frec = up.read_sentinel_record(forged)
+    check("a `pid=` claim under a malformed line 1 manufactures no pid",
+          "pid" not in frec and frec.get("pid_line") == "broken", f"got {frec!r}")
+    check("  ...and read_sentinel_pid is None for it", up.read_sentinel_pid(forged) is None)
+    forged.write_bytes(b"broken\npid_line=4242\npid=4242\n")
+    frec = up.read_sentinel_record(forged)
+    check("  ...nor can a claim overwrite pid_line", frec == {"pid_line": "broken"}, f"got {frec!r}")
+    ctrl = state / "ctrl-forged.pid"
+    ctrl.write_bytes(b"4242\npid=1\ninstance=w1\n")
+    crec = up.read_sentinel_record(ctrl)
+    check("CONTROL: a well-formed line 1 still reads its pid beside a `pid=` claim",
+          crec.get("pid") == 4242 and crec.get("instance") == "w1", f"got {crec!r}")
+
+    # Total on bytes: one invalid UTF-8 byte or a 5000-digit line 1 must yield
+    # a record, never a UnicodeDecodeError / ValueError out of a status probe.
+    raw = state / "bad-bytes.pid"
+    raw.write_bytes(b"\xff\n")
+    try:
+        brec = up.read_sentinel_record(raw)
+        check("a line 1 holding byte 0xff reads a pid-less record, not a raise",
+              "pid" not in brec and "pid_line" in brec, f"got {brec!r}")
+    except Exception as e:  # noqa: BLE001
+        check("a line 1 holding byte 0xff reads a pid-less record, not a raise", False, repr(e))
+    raw.write_bytes(b"4242\ninstance=\xff\n")
+    try:
+        brec = up.read_sentinel_record(raw)
+        check("byte 0xff in a claim line keeps line 1's pid and does not raise",
+              brec.get("pid") == 4242, f"got {brec!r}")
+    except Exception as e:  # noqa: BLE001
+        check("byte 0xff in a claim line keeps line 1's pid and does not raise", False, repr(e))
+    big = state / "bad-big.pid"
+    big.write_text("9" * 5000 + "\n")
+    try:
+        check("a 5000-digit line 1 reads None, never int()'s ValueError",
+              up.read_sentinel_pid(big) is None, f"got {up.read_sentinel_pid(big)!r}")
+    except Exception as e:  # noqa: BLE001
+        check("a 5000-digit line 1 reads None, never int()'s ValueError", False, repr(e))
+    big.write_text("2147483648\n")
+    check("  ...and so does the first integer past pid_t", up.read_sentinel_pid(big) is None)
+    big.write_text("2147483647\n")
+    check("CONTROL: the last pid_t value still reads", up.read_sentinel_pid(big) == 2147483647)
     check("CONTROL: the non-positive detail wording survives the migration",
           _load("services_status", "src/services_status.py")
           .probe_pidfile(state / "bad-zero.pid", lambda p: True)[1].startswith("non-positive"),
