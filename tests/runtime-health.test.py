@@ -11,7 +11,9 @@ working-state e2e would need a live core, which CI doesn't have.
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -50,6 +52,80 @@ WORKING_PANE = """\
 """
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
+
+# 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
+#     import-time default reports a live core as offline. Prefer the recorded socket.
+_sock_tmp = tempfile.mkdtemp()
+_cores = os.path.join(_sock_tmp, "state", "cores")
+os.makedirs(_cores, exist_ok=True)
+_host = rh._host_label_safe() or "testhost"
+_alive = os.path.join(_cores, _host + ".alive")
+_orig_resolve, _orig_host = rh._resolve_workspace, rh._host_label_safe
+rh._resolve_workspace = lambda repo: _sock_tmp
+rh._host_label_safe = lambda: _host
+# The record is only consulted when no explicit socket was given, so these cases
+# must run with the variable clear however the suite happened to be launched.
+_env_before = os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/run/real.sock"}, _fh)
+check("_tmux_socket: prefers the socket the heartbeat recorded",
+      rh._tmux_socket() == "/run/real.sock")
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"session": "sutando-core"}, _fh)
+check("_tmux_socket: falls back when .alive carries no socket",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    _fh.write("{not json")
+check("_tmux_socket: falls back on an unreadable .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.remove(_alive)
+check("_tmux_socket: falls back when .alive is absent",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: ""
+check("_tmux_socket: falls back when the host label is unknown",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: _host
+# A crashed core leaves its .alive behind; trusting it would pin the probe to a
+# dead socket, which is the failure this resolver exists to remove.
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/tmp/stale.sock"}, _fh)
+os.utime(_alive, (time.time() - 10000, time.time() - 10000))
+check("_tmux_socket: refuses a stale .alive record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, None)
+check("_tmux_socket: accepts the same record once it is fresh",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+# A clock step leaves a future-dated record; a one-sided age test reads that as
+# fresh forever, so the bound has to hold on both sides.
+os.utime(_alive, (time.time() + 10000, time.time() + 10000))
+check("_tmux_socket: refuses a future-dated .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, (time.time() + 1, time.time() + 1))
+check("_tmux_socket: tolerates small clock skew",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+_prev_env = os.environ.get("SUTANDO_TMUX_SOCKET")
+os.environ["SUTANDO_TMUX_SOCKET"] = "/tmp/explicit.sock"
+check("_tmux_socket: an explicit SUTANDO_TMUX_SOCKET wins over the record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+if _prev_env is None:
+    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+else:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _prev_env
+
+rh._resolve_workspace, rh._host_label_safe = _orig_resolve, _orig_host
+if _env_before is not None:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _env_before
+shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
 env = dict(os.environ)
@@ -153,7 +229,6 @@ d = _derive_with(core=False, pane="", status="running")
 check("derive: no core -> offline", d["health"] == "offline" and d["authenticated"] is None)
 
 # 5) _core_status reads the status field from a fixture core-status.json.
-import tempfile
 T = tempfile.mkdtemp()
 os.makedirs(os.path.join(T, "state"))
 with open(os.path.join(T, "state", "core-status.json"), "w") as f:

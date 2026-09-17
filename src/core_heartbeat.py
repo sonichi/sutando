@@ -64,6 +64,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from tmux_probe import classify as _classify_session_probe  # noqa: E402
+import core_lineage  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -496,6 +497,17 @@ def write_beat(status: str = "running") -> None:
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(target)
+    # Liveness is not lineage: .alive says a core runs, not WHICH conversation
+    # it is having, so a reboot cannot resume the core the way it resumes workers.
+    try:
+        core_lineage.record_run(
+            CORES_DIR.parent.parent, _hostname(),
+            os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+            runtime="claude", cwd=os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
+            or str(Path(__file__).resolve().parents[1]),
+            tmux_socket=sock, tmux_session=observed_session or "")
+    except Exception:
+        pass  # a lineage write must never take the heartbeat down
 
 
 _STARTED_AT: float = time.time()

@@ -122,6 +122,15 @@ class TestHeartbeatWrite(unittest.TestCase):
         alive_path = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         self.assertTrue(alive_path.is_file(), f"expected {alive_path} to exist")
 
+    def test_a_failing_lineage_write_does_not_take_the_beat_down(self):
+        """Liveness must survive a lineage failure: .alive is what peers poll."""
+        import core_heartbeat
+        with patch.object(core_heartbeat.core_lineage, "record_run",
+                          side_effect=RuntimeError("lineage exploded")):
+            core_heartbeat.write_beat()          # must not raise
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        self.assertTrue(alive.is_file(), "the beat did not land despite the guard")
+
     def test_handle_signal_writes_tombstone_before_unlink(self):
         import core_heartbeat
         core_heartbeat.write_beat()

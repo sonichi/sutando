@@ -54,12 +54,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`crash-only.ts`** — crash-only.ts — voice-agent fatal-path helpers (design 1d; impl plan WS1 Steps 1–2, amendments R1/R2).
 - **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
+- **`cron_ownership.py`** — Which crons.json entries a given session may register.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`current_track.py`** — The one writer for a host's current-track.md: append and rotate share a lock.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
