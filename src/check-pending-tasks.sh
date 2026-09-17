@@ -20,19 +20,24 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO_DIR/scripts/git-binary.sh"
 GIT_BIN="$(resolve_git)"
 if [ -n "$GIT_BIN" ]; then
+  # Both identity probes must walk the FULL ancestor chain and speak English:
+  # a caller-inherited GIT_CEILING_DIRECTORIES truncates discovery early and
+  # a translated locale renames the diagnostic line 52 matches on -- either
+  # one alone can turn a real, still-ours directory into a false "absent".
+  GIT_PROBE_ENV="env -u GIT_CEILING_DIRECTORIES LC_ALL=C LANGUAGE=C"
   # --path-format=absolute (git >= 2.31): a plain rev-parse, run from a
   # different cwd, can print a path relative to <dir> instead of to the caller.
-  CWD_COMMON_DIR="$("$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  CWD_COMMON_DIR="$($GIT_PROBE_ENV "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   # Capture git's own stderr instead of discarding it: only git explicitly
   # saying "not a git repository" may ever license the guest exit below.
-  REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+  REPO_COMMON_DIR="$($GIT_PROBE_ENV "$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>&1)"
   REPO_PROBE_RC=$?
   REPO_PROBE_ERR=""
   [ "$REPO_PROBE_RC" -ne 0 ] && REPO_PROBE_ERR="$REPO_COMMON_DIR" && REPO_COMMON_DIR=""
   # A `-C DIR` probe and an actually-`cd`'d one can disagree in ways neither
   # side's stdout reveals; retry via `cd` before trusting an empty result.
   if [ -z "$REPO_COMMON_DIR" ]; then
-    FALLBACK_OUT="$(cd "$REPO_DIR" 2>/dev/null && "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+    FALLBACK_OUT="$(cd "$REPO_DIR" 2>/dev/null && $GIT_PROBE_ENV "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>&1)"
     if [ $? -eq 0 ]; then
       REPO_COMMON_DIR="$FALLBACK_OUT"
       REPO_PROBE_ERR=""

@@ -540,6 +540,83 @@ else
 fi
 rm -rf "$OUTER_REPO"
 
+# 12e. Same no-own-.git subdir as case 12, but the CALLER'S environment
+# already carries a GIT_CEILING_DIRECTORIES that stops discovery exactly at
+# the outer repo -- both probes then answer "not a git repository" like a
+# genuinely different repo would, though this child IS still ours.
+OUTER_REPO="$(mktemp -d)"
+_git_fixture_repo "$OUTER_REPO"
+NESTED_REPO="$OUTER_REPO/child"
+mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
+cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
+chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
+printf 'id: probe\ntask: nested-subdir-ceiling\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
+CE_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+CE_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+CE_CEILINGED="$(GIT_CEILING_DIRECTORIES="$OUTER_REPO" "$TEST_GIT" -C "$NESTED_REPO" rev-parse --git-common-dir 2>&1)"
+if [ -e "$NESTED_REPO/.git" ] || [ -z "$CE_REPO_ID" ] || [ -z "$CE_CWD_ID" ] || [ "$CE_REPO_ID" != "$CE_CWD_ID" ] \
+   || [[ "$CE_CEILINGED" != *"not a git repository"* ]]; then
+  bad "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" \
+    "fixture bug: child='$CE_REPO_ID' outer='$CE_CWD_ID' ceilinged='$CE_CEILINGED', this case tests nothing"
+else
+  CE_OUT="$(cd "$OUTER_REPO" && GIT_CEILING_DIRECTORIES="$OUTER_REPO" \
+    bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+  case "$CE_OUT" in
+    *'"decision":"block"'*) ok "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" ;;
+    *) bad "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" "got: ${CE_OUT:0:160}" ;;
+  esac
+fi
+rm -rf "$OUTER_REPO"
+
+# 12f. A genuinely non-Git bundle in a foreign Git cwd (case 9's fixture),
+# but git's diagnostic is TRANSLATED for the caller's locale -- the guest
+# carve-out must not go blind just because the caller isn't LC_ALL=C.
+LOC_BUNDLE="$(mktemp -d)"
+mkdir -p "$LOC_BUNDLE/src" "$LOC_BUNDLE/scripts" "$LOC_BUNDLE/workspace/tasks" "$LOC_BUNDLE/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$LOC_BUNDLE/src/"
+cp "$REPO/scripts/git-binary.sh" "$LOC_BUNDLE/scripts/"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$LOC_BUNDLE" "$TEST_PY" > "$LOC_BUNDLE/scripts/sutando-config.sh"
+chmod +x "$LOC_BUNDLE/scripts/sutando-config.sh"
+printf 'id: probe\ntask: locale-translated-not-a-repo\n' > "$LOC_BUNDLE/workspace/tasks/$PROBE"
+LOC_FOREIGN="$(mktemp -d)"
+_git_fixture_repo "$LOC_FOREIGN"
+LOC_STUBDIR="$(mktemp -d)"
+# Wraps the resolved real git; only TRANSLATES its own "not a git repository"
+# line when the caller's LC_ALL isn't C, so the fix is what forces English.
+cat > "$LOC_STUBDIR/git" << WRAP
+#!/bin/bash
+OUT="\$("$TEST_GIT" "\$@" 2>"$LOC_STUBDIR/.err")"
+RC=\$?
+ERR="\$(cat "$LOC_STUBDIR/.err")"
+if [ "\$RC" -ne 0 ]; then
+  if [ "\${LC_ALL:-}" != "C" ] && [[ "\$ERR" == *"not a git repository"* ]]; then
+    echo "fatal : ceci n'est pas un dépôt git : .git" >&2
+  else
+    echo "\$ERR" >&2
+  fi
+else
+  echo "\$OUT"
+fi
+exit "\$RC"
+WRAP
+chmod +x "$LOC_STUBDIR/git"
+if [ -z "$("$TEST_GIT" -C "$LOC_FOREIGN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ]; then
+  bad "translated not-a-repo diagnostic -> guest carve-out still applies" \
+    "fixture bug: LOC_FOREIGN has no resolvable git identity, this case tests nothing"
+else
+  LOC_OUT="$(cd "$LOC_FOREIGN" && LC_ALL=fr_FR.UTF-8 PATH="$LOC_STUBDIR:$PATH" \
+    bash "$LOC_BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+  case "$LOC_OUT" in
+    '{}') ok "translated not-a-repo diagnostic -> guest carve-out still applies" ;;
+    *) bad "translated not-a-repo diagnostic -> guest carve-out still applies" "got: ${LOC_OUT:0:160}" ;;
+  esac
+fi
+rm -rf "$LOC_BUNDLE" "$LOC_FOREIGN" "$LOC_STUBDIR"
+
 # 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
 # -- `-e` alone would misread a broken checkout as an intentional bundle.
 DANGLING="$(mktemp -d)"
