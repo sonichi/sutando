@@ -69,6 +69,10 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
                              os.O_CREAT | os.O_EXCL))
         except FileExistsError:
             return "already"
+        # Under the SAME lock as the sentinel: attribution and delivery are one
+        # fact. Recording earlier attributed refusals that never delivered.
+        if recipient != pr.CORE:
+            pa.record(workspace, task_id, recipient)
     return "delivered"
 
 
@@ -100,10 +104,6 @@ def route(workspace, task: dict, roster=None) -> dict:
     # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
     buckets = {"delivered": [], "already": [], "no-payload": []}
     for t in targets:
-        # Recorded BEFORE the delivery sentinel: a crash between the two must
-        # leave an attributed task, never a delivered one nobody can attribute.
-        if t != pr.CORE:
-            pa.record(workspace, task_id, t)
         buckets[deliver_one(workspace, t, task_id)].append(t)
     return {"task_id": task_id, "version": r.get("version"),
             "delivered": buckets["delivered"], "already": buckets["already"],

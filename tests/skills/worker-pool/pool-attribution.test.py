@@ -60,5 +60,47 @@ class AttributionStore(unittest.TestCase):
             self.assertFalse(a.record(ws, "", W))
 
 
+class RecordingFollowsDelivery(unittest.TestCase):
+    """qingyun-001 on #4359: recording before deliver_one() attributed refusals.
+    A no-payload target left a record, and a later real delivery to a DIFFERENT
+    worker inherited it — the bridge then stamps a reply with a worker that
+    never ran, which is the failure the reader's fail-closed rule exists to
+    prevent."""
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]
+                               / "skills" / "worker-pool" / "scripts"))
+        import pool_router
+        self.router = pool_router
+        self.ws = tempfile.mkdtemp()
+
+    def test_refusal_is_not_recorded(self):
+        """No payload -> nothing delivered -> nothing attributed."""
+        tid = "task-99aabbccddeeff0011"
+        self.assertEqual(self.router.deliver_one(self.ws, W, tid), "no-payload")
+        self.assertIsNone(a.worker_for_task(self.ws, tid))
+
+    def test_a_later_real_delivery_is_attributed_to_its_own_worker(self):
+        """THE REGRESSION GUARD. The refused target must not poison the task."""
+        W2 = "212e8040d38d48b5aadab0db295dc33a"
+        tid = "task-aabbccddeeff001122"
+        self.assertEqual(self.router.deliver_one(self.ws, W, tid), "no-payload")
+        payload = Path(self.ws) / "tasks" / f"{tid}.txt"
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_text("task: hi\n")
+        self.assertEqual(self.router.deliver_one(self.ws, W2, tid), "delivered")
+        self.assertEqual(a.worker_for_task(self.ws, tid), W2)
+
+    def test_record_is_never_half_written(self):
+        """link() publishes the NAME only once the content exists, so no reader
+        can see an empty record and no writer is blocked by one."""
+        tid = "task-bbccddeeff00112233"
+        self.assertTrue(a.record(self.ws, tid, W))
+        self.assertEqual(a.attribution_path(self.ws, tid).read_text(), W)
+        leftovers = [p.name for p in a.attribution_dir(self.ws).iterdir()
+                     if p.name.startswith(".")]
+        self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

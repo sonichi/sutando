@@ -19,6 +19,7 @@ writer's.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 _WORKER_ID_CHARS = set("0123456789abcdef")
@@ -59,12 +60,21 @@ def record(workspace, task_id: str, worker_id: str) -> bool:
     d = attribution_dir(workspace)
     d.mkdir(parents=True, exist_ok=True)
     p = d / task_id
+    # Content first, then the NAME, via link(): O_EXCL+write is not atomic, and a
+    # crash between them leaves an empty record that is refused forever.
+    tmp = d / f".{task_id}.{os.getpid()}.tmp"
     try:
-        with open(p, "x", encoding="utf-8") as fh:
-            fh.write(worker_id)
-    except FileExistsError:
-        return False
-    return True
+        tmp.write_text(worker_id, encoding="utf-8")
+        try:
+            os.link(tmp, p)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def worker_for_task(workspace, task_id: str) -> str | None:
