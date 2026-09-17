@@ -136,6 +136,75 @@ class GateDecision(unittest.TestCase):
         self.assertEqual(self.gate.writer_state(1), "dead")
 
 
+class GateEdges(unittest.TestCase):
+    """The branches a stubbed happy path never reaches: the real pane-pid resolution,
+    an own-checkout comparison that raises, an unreadable .alive, a --stop that raises."""
+
+    def setUp(self):
+        self.gate = _load_gate()
+        self.hb = self.gate.hb
+        self.tmp = Path(tempfile.mkdtemp(prefix="hb-gate-"))
+        self.alive = self.tmp / "state" / "cores" / "host.alive"
+        self.alive.parent.mkdir(parents=True)
+        self.patches = [patch.object(self.hb, "_alive_path", lambda: self.alive),
+                        patch.object(self.hb, "_pidfile", lambda: self.alive.with_suffix(".heartbeat.pid"))]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_current_core_pid_resolves_through_the_writers_own_functions(self):
+        seen = {}
+
+        def core_pid(sock, session):
+            seen["args"] = (sock, session)
+            return 4243
+        with patch.object(self.hb, "_socket_path", return_value="/tmp/x.sock"), \
+             patch.object(self.hb, "_observed_session", return_value="real"), \
+             patch.object(self.hb, "core_pid", side_effect=core_pid):
+            self.assertEqual(self.gate.current_core_pid(), (4243, True))
+        self.assertEqual(seen["args"], ("/tmp/x.sock", "real"), "the same socket + session write_beat uses")
+
+    def test_current_core_pid_reports_unobserved_when_the_probe_says_so(self):
+        def core_pid(sock, session):
+            self.hb._LAST_SESSION_PROBE = None
+            return None
+        with patch.object(self.hb, "_socket_path", return_value="/tmp/x.sock"), \
+             patch.object(self.hb, "_observed_session", return_value=None), \
+             patch.object(self.hb, "core_pid", side_effect=core_pid):
+            self.assertEqual(self.gate.current_core_pid(), (None, False))
+
+    def test_a_recorded_script_that_cannot_be_resolved_reads_foreign_not_a_raise(self):
+        argv = f"/usr/bin/python3 {self.gate.HB_SCRIPT}"
+        ps = type("R", (), {"returncode": 0, "stdout": argv, "stderr": ""})()
+        with patch.object(self.gate.subprocess, "run", return_value=ps), \
+             patch.object(self.gate, "_recorded_script", return_value="/abs/\x00bad"):
+            self.assertEqual(self.gate.writer_state(4242), "foreign")
+
+    def test_an_unreadable_alive_starts_and_names_the_error(self):
+        self.alive.write_text("{not json")
+        word, reason, live = self.gate.decide()
+        self.assertEqual(word, "start")
+        self.assertIn("unreadable .alive (JSONDecodeError)", reason)
+        self.assertIsNone(live)
+
+    def test_a_stop_that_raises_is_a_failed_stop_exit_3(self):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(self.gate, "decide", return_value=("start", "fresh, foreign writer", 4242)), \
+             patch.object(self.gate.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired(cmd="stop", timeout=30)), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.gate.main([])
+        self.assertEqual(rc, 3)
+        self.assertIn("would not stop", out.getvalue())
+
+
 class GateMain(unittest.TestCase):
     """main() stops a live foreign writer through core_heartbeat.py --stop before saying `start`."""
 
