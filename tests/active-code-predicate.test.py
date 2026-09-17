@@ -200,6 +200,32 @@ class DeadBranches(unittest.TestCase):
             "else\n  python3 packages/x/else.py\nfi\n"),
             ["packages/x/else.py"])
 
+    def test_unary_negation_of_a_literal_condition_picks_the_live_arm(self):
+        """qingyun-wu round 28: `if ! true` used to be unrecognized ('other'),
+        crediting both arms -- confirmed by direct execution that Bash only
+        ever runs the else here."""
+        self.assertEqual(program_python_args(
+            "if ! true; then\n  python3 packages/x/test_dead.py\n"
+            "else\n  python3 packages/x/test_live.py\nfi\n"),
+            ["packages/x/test_live.py"])
+        self.assertEqual(program_python_args(
+            "if ! false; then\n  python3 packages/x/test_live.py\n"
+            "else\n  python3 packages/x/test_dead.py\nfi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_two_separately_negated_operands_each_get_their_own_negation(self):
+        """`! true && ! false` is FALSE overall (false && true) -- confirmed
+        by direct execution. Each `!` binds to the operand right after it,
+        not to the whole chain."""
+        self.assertEqual(program_python_args(
+            "if ! true && ! false; then\n  python3 packages/x/then.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/else.py"])
+        self.assertEqual(program_python_args(
+            "if ! false && ! false; then\n  python3 packages/x/then.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/then.py"])
+
     def test_a_taken_if_arm_drops_every_later_elif(self):
         """qingyun-wu round 24: once `if true` is taken, the following
         `elif true` never runs regardless of ITS OWN condition -- confirmed

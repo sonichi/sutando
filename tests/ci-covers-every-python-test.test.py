@@ -59,6 +59,32 @@ def _yaml_scalar(value: str) -> str:
     return value
 
 
+def _fold_scalar(lines: list[str]) -> list[str]:
+    """YAML `>` folding (spec 8.1.3), approximated for a flat `run:` body:
+    adjacent plain lines join with a single space, the way Bash would see
+    one command instead of two; a blank or still-indented line keeps its
+    own line break (round 28, qingyun-wu: `>-` with `echo inert` then a
+    python invocation folds into ONE `echo` command, naming the invocation
+    that never runs; the reverse split -- `python3` alone, then its path
+    on the next line -- folds into a real invocation the line-per-line
+    model named nothing)."""
+    out, para = [], []
+
+    def _emit():
+        if para:
+            out.append(" ".join(para))
+            para.clear()
+
+    for ln in lines:
+        if not ln.strip() or ln[:1] in (" ", "\t"):
+            _emit()
+            out.append(ln)
+            continue
+        para.append(ln.strip())
+    _emit()
+    return out
+
+
 def _run_bodies(text: str) -> list[str]:
     """Lines inside a workflow `run:` value — the only place a command executes.
 
@@ -75,15 +101,20 @@ def _run_bodies(text: str) -> list[str]:
     alongside `indent`, not just at a new `run:` (round 27, keweichen): a
     stale indicator survived a dedent-ended block into the final
     unconditional `_flush()`, crashing `None + indicator` on any file
-    whose last `run:` used one and was followed by an ordinary sibling key."""
-    out, indent, indicator, block = [], None, None, []
+    whose last `run:` used one and was followed by an ordinary sibling key.
+    The scalar TYPE (`|` literal vs `>` folded) was captured and discarded
+    (round 28, qingyun-wu): every block scalar was dedented line-per-line
+    regardless of indicator, so a folded `run: >-` was read as literal
+    multi-line shell -- see `_fold_scalar`. Reset alongside the rest."""
+    out, indent, indicator, scalar, block = [], None, None, None, []
 
     def _flush():
         cut = indent + indicator if indicator is not None else None
         if cut is None:
             indents = [len(ln) - len(ln.lstrip()) for ln in block if ln.strip()]
             cut = min(indents) if indents else 0
-        out.extend(ln[cut:] for ln in block)
+        lines = [ln[cut:] for ln in block]
+        out.extend(_fold_scalar(lines) if scalar == ">" else lines)
         block.clear()
 
     for ln in text.splitlines():
@@ -94,6 +125,7 @@ def _run_bodies(text: str) -> list[str]:
             # The KEY's column, not the line's: a `- ` list marker sits left of
             # it, so a sibling key would otherwise read as a continuation line.
             indent = ln.index("run:")
+            scalar = m.group(1)
             digits = m.group(3)
             indicator = int(digits) if digits else None
             if m.group(5):
@@ -102,7 +134,7 @@ def _run_bodies(text: str) -> list[str]:
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
                 _flush()
-                indent, indicator = None, None
+                indent, indicator, scalar = None, None, None
             else:
                 block.append(ln)
     _flush()
@@ -784,6 +816,37 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
         self.assertEqual(
             orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
+    def test_folded_scalar_joins_lines_so_a_dead_argument_names_nothing(self):
+        """qingyun-wu round 28: `run: >-` FOLDS into one line, so `echo inert`
+        followed by a python invocation is one `echo` command -- the
+        invocation never runs, confirmed against real PyYAML + Bash."""
+        wf = ("steps:\n  - run: >-\n"
+              "      echo inert\n"
+              "      python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_folded_scalar_joins_lines_so_a_split_invocation_still_names_its_test(self):
+        """qingyun-wu round 28, the inverse split: `python3` alone on one
+        line, its script path on the next -- folding joins them into a real
+        invocation the line-per-line model named nothing for."""
+        wf = ("steps:\n  - run: >-\n"
+              "      python3\n"
+              "      packages/x/test_live.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
+    def test_literal_scalar_is_not_folded_by_the_new_scalar_type_tracking(self):
+        """Control for the folded-scalar fix: an ordinary `run: |` block
+        must still keep each line separate -- only `>` folds."""
+        wf = ("steps:\n  - run: |\n"
+              "      echo inert\n"
+              "      python3 packages/x/test_live.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
 
     def test_heredoc_nested_in_arithmetic_command_substitution_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 25: a real heredoc inside a `$(...)` nested

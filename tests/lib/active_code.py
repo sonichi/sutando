@@ -417,16 +417,31 @@ def _eval_condition(seg: str) -> str:
     'other' -- a `&&`/`||` chain of bare `true`/`false` is evaluated
     left to right the way a real Bash AND-OR list decides its exit status
     (round 24: `true && false; then` used to see only `true`, since
-    `_raw_segments` split at the `&&` before this ever saw the `false`)."""
+    `_raw_segments` split at the `&&` before this ever saw the `false`).
+    A literal operand may carry one leading `!` (round 28, qingyun-wu):
+    Bash's unary `!` negates a pipeline's own exit status -- `if ! true`
+    used to be unrecognized ('other'), crediting both arms of a branch
+    Bash only ever takes one side of. A SECOND `!` on the same operand is
+    not valid Bash grammar (confirmed: `! ! true` is a syntax error), so
+    only one is consumed; two separately-negated operands either side of
+    a `&&`/`||` (`! true && ! false`) each get their own, confirmed live."""
     toks = seg.replace(_MASK_AND, " && ").replace(_MASK_OR, " || ").split()
     if len(toks) < 2:
         return "other"
-    status, pending_op = None, None
-    for t in toks[1:]:
+    rest = toks[1:]
+    status, pending_op, i, n = None, None, 0, len(rest)
+    while i < n:
+        t = rest[i]
         if t in ("&&", "||"):
             if pending_op is not None:
                 return "other"
-            pending_op = t; continue
+            pending_op = t; i += 1; continue
+        negate = rest[i] == "!"
+        if negate:
+            i += 1
+        if i >= n:
+            return "other"
+        value = rest[i]; i += 1
         if status is None:
             runs = True
         elif pending_op == "&&":
@@ -436,9 +451,10 @@ def _eval_condition(seg: str) -> str:
         else:
             return "other"
         if runs:
-            if t not in ("true", "false"):
+            if value not in ("true", "false"):
                 return "other"
-            status = t == "true"
+            lit = value == "true"
+            status = (not lit) if negate else lit
         pending_op = None
     if pending_op is not None or status is None:
         return "other"
