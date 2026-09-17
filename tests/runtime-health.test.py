@@ -331,16 +331,21 @@ finally:
     rh._resolve_workspace = _ow
 
 # 7) The tri-state process probe has ONE owner: _core_running delegates to
-#    tmux_probe.has_session with this module's socket/session and its 8s budget.
+#    tmux_probe.has_session with _tmux_socket()'s result (not the bare
+#    constant -- same reason as section 6) plus this module's session/budget.
 _seen = {}
 _oh = rh._tmux_has_session
+_ot = rh._tmux_socket
+_injected_sock = "/tmp/rh-delegation-check-%d.sock" % os.getpid()
 rh._tmux_has_session = lambda sock, sess, timeout=None: _seen.update(sock=sock, sess=sess, timeout=timeout)
+rh._tmux_socket = lambda: _injected_sock
 try:
-    check("_core_running: delegates to tmux_probe.has_session(TMUX_SOCKET, SESSION, timeout=8)",
+    check("_core_running: delegates to tmux_probe.has_session(_tmux_socket(), SESSION, timeout=8)",
           rh._core_running() is None
-          and _seen == {"sock": rh.TMUX_SOCKET, "sess": rh.SESSION, "timeout": 8})
+          and _seen == {"sock": _injected_sock, "sess": rh.SESSION, "timeout": 8})
 finally:
     rh._tmux_has_session = _oh
+    rh._tmux_socket = _ot
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)
