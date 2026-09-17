@@ -318,5 +318,43 @@ class PythonArgsScriptOperand(unittest.TestCase):
                           ["packages/x/test_real.py"])
 
 
+class PythonArgsOptionContract(unittest.TestCase):
+    """keweichen's round-6 finding: the parser had no notion of a TERMINAL
+    option (exits before any script runs) or of `--`/a separate-value long
+    option (both still let a real script through). Every case here was
+    confirmed by direct python3 execution before being pinned."""
+
+    def test_dash_v_and_dash_h_are_terminal_anywhere_in_a_cluster(self):
+        self.assertEqual(python_args("python3 -V packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 -h packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 -uV packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 -Vu packages/x/test_dead.py"), [])
+
+    def test_long_terminal_forms_are_terminal(self):
+        self.assertEqual(python_args("python3 --version packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 --help packages/x/test_dead.py"), [])
+
+    def test_a_bare_double_dash_still_passes_the_real_script_through(self):
+        """`python3 -- T.py` really does run T.py -- the option list ends,
+        the script does not disappear with it."""
+        self.assertEqual(python_args("python3 -- packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
+    def test_a_separate_value_long_option_still_reaches_the_script(self):
+        self.assertEqual(
+            python_args("python3 --check-hash-based-pycs always packages/x/test_real.py"),
+            ["packages/x/test_real.py"])
+
+    def test_the_equals_form_of_that_long_option_is_unknown_to_real_python(self):
+        """`--check-hash-based-pycs=always` is NOT accepted (real python3
+        exits with 'Unknown option'); failing closed here matches that."""
+        self.assertEqual(
+            python_args("python3 --check-hash-based-pycs=always packages/x/test_real.py"), [])
+
+    def test_an_unrecognized_option_fails_closed_short_and_long(self):
+        self.assertEqual(python_args("python3 -Z packages/x/test_real.py"), [])
+        self.assertEqual(python_args("python3 --frobnicate packages/x/test_real.py"), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

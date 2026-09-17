@@ -101,27 +101,47 @@ def _command_tokens(seg: str) -> list[str]:
     return toks
 
 
+# python3's real option grammar (verified against `python3 --help` and
+# direct execution, never assumed) -- unlisted tokens fail CLOSED.
+_TERMINAL_LONG = frozenset(("--help", "--version", "--help-env", "--help-xoptions", "--help-all"))
+_VALUE_LONG = frozenset(("--check-hash-based-pycs",))
+_TERMINAL_CHARS = frozenset("hV?")
+_SCRIPT_CHARS = frozenset("cm")
+_VALUE_CHARS = frozenset("WX")
+_VALUELESS_CHARS = frozenset("bBdEiIOPqsSuvx")
+
+
 def _option_kind(tok: str):
-    """Classify a short-option cluster by its FIRST value-taking letter,
-    scanned in order -- ownership, not a fixed position, decides attached
-    vs. separate. Returns ("script", 0) for -c/-m (consumes the rest of the
-    command line, per Python CLI rules); ("value", extra) for -W/-X, extra=0
-    when a value is attached right after that letter in the SAME token
-    (`-uWX` -- W owns "X"), extra=1 when nothing follows (the value is the
-    NEXT token, bare or clustered: `-W`, `-uW`); or (None, 0) otherwise
-    (measured: `-uWX`/`-uXdevW` both still run their script, but a
-    last-char-only test misread each as taking a separate value it doesn't
-    own -- keweichen, 2026-09-17)."""
-    if not tok.startswith("-") or tok.startswith("--") or tok == "-":
+    """Classify one option token by the real grammar above, short clusters
+    scanned left to right so ownership (not a fixed position) decides
+    attached vs. separate for -W/-X (measured: `-uWX`/`-uXdevW` both still
+    run their script; keweichen, 2026-09-17). Returns ("terminal", 0) if
+    Python exits before any script runs (-h/-V/--help/... anywhere in a
+    cluster); ("script", 0) for -c/-m; ("value", extra) for -W/-X or
+    --check-hash-based-pycs, extra=1 when the value is a separate NEXT
+    token, else 0; ("sep", 0) for `--`; ("skip", 0) for a recognized
+    valueless flag; or (None, 0) when the token is unknown/unrecognized --
+    fail closed rather than guess past what the real grammar doesn't cover."""
+    if tok == "--":
+        return ("sep", 0)
+    if not tok.startswith("-") or tok == "-":
         return (None, 0)
+    if tok.startswith("--"):
+        if tok in _TERMINAL_LONG:
+            return ("terminal", 0)
+        if tok in _VALUE_LONG:
+            return ("value", 1)
+        return (None, 0)  # unrecognized long option -- real Python errors too
     for pos, ch in enumerate(tok[1:], start=1):
-        if ch in "cm":
+        if ch in _TERMINAL_CHARS:
+            return ("terminal", 0)
+        if ch in _SCRIPT_CHARS:
             return ("script", 0)
-        if ch in "WX":
+        if ch in _VALUE_CHARS:
             return ("value", 0 if pos + 1 < len(tok) else 1)
-        if not ch.isalpha():
-            break
-    return (None, 0)
+        if ch not in _VALUELESS_CHARS:
+            return (None, 0)  # unrecognized char in the cluster -- fail closed
+    return ("skip", 0)
 
 
 def _segment_invokes(seg: str, name: str) -> bool:
@@ -137,11 +157,13 @@ def _segment_python_arg(seg: str):
         return None
     rest = toks[1:]
     i = 0
-    while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
+    while i < len(rest) and rest[i].startswith("-") and rest[i] != "-":
         kind, extra = _option_kind(rest[i])
-        if kind == "script":
+        if kind is None or kind in ("terminal", "script"):
             return None  # no script operand exists in this shape
         i += 1 + extra
+        if kind == "sep":
+            break  # `--` ends option scanning; the next token is positional
     if i < len(rest) and rest[i].endswith(".py"):
         return rest[i]
     return None

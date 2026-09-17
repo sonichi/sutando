@@ -191,5 +191,42 @@ class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
         self.assertEqual(_named_in(wf), set())
 
 
+class OptionContractThroughTheConsumerPath(unittest.TestCase):
+    """keweichen's round-6 ask: pin the option contract through
+    _named_in() -> orphans_in(), not only python_args() directly -- a
+    workflow that credits a terminal flag's argument would silently drop
+    a real orphan from CI-coverage scrutiny (false-green); one that gives
+    up at `--` or a separate-value long option would flag a genuinely
+    covered test as an orphan (false-orphan, the safe direction, but
+    still a false alarm this suite would otherwise manufacture)."""
+
+    def test_a_terminal_flag_does_not_false_green_an_orphan(self):
+        """If -V's argument were credited, this test would vanish from
+        the orphan set though python3 never opens it -- the dangerous
+        direction, checked through the real consumer, not just python_args()."""
+        wf = "steps:\n  - run: python3 -V packages/x/test_dead.py\n"
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_a_bare_double_dash_does_not_false_orphan_a_real_test(self):
+        """A workflow line most of this repo's own CI could plausibly write
+        -- `--` before a path defends against an accidental leading-dash
+        filename. Giving up at `--` would flag this real, executed test
+        as an orphan."""
+        wf = "steps:\n  - run: python3 -- packages/x/test_real.py\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
+    def test_a_separate_value_long_option_does_not_false_orphan_either(self):
+        wf = ("steps:\n  - run: python3 --check-hash-based-pycs always "
+              "packages/x/test_real.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
