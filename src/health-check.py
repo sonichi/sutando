@@ -1268,10 +1268,8 @@ def check_session_cron_registration(
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
         if entry_owner(entry) != CRON_CORE:
-            # Pinned to a worker: that worker's own /startup registers it
-            # (skills/startup/SKILL.md), not this core's /schedule-crons. Counting
-            # it here would warn "expected but missing" forever for a job that was
-            # never meant to be this session's.
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
             return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
