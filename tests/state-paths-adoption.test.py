@@ -136,6 +136,15 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # cloud_auth never resolves the workspace — read_cloud_auth(ws) takes the
+    # dir from its caller (report-feedback / marketplace resolve it).
+    "src/cloud_auth.py",
+    # core_lineage never resolves the workspace — lineage_dir(workspace, host)
+    # takes the root from the heartbeat, which owns the resolution.
+    "src/core_lineage.py",
+    # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
+    # dir from its caller (marketplace / connect-apps resolve it).
+    "src/station_stamp.py",
     # runtime-api views + registry never resolve the workspace — server.py
     # (the composition root) imports the canonical resolver and injects dirs.
     "src/runtime-api/instance_registry.py",

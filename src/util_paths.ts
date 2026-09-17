@@ -25,12 +25,12 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { homedir, hostname } from 'node:os';
+import { dirname, join, win32 } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
-function expandHome(p: string): string {
-	return p.replace(/^~/, process.env.HOME || '');
+export function expandHome(p: string): string {
+	return p.replace(/^~/, homedir());
 }
 
 /**
@@ -226,7 +226,7 @@ export function claudeHomePath(...subpath: string[]): string {
 		}
 		base = expandHome(home);
 	} else {
-		base = join(process.env.HOME || '', '.claude');
+		base = join(homedir(), '.claude');
 	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
@@ -244,6 +244,13 @@ export function claudeProjectSlug(path: string): string {
 	return path.replace(/[^A-Za-z0-9]/g, '-');
 }
 
+/** Derive the Claude project slug for the repository containing an agent module directory. */
+export function voiceMemoryProjectSlug(agentModuleDir: string): string {
+	const moduleDir = agentModuleDir.replace(/[\\/]+$/, '');
+	const repoDir = moduleDir.includes('\\') ? win32.dirname(moduleDir) : dirname(moduleDir);
+	return claudeProjectSlug(repoDir.replace(/[\\/]+$/, ''));
+}
+
 // ---------------------------------------------------------------------------
 // Screen-capture token — issued once at screen-capture-server startup,
 // stored 0600 at ~/.config/sutando/screen-capture-token.  Callers include
@@ -252,7 +259,7 @@ export function claudeProjectSlug(path: string): string {
 // no-cors requests or read local files).
 // ---------------------------------------------------------------------------
 
-const _CAPTURE_TOKEN_PATH = join(process.env.HOME || '', '.config', 'sutando', 'screen-capture-token');
+const _CAPTURE_TOKEN_PATH = join(homedir(), '.config', 'sutando', 'screen-capture-token');
 
 /**
  * Read the screen-capture server token from disk.  Returns the token string

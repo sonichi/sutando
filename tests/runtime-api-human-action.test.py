@@ -42,6 +42,7 @@ class HumanActionTests(unittest.TestCase):
             granted_methods=frozenset(SETTLE_METHODS))
 
     def tearDown(self):
+        self.store.close()
         self.tmp.cleanup()
 
     def _request(self, **extra) -> str:
@@ -188,6 +189,7 @@ class ProductionComposedSettleTests(unittest.TestCase):
         self.d = self.srv.dispatcher
 
     def tearDown(self):
+        self.srv.store.close()
         self.tmp.cleanup()
 
     def test_unix_transport_grants_nothing(self):

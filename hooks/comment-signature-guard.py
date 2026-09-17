@@ -69,7 +69,8 @@ def unsigned_body(command):
         if w in FILE_FLAGS and i + 1 < len(words):
             path = words[i + 1]
             try:
-                text = open(path, encoding="utf-8", errors="replace").read()
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
             except OSError:
                 return None  # unreadable: the gate cannot answer, so it does not
             if MXID not in text:

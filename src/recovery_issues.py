@@ -12,6 +12,34 @@ except ImportError:
     fcntl = None
 
 
+HEALTH_CAUSES = frozenset("""
+voice-agent voice-watchers voice-transport bodhi-dist cli-wedge secret-scanner
+node-runtime cron-runner session-crons memory-dir-override workspace-wiring
+context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index
+memory-sync onboarding-status host-subtrees per-host-config-backup sync-conflicts-unmerged
+skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
+tcc-documents-access quota-telemetry core-request-rejections core-quota quota-account-identity
+battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge runtime-identity
+daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement held-no-consumer
+orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog
+task-watcher a-fallback-hits task-claims codex-task-notifier codex-presence notes-split-brain
+vendored-resolver-env legacy-notes-divergence vault-manifest claude-hooks comm-sweep
+core-model-pin web-client memory-dir tailscale-funnel sutando-app telegram-bridge
+discord-bridge slack-bridge whatsapp-bridge
+agent-api dashboard screen-capture credential-proxy notes-dir voice-config
+CLAUDE.md build_log.md .env conversation-server ngrok
+""".split())
+
+
+def _health_cause(check):
+    name = check['name']
+    if name not in HEALTH_CAUSES:
+        name = 'custom-check' if name.startswith('extra:') else (
+            'dynamic-loop' if name.startswith('dynamic-loop:') else 'other-check')
+    status = check['status'] if check['status'] in ('warn', 'down') else 'non-ok'
+    return 'health:' + name + ':' + status
+
+
 def _update(path, change, emit):
     """Publish observations best effort; skip a tick if another writer holds the lock."""
     if fcntl is None:
@@ -49,6 +77,7 @@ def _update(path, change, emit):
 def _event(events, action, issue):
     events.append(('recovery_issue_' + action, {
         'issue_id': issue['issue_id'], 'issue_type': issue['issue_type'],
+        'issue_cause': issue.get('issue_cause', 'unknown'),
     }))
 
 
@@ -67,11 +96,11 @@ def track_health_issues(path, checks, *, start, emit):
             if check['status'] == 'ok' and key in state:
                 _event(events, 'recovered', state.pop(key))
             elif start and check['status'] != 'ok':
-                _begin(state, key, 'health_check', events)
+                _begin(state, key, 'health_check', events, issue_cause=_health_cause(check))
     _update(path, change, emit)
 
 
-def track_core_issue(path, *, alive, task, status_ts, start=False, emit):
+def track_core_issue(path, *, alive, task, status_ts, start=False, cause=None, emit):
     """Keep one core issue across retries until observed queue/status progress."""
     def change(state, events):
         issue = state.get('core')
@@ -84,5 +113,6 @@ def track_core_issue(path, *, alive, task, status_ts, start=False, emit):
         ):
             _event(events, 'recovered', state.pop('core'))
         if start:
-            _begin(state, 'core', 'core', events, task=task, status_ts=status_ts)
+            _begin(state, 'core', 'core', events, task=task, status_ts=status_ts,
+                   issue_cause='core:' + cause if cause in ('dead', 'wedged') else 'unknown')
     _update(path, change, emit)

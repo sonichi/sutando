@@ -30,6 +30,11 @@ python3 src/write_calendar_cache.py --empty   # ONLY for a genuinely empty day
 Calendar. Step 1 below still runs on every host. See "Calendar source (Google Workspace) —
 activation" for the full contract.
 
+**A missing connector is one line of text, never a card.** If `composio_find` reports the owner's
+calendar or mail app `connected: false`, say so in the briefing ("Google Calendar isn't connected;
+connect it in AG2 Space") and move on. The briefing is not an owner request: never post a connect
+card or start a `connect-apps` wait from it.
+
 **Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
 
 ```bash
@@ -41,7 +46,9 @@ python3 src/morning-briefing.py
 
 **Then augment with the following if configured (skip if not available):**
 
-1. **Email** — Run `gws gmail +triage` to get unread inbox. Summarize top 5 by priority. Flag anything urgent.
+1. **Email** — Read the unread inbox through the Station Gmail connector (`composio_find` /
+   `composio_exec`), or `gws gmail +triage` where the Station isn't available. Summarize top 5 by
+   priority. Flag anything urgent.
 
 2. **GWS Calendar** — If the user uses Google Calendar (not just macOS Calendar), run `gws calendar +agenda --today`. List any meetings not already covered by the macOS Calendar output above.
 
