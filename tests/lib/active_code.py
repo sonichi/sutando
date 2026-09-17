@@ -76,11 +76,14 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _command_tokens(seg: str) -> list[str]:
-    """`seg`'s tokens with a leading env/VAR= prefix peeled off.
+    """`seg`'s tokens with a leading env/VAR=/`!` prefix peeled off.
 
     `FOO=1 cmd` runs `cmd`; `BAD-NAME=1 cmd` is not a valid assignment (a
     hyphen can't start a shell identifier), so bash tries to RUN it and
-    fails — peeling it here would wrongly credit `cmd` as invoked."""
+    fails — peeling it here would wrongly credit `cmd` as invoked. `!`
+    negates the reported STATUS only; the command after it still runs
+    (keweichen round 13, confirmed by direct execution: `! python3 x.py`
+    really executes python3 on both Bash 3.2 and 5.2)."""
     import shlex
     try:
         toks = shlex.split(seg)
@@ -90,6 +93,8 @@ def _command_tokens(seg: str) -> list[str]:
     while changed and toks:
         changed = False
         if _IDENT_RE.match(toks[0]):
+            toks = toks[1:]; changed = True
+        elif toks[0] == "!" and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -293,13 +298,22 @@ def _sets_pipefail(text: str) -> "bool | None":
     and `set -euo pipefail` both enable it exactly like `-o`/`-eo` do, so
     scanning for a trailing `o` (round 11's regex) missed the leading-`o`
     form. Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
-    re-evaluates each left to right -- so the LAST one found wins."""
-    toks = text.split()
+    re-evaluates each left to right -- so the LAST one found wins. `--`
+    ends option scanning (`set -- +o pipefail` sets $1/$2, not a toggle),
+    and a quoted value (`set -o 'pipefail'`) is the same value shell-quoted
+    -- both keweichen round 13, confirmed by direct execution."""
+    import shlex
+    try:
+        toks = shlex.split(text)
+    except ValueError:
+        toks = text.split()
     if not toks or toks[0] != "set":
         return None
     result, i = None, 1
     while i < len(toks):
         tok = toks[i]
+        if tok == "--":
+            break
         if len(tok) > 1 and tok[0] in "-+" and not tok.startswith("--") and "o" in tok[1:]:
             i += 1
             if i < len(toks):

@@ -330,6 +330,25 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_set_dash_dash_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 13: `--` ends `set` option scanning."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set -- +o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_negated_direct_invocation_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 13: `!` doesn't hide the invocation from the
+        consumer path either."""
+        wf = "steps:\n  - run: '! python3 packages/x/test_live.py'\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

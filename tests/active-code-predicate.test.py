@@ -432,6 +432,31 @@ class PipefailIsNotABareRegex(unittest.TestCase):
             program_python_args("true && printf x |& python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_set_dash_dash_is_positional_params_not_a_pipefail_toggle(self):
+        """`set -- +o pipefail`: `--` ends option scanning, so `+o pipefail`
+        becomes $1/$2, not a toggle -- keweichen round 13, confirmed by
+        direct execution: pipefail stays ON from the earlier `set -o
+        pipefail` and dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\nset -- +o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_shell_quoted_pipefail_value_still_toggles_it(self):
+        """`set -o 'pipefail'`: the quotes are shell quoting, not part of the
+        value -- confirmed by direct execution."""
+        self.assertEqual(
+            program_python_args(
+                "set -o 'pipefail'\nfalse | true && python3 packages/x/dead.py"), [])
+
+    def test_a_negated_direct_invocation_still_credits_the_script(self):
+        """`! python3 x.py` really executes python3 (on both Bash 3.2 and
+        5.2, confirmed by direct execution) -- `!` inverts the reported
+        status only, never the fact that the command ran."""
+        self.assertEqual(
+            program_python_args("! python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
