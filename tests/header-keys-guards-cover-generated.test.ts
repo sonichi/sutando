@@ -1,6 +1,6 @@
 /**
  * Asserts BEHAVIOUR on the constructed regex, not that the guard imports the
- * key set: a 45-key literal dropping one key leaves an import-only test green.
+ * key set: a 50-key literal dropping one key leaves an import-only test green.
  */
 
 import { describe, it } from 'node:test';

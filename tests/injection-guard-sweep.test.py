@@ -423,9 +423,7 @@ for _tsf in sorted(
 
 # ---------------------------------------------------------------------------
 # Header-key parity: _HEADER_KEYS in task_body_guard.py, task-bridge.ts, and
-# conversation-server.ts must contain the same 14 keys.  Drift between
-# implementations creates blind spots — a key guarded in Python but not TS
-# (or vice versa) leaves one attack surface unprotected.
+# conversation-server.ts must contain the same 50 generated keys, or one side leaves an attack surface unguarded.
 # ---------------------------------------------------------------------------
 
 _tg = _src("src/task_body_guard.py")
@@ -488,6 +486,6 @@ for _path, _sym in (("src/task-bridge.ts", "HEADER_KEYS"),
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 48/48
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 51/51
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
