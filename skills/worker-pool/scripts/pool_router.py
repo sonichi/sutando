@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # helpers live in the core; repo root is parents[3] from this directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
+import pool_attribution as pa  # noqa: E402
 import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
@@ -99,6 +100,10 @@ def route(workspace, task: dict, roster=None) -> dict:
     # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
     buckets = {"delivered": [], "already": [], "no-payload": []}
     for t in targets:
+        # Recorded BEFORE the delivery sentinel: a crash between the two must
+        # leave an attributed task, never a delivered one nobody can attribute.
+        if t != pr.CORE:
+            pa.record(workspace, task_id, t)
         buckets[deliver_one(workspace, t, task_id)].append(t)
     return {"task_id": task_id, "version": r.get("version"),
             "delivered": buckets["delivered"], "already": buckets["already"],

@@ -3917,10 +3917,79 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
+def _is_worker_id(value: str) -> bool:
+    """The pool's instance-id grammar, restated here for the same reason the
+    path conventions below are: this package cannot import the optional skill
+    that owns it. `core` is not a worker and never satisfies this."""
+    return len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
+
+def _assigned_worker(task_id: str) -> str:
+    """Which pool worker this task was ASSIGNED to, read from the router's
+    assignment record. Provenance is fixed before the task runs, so it does
+    not depend on the worker finishing, on residue surviving, or on the
+    producer remembering to stamp itself.
+
+    Path convention (state/attribution/<task_id>) is owned by the pool's own
+    recorder in an optional local skill this standalone PyPI package cannot
+    import or name (docs/architecture-boundaries.md, "Optional adapter
+    capabilities") — the same arrangement _worker_of() has with the done-flag
+    writer. tests/gateway-result-worker-attribution.test.py builds its
+    fixtures through that recorder's own path function, so a drift fails a
+    test instead of silently losing attribution.
+
+    FAILS CLOSED, for the reason _worker_of does: a wrong worker id labels a
+    reply with another worker's identity. Anything unreadable, not a regular
+    file, or outside the instance-id grammar yields "" rather than a guess.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return ""
+    path = _STATE / "attribution" / task_id
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""  # unreadable: no reading, not "never assigned"
+    if not stat.S_ISREG(st.st_mode):
+        return ""  # malformed record the recorder would itself refuse
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return value if _is_worker_id(value) else ""
+
+
+def _result_worker(task_id: str) -> str:
+    """Attribution for one result: assignment truth first, completion residue
+    only as the migration fallback.
+
+    A task routed before assignment records existed has none, so residue still
+    answers for it; once no such task is in flight the residue arm can go. A
+    result with residue but no assignment record is precisely the anomaly the
+    assignment store exists to surface — an author nobody recorded at routing
+    time — so it is logged rather than passed over.
+    """
+    assigned = _assigned_worker(task_id)
+    if assigned:
+        return assigned
+    residue = _worker_of(task_id)
+    if residue:
+        _log(f"attribution: {task_id} has no assignment record; using "
+             f"completion residue ({residue}). Assignment-time recording "
+             f"did not run for this task.")
+    return residue
+
+
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
     done-flag. `task_id` is the result stem, which already carries the
     `task-` prefix.
+
+    SUPERSEDED as the primary signal by _assigned_worker(): this infers the
+    author from completion residue after the fact, which is exactly the
+    fragility assignment-time provenance removes. Kept as the transition
+    fallback in _result_worker() for tasks routed before that record existed.
 
     Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
     by the pool's own done_flag()/mark_done() writer, in an optional local
@@ -3950,7 +4019,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _worker_of(tid)
+    worker = _result_worker(tid)
     if worker:
         doc["metadata"] = {"worker_id": worker}
     payload = json.dumps(doc).encode("utf-8")
