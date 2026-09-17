@@ -301,6 +301,7 @@ from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
+from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -684,15 +685,15 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
 
 
 def _publish_staged(tmp: Path, path: Path) -> bool:
-    """Rename a staged file into place and fsync the directory entry, so the
-    publication is durable the moment it becomes visible."""
+    """Rename a staged file into place and fsync the directory where supported."""
     try:
         os.replace(tmp, path)
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({exc})")
@@ -1740,8 +1741,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total.
-                "room_members", "room_member_count",
+                # a capped one-line mxid list + the true joined total, and the
+                # broker's own dm|room verdict so a skill need not count members.
+                "room_members", "room_member_count", "channel_kind",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -3004,12 +3006,13 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 
 
 def _fsync_in_place(tid: str, *targets: Path) -> bool:
-    """fsync files (and directories) already on disk. A pre-durability writer
-    left these bytes uncommitted, so nothing may be claimed durable until this
-    lands; False when it did not."""
+    """Fsync existing files and directories where supported."""
     try:
         for target in targets:
-            fd = os.open(target, os.O_RDONLY)
+            if os.name == "nt" and target.is_dir():
+                continue
+            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+            fd = os.open(target, flags)
             try:
                 os.fsync(fd)
             finally:
@@ -3565,16 +3568,6 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
              "(delivery unaffected)")
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True  # exists but not signalable — treat as alive
-    return True
-
-
 def _recover_orphan_proactive() -> None:
     """Restart-safety: recover orphan proactive claims back to `.txt` so the
     next drain re-claims them — WITHOUT stealing a live worker's in-flight
@@ -3924,10 +3917,79 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
+def _is_worker_id(value: str) -> bool:
+    """The pool's instance-id grammar, restated here for the same reason the
+    path conventions below are: this package cannot import the optional skill
+    that owns it. `core` is not a worker and never satisfies this."""
+    return len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
+
+def _assigned_worker(task_id: str) -> str:
+    """Which pool worker this task was ASSIGNED to, read from the router's
+    assignment record. Provenance is fixed before the task runs, so it does
+    not depend on the worker finishing, on residue surviving, or on the
+    producer remembering to stamp itself.
+
+    Path convention (state/attribution/<task_id>) is owned by the pool's own
+    recorder in an optional local skill this standalone PyPI package cannot
+    import or name (docs/architecture-boundaries.md, "Optional adapter
+    capabilities") — the same arrangement _worker_of() has with the done-flag
+    writer. tests/gateway-result-worker-attribution.test.py builds its
+    fixtures through that recorder's own path function, so a drift fails a
+    test instead of silently losing attribution.
+
+    FAILS CLOSED, for the reason _worker_of does: a wrong worker id labels a
+    reply with another worker's identity. Anything unreadable, not a regular
+    file, or outside the instance-id grammar yields "" rather than a guess.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return ""
+    path = _STATE / "attribution" / task_id
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""  # unreadable: no reading, not "never assigned"
+    if not stat.S_ISREG(st.st_mode):
+        return ""  # malformed record the recorder would itself refuse
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return value if _is_worker_id(value) else ""
+
+
+def _result_worker(task_id: str) -> str:
+    """Attribution for one result: assignment truth first, completion residue
+    only as the migration fallback.
+
+    A task routed before assignment records existed has none, so residue still
+    answers for it; once no such task is in flight the residue arm can go. A
+    result with residue but no assignment record is precisely the anomaly the
+    assignment store exists to surface — an author nobody recorded at routing
+    time — so it is logged rather than passed over.
+    """
+    assigned = _assigned_worker(task_id)
+    if assigned:
+        return assigned
+    residue = _worker_of(task_id)
+    if residue:
+        _log(f"attribution: {task_id} has no assignment record; using "
+             f"completion residue ({residue}). Assignment-time recording "
+             f"did not run for this task.")
+    return residue
+
+
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
     done-flag. `task_id` is the result stem, which already carries the
     `task-` prefix.
+
+    SUPERSEDED as the primary signal by _assigned_worker(): this infers the
+    author from completion residue after the fact, which is exactly the
+    fragility assignment-time provenance removes. Kept as the transition
+    fallback in _result_worker() for tasks routed before that record existed.
 
     Path convention (state/workers/<recipient>/done/<task_id>.{pending,flag})
     is owned by the pool's own done_flag()/mark_done() writer, in an optional
@@ -3985,7 +4047,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _worker_of(tid)
+    worker = _result_worker(tid)
     if worker:
         doc["metadata"] = {"worker_id": worker}
     payload = json.dumps(doc).encode("utf-8")

@@ -8,8 +8,9 @@ connector tools, first:
   → whether the app is connected, plus the matching actions with their input schemas;
 - `mcp__sutando-station__composio_exec` `{"toolkit": "googlecalendar", "action": "<from find>", "arguments": {…}}`.
 
-Not connected → follow the `connect-apps` skill: one in-chat Connect card, the task closes, and the
-answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
+Not connected → follow the `connect-apps` skill: one Connect card (a message in the owner's DM; in a
+room with other people a private card under their message that only they see), the task closes, and
+the answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
 Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
 macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
@@ -38,6 +39,8 @@ stream, pull or push) are bounded first: anything over 200 KB is resampled to a
 3024×1964 display. Frames share one websocket with realtime audio, so an
 unbounded frame delays speech, not just vision. Reading a captured file from disk
 is unaffected — the bound applies only on the way into a session.
+
+**Windows platform tools** — `open_file` uses Windows ShellExecute with a literal target; characters such as `&`, `%`, and apostrophes are not interpreted as commands. Missing handlers return an error. Clipboard reads and writes preserve Unicode and multiline text through UTF-8. `pwsh -File src/notify.ps1 "message"` delegates Discord delivery to the shared owner-resolution and send policy, honoring the configured Claude home. Voice frames use Windows image resizing before the same frame-size limit is applied.
 
 **Notes** — the user's second brain. Save and retrieve notes:
 - Save: write to `notes/{slug}.md` with a descriptive filename
@@ -265,21 +268,53 @@ is needed only when `install` prints `RESTART REQUIRED` (the running engine star
 Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
-Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec`. Connecting one is the
-`connect-apps` skill's job (an in-chat Connect card, then an automatic resume); its helper:
+Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
+ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
+payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
+owner-only card and nothing is posted. Its helper:
 ```bash
 C=skills/connect-apps/scripts/connectors.py
-python3 "$C" find "google calendar"     # exact catalog app, connected or not
-python3 "$C" status googlecalendar      # connected? plus pending waits
+python3 "$C" find "google calendar"     # exact catalog app, connected or not (30s read cache)
+python3 "$C" status googlecalendar      # connected? plus pending waits (30s read cache)
+python3 "$C" card googlecalendar --room '<room>' --reply-to '<source_message_id>' --task '<task id>' \
+  --owner-from-task [--private] [--switch] --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
 python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
 ```
+The skill's precheck hook adds a `connect-apps precheck:` line on your first touch of a task naming an
+app: which apps it needs, which are connected (from the cache), and the room kind from the task's
+`channel_kind:` header. The owner sees, switches and disconnects connected apps in AG2 Space →
+Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
+app is signed in with a new account.
 
 **App launcher** — open any macOS app:
 ```bash
-open -a "Safari"                    # open by name
+# Windows: use the registered display name; success requires verified foreground focus.
+pwsh -NoProfile -File scripts/open-app.ps1 "Paint"
+pwsh -NoProfile -File scripts/open-app.ps1 "Microsoft Store"
+
+# macOS
+open -a "Safari"
 open -a "Slack"
 open "https://github.com"           # open URL in default browser
 ```
+Voice and phone can use `switch_app` on macOS and Windows. The Windows CLI and
+inline tool share `src/windows-app-launcher.ps1`; bundled services ship the same
+backend beside their JavaScript artifacts.
+
+Windows matches registered app IDs or exact executable paths, never window-title
+substrings. It reuses an existing window (restoring it if minimized) or launches
+once, then verifies the intended app actually owns the foreground. An already
+foreground app is left alone; otherwise the first matching window is selected,
+not a particular document or profile. Shortcuts whose identity cannot be resolved
+fail rather than guessing from their display name.
+
+An interactive desktop is required. Windows may refuse foreground activation,
+especially when the agent runs in the background; the tool reports that refusal
+and asks the user to select the app from the taskbar. Merely launching a process
+or making a window visible is not success.
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 

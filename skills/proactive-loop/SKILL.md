@@ -19,6 +19,7 @@ caps this file and refuses date stamps in it).
 1. `/schedule-crons` — registers the session crons and stamps them.
 2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
 
@@ -48,7 +49,10 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$S" && mv -f "$S" "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
-   Bind idle to it too: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
+   `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
+   archive their own claims.
+   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
@@ -58,11 +62,6 @@ caps this file and refuses date stamps in it).
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
-3.4. **Zero-result rule**, chained so a refusal cannot be skipped:
-   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>" && <the send>`
-   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). A negative
-   states its population inline — "0 of N matching X" — or nobody, including its author, can falsify it.
-   Name what a non-zero looks like, run the positive control, suspect scope then shape, never in zsh.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
    (0 no candidate · 1 do not file, candidates named · 2 cannot answer).

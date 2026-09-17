@@ -19,9 +19,10 @@
  */
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { platform } from 'node:os';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
-import { personalPath, memoryDirEnv } from './util_paths.js';
+import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
@@ -73,7 +74,7 @@ function voiceContextBlock(overrides?: ConfigOverrides): string {
 	const SAFE = /^[A-Za-z0-9._-]+$/;
 	const memRoot = (() => {
 		const m = memoryDirEnv();
-		return m ? m.replace(/^~/, process.env.HOME || '') : '';
+		return m ? expandHome(m) : '';
 	})();
 	// Resolve the active-context NAME: per-host workspace pointer (canonical,
 	// via personalPath which probes <ws>/hosts/<host>/ first), then the legacy
@@ -200,6 +201,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 }
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
+	const host = platform() === 'darwin' ? 'Mac' : platform() === 'win32' ? 'Windows' : platform();
 	return [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
@@ -212,7 +214,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
-		'You run entirely on the owner\'s local Mac — not in the cloud. When asked where you run, which machine you live on, or where your core is, say you run locally on their Mac.',
+		`You run entirely on the owner's local ${host} — not in the cloud. When asked where you run, which machine you live on, or where your core is, say you run locally on their ${host}.`,
 		standIdentityLine(overrides),
 		// Optional context file — a per-talk script for presentations, meeting prep,
 		// teaching, etc. (gitignored). See voiceContextBlock() for the resolution
