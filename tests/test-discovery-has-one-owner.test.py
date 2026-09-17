@@ -183,8 +183,7 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
             scripts = Path(td) / "scripts"
             scripts.mkdir()
             # Stands in for a discovery call that never reaches the real
-            # script (dead branch, moved call) rather than for the real
-            # script's own already-tested empty-list refusal.
+            # script, not for the real script's own already-tested refusal.
             (scripts / "discover-python-tests.sh").write_text("#!/bin/sh\nexit 0\n")
             (scripts / "discover-python-tests.sh").chmod(0o755)
             r = subprocess.run(["bash", "-c", body], cwd=td,
