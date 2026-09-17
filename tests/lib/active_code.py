@@ -917,7 +917,22 @@ def _raw_segments(line: str):
     A `set` line reporting `"fatal"` (a delimiter-less heredoc, round 22) is
     a real Bash PARSE error: once seen, nothing anywhere later in the WHOLE
     program is reachable, not merely the rest of its own AND-OR list -- so
-    it latches a sticky flag that blocks every later append to `out`."""
+    it latches a sticky flag that blocks every later append to `out`.
+
+    An undecidable cmd1 still pins the compound's status when the OTHER
+    side is a decisive literal: `<unknown> && false` is false either way
+    (if cmd1 fails the chain is already false; if it succeeds, `false`
+    runs and IS false), and symmetrically `<unknown> || true` is true
+    either way -- so the segment after it is credited even though cmd1's
+    own status never resolved (round 27, keweichen: `printf if && false
+    || python3 live.py` really runs live.py on real Bash 3.2.57/5.2.32,
+    confirmed by direct execution). This is narrower than crediting on ANY
+    undecidable cmd1: `<unknown> && true` still equals cmd1's own status,
+    so `printf if && true && python3 x.py` stays uncredited on purpose --
+    declined even though named alongside the `&& false` case, since
+    crediting it would regress the `true`/`false`-LHS-only contract this
+    file already tests (`python3 real.py && python3 x.py` must still drop
+    x.py)."""
     # Named above: &&/|| gate on pending_op/chain_status; the open pipe on
     # last_runs/pipe_group/pipe_entered; pipefail_on is the sticky `set` toggle.
     out, cur, quote, i = [], [], None, 0
@@ -994,7 +1009,7 @@ def _raw_segments(line: str):
                 elif maybe:
                     pipefail_on = "unknown"
             last_runs = runs
-            shape = text if (runs and text in ("true", "false")) else "unknown"
+            shape = text if text in ("true", "false") else "unknown"
             if pending_op == "|":
                 pipe_group.append(shape)
             else:
@@ -1003,10 +1018,16 @@ def _raw_segments(line: str):
         if sep == "|":
             pending_op = "|"
             return
+        own_status = pipe_status()
         if pipe_entered:
-            chain_status = pipe_status()
-        # else: the pipe never ran -- chain_status (the gate's own
-        # already-known status) passes through unchanged.
+            chain_status = own_status
+        elif pending_op == "&&" and own_status == "false":
+            # `<unknown> && false` is false either way (round 27, keweichen).
+            chain_status = "false"
+        elif pending_op == "||" and own_status == "true":
+            chain_status = "true"
+        # else: chain_status (the gate's own already-known status) passes
+        # through unchanged.
         pipe_group = []
         if sep in ("&&", "||"):
             pending_op = sep

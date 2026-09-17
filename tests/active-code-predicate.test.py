@@ -367,6 +367,28 @@ class LiteralConstantAndOrChains(unittest.TestCase):
                 "false && python3 packages/x/dead.py || python3 packages/x/live.py"),
             ["packages/x/live.py"])
 
+    def test_a_literal_false_decides_the_compound_even_behind_an_undecidable_lhs(self):
+        """`printf if && false || python3 live.py`: `printf if`'s own exit
+        status is undecidable, but `X && false` is false EITHER WAY -- if
+        printf fails the chain is already false, if it succeeds `false`
+        runs and is false -- so `|| live.py` runs regardless (round 27,
+        keweichen: confirmed on real Bash 3.2.57 and 5.2.32)."""
+        self.assertEqual(
+            program_python_args(
+                "printf if && false || python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+
+    def test_an_undecidable_lhs_then_a_literal_true_stays_undecidable(self):
+        """`printf if && true && python3 x.py`: unlike the `false` case
+        above, `X && true` equals X -- if printf fails the chain never
+        reaches x.py, so this genuinely depends on printf's own status and
+        stays uncredited, same as any other undecidable LHS (round 27,
+        keweichen asked for this case too; declined -- it would regress
+        test_an_undecidable_lhs_still_refuses_credit_for_the_rhs above)."""
+        self.assertEqual(
+            program_python_args(
+                "printf if && true && python3 packages/x/x.py"), [])
+
 
 class PipeIsNotAHardReset(unittest.TestCase):
     """keweichen round 11: a lone `|` is one syntactic unit with its guard,

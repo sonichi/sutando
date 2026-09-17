@@ -71,7 +71,11 @@ def _run_bodies(text: str) -> list[str]:
     auto-detected common indent entirely (round 25, keweichen): it strips
     exactly `key_column + N` from every line, deliberately preserving any
     extra source indentation as literal content -- `min(indents)` cannot
-    express that, since it always strips the block's OWN minimum."""
+    express that, since it always strips the block's OWN minimum. Reset
+    alongside `indent`, not just at a new `run:` (round 27, keweichen): a
+    stale indicator survived a dedent-ended block into the final
+    unconditional `_flush()`, crashing `None + indicator` on any file
+    whose last `run:` used one and was followed by an ordinary sibling key."""
     out, indent, indicator, block = [], None, None, []
 
     def _flush():
@@ -98,7 +102,7 @@ def _run_bodies(text: str) -> list[str]:
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
                 _flush()
-                indent = None
+                indent, indicator = None, None
             else:
                 block.append(ln)
     _flush()
@@ -768,6 +772,19 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_explicit_indicator_state_does_not_leak_into_a_later_flush(self):
+        """keweichen round 27: a sibling key ends the `run:` block by dedent
+        (not by a new `run:`), which reset `indent` but left `indicator`
+        stale -- the unconditional `_flush()` at end-of-input then computed
+        `None + indicator` and crashed on this ordinary, valid YAML."""
+        wf = ("steps:\n  - run: |2-\n"
+              "      python3 packages/x/test_live.py\n"
+              "    env:\n"
+              "      X: y\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
     def test_heredoc_nested_in_arithmetic_command_substitution_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 25: a real heredoc inside a `$(...)` nested
         within `$((...))` arithmetic must still be recognized as one."""
@@ -792,6 +809,17 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_printf_if_as_cmd1_still_credits_the_or_side_through_the_consumer_path(self):
+        """keweichen round 25/26/27: the actually-named case has `printf if`
+        as the FIRST command, not guarded by a preceding `false &&` -- its
+        own exit status is undecidable, but `X && false` is false either
+        way, so `|| test_live.py` still runs (confirmed on real Bash)."""
+        wf = ("steps:\n  - run: |\n"
+              "      printf if && false || python3 packages/x/test_live.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
 
     def test_unknown_then_guaranteed_true_elif_proves_else_dead_through_the_consumer_path(self):
         """keweichen round 25: a trailing `else` after an undecidable `if`
