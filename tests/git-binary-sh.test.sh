@@ -150,9 +150,7 @@ else
 fi
 
 # --- 11. a CASE-VARIANT spelling of the real system stub must not bypass the
-# guard -- `realpath` does not case-fold, only device+inode identity does
-# (keweichen, reviewing #4323 at b281d71f3). Skipped on a case-sensitive
-# filesystem, where no such alias exists to test.
+# guard -- realpath does not case-fold, only device+inode identity does.
 if [ -f "/USR/BIN/git" ]; then
   lab11=$(mktemp -d)
   printf '#!/bin/sh\nexit 2\n' > "$lab11/xcode-select"; chmod +x "$lab11/xcode-select"

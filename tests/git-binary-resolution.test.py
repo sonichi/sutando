@@ -53,6 +53,12 @@ _spec.loader.exec_module(git_binary)
 
 SYSTEM_GIT = git_binary.SYSTEM_GIT
 
+# A REAL file, not a bare path string: an unstatable candidate is no longer
+# trivially "not the stub", so a fixture standing in for a real git must exist.
+_FIXTURE_DIR = tempfile.TemporaryDirectory()
+FIXTURE_GIT = str(Path(_FIXTURE_DIR.name) / "git")
+Path(FIXTURE_GIT).write_bytes(b"")
+
 # health-check.py is imported for the integration case below (the caller whose
 # degradation path this fix relies on). Banner suppressed so the suite output
 # stays readable; CLAUDE_CONFIG_DIR isolated so importing a src/ module never
@@ -137,7 +143,7 @@ class SelectGitOrdering(unittest.TestCase):
 
     def test_non_shim_git_wins_without_probing(self):
         # A Homebrew/standalone git short-circuits: xcode-select is never spawned.
-        brew_git = str(REPO / "fixture-bin" / "git")
+        brew_git = FIXTURE_GIT
         self.assertEqual(
             git_binary.select_git(
                 [brew_git], is_darwin=True, clt_installed=self._never_called
@@ -212,6 +218,30 @@ class SelectGitOrdering(unittest.TestCase):
             "the same case-variant path is a usable git once CLT is installed",
         )
 
+    def test_default_wiring_recognizes_a_real_hardlinked_alias(self):
+        """Exercises the PRODUCTION composition -- default `same_file` AND
+        default `realpath` together, no injection -- so a broken default
+        cannot hide behind a test that only ever exercised a mock.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "git")
+            open(real, "w").close()
+            alias = os.path.join(tmp, "git-alias")
+            os.link(real, alias)
+            old_system_git = git_binary.SYSTEM_GIT
+            git_binary.SYSTEM_GIT = real
+            try:
+                self.assertIsNone(
+                    git_binary.select_git([alias], is_darwin=True, clt_installed=lambda: False),
+                    "a real hardlinked alias of the stub must refuse without CLT",
+                )
+                self.assertEqual(
+                    git_binary.select_git([alias], is_darwin=True, clt_installed=lambda: True),
+                    alias,
+                )
+            finally:
+                git_binary.SYSTEM_GIT = old_system_git
+
 
 class SameFileHelper(unittest.TestCase):
     """`_same_file` is the identity check `select_git` defaults to."""
@@ -232,13 +262,30 @@ class SameFileHelper(unittest.TestCase):
             open(b, "w").close()
             self.assertFalse(git_binary._same_file(a, b))
 
-    def test_a_missing_path_is_not_the_same_file(self):
+    def test_missing_system_git_means_nothing_can_be_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             real = os.path.join(tmp, "git")
             open(real, "w").close()
             self.assertFalse(
                 git_binary._same_file(real, os.path.join(tmp, "absent"))
             )
+
+    def test_unreadable_candidate_fails_closed_toward_the_stub(self):
+        """The identity-probe-failure policy (keweichen, reviewing #4323 at
+        b0b02dd57): the two stat calls must fail in OPPOSITE directions. An
+        unreadable CANDIDATE is unknown, not proven safe -- returning False
+        here would let `select_git` hand back an unverified binary with no
+        CLT check, which is the exact modal-dialog bug this module exists to
+        prevent. An absent SYSTEM_GIT (tested above) is the safe direction:
+        nothing can be identical to a file that does not exist.
+        """
+        def raises(path):
+            raise OSError(f"simulated unreadable candidate: {path}")
+
+        self.assertTrue(
+            git_binary._same_file("/some/candidate", git_binary.SYSTEM_GIT, stat=raises),
+            "an unreadable candidate must be treated as the stub, not as a verified non-stub",
+        )
 
 
 class PathCandidates(unittest.TestCase):
@@ -317,7 +364,7 @@ class ResolveGit(unittest.TestCase):
         git_binary.reset_cache_for_tests()
 
     def test_returns_path_result_when_a_real_git_exists(self):
-        real = str(REPO / "fixture-bin" / "git")
+        real = FIXTURE_GIT
         with patch.object(git_binary, "path_candidates", return_value=[real]):
             self.assertEqual(git_binary.resolve_git(), real)
 
@@ -326,7 +373,7 @@ class ResolveGit(unittest.TestCase):
             self.assertIsNone(git_binary.resolve_git())
 
     def test_a_positive_answer_is_cached(self):
-        real = str(REPO / "fixture-bin" / "git")
+        real = FIXTURE_GIT
         with patch.object(git_binary, "path_candidates", return_value=[real]) as which:
             git_binary.resolve_git()
             git_binary.resolve_git()
@@ -347,7 +394,7 @@ class ResolveGit(unittest.TestCase):
 
     def test_install_after_start_is_picked_up(self):
         """The exact install-after-start ordering a post-restart test cannot reach."""
-        real = str(REPO / "fixture-bin" / "git")
+        real = FIXTURE_GIT
         with patch.object(git_binary, "path_candidates", return_value=[]):
             self.assertIsNone(git_binary.resolve_git())
         # ...user installs the tools; no restart.
@@ -357,7 +404,7 @@ class ResolveGit(unittest.TestCase):
 
 class GitArgv(unittest.TestCase):
     def test_builds_argv_when_git_is_available(self):
-        real = str(REPO / "fixture-bin" / "git")
+        real = FIXTURE_GIT
         with patch.object(git_binary, "resolve_git", return_value=real):
             self.assertEqual(
                 git_binary.git_argv("log", "-1"), [real, "log", "-1"]
