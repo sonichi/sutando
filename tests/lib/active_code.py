@@ -308,15 +308,25 @@ def _sets_pipefail(text: str) -> "bool | str | None":
     form. Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
     re-evaluates each left to right -- so the LAST one found wins.
 
-    Scanning stops at `--` OR at the first token that isn't `-`/`+`-shaped
-    at all (`set -o pipefail positional +o pipefail` leaves it ON: Bash's
-    own `set` ends option processing there too, so the trailing `+o
-    pipefail` is just $2/$3) -- and a quoted value (`set -o 'pipefail'`) is
-    the same value shell-quoted -- keweichen rounds 13/15, confirmed by
-    direct execution. A value containing `$`/backtick may resolve to
-    "pipefail" at runtime and we cannot know without a real shell (`OPT=
-    pipefail; set -o "$OPT"` really enables it) -- "unknown" propagates
-    that honestly rather than silently asserting the toggle did nothing."""
+    Scanning stops at `--` OR a lone `-` (both are Bash's own end-of-options
+    markers for `set`) OR at the first token that isn't `-`/`+`-shaped at
+    all (`set -o pipefail positional +o pipefail` leaves it ON: Bash's own
+    `set` ends option processing there too, so the trailing `+o pipefail`
+    is just $2/$3) -- and a quoted value (`set -o 'pipefail'`) is the same
+    value shell-quoted -- keweichen rounds 13/15/16, confirmed by direct
+    execution. A value containing `$`/backtick may resolve to "pipefail" at
+    runtime and we cannot know without a real shell (`OPT=pipefail; set -o
+    "$OPT"` really enables it) -- "unknown" propagates that honestly rather
+    than silently asserting the toggle did nothing. But shlex has ALREADY
+    erased single-quoting/escaping by the time a token exists, so `set -o
+    '$OPT'`/`set -o \\$OPT` produce the identical token "$OPT" as the
+    expandable bare/double-quoted form, though Bash rejects both as a
+    literal invalid option name and leaves pipefail untouched (round 16) --
+    checked against the untokenized text, the same fix as `!`'s. And the
+    cluster/option SLOT itself can be an expansion (`FLAG=-o; set "$FLAG"
+    pipefail` really enables it) -- once we can't even tell if a token is
+    an option or the end of options, "unknown" is the only honest answer
+    and nothing after it is safe to interpret either (round 16)."""
     import re
     import shlex
     try:
@@ -325,10 +335,25 @@ def _sets_pipefail(text: str) -> "bool | str | None":
         toks = text.split()
     if not toks or toks[0] != "set":
         return None
+
+    def literally_quoted(val: str) -> bool:
+        """True when `val`'s occurrence in `text` was single-quoted or
+        backslash-escaped -- a literal argument, never expanded, though
+        shlex's OWN token for it is identical to the expandable forms."""
+        return f"'{val}'" in text or ("\\" + val) in text
+
     result, i = None, 1
     while i < len(toks):
         tok = toks[i]
-        if tok == "--" or not tok or tok[0] not in "-+":
+        # An expansion HERE could be an option or the end of options -- we
+        # cannot even tell which, so nothing past it is safe to interpret.
+        if re.search(r"[$`]", tok):
+            if not literally_quoted(tok):
+                result = "unknown"
+            break
+        if tok in ("--", "-"):
+            break
+        if not tok or tok[0] not in "-+":
             break
         if len(tok) > 1 and not tok.startswith("--") and "o" in tok[1:]:
             i += 1
@@ -336,7 +361,7 @@ def _sets_pipefail(text: str) -> "bool | str | None":
                 val = toks[i]
                 if val == "pipefail":
                     result = tok[0] == "-"
-                elif re.search(r"[$`]", val):
+                elif re.search(r"[$`]", val) and not literally_quoted(val):
                     result = "unknown"
                 i += 1
             continue

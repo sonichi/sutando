@@ -497,6 +497,44 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 'OPT=pipefail\nset -o "$OPT"\n'
                 "false | true && python3 packages/x/dead.py"), [])
 
+    def test_a_single_quoted_dollar_value_is_a_literal_bash_rejects(self):
+        """`set -o '$OPT'`: shlex already erased the single-quoting by the
+        time a token exists, giving the identical "$OPT" text as the
+        expandable bare/double-quoted forms -- but Bash rejects it as an
+        invalid literal option name and leaves pipefail untouched, so the
+        later pipe's real exit is `true`'s and dead.py DOES run -- keweichen
+        round 16, confirmed by direct execution on Bash 3.2 and 5.2."""
+        self.assertEqual(
+            program_python_args(
+                "set -o '$OPT'\nfalse | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_an_escaped_dollar_value_is_also_a_rejected_literal(self):
+        self.assertEqual(
+            program_python_args(
+                r"set -o \$OPT" "\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_an_expansion_in_the_option_slot_itself_is_also_unknown(self):
+        """`FLAG=-o; set "$FLAG" pipefail`: Bash resolves $FLAG to `-o` and
+        really enables pipefail -- confirmed by direct execution -- but a
+        static read cannot tell an expansion in OPTION position from the
+        end of options, so nothing after it is safe to interpret either."""
+        self.assertEqual(
+            program_python_args(
+                'FLAG=-o\nset "$FLAG" pipefail\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_lone_dash_also_ends_sets_own_option_scanning(self):
+        """`set - +o pipefail`: a lone `-` is Bash's OWN end-of-options
+        marker for `set`, same as `--` -- confirmed by direct execution:
+        pipefail (enabled earlier) stays on and dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\nset - +o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

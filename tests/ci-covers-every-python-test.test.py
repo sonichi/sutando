@@ -370,6 +370,29 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_a_quoted_dollar_value_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 16: shlex erases the single-quoting, but Bash
+        rejects the literal option name (pipefail stays at its OFF default)
+        and dead.py really runs."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o '$OPT'\n"
+              "      false | true && python3 packages/x/test_live.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
+    def test_a_lone_dash_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 16: a lone `-` ends `set`'s own option
+        scanning the same as `--`."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set - +o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
