@@ -27,6 +27,7 @@ from task_archive import find_task_file  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+import cron_eval  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -110,54 +111,11 @@ def scheduler_lock(workspace: Path) -> Iterator[None]:
 
 
 def _field_values(spec: str, minimum: int, maximum: int, *, sunday_7: bool = False) -> set[int]:
-    values: set[int] = set()
-    for token in spec.split(","):
-        token = token.strip()
-        if not token:
-            raise ValueError("empty cron field token")
-        base, slash, step_text = token.partition("/")
-        step = int(step_text) if slash else 1
-        if step <= 0:
-            raise ValueError("cron step must be positive")
-        if base == "*":
-            start, end = minimum, maximum
-        elif "-" in base:
-            left, right = base.split("-", 1)
-            start, end = int(left), int(right)
-        else:
-            start = end = int(base)
-        if start < minimum or end > maximum or start > end:
-            raise ValueError(f"cron value {base!r} outside {minimum}-{maximum}")
-        values.update(range(start, end + 1, step))
-    if sunday_7 and 7 in values:
-        values.remove(7)
-        values.add(0)
-    return values
+    return set(cron_eval.field_values(spec, minimum, maximum, sunday_7=sunday_7))
 
 
 def cron_matches(expression: str, local_dt: datetime) -> bool:
-    fields = expression.split()
-    if len(fields) != 5:
-        raise ValueError("cron expression must have five fields")
-    minute = _field_values(fields[0], 0, 59)
-    hour = _field_values(fields[1], 0, 23)
-    day = _field_values(fields[2], 1, 31)
-    month = _field_values(fields[3], 1, 12)
-    weekday = _field_values(fields[4], 0, 7, sunday_7=True)
-    cron_weekday = (local_dt.weekday() + 1) % 7
-    day_match = local_dt.day in day
-    weekday_match = cron_weekday in weekday
-    # Vixie cron treats restricted day-of-month and day-of-week fields as OR.
-    if fields[2] != "*" and fields[4] != "*":
-        calendar_match = day_match or weekday_match
-    else:
-        calendar_match = day_match and weekday_match
-    return (
-        local_dt.minute in minute
-        and local_dt.hour in hour
-        and local_dt.month in month
-        and calendar_match
-    )
+    return cron_eval.matches(expression, local_dt)
 
 
 def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dict[str, Any]]:
