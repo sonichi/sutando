@@ -29,6 +29,13 @@ cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$SB/src/startup.sh"
+# The heartbeat handoff is a python call, not a pops_* one: a stub writer logs
+# its argv beside the seam's calls so scope can be read for it too.
+cat > "$SB/src/core_heartbeat.py" <<'HB'
+import os, sys
+with open(os.environ["POPS_LOG"], "a") as f:
+    f.write("heartbeat " + " ".join(sys.argv[1:]) + "\n")
+HB
 cat > "$SB/scripts/sutando-config.sh" <<CFG
 #!/bin/sh
 case "\$1" in
@@ -290,7 +297,9 @@ peer_hits="$(grep -E "(^| )($W1_PID|$W2_PID)( |$)" "$LOG" | grep -v '^alive ' ||
 [ "$(grep -c '^signal ' "$LOG")" = "1" ]; ck "(d) exactly one signal was issued in the entire run" $?
 
 # ================================================== (e) the declared scope sets
-CORE_KILLS="agent-api.py
+# A pattern kill is host-wide whatever scope issues it, so core issues NONE: it
+# stops only what its own records name — its watcher and its heartbeat writer.
+HOST_KILLS="agent-api.py
 conversation-server
 dashboard.py
 discord-bridge
@@ -304,17 +313,39 @@ telegram-bridge"
 APP_KILLS="credential-proxy
 src/Sutando/Sutando
 web-client.ts"
+ALL_KILLS="$(printf '%s\n%s' "$APP_KILLS" "$HOST_KILLS" | sort -u)"
 
 arm; restart --stop-only; out="$OUT"
-[ "$(killed_patterns)" = "$CORE_KILLS" ]; ck "(e) --scope core kills EXACTLY its declared set" $?
-[ "$(killed_patterns)" != "$CORE_KILLS" ] && diff <(echo "$CORE_KILLS") <(killed_patterns) | sed 's/^/       /'
+[ -z "$(killed_patterns)" ]; ck "(e) --scope core issues NO pattern kill at all" $?
+note "core pattern kills: [$(killed_patterns | tr '\n' ' ')]"
+grep -q '^heartbeat --stop$' "$LOG"; ck "(e) --scope core hands over its own recorded heartbeat writer (--stop)" $?
+[ "$(grep -c '^heartbeat ' "$LOG")" = "1" ]; ck "(e) and calls the heartbeat exactly once" $?
 grep -q "host-wide components" <<<"$out"; ck "(e) and says which components it deliberately left up" $?
+grep -q "bridges, dashboard" <<<"$out"; ck "(e) naming the shared services among them" $?
+
+# The control: a pattern kill re-added OUTSIDE the all-gate shows up in the same
+# core-scope log, so the empty list above is the gate, not a blind instrument.
+sed 's|^_stop_own_task_watcher "|pops_pattern_kill "dashboard.py"\n&|' \
+    "$SB/src/restart.sh" > "$SB/src/restart-perturbed-e.sh"
+grep -q '^pops_pattern_kill "dashboard.py"$' "$SB/src/restart-perturbed-e.sh"
+ck "(e) CONTROL: the perturbation applied (control is not vacuous)" $?
+arm; run bash "$SB/src/restart-perturbed-e.sh" --stop-only
+[ "$(killed_patterns)" = "dashboard.py" ]; ck "(e) CONTROL: an ungated pattern kill IS counted under core scope" $?
 
 arm; restart --scope all --stop-only; out="$OUT"
-[ "$(killed_patterns)" = "$(printf '%s\n%s' "$APP_KILLS" "$CORE_KILLS" | sort -u)" ]
-ck "(e) --scope all kills EXACTLY the core set plus the app-wide set" $?
-[ "$(killed_patterns)" != "$(printf '%s\n%s' "$APP_KILLS" "$CORE_KILLS" | sort -u)" ] && \
-  diff <(printf '%s\n%s' "$APP_KILLS" "$CORE_KILLS" | sort -u) <(killed_patterns) | sed 's/^/       /'
+[ "$(killed_patterns)" = "$ALL_KILLS" ]
+ck "(e) --scope all kills EXACTLY the host-wide set plus the app-wide set" $?
+[ "$(killed_patterns)" != "$ALL_KILLS" ] && diff <(echo "$ALL_KILLS") <(killed_patterns) | sed 's/^/       /'
+note "all pattern kills: [$(killed_patterns | tr '\n' ' ')]"
+grep -q '^heartbeat --stop$' "$LOG"; ck "(e) --scope all hands over the heartbeat writer too" $?
+
+# The drain wait is on the pattern-killed set: under core nothing in it was
+# signalled, so waiting on it would only block on a live (maybe a peer's) service.
+arm; restart --scope=all; out="$OUT"
+grep -q '^pattern_running ' "$LOG"; ck "(e) --scope all drains on the services it signalled" $?
+arm; restart; out="$OUT"
+! grep -q '^pattern_running ' "$LOG"; ck "(e) --scope core does not wait on services it never signalled" $?
+grep -q "STUB-STARTUP-REACHED" <<<"$out"; ck "(e) and still runs to completion and reaches startup.sh" $?
 
 # The launchd proxy is app-wide too: it must be reached only under --scope all.
 arm; POPS_LAUNCHCTL_PRINT_RC=0 restart --stop-only

@@ -5,9 +5,11 @@
 #   --stop-only    Stop without restarting
 #   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
 #                  (implies --scope all: the binary cannot be replaced under the running app)
-#   --scope core          (default) this instance's own session and the components it owns
+#   --scope core          (default) only what this instance's own records name: its task
+#                         watcher (the sentinel) and its heartbeat writer (the pidfile)
 #   --scope worker <id>   that worker's watcher and tmux session, nothing else
-#   --scope all           adds the host-wide components every instance shares
+#   --scope all           every service on the host: the bridges, dashboard, agent API and
+#                         the rest matched by pattern, plus web-client, credential proxy, app
 #
 # Scope exists because a host runs more than one Sutando: a core plus pool
 # workers, or two cores. Anything outside the declared scope belongs to another
@@ -185,26 +187,30 @@ _resolve_workspace
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 # The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
 # startup.sh only starts one when none is running, and an old writer keeps its old schema.
-# No interpreter → no handoff, said aloud; an argv sweep is never the fallback.
+# --stop ends only the writer this instance's records name, so it is in scope for core.
 if [ -n "${PY_BIN:-}" ]; then
     "$PY_BIN" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null || echo "  WARN heartbeat handoff (--stop) failed — the old writer may still be running"
 else
     echo "  WARN no runnable python3 for the heartbeat handoff — old writer left running (startup will not replace it)"
 fi
-pops_pattern_kill "dashboard.py"
-pops_pattern_kill "agent-api.py"
-pops_pattern_kill "screen-capture-server"
-pops_pattern_kill "telegram-bridge"
-pops_pattern_kill "discord-bridge"
-pops_pattern_kill "slack-bridge"
-pops_pattern_kill "remote-gateway-bridge"
-# The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
-# IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
-# `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
-# host 2026-08-03, a stub-launched instance had been up 39 DAYS, survived every
-# restart, and kept stamping tasks from 39-day-old code. Kill both names.
-pops_pattern_kill "remote-relay-bridge"
-pops_pattern_kill "observability/boot"
+# --- shared services: a pattern kill takes every instance's copy, a peer core's too, so
+# only `all` may issue one; under core they run on (startup.sh's guards leave them as-is).
+if [ "$SCOPE" = "all" ]; then
+    pops_pattern_kill "dashboard.py"
+    pops_pattern_kill "agent-api.py"
+    pops_pattern_kill "screen-capture-server"
+    pops_pattern_kill "telegram-bridge"
+    pops_pattern_kill "discord-bridge"
+    pops_pattern_kill "slack-bridge"
+    pops_pattern_kill "remote-gateway-bridge"
+    # The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
+    # IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
+    # `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
+    # host 2026-08-03, a stub-launched instance had been up 39 DAYS, survived every
+    # restart, and kept stamping tasks from 39-day-old code. Kill both names.
+    pops_pattern_kill "remote-relay-bridge"
+    pops_pattern_kill "observability/boot"
+fi
 _stop_own_task_watcher "${_WS:+$_WS/state}" || WATCHER_STOP_RC=$?
 # Every other stopped service is relaunched below or by startup.sh. This one
 # cannot be: the watcher is armed by the AGENT via the Monitor tool, so a
@@ -218,8 +224,10 @@ else
     echo "      watcher may still be draining tasks/. Nothing here re-arms one either:"
     echo "      Monitor  bash src/watch-tasks-stream.sh  (persistent)"
 fi
-pops_pattern_kill "conversation-server"
-pops_pattern_kill "ngrok"
+if [ "$SCOPE" = "all" ]; then
+    pops_pattern_kill "conversation-server"
+    pops_pattern_kill "ngrok"
+fi
 
 # --- app-wide: every instance on this host shares these ----------------------
 # The web-client listener, the launchd proxy every session authenticates
@@ -250,9 +258,10 @@ if [ "$SCOPE" = "all" ]; then
     fi
     pops_pattern_kill "src/Sutando/Sutando"
 else
-    echo "  ⊘ host-wide components (web-client, credential proxy, Sutando.app) left running — scope is $SCOPE"
+    echo "  ⊘ host-wide components (bridges, dashboard, agent API, screen capture, conversation server,"
+    echo "      ngrok, web-client, credential proxy, Sutando.app) left running — scope is $SCOPE"
 fi
-echo "  All services stopped"
+echo "  Stopped everything in scope: $SCOPE"
 [ "$WATCHER_STOP_RC" -ne 0 ] && echo "restart.sh: watcher stop rc=$WATCHER_STOP_RC — ownership unconfirmed, see above"
 
 if [ "$STOP_ONLY" -eq 1 ]; then
@@ -272,18 +281,20 @@ STOP_PATTERNS=(
     "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "$REPO/src/core_heartbeat.py"
 )
-# Waited on only under --scope all: a peer instance's web-client or desktop app
-# is not ours to outlast, and draining on it would block on a live service.
+# Waited on only under --scope all: below it nothing here was signalled, and the core
+# scope's two stops (heartbeat --stop, watcher_stop_owned) each wait for exit themselves.
 APP_STOP_PATTERNS=( "web-client.ts" "src/Sutando/Sutando" )
-[ "$SCOPE" = "all" ] && STOP_PATTERNS+=( "${APP_STOP_PATTERNS[@]}" )
-for _ in $(seq 1 30); do
-    still=0
-    for pat in "${STOP_PATTERNS[@]}"; do
-        if pops_pattern_running "$pat"; then still=1; break; fi
+if [ "$SCOPE" = "all" ]; then
+    STOP_PATTERNS+=( "${APP_STOP_PATTERNS[@]}" )
+    for _ in $(seq 1 30); do
+        still=0
+        for pat in "${STOP_PATTERNS[@]}"; do
+            if pops_pattern_running "$pat"; then still=1; break; fi
+        done
+        [ $still -eq 0 ] && break
+        sleep 0.1
     done
-    [ $still -eq 0 ] && break
-    sleep 0.1
-done
+fi
 
 # Restart, not a stop: the core is NOT in STOP_PATTERNS and survives this, so a
 # A restart is not a shutdown: a sentinel left set would make the surviving
