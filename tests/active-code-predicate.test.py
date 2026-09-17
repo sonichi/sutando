@@ -124,6 +124,57 @@ class ConditionalOperators(unittest.TestCase):
         self.assertTrue(invokes(f"bash scripts/{NAME} &", NAME))
 
 
+class DeadBranches(unittest.TestCase):
+    """qingyun-wu's blocking finding on #4202: a compound-command guard credited
+    a Python test that sits inside a static `if false` branch Bash never runs."""
+
+    def test_a_dead_if_false_branch_is_not_named(self):
+        self.assertEqual(program_python_args(
+            "if false\nthen\n  python3 packages/x/test_dead.py\nfi\n"), [])
+
+    def test_the_same_dead_branch_with_then_on_the_if_line_is_not_named(self):
+        self.assertEqual(program_python_args(
+            "if false; then\n  python3 packages/x/test_dead.py\nfi\n"), [])
+
+    def test_an_if_true_branch_still_counts(self):
+        self.assertEqual(program_python_args(
+            "if true\nthen\n  python3 packages/x/test_live.py\nfi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_the_else_of_a_dead_if_false_still_counts(self):
+        self.assertEqual(program_python_args(
+            "if false\nthen\n  python3 packages/x/test_dead.py\n"
+            "else\n  python3 packages/x/test_alive.py\nfi\n"),
+            ["packages/x/test_alive.py"])
+
+    def test_the_else_of_an_if_true_is_dead(self):
+        self.assertEqual(program_python_args(
+            "if true\nthen\n  python3 packages/x/test_live.py\n"
+            "else\n  python3 packages/x/test_dead.py\nfi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_an_undecidable_condition_credits_both_branches(self):
+        """Only a literal `false`/`true` is decidable here; anything else must
+        not be silently dropped either way."""
+        self.assertEqual(program_python_args(
+            'if [ "$X" = y ]\nthen\n  python3 packages/x/test_a.py\n'
+            "else\n  python3 packages/x/test_b.py\nfi\n"),
+            ["packages/x/test_a.py", "packages/x/test_b.py"])
+
+    def test_a_nested_dead_branch_inside_a_live_one_is_not_named(self):
+        self.assertEqual(program_python_args(
+            "if true\nthen\n  if false\n  then\n    python3 packages/x/test_inner_dead.py\n  fi\n"
+            "  python3 packages/x/test_outer_live.py\nfi\n"),
+            ["packages/x/test_outer_live.py"])
+
+    def test_glued_single_line_form_was_already_safe_before_this_fix(self):
+        """`if false; then cmd; fi` on one line already fails the command-
+        position check upstream (`then` sits before `python3`), so this pins
+        the pre-existing behaviour rather than this fix's own new code."""
+        self.assertEqual(program_python_args(
+            "if false; then python3 packages/x/test_dead.py; fi\n"), [])
+
+
 class MultiLinePrograms(unittest.TestCase):
     """keweichen's third [P2] on #4202: the AND-OR state `_segments()` tracks
     ended at each physical line, so `false &&` on one line never guarded the

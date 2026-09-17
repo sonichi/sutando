@@ -188,7 +188,54 @@ def program_python_args(text: str) -> list[str]:
     return out
 
 
+def _if_head(seg: str) -> str:
+    """'false'/'true' for a literal-constant `if`, else 'other' (unknown to us)."""
+    toks = seg.split()
+    if len(toks) >= 2 and toks[1] in ("false", "true"):
+        return toks[1]
+    return "other"
+
+
+def _filter_dead_branches(segments: list[str]) -> list[str]:
+    """Drop segments inside an `if false`/`if true` branch that provably never runs.
+
+    Only a literal constant condition is decidable without a real shell, so
+    `elif`/any other `if <cond>` leaves both its branches in — credited, not
+    proven reachable, but never wrongly dropped either. `if`/`then`/`else`/
+    `elif`/`fi` are markers here, one whole segment each; a single-line form
+    that glues one onto a real command (`if false; then python3 x.py; fi`)
+    already fails `_segment_python_arg`'s command-position check upstream, so
+    it is not (falsely) credited either way — nothing left for this to do."""
+    out, stack = [], []
+    for seg in segments:
+        head = seg.split()[0] if seg.split() else ""
+        if head == "if":
+            parent_drop = stack[-1]["drop"] if stack else False
+            kind = _if_head(seg)
+            stack.append({"kind": kind, "drop": parent_drop or kind == "false"})
+            continue
+        if head == "elif" and stack:
+            stack[-1] = {"kind": "other", "drop": stack[-2]["drop"] if len(stack) > 1 else False}
+            continue
+        if head == "then" and stack:
+            continue
+        if head == "else" and stack:
+            frame, parent_drop = stack[-1], (stack[-2]["drop"] if len(stack) > 1 else False)
+            frame["drop"] = True if frame["kind"] == "true" else parent_drop
+            continue
+        if head == "fi" and stack:
+            stack.pop()
+            continue
+        if not (stack and stack[-1]["drop"]):
+            out.append(seg)
+    return out
+
+
 def _segments(line: str):
+    return _filter_dead_branches(_raw_segments(line))
+
+
+def _raw_segments(line: str):
     """Split into AND-OR lists on UNCONDITIONAL separators, keeping only each
     list's FIRST command — the only one Bash is guaranteed to reach.
 
