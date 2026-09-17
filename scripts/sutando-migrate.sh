@@ -1838,16 +1838,28 @@ commit_main() {
         echo "  hook bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
     elif [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _hook_helper="$(dirname "$0")/sutando-config-hooks.sh"
+        local _primary_installer="$(dirname "$0")/../src/install-claude-hooks.sh"
         local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _new_settings="${_new_ccd}/settings.json"
         local _old_settings="$HOME/.claude/settings.json"
         if [ -x "$_hook_helper" ] || [ -f "$_hook_helper" ]; then
             if [ -n "$_new_ccd" ]; then
                 echo
-                echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh ..."
-                # Idempotent install of catchup hook; project hooks are repo-level (already in repo's .claude/settings.json).
-                bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
-                    echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                # install-claude-hooks.sh now targets THIS SAME claude-sutando-config-dir
+                # (moved there by #4309 — core-only hooks fire only for the core, not
+                # every session with this repo as cwd), so it is the single owner of the
+                # full core hook set (PreCompact archiver+handoff, SessionEnd, Stop) and
+                # the legacy project-settings sweep; sutando-config-hooks.sh's own
+                # --with-catchup-hook only ever covered the SessionEnd entry.
+                if [ -f "$_primary_installer" ]; then
+                    echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
+                    bash "$_primary_installer" || \
+                        echo "  hook install: primary installer failed (rc=$?) — re-run manually: bash src/install-claude-hooks.sh" >&2
+                else
+                    echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh (primary installer not found at expected path) ..."
+                    bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
+                        echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                fi
                 # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
                 bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
             else
