@@ -474,10 +474,12 @@ def case_ownership_policy(state: Path) -> None:
     # The CLI the shell bridge calls, in-process: rc 0 confirms, rc 1 refuses.
     check("CLI owner-pid confirms a complete record",
           wi.main(["owner-pid", "--sentinel", str(pf), "--instance", "",
-                   "--workspace", "/x/ws", "--incarnation-file", str(marker)]) == 0)
+                   "--workspace", "/x/ws", "--incarnation-file", str(marker),
+                   "--code-path", code]) == 0)
     check("CLI owner-pid refuses a pid-only sentinel",
           wi.main(["owner-pid", "--sentinel", str(legacy), "--instance", "",
-                   "--workspace", "/x/ws", "--incarnation-file", str(marker)]) == 1)
+                   "--workspace", "/x/ws", "--incarnation-file", str(marker),
+                   "--code-path", code]) == 1)
     check("CLI runs-watcher confirms the real invocation",
           wi.main(["runs-watcher", "--pid", "4242", "--argv", f"bash {code}",
                    "--code-path", code]) == 0)

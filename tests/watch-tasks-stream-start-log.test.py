@@ -21,7 +21,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -72,19 +71,18 @@ def test_append(box: Path) -> None:
           stat.S_ISFIFO(os.lstat(fifo).st_mode), "replaced")
 
     # A FIFO WITH a reader opens fine and is still not a log: nothing is written.
-    got: list[bytes] = []
-    def drain():
-        with open(fifo, "rb") as fh:
-            got.append(fh.read())
-    t = threading.Thread(target=drain, daemon=True)
-    t.start()
-    check("FIFO with a reader: the helper refuses to write into it",
-          da.append_line(str(fifo), "line") is False, "it reported a write")
-    # Release the reader: open+close for write gives it EOF.
-    fd = os.open(fifo, os.O_WRONLY)
-    os.close(fd)
-    t.join(timeout=5)
-    check("  ...and the reader received nothing", got == [b""], f"reader got {got!r}")
+    # The reader is a non-blocking fd held here, so its lifetime spans the call.
+    rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        check("FIFO with a reader: the helper refuses to write into it",
+              da.append_line(str(fifo), "line") is False, "it reported a write")
+        try:
+            got = os.read(rfd, 4096)
+        except BlockingIOError:
+            got = b""
+    finally:
+        os.close(rfd)
+    check("  ...and the reader received nothing", got == b"", f"reader got {got!r}")
 
     log = box / "regular.log"
     r = run_append(log, "first line")
