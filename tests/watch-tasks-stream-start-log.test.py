@@ -84,6 +84,24 @@ def test_append(box: Path) -> None:
         os.close(rfd)
     check("  ...and the reader received nothing", got == b"", f"reader got {got!r}")
 
+    # In-process arms, so the helper's own branches are measured, not only its CLI.
+    check("open failure (missing parent dir): False, no raise",
+          da.append_line(str(box / "no-such-dir" / "x.log"), "line") is False)
+    inproc = box / "inproc.log"
+    check("regular file in-process: True and the line landed",
+          da.append_line(str(inproc), "one") is True and inproc.read_text() == "one\n",
+          f"content {inproc.read_text()!r}" if inproc.exists() else "missing")
+    real_write = os.write
+    def failing_write(fd, data):
+        raise OSError(5, "injected EIO")
+    os.write = failing_write
+    try:
+        check("write failure: False, no raise, fd still closed",
+              da.append_line(str(inproc), "two") is False)
+    finally:
+        os.write = real_write
+    check("  ...and the earlier content is intact", inproc.read_text() == "one\n")
+
     log = box / "regular.log"
     r = run_append(log, "first line")
     check("regular file: created and appended, rc 0", r is not None and r.returncode == 0
