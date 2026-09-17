@@ -925,6 +925,38 @@ ok "relocated checkout: operator's own hook.sh-mentioning command still survives
    "$(echo "$SSURV" | grep -qF 'my-own-hook.sh' && echo 0 || echo 1)"
 rm -rf "$SROOT"
 
+# --- 16. An OPERATOR'S OWN guard-shaped command around a BUILT-IN marker must
+# survive -- only a skill-declared entry may wear the skill_hooks.py guard
+# shape. #4309 review round 7 (keweichen, 2026-09-16): candidate_is_owned()
+# recognized `[ -f Q ] || exit 0; exec RUNNER Q` for EVERY HOOKS entry, not
+# only skill-declared ones, so this operator command -- never emitted by
+# skill_hooks.py, which only guards files under skills/*/ -- was classified
+# as ours and swept.
+GROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks guard-scope.XXXXXX")"
+GREPO="$GROOT/repo"
+mkdir -p "$GREPO/src" "$GREPO/.claude" "$GREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$GREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\ntrue\n' > "$GREPO/src/session-handoff.sh"
+echo '{}' > "$GREPO/workspace/.claude-sutando/settings.json"
+export G_LEGACY="$GREPO/.claude/settings.json" \
+       G_OPERATOR_TARGET="/tmp/an operator path/src/session-handoff.sh"
+python3 - <<'PY'
+import json, os, shlex
+p, target = os.environ['G_LEGACY'], os.environ['G_OPERATOR_TARGET']
+q = shlex.quote(target)
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # the operator's own guard around a DIFFERENT absolute path than this
+    # checkout's -- skill_hooks.py never emits a guard for a built-in
+    # marker like session-handoff.sh, so this is not ours -- must SURVIVE.
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$GREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+GSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+ok "operator's own guard around a built-in marker survives (not skill-declared)" \
+   "$(echo "$GSURV" | grep -qF "$G_OPERATOR_TARGET" && echo 0 || echo 1)"
+rm -rf "$GROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

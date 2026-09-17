@@ -1277,10 +1277,10 @@ _migrate_flat_anchor() {
     echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
 }
 
-# Commit modified + new carrier files before a pull. Runs generate_exclude first
-# so an out-of-carrier path cannot ride into the vault on this commit.
+# Commit modified + new carrier files before a pull. Untracks newly-denied
+# paths first, same order as _push_only_impl -- `git add` stages a tracked path's edit regardless of exclude rules.
 _commit_local_pre_pull() {
-    generate_exclude 2>/dev/null || true
+    _enforce_carrier_set_pre 2>/dev/null || true
     git add --ignore-removal . 2>/dev/null || true
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
