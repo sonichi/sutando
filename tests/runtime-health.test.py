@@ -257,7 +257,11 @@ check("_core_status: non-numeric ts -> (status, None)", rh._core_status(Tt) == (
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
 #    _pane_text/main uncovered. Point at a socket with no session → offline, and
 #    call each real helper directly (they degrade to empty/false, never crash).
+# _core_running() resolves via _tmux_socket(), not the bare TMUX_SOCKET constant --
+# on a live fresh-heartbeat host that finds the REAL socket, so mock the function too.
+_orig_tmux_socket = rh._tmux_socket
 _orig_socket = rh.TMUX_SOCKET
+rh._tmux_socket = lambda: "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 try:
     check("real _core_running: false on bogus socket", rh._core_running() is False)
@@ -287,6 +291,7 @@ try:
     check("real main() ran without error", True)
 finally:
     rh.TMUX_SOCKET = _orig_socket
+    rh._tmux_socket = _orig_tmux_socket
 
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a
