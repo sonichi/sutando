@@ -25,7 +25,7 @@ SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT
 mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state"
 cp "$REPO/src/restart.sh" "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
 cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
-cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$SB/src/"
+cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$REPO/src/proc_argv.py" "$SB/src/"
 # The REAL shutdown helper: which gate a scope marks is shared state every
 # watcher on the workspace reads, so it must be observable here, not stubbed.
 cp "$REPO/src/shutdown.py" "$REPO/src/workspace_default.py" "$SB/src/"

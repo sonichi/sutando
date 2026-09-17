@@ -27,7 +27,7 @@ build() {                       # build <sandbox> [perturbation]
   cp "$REPO/src/restart.sh" "$sb/src/restart.sh"
   cp "$REPO/src/process-ops.sh" "$REPO/src/watcher_sentinel.sh" "$sb/src/"
   cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$sb/src/"
-  cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$sb/src/"
+  cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$REPO/src/proc_argv.py" "$sb/src/"
   cp -R "$REPO/src/runtime-api" "$sb/src/runtime-api"
   cp "$REPO/scripts/python-binary.sh" "$sb/scripts/python-binary.sh"
   cat > "$sb/scripts/sutando-config.sh" <<CFG

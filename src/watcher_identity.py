@@ -60,10 +60,10 @@ import os
 import re
 import subprocess
 import sys
-from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import proc_argv  # noqa: E402
 from util_paths import read_sentinel_record  # noqa: E402
 
 WATCHER_STEM = "watch-tasks-stream"
@@ -88,41 +88,9 @@ def as_pid(tok) -> Optional[int]:
 
 def proc_argv_vector(pid) -> Optional[List[str]]:
     """Real argv of `pid` as a LIST, or None when no authoritative read exists.
-
-    A flattened argv cannot separate an operand containing a space from two
-    operands, so the executed script is not recoverable from it by any rule.
-    """
-    try:  # linux: NUL-delimited, authoritative
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        if raw:
-            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
-    except Exception:  # noqa: BLE001 -- not linux, or gone
-        pass
-    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-        size = ctypes.c_size_t(262144)
-        buf = ctypes.create_string_buffer(size.value)
-        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None
-        data = buf.raw[:size.value]
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        parts = data[4:].split(b"\0")
-        i = 0
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += 1                                   # the exec path
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        out = []
-        while i < len(parts) and len(out) < argc:
-            out.append(parts[i].decode("utf8", "replace"))
-            i += 1
-        return out or None
-    except Exception:  # noqa: BLE001 -- probe failure must not fail the caller
-        return None
+    The read itself is src/proc_argv.py's: one reader for the signaller, the
+    reporter and the pool bootstrap, so no two of them can disagree about a pid."""
+    return proc_argv.argv_vector(pid)
 
 
 class Verdict(NamedTuple):
