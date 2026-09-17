@@ -187,3 +187,23 @@ def reset_cache_for_tests() -> None:
     """Drop the memoised positive answer. Tests only."""
     global _resolved
     _resolved = None
+
+
+def short_head(repo: str) -> str:
+    """The abbreviated HEAD of `repo`, or "unknown" — provenance is optional,
+    and a host without git (or a dir that is not a checkout) must not fail it."""
+    try:
+        proc = subprocess.run(git_argv("-C", repo, "rev-parse", "--short", "HEAD"),
+                              capture_output=True, text=True, timeout=5)
+    except (GitUnavailable, OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    out = proc.stdout.strip()
+    return out if proc.returncode == 0 and out else "unknown"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "short-head":
+        print(short_head(sys.argv[2]))
+        sys.exit(0)
+    print("usage: git_binary.py short-head <repo>", file=sys.stderr)
+    sys.exit(2)

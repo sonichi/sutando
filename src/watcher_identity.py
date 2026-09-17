@@ -17,6 +17,9 @@ and both are answered here rather than once per caller:
      A substring test also counts the OBSERVER — a `ps | grep watch-tasks-stream`,
      or the wrapper running the health check — as another watcher; measured
      2026-07-21, it reported 3 watcher trees where 2 were real.
+  3. Is the script the record names THIS checkout's watcher? A record and an
+     argv that agree on `/foreign/checkout/src/watch-tasks-stream.sh` are
+     self-consistent and still not ours: checkouts may share one workspace.
 
 Everything here is pure: process and file I/O belong to the caller (restart.sh
 reaches the process table only through `src/process-ops.sh`, so a test can
@@ -24,12 +27,14 @@ replace that layer wholesale), and this module decides. Refusals carry a reason
 string because "I could not prove that watcher is mine" is a reportable
 outcome, never a silent pass — the owner's rule is refuse-and-report.
 
-Consumers: `src/restart.sh` (through the CLI below, via its resolved python),
+Consumers: `src/watcher_identity.sh` — the one shell sequence restart.sh and
+the startup reaper both run (through the CLI below, via the resolved python) —
 and `src/health-check.py` (imported).
 
 CLI, for the shell bridge:
   watcher_identity.py owner-pid --sentinel P --instance I --workspace W
-                                --incarnation-file F   -> "<pid>\t<code_path>"
+                                --incarnation-file F --code-path C
+                                                        -> "<pid>\t<code_path>"
   watcher_identity.py runs-watcher --pid N --argv A --code-path C
 Both exit 0 on confirmation, or print the reason and exit 1.
 """
@@ -121,10 +126,11 @@ class Refused(Exception):
 
 
 def confirm_record(sentinel, want_instance: str, want_workspace: str,
-                   incarnation_file) -> "tuple[int, str]":
+                   incarnation_file, expect_code_path: str) -> "tuple[int, str]":
     """(pid, code_path) from a sentinel that names THIS install's watcher, or
     raise Refused with the check that failed. Reads the record through the one
-    shared reader, so a consumer never re-spells the on-disk grammar."""
+    shared reader, so a consumer never re-spells the on-disk grammar.
+    `expect_code_path` is the watcher script of the checkout asking."""
     rec = read_sentinel_record(sentinel)
     pid = rec.get("pid")
     if pid is None:
@@ -150,6 +156,12 @@ def confirm_record(sentinel, want_instance: str, want_workspace: str,
     if not rec["code_path"]:
         raise Refused(f"code_path: {sentinel} records none, so pid {pid}'s argv cannot "
                       f"be matched to our checkout")
+    if not expect_code_path:
+        raise Refused(f"code_path: this checkout resolved no watcher script, so {sentinel}'s "
+                      f'claim "{rec["code_path"]}" cannot be checked')
+    if os.path.realpath(rec["code_path"]) != os.path.realpath(expect_code_path):
+        raise Refused(f'code_path: {sentinel} records "{rec["code_path"]}", this checkout runs '
+                      f'"{expect_code_path}" — another checkout\'s watcher is not ours to signal')
     if not rec["incarnation"]:
         raise Refused(f"incarnation: {sentinel} records an empty one, so nothing "
                       f"distinguishes this watcher from the one it replaced")
@@ -187,6 +199,7 @@ def main(argv_in: "list[str] | None" = None) -> int:
     o.add_argument("--instance", default="")
     o.add_argument("--workspace", default="")
     o.add_argument("--incarnation-file", required=True)
+    o.add_argument("--code-path", required=True)
     r = sub.add_parser("runs-watcher")
     r.add_argument("--pid", type=int, required=True)
     r.add_argument("--argv", default="")
@@ -195,7 +208,8 @@ def main(argv_in: "list[str] | None" = None) -> int:
     try:
         if args.cmd == "owner-pid":
             pid, code_path = confirm_record(args.sentinel, args.instance,
-                                            args.workspace, args.incarnation_file)
+                                            args.workspace, args.incarnation_file,
+                                            args.code_path)
             print(f"{pid}\t{code_path}")
         else:
             confirm_process(args.pid, args.argv, args.code_path)

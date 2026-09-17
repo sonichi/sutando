@@ -37,6 +37,13 @@ done
 hits="$(scan "$RS")"
 [ -z "$hits" ]; ck "the shipped restart.sh contains no bare process verb" $?
 [ -n "$hits" ] && printf '%s\n' "$hits" | sed 's/^/       /'
+# The ownership sequence restart.sh runs lives in watcher_identity.sh: a bare
+# verb there escapes the fake exactly as one in restart.sh would.
+WI="$REPO/src/watcher_identity.sh"
+hits="$(scan "$WI")"
+[ -z "$hits" ]; ck "the shared src/watcher_identity.sh contains no bare process verb" $?
+[ -n "$hits" ] && printf '%s\n' "$hits" | sed 's/^/       /'
+grep -q 'pops_signal' "$WI"; ck "watcher_identity.sh signals through the seam (scan is not vacuous)" $?
 
 grep -q '^\. "\$REPO/src/process-ops.sh"' "$RS"; ck "restart.sh sources the interface" $?
 grep -q 'pops_' "$RS"; ck "restart.sh actually calls through it (scan is not vacuous)" $?

@@ -434,14 +434,15 @@ WATCHER_INSTANCE="$(sentinel_instance_from_path "$PID_FILE")"
 # distinguishable by pid alone during the handover, and this always is.
 WATCHER_INCARNATION="$(date +%s)-$$-${RANDOM:-0}${RANDOM:-0}"
 WATCHER_CODE_PATH="$__SCRIPT_DIR/$(basename "$0")"
-WATCHER_VERSION="$(git -C "$__REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+# Through the resolver: a bare `git` is the Xcode-CLT stub on a clean Mac.
+WATCHER_VERSION="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/git_binary.py" short-head "$__REPO_ROOT" 2>/dev/null || true)"
 [ -n "$WATCHER_VERSION" ] || WATCHER_VERSION="unknown"
-# BEFORE the record is published: the record is what every readiness gate waits
-# on, and a start that died mid-publish is exactly what this log is read for.
+# BEFORE the record is published, since a start that died mid-publish is what
+# this log is read for. Never `>>`: that open blocks on a reader-less FIFO.
 mkdir -p "$WORKSPACE_DIR/logs" 2>/dev/null || true
-printf '%s %s %s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  "${WATCHER_INSTANCE:--}" "$WATCHER_INCARNATION" "$$" "$WATCHER_CODE_PATH" \
-  "$WATCHER_VERSION" "$PID_FILE" >> "$WORKSPACE_DIR/logs/watcher-starts.log" 2>/dev/null || true
+"$SUTANDO_PY_BIN" "$__SCRIPT_DIR/diagnostic_append.py" "$WORKSPACE_DIR/logs/watcher-starts.log" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${WATCHER_INSTANCE:--} $WATCHER_INCARNATION $$ $WATCHER_CODE_PATH $WATCHER_VERSION $PID_FILE" \
+  2>/dev/null || true
 # Under the lock so a peer's cleanup cannot claim this record mid-publish. A
 # failed write is fatal: an unrecorded watcher is one no signaller may stop.
 if ! sentinel_lock_acquire "$PID_FILE"; then

@@ -81,91 +81,28 @@ _shutdown_state() {
   }
 }
 
-# `kill -0` (pops_alive) proves a pid EXISTS, never that it is OURS: a dead
-# watcher's number is reissued and the next holder answers identically. The
-# policy that decides ownership is src/watcher_identity.py, shared with
-# health-check.py; this function is only its process I/O.
-#
-# Sets WATCHER_OWNER_PID on success, WATCHER_OWNER_REASON on refusal. NOT via
-# stdout: `$( )` is a subshell and the reason would die with it.
-_confirm_watcher_owner() {
-    local sentinel="$1" want_instance="${2:-}" want_workspace="${3:-}"
-    local owner pid code_path argv inc_file wrote_rc=0
-    WATCHER_OWNER_REASON=""; WATCHER_OWNER_PID=""
-    if [ -z "${PY_BIN:-}" ]; then
-        WATCHER_OWNER_REASON="no runnable python3 — the ownership policy cannot be asked, so nothing is ours to signal"
-        return 1
-    fi
-    inc_file="$(sentinel_incarnation_path "$sentinel")"
-    # The record half: a COMPLETE identity naming this install, this instance and
-    # the incarnation the live marker exposes. A missing field is a refusal.
-    if ! owner="$("$PY_BIN" "$REPO/src/watcher_identity.py" owner-pid \
-                    --sentinel "$sentinel" --instance "$want_instance" \
-                    --workspace "$want_workspace" --incarnation-file "$inc_file" 2>&1)"; then
-        WATCHER_OWNER_REASON="$owner"
-        return 1
-    fi
-    IFS=$'\t' read -r pid code_path <<< "$owner"
-    if ! pops_alive "$pid"; then
-        WATCHER_OWNER_REASON="pid $pid is not alive"
-        return 1
-    fi
-    # The process half: the EXECUTED script, never containment. `python3 -c pass
-    # /x/watch-tasks-stream.sh` carries that path as data and must not confirm.
-    argv="$(pops_argv "$pid")"
-    if ! WATCHER_OWNER_REASON="$("$PY_BIN" "$REPO/src/watcher_identity.py" runs-watcher \
-                    --pid "$pid" --argv "$argv" --code-path "$code_path" 2>&1)"; then
-        return 1
-    fi
-    # The shared age policy the startup reaper also asks; errexit-safe, since a
-    # bare call would abort the caller on its rc 1 (reissued) or 2 (unknown).
-    sentinel_pid_wrote_file "$pid" "$sentinel" || wrote_rc=$?
-    if [ "$wrote_rc" -eq 1 ]; then
-        WATCHER_OWNER_REASON="stale sentinel: pid $pid started AFTER $sentinel was stamped — a reissued pid, not its owner"
-        return 1
-    fi
-    if [ "$wrote_rc" -ne 0 ]; then
-        WATCHER_OWNER_REASON="stale sentinel: whether pid $pid wrote $sentinel is UNMEASURABLE — an unprovable owner is a refusal"
-        return 1
-    fi
-    WATCHER_OWNER_REASON=""
-    WATCHER_OWNER_PID="$pid"
-}
-
-# Stop the ONE watcher a sentinel names, and only once it is proven ours.
-# A pattern kill is never the fallback here: `pkill -f watch-tasks` matched every
-# watcher on the host, which is the outage this whole path exists to prevent.
+# Ownership and the stop are the shared src/watcher_identity.sh sequence the
+# startup reaper also runs; this function only names the scope and reports.
 _stop_watcher_at() {            # <sentinel> [expected-instance] [expected-workspace]
-    local sentinel="$1" pid
+    local sentinel="$1" pid rc=0
     if [ ! -f "$sentinel" ]; then
         echo "  watcher stop: no sentinel at $sentinel — nothing of ours to stop"
         return 0
     fi
-    if ! _confirm_watcher_owner "$sentinel" "${2:-}" "${3:-}"; then
+    if ! watcher_confirm_owner "$sentinel" "${2:-}" "${3:-}" "$REPO/src/watch-tasks-stream.sh"; then
         echo "  watcher stop: OWNERSHIP NOT CONFIRMED — $WATCHER_OWNER_REASON"
         echo "  watcher stop: nothing signalled, $sentinel left in place"
         return "$RC_WATCHER_UNCONFIRMED"
     fi
     pid="$WATCHER_OWNER_PID"
     echo "  watcher stop: signalling this core's watcher (pid $pid)"
-    # The sentinel is the only record of a watcher that is still running, so it
-    # is released after the stop is CONFIRMED and never before.
-    if ! pops_signal "$pid" TERM; then
-        echo "  watcher stop: SIGNAL FAILED for pid $pid — $sentinel left in place so a retry can still name it"
-        return "$RC_WATCHER_NOT_STOPPED"
-    fi
-    local tries="${SUTANDO_WATCHER_STOP_TICKS:-30}" i=0
-    while [ "$i" -lt "$tries" ]; do
-        pops_alive "$pid" || break
-        pops_grace_tick
-        i=$((i+1))
-    done
-    if pops_alive "$pid"; then
-        echo "  watcher stop: pid $pid is STILL ALIVE after TERM and $tries ticks of grace — $sentinel left in place"
-        return "$RC_WATCHER_NOT_STOPPED"
-    fi
-    sentinel_release_if_owner "$sentinel" "$pid"
-    return 0
+    watcher_stop_owned "$sentinel" "$pid" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) echo "  watcher stop: SIGNAL FAILED for pid $pid — $sentinel left in place so a retry can still name it" ;;
+        *) echo "  watcher stop: pid $pid is STILL ALIVE after TERM and ${SUTANDO_WATCHER_STOP_TICKS:-30} ticks of grace — $sentinel left in place" ;;
+    esac
+    return "$RC_WATCHER_NOT_STOPPED"
 }
 
 # Resolve the sentinel for one instance and stop the watcher it names.
@@ -176,9 +113,9 @@ _stop_own_task_watcher() {
         echo "  watcher stop: no workspace resolved — cannot name this core's watcher; every watcher left alone"
         return "$RC_WATCHER_UNCONFIRMED"
     fi
-    # shellcheck source=watcher_sentinel.sh
-    if ! . "$REPO/src/watcher_sentinel.sh" 2>/dev/null; then
-        echo "  watcher stop: src/watcher_sentinel.sh unreadable — every watcher left alone"
+    # shellcheck source=watcher_identity.sh
+    if ! . "$REPO/src/watcher_identity.sh" 2>/dev/null; then
+        echo "  watcher stop: src/watcher_identity.sh unreadable — every watcher left alone"
         return "$RC_WATCHER_UNCONFIRMED"
     fi
     if ! sentinel="$(sentinel_path_for "$state_dir" "$instance")" || [ -z "$sentinel" ]; then

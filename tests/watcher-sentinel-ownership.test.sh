@@ -9,7 +9,16 @@
 # Run: bash tests/watcher-sentinel-ownership.test.sh
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# The reaper compares every record with THIS checkout's watcher script, so the
+# fixtures run from a sandbox checkout whose script is a sleeper and whose every
+# other src/ entry is the real one, linked (tests/fixtures/sandbox-checkout.sh).
+# shellcheck source=fixtures/sandbox-checkout.sh
+. "$REAL_REPO/tests/fixtures/sandbox-checkout.sh"
+SB="$(mktemp -d)/checkout"
+make_sandbox_checkout "$SB" "$REAL_REPO"
+CODE="$SB/src/watch-tasks-stream.sh"
+REPO="$SB"
 # shellcheck source=../src/watcher_sentinel.sh
 source "$REPO/src/watcher_sentinel.sh"
 # shellcheck source=../src/startup-runtime.sh
@@ -31,26 +40,17 @@ cleanup_all() {
   # leave alive therefore survived the suite as ppid=1 orphans for their full
   # sleep, and health-check's task-watcher probe counts them as live watchers.
   [ -f "$PIDFILE" ] && while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$PIDFILE"
-  rm -rf "$TMP"
+  rm -rf "$TMP" "${SB%/checkout}"
 }
 trap cleanup_all EXIT
 
-# A real process whose argv matches the reaper's `ps ... | grep watch-tasks-stream`.
-spawn_fake_watcher() {
-  local dir="$1" script="$1/watch-tasks-stream.sh"
-  printf '#!/usr/bin/env bash\nsleep 120\n' > "$script"
-  chmod +x "$script"
-  # stdout/stderr MUST be redirected: this runs inside $( ), and a background
-  # child inheriting that pipe keeps it open, so the substitution would block
-  # until the child exits — a 120s hang rather than a test.
-  "$script" >/dev/null 2>&1 & local pid=$!
+# A real process executing THIS checkout's watcher script — or, when a second
+# argument names one, some other script (a foreign checkout's).
+spawn_fake_watcher() {          # spawn_fake_watcher <dir> [script]
+  local pid
+  pid="$(spawn_sandbox_watcher "${2:-$CODE}")"
   KILL_LIST+=("$pid")
   echo "$pid" >> "$PIDFILE"   # survives the $( ) the caller wraps this in
-  # Wait until ps can actually see it, so the test never races the fixture.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    ps -p "$pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break
-    sleep 0.1
-  done
   printf '%s' "$pid"
 }
 
@@ -74,7 +74,7 @@ check "$([ "$E" = "62" ] && echo 0 || echo 1)" "e1) MM:SS parses to seconds"
 D1="$TMP/aba"; mkdir -p "$D1"
 PID1="$(spawn_fake_watcher "$D1")"
 PF1="$D1/watch-tasks-stream.pid"
-stamp_record "$PF1" "$PID1" "$D1/watch-tasks-stream.sh"
+stamp_record "$PF1" "$PID1" "$CODE"
 touch -t 202601010000 "$PF1"          # sentinel far older than the process
 
 reap_stale_task_watcher "$PF1" >"$TMP/out1" 2>&1
@@ -90,7 +90,7 @@ check "$(grep -q 'reissued pid' "$TMP/out1" && echo 0 || echo 1)" \
 D2="$TMP/stale"; mkdir -p "$D2"
 PID2="$(spawn_fake_watcher "$D2")"
 PF2="$D2/watch-tasks-stream.pid"
-stamp_record "$PF2" "$PID2" "$D2/watch-tasks-stream.sh"   # fresh: old enough to own it
+stamp_record "$PF2" "$PID2" "$CODE"   # fresh: old enough to own it
 
 reap_stale_task_watcher "$PF2" >"$TMP/out2" 2>&1
 check "$([ -f "$PF2" ] && echo 1 || echo 0)" \
@@ -173,7 +173,7 @@ check "$(grep -qi 'unbound variable' "$TMP/sout" && echo 1 || echo 0)" \
 D5="$TMP/movedin"; mkdir -p "$D5"
 PID5="$(spawn_fake_watcher "$D5")"
 PF5="$D5/watch-tasks-stream.pid"
-stamp_record "$TMP/staged.pid" "$PID5" "$D5/watch-tasks-stream.sh"
+stamp_record "$TMP/staged.pid" "$PID5" "$CODE"
 touch -t 202601010000 "$TMP/staged.pid"     # built earlier, elsewhere
 mv "$TMP/staged.pid" "$PF5"                 # mv preserves that old mtime
 mv "$TMP/staged.incarnation" "${PF5%.pid}.incarnation"
@@ -212,7 +212,7 @@ check "$([ "$f1_rc" -eq 2 ] && echo 0 || echo 1)" \
 DIR_U="$TMP/unknown"; mkdir -p "$DIR_U"
 U_PID="$(spawn_fake_watcher "$DIR_U")"
 PF_U="$DIR_U/watch-tasks-stream.pid"
-stamp_record "$PF_U" "$U_PID" "$DIR_U/watch-tasks-stream.sh"
+stamp_record "$PF_U" "$U_PID" "$CODE"
 _real_elapsed="$(declare -f sentinel_pid_elapsed)"
 sentinel_pid_elapsed() { return 1; }          # ownership becomes unmeasurable
 reap_stale_task_watcher "$PF_U" >"$TMP/outU" 2>&1
@@ -283,12 +283,25 @@ g_case() {                      # g_case <label> <writer> <expect-substring>
 }
 
 w_pid_only()  { printf '%s\n' "$2" > "$1"; }
-w_foreign()   { stamp_record "$1" "$2" "$3/watch-tasks-stream.sh" "peer+w2"; }
+w_foreign()   { stamp_record "$1" "$2" "$CODE" "peer+w2"; }
 w_other_code(){ stamp_record "$1" "$2" "$3/some-other-daemon.sh"; }
 
 g_case "pidonly" w_pid_only  "records a pid only"
 g_case "foreign" w_foreign   'instance: '
-g_case "code"    w_other_code "does not run"
+g_case "code"    w_other_code "this checkout runs"
+
+# g-checkout) a record and an argv that AGREE on another checkout's script.
+# Self-consistent, and still not this checkout's: workspaces may be shared.
+DIR_FC="$TMP/g-checkout/src"; mkdir -p "$DIR_FC"
+write_sandbox_watcher "$DIR_FC/watch-tasks-stream.sh"
+FC_PID="$(spawn_fake_watcher "$DIR_FC" "$DIR_FC/watch-tasks-stream.sh")"
+PF_FC="$TMP/g-checkout/watch-tasks-stream.pid"
+stamp_record "$PF_FC" "$FC_PID" "$DIR_FC/watch-tasks-stream.sh"
+out_fc="$(reap_stale_task_watcher "$PF_FC" 2>&1)"
+check "$(kill -0 "$FC_PID" 2>/dev/null && echo 0 || echo 1)" "g-checkout) a foreign checkout's watcher is NOT signalled"
+check "$([ -f "$PF_FC" ] && echo 0 || echo 1)" "g-checkout) ...and its sentinel is left in place"
+check "$(printf '%s' "$out_fc" | grep -q "code_path:.*this checkout runs" && echo 0 || echo 1)" \
+      "g-checkout) ...and the refusal names this checkout's script (got: $out_fc)"
 
 echo
 echo "passed $PASS, failed $FAIL"

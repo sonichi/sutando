@@ -85,37 +85,59 @@ sentinel_lock_abandoned() {
   find "$1" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .
 }
 
-# A holder killed mid-section would wedge every later start, so an ABANDONED
-# lock is removed under a SECOND lock, which only one stealer can hold.
-sentinel_lock_acquire() {
-  local lock steal deadline
-  lock="$(sentinel_lock_path "$1")"
-  steal="${lock}.steal"
-  deadline=$(( $(date +%s) + ${2:-10} ))
-  while ! mkdir "$lock" 2>/dev/null; do
-    if sentinel_lock_abandoned "$lock"; then
-      if mkdir "$steal" 2>/dev/null; then
-        # RE-probe under the steal lock. `$lock` is never renamed away, so a
-        # winner that took it since the probe above is still there to be seen.
-        if sentinel_lock_abandoned "$lock"; then
-          rm -rf "$lock"
-        fi
-        rmdir "$steal" 2>/dev/null || true
-        continue
-      fi
-      # A stealer killed between those two lines wedges the steal, not the lock.
-      if sentinel_lock_abandoned "$steal"; then
-        rm -rf "$steal"
-      fi
-    fi
-    [ "$(date +%s)" -lt "$deadline" ] || return 1
-    sleep 0.05
+# A stealer unlinks only a stamp that is ITSELF abandoned — a fresh holder's is
+# younger — and never removes the directory: an emptied one is taken by rename.
+sentinel_lock_steal_abandoned() {
+  local lock="$1" stamp
+  for stamp in "$lock"/held.*; do
+    [ -e "$stamp" ] || continue
+    sentinel_lock_abandoned "$stamp" && rm -f "$stamp"
   done
-  return 0
 }
 
+# rename(2): atomic, and onto an existing directory only when that directory is
+# EMPTY. `mv` would move the source INSIDE an existing target instead.
+_sentinel_rename_dir() {
+  local here py
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "take the sentinel lock")" || return 1
+  "$py" -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2" 2>/dev/null
+}
+
+# A lock holds its taker's stamp <lock>/held.<token> from the instant it exists
+# (built privately, renamed in), so a held lock is never empty for a rename to take.
+SENTINEL_LOCK_TOKEN=""
+sentinel_lock_acquire() {
+  local lock deadline token tmp
+  lock="$(sentinel_lock_path "$1")"
+  deadline=$(( $(date +%s) + ${2:-10} ))
+  token="$$.$(date +%s).${RANDOM:-0}${RANDOM:-0}"
+  tmp="$(mktemp -d "${lock}.acq.XXXXXX")" || return 1
+  : > "$tmp/held.$token" || { rm -rf "$tmp"; return 1; }
+  while :; do
+    if _sentinel_rename_dir "$tmp" "$lock"; then
+      SENTINEL_LOCK_TOKEN="$token"
+      return 0
+    fi
+    if sentinel_lock_abandoned "$lock"; then
+      sentinel_lock_steal_abandoned "$lock"
+      continue
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || { rm -rf "$tmp"; return 1; }
+    sleep 0.05
+  done
+}
+
+# Own stamp first, then the directory only if that left it empty: `rmdir`
+# refuses one another taker has since renamed into place.
 sentinel_lock_release() {
-  rmdir "$(sentinel_lock_path "$1")" 2>/dev/null || true
+  local lock
+  lock="$(sentinel_lock_path "$1")"
+  [ -n "$SENTINEL_LOCK_TOKEN" ] && rm -f "$lock/held.$SENTINEL_LOCK_TOKEN"
+  SENTINEL_LOCK_TOKEN=""
+  rmdir "$lock" 2>/dev/null || true
 }
 
 # Temp+rename both files, marker first: a reader must never find a record whose

@@ -24,7 +24,8 @@ SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT
 # stubbed, absent, or routed to the fake.
 mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state"
 cp "$REPO/src/restart.sh" "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
-cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$REPO/src/watcher_identity.py" "$SB/src/"
+cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
+cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$SB/src/startup.sh"
@@ -161,7 +162,15 @@ refuses "another instance's record" "instance:"
 
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
 sed -i.bak "s|code_path=.*|code_path=/somewhere/else/watch-tasks-stream.sh|" "$CORE_SENT"
-refuses "another checkout's code_path" "code_path: pid $CORE_PID does not run"
+refuses "another checkout's code_path" "code_path: .*this checkout runs"
+
+# A record and an argv that AGREE on a foreign checkout are self-consistent and
+# still not ours: checkouts may share one workspace, so consistency with the
+# record is not identity with this checkout.
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+sed -i.bak "s|code_path=.*|code_path=$SB/foreign/src/watch-tasks-stream.sh|" "$CORE_SENT"
+CORE_ARGV="/bin/bash $SB/foreign/src/watch-tasks-stream.sh" \
+  refuses "a self-consistent FOREIGN checkout's watcher" "code_path: .*this checkout runs"
 
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
 printf 'inc-OTHER\n' > "${CORE_SENT%.pid}.incarnation"

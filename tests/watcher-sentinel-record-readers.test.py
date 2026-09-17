@@ -282,9 +282,9 @@ def case_ownership_policy(state: Path) -> None:
     Its refusals are the inputs a containment check used to accept."""
     import watcher_identity as wi
 
+    code = "/x/src/watch-tasks-stream.sh"          # this checkout's watcher script
     pf = state / "own.pid"
-    write_record(pf, 4242, instance="", inc="inc-G", code="/x/src/watch-tasks-stream.sh",
-                 ws="/x/ws")
+    write_record(pf, 4242, instance="", inc="inc-G", code=code, ws="/x/ws")
     marker = state / "own.incarnation"
     marker.write_text("inc-G\n")
 
@@ -296,16 +296,36 @@ def case_ownership_policy(state: Path) -> None:
     check("the shell and the policy name the same incarnation marker",
           shell_marker == str(marker), f"shell said {shell_marker!r}")
 
-    got = wi.confirm_record(pf, "", "/x/ws", str(marker))
+    got = wi.confirm_record(pf, "", "/x/ws", str(marker), code)
     check("a COMPLETE record naming this install confirms",
           got == (4242, "/x/src/watch-tasks-stream.sh"), f"got {got!r}")
+
+    # The record half compares the recorded script with THIS checkout's, before
+    # any argv is read; a spelling resolving to the same file is not "another".
+    try:
+        wi.confirm_record(pf, "", "/x/ws", str(marker), "/other/checkout/src/watch-tasks-stream.sh")
+        check("a record naming ANOTHER CHECKOUT's script is REFUSED", False, "it confirmed")
+    except wi.Refused as exc:
+        check("a record naming ANOTHER CHECKOUT's script is REFUSED",
+              str(exc).startswith("code_path:") and "this checkout runs" in str(exc), str(exc))
+    try:
+        wi.confirm_record(pf, "", "/x/ws", str(marker), "")
+        check("a checkout that resolved NO script is REFUSED, not skipped", False, "it confirmed")
+    except wi.Refused as exc:
+        check("a checkout that resolved NO script is REFUSED, not skipped",
+              str(exc).startswith("code_path:"), str(exc))
+    try:
+        wi.confirm_record(pf, "", "/x/ws", str(marker), "/x/./src/../src/watch-tasks-stream.sh")
+        check("CONTROL: the same script spelled through ./ and ../ confirms", True)
+    except wi.Refused as exc:
+        check("CONTROL: the same script spelled through ./ and ../ confirms", False, str(exc))
 
     for field in ("instance", "incarnation", "code_path", "workspace"):
         cut = state / f"no-{field}.pid"
         cut.write_text("\n".join(ln for ln in pf.read_text().splitlines()
                                   if not ln.startswith(f"{field}=")) + "\n")
         try:
-            wi.confirm_record(cut, "", "/x/ws", str(marker))
+            wi.confirm_record(cut, "", "/x/ws", str(marker), code)
             check(f"a record with no {field} is REFUSED", False, "it confirmed")
         except wi.Refused as exc:
             check(f"a record with no {field} is REFUSED", str(exc).startswith(f"{field}:"),
@@ -314,12 +334,11 @@ def case_ownership_policy(state: Path) -> None:
     legacy = state / "legacy-only.pid"
     legacy.write_text("4242\n")
     try:
-        wi.confirm_record(legacy, "", "/x/ws", str(marker))
+        wi.confirm_record(legacy, "", "/x/ws", str(marker), code)
         check("a pid-only sentinel is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("a pid-only sentinel is REFUSED", "records a pid only" in str(exc), str(exc))
 
-    code = "/x/src/watch-tasks-stream.sh"
     for label, argv in (
             ("an interpreter carrying the path as DATA", f"python3 -c pass {code}"),
             ("a shell whose executed slot is a flag", f"bash -c 'sleep 1' {code}"),
@@ -349,12 +368,12 @@ def case_ownership_policy(state: Path) -> None:
         bad = state / f"bad-policy-{len(label)}.pid"
         bad.write_text(fixture)
         try:
-            wi.confirm_record(bad, "", "/x/ws", str(marker))
+            wi.confirm_record(bad, "", "/x/ws", str(marker), code)
             check(f"{label} is REFUSED", False, "it confirmed")
         except wi.Refused as exc:
             check(f"{label} is REFUSED", want in str(exc), str(exc))
     try:
-        wi.confirm_record(pf, "", "", str(marker))
+        wi.confirm_record(pf, "", "", str(marker), code)
         check("a scope that resolved NO workspace is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("a scope that resolved NO workspace is REFUSED", "workspace:" in str(exc), str(exc))
@@ -365,19 +384,19 @@ def case_ownership_policy(state: Path) -> None:
         blank.write_text("\n".join(
             (value if ln.startswith(f"{key}=") else ln) for ln in pf.read_text().splitlines()) + "\n")
         try:
-            wi.confirm_record(blank, "", "/x/ws", str(marker))
+            wi.confirm_record(blank, "", "/x/ws", str(marker), code)
             check(f"{label} is REFUSED", False, "it confirmed")
         except wi.Refused as exc:
             check(f"{label} is REFUSED", want in str(exc), str(exc))
     try:
-        wi.confirm_record(pf, "", "/x/ws", str(state / "no-such.incarnation"))
+        wi.confirm_record(pf, "", "/x/ws", str(state / "no-such.incarnation"), code)
         check("a missing incarnation marker is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("a missing incarnation marker is REFUSED", "exposes no marker" in str(exc), str(exc))
     other = state / "other.incarnation"
     other.write_text("inc-OLD\n")
     try:
-        wi.confirm_record(pf, "", "/x/ws", str(other))
+        wi.confirm_record(pf, "", "/x/ws", str(other), code)
         check("a marker from a PREVIOUS incarnation is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("a marker from a PREVIOUS incarnation is REFUSED",
@@ -385,7 +404,7 @@ def case_ownership_policy(state: Path) -> None:
     adir = state / "dir.incarnation"
     adir.mkdir(exist_ok=True)
     try:
-        wi.confirm_record(pf, "", "/x/ws", str(adir))
+        wi.confirm_record(pf, "", "/x/ws", str(adir), code)
         check("an unreadable incarnation marker is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("an unreadable incarnation marker is REFUSED", "incarnation:" in str(exc), str(exc))
@@ -416,7 +435,7 @@ def case_ownership_policy(state: Path) -> None:
     peer = state / "peer-instance.pid"
     write_record(peer, 4242, instance="worker-1", inc="inc-G", code=code, ws="/x/ws")
     try:
-        wi.confirm_record(peer, "", "/x/ws", str(marker))
+        wi.confirm_record(peer, "", "/x/ws", str(marker), code)
         check("another INSTANCE's record is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("another INSTANCE's record is REFUSED",
@@ -424,7 +443,7 @@ def case_ownership_policy(state: Path) -> None:
     elsewhere = state / "elsewhere.pid"
     write_record(elsewhere, 4242, instance="", inc="inc-G", code=code, ws="/other/install")
     try:
-        wi.confirm_record(elsewhere, "", "/x/ws", str(marker))
+        wi.confirm_record(elsewhere, "", "/x/ws", str(marker), code)
         check("another install's workspace is REFUSED", False, "it confirmed")
     except wi.Refused as exc:
         check("another install's workspace is REFUSED",
@@ -445,7 +464,7 @@ def case_ownership_policy(state: Path) -> None:
         readable = False
     if not readable:
         try:
-            wi.confirm_record(pf, "", "/x/ws", str(locked))
+            wi.confirm_record(pf, "", "/x/ws", str(locked), code)
             check("an incarnation marker we cannot OPEN is REFUSED", False, "it confirmed")
         except wi.Refused as exc:
             check("an incarnation marker we cannot OPEN is REFUSED",
