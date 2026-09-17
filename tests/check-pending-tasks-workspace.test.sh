@@ -507,6 +507,39 @@ else
 fi
 rm -rf "$OUTER_REPO"
 
+# 12d. Both repo-side probes FAIL, but not with git's own "not a git
+# repository" answer -- an unrelated error must not be read as confirmed absence.
+OUTER_REPO="$(mktemp -d)"
+_git_fixture_repo "$OUTER_REPO"
+NESTED_REPO="$OUTER_REPO/child"
+mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
+cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
+cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
+printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
+  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
+chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
+printf 'id: probe\ntask: nested-subdir-other-error\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
+OE_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+OE_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -e "$NESTED_REPO/.git" ] || [ -z "$OE_REPO_ID" ] || [ -z "$OE_CWD_ID" ] || [ "$OE_REPO_ID" != "$OE_CWD_ID" ]; then
+  bad "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" \
+    "fixture bug: child='$OE_REPO_ID' outer='$OE_CWD_ID', this case tests nothing"
+else
+  # Fails only probes targeting NESTED_REPO (both `-C DIR` and the cd'd retry),
+  # leaving the separate CWD_COMMON_DIR probe (run from OUTER_REPO) untouched.
+  STUBDIR="$(mktemp -d)"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "%s" ] && { echo "fatal: unable to read config file" >&2; exit 128; }; done\n[ "$PWD" = "%s" ] && { echo "fatal: unable to read config file" >&2; exit 128; }\nexec "%s" "$@"\n' \
+    "$NESTED_REPO" "$NESTED_REPO" "$TEST_GIT" > "$STUBDIR/git"
+  chmod +x "$STUBDIR/git"
+  OE_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
+  case "$OE_OUT" in
+    *'"decision":"block"'*) ok "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" ;;
+    *) bad "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" "got: ${OE_OUT:0:160}" ;;
+  esac
+  rm -rf "$STUBDIR"
+fi
+rm -rf "$OUTER_REPO"
+
 # 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
 # -- `-e` alone would misread a broken checkout as an intentional bundle.
 DANGLING="$(mktemp -d)"

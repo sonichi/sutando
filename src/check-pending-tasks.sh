@@ -23,10 +23,23 @@ if [ -n "$GIT_BIN" ]; then
   # --path-format=absolute (git >= 2.31): a plain rev-parse, run from a
   # different cwd, can print a path relative to <dir> instead of to the caller.
   CWD_COMMON_DIR="$("$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # Capture git's own stderr instead of discarding it: only git explicitly
+  # saying "not a git repository" may ever license the guest exit below.
+  REPO_COMMON_DIR="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+  REPO_PROBE_RC=$?
+  REPO_PROBE_ERR=""
+  [ "$REPO_PROBE_RC" -ne 0 ] && REPO_PROBE_ERR="$REPO_COMMON_DIR" && REPO_COMMON_DIR=""
   # A `-C DIR` probe and an actually-`cd`'d one can disagree in ways neither
   # side's stdout reveals; retry via `cd` before trusting an empty result.
-  [ -z "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_DIR" 2>/dev/null && "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [ -z "$REPO_COMMON_DIR" ]; then
+    FALLBACK_OUT="$(cd "$REPO_DIR" 2>/dev/null && "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+    if [ $? -eq 0 ]; then
+      REPO_COMMON_DIR="$FALLBACK_OUT"
+      REPO_PROBE_ERR=""
+    else
+      [ -n "$FALLBACK_OUT" ] && REPO_PROBE_ERR="$FALLBACK_OUT"
+    fi
+  fi
   # Kept PRE-canonicalization -- a path that then fails to `cd` must not
   # read the same as no identity ever being found (see the elif below).
   REPO_COMMON_DIR_RAW="$REPO_COMMON_DIR"
@@ -36,6 +49,10 @@ if [ -n "$GIT_BIN" ]; then
   [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
   # A known identity wins regardless of the marker; marker absence (incl. `-L`,
   # so a dangling symlink still counts as present) only breaks the empty-probe tie.
+  case "$REPO_PROBE_ERR" in
+    *"not a git repository"*) REPO_CONFIRMED_ABSENT=1 ;;
+    *) REPO_CONFIRMED_ABSENT="" ;;
+  esac
   if [ -n "$REPO_COMMON_DIR" ]; then
     if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
       echo '{}'
@@ -45,7 +62,9 @@ if [ -n "$GIT_BIN" ]; then
     : # a real answer that then failed to canonicalize -- ambiguous, fall through to gate
   elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
     : # marker present, probe still failed -- ambiguous, fall through to gate
-  elif [ -n "$CWD_COMMON_DIR" ]; then
+  elif [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_CONFIRMED_ABSENT" ]; then
+    # Both probes failed AND git itself confirmed no repo -- not just an
+    # unresolved probe on a markerless child that IS still ours.
     echo '{}'
     exit 0
   fi
