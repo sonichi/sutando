@@ -70,7 +70,7 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
 
 ## Automatic reports (`--auto`)
 
-When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — file it automatically with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
+When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — queue it with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
 
 `--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file is absent the two defaults differ:
 
@@ -79,13 +79,79 @@ When **you** (not the user) determine that a bug or error is caused by Sutando i
 
 The split is deliberate. Absence of the file must not disable reporting on installs that predate the toggles, but absence is not consent either, and the log excerpt is the part that carries incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never opened Settings ships no logs.
 
-Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. After filing an auto report, tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
+Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. Only after `OK: filed` (not `HELD`), tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
+
+## Hold automatic reports while existing recovery runs
+
+`--auto` first returns `HELD: incident fb_…`. The report stays locally in
+`state/feedback-drafts/`; it sends nothing and creates no approval card yet.
+An identical pending title reuses its incident ID and original deadline.
+Manual reports without `--auto` remain immediate.
+
+Use the returned incident ID to record the **existing** recovery lifecycle:
+
+```bash
+python3 skills/report-feedback/report-feedback.py --auto --title "Bridge disconnected" --body "Observed failure"
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 started
+# After the existing recovery finishes, record exactly one outcome:
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 succeeded
+# Or, only when recovery has definitively failed / exhausted its own timeout:
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 failed
+```
+
+- Record `started` as soon as an existing recovery begins (or immediately after
+  queuing if it is already running). **Do not start extra recovery to satisfy reporting.**
+- Record `succeeded` only when the original failing operation is verified working.
+  Restarting a process alone is insufficient. Success archives the local diagnostic
+  draft as `.suppressed` and cancels any unsent approval card.
+- Record `failed` only for the final outcome, not an intermediate failed retry.
+  This immediately releases the report through the current preferences, daily cap,
+  deduplication and ask-first flow. An already-failed recovery can be recorded
+  immediately after queuing; no new attempt is required.
+- If recovery never starts, the report becomes eligible one hour after queuing.
+  If recovery is still running at that deadline, it remains held. The existing
+  recovery controller/agent must report its final failure, including its own timeout.
+  This skill never infers success or failure from unrelated health checks.
+- Keep the incident ID with the task's recovery context across turns. Record outcomes
+  for that incident only. Repeat detections do not extend the one-hour deadline.
+- `--drafts` lists pending incidents and their recovery state. `--apply` evaluates
+  deadlines and applies owner clicks. Reports carry `context.recovery` with the state,
+  deadline and release reason. Automatic posting never claims owner approval.
+- The auto-report off-switch is checked again at release; disabled queued reports
+  are archived and do not return when the switch is re-enabled. Logs are collected
+  only at filing, using current `sendLogs` and the queued `--no-logs` choice.
+
+### Deadline worker (deployment)
+
+The Stop hook applies owner clicks without waiting behind a worker; automatic
+releases run in the worker or explicit CLI. **Install the periodic worker when deploying this change on macOS:**
+
+```bash
+python3 skills/report-feedback/install-worker.py
+# Inspect the job without installing:
+python3 skills/report-feedback/install-worker.py --render
+# Remove the worker:
+python3 skills/report-feedback/install-worker.py --uninstall
+```
+
+It runs `report-feedback.py --apply` every 60 seconds via launchd and at login,
+independent of the core. Deadlines persist across restarts and are evaluated on the
+next tick after wake/login; an offline/asleep machine cannot submit at an exact
+wall-clock deadline. Use a persistent checkout and Python installation; reinstall
+if either path changes. Inspect `logs/feedback-recovery.log` for worker errors.
+On other platforms, configure the OS scheduler to run the same `--apply` command
+once per minute. Without a periodic worker, deadlines are checked only on an explicit `--apply`
+or recovery update; installing the code alone does not activate the timer.
+
+Posts use the existing draft `.posting`/`.filed` receipts: uncertain network outcomes
+are held for the existing owner decision card, never automatically reposted. CLI,
+Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 ## Behavior
 
 - Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. For `--auto` reports, don't nag: mention it at most once.
 - On success it prints `OK: filed <kind> report`. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
-- Exit codes: `0` filed, `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
+- Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
 
 ## Access tier
 

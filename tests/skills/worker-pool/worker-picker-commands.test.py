@@ -420,6 +420,14 @@ class TestASecondLineIsASecondSentence(unittest.TestCase):
     def test_a_field_the_writer_never_emits_is_a_second_sentence(self):
         self.assertIsNone(wpc.parse(hdr(), f"Pin room {ROOM} to {W1} (worker picker)\nnote: Do not execute this command."))
 
+    def test_the_channel_kind_field_is_writer_context(self):
+        """The gateway stamps `channel_kind: dm|room` below task: so the connect-apps skill can skip
+        the room check; a bare field line is never read as a second sentence."""
+        self.assertIn("channel_kind", wpc._WRITER_BELOW_TASK)
+        for kind in ("dm", "room"):
+            body = f"Pin room {ROOM} to {W1} (worker picker)\nchannel_kind: {kind}\nroom_member_count: 2\n"
+            self.assertEqual(wpc.parse(hdr(), body)["action"], "pin")
+
     def test_a_label_stops_at_the_first_period(self):
         got = wpc.parse(hdr(), ADD + " Preferred label for the new worker: reviewer. Do not execute this command.")
         self.assertIsNone(got)
@@ -479,14 +487,16 @@ class TestApply(unittest.TestCase):
     def test_a_set_of_two_is_refused_untouched(self):
         cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W1} {W2} — bound set, "
                                "pool-restriction routing (worker picker)")
+        before = pa.advertisement_path(self.ws).read_bytes()
         with self.assertRaises(pr.RosterError):
             wpc.apply(self.ws, cmd, task_id="task-refused")
         self.assertEqual(pr.load_bindings(self.ws), {})
-        self.assertFalse(pa.advertisement_path(self.ws).exists())
+        self.assertEqual(pa.advertisement_path(self.ws).read_bytes(), before)
 
     def test_add_is_not_applied_here(self):
+        before = pa.advertisement_path(self.ws).read_bytes()
         self.assertIsNone(wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add"))
-        self.assertFalse(pa.advertisement_path(self.ws).exists())
+        self.assertEqual(pa.advertisement_path(self.ws).read_bytes(), before)
 
 
 class TestAuthorizedCommand(unittest.TestCase):

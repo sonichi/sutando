@@ -15,7 +15,7 @@ recipe of its logic — racing a genuine `access_store.mutate_access_file` call
 (what a bridge writer, e.g. thread-engage seeding, actually calls) against
 the SAME file, and asserts both updates survive. The bridge-side mutator
 sleeps while holding the lock so the CLI subprocess's own
-`mutate_access_file` call is forced to block on the real `fcntl.flock` (cross-
+`mutate_access_file` call is forced to block on the real advisory lock (cross-
 process, not merely GIL-serialized) rather than racing for who reads first.
 
 Run: python3 tests/access-mutate-cli-concurrency.test.py

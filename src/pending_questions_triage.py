@@ -12,7 +12,6 @@ behind it.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
@@ -20,6 +19,9 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Iterable, Optional
+
+from file_lock import locked_file
+from atomic_replace import replace_snapshot
 
 # A reference carrying its own repository: `owner/repo#123`, or a github.com pull/
 # issue URL. These are the only ones whose repository is known from the text alone.
@@ -165,7 +167,7 @@ def rank(rows: list[dict]) -> list[dict]:
 # Permanent by design: a changed situation is written as a NEW section, which
 # hashes to a new id. So this stores ids, never "until" state.
 
-# Paired with the flock below, matching triage_actions.py's _locked_for_append.
+# Serialize threads as well as processes during dismissal transactions.
 _dismiss_write_lock = threading.Lock()
 
 
@@ -177,22 +179,28 @@ def _locked_for_dismiss(path):
     set, each add their own id in memory, and each write — the second write wins
     outright and silently drops the first id (review finding: two calls reading
     {seed} in parallel both "succeed"; final store [Q2, seed], Q1 lost). The lock
-    is on a sidecar file next to the store, not the store itself, so a reader
-    (`load_dismissed`) is never blocked by a writer holding it.
+    is on a stable sidecar. Windows readers share it because opening a file
+    during replacement can fail; POSIX readers use atomic snapshots directly.
     """
     path = Path(path) if not isinstance(path, Path) else path
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(f"{path.suffix}.lock")
-    with _dismiss_write_lock, lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with _dismiss_write_lock, locked_file(lock_path):
+        yield
 
 
 def load_dismissed(path) -> set[str]:
     """Dismissed question ids. A missing or unreadable store means none."""
+    try:
+        if os.name == "nt":
+            with _locked_for_dismiss(path):
+                return _load_dismissed_unlocked(path)
+        return _load_dismissed_unlocked(path)
+    except OSError:
+        return set()
+
+
+def _load_dismissed_unlocked(path) -> set[str]:
     try:
         with open(path, "r") as handle:
             data = json.load(handle)
@@ -205,7 +213,7 @@ def load_dismissed(path) -> set[str]:
 
 
 def save_dismissed(path, ids: Iterable[str]) -> None:
-    """Replace the store atomically; a reader never observes a truncated file."""
+    """Replace atomically; concurrent callers must hold `_locked_for_dismiss`."""
     path = str(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload = json.dumps({"dismissed": sorted(set(ids))}, indent=1)
@@ -215,7 +223,7 @@ def save_dismissed(path, ids: Iterable[str]) -> None:
             out.write(payload)
             out.flush()
             os.fsync(out.fileno())
-        os.replace(tmp, path)
+        replace_snapshot(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -229,7 +237,7 @@ def dismiss(path, qid: str) -> set[str]:
     can never both start from the same snapshot and clobber each other.
     """
     with _locked_for_dismiss(path):
-        ids = load_dismissed(path)
+        ids = _load_dismissed_unlocked(path)
         ids.add(str(qid))
         save_dismissed(path, ids)
         return ids
