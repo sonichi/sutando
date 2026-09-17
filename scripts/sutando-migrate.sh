@@ -1674,6 +1674,11 @@ commit_source() {
 }
 
 commit_main() {
+    # Set by the hook bridge below on a real installer failure; checked at the
+    # end so `--commit`'s own exit status reflects it (startup.sh's migration
+    # sentinel is gated on that status, not on this function's prose output).
+    local _hook_bridge_failed=0
+
     # Mini's polish: --delete-source REQUIRES --backup-id pointer. Forces
     # operator to reference a real backup before destructive op.
     if [ "$DELETE_SOURCE" = "1" ] && [ -z "$ROLLBACK_ID" ]; then
@@ -1845,20 +1850,22 @@ commit_main() {
         if [ -x "$_hook_helper" ] || [ -f "$_hook_helper" ]; then
             if [ -n "$_new_ccd" ]; then
                 echo
-                # install-claude-hooks.sh now targets THIS SAME claude-sutando-config-dir
-                # (moved there by #4309 — core-only hooks fire only for the core, not
-                # every session with this repo as cwd), so it is the single owner of the
-                # full core hook set (PreCompact archiver+handoff, SessionEnd, Stop) and
-                # the legacy project-settings sweep; sutando-config-hooks.sh's own
-                # --with-catchup-hook only ever covered the SessionEnd entry.
+                # install-claude-hooks.sh is the single owner of the full core hook set
+                # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
-                    bash "$_primary_installer" || \
-                        echo "  hook install: primary installer failed (rc=$?) — re-run manually: bash src/install-claude-hooks.sh" >&2
+                    if ! bash "$_primary_installer"; then
+                        local _hb_rc=$?
+                        echo "  hook install: primary installer failed (rc=$_hb_rc) — re-run manually: bash src/install-claude-hooks.sh" >&2
+                        _hook_bridge_failed=1
+                    fi
                 else
                     echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh (primary installer not found at expected path) ..."
-                    bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
-                        echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                    if ! bash "$_hook_helper" install "$_new_settings" --with-catchup-hook; then
+                        local _hb_rc=$?
+                        echo "  hook install: failed (rc=$_hb_rc) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                        _hook_bridge_failed=1
+                    fi
                 fi
                 # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
                 bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
@@ -1973,6 +1980,23 @@ commit_main() {
         echo "  Sources NOT deleted (default). After ~7d observing no source-side writes, run:"
         echo "    bash scripts/sutando-migrate.sh commit --delete-source --backup-id $BACKUP_ID"
         echo "  Two-phase pattern keeps the (b)-style reader-fallback bridge intact during transition."
+    fi
+
+    # A failed hook bridge leaves the core without its Stop/PreCompact/SessionEnd
+    # protections; unlike the Claude-memory import above, this is not "safe to
+    # retry manually later" by default -- startup.sh's auto-migration writes its
+    # completion sentinel from THIS function's exit status alone, so a lenient
+    # return here would mark migration complete with no usable core hooks. Leave
+    # a durable marker (for an operator who doesn't inspect exit codes) and fail
+    # the commit so the caller's `if ... --commit; then` takes the failure branch.
+    if [ "$_hook_bridge_failed" = "1" ]; then
+        mkdir -p "$DEST_REAL/state" 2>/dev/null
+        printf 'hook_bridge_failed_at=%s\nretry=bash src/install-claude-hooks.sh\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DEST_REAL/state/.hook-bridge-retry-needed" 2>/dev/null
+        echo
+        echo "sutando-migrate: COMMIT reporting FAILURE — the hook bridge did not install successfully (see above)." >&2
+        echo "  Retry marker: $DEST_REAL/state/.hook-bridge-retry-needed" >&2
+        return 1
     fi
 }
 

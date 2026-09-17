@@ -855,14 +855,9 @@ _refuse_foreign_host_deletions() {
     return 1
 }
 
-# Pre-pull half of the same policy (#4309 round 11, keweichen): carrier-set
-# enforcement untracks any newly-excluded path with no notion of whose
-# subtree it's in, and _commit_local_pre_pull COMMITS that untrack directly
-# -- _refuse_foreign_host_deletions only inspects the STAGED diff, and by
-# push time the deletion is already in HEAD, so nothing is left staged to
-# refuse. Unstage (not abort) each foreign-host hit here: a local pre-pull
-# commit should never remove a peer's subtree, but the caller's own
-# legitimate edits alongside it still deserve to land.
+# Pre-pull half of the push-time guard above: a local commit can untrack a
+# peer's subtree before it's ever staged for push. Unstage (never abort) so
+# the caller's own legitimate edits alongside it still land.
 _unstage_foreign_host_deletions_pre_pull() {
     [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
     local path hits=0

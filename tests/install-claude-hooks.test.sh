@@ -957,6 +957,56 @@ ok "operator's own guard around a built-in marker survives (not skill-declared)"
    "$(echo "$GSURV" | grep -qF "$G_OPERATOR_TARGET" && echo 0 || echo 1)"
 rm -rf "$GROOT"
 
+# --- 17. #4309 review round 6/7 (keweichen, 2026-09-17), BOTH exact repros in
+# one installer run. skill_hooks.py's marker used to be just target.name (a
+# bare basename), and _is_installer_path_shape accepted any absolute path,
+# so an operator's own guard sharing a discovered skill's filename -- or an
+# operator's built-in-shaped command carrying an unexpanded shell-variable
+# path prefix -- both got misclassified as ours and swept.
+KROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-repro.XXXXXX")"
+KREPO="$KROOT/repo"
+mkdir -p "$KREPO/src" "$KREPO/.claude" "$KREPO/workspace/.claude-sutando" \
+         "$KREPO/skills/discoveredskill"
+cp "$INSTALLER" "$KREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$KREPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$KREPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$KREPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$KREPO/skills/discoveredskill/hook.sh"
+chmod +x "$KREPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$KREPO/workspace/.claude-sutando/settings.json"
+export K_SETTINGS="$KREPO/workspace/.claude-sutando/settings.json"
+python3 - <<'PY'
+import json, os
+p = os.environ['K_SETTINGS']
+json.dump({"hooks": {
+    "PreToolUse": [{"matcher": "", "hooks": [
+        # PoC #1: a discovered skill is ALSO named hook.sh -- an unrelated
+        # operator guard sharing only that basename must not be swept.
+        {"type": "command",
+         "command": "[ -f '/tmp/operator/hook.sh' ] || exit 0; exec bash '/tmp/operator/hook.sh'"},
+    ]}],
+    "SessionEnd": [{"matcher": "", "hooks": [
+        # PoC #2: an operator's own built-in-shaped command whose path
+        # carries an unexpanded shell-variable prefix -- must not be swept.
+        {"type": "command",
+         "command": 'bash "/tmp/${CUSTOM_ROOT}/src/session-handoff.sh" "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$KREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+KP_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_SETTINGS")"
+KS_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_SETTINGS")"
+ok "PoC #1: operator guard sharing a discovered skill's basename survives" \
+   "$(echo "$KP_SURV" | grep -qF '/tmp/operator/hook.sh' && echo 0 || echo 1)"
+ok "our own discovered-skill hook is still installed alongside it" \
+   "$(echo "$KP_SURV" | grep -qF 'discoveredskill/hook.sh' && echo 0 || echo 1)"
+ok "PoC #2: operator command with an unexpanded \$CUSTOM_ROOT path prefix survives" \
+   "$(echo "$KS_SURV" | grep -qF 'CUSTOM_ROOT' && echo 0 || echo 1)"
+ok "our own SessionEnd hook is still installed alongside it" \
+   "$([ "$(echo "$KS_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$KROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
