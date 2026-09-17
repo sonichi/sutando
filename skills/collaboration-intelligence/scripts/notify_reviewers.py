@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 import datetime
@@ -46,6 +45,13 @@ import threading
 import sys
 from pathlib import Path
 from urllib.parse import quote
+
+# POSIX-only; a bare import crashed every caller on Windows (no fcntl there).
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
+    import msvcrt
 
 _REPO = Path(__file__).resolve().parents[3]
 # Bare `python3` can resolve to the Xcode CLT stub on a clean macOS host, which
@@ -935,6 +941,25 @@ _LEDGER_MODE = 0o600
 #: LEDGER: a process-global counter let another thread skip flock entirely.
 _LOCK_STATE = threading.local()
 
+# Mirrors src/file_lock.py's lock_fd/unlock_fd (post-dates this branch's fork point).
+_WIN_LOCK_OFFSET = 1 << 20
+
+
+def _lock_fd(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+
+
+def _unlock_fd(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
 
 @contextlib.contextmanager
 def _ledger_lock(led: Path):
@@ -950,13 +975,13 @@ def _ledger_lock(led: Path):
     led.parent.mkdir(parents=True, exist_ok=True)
     lock = led.with_suffix(led.suffix + ".lock")
     with open(lock, "a") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        _lock_fd(lf.fileno())
         held.add(key)
         try:
             yield
         finally:
             held.discard(key)
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            _unlock_fd(lf.fileno())
 
 
 def reserve_ask(a, t, who, person_of, roster, require_ref=True):
