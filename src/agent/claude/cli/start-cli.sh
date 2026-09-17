@@ -596,6 +596,48 @@ log_restart_attempt() {
     "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
     >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
 }
+# Claude Code slugs the core's cwd; its transcripts land under this dir.
+core_transcripts_dir() {
+  local slug
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] || return 1
+  slug="$("${PY:-python3}" -c 'import sys; sys.path.insert(0, sys.argv[1]); from util_paths import claude_project_slug; print(claude_project_slug(sys.argv[2]), end="")' \
+    "$REPO/src" "${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}" 2>/dev/null)" || return 1
+  [ -n "$slug" ] || return 1
+  printf '%s' "$CLAUDE_CONFIG_DIR/projects/$slug"
+}
+# The presence poll passes a pane whose claude never reaches its first turn;
+# only an artifact the new core wrote after $1 (a marker file) proves it booted.
+restart_boot_evidence() {
+  local mark="$1" stamp="$2" tdir="$3"
+  if [ -n "$stamp" ] && [ -n "$(find "$stamp" -prune -newer "$mark" 2>/dev/null)" ]; then
+    echo stamp; return 0
+  fi
+  if [ -n "$tdir" ] && [ -n "$(find "$tdir" -maxdepth 1 -name '*.jsonl' -newer "$mark" 2>/dev/null)" ]; then
+    echo transcript; return 0
+  fi
+  return 1
+}
+wait_restart_booted() {
+  local mark="$1" timeout="${SUTANDO_RESTART_BOOT_TIMEOUT:-120}" t0 elapsed how ws host stamp="" tdir=""
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || ws=""
+  host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || host=""
+  [ -n "$ws" ] && [ -n "$host" ] && stamp="$ws/hosts/$host/schedule-crons-stamp.json"
+  tdir="$(core_transcripts_dir)" || tdir=""
+  echo "  waiting up to ${timeout}s for the core's first turn (crons stamp or session transcript)..."
+  t0=$(date +%s)
+  while :; do
+    elapsed=$(( $(date +%s) - t0 ))
+    if how="$(restart_boot_evidence "$mark" "$stamp" "$tdir")"; then
+      log_restart_attempt "success: core live (booted: $how, ${elapsed}s)"
+      return 0
+    fi
+    [ "$elapsed" -lt "$timeout" ] || break
+    sleep 1
+  done
+  echo "  ⚠ $SESSION pane is up but the core did not boot within ${timeout}s — restart FAILED." >&2
+  log_restart_attempt "started, not booted after ${elapsed}s"
+  return 1
+}
 # Enforces the HAZARD above; the decision and its message are shared with
 # the codex launcher, this adapter keeps only its own attempt logging.
 if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SESSION"; then
@@ -914,6 +956,10 @@ if [ -t 1 ]; then
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
+  # Nothing of the old core survives kill-complete, so anything newer than this
+  # marker was written by the core launched below.
+  RESTART_BOOT_MARK=""
+  [ -n "$RESTART_REQUESTED" ] && RESTART_BOOT_MARK="$(mktemp -t sutando-restart-boot.XXXXXX)"
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
@@ -936,8 +982,15 @@ else
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
-  [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
+  # Presence is not boot: the monitor above watches the pane either way, but a
+  # restart reports success only once the core's first turn is on disk.
+  if [ -n "$RESTART_REQUESTED" ]; then
+    _booted=0
+    wait_restart_booted "$RESTART_BOOT_MARK" && _booted=1
+    rm -f "$RESTART_BOOT_MARK"
+    [ "$_booted" = 1 ] || exit 1
+  fi
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."
