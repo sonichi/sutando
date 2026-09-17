@@ -9762,19 +9762,24 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     # The probe above was a snapshot taken BEFORE publication; retract our own
     # stamp if it went stale mid-write.
     if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
+        # Through the ONE locked release, keyed by pid AND incarnation: a
+        # read-then-unlink here deletes a successor published in between.
         try:
-            # Read-then-unlink, NOT arbitrated the way the write above is:
-            # POSIX has no conditional unlink, so a claim landing here is lost.
-            rec = read_sentinel_record(pid_file)
-            # Ours = the pid AND the incarnation we just recorded; a re-claim
-            # by another watcher carries its own.
-            if rec.get("pid") == int(pid) and rec.get("incarnation") == incarnation:
-                pid_file.unlink()
-        except OSError as e:
-            # Reporting a withdrawal that did not happen is the same class of
-            # lie as the stale stamp; the operator needs the real state.
+            rel = subprocess.run(["bash", str(REPO_DIR / "src" / "watcher_sentinel.sh"), "release",
+                                  str(pid_file), pid, incarnation],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
             return (f"pid {pid} stopped being the watcher mid-write and the "
                     f"stamp could not be withdrawn: {e}")
+        if rel.returncode == 1:
+            return (f"pid {pid} stopped being the watcher mid-write; a successor's record "
+                    f"now holds {pid_file} — left alone")
+        if rel.returncode != 0:
+            # Reporting a withdrawal that did not happen is the same class of
+            # lie as the stale stamp; the operator needs the real state.
+            why = rel.stderr.strip() or f"release exited {rel.returncode}"
+            return (f"pid {pid} stopped being the watcher mid-write and the "
+                    f"stamp could not be withdrawn: {why}")
         return f"pid {pid} stopped being the watcher mid-write — sentinel withdrawn"
     return (f"re-stamped the sentinel for live watcher pid {pid} "
             f"(full record: incarnation {incarnation}, {code_path})")

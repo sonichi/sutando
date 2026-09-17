@@ -105,7 +105,7 @@ _stop_watcher_at() {            # <sentinel> [expected-instance] [expected-works
     fi
     pid="$WATCHER_OWNER_PID"
     echo "  watcher stop: signalling this core's watcher (pid $pid)"
-    watcher_stop_owned "$sentinel" "$pid" || rc=$?
+    watcher_stop_owned "$sentinel" "$pid" "$WATCHER_OWNER_INCARNATION" || rc=$?
     case "$rc" in
         0) return 0 ;;
         1) echo "  watcher stop: SIGNAL FAILED for pid $pid — $sentinel left in place so a retry can still name it" ;;

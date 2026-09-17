@@ -336,7 +336,7 @@ reap_wedged_voice_agent() {
 # Ownership is the shared src/watcher_identity.sh sequence restart.sh also runs;
 # the sentinel is released only for a pid that is GONE, or a stop that was confirmed.
 reap_stale_task_watcher() {
-  local pid_file="$1" stale_pid rc=0
+  local pid_file="$1" stale_pid stale_inc rc=0 rel_rc=0
   [ -f "$pid_file" ] || return 0
   # LINE 1, through the one shared reader. `cat` fed the whole sentinel to
   # `ps -p`, which answers "Invalid process id" for every identity record.
@@ -345,6 +345,9 @@ reap_stale_task_watcher() {
     echo "  ⚠ $pid_file names no readable pid on line 1; leaving it alone"
     return 0
   fi
+  # The incarnation of the record INSPECTED: the release compares it under the
+  # lock, so a successor published meanwhile — same pid or not — is refused.
+  stale_inc="$(sentinel_field_in "$pid_file" incarnation 2>/dev/null || true)"
 
   if ! pops_alive "$stale_pid"; then
     # `kill -0` also fails for a pid this user may not signal: `ps` still lists
@@ -358,10 +361,12 @@ reap_stale_task_watcher() {
       return 0
     fi
     rm -f "$ps_err"
-    sentinel_release_if_owner "$pid_file" "$stale_pid"
-    if [ -f "$pid_file" ]; then
-      echo "  ⚠ watch-tasks-stream sentinel changed under the reap — a live watcher owns it, leaving it in place"
-    fi
+    sentinel_release_incarnation "$pid_file" "$stale_pid" "$stale_inc" || rel_rc=$?
+    case "$rel_rc" in
+      0) ;;
+      1) echo "  ⚠ watch-tasks-stream sentinel changed under the reap — a live watcher owns it, leaving it in place" ;;
+      *) echo "  ⚠ watch-tasks-stream sentinel names dead pid $stale_pid but could not be released (rc $rel_rc); leaving it in place" ;;
+    esac
     return 0
   fi
 
@@ -373,7 +378,7 @@ reap_stale_task_watcher() {
     echo "  ⚠ $WATCHER_OWNER_REASON; leaving both alone"
     return 0
   fi
-  watcher_stop_owned "$pid_file" "$WATCHER_OWNER_PID" || rc=$?
+  watcher_stop_owned "$pid_file" "$WATCHER_OWNER_PID" "$WATCHER_OWNER_INCARNATION" || rc=$?
   case "$rc" in
     0) echo "  ✓ reaped stale watch-tasks-stream watcher (pid $WATCHER_OWNER_PID)" ;;
     1) echo "  ⚠ SIGNAL FAILED for pid $WATCHER_OWNER_PID — $pid_file left in place so a retry can still name it" ;;

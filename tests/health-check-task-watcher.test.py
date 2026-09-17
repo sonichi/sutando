@@ -40,6 +40,11 @@ Covers:
      the pre-write probe is a snapshot, so publication is re-validated
   u4) ...and a withdrawal the OS denied is reported as such, never as done
   u5) ...and a corrupt re-claim in that window is left alone, never a raise
+  u6) the withdrawal is the ONE locked release keyed by pid AND incarnation: the
+     fixer neither reads the record nor unlinks it itself, so a successor that
+     publishes after any read of ours cannot be deleted by our unlink
+  u7) ...and a successor already holding the path when the release runs — a
+     different pid, or the SAME pid under a new incarnation — survives it
   v) a check with no repairable pid is declined, not stamped with junk
   w) an unwritable state dir is reported, never raised into the caller
   w2) ...including when it is the exclusive create, not the mkdir, that fails
@@ -139,12 +144,33 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
 MARKER_NAME = "watch-tasks-stream.incarnation"
 FAKE_SEAM = REPO / "tests" / "fixtures" / "process-ops-fake.sh"
 IDENTITY_SH = REPO / "src" / "watcher_identity.sh"
+SENTINEL_SH = REPO / "src" / "watcher_sentinel.sh"
 WATCHER_CODE = REPO / "src" / "watch-tasks-stream.sh"
 
 
 def own_incarnation(pid: str) -> str:
     """The shape the watcher's writer stamps: `<epoch>-<pid>-<random>`."""
     return f"{int(time.time())}-{pid}-4242"
+
+
+def publish_successor(ws: Path, pid: str, inc: str) -> None:
+    """A successor watcher's START, exactly as watch-tasks-stream.sh publishes:
+    the production writer, under the lock every publisher takes."""
+    pf = ws / "state" / "watch-tasks-stream.pid"
+    subprocess.run(["bash", "-c",
+                    '. "$1"; sentinel_lock_acquire "$2" || exit 4; '
+                    'sentinel_write_record "$2" "$3" "" "$4" "$5" v "$6"; rc=$?; '
+                    'sentinel_lock_release "$2"; exit $rc',
+                    "_", str(SENTINEL_SH), str(pf), pid, inc, str(WATCHER_CODE), os.path.realpath(ws)],
+                   check=True, capture_output=True, text=True, timeout=30)
+
+
+def successor_record(ws: Path) -> "tuple[str, str]":
+    pf = ws / "state" / "watch-tasks-stream.pid"
+    if not pf.exists():
+        return ("<ABSENT>", "<ABSENT>")
+    rec = hc.read_sentinel_record(pf)
+    return (str(rec.get("pid")), str(rec.get("incarnation")))
 
 
 @contextlib.contextmanager
@@ -591,6 +617,86 @@ def case_w3_a_writer_failure_is_reported_with_its_reason() -> list[str]:
             hc.subprocess.run = real_run
         if "could not write" not in msg or "no bash" not in msg:
             fails.append(f"w3) an unspawnable writer should be reported, got {msg!r}")
+    return fails
+
+
+def case_u6_a_successor_published_after_our_read_survives_the_withdrawal() -> list[str]:
+    """(u3) with a successor publishing AFTER the fixer's own read of the record
+    and BEFORE its unlink — the read-then-unlink window. POSIX has no
+    conditional unlink, so a fixer that arbitrates in Python deletes the
+    successor's record. The contract: the fixer makes no such read; the ONE
+    locked release (watcher_sentinel.sh) compares pid AND incarnation under
+    the lock every publisher takes."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        seen = {"n": 0}
+        reads: list = []
+
+        def _argv_then_exit(pid):
+            seen["n"] += 1
+            return "bash src/watch-tasks-stream.sh" if seen["n"] == 1 else "zsh -l"
+
+        real_read = hc.read_sentinel_record
+
+        def _read_then_successor(path):
+            rec = real_read(path)
+            reads.append(str(path))
+            publish_successor(ws, "7200", "inc-succ")
+            return rec
+
+        hc._proc_argv = _argv_then_exit
+        hc.read_sentinel_record = _read_then_successor
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        finally:
+            hc._proc_argv = _REAL_PROC_ARGV
+            hc.read_sentinel_record = real_read
+        if seen["n"] < 2:
+            fails.append(f"u6) the post-write probe never ran ({seen['n']} call(s))")
+        if reads:
+            fails.append(f"u6) the fixer read the record itself ({len(reads)} read(s)) — "
+                         f"a read-then-unlink is not the locked release")
+            if successor_record(ws) != ("7200", "inc-succ"):
+                fails.append(f"u6) the successor published after that read was deleted: "
+                             f"record now {successor_record(ws)}")
+        if "withdrawn" not in msg and "successor" not in msg:
+            fails.append(f"u6) should report the withdrawal outcome, got {msg!r}")
+    return fails
+
+
+def case_u7_a_successor_holding_the_path_survives_the_release() -> list[str]:
+    """Both successor shapes, published (through the production start sequence)
+    in the window after the post-publication probe and before the release: a
+    different pid, and the SAME pid wearing a new incarnation — the ambiguity
+    the identity record exists to remove. Each must survive, and the fixer
+    must say a successor holds the path rather than claim a withdrawal."""
+    fails = []
+    for label, succ_pid in (("different pid", "7200"), ("same pid, new incarnation", "7100")):
+        with supervised_watcher() as ws:
+            check = hc.check_task_watcher()
+            seen = {"n": 0}
+
+            def _argv_then_exit_and_successor(pid):
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    return "bash src/watch-tasks-stream.sh"
+                if seen["n"] == 2:
+                    publish_successor(ws, succ_pid, "inc-succ")
+                return "zsh -l"
+
+            hc._proc_argv = _argv_then_exit_and_successor
+            try:
+                msg = hc.fix_task_watcher_sentinel(check)
+            finally:
+                hc._proc_argv = _REAL_PROC_ARGV
+            got = successor_record(ws)
+            if got != (succ_pid, "inc-succ"):
+                fails.append(f"u7/{label}) the successor's record did not survive: {got}")
+            if "withdrawn" in msg:
+                fails.append(f"u7/{label}) claimed a withdrawal while a successor holds the path: {msg!r}")
+            if "successor" not in msg:
+                fails.append(f"u7/{label}) should say a successor holds the path, got {msg!r}")
     return fails
 
 
@@ -1074,6 +1180,8 @@ def main() -> int:
         ("u3", case_u3_pid_stale_after_publication_is_withdrawn),
         ("u4", case_u4_a_withdrawal_that_failed_is_not_reported_as_done),
         ("u5", case_u5_a_corrupt_reclaim_mid_write_does_not_crash_the_fix),
+        ("u6", case_u6_a_successor_published_after_our_read_survives_the_withdrawal),
+        ("u7", case_u7_a_successor_holding_the_path_survives_the_release),
         ("v", case_v_fix_declines_without_a_pid),
         ("w", case_w_fix_reports_a_write_failure),
         ("w2", case_w2_unwritable_state_dir_is_reported),

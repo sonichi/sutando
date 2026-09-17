@@ -306,7 +306,7 @@ def case_ownership_policy(state: Path) -> None:
 
     got = wi.confirm_record(pf, "", "/x/ws", str(marker), code)
     check("a COMPLETE record naming this install confirms",
-          got == (4242, "/x/src/watch-tasks-stream.sh"), f"got {got!r}")
+          got == (4242, "/x/src/watch-tasks-stream.sh", "inc-G"), f"got {got!r}")
 
     # The record half compares the recorded script with THIS checkout's, before
     # any argv is read; a spelling resolving to the same file is not "another".

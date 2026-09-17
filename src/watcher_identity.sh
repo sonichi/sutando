@@ -7,14 +7,17 @@
 # that layer whole. Nothing here decides ownership on its own.
 #
 # watcher_confirm_owner <sentinel> <instance> <workspace> <code_path>
-#   rc 0: WATCHER_OWNER_PID names the watcher. rc 1: WATCHER_OWNER_REASON says
-#   which check refused. Via variables, not stdout: `$( )` would lose them.
+#   rc 0: WATCHER_OWNER_PID names the watcher and WATCHER_OWNER_INCARNATION the
+#   start the record confirmed. rc 1: WATCHER_OWNER_REASON says which check
+#   refused. Via variables, not stdout: `$( )` would lose them.
 #   <code_path> is THIS checkout's src/watch-tasks-stream.sh — a record that
 #   names another checkout's is refused even when its argv agrees with it.
-# watcher_stop_owned <sentinel> <pid>
+# watcher_stop_owned <sentinel> <pid> [<incarnation>]
 #   TERM, then wait for the exit; the sentinel is released only once the exit is
-#   confirmed. rc 0 stopped and released, 1 the signal failed, 2 still alive —
-#   on 1 and 2 the sentinel stays, so a retry can still name the watcher.
+#   confirmed, and only while it still names <pid> under <incarnation> (default:
+#   the one watcher_confirm_owner just confirmed) — a successor's record, even
+#   one wearing the same pid, stays. rc 0 stopped, 1 the signal failed, 2 still
+#   alive — on 1 and 2 the sentinel stays, so a retry can still name the watcher.
 
 _wi_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=watcher_sentinel.sh
@@ -28,9 +31,9 @@ fi
 
 watcher_confirm_owner() {
   local sentinel="$1" want_instance="${2:-}" want_workspace="${3:-}" code_path="${4:-}"
-  local py owner pid rec_code argv vector inc_file wrote_rc=0
+  local py owner pid rec_code rec_inc argv vector inc_file wrote_rc=0
   local -a vec_opt=()
-  WATCHER_OWNER_PID=""; WATCHER_OWNER_REASON=""
+  WATCHER_OWNER_PID=""; WATCHER_OWNER_INCARNATION=""; WATCHER_OWNER_REASON=""
   # shellcheck source=../scripts/python-binary.sh
   . "$_wi_here/../scripts/python-binary.sh" 2>/dev/null || true
   py="$(resolve_python "$_wi_here/.." 2>/dev/null || true)"
@@ -48,7 +51,7 @@ watcher_confirm_owner() {
     WATCHER_OWNER_REASON="$owner"
     return 1
   fi
-  IFS=$'\t' read -r pid rec_code <<< "$owner"
+  IFS=$'\t' read -r pid rec_code rec_inc <<< "$owner"
   if ! pops_alive "$pid"; then
     WATCHER_OWNER_REASON="pid $pid is not alive"
     return 1
@@ -79,11 +82,13 @@ watcher_confirm_owner() {
   fi
   WATCHER_OWNER_REASON=""
   WATCHER_OWNER_PID="$pid"
+  WATCHER_OWNER_INCARNATION="$rec_inc"
   return 0
 }
 
 watcher_stop_owned() {
-  local sentinel="$1" pid="$2" tries="${SUTANDO_WATCHER_STOP_TICKS:-30}" i=0
+  local sentinel="$1" pid="$2" inc="${3-${WATCHER_OWNER_INCARNATION:-}}"
+  local tries="${SUTANDO_WATCHER_STOP_TICKS:-30}" i=0
   pops_signal "$pid" TERM || return 1
   while [ "$i" -lt "$tries" ]; do
     pops_alive "$pid" || break
@@ -93,6 +98,8 @@ watcher_stop_owned() {
   if pops_alive "$pid"; then
     return 2
   fi
-  sentinel_release_if_owner "$sentinel" "$pid"
+  # rc 1 = a successor's record holds the path: the stop succeeded, the
+  # record is not ours to remove.
+  sentinel_release_incarnation "$sentinel" "$pid" "$inc" || true
   return 0
 }

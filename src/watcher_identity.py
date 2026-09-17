@@ -45,7 +45,7 @@ CLI, for the shell bridges:
                                         when decided, 2 when not.
   watcher_identity.py owner-pid --sentinel P --instance I --workspace W
                                 --incarnation-file F --code-path C
-                                                        -> "<pid>\t<code_path>"
+                                          -> "<pid>\t<code_path>\t<incarnation>"
   watcher_identity.py runs-watcher --pid N --argv A [--argv-vector J] --code-path C
 The last two exit 0 on confirmation, or print the reason and exit 1. J is the
 JSON argv LIST src/process-ops.sh read for N (`pops_argv_vector`); when the seam
@@ -259,8 +259,8 @@ class Refused(Exception):
 
 
 def confirm_record(sentinel, want_instance: str, want_workspace: str,
-                   incarnation_file, expect_code_path: str) -> "tuple[int, str]":
-    """(pid, code_path) from a sentinel that names THIS install's watcher, or
+                   incarnation_file, expect_code_path: str) -> "tuple[int, str, str]":
+    """(pid, code_path, incarnation) from a sentinel that names THIS install's watcher, or
     raise Refused with the check that failed. Reads the record through the one
     shared reader, so a consumer never re-spells the on-disk grammar.
     `expect_code_path` is the watcher script of the checkout asking."""
@@ -308,7 +308,7 @@ def confirm_record(sentinel, want_instance: str, want_workspace: str,
     if live != rec["incarnation"]:
         raise Refused(f'incarnation: {sentinel} claims "{rec["incarnation"]}", the live '
                       f'marker says "{live}"')
-    return pid, rec["code_path"]
+    return pid, rec["code_path"], rec["incarnation"]
 
 
 def parse_vector(pid: int, encoded: str) -> "list[str]":
@@ -355,9 +355,9 @@ def _main_ownership(args: "list[str]") -> int:
     ns = ap.parse_args(args)
     try:
         if ns.cmd == "owner-pid":
-            pid, code_path = confirm_record(ns.sentinel, ns.instance, ns.workspace,
-                                            ns.incarnation_file, ns.code_path)
-            print(f"{pid}\t{code_path}")
+            pid, code_path, incarnation = confirm_record(ns.sentinel, ns.instance, ns.workspace,
+                                                         ns.incarnation_file, ns.code_path)
+            print(f"{pid}\t{code_path}\t{incarnation}")
         else:
             vector = None
             if ns.argv_vector is not None:

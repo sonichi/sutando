@@ -210,23 +210,29 @@ sentinel_stamp_absent() {   # <pid_file> <pid> <code> <ver> <ws>
   return "$rc"
 }
 
-# cleanup()'s release, under the lock a start takes. The marker holds no pid, so
-# only its own content says whether a live successor wrote it. rc 1 = it did.
-sentinel_release_incarnation() {
-  local pid_file="$1" pid="$2" inc="$3" marker recorded live rc=0
+# The ONE conditional release, under the lock every publisher takes. The record
+# goes only when it still names <pid> AND <inc>: a successor is a new incarnation
+# even when the OS handed it the dead watcher's pid. <inc> empty = a pre-identity
+# record, where the pid is all the file claims. The marker goes only with its own
+# record. rc 0 released or already absent, 1 another watcher's record holds the
+# path, 2 ours but not removable, 4 no lock.
+sentinel_release_incarnation() {   # <pid_file> <pid> [<inc>]
+  local pid_file="$1" pid="$2" inc="${3:-}" marker recorded held live rc=0
   marker="$(sentinel_incarnation_path "$pid_file")"
-  sentinel_lock_acquire "$pid_file" || return 1
-  recorded="$(sentinel_field_in "$pid_file" incarnation 2>/dev/null || true)"
-  if [ -n "$inc" ] && [ -f "$pid_file" ] && [ "$recorded" != "$inc" ]; then
-    sentinel_lock_release "$pid_file"
-    return 1
+  sentinel_lock_acquire "$pid_file" || return 4
+  if [ -f "$pid_file" ]; then
+    held="$(sentinel_pid_in "$pid_file" 2>/dev/null || true)"
+    recorded="$(sentinel_field_in "$pid_file" incarnation 2>/dev/null || true)"
+    if [ "$held" != "$pid" ] || { [ -n "$inc" ] && [ "$recorded" != "$inc" ]; }; then
+      rc=1
+    else
+      sentinel_release_if_owner "$pid_file" "$pid"
+      [ -f "$pid_file" ] && rc=2
+    fi
   fi
-  sentinel_release_if_owner "$pid_file" "$pid"
-  live="$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ -z "$inc" ] || [ "$live" = "$inc" ]; then
-    rm -f "$marker"
-  else
-    rc=1
+  if [ "$rc" -eq 0 ] && [ -n "$inc" ]; then
+    live="$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]' || true)"
+    [ "$live" = "$inc" ] && rm -f "$marker"
   fi
   sentinel_lock_release "$pid_file"
   return "$rc"
@@ -364,10 +370,12 @@ sentinel_release_if_owner() {
   return 0
 }
 
-# Executed, not sourced: the repair path stamps through THIS file's writer.
+# Executed, not sourced: the repair path stamps and withdraws through THIS file.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     stamp) shift; sentinel_stamp_absent "$@"; exit $? ;;
-    *) echo "usage: watcher_sentinel.sh stamp <pid_file> <pid> <code_path> <version> <workspace>" >&2; exit 2 ;;
+    release) shift; sentinel_release_incarnation "$@"; exit $? ;;
+    *) echo "usage: watcher_sentinel.sh stamp <pid_file> <pid> <code_path> <version> <workspace>" >&2
+       echo "       watcher_sentinel.sh release <pid_file> <pid> [<incarnation>]" >&2; exit 2 ;;
   esac
 fi
