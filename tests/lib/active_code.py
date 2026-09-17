@@ -101,23 +101,27 @@ def _command_tokens(seg: str) -> list[str]:
     return toks
 
 
-def _consumes_script(tok: str) -> bool:
-    """A short-option token that carries `c` or `m` has no script operand.
-
-    `-c` and `-m` take the REST of the command line, and Python lets them be
-    attached (`-cpass`) or clustered (`-uc code`), so the flag is any letter in
-    the cluster, not the whole token (measured: `python3 -cpass x/test_dead.py`
-    returned 0 without executing the file and was still credited)."""
+def _option_kind(tok: str):
+    """Classify a short-option cluster by its FIRST value-taking letter,
+    scanned in order -- ownership, not a fixed position, decides attached
+    vs. separate. Returns ("script", 0) for -c/-m (consumes the rest of the
+    command line, per Python CLI rules); ("value", extra) for -W/-X, extra=0
+    when a value is attached right after that letter in the SAME token
+    (`-uWX` -- W owns "X"), extra=1 when nothing follows (the value is the
+    NEXT token, bare or clustered: `-W`, `-uW`); or (None, 0) otherwise
+    (measured: `-uWX`/`-uXdevW` both still run their script, but a
+    last-char-only test misread each as taking a separate value it doesn't
+    own -- keweichen, 2026-09-17)."""
     if not tok.startswith("-") or tok.startswith("--") or tok == "-":
-        return False
-    for ch in tok[1:]:
-        if ch in "WX":
-            return False  # owns an attached value, not a cluster continuation
+        return (None, 0)
+    for pos, ch in enumerate(tok[1:], start=1):
         if ch in "cm":
-            return True
+            return ("script", 0)
+        if ch in "WX":
+            return ("value", 0 if pos + 1 < len(tok) else 1)
         if not ch.isalpha():
             break
-    return False
+    return (None, 0)
 
 
 def _segment_invokes(seg: str, name: str) -> bool:
@@ -134,10 +138,10 @@ def _segment_python_arg(seg: str):
     rest = toks[1:]
     i = 0
     while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
-        if _consumes_script(rest[i]):
+        kind, extra = _option_kind(rest[i])
+        if kind == "script":
             return None  # no script operand exists in this shape
-        # A separate value token follows only when W/X is the LAST char (bare or clustered, e.g. -uW).
-        i += 2 if rest[i][-1] in "WX" else 1
+        i += 1 + extra
     if i < len(rest) and rest[i].endswith(".py"):
         return rest[i]
     return None

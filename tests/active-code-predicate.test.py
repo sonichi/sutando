@@ -306,6 +306,17 @@ class PythonArgsScriptOperand(unittest.TestCase):
         script); the real `-c` right after still consumes everything else."""
         self.assertEqual(python_args("python3 -uX dev.py -c pass"), [])
 
+    def test_a_clustered_flag_owns_the_value_right_after_it_in_the_token(self):
+        """keweichen's round-5 finding: a last-char-only test can't tell a
+        separate-value flag from an attached value that itself ends in
+        W/X. `-uWX` has W owning attached value "X"; `-uXdevW` has X
+        owning attached value "devW" -- both still run the script that
+        follows, confirmed by direct python3 execution."""
+        self.assertEqual(python_args("python3 -uWX packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -uXdevW packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
