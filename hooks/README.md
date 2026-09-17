@@ -366,3 +366,71 @@ PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the n
 **Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
 the same login and is outside the subcommand set, as is a body read from stdin
 (`-F -`). Both are deliberate — the guard reads a body it can see.
+
+## `memory-index-guard.py`
+
+Denies an `Edit` or `Write` to `MEMORY.md` that would silently push an already-loading
+index row past the session read-budget cut — via
+`skills/proactive-loop/scripts/memory-index-budget.py`, for **any** caller, not only the
+skills whose own checklist remembers to chain step 7.5.
+
+Same architectural move as `gh-policy-gate.py`: enforcement moves from "a step I remember
+to chain" to the action itself. `context-source-guard.py` already proves file_path-based
+PreToolUse filtering works (live on this host, matched on `Read`); this hook matches on
+`Edit`/`Write` and checks whether `tool_input.file_path` ends in `MEMORY.md`.
+
+What counts as "the addition": an `Edit`'s `new_string` directly (skipped if it's not a
+growth over `old_string` — a shrink is never refused). A `Write` replaces the whole file,
+so there's no single addition in the tool input; the hook reads the file's current
+on-disk content (before the write happens) and diffs it against the incoming `content`,
+treating lines present in the new content but not the old as the addition. A `Write` to a
+path that doesn't exist yet treats the whole `content` as the addition.
+
+Fails open on uncertainty, denies only on a positive finding — same contract as
+`gh-policy-gate.py`.
+
+- `SUTANDO_ALLOW_UNGATED_MEMORY_WRITE=1` — one-shot override.
+
+**Not covered:** a memory file other than `MEMORY.md` itself (the index budget script's
+own target — other memory files have no load-order cap to violate), and an Edit/Write
+whose `file_path` cannot be read from `tool_input` at all.
+
+## `dedup-staging-guard.py`
+
+Denies a Bash `mv` that lands a `state/dedup-staging/<file>` result into `results/`
+without a `check-dedup-targets.py` call anywhere in the same command — for **any**
+caller, not only proactive-loop step 1's own checklist.
+
+Step 1 stages a grouped `[deduped: X]` reply and only promotes it via `S="$WORKSPACE/
+state/dedup-staging/<file>"` then `check-dedup-targets.py "$S" && mv -f "$S"
+"$WORKSPACE/results/<file>"` — the checker refuses (exit 1) a staged file whose dedup
+target resolves to nothing (`[no-send]` or absent), which would otherwise have the
+bridge tell the room "see task X" for an X that delivers nothing. That protection only
+holds if the `&&` chain is typed; a bare `mv` bypasses it. Same architectural move as
+`gh-policy-gate.py` and `memory-index-guard.py` above.
+
+**What counts as the match.** A PreToolUse hook sees the raw, unexpanded command text —
+`$S` is a literal variable reference, not a resolved path — so this hook does not track
+shell variables (out of scope, same call as `gh-policy-gate.py`'s docstring makes for
+not resolving `$(...)`). It matches literal substrings instead: an `mv` segment whose
+own arguments mention `results` (the destination is always written out literally, even
+when the source is `$S`), AND `dedup-staging` appearing anywhere in the command (usually
+an earlier `S=...` assignment, `;`-separated from the `mv`), AND no segment anywhere in
+the command invoking `check-dedup-targets.py`. `&&` splits into a separate `_shell_scan`
+segment from what precedes it — verified directly, not assumed — so the checker call and
+the `mv` it gates are almost always in *different* segments (unlike `gh-policy-gate.py`'s
+same-segment `gh` matches); the `dedup-staging`/checker checks are scanned across the
+whole command for this reason, while the `results` match stays scoped to the `mv`'s own
+segment.
+
+Fails open on uncertainty: a command mentioning only one of `dedup-staging` / `results`,
+or no `mv` at all, is allowed — same contract as the other two hooks above.
+
+- `SUTANDO_ALLOW_UNGATED_DEDUP_STAGING=1` — one-shot override.
+
+**Not covered:** a staging→promotion sequence split across multiple Bash tool calls
+(`S=...` in one call, the check+`mv` in a later one) — this hook only sees one command
+string at a time, the same scope limit the other two hooks accept. Deploy is the same
+per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
+(`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
+landing this hook's source.

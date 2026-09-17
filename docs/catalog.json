@@ -21,7 +21,7 @@
    ],
    "status": "active",
    "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-09-10"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-08-26"
+   "last_verified": "2026-09-15"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -453,6 +453,36 @@
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
    "last_verified": "2026-09-04"
+  },
+  "docs/recovery-issue-metrics.md": {
+   "title": "Recovery issue metrics",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "canonical",
+   "canonical_for": "Recovery issue identity, event lifecycle, and rate query semantics",
+   "last_verified": "2026-09-15"
+  },
+  "docs/worker-pool-design.md": {
+   "title": "Worker pool — design (v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
+   "last_verified": "2026-09-11"
+  },
+  "docs/worker-pool-design-notes.md": {
+   "title": "Worker pool — design notes",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the record behind the v1 worker-pool design: rejected alternatives, the failure model inherited from the #3860 draft, and the owner decisions it encodes",
+   "last_verified": "2026-09-08"
   }
  }
 }

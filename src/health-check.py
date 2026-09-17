@@ -68,6 +68,12 @@ import slack_access  # noqa: E402
 import watcher_identity  # noqa: E402
 import proc_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_platform import (  # noqa: E402
+    find_pids,
+    probe_pids,
+    process_executable as _platform_process_executable,
+    process_snapshot as _platform_process_snapshot,
+)
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -720,12 +726,7 @@ _VAULT_SCANNER_SCRIPTS = {
 def _proc_executable(pid: "str | int") -> "str | None":
     """Executable path of `pid`, or None. `comm` is one field, so a path with
     spaces survives it — argv cannot be split back apart reliably."""
-    try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip() or None
+    return _platform_process_executable(pid)
 
 
 # The script must appear as its own argv token — a `-c` payload that merely
@@ -1586,6 +1587,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
     "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
+    "dismissed-questions.json",  # per-host, alongside pending-questions.md
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",
@@ -1721,6 +1723,40 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+# The compact forms a compacted index uses for entries, shared by the two
+# readers below so a row cannot be an entry for one and invisible to the other.
+INDEX_ENTRY_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
+_INDEX_ROW_ENTRY = re.compile(
+    r"^\s*[-*] .*(?:\]\(|(?<![\w-])(?:"
+    + "|".join(re.escape(s) for s in INDEX_ENTRY_ABBREV.values())
+    + r")[\w-])"
+)
+
+
+def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
+    """True when a corpus holds memories rather than just an untouched index.
+
+    MEMORY.md is the index every corpus ships with, so counting it makes a bare
+    project dir read as populated forever. Nothing can be invisible there — the
+    corpus has no memories — and a warning that can never clear is the exact
+    failure this probe's scope filter already guards against elsewhere. An index
+    carrying entries still counts: that says something wrote here.
+    """
+    if any(p.name != "MEMORY.md" for p in mds):
+        return True
+    index = mem / "MEMORY.md"
+    if not index.is_file():
+        return False
+    try:
+        text = index.read_text(errors="replace")
+    except OSError:
+        return True  # unreadable: report rather than silently drop a real corpus
+
+    # Anchor on the bullet, not the link: a compacted index writes `- f:slug`.
+    return any(_INDEX_ROW_ENTRY.search(ln) for ln in text.splitlines())
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -1764,8 +1800,9 @@ def check_memory_dir_siblings() -> "dict | None":
             continue
         if _slug_derivation_key(entry.name) != live_key:
             continue  # unrelated project, not a slug split
-        count = len(list(mem.glob("*.md")))
-        if count == 0:
+        mds = list(mem.glob("*.md"))
+        count = len(mds)
+        if not _corpus_holds_memories(mem, mds):
             continue
         key = str(mem.resolve())  # collapse symlinked twins onto one entry
         if key not in seen or count > seen[key][1]:
@@ -2490,9 +2527,6 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
-    # An index that outgrows the load budget compacts its entries to prefix
-    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
-    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
 
     def _referenced_in(hay: str, name: str) -> bool:
         stem = name[:-3] if name.endswith(".md") else name
@@ -2500,7 +2534,7 @@ def check_memory_index_integrity() -> "dict | None":
             return True
         # Without this the probe calls an indexed file unindexed, and the
         # "fix" it invites — expanding the index — is what blows the read limit.
-        for full, short in _INDEX_ABBREV.items():
+        for full, short in INDEX_ENTRY_ABBREV.items():
             if not stem.startswith(full):
                 continue
             token = short + stem[len(full):]
@@ -3177,6 +3211,130 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
+                                  repo_root: "Path | None" = None) -> dict:
+    """Peer content the sync preserved and nobody merged back.
+
+    `_resolve_conflicts_keep_ours` keeps OUR side on a conflict and banks THEIRS
+    under the git dir. That happens at exit 0, and the sync cron is told to speak
+    only on failure, so the fact lands where nothing reads it. Measured on two
+    hosts the same hour: both agents read past the line while quoting other rows.
+
+    Counts the preserved files; it does NOT diff them against the live copy.
+    That diff is what `scripts/sync-conflicts-report.py` does and it costs 24s
+    over 892 MB here and over 120s on a peer -- a per-pass probe cannot run it,
+    and a probe whose only reachable arm is its timeout prints a tick forever.
+    """
+    name = "sync-conflicts-unmerged"
+    ws = Path(workspace) if workspace else resolve_workspace()
+    try:
+        # `rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+        # its parent; require the toplevel to BE the workspace, as the reporter does.
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--show-toplevel", "--git-dir"),
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or len(lines) < 2:
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git checkout — no conflict backups to read"}
+        if Path(lines[0]).resolve() != Path(ws).resolve():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git top level (git resolved {lines[0]}) — not asserting a count"}
+        gitdir = Path(lines[1])
+        if not gitdir.is_absolute():
+            gitdir = Path(ws) / gitdir
+    except Exception as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
+    root = gitdir / "sutando-sync-conflicts"
+    if not root.is_dir():
+        return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
+    try:
+        batches = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    batch_files, unreadable_dirs = _sync_conflicts_walk_batches(batches)
+    # The digest is IN the writer's key so retiring one copy cannot silence a
+    # later, DIFFERENT one at the same path; the reporter owns that identity.
+    try:
+        retired = set(json.loads((root / ".retired.json").read_text()))
+    except Exception:
+        retired = set()
+    entry_key = _sync_conflicts_entry_key()
+    if entry_key is None:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(batch_files)} peer file(s) preserved across {len(batches)} keep-ours "
+                           "batch(es); the reporter's retirement key could not be loaded, so "
+                           "retirement is UNOBSERVED here rather than assumed — run "
+                           f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
+    live, unobserved = [], []
+    for batch, f in batch_files:
+        try:
+            # errors="replace" matches the writer: a different decode is a
+            # different digest, and every copy would then read un-retired.
+            key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+        except OSError:
+            unobserved.append(f)
+            continue
+        if key not in retired:
+            live.append(f)
+    if unreadable_dirs and not live:
+        # A subtree os.walk could not list may hold live, un-retired files we
+        # structurally never enumerated -- never report clean while that holds.
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unreadable_dirs)} subdirectory read failure(s) across "
+                           f"{len(batches)} keep-ours batch(es) ({len(unobserved)} file(s) also "
+                           "unreadable) — retirement is UNOBSERVED for whatever those subtrees "
+                           "hold, not asserting clean")}
+    if not live and not unobserved:
+        return {"name": name, "status": "ok",
+                "detail": "no preserved peer files outstanding — all retired or none kept"}
+    if not live:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unobserved)} preserved peer file(s) could not be read, so their "
+                           "retirement is UNOBSERVED — not asserting they are retired")}
+    oldest = batches[0].name if batches else "?"
+    return {"name": name, "status": "warn",
+            "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, not retired — whether each is still absent from the live copy "
+                       f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_walk_batches(batches: "list[Path]") -> "tuple[list[tuple[Path, Path]], list[str]]":
+    """Enumerate files under each batch, reporting subtrees `rglob` would hide.
+
+    `Path.rglob()` swallows `OSError` when `scandir` fails on a subdirectory and
+    silently treats it as empty rather than raising -- a permission-denied
+    subtree then reads as "no files here" instead of "unreadable", which is how
+    a batch holding live, un-retired content could report a clean verdict.
+    `os.walk`'s `onerror` hook is what makes that failure visible.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    unreadable: list[str] = []
+    for batch in batches:
+        for dirpath, _dirnames, filenames in os.walk(
+                str(batch), onerror=lambda exc: unreadable.append(str(exc))):
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_file():
+                    pairs.append((batch, p))
+    pairs.sort(key=lambda bf: (bf[0].name, bf[1]))
+    return pairs, unreadable
+
+
+def _sync_conflicts_entry_key():
+    """The reporter OWNS retirement identity; a second spelling here would drift."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync-conflicts-report.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_sync_conflicts_report", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._entry_key
+    except Exception:
+        return None
+
+
 def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
     """Warn when a long-running skills process is executing code older than disk.
 
@@ -3210,8 +3368,54 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
     if not head:
         return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
-    if running == head:
-        return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
+    # Never compare two abbreviations: each writer picks its own length, so they
+    # agree until a colliding object lands and `--short` grows. Resolve both.
+    def _git(*args, timeout=10):
+        return subprocess.run(git_argv("-C", str(skills), *args),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _oid(rev):
+        """(state, oid) — 'ok' | 'absent' | 'unknown'.
+
+        A nonzero exit does not establish absence: an unreadable loose object,
+        a signal, or exit 128 all fail while the commit is right there. Absence
+        is established POSITIVELY, by asking how many objects carry the prefix.
+        """
+        try:
+            r = _git("rev-parse", "--verify", f"{rev}^{{commit}}")
+            if r.returncode == 0 and r.stdout.strip():
+                return ("ok", r.stdout.strip())
+            # --disambiguate takes an object PREFIX. A symbolic name like HEAD
+            # matches nothing, which would read as absence rather than a failure.
+            if not _re.fullmatch(r"[0-9a-fA-F]{4,40}", rev or ""):
+                return ("unknown", "")
+            d = _git("rev-parse", f"--disambiguate={rev}")
+        except Exception:
+            return ("unknown", "")
+        # rc 0 with nothing on stdout and a complaint on stderr is a FAILED
+        # read, not an empty candidate set: an unreadable object dir does this.
+        if d.returncode != 0 or (not d.stdout.strip() and d.stderr.strip()):
+            return ("unknown", "")
+        n = len([ln for ln in d.stdout.split() if ln.strip()])
+        # 0 candidates is the only positively-established absence. One candidate
+        # that would not resolve means present-but-unreadable; >1 is ambiguous.
+        return ("absent", "") if n == 0 else ("unknown", "")
+    head_state, head_oid = _oid("HEAD")
+    if head_state != "ok":
+        return {"name": name, "status": "ok",
+                "detail": f"HEAD in the skills checkout is {head_state} — not asserting drift"}
+    run_state, run_oid = _oid(running)
+    # Unobserved is not stale. An ambiguous prefix or an unrunnable git says
+    # nothing about the driver; only a resolvable, different commit does.
+    if run_state == "unknown":
+        return {"name": name, "status": "ok",
+                "detail": (f"could not identify the driver stamp {running} (ambiguous prefix, "
+                           f"unreadable object, or git unavailable) — INCONCLUSIVE, not asserting "
+                           f"drift or a re-arm")}
+    same = run_oid == head_oid
+    if same:
+        return {"name": name, "status": "ok",
+                "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
     return {"name": name, "status": "warn",
             "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
                        f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "
@@ -6502,7 +6706,8 @@ def check_core_supervisor() -> dict:
     "needs you" line + the prompt excerpt; degraded states (crashed / hung /
     gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
     last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
-    running, or a pre-supervisor install).
+    running, or a pre-supervisor install). File present but unparseable → warn:
+    it can hide a hard blocker, and the relay escalates on it too.
     """
     name = "core-supervisor"
     sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
@@ -6511,7 +6716,12 @@ def check_core_supervisor() -> dict:
     try:
         data = json.loads(sig_path.read_text())
     except Exception as e:
-        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+        data, err = None, str(e)[:60]
+    else:
+        err = f"expected an object, got {type(data).__name__}"
+    if not isinstance(data, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"core-supervisor.json unreadable ({err}) — a blocked core can't be ruled out"}
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
@@ -7598,11 +7808,12 @@ def check_disk_space() -> dict:
     targets = {}
     for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
         try:
-            st = os.statvfs(str(path))
+            device = path.stat().st_dev
+            free_gib = shutil.disk_usage(path).free / (1024 ** 3)
         except OSError as e:
             return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
         # Key by device so the same volume isn't reported twice.
-        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+        targets[device or label] = (label, path, free_gib)
 
     worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
     where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
@@ -7639,8 +7850,19 @@ def _is_ephemeral(target: str) -> bool:
     Equality counts: a link pointing AT the root is as ephemeral as one pointing
     inside it, and a trailing-slash prefix test answers False for exactly that case.
     """
-    t = os.path.normpath(target).rstrip("/") or "/"
-    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+    t = os.path.normcase(os.path.normpath(target))
+    roots = (os.path.normcase(os.path.normpath(r)) for r in _ephemeral_roots())
+    return any(t == r or t.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _is_skill_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        # Directory junctions are mount-point reparse tags, including on Python 3.11.
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError):
+        return False
 
 
 def check_skill_symlinks() -> dict:
@@ -7704,13 +7926,14 @@ def check_skill_symlinks() -> dict:
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if dst.is_symlink() and not dst.exists():
+        is_link = _is_skill_link(dst)
+        if is_link and not dst.exists():
             broken.append(skill_name)
-        elif not dst.exists() and not dst.is_symlink():
+        elif not dst.exists() and not is_link:
             unlinked.append(skill_name)
-        elif dst.is_dir() and not dst.is_symlink():
+        elif dst.is_dir() and not is_link:
             shadowed.append(skill_name)
-        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+        elif (is_link and _is_ephemeral(os.path.realpath(dst))
               and not _is_ephemeral(str(skills_src.resolve()))):
             # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
             # is self-consistent, and another DURABLE clone is a supported layout.
@@ -7728,7 +7951,7 @@ def check_skill_symlinks() -> dict:
         for entry in sorted(skills_dst.iterdir()):
             if entry.name in repo_names:
                 continue
-            if entry.is_symlink() and not entry.exists():
+            if _is_skill_link(entry) and not entry.exists():
                 orphaned.append(entry.name)
     except OSError:
         pass
@@ -8075,6 +8298,40 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
         except OSError:
             continue
     return out
+
+
+def check_pool_advertisement() -> dict:
+    """The picker follows the roster only through the advertisement the bridge
+    sends; a roster version that file does not carry is a pin nobody was told."""
+    name = "pool-advertisement"
+    roster_p = WORKSPACE_DIR / "state" / "roster.json"
+    ad_p = WORKSPACE_DIR / "state" / "pool-advertisement.json"
+    if not roster_p.exists():
+        return {"name": name, "status": "ok", "detail": "no pool roster"}
+    try:
+        roster = json.loads(roster_p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn", "detail": f"roster.json unreadable: {e}"}
+    rv = roster.get("version")
+    rooms = len(roster.get("bindings") or {})
+    repair = "re-publish the pool advertisement from the roster"
+    try:
+        ad = json.loads(ad_p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"name": name, "status": "warn",
+                "detail": f"roster v{rv} ({rooms} binding(s)) has no advertisement — "
+                          f"the picker was never told; repair: {repair}"}
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn",
+                "detail": f"pool-advertisement.json unreadable: {e}; repair: {repair}"}
+    workers = ad.get("workers") if isinstance(ad, dict) else None
+    av = workers.get("roster_version") if isinstance(workers, dict) else None
+    if av != rv:
+        return {"name": name, "status": "warn",
+                "detail": f"binding unpublished: advertisement carries roster v{av}, "
+                          f"roster is v{rv} ({rooms} binding(s)); repair: {repair}"}
+    return {"name": name, "status": "ok",
+            "detail": f"advertisement matches roster v{rv} ({rooms} binding(s))"}
 
 
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
@@ -8552,12 +8809,7 @@ def _ps_snapshot() -> "str | None":
     a nonzero exit: its empty stdout would otherwise read as a successful scan
     that found nothing, which is the absence callers must not assert.
     """
-    try:
-        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5)
-    except Exception:  # noqa: BLE001
-        return None
-    return done.stdout if done.returncode == 0 else None
+    return _platform_process_snapshot()
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -8668,22 +8920,10 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
-def _as_pid(tok: str) -> "int | None":
-    try:
-        return int(tok)
-    except (TypeError, ValueError):
-        return None
-
-
 def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     """True/False from the EXECUTED script; None when nothing can prove it.
-
-    The policy itself lives in src/watcher_identity.py, which restart.sh also
-    asks before it signals anything: one answer to "is that process our
-    watcher", so a reporter and a signaller cannot disagree about one pid.
-    """
-    return watcher_identity.is_watcher_argv(
-        argv, _proc_argv_vector(pid) if pid is not None else None)
+    The policy is `watcher_identity`; this binds it to the argv reader above."""
+    return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
 # Read from the module that defines the precedence; a copy here is how this
@@ -8798,27 +9038,8 @@ def _group_roots_by_target(state_dir, roots):
 
 
 def _ps_watcher_index(ps_output: str) -> tuple:
-    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
-
-    Both the tree walk and the ownership split need this; two parses could
-    disagree about a process that exited between them.
-    """
-    me = str(os.getpid())
-    parent: dict = {}
-    live: set = set()
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        live.add(parts[0])
-        if parts[0] == me:
-            continue
-        # None is UNKNOWN: count it, because a missed watcher starts a second
-        # one and every task is then processed twice.
-        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
-            continue
-        parent[parts[0]] = parts[1]
-    return parent, live
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse."""
+    return watcher_identity.ps_watcher_index(ps_output, is_watcher=_is_watcher_argv)
 
 
 def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
@@ -8839,34 +9060,9 @@ def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
-    """Map root PID -> set of PIDs for each distinct watcher TREE running.
-
-    Each watcher is several processes (a shell wrapper, the script, a
-    subshell), so counting matching lines overcounts. A "root" is a match
-    whose parent is not itself a match — one per independent watcher. Callers
-    need the whole tree, not just the root, to tell which tree owns the
-    sentinel PID (the sentinel records the script's PID, not the wrapper's).
-
-    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
-    the reason in _proc_argv: pgrep would match the caller. Our own argv is
-    the health-check invocation, but we drop it explicitly anyway.
-    """
-    if ps_output is None:
-        try:
-            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                                       capture_output=True, text=True,
-                                       timeout=5).stdout
-        except Exception:  # noqa: BLE001
-            return {}
-    parent, _live = _ps_watcher_index(ps_output)
-    trees: dict = {}
-    for pid in parent:
-        root, seen = pid, set()
-        while parent.get(root) in parent and root not in seen:
-            seen.add(root)
-            root = parent[root]
-        trees.setdefault(root, set()).add(pid)
-    return trees
+    """Root PID -> member PIDs per distinct watcher TREE; None runs `ps`.
+    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`."""
+    return watcher_identity.watcher_trees(ps_output, is_watcher=_is_watcher_argv)
 
 
 def extras_present(trees, live) -> bool:
@@ -10866,7 +11062,8 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
         labels = "/".join(e["label"] for e in entries if e.get("label"))
     except (OSError, ValueError, TypeError, AttributeError):
         labels = ""
-    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+    watch = "watcher-watchdog + hotkeys"
+    return f"running ({watch}: {labels})" if labels else f"running ({watch}, none published)"
 
 
 def _outermost_bundle(comm: str) -> Optional[Path]:
@@ -12487,6 +12684,7 @@ def run_all_checks() -> list[dict]:
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
     checks.append(check_skills_driver_code_drift())
+    checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
@@ -12573,19 +12771,9 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Anchor on the .py suffix so we don't match unrelated processes
-            # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
-            # name produces false-positive "multiple processes" warnings
-            # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            # rc 1 is the authoritative no-match; any other non-zero exit is a
-            # PROBE ERROR and must not read as "bridge is down".
-            _probe_ok = result.returncode in (0, 1)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-            # A launcher's argv ends with the same script path, so it matches
-            # this pgrep too — see _drop_launcher_parents.
+            # Anchor to the script suffix; find_pids preserves anchors on every OS.
+            # Drop launcher parents so only actual pollers remain.
+            pids, _probe_ok = probe_pids(f"{proc_name}\\.py$")
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
@@ -12837,7 +13025,12 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
+            # so absent app + busy CLI means nothing recovers the watcher from either side.
+            checks.append({"name": "sutando-app", "status": "warn",
+                           "detail": "not running — hotkeys disabled AND checkWatcher is "
+                                     "absent, so a dead task watcher is recovered by nothing "
+                                     "while the CLI is busy"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -12864,6 +13057,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_pool_advertisement())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
@@ -13683,6 +13877,15 @@ def _recovery_metric(event: str, **properties) -> None:
         pass
 
 
+def _track_core_issue(state_file, **observation):
+    try:
+        from recovery_issues import track_core_issue
+        track_core_issue(state_file.with_name(state_file.stem + "-issues.json"),
+                         emit=_recovery_metric, **observation)
+    except Exception:
+        pass
+
+
 def _recovery_duration(seconds: float) -> str:
     for threshold, bucket in ((60, "<1m"), (300, "1-5m"), (1800, "5-30m")):
         if seconds < threshold:
@@ -13691,11 +13894,14 @@ def _recovery_duration(seconds: float) -> str:
 
 
 def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
-    """Observe fix health; names are local correlation data, never telemetry properties."""
+    """Observe fix health; only allowlisted check names leave local correlation state."""
     try:
         if fcntl is None:
             return
         state_file = state_file or WORKSPACE_DIR / "state" / "health-fix-metrics.json"
+        from recovery_issues import track_health_issues
+        track_health_issues(state_file.with_name(state_file.stem + "-issues.json"),
+                            checks, start=start, emit=_recovery_metric)
         now = time.time() if now is None else now
         state_file.parent.mkdir(parents=True, exist_ok=True)
         with open(state_file.with_name(state_file.name + ".lock"), "a") as lock:
@@ -13836,6 +14042,7 @@ def recover_core_if_wedged(
                   f"UNKNOWN, not dead; suppressing restart and RESETTING the "
                   f"confirmation window", file=sys.stderr)
             return {"action": "probe-failed", "probe": which}
+        _track_core_issue(state_file, alive=alive, task=cur_key, status_ts=status_ts)
         pending = state.get("recovery_metric_pending")
         if pending and alive and (
             oldest is None or cur_key != pending["task"] or (
@@ -13959,6 +14166,8 @@ def recover_core_if_wedged(
         if not dm_ok:
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
+        _track_core_issue(state_file, alive=alive, task=cur_key,
+                          status_ts=status_ts, start=True, cause=cur_mode)
         _recovery_metric("core_recovery_attempted", trigger=cur_mode)
         try:
             restart_ok = restart_fn()

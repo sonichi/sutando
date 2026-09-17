@@ -7,6 +7,13 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
+# This runtime has no worker mode: everything below is the canonical core's
+# ceremony, so an instance launch is refused before the first step of it.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  exit 2
+fi
+
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
@@ -221,7 +228,9 @@ ensure_core_monitor() {
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" >/dev/null 2>&1; then
+  # Socket only (see the claude launcher): the desktop launcher's tmux-window
+  # copy spells --out differently, and one watcher per socket is the invariant.
+  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" >/dev/null 2>&1; then
     return 0
   fi
   python3 "$REPO/src/core-input-watch.py" \

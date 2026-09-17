@@ -419,11 +419,11 @@ def case_ownership_policy(state: Path) -> None:
 
     # The real argv LIST, when a caller could read one: the authoritative form.
     check("a vector whose executed slot is the watcher confirms",
-          wi.is_watcher_argv("", ["/bin/bash", code]) is True)
+          wi.is_watcher_argv("", vector=["/bin/bash", code]) is True)
     check("  ...and one whose executed slot is a flag does not",
-          wi.is_watcher_argv("", ["/bin/bash", "-c", code]) is False)
+          wi.is_watcher_argv("", vector=["/bin/bash", "-c", code]) is False)
     check("  ...nor one whose argv[0] is not a shell",
-          wi.is_watcher_argv("", ["/usr/bin/python3", code]) is False)
+          wi.is_watcher_argv("", vector=["/usr/bin/python3", code]) is False)
     check("a one-token argv proves nothing", wi.is_watcher_argv("bash") is False)
     check("executed_script returns None when the slot is a flag",
           wi.executed_script("bash -c true") is None)
@@ -434,13 +434,13 @@ def case_ownership_policy(state: Path) -> None:
     # The real launches carry an operand (`/bin/bash <script> <tasks-dir>`):
     # only the vector names the executed slot; the same text flattened cannot.
     check("the notifier form's vector confirms",
-          wi.is_watcher_argv("", ["/bin/bash", code, "/x/ws/tasks"]) is True)
+          wi.is_watcher_argv("", vector=["/bin/bash", code, "/x/ws/tasks"]) is True)
     check("  ...and the Monitor form's vector confirms",
-          wi.is_watcher_argv("", ["bash", code, "/x/ws/tasks"]) is True)
+          wi.is_watcher_argv("", vector=["bash", code, "/x/ws/tasks"]) is True)
     check("  ...while the SAME text flattened is UNPROVABLE",
           wi.is_watcher_argv(f"/bin/bash {code} /x/ws/tasks") is None)
     check("  ...and a vector whose one operand is that spaced path is NOT our watcher",
-          wi.is_watcher_argv("", ["/bin/bash", f"{code} /x/ws/tasks"]) is False)
+          wi.is_watcher_argv("", vector=["/bin/bash", f"{code} /x/ws/tasks"]) is False)
     check("the notifier form's vector runs this checkout's code_path",
           wi.runs_code_path("", code, ["/bin/bash", code, "/x/ws/tasks"]) is True)
 

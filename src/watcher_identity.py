@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Watcher ownership — the ONE policy every signaller and reporter asks.
+"""Watcher identity and ownership — the ONE policy every signaller and reporter asks.
 
 WHY THIS MODULE EXISTS. `kill -0` proves a pid EXISTS; it never proves the pid
 is ours. The OS reissues the numbers of exited processes, and `watch-tasks-stream.sh`
 appearing anywhere in a flattened argv is satisfied by a stranger carrying that
 path as ORDINARY DATA (`python3 -c pass /scratch/watch-tasks-stream.sh` matched
-a containment check and authorised a kill). Ownership is therefore two questions,
-and both are answered here rather than once per caller:
+a containment check and authorised a kill). Ownership is therefore three
+questions, and all are answered here rather than once per caller:
 
   1. Does the sentinel carry a COMPLETE identity record naming this install,
      this instance and this incarnation? A missing field is a refusal — an
@@ -21,25 +21,36 @@ and both are answered here rather than once per caller:
      argv that agree on `/foreign/checkout/src/watch-tasks-stream.sh` are
      self-consistent and still not ours: checkouts may share one workspace.
 
-Everything here is pure: process and file I/O belong to the caller (restart.sh
-reaches the process table only through `src/process-ops.sh`, so a test can
-replace that layer wholesale), and this module decides. Refusals carry a reason
+Every identity answer is tri-state. A `ps` that failed, timed out or answered
+non-zero proves nothing; a caller that treats its empty answer as "not a
+watcher" starts a duplicate watcher, or publishes a stranger's pid. So the
+answer is True / False / None, and None is never a default — callers disagree
+on what it should mean (over-counting costs delayed tasks, a wrong pid costs a
+killed stranger), so it is carried to them undecided.
+
+The decisions here are pure: process and file I/O belong to the caller
+(restart.sh reaches the process table only through `src/process-ops.sh`, so a
+test can replace that layer wholesale; the readers below take injectable
+`run`/`argv_vector` seams), and this module decides. Refusals carry a reason
 string because "I could not prove that watcher is mine" is a reportable
 outcome, never a silent pass — the owner's rule is refuse-and-report.
 
 Consumers: `src/watcher_identity.sh` — the one shell sequence restart.sh and
 the startup reaper both run (through the CLI below, via the resolved python) —
-and `src/health-check.py` (imported).
+`src/health-check.py` (imported) and the pool's per-worker bootstrap gate.
 
-CLI, for the shell bridge:
+CLI, for the shell bridges:
+  watcher_identity.py <pid>          -> `watcher`, `not-watcher`, `dead` or
+                                        `unknown`, with `why=` beneath; exit 0
+                                        when decided, 2 when not.
   watcher_identity.py owner-pid --sentinel P --instance I --workspace W
                                 --incarnation-file F --code-path C
                                                         -> "<pid>\t<code_path>"
   watcher_identity.py runs-watcher --pid N --argv A [--argv-vector J] --code-path C
-Both exit 0 on confirmation, or print the reason and exit 1. J is the JSON argv
-LIST src/process-ops.sh read for N (`pops_argv_vector`); when the seam could
-not read one, only the flattened A is judged, and an operand after the script
-then stays unprovable — the adapter never splits the text itself.
+The last two exit 0 on confirmation, or print the reason and exit 1. J is the
+JSON argv LIST src/process-ops.sh read for N (`pops_argv_vector`); when the seam
+could not read one, only the flattened A is judged, and an operand after the
+script then stays unprovable — the adapter never splits the text itself.
 """
 from __future__ import annotations
 
@@ -47,7 +58,10 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+from pathlib import Path
+from typing import Callable, List, NamedTuple, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from util_paths import read_sentinel_record  # noqa: E402
@@ -57,44 +71,107 @@ WATCHER_SCRIPT_NAME = WATCHER_STEM + ".sh"
 # A shell in the executed slot, and the name as a whole final path component, so
 # `x-watch-tasks-stream.sh` and a mention inside a longer word cannot match.
 WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
-WATCHER_SCRIPT_RE = re.compile(r"(?:^|[\s/])" + re.escape(WATCHER_SCRIPT_NAME) + r"(?=\s|$)")
+WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
+WATCHER_SCRIPT_RE = WATCHER_SCRIPT
 
 # Every claim a signaller must find before it may target the pid on line 1.
 # `version`/`started_at` are recorded but not required: neither narrows ownership.
 REQUIRED_FIELDS = ("instance", "incarnation", "code_path", "workspace")
 
 
-def is_watcher_argv(argv: str, vector: "list[str] | None" = None) -> "bool | None":
-    """True/False from the EXECUTED script; None when nothing can prove it.
+def as_pid(tok) -> Optional[int]:
+    try:
+        return int(tok)
+    except (TypeError, ValueError):
+        return None
 
-    Callers disagree on what None should mean, which is why this is tri-state:
-    over-counting a watcher costs delayed tasks, publishing (or signalling) a
-    wrong pid costs a killed stranger. `vector` is the real argv list when the
-    caller could read one — a flattened string cannot separate an operand
-    containing a space from two operands.
+
+def proc_argv_vector(pid) -> Optional[List[str]]:
+    """Real argv of `pid` as a LIST, or None when no authoritative read exists.
+
+    A flattened argv cannot separate an operand containing a space from two
+    operands, so the executed script is not recoverable from it by any rule.
     """
-    if vector is not None and len(vector) >= 2:
-        if vector[0].rsplit("/", 1)[-1] not in WATCHER_SHELLS:
-            return False
-        if vector[1].startswith("-"):
-            return False
-        return os.path.basename(vector[1]) == WATCHER_SCRIPT_NAME
+    try:  # linux: NUL-delimited, authoritative
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
+    except Exception:  # noqa: BLE001 -- not linux, or gone
+        pass
+    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(262144)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        data = buf.raw[:size.value]
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        parts = data[4:].split(b"\0")
+        i = 0
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        i += 1                                   # the exec path
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        out = []
+        while i < len(parts) and len(out) < argc:
+            out.append(parts[i].decode("utf8", "replace"))
+            i += 1
+        return out or None
+    except Exception:  # noqa: BLE001 -- probe failure must not fail the caller
+        return None
+
+
+class Verdict(NamedTuple):
+    """`watcher` is True / False / None (undecidable); `operands` are the tokens
+    after the script, present only when `watcher` is True."""
+    watcher: Optional[bool]
+    operands: Optional[List[str]]
+
+
+def classify_argv(argv: str, pid=None, argv_vector: Optional[Callable] = None,
+                  vector: Optional[List[str]] = None) -> Verdict:
+    """Decide from the EXECUTED script; the flattened `argv` only when no
+    authoritative vector exists, and only where it cannot mislead. `vector` is
+    the real argv list when the caller already read one; otherwise it is read
+    for `pid` through `argv_vector` (the module's reader by default)."""
+    vec = vector
+    if vec is None and pid is not None:
+        read = argv_vector if argv_vector is not None else proc_argv_vector
+        vec = read(pid)
+    if vec is not None and len(vec) >= 2:
+        if vec[0].rsplit("/", 1)[-1] not in WATCHER_SHELLS:
+            return Verdict(False, None)
+        if vec[1].startswith("-"):
+            return Verdict(False, None)
+        if os.path.basename(vec[1]) == WATCHER_SCRIPT_NAME:
+            return Verdict(True, list(vec[2:]))
+        return Verdict(False, None)
     parts = argv.split()
     if len(parts) < 2:
-        return False
+        return Verdict(False, None)
     if parts[0].rsplit("/", 1)[-1] not in WATCHER_SHELLS:
-        return False
+        return Verdict(False, None)
     if parts[1].startswith("-"):
-        return False
+        return Verdict(False, None)
     # Authoritative only when argv ends at parts[1]: with more tokens the real
     # pathname may continue past a space and end in a different name.
-    if WATCHER_SCRIPT_RE.search(parts[1]) is not None:
-        return True if len(parts) == 2 else None
+    if WATCHER_SCRIPT.search(parts[1]) is not None:
+        return Verdict(True, []) if len(parts) == 2 else Verdict(None, None)
     if len(parts) == 2:
-        return False
-    # Only a later token matches, and a spaced script path is the same string as
-    # a script plus arguments -- nothing here can decide between them.
-    return None if WATCHER_SCRIPT_RE.search(argv) else False
+        return Verdict(False, None)
+    # Only a later token matches, and a spaced script path is the same string as a
+    # script plus arguments -- nothing here can decide between them.
+    return Verdict(None, None) if WATCHER_SCRIPT.search(argv) else Verdict(False, None)
+
+
+def is_watcher_argv(argv: str, pid=None, argv_vector: Optional[Callable] = None,
+                    vector: Optional[List[str]] = None) -> Optional[bool]:
+    """True/False from the EXECUTED script; None when nothing can prove it."""
+    return classify_argv(argv, pid, argv_vector, vector).watcher
 
 
 def executed_script(argv: str, vector: "list[str] | None" = None) -> "str | None":
@@ -123,6 +200,90 @@ def runs_code_path(argv: str, code_path: str, vector: "list[str] | None" = None)
     want = [p for p in os.path.normpath(executed).split(os.sep) if p not in ("", ".")]
     have = os.path.normpath(code_path).split(os.sep)
     return bool(want) and len(have) >= len(want) and have[-len(want):] == want
+
+
+class Inspection(NamedTuple):
+    """`observed` False: `ps` proved nothing (failed, timed out, non-zero, empty),
+    and `watcher` is then None -- an unobserved process is not a proven non-watcher."""
+    observed: bool
+    watcher: Optional[bool]
+    operands: Optional[List[str]]
+    argv: str
+    reason: str
+
+
+def inspect_pid(pid, run: Callable = subprocess.run, argv_vector: Optional[Callable] = None,
+                timeout: float = 10) -> Inspection:
+    """Classify one live pid. The command column only: `ps eww` would print the
+    process's environment, which carries credentials on a Sutando host."""
+    try:
+        out = run(["ps", "-o", "command=", "-p", str(pid)],
+                  capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return Inspection(False, None, None, "", f"ps timed out after {timeout}s for pid {pid}")
+    except Exception as e:  # noqa: BLE001 -- ps missing, signalled, unrunnable
+        return Inspection(False, None, None, "", f"ps could not run for pid {pid}: {e}")
+    rc = getattr(out, "returncode", None)
+    argv = (getattr(out, "stdout", "") or "").strip()
+    if rc != 0 or not argv:
+        return Inspection(False, None, None, "",
+                          f"ps answered rc {rc} with {'no' if not argv else 'a'} command for pid {pid}")
+    verdict = classify_argv(argv, pid, argv_vector)
+    return Inspection(True, verdict.watcher, verdict.operands, argv,
+                      "argv could not be decided" if verdict.watcher is None else "")
+
+
+def ps_watcher_index(ps_output: str, is_watcher: Optional[Callable] = None) -> tuple:
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE `ps -Ao pid,ppid,args`
+    parse. Both the tree walk and an ownership split need this; two parses could
+    disagree about a process that exited between them."""
+    decide = is_watcher if is_watcher is not None else is_watcher_argv
+    me = str(os.getpid())
+    parent: dict = {}
+    live: set = set()
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        live.add(parts[0])
+        if parts[0] == me:
+            continue
+        # None is UNKNOWN: count it, because a missed watcher starts a second
+        # one and every task is then processed twice.
+        if decide(parts[2], as_pid(parts[0])) is False:
+            continue
+        parent[parts[0]] = parts[1]
+    return parent, live
+
+
+def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable] = None) -> dict:
+    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    Each watcher is several processes (a shell wrapper, the script, a subshell),
+    so counting matching lines overcounts. A "root" is a match whose parent is
+    not itself a match -- one per independent watcher. Callers need the whole
+    tree to tell which one owns a sentinel PID (the sentinel records the
+    script's PID, not the wrapper's).
+
+    `ps -Ao` + filtering rather than `pgrep -f watch-tasks-stream`: pgrep would
+    match the caller. Our own argv is dropped explicitly anyway.
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout
+        except Exception:  # noqa: BLE001
+            return {}
+    parent, _live = ps_watcher_index(ps_output, is_watcher)
+    trees: dict = {}
+    for pid in parent:
+        root, seen = pid, set()
+        while parent.get(root) in parent and root not in seen:
+            seen.add(root)
+            root = parent[root]
+        trees.setdefault(root, set()).add(pid)
+    return trees
 
 
 class Refused(Exception):
@@ -199,7 +360,7 @@ def parse_vector(pid: int, encoded: str) -> "list[str]":
 def confirm_process(pid: int, argv: str, code_path: str,
                     vector: "list[str] | None" = None) -> None:
     """Raise Refused unless the live process is EXECUTING our watcher script."""
-    verdict = is_watcher_argv(argv, vector)
+    verdict = is_watcher_argv(argv, vector=vector)
     if verdict is False:
         raise Refused(f"argv: pid {pid} is not a live {WATCHER_STEM}")
     if verdict is None:
@@ -209,7 +370,7 @@ def confirm_process(pid: int, argv: str, code_path: str,
         raise Refused(f"code_path: pid {pid} does not run {code_path}")
 
 
-def main(argv_in: "list[str] | None" = None) -> int:
+def _main_ownership(args: "list[str]") -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("owner-pid")
@@ -223,23 +384,60 @@ def main(argv_in: "list[str] | None" = None) -> int:
     r.add_argument("--argv", default="")
     r.add_argument("--argv-vector", default=None, help="JSON list, the authoritative argv")
     r.add_argument("--code-path", required=True)
-    args = ap.parse_args(argv_in)
+    ns = ap.parse_args(args)
     try:
-        if args.cmd == "owner-pid":
-            pid, code_path = confirm_record(args.sentinel, args.instance,
-                                            args.workspace, args.incarnation_file,
-                                            args.code_path)
+        if ns.cmd == "owner-pid":
+            pid, code_path = confirm_record(ns.sentinel, ns.instance, ns.workspace,
+                                            ns.incarnation_file, ns.code_path)
             print(f"{pid}\t{code_path}")
         else:
             vector = None
-            if args.argv_vector is not None:
-                vector = parse_vector(args.pid, args.argv_vector)
-            confirm_process(args.pid, args.argv, args.code_path, vector)
+            if ns.argv_vector is not None:
+                vector = parse_vector(ns.pid, ns.argv_vector)
+            confirm_process(ns.pid, ns.argv, ns.code_path, vector)
     except Refused as exc:
         print(str(exc))
         return 1
     return 0
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    """`watcher_identity.py <pid>` -> `watcher`, `not-watcher`, `dead` or
+    `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
+    so a shell adapter cannot read an unobservable `ps` as a proven answer.
+    `owner-pid` / `runs-watcher` are the ownership subcommands (see the module doc)."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in ("owner-pid", "runs-watcher"):
+        return _main_ownership(args)
+    if len(args) != 1:
+        print("usage: watcher_identity.py <pid> | owner-pid ... | runs-watcher ...",
+              file=sys.stderr)
+        return 64
+    seen = inspect_pid(args[0])
+    if not seen.observed:
+        # Unobserved is two facts: gone, or unobservable — only the first
+        # licenses cleanup. An observed process is never `dead`, whatever its argv.
+        pid = as_pid(args[0])
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print("dead")
+                print(f"why=no such process ({seen.reason})")
+                return 0
+            except Exception:  # noqa: BLE001 -- EPERM and friends: it exists, we cannot say more
+                pass
+        print("unknown")
+        print(f"why={seen.reason}")
+        return 2
+    if seen.watcher is None:
+        print("unknown")
+        print(f"why={seen.reason or 'argv could not be decided'}")
+        return 2
+    print("watcher" if seen.watcher else "not-watcher")
+    print(f"why={seen.argv}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover -- exercised as a subprocess
     sys.exit(main())

@@ -319,10 +319,7 @@ else
 fi
 
 # --- peer survival: the property the enumeration assertion could not express ---
-# LIMIT, measured: this case calls sentinel_path_for + the reaper DIRECTLY, so it
-# proves the scoped shape is safe -- it does NOT re-fail if startup.sh regresses
-# to the enumeration. The two greps above are what pin the wiring; restoring the
-# loop failed exactly those two while this case still reported ok.
+# LIMIT: calls the reaper directly, so it does NOT re-fail if startup.sh regresses to enumeration.
 if [ -n "${have_fn:-}" ] && command -v sentinel_path_for >/dev/null 2>&1; then
   _pt="$(mktemp -d)"; mkdir -p "$_pt/state"
   _a="$(spawn "$CODE")"
@@ -360,6 +357,219 @@ if grep -q 'rm -f "\$WATCHER_PID_FILE"' "$REAL_REPO/src/startup.sh"; then
 else
   ok "startup.sh keeps no unguarded copy"
 fi
+
+# --- case 5: an OBSERVER whose argv merely NAMES the script is not a watcher --
+# Identity belongs to src/watcher_identity.py: argv[1] is not the script.
+cat > "$TMP/observer.sh" << 'SH'
+#!/bin/bash
+# argv carries the watcher's name as an OPERAND, which is what used to match.
+sleep 30
+SH
+chmod +x "$TMP/observer.sh"
+"$TMP/observer.sh" src/watch-tasks-stream.sh "$TMP/inbox" &
+obs_pid=$!
+f="$TMP/case5.pid"
+echo "$obs_pid" > "$f"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+if kill -0 "$obs_pid" 2>/dev/null; then
+  ok "observer naming the script is NOT killed"
+else
+  bad "observer naming the script is NOT killed" "reaped an unrelated process ($out)"
+fi
+kill "$obs_pid" 2>/dev/null; wait "$obs_pid" 2>/dev/null
+
+# --- case 6: an UNOBSERVED ps must not release the sentinel -------------------
+# A silent non-zero `ps` (no stderr) used to fall through to release; hazard is a LIVE, unreadable watcher.
+sleep 30 &
+live6=$!
+f="$TMP/case6.pid"
+echo "$live6" > "$f"
+shimdir="$TMP/shim6"; mkdir -p "$shimdir"
+printf '#!/bin/sh\nexit 1\n' > "$shimdir/ps"; chmod +x "$shimdir/ps"
+out="$(PATH="$shimdir:$PATH" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ]; then
+  ok "unobserved ps: sentinel left in place"
+else
+  bad "unobserved ps: sentinel left in place" "released on an unproven pid ($out)"
+fi
+kill "$live6" 2>/dev/null; wait "$live6" 2>/dev/null
+
+
+# --- case 7: stdout NOISE ahead of the verdict must not be read as one --------
+# A startup hook can prepend a line; unrecognised output is not an answer.
+sleep 30 &
+live7=$!
+f="$TMP/case7.pid"
+echo "$live7" > "$f"
+noisy="$TMP/noisy"; mkdir -p "$noisy"
+cat > "$noisy/python3" << 'SH'
+#!/bin/sh
+echo "site-banner"
+echo "watcher"
+echo "why=bash /x/watch-tasks-stream.sh /inbox"
+exit 0
+SH
+chmod +x "$noisy/python3"
+out="$(PATH="$noisy:$PATH" SUTANDO_PY="$noisy/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live7" 2>/dev/null; then
+  ok "banner ahead of the verdict: neither killed nor released"
+else
+  bad "banner ahead of the verdict: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live7" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live7" 2>/dev/null; wait "$live7" 2>/dev/null
+
+
+# --- case 8: `dead` from a SUCCEEDING helper still licenses the release -------
+# On the record contract the helper is the seam's `pops_alive`, and the record is
+# COMPLETE, so nothing but the pid's absence licenses the release. Case 1 is the
+# pid-only sibling: a GONE pid's record is stale whatever its shape.
+mkdir -p "$TMP/case8m"
+f="$TMP/case8m/watch-tasks-stream.pid"
+record "$f" "$(dead_pid)" "$CODE" "$TMP/case8m"
+out="$(reap_stale_task_watcher "$f" 2>&1)"; rc8=$?
+if [ "$rc8" -eq 0 ] && [ ! -f "$f" ]; then
+  ok "dead from a succeeding helper (full record): sentinel released, rc 0"
+else
+  bad "dead from a succeeding helper (full record): sentinel released, rc 0" \
+      "rc=$rc8 present=$([ -f "$f" ] && echo yes || echo no) ($out)"
+fi
+
+# --- case 9: `dead` from a FAILED helper licenses nothing ---------------------
+# A failed run is not a verdict, whatever it printed.
+sleep 30 &
+live9=$!
+f="$TMP/case9.pid"
+echo "$live9" > "$f"
+bad9="$TMP/bad9"; mkdir -p "$bad9"
+cat > "$bad9/python3" << 'SH'
+#!/bin/sh
+echo "dead"
+echo "why=no such process"
+exit 42
+SH
+chmod +x "$bad9/python3"
+out="$(PATH="$bad9:$PATH" SUTANDO_PY="$bad9/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live9" 2>/dev/null; then
+  ok "dead from a FAILED helper: neither killed nor released"
+else
+  bad "dead from a FAILED helper: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live9" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live9" 2>/dev/null; wait "$live9" 2>/dev/null
+
+
+# --- case 10: a watcher that does not exit on TERM is surfaced, never KILLed ---
+# The reaper reports it and keeps the sentinel; it never escalates, because a
+# KILL lands on whoever wears the pid by then. TERM is ignored across the exec,
+# so the process still EXECUTES this checkout's script and ownership confirms.
+mkdir -p "$TMP/case10m"
+bash -c 'trap "" TERM; exec bash "$1"' _ "$CODE" >/dev/null 2>&1 &
+live10=$!; SPAWNED="$SPAWNED $live10"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps -p "$live10" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break; sleep 0.1
+done
+f="$TMP/case10m/watch-tasks-stream.pid"
+record "$f" "$live10" "$CODE" "$TMP/case10m"
+SIGLOG10="$TMP/case10m/signals"; : > "$SIGLOG10"
+# The real signal, logged: the assertion below is about which signals were SENT.
+pops_signal() { printf 'signal %s %s\n' "$1" "${2:-TERM}" >> "$SIGLOG10"; kill -"${2:-TERM}" "$1" 2>/dev/null; }
+out="$(SUTANDO_WATCHER_STOP_TICKS=3 reap_stale_task_watcher "$f" 2>&1)"
+grep -q "^signal $live10 TERM$" "$SIGLOG10" \
+  && ok "watcher ignoring TERM: TERM was sent through the seam (the case is not vacuous)" \
+  || bad "watcher ignoring TERM: TERM was sent through the seam" "log: $(cat "$SIGLOG10") ($out)"
+if kill -0 "$live10" 2>/dev/null && [ -f "$f" ]; then
+  ok "watcher ignoring TERM: still running, sentinel RETAINED so it stays tracked"
+else
+  bad "watcher ignoring TERM: still running, sentinel RETAINED" \
+      "alive=$(kill -0 "$live10" 2>/dev/null && echo yes || echo no) sentinel=$([ -f "$f" ] && echo present || echo gone) ($out)"
+fi
+case "$out" in *"STILL ALIVE"*) ok "watcher ignoring TERM: the survival is reported" ;;
+  *) bad "watcher ignoring TERM: the survival is reported" "got: $out" ;; esac
+if grep -qE '^signal [0-9]+ (KILL|9|-9|SIGKILL)$' "$SIGLOG10"; then
+  bad "watcher ignoring TERM: NO kill -KILL was issued" "log: $(cat "$SIGLOG10")"
+else
+  ok "watcher ignoring TERM: NO kill -KILL was issued"
+fi
+# CONTROL: the same seam, a watcher that honours TERM -> released on one TERM.
+ctl10="$(spawn "$CODE")"
+mkdir -p "$TMP/case10c"
+f="$TMP/case10c/watch-tasks-stream.pid"
+record "$f" "$ctl10" "$CODE" "$TMP/case10c"
+: > "$SIGLOG10"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+if [ ! -e "$f" ] && [ "$(cat "$SIGLOG10")" = "signal $ctl10 TERM" ]; then
+  ok "watcher ignoring TERM, CONTROL: one honouring TERM is released on one TERM"
+else
+  bad "watcher ignoring TERM, CONTROL: one honouring TERM is released on one TERM" \
+      "sentinel=$([ -e "$f" ] && echo present || echo gone) log: $(cat "$SIGLOG10") ($out)"
+fi
+. "$SB/src/process-ops.sh"            # the real seam back
+kill -KILL "$live10" 2>/dev/null; wait "$live10" 2>/dev/null
+
+# --- case 11: a verdict-shaped line from a startup hook is still not a verdict -
+# Case 7 covers an unrecognised prelude; this one uses protocol vocabulary.
+sleep 30 &
+live11=$!
+f="$TMP/case11.pid"
+echo "$live11" > "$f"
+vocab="$TMP/vocab11"; mkdir -p "$vocab"
+cat > "$vocab/python3" << 'SH'
+#!/bin/sh
+printf 'watcher\nnot-watcher\nwhy=python3 observer.py src/watch-tasks-stream.sh /inbox\n'
+SH
+chmod +x "$vocab/python3"
+out="$(PATH="$vocab:$PATH" SUTANDO_PY="$vocab/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live11" 2>/dev/null; then
+  ok "vocabulary prelude: neither killed nor released"
+else
+  bad "vocabulary prelude: neither killed nor released" \
+      "sentinel=$([ -f "$f" ] && echo present || echo gone) alive=$(kill -0 "$live11" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live11" 2>/dev/null; wait "$live11" 2>/dev/null
+
+
+# --- case 12: the refusal is the reason, not an earlier return ----------------
+# With no KILL there is no re-proof window: the identity refusal is the last
+# word, and nothing may be signalled on the way to it. Measured through the seam.
+SIGLOG12="$TMP/siglog12"; : > "$SIGLOG12"
+pops_signal() { printf 'signal %s %s\n' "$1" "${2:-TERM}" >> "$SIGLOG12"; return 0; }
+# (a) this checkout's live watcher behind a pid-only record
+p12a="$(spawn "$CODE")"
+mkdir -p "$TMP/case12a"
+f="$TMP/case12a/watch-tasks-stream.pid"
+echo "$p12a" > "$f"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+case "$out" in *"records a pid only"*) ok "refusal is the reason: a pid-only record names the record check" ;;
+  *) bad "refusal is the reason: a pid-only record names the record check" "got: $out" ;; esac
+[ -f "$f" ] && ok "refusal is the reason: the pid-only sentinel is retained" \
+            || bad "refusal is the reason: the pid-only sentinel is retained" "unlinked ($out)"
+# (b) a COMPLETE record whose pid carries the script as DATA
+"$PY_BIN" -c 'import time; time.sleep(120)' "$CODE" >/dev/null 2>&1 & p12b=$!
+SPAWNED="$SPAWNED $p12b"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps -p "$p12b" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break; sleep 0.1
+done
+mkdir -p "$TMP/case12b"
+f="$TMP/case12b/watch-tasks-stream.pid"
+record "$f" "$p12b" "$CODE" "$TMP/case12b"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+case "$out" in *"argv:"*) ok "refusal is the reason: a data-argument pid names the executed-slot check" ;;
+  *) bad "refusal is the reason: a data-argument pid names the executed-slot check" "got: $out" ;; esac
+[ -f "$f" ] && ok "refusal is the reason: the data-argument sentinel is retained" \
+            || bad "refusal is the reason: the data-argument sentinel is retained" "unlinked ($out)"
+. "$SB/src/process-ops.sh"            # the real seam back
+if [ ! -s "$SIGLOG12" ]; then
+  ok "refusal is the reason: nothing was signalled on the way to either refusal"
+else
+  bad "refusal is the reason: nothing was signalled on the way to either refusal" "log: $(cat "$SIGLOG12")"
+fi
+if kill -0 "$p12a" 2>/dev/null && kill -0 "$p12b" 2>/dev/null; then
+  ok "refusal is the reason: both processes still run"
+else
+  bad "refusal is the reason: both processes still run" "a=$(kill -0 "$p12a" 2>/dev/null && echo yes || echo no) b=$(kill -0 "$p12b" 2>/dev/null && echo yes || echo no)"
+fi
+kill "$p12a" "$p12b" 2>/dev/null
 
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"

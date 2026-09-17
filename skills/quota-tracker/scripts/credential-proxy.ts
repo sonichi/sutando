@@ -353,6 +353,8 @@ export function appendRejection(prev: unknown, rej: RejectionRecord, max: number
 	return list.slice(-max);
 }
 
+export type CredentialState = 'ok' | 'exhausted';
+
 export interface ProxyDeps {
 	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
@@ -361,6 +363,7 @@ export interface ProxyDeps {
 	upstreamUrl: URL;
 	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
 	recordRejection: (rej: RejectionRecord) => void;
+	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
 	idleTimeoutMs: number;
 }
@@ -374,6 +377,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		upstreamUrl: new URL(UPSTREAM),
 		updateQuotaState,
 		recordRejection,
+		recordCredentialState,
 		now: Date.now,
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		...overrides,
@@ -501,6 +505,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					if (headers['authorization']) {
 						headers['authorization'] = `Bearer ${stored.oauth.accessToken}`;
 						injectedToken = stored.oauth.accessToken;
+						deps.recordCredentialState('ok');
 					}
 				} else if (hasClientAuth) {
 					// Never inject a known-dead token over a client credential that may
@@ -508,6 +513,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable — pass-through engaged (client credential forwarded untouched)`);
 				} else {
 					console.error(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable, no client credential — failing fast (401)`);
+					deps.recordCredentialState('exhausted', `stored token ${verdict}, refresh unavailable`);
 					res.writeHead(401, { 'content-type': 'application/json' });
 					res.end(authUnavailableBody(verdict));
 					return;
@@ -555,6 +561,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 									return;
 								}
 								console.error(`${ts()} [Proxy] credential recovery failed — forwarding the upstream 401 (re-auth with /login)`);
+								deps.recordCredentialState('exhausted', 'post-401 recovery failed (reload + refresh)');
 								const h = { ...upRes.headers };
 								delete h['content-length'];
 								delete h['transfer-encoding'];
@@ -566,6 +573,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						if (upRes.statusCode === 401 && injectedToken && attempt > 0) {
 							console.error(`${ts()} [Proxy] reloaded credential also rejected (401) — giving up`);
 							rejectedToken = injectedToken;
+							deps.recordCredentialState('exhausted', 'reloaded credential rejected upstream');
 						}
 
 						const code = upRes.statusCode ?? 0;
@@ -656,6 +664,23 @@ function recordRejection(rej: RejectionRecord): void {
 	} catch { /* best effort */ }
 }
 
+// Terminal credential health for the desktop app's banner: 'exhausted' means
+// every recovery path (keychain re-read, refresh, retry) failed and only a
+// human /login restores service. Change-only write, so per-request 'ok'
+// confirmations cost nothing.
+function recordCredentialState(state: CredentialState, detail = ''): void {
+	try {
+		const prev = readQuotaFile();
+		if (prev.credential_state === state) return;
+		writeQuotaFile({
+			...prev,
+			credential_state: state,
+			credential_state_detail: detail,
+			credential_state_at: new Date().toISOString(),
+		});
+	} catch { /* best effort */ }
+}
+
 function updateQuotaState(headers: Record<string, string>, model = ''): void {
 	try {
 		// The header write replaces the file, so carry the rejection ledger across it.
@@ -668,6 +693,13 @@ function updateQuotaState(headers: Record<string, string>, model = ''): void {
 			headers,
 			recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
 			...(lastRequest ? { last_request: lastRequest } : {}),
+			// The header write replaces the file — carry credential health across it
+			// the same way as the rejection ledger.
+			...(typeof prev.credential_state === 'string' ? {
+				credential_state: prev.credential_state,
+				credential_state_detail: prev.credential_state_detail,
+				credential_state_at: prev.credential_state_at,
+			} : {}),
 		};
 
 		// Parse specific headers

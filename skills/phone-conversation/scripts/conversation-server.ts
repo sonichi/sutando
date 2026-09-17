@@ -56,6 +56,7 @@ import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
 
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
@@ -213,7 +214,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|hitl_click)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
@@ -1057,7 +1058,7 @@ function cleanupCall(callSid: string): void {
 	session.cleanupNarration?.();
 	try { if (session.channelScanHandle) clearInterval(session.channelScanHandle); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+	try { unlinkSync(PLAYBACK_PATH); } catch {}
 
 	// Restore vision session to the prior (likely web) session before tearing
 	// down the call's VoiceSession so push-mode frames don't get sent to a

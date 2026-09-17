@@ -45,6 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
+import { waitForProfileExit } from './profile-lock-wait.mjs';
 import { readLanding, landingExit } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
@@ -224,14 +225,32 @@ function pidsForProfile() {
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
+  const signalled = [];
   try {
     for (const pid of pidsForProfile().pids) {
-      try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
+      try { process.kill(parseInt(pid, 10), 'SIGTERM'); signalled.push(pid); } catch {}
     }
   } catch {}
-  try { execFileSync('sleep', ['1']); } catch {}
+  // WAIT for the SIGTERM to be honoured instead of killing on a fixed 1s. Chrome
+  // writes its cookie jar lazily and flushes on clean shutdown; a SIGKILL before
+  // that flush drops every cookie set since the last write — which is exactly the
+  // auth cookies from a sign-in that just happened.
+  const graceMs = Number(setting('X_PROFILE_GRACE_MS', '10000'));
+  const { remaining, waitedMs, exitedCleanly } = waitForProfileExit(
+    pidsForProfile,
+    graceMs,
+    (ms) => { try { execFileSync('sleep', [String(ms / 1000)]); } catch {} },
+  );
+  // Say what happened, so a surviving session is evidence the grace ENGAGED rather
+  // than an absence anyone can read either way: which pids were signalled, whether
+  // they exited on their own, and how long it took.
+  console.error(
+    `profile-lock: SIGTERM->[${signalled.join(',') || 'none'}] ` +
+    `exited_cleanly=${exitedCleanly} waited_ms=${waitedMs} ` +
+    `sigkilled=[${remaining.join(',') || 'none'}]`,
+  );
   try {
-    for (const pid of pidsForProfile().pids) {
+    for (const pid of remaining) {
       try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch {}
     }
   } catch {}
