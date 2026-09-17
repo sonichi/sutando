@@ -803,11 +803,33 @@ trap 'cleanup; exit 0' HUP INT TERM
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap. Install cleanup first so an immediately exiting fswatch cannot
 # kill a just-started provider before its durable fallback receipt is emitted.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  dispatch_task "$f"
-done
-shopt -u nullglob
+#
+# The same hold the event loop applies: a watcher re-armed while its gate is
+# still set (--stop-only, a restart mid all-scope stop) must not dispatch the
+# backlog into a shutdown. fswatch is not running yet, so after a hold the
+# directory is globbed AGAIN — a task that landed during the hold has no event
+# to replay it and would otherwise be lost.
+sweep_pending_tasks() {
+  local f seen="" found
+  shopt -s nullglob
+  while :; do
+    found=0
+    for f in "$TASKS_DIR"/*.txt; do
+      case "$seen" in *"|$f|"*) continue ;; esac
+      seen="$seen|$f|"
+      found=1
+      if intake_gated; then
+        echo "watch-tasks-stream: intake gated (shutdown in progress); holding $(basename "$f") until the gate lifts" >&2
+        while intake_gated; do sleep 0.5; done
+      fi
+      [ -f "$f" ] || continue
+      dispatch_task "$f"
+    done
+    [ "$found" -eq 1 ] || break
+  done
+  shopt -u nullglob
+}
+sweep_pending_tasks
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file

@@ -45,8 +45,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def make_stub_fswatch(bin_dir: Path) -> None:
-    """Prints every new .txt in the watched dir as fswatch does: absolute
-    physical path, one per line, polled — so a held event is observable."""
+    """Prints every NEW .txt in the watched dir as fswatch does: absolute
+    physical path, one per line, polled — so a held event is observable.
+    Files already present when it starts are not events (FSEvents reports
+    changes, never the existing tree), so the startup sweep alone owns them."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     stub = bin_dir / "fswatch"
     stub.write_text(
@@ -54,6 +56,8 @@ def make_stub_fswatch(bin_dir: Path) -> None:
         "for a in \"$@\"; do d=\"$a\"; done\n"
         "d=\"$(cd \"$d\" 2>/dev/null && pwd -P)\" || exit 1\n"
         "seen=\"\"\n"
+        "for f in \"$d\"/*.txt; do [ -f \"$f\" ] && seen=\"$seen|$f|\"; done\n"
+        ": > \"$d/../fswatch-ready.$PPID\"\n"
         "while :; do\n"
         "  for f in \"$d\"/*.txt; do\n"
         "    [ -f \"$f\" ] || continue\n"
@@ -96,10 +100,25 @@ class Watcher:
         return self.proc.poll() is None
 
     def emitted(self, filename: str) -> bool:
+        return self.emit_count(filename) > 0
+
+    def emit_count(self, filename: str) -> int:
         try:
-            return f"TASK_FILE: {filename}" in self.out.read_text(errors="replace")
+            return self.out.read_text(errors="replace").count(f"TASK_FILE: {filename}\n")
+        except OSError:
+            return 0
+
+    def holding(self) -> bool:
+        """The hold is announced once, for the first file it holds."""
+        try:
+            return "intake gated" in pathlib_read(str(self.out) + ".err")
         except OSError:
             return False
+
+    def ready(self) -> bool:
+        """Its fswatch is monitoring: a task dropped now is an event, not a file
+        that landed in the sweep-to-fswatch gap."""
+        return (Path(self.env["SUTANDO_WORKSPACE"]) / f"fswatch-ready.{self.proc.pid}").exists()
 
     def gate_path(self, gate: str) -> Path:
         """The gate THIS watcher's identity resolves — through the one owner."""
@@ -132,6 +151,10 @@ class Watcher:
                 fh.close()
             except OSError:
                 pass
+
+
+def pathlib_read(path: str) -> str:
+    return Path(path).read_text(errors="replace")
 
 
 def wait_for(pred, timeout: float = 10.0, step: float = 0.2) -> bool:
@@ -181,6 +204,8 @@ def main() -> int:
         check("the workspace-wide gate is state/shutdown.sentinel (the pre-fix file)",
               ws_gate == state / "shutdown.sentinel", str(ws_gate))
 
+        check("both watchers' fswatch are monitoring before any task is dropped",
+              wait_for(lambda: core.ready() and worker.ready()))
         # --- control: with no gate, both drain the same task ------------------
         t1 = drop_task(tasks, "task-t1.txt")
         check("CONTROL: both watchers emit a task with no gate set",
@@ -238,17 +263,41 @@ def main() -> int:
         check("the worker's gate never appeared and the worker is alive",
               not worker_gate.exists() and worker.alive())
         check("the held task is still on disk for the next sweep", (tasks / t4).exists())
+        # --- a watcher STARTED while its gate is already set (the re-arm after
+        #     --stop-only): the startup sweep holds the backlog like a live event.
+        t5 = drop_task(tasks, "task-t5.txt")
+        check("--stop-only (core): the worker emits the second backlog task too",
+              wait_for(lambda: worker.emitted(t5)))
+        core2 = Watcher("core-2", ws, bin_dir, box / "core2.out", None)
+        procs.append(core2)
+        ok = wait_for(lambda: core2.holding() or core2.emitted(t4), timeout=6.0)
+        time.sleep(2.0)
+        check("a core started under its own gate does NOT sweep the backlog while gated",
+              not core2.emitted(t4) and not core2.emitted(t5),
+              f"t4={core2.emit_count(t4)} t5={core2.emit_count(t5)}")
+        check("...and says it is holding (a hold, not a silent drop)",
+              ok and core2.holding(), "no 'intake gated' line on stderr")
+        check("...and is alive while holding", core2.alive())
+        # A task landing DURING the startup hold must not be lost either: the
+        # sweep re-globs after a hold, and fswatch has not started yet.
+        t6 = drop_task(tasks, "task-t6.txt")
+        check("the worker emits a task that lands during the core's startup hold",
+              wait_for(lambda: worker.emitted(t6)))
+        time.sleep(1.0)
+        check("...which the gated core still holds", not core2.emitted(t6))
         # A launcher's bare `clear` in the core's env lifts the gate --stop-only
         # left; the re-armed core's startup sweep then emits what was held.
         r = core.shutdown("clear")
         check("a bare clear in the core's env lifts its instance gate", r.returncode == 0 and not core_gate.exists())
-        core2 = Watcher("core-2", ws, bin_dir, box / "core2.out", None)
-        procs.append(core2)
-        check("a re-armed core sweeps the held task on startup",
-              wait_for(lambda: core2.emitted(t4)), "no TASK_FILE for the held task")
+        check("once the gate lifts the re-armed core sweeps the held backlog",
+              wait_for(lambda: core2.emitted(t4) and core2.emitted(t5) and core2.emitted(t6)),
+              f"t4={core2.emit_count(t4)} t5={core2.emit_count(t5)} t6={core2.emit_count(t6)}")
+        time.sleep(2.0)
+        check("...each EXACTLY once (no duplicate from the sweep + the event loop)",
+              core2.emit_count(t4) == 1 and core2.emit_count(t5) == 1 and core2.emit_count(t6) == 1,
+              f"t4={core2.emit_count(t4)} t5={core2.emit_count(t5)} t6={core2.emit_count(t6)}")
         check("the worker was never gated across the whole run",
-              worker.emitted(t1) and worker.emitted(t2) and worker.emitted(t3) and worker.emitted(t4)
-              and worker.alive())
+              all(worker.emitted(t) for t in (t1, t2, t3, t4, t5, t6)) and worker.alive())
     finally:
         for p in procs:
             p.hard_stop()
