@@ -227,6 +227,24 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
 
+    def test_hidden_compat_flags_do_not_false_orphan(self):
+        """keweichen's round-8 ask: -R/-t are real (missing from --help,
+        confirmed by execution) and must not cost a covered test its
+        credit through the actual consumer path."""
+        for flag in ("-R", "-t"):
+            wf = f"steps:\n  - run: python3 {flag} packages/x/test_real.py\n"
+            self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+            self.assertEqual(
+                orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
+    def test_an_invalid_hash_policy_value_does_not_false_green_an_orphan(self):
+        wf = ("steps:\n  - run: python3 --check-hash-based-pycs sometimes "
+              "packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

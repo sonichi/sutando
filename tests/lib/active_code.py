@@ -101,14 +101,15 @@ def _command_tokens(seg: str) -> list[str]:
     return toks
 
 
-# python3's real option grammar (verified against `python3 --help` and
-# direct execution, never assumed) -- unlisted tokens fail CLOSED.
+# python3's real option grammar, verified by EXECUTION on both this host's
+# python3 AND the repo's explicit 3.9 floor (python39-compat.yml) -- unlisted tokens fail CLOSED.
 _TERMINAL_LONG = frozenset(("--help", "--version", "--help-env", "--help-xoptions", "--help-all"))
 _VALUE_LONG = frozenset(("--check-hash-based-pycs",))
+_HASH_PYCS_VALUES = frozenset(("always", "default", "never"))
 _TERMINAL_CHARS = frozenset("hV?")
 _SCRIPT_CHARS = frozenset("cm")
 _VALUE_CHARS = frozenset("WX")
-_VALUELESS_CHARS = frozenset("bBdEiIOPqsSuvx")
+_VALUELESS_CHARS = frozenset("bBdEiIORsStuv")
 
 
 def _option_kind(tok: str):
@@ -158,9 +159,13 @@ def _segment_python_arg(seg: str):
     rest = toks[1:]
     i = 0
     while i < len(rest) and rest[i].startswith("-") and rest[i] != "-":
-        kind, extra = _option_kind(rest[i])
+        tok = rest[i]
+        kind, extra = _option_kind(tok)
         if kind is None or kind in ("terminal", "script"):
             return None  # no script operand exists in this shape
+        # An out-of-domain value for this long option errors too -- no script runs.
+        if tok in _VALUE_LONG and (i + 1 >= len(rest) or rest[i + 1] not in _HASH_PYCS_VALUES):
+            return None
         i += 1 + extra
         if kind == "sep":
             break  # `--` ends option scanning; the next token is positional

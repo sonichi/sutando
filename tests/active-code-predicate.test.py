@@ -355,6 +355,40 @@ class PythonArgsOptionContract(unittest.TestCase):
         self.assertEqual(python_args("python3 -Z packages/x/test_real.py"), [])
         self.assertEqual(python_args("python3 --frobnicate packages/x/test_real.py"), [])
 
+    def test_hidden_compat_flags_r_and_t_still_reach_the_script(self):
+        """keweichen's round-8 finding: -R and -t are accepted (confirmed by
+        an exhaustive a-z/A-Z execution sweep on both this host's python3
+        and the repo's 3.9 floor) but absent from `python3 --help` -- the
+        round-7 table, built from --help alone, silently dropped them."""
+        self.assertEqual(python_args("python3 -R packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -t packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -uR packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -ut packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
+    def test_dash_p_fails_closed_because_the_repo_has_a_39_floor(self):
+        """-P exists on 3.11+ but errors as unknown on 3.9 (confirmed by
+        direct execution against /usr/bin/python3 3.9.6) -- one workflow in
+        this repo pins exactly 3.9, so crediting -P universally risks a
+        false-green under the interpreter that would actually refuse it."""
+        self.assertEqual(python_args("python3 -P packages/x/test_real.py"), [])
+
+    def test_check_hash_based_pycs_rejects_an_out_of_domain_value(self):
+        """Real python3 accepts only always/default/never; anything else
+        exits 2 before opening any script -- confirmed by direct execution."""
+        self.assertEqual(
+            python_args("python3 --check-hash-based-pycs sometimes packages/x/test_dead.py"), [])
+        self.assertEqual(python_args("python3 --check-hash-based-pycs"), [])
+
+    def test_check_hash_based_pycs_still_reaches_the_script_on_each_valid_value(self):
+        for value in ("always", "default", "never"):
+            self.assertEqual(
+                python_args(f"python3 --check-hash-based-pycs {value} packages/x/test_real.py"),
+                ["packages/x/test_real.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
