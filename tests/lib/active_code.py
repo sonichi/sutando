@@ -284,16 +284,22 @@ def _segments(line: str):
 
 
 def _raw_segments(line: str):
-    """Split into AND-OR lists on UNCONDITIONAL separators, keeping only each
-    list's FIRST command — the only one Bash is guaranteed to reach.
+    """Split into AND-OR lists on UNCONDITIONAL separators, keeping each
+    list's FIRST command and, when decidable, the ones after it too.
 
     `cmd1 && cmd2` may skip cmd2 depending on cmd1's exit status, so cmd2 is
-    never credited as invoked (measured false positive: `false && python3
-    packages/x/test_dead.py || true` used to name test_dead.py as invoked,
-    though Bash never runs it). `;`, a lone `&` (background), and a lone `|`
-    (pipe) don't gate on exit status, so each command they separate is its
-    own independently-scanned list — and a `;` after a `&&`/`||` chain ends
-    the conditional run, so what follows it is unconditional again.
+    credited only when that status is KNOWN without a real shell -- cmd1 is
+    the literal bare word `true` (for `&&`) or `false` (for `||`); anything
+    else stays undecidable and cmd2 is dropped (measured false positive:
+    `false && python3 packages/x/test_dead.py || true` used to name
+    test_dead.py as invoked, though Bash never runs it -- and it must stay
+    that way here, since `false` is not `true`). This chains: once a segment
+    is undecidable, every later one in the same list is too, until a hard
+    reset (measured false negative: `true && python3 x.py` never credited
+    x.py at all -- qingyun-wu + keweichen, the one gap named and deferred
+    through every earlier round of this file). `;`, a lone `&` (background),
+    and a lone `|` (pipe) don't gate on exit status, so each command they
+    separate is its own independently-scanned, freshly-reachable list.
 
     Inside single quotes nothing is special, backslash included: `'a\\'`
     is a 2-char literal, not an escaped, still-open quote.
@@ -301,14 +307,25 @@ def _raw_segments(line: str):
     Multi-line input is one program: an unquoted newline ends an open command
     the way `;` does, but a line that ended right after `&&`/`||` leaves the
     next line's command under that guard, and backslash-newline joins."""
-    out, cur, quote, i, conditional = [], [], None, 0, False
+    out, cur, quote, i = [], [], None, 0
+    pending_op = None      # "&&" / "||" gating the segment about to flush, or None (fresh)
+    chain_status = None    # known status ("true"/"false"/"unknown") of the list so far
 
     def flush():
-        nonlocal cur
+        nonlocal cur, chain_status, pending_op
         s = "".join(cur)
-        if s.strip() and not conditional:
-            out.append(s)
         cur = []
+        text = s.strip()
+        if not text:
+            return
+        if pending_op is None:
+            runs = True
+        else:
+            runs = chain_status == ("true" if pending_op == "&&" else "false")
+        if runs:
+            out.append(s)
+            chain_status = text if text in ("true", "false") else "unknown"
+        pending_op = None
 
     while i < len(line):
         ch = line[i]
@@ -319,7 +336,7 @@ def _raw_segments(line: str):
             cur.append(ch); cur.append(line[i + 1]); i += 2; continue
         if ch == "\n" and not quote:
             if "".join(cur).strip():
-                flush(); conditional = False
+                flush(); chain_status = None
             i += 1; continue
         if quote:
             cur.append(ch)
@@ -329,9 +346,9 @@ def _raw_segments(line: str):
         if ch in "'\"":
             quote = ch; cur.append(ch); i += 1; continue
         if ch in "&|" and nxt == ch:
-            flush(); conditional = True; i += 2; continue
+            flush(); pending_op = ch + ch; i += 2; continue
         if ch in ";|&":
-            flush(); conditional = False; i += 1; continue
+            flush(); chain_status = None; i += 1; continue
         cur.append(ch); i += 1
     flush()
     return [s for s in out if s.strip()]

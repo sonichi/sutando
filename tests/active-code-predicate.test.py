@@ -248,6 +248,56 @@ class MultiLinePrograms(unittest.TestCase):
                          program_python_args("python3 x/a.py; false && python3 x/b.py"))
 
 
+class LiteralConstantAndOrChains(unittest.TestCase):
+    """The `&&`/`||` under-credit named and deferred through every earlier
+    round: `true && python3 x.py` and `false || python3 x.py` both really
+    run x.py (confirmed by direct bash execution), and the old code never
+    credited either. `true`/`false` are the only LHS whose exit status is
+    known without a real shell, so only those two forms gain credit."""
+
+    def test_true_and_and_credits_the_rhs(self):
+        self.assertEqual(program_python_args("true && python3 packages/x/x.py"),
+                          ["packages/x/x.py"])
+
+    def test_false_or_or_credits_the_rhs(self):
+        self.assertEqual(program_python_args("false || python3 packages/x/x.py"),
+                          ["packages/x/x.py"])
+
+    def test_true_or_or_does_not_credit_the_rhs(self):
+        """true succeeds, so || never evaluates its right side."""
+        self.assertEqual(program_python_args("true || python3 packages/x/x.py"), [])
+
+    def test_false_and_and_still_does_not_credit_the_rhs(self):
+        """The original false-positive this file exists to prevent -- must
+        still refuse credit now that the true/false LHS case is handled."""
+        self.assertEqual(program_python_args("false && python3 packages/x/x.py"), [])
+
+    def test_an_undecidable_lhs_still_refuses_credit_for_the_rhs(self):
+        """Only a literal true/false LHS is decidable; a real command's exit
+        status is not known without running it, so the RHS stays uncredited."""
+        self.assertEqual(
+            program_python_args("python3 packages/x/real.py && python3 packages/x/x.py"),
+            ["packages/x/real.py"])
+
+    def test_undecidability_propagates_through_a_chain(self):
+        """`true && false && python3 x.py`: true lets false run, but false
+        breaks the chain, so x.py never runs -- confirmed by direct execution."""
+        self.assertEqual(
+            program_python_args("true && false && python3 packages/x/x.py"), [])
+        self.assertEqual(
+            program_python_args("false && true && python3 packages/x/x.py"), [])
+
+    def test_a_short_circuited_segment_still_sets_the_compounds_status_for_or(self):
+        """`false && python3 dead.py || python3 live.py`: dead.py never runs
+        (already-documented behavior, preserved), but the compound's exit
+        status is still `false`'s, so `|| live.py` DOES run -- confirmed by
+        direct execution, which prints only "LIVE"."""
+        self.assertEqual(
+            program_python_args(
+                "false && python3 packages/x/dead.py || python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+
+
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
     `-c`/`-m` is the script's OWN argv, not something python loads."""

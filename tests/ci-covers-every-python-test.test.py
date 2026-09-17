@@ -255,6 +255,29 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             self.assertEqual(
                 orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
 
+    def test_true_and_and_does_not_false_orphan_through_the_consumer_path(self):
+        """The literal `&&`/`||` gap, pinned through the actual
+        _named_in()/orphans_in() path, not just program_python_args()."""
+        wf = "steps:\n  - run: true && python3 packages/x/test_real.py\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
+    def test_false_or_or_does_not_false_orphan_through_the_consumer_path(self):
+        wf = "steps:\n  - run: false || python3 packages/x/test_real.py\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
+    def test_false_and_and_still_does_not_false_green_through_the_consumer_path(self):
+        """The original defect this file exists to prevent, re-checked
+        through the consumer path now that true/false LHS is decidable."""
+        wf = "steps:\n  - run: false && python3 packages/x/test_dead.py\n"
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
