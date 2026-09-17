@@ -3999,10 +3999,13 @@ def _worker_of(task_id: str) -> str:
     builds its fixtures through that writer's own path function so a future
     drift between the two fails a test instead of silently returning "".
 
-    BOTH stages count. The writer lays `.pending` BEFORE the handler publishes
-    the result and promotes it to `.flag` only after the handler returns, so a
-    ready result is routinely visible to this drain while only `.pending`
-    exists; reading `.flag` alone loses attribution for that whole window.
+    BOTH stages count, and `.pending` is probed FIRST. The writer lays
+    `.pending` before the handler publishes, then creates `.flag` and only then
+    unlinks `.pending` — so at every instant at least one name exists. Probing
+    `.flag` first can observe neither when promotion lands between the two
+    probes (keweichen, #4306); pending-first cannot, because a present
+    `.pending` resolves immediately and an absent one means `.flag` is already
+    there.
 
     FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
     with another worker's identity — so anything this cannot read or does not
@@ -4020,7 +4023,9 @@ def _worker_of(task_id: str) -> str:
         return ""  # unreadable root: no reading, not "nobody claimed it"
     claimants = set()
     for name in recipients:
-        for stage in ("flag", "pending"):
+        # PENDING FIRST. The writer publishes `.flag` and only then unlinks
+        # `.pending`, so probing flag first can miss both across a promotion.
+        for stage in ("pending", "flag"):
             try:
                 st = os.lstat(root / name / "done" / f"{task_id}.{stage}")
             except FileNotFoundError:

@@ -31,6 +31,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -184,6 +185,48 @@ class WorkerAttribution(unittest.TestCase):
         finally:
             os.chmod(b.parent, mode)
 
+
+
+class PromotionBetweenProbes(unittest.TestCase):
+    """keweichen on #4306: the writer creates `.flag` and only then unlinks
+    `.pending`, so probing flag-first can observe NEITHER name if promotion
+    lands between the two probes — an unattributed result while the writer
+    maintained continuous evidence throughout."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.workspace = tempfile.mkdtemp()
+        self.mod._STATE = Path(self.workspace) / "state"
+
+    def test_promotion_between_probes_still_attributes(self):
+        """Drives the REAL writer between the two probes, not a fake: the first
+        lstat runs, then mark_done(published=True) promotes, then the second."""
+        tid = "task-promotionrace0001"
+        recipient = "core-7"
+        pool_delivery.mark_done(Path(self.workspace), recipient, tid, published=False)
+
+        real_lstat = os.lstat
+        state = {"n": 0}
+
+        def racing_lstat(path, *a, **k):
+            state["n"] += 1
+            if state["n"] == 1:
+                # after the first probe resolves, let the writer promote
+                try:
+                    return real_lstat(path, *a, **k)
+                finally:
+                    pool_delivery.mark_done(
+                        Path(self.workspace), recipient, tid, published=True)
+            return real_lstat(path, *a, **k)
+
+        with mock.patch.object(self.mod.os, "lstat", side_effect=racing_lstat):
+            got = self.mod._worker_of(tid)
+        flag = pool_delivery.done_flag(Path(self.workspace), recipient, tid)
+        pend = pool_delivery.pending_flag(Path(self.workspace), recipient, tid)
+        self.assertEqual(
+            got, recipient,
+            f"lost attribution across promotion: flag_exists={flag.exists()} "
+            f"pending_exists={pend.exists()}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
