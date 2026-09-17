@@ -837,6 +837,34 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "false | true && python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_process_substitution_inside_an_already_supported_brace_group_is_expandable(self):
+        """`set {+u<(echo o),pipefail}`: Bash expands the ONE brace group
+        to `+u/dev/fd/N` and `pipefail`, rejects the invalid option,
+        retains pipefail -- confirmed by direct execution: dead.py never
+        runs. At the point `<(` is seen the `{` hasn't split yet, so
+        `val[0]` alone is `{`, not `+`; round 23 peeks past a leading
+        unquoted `{` to the char that will start the first split word."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set {+u<(echo o),pipefail}\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_heredoc_body_line_is_data_never_a_command(self):
+        """`: <<'EOF' / set -o pipefail << / EOF / python3 dead.py`: the
+        middle line is literal heredoc BODY text, never executed --
+        confirmed by direct execution: dead.py runs. Scanned as a real
+        command it looks exactly like the fatal delimiter-less-heredoc
+        case (round 22), which would wrongly halt the whole rest of the
+        program; round 23 strips heredoc bodies before any command scan."""
+        self.assertEqual(
+            program_python_args(
+                ": <<'EOF'\n"
+                "set -o pipefail <<\n"
+                "EOF\n"
+                "python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

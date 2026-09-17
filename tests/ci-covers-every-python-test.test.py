@@ -610,6 +610,36 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
 
+    def test_brace_grouped_process_substitution_does_not_false_green_through_the_consumer_path(self):
+        """keweichen round 23: a brace group already supported by the
+        parser can expand its process-substitution word into a genuinely
+        flag-shaped one, which must poison the same way a bare `+u<(..)`
+        would."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set {+u<(echo o),pipefail}\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_heredoc_body_line_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 23: a heredoc BODY line that merely looks like
+        a delimiter-less-heredoc command must not trigger the whole-
+        program fatal halt -- it is literal data, never executed. The
+        delimiter carries the run-body's own indentation (confirmed valid
+        Bash by direct execution) since `_run_bodies` doesn't dedent, and
+        a flush-left terminator would end extraction early instead."""
+        wf = ("steps:\n  - run: |\n"
+              "      : <<'      EOF'\n"
+              "      set -o pipefail <<\n"
+              "      EOF\n"
+              "      python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

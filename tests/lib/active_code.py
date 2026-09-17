@@ -195,13 +195,92 @@ def invokes(line: str, name: str) -> bool:
     return any(_segment_invokes(seg, name) for seg in _segments(_strip_comment(line)))
 
 
+def _heredoc_delimiters(line: str):
+    """Each valid `<<`/`<<-` heredoc's (delimiter_text, strip_tabs) on this
+    line, left to right, quote-aware. A delimiter-less `<<` (no word at
+    all) contributes nothing -- there is no body to consume, and its own
+    line already carries the fatal verdict via `_shell_words`. `<<<`
+    (here-string) is a different operator with no body and is skipped."""
+    out, i, n, quote = [], 0, len(line), None
+    while i < n:
+        ch = line[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"' and i + 1 < n:
+                i += 1
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch; i += 1; continue
+        if ch == "\\" and i + 1 < n:
+            i += 2; continue
+        if ch == "<" and i + 1 < n and line[i + 1] == "<":
+            if i + 2 < n and line[i + 2] == "<":
+                i += 3; continue  # here-string, not a heredoc
+            j = i + 2
+            strip_tabs = False
+            if j < n and line[j] == "-":
+                strip_tabs = True; j += 1
+            while j < n and line[j] in " \t":
+                j += 1
+            delim, word_started = [], False
+            while j < n and line[j] not in " \t\n":
+                word_started = True
+                if line[j] == "'":
+                    j += 1
+                    while j < n and line[j] != "'":
+                        delim.append(line[j]); j += 1
+                    j += 1
+                elif line[j] == '"':
+                    j += 1
+                    while j < n and line[j] != '"':
+                        if line[j] == "\\" and j + 1 < n:
+                            delim.append(line[j + 1]); j += 2
+                        else:
+                            delim.append(line[j]); j += 1
+                    j += 1
+                elif line[j] == "\\" and j + 1 < n:
+                    delim.append(line[j + 1]); j += 2
+                else:
+                    delim.append(line[j]); j += 1
+            if word_started:
+                out.append(("".join(delim), strip_tabs))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def _strip_heredoc_bodies(text: str) -> str:
+    """Heredoc BODY lines are literal data fed to the redirect, never
+    command text -- drop them (and their terminator) before any
+    command-position scan sees them (round 23: a body line that merely
+    LOOKS like a command, e.g. `set -o pipefail <<`, was scanned as one,
+    including into the whole-program fatal halt it happened to resemble)."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        for delim, strip_tabs in _heredoc_delimiters(lines[i]):
+            i += 1
+            while i < len(lines):
+                probe = lines[i].lstrip("\t") if strip_tabs else lines[i]
+                if probe == delim:
+                    break
+                i += 1
+        i += 1
+    return "\n".join(out)
+
+
 def program_invokes(text: str, name: str) -> bool:
     """invokes() over a WHOLE program, so AND-OR state survives line breaks.
 
     `false &&` at the end of one line guards the command on the next; scanning
     the lines one at a time credited that command (measured: both real
     consumers did, and Bash returned 0 with the planted test never run)."""
-    return any(_segment_invokes(seg, name) for seg in _segments(active_text(text)))
+    return any(_segment_invokes(seg, name)
+               for seg in _segments(_strip_heredoc_bodies(active_text(text))))
 
 
 def python_args(line: str) -> list[str]:
@@ -227,7 +306,7 @@ def python_args(line: str) -> list[str]:
 def program_python_args(text: str) -> list[str]:
     """python_args() over a WHOLE program; see program_invokes()."""
     out = []
-    for seg in _segments(active_text(text)):
+    for seg in _segments(_strip_heredoc_bodies(active_text(text))):
         a = _segment_python_arg(seg)
         if a:
             out.append(a)
@@ -381,7 +460,10 @@ def _shell_words(text: str):
     real `/dev/fd/N` text is unknowable and a literal copy can smuggle an
     option-shaped character (`o`) into a cluster scan that never should
     have seen it (round 20: `<(echo o)`'s inner `o` was mistaken for a
-    real `+o`).
+    real `+o`) -- flag-shapedness is checked past a leading unquoted `{`
+    (round 23: `{+u<(echo o),pipefail}` expands to a genuinely flag-shaped
+    first word, but the brace hasn't been split yet at this point in the
+    scan, so `val[0]` alone is `{`, not `+`).
 
     Brace expansion runs per accumulated word at flush time, tracked via a
     per-character quoted mask (round 18, `_split_unquoted_braces`) -- a
@@ -425,9 +507,10 @@ def _shell_words(text: str):
         elif ch in " \t\n":
             flush(); i += 1
         elif ch in "<>" and i + 1 < n and text[i + 1] == "(":
-            # Process substitution (see docstring) -- expandable only when
-            # glued to a flag-shaped prefix, never a plain positional one.
-            if val and val[0] in "-+":
+            # Process substitution (see docstring) -- peek past a leading
+            # unquoted `{` (not split yet) to the real flag-shape check.
+            _skip = 1 if val and val[0] == "{" and not qmask[0] else 0
+            if len(val) > _skip and val[_skip] in "-+":
                 expandable = True
             start = i; i += 2; depth = 1; pq = None
             while i < n and depth > 0:
