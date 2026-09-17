@@ -185,6 +185,23 @@ class WorkerAttribution(unittest.TestCase):
         finally:
             os.chmod(b.parent, mode)
 
+    def test_an_unreadable_root_abstains_rather_than_reading_nobody(self):
+        """The claim root's own OSError is NO READING, not "nobody claimed it".
+
+        FileNotFoundError is caught above this branch and means the absent
+        root, so only a non-FileNotFoundError OSError reaches it — the case
+        where residue exists and is merely unreachable. Abstaining is what
+        keeps an unreadable root from reading as an unattributed result.
+        """
+        tid = "task-unreadableroot0001"
+        self._flag("worker-a", tid)
+        # Control first: without the fault the same fixture MUST resolve, or
+        # the assertion below would pass for a fixture that never worked.
+        self.assertEqual(self.mod._worker_of(tid), "worker-a")
+        with mock.patch.object(Path, "iterdir",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.mod._worker_of(tid), "")
+
 
 
 class PromotionBetweenProbes(unittest.TestCase):
