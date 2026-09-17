@@ -170,6 +170,8 @@ class AdvertisementFile(unittest.TestCase):
         def boom(src, dst):
             raise OSError("disk full")
 
+        # The compile in setUp published; the property is about THIS write.
+        pa.advertisement_path(self.ws).unlink()
         pa.os.replace = boom
         try:
             with self.assertRaises(OSError):
@@ -388,6 +390,8 @@ class TestTheHandlerPublishesAnInheritedRoster(unittest.TestCase):
         import pool_route_handler as prh
         ws = Path(tempfile.mkdtemp())
         pr.compile_roster(ws, {"w1": {"state": "live", "label": "one"}}, {}, version=7)
+        # An inherited roster: compiled by a checkout that did not publish.
+        pa.advertisement_path(ws).unlink()
         self.assertFalse(pa.advertisement_path(ws).exists())
         task = ws / "task-x.txt"
         task.write_text("id: task-x\nsource: ag2space\nchannel_id: !r:ag2.space\naccess_tier: owner\ntask: hello\n")
