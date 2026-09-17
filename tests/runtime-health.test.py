@@ -257,7 +257,11 @@ check("_core_status: non-numeric ts -> (status, None)", rh._core_status(Tt) == (
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
 #    _pane_text/main uncovered. Point at a socket with no session → offline, and
 #    call each real helper directly (they degrade to empty/false, never crash).
+# _core_running() resolves via _tmux_socket(), not the bare TMUX_SOCKET constant --
+# on a live fresh-heartbeat host that finds the REAL socket, so mock the function too.
+_orig_tmux_socket = rh._tmux_socket
 _orig_socket = rh.TMUX_SOCKET
+rh._tmux_socket = lambda: "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 try:
     check("real _core_running: false on bogus socket", rh._core_running() is False)
@@ -287,6 +291,7 @@ try:
     check("real main() ran without error", True)
 finally:
     rh.TMUX_SOCKET = _orig_socket
+    rh._tmux_socket = _orig_tmux_socket
 
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a
@@ -326,16 +331,21 @@ finally:
     rh._resolve_workspace = _ow
 
 # 7) The tri-state process probe has ONE owner: _core_running delegates to
-#    tmux_probe.has_session with this module's socket/session and its 8s budget.
+#    tmux_probe.has_session with _tmux_socket()'s result (not the bare
+#    constant -- same reason as section 6) plus this module's session/budget.
 _seen = {}
 _oh = rh._tmux_has_session
+_ot = rh._tmux_socket
+_injected_sock = "/tmp/rh-delegation-check-%d.sock" % os.getpid()
 rh._tmux_has_session = lambda sock, sess, timeout=None: _seen.update(sock=sock, sess=sess, timeout=timeout)
+rh._tmux_socket = lambda: _injected_sock
 try:
-    check("_core_running: delegates to tmux_probe.has_session(TMUX_SOCKET, SESSION, timeout=8)",
+    check("_core_running: delegates to tmux_probe.has_session(_tmux_socket(), SESSION, timeout=8)",
           rh._core_running() is None
-          and _seen == {"sock": rh.TMUX_SOCKET, "sess": rh.SESSION, "timeout": 8})
+          and _seen == {"sock": _injected_sock, "sess": rh.SESSION, "timeout": 8})
 finally:
     rh._tmux_has_session = _oh
+    rh._tmux_socket = _ot
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)
