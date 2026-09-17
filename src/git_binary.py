@@ -46,6 +46,21 @@ from typing import Callable, Optional
 SYSTEM_GIT = "/usr/bin/git"
 
 
+def _same_file(path_a: str, path_b: str, stat: Callable[[str], object] = os.stat) -> bool:
+    """True when both paths name the same inode, never by spelling.
+
+    `os.path.realpath` does not case-fold on a case-insensitive volume, so a
+    string compare against `SYSTEM_GIT` misses an alternate-case alias of the
+    shim (e.g. `/USR/BIN/GIT`). A stat-identity check is unaffected by case.
+    """
+    try:
+        stat_a = stat(path_a)
+        stat_b = stat(path_b)
+    except OSError:
+        return False
+    return (stat_a.st_dev, stat_a.st_ino) == (stat_b.st_dev, stat_b.st_ino)
+
+
 def developer_tools_installed(run: Callable = subprocess.run) -> bool:
     """True when `xcode-select -p` reports an installed developer directory.
 
@@ -96,6 +111,7 @@ def select_git(
     is_darwin: bool,
     clt_installed: Callable[[], bool],
     realpath: Callable[[str], str] = os.path.realpath,
+    same_file: Callable[[str, str], bool] = _same_file,
 ) -> Optional[str]:
     """First runnable non-stub git in PATH order; the stub only as a fallback.
 
@@ -109,11 +125,13 @@ def select_git(
 
     `clt_installed` is a callable rather than a bool so the `xcode-select`
     probe is only spawned when it can change the answer — i.e. never on a host
-    where a real git was found first.
+    where a real git was found first. `same_file` is injected for the same
+    reason `realpath` is: identity must be checkable without touching a real
+    filesystem alias.
     """
     stub = None
     for candidate in candidates:
-        if not is_darwin or realpath(candidate) != SYSTEM_GIT:
+        if not is_darwin or not same_file(realpath(candidate), SYSTEM_GIT):
             return candidate
         if stub is None:
             stub = candidate

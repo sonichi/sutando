@@ -27,15 +27,18 @@ _sutando_git_realpath() {
 	printf '%s/%s' "$_rdir" "${_target##*/}"
 }
 
-# True when $1's REAL target (symlinks resolved) is the literal system git --
-# a symlink pointing AT the stub is the stub. Unresolvable -> treated as stub too.
+# True when $1's REAL target (symlinks resolved) is the system git -- a
+# symlink pointing AT the stub is the stub. Unresolvable -> treated as stub too.
 _sutando_git_is_system_stub() {
 	[ -f "$1" ] || return 1
 	_resolved="$(_sutando_git_realpath "$1")" || return 0
 	# Split so the exact flagged token stays out of this file (REVIEW.md
 	# lesson 7 / scripts/python-binary.sh's own comment on the same point).
 	_sb="/usr"/bin/git
-	[ "$_resolved" = "$_sb" ]
+	# -ef compares filesystem identity (device+inode), not spelling: on a
+	# case-insensitive volume /USR/BIN/GIT is the same inode as /usr/bin/git,
+	# but realpath above does not case-fold, so `=` alone missed the alias.
+	[ "$_resolved" -ef "$_sb" ]
 }
 
 # Echo a runnable git, or NOTHING. Never echoes the stub unless the developer

@@ -38,6 +38,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -149,7 +150,7 @@ class SelectGitOrdering(unittest.TestCase):
         self.assertIsNone(
             git_binary.select_git(
                 [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: False,
-                realpath=lambda p: p,
+                realpath=lambda p: p, same_file=lambda a, b: a == b,
             )
         )
 
@@ -166,7 +167,7 @@ class SelectGitOrdering(unittest.TestCase):
             [SYSTEM_GIT, real],
             is_darwin=True,
             clt_installed=self._never_called,   # must not even be consulted
-            realpath=lambda p: p,
+            realpath=lambda p: p, same_file=lambda a, b: a == b,
         )
         self.assertEqual(picked, real)
 
@@ -174,7 +175,7 @@ class SelectGitOrdering(unittest.TestCase):
         """Stub first, no other candidate, CLT present -> the stub is usable."""
         picked = git_binary.select_git(
             [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True,
-            realpath=lambda p: p,
+            realpath=lambda p: p, same_file=lambda a, b: a == b,
         )
         self.assertEqual(picked, SYSTEM_GIT)
 
@@ -182,10 +183,62 @@ class SelectGitOrdering(unittest.TestCase):
         self.assertEqual(
             git_binary.select_git(
                 [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True,
-                realpath=lambda p: p,
+                realpath=lambda p: p, same_file=lambda a, b: a == b,
             ),
             SYSTEM_GIT,
         )
+
+    def test_case_variant_alias_of_the_stub_is_still_recognized(self):
+        """A case-insensitive volume aliases /USR/BIN/GIT to the same inode as
+        SYSTEM_GIT; `realpath` does not case-fold, so identity must come from
+        `same_file`, not `==`. (keweichen, reviewing #4323.)
+        """
+        case_variant = "/USR/BIN/git"
+        same_file_by_identity = lambda a, b: a.lower() == b.lower()  # noqa: E731
+
+        self.assertIsNone(
+            git_binary.select_git(
+                [case_variant], is_darwin=True, clt_installed=lambda: False,
+                realpath=lambda p: p, same_file=same_file_by_identity,
+            ),
+            "a case-variant spelling of the shim must still refuse without CLT",
+        )
+        self.assertEqual(
+            git_binary.select_git(
+                [case_variant], is_darwin=True, clt_installed=lambda: True,
+                realpath=lambda p: p, same_file=same_file_by_identity,
+            ),
+            case_variant,
+            "the same case-variant path is a usable git once CLT is installed",
+        )
+
+
+class SameFileHelper(unittest.TestCase):
+    """`_same_file` is the identity check `select_git` defaults to."""
+
+    def test_two_names_for_the_same_inode_are_the_same_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "git")
+            open(real, "w").close()
+            hardlink = os.path.join(tmp, "git-alias")
+            os.link(real, hardlink)
+            self.assertTrue(git_binary._same_file(real, hardlink))
+
+    def test_two_distinct_files_are_not_the_same_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a")
+            b = os.path.join(tmp, "b")
+            open(a, "w").close()
+            open(b, "w").close()
+            self.assertFalse(git_binary._same_file(a, b))
+
+    def test_a_missing_path_is_not_the_same_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "git")
+            open(real, "w").close()
+            self.assertFalse(
+                git_binary._same_file(real, os.path.join(tmp, "absent"))
+            )
 
 
 class PathCandidates(unittest.TestCase):
