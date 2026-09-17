@@ -223,12 +223,23 @@ case "$grep_rc" in
   *) bad "the classifier must not use -ef anywhere" "grep itself failed (rc=$grep_rc) -- inconclusive, not a pass" ;;
 esac
 
-# --- 15b. structural pin: the identity probe must force the C locale, so a
-# non-English ENOENT message on a real GNU host cannot slip past the match.
-if grep -q 'LC_ALL=C.*stat' "$REPO/scripts/git-binary.sh"; then
-  ok "the stat probe forces LC_ALL=C ahead of the ENOENT text match"
+# --- 15b. structural pin: LC_ALL=C must be on the EXECUTABLE line -- a bare
+# `LC_ALL=C.*stat` grep also matches the comment, even once the fix is gone.
+_locale_pin='^[[:space:]]*_out="\$\(LC_ALL=C /usr/bin/stat'
+if grep -qE "$_locale_pin" "$REPO/scripts/git-binary.sh"; then
+  ok "the stat probe forces LC_ALL=C on the executable line, not just a comment"
 else
-  bad "the stat probe forces LC_ALL=C ahead of the ENOENT text match" "not found"
+  bad "the stat probe forces LC_ALL=C on the executable line, not just a comment" "not found"
+fi
+
+# Negative control on a mutated COPY: strip LC_ALL=C from the executable
+# line, keep the comment -- the anchored pattern must now refuse.
+lab15b=$(mktemp -d)
+sed 's|_out="\$(LC_ALL=C /usr/bin/stat|_out="$(/usr/bin/stat|' "$REPO/scripts/git-binary.sh" > "$lab15b/mutated.sh"
+if grep -qE "$_locale_pin" "$lab15b/mutated.sh"; then
+  bad "the anchored pin must refuse once LC_ALL=C is stripped from the real command" "matched the comment-only mutation"
+else
+  ok "the anchored pin correctly refuses on the comment-only mutation (proves it isn't a comment match)"
 fi
 
 # --- 16. the platform-to-flag mapping is a PURE function, real per spelling
