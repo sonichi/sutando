@@ -70,6 +70,21 @@ class GatewayProbeUnknown(unittest.TestCase):
             "a probe that RAN and found nothing must still report the outage",
         )
 
+    def test_a_raising_probe_is_unknown_too(self):
+        """The `except` arm. probe_pids can raise, not only report failure, and
+        that path must reach the same unknown row rather than the DOWN copy."""
+        mod = _load()
+        mod._gateway_configured = lambda: True
+
+        def boom(_pattern):
+            raise OSError("probe exploded")
+
+        mod.probe_pids = boom
+        row = mod.check_gateway_bridge() or {}
+        self.assertEqual(row.get("status"), "warn")
+        self.assertIn("unknown", row.get("detail", "").lower())
+        self.assertNotEqual(row.get("detail"), mod.GATEWAY_DOWN_DETAIL)
+
     def test_running_bridge_is_not_reported_down(self):
         """Control. A single live pid must not trip either warn branch."""
         mod = _load()
