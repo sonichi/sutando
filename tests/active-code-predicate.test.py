@@ -171,6 +171,63 @@ class DeadBranches(unittest.TestCase):
         self.assertEqual(program_python_args(
             "if false; then python3 packages/x/test_dead.py; fi\n"), [])
 
+    def test_a_compound_and_condition_is_evaluated_not_split(self):
+        """qingyun-wu round 24: `if true && false` is FALSE overall (the
+        `&&` chains inside the condition, not between top-level commands)
+        -- confirmed by direct execution: the else runs. `_raw_segments`
+        used to split at the `&&` before `_if_head` ever saw the whole
+        condition, corrupting the one word it needed."""
+        self.assertEqual(program_python_args(
+            "if true && false; then\n  python3 packages/x/then.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/else.py"])
+
+    def test_a_compound_or_condition_is_evaluated_not_split(self):
+        """qingyun-wu round 24: `if false || true` is TRUE overall --
+        confirmed by direct execution: the then runs."""
+        self.assertEqual(program_python_args(
+            "if false || true; then\n  python3 packages/x/then.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/then.py"])
+
+    def test_a_three_term_compound_condition_evaluates_left_to_right(self):
+        """`true || false && false` is FALSE overall -- confirmed by
+        direct execution. `||` short-circuits the middle `false` (never
+        runs), carrying `true`'s success into `&&`, which then runs and
+        is decided by the trailing `false`."""
+        self.assertEqual(program_python_args(
+            "if true || false && false; then\n  python3 packages/x/then.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/else.py"])
+
+    def test_a_taken_if_arm_drops_every_later_elif(self):
+        """qingyun-wu round 24: once `if true` is taken, the following
+        `elif true` never runs regardless of ITS OWN condition -- confirmed
+        by direct execution: only the if-body prints."""
+        self.assertEqual(program_python_args(
+            "if true; then\n  python3 packages/x/if.py\n"
+            "elif true; then\n  python3 packages/x/elif.py\nfi\n"),
+            ["packages/x/if.py"])
+
+    def test_a_taken_elif_arm_drops_the_following_else(self):
+        """qingyun-wu round 24: once an `elif` is taken, the trailing
+        `else` never runs -- confirmed by direct execution."""
+        self.assertEqual(program_python_args(
+            "if false; then\n  python3 packages/x/if.py\n"
+            "elif true; then\n  python3 packages/x/elif.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/elif.py"])
+
+    def test_a_nonliteral_arm_poisons_chain_exclusivity_to_unknown(self):
+        """An undecidable earlier arm means a later arm's own reachability
+        can't be proven dead either -- both must stay credited, matching
+        the file's own 'never wrongly drop' rule for a single undecidable
+        condition."""
+        self.assertEqual(program_python_args(
+            'if [ "$X" = y ]; then\n  python3 packages/x/if.py\n'
+            "elif true; then\n  python3 packages/x/elif.py\nfi\n"),
+            ["packages/x/if.py", "packages/x/elif.py"])
+
 
 class GluedBranchCommand(unittest.TestCase):
     """qingyun-wu's + keweichen's blocking finding on round 2 of #4202: a
@@ -862,6 +919,28 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 ": <<'EOF'\n"
                 "set -o pipefail <<\n"
                 "EOF\n"
+                "python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_a_backgrounded_set_does_not_mutate_the_parent_shell(self):
+        """qingyun-wu round 24: `set +o pipefail &` runs in a SUBSHELL like
+        a pipe stage does -- confirmed by direct execution: pipefail
+        (already on) stays on in the parent, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set +o pipefail &\n"
+                "wait\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_arithmetic_left_shift_is_not_a_heredoc(self):
+        """keweichen round 24: `<<` inside `$((...))` is arithmetic
+        left-shift, not a redirect at all -- confirmed by direct
+        execution: dead.py runs. Misread as a heredoc it swallows the
+        rest of the program as a never-terminated body."""
+        self.assertEqual(
+            program_python_args(
+                "x=$((1 << 2))\n"
                 "python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 

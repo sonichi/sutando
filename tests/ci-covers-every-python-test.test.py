@@ -62,12 +62,24 @@ def _yaml_scalar(value: str) -> str:
 def _run_bodies(text: str) -> list[str]:
     """Lines inside a workflow `run:` value — the only place a command executes.
 
-    A path under `name:` or `if:` is data; scanning the whole file counts it."""
-    out, indent = [], None
+    A path under `name:` or `if:` is data; scanning the whole file counts it.
+    Dedented per YAML block-scalar rules, per BLOCK (round 24, keweichen):
+    real CI strips each block's own common indentation before Bash ever
+    sees the script, so a line-exact check (e.g. a heredoc terminator)
+    must see the SAME text CI would run, not the raw source indentation."""
+    out, indent, block = [], None, []
+
+    def _flush():
+        indents = [len(ln) - len(ln.lstrip()) for ln in block if ln.strip()]
+        cut = min(indents) if indents else 0
+        out.extend(ln[cut:] for ln in block)
+        block.clear()
+
     for ln in text.splitlines():
         stripped = ln.strip()
         m = re.match(r"-?\s*run:\s*\|?-?\s*(.*)$", stripped)
         if m and re.search(r"(^|\s)run:", stripped):
+            _flush()
             # The KEY's column, not the line's: a `- ` list marker sits left of
             # it, so a sibling key would otherwise read as a continuation line.
             indent = ln.index("run:")
@@ -76,9 +88,11 @@ def _run_bodies(text: str) -> list[str]:
             continue
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
+                _flush()
                 indent = None
             else:
-                out.append(ln)
+                block.append(ln)
+    _flush()
     return out
 
 
@@ -625,16 +639,70 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             ["packages/x/test_dead.py"])
 
     def test_heredoc_body_line_does_not_false_orphan_through_the_consumer_path(self):
-        """keweichen round 23: a heredoc BODY line that merely looks like
+        """keweichen round 23/24: a heredoc BODY line that merely looks like
         a delimiter-less-heredoc command must not trigger the whole-
-        program fatal halt -- it is literal data, never executed. The
-        delimiter carries the run-body's own indentation (confirmed valid
-        Bash by direct execution) since `_run_bodies` doesn't dedent, and
-        a flush-left terminator would end extraction early instead."""
+        program fatal halt -- it is literal data, never executed. Bare
+        `EOF` (round 24: real YAML dedents `run: |` before Bash ever sees
+        it, so `_run_bodies` must too, not carry an artificial indented
+        delimiter just to survive its own non-dedenting bug)."""
         wf = ("steps:\n  - run: |\n"
-              "      : <<'      EOF'\n"
+              "      : <<'EOF'\n"
               "      set -o pipefail <<\n"
               "      EOF\n"
+              "      python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_a_compound_if_condition_does_not_false_green_through_the_consumer_path(self):
+        """qingyun-wu round 24: `if true && false` is false overall, the
+        else runs -- confirmed by direct execution."""
+        wf = ("steps:\n  - run: |\n"
+              "      if true && false; then\n"
+              "        python3 packages/x/test_then.py\n"
+              "      else\n"
+              "        python3 packages/x/test_else.py\n"
+              "      fi\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_else.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_then.py", "packages/x/test_else.py"},
+                       set(), _named_in(wf)),
+            ["packages/x/test_then.py"])
+
+    def test_chain_exclusivity_does_not_false_green_through_the_consumer_path(self):
+        """qingyun-wu round 24: a taken `if` arm drops every later `elif`,
+        regardless of its own condition -- confirmed by direct execution."""
+        wf = ("steps:\n  - run: |\n"
+              "      if true; then\n"
+              "        python3 packages/x/test_if.py\n"
+              "      elif true; then\n"
+              "        python3 packages/x/test_elif.py\n"
+              "      fi\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_if.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_if.py", "packages/x/test_elif.py"},
+                       set(), _named_in(wf)),
+            ["packages/x/test_elif.py"])
+
+    def test_backgrounded_set_does_not_false_green_through_the_consumer_path(self):
+        """qingyun-wu round 24: `set +o pipefail &` runs in a subshell and
+        must not mutate the parent's modeled pipefail state -- confirmed
+        by direct execution."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set +o pipefail &\n"
+              "      wait\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_arithmetic_left_shift_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 24: `<<` inside `$((...))` is a left-shift, not
+        a heredoc -- confirmed by direct execution."""
+        wf = ("steps:\n  - run: |\n"
+              "      x=$((1 << 2))\n"
               "      python3 packages/x/test_dead.py\n")
         self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
         self.assertEqual(

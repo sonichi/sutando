@@ -200,8 +200,13 @@ def _heredoc_delimiters(line: str):
     line, left to right, quote-aware. A delimiter-less `<<` (no word at
     all) contributes nothing -- there is no body to consume, and its own
     line already carries the fatal verdict via `_shell_words`. `<<<`
-    (here-string) is a different operator with no body and is skipped."""
+    (here-string) is a different operator with no body and is skipped.
+    `<<` inside `((...))`/`$((...))` arithmetic is a left-shift, not a
+    redirect at all (round 24: `x=$((1 << 2))` was misread as one) --
+    tracked via the depth `((` opened at, single non-nested span only."""
     out, i, n, quote = [], 0, len(line), None
+    arith_depth = None
+    depth = 0
     while i < n:
         ch = line[i]
         if quote:
@@ -214,6 +219,19 @@ def _heredoc_delimiters(line: str):
         if ch in "'\"":
             quote = ch; i += 1; continue
         if ch == "\\" and i + 1 < n:
+            i += 2; continue
+        if ch == "(" and i + 1 < n and line[i + 1] == "(":
+            if arith_depth is None:
+                arith_depth = depth
+            depth += 2; i += 2; continue
+        if ch == "(":
+            depth += 1; i += 1; continue
+        if ch == ")":
+            depth -= 1; i += 1
+            if arith_depth is not None and depth <= arith_depth:
+                arith_depth = None
+            continue
+        if arith_depth is not None and ch == "<" and i + 1 < n and line[i + 1] == "<":
             i += 2; continue
         if ch == "<" and i + 1 < n and line[i + 1] == "<":
             if i + 2 < n and line[i + 2] == "<":
@@ -313,19 +331,86 @@ def program_python_args(text: str) -> list[str]:
     return out
 
 
-def _if_head(seg: str) -> str:
-    """'false'/'true' for a literal-constant `if`, else 'other' (unknown to us)."""
-    toks = seg.split()
-    if len(toks) >= 2 and toks[1] in ("false", "true"):
-        return toks[1]
-    return "other"
+_MASK_AND = "\x01\x02"
+_MASK_OR = "\x03\x04"
+
+
+def _mask_if_conditions(text: str) -> str:
+    """Blind `_raw_segments()` to a `&&`/`||` inside an `if`/`elif`
+    CONDITION -- those belong to the condition as ONE compound-list unit,
+    not to top-level AND-OR chaining between separate commands (round 24:
+    `if true && false; then ...` was split at the `&&`, corrupting the
+    single word `_eval_condition()` needs to see). Restored there, not at
+    the character-scan level, so `_raw_segments` never sees a real one.
+    Single-span, non-nested: a condition containing its own nested `if`
+    is not handled (unreported, out of scope)."""
+    out, i, n, quote, masking = [], 0, len(text), None, False
+    while i < n:
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1; continue
+        if ch in "'\"":
+            quote = ch; out.append(ch); i += 1; continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch); out.append(text[i + 1]); i += 2; continue
+        if masking and ch in "&|" and i + 1 < n and text[i + 1] == ch:
+            out.append(_MASK_AND if ch == "&" else _MASK_OR); i += 2; continue
+        if ch.isalpha() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word = text[i:j]
+            at_boundary = j >= n or not (text[j].isalnum() or text[j] == "_")
+            if at_boundary and word in ("if", "elif"):
+                masking = True
+            elif at_boundary and word == "then":
+                masking = False
+            out.append(word); i = j; continue
+        out.append(ch); i += 1
+    return "".join(out)
+
+
+def _eval_condition(seg: str) -> str:
+    """'false'/'true' for a literal-constant `if`/`elif` CONDITION, else
+    'other' -- a `&&`/`||` chain of bare `true`/`false` is evaluated
+    left to right the way a real Bash AND-OR list decides its exit status
+    (round 24: `true && false; then` used to see only `true`, since
+    `_raw_segments` split at the `&&` before this ever saw the `false`)."""
+    toks = seg.replace(_MASK_AND, " && ").replace(_MASK_OR, " || ").split()
+    if len(toks) < 2:
+        return "other"
+    status, pending_op = None, None
+    for t in toks[1:]:
+        if t in ("&&", "||"):
+            if pending_op is not None:
+                return "other"
+            pending_op = t; continue
+        if status is None:
+            runs = True
+        elif pending_op == "&&":
+            runs = status is True
+        elif pending_op == "||":
+            runs = status is False
+        else:
+            return "other"
+        if runs:
+            if t not in ("true", "false"):
+                return "other"
+            status = t == "true"
+        pending_op = None
+    if pending_op is not None or status is None:
+        return "other"
+    return "true" if status else "false"
 
 
 def _filter_dead_branches(segments: list[str]) -> list[str]:
     """Drop segments inside an `if false`/`if true` branch that provably never runs.
 
     Only a literal constant condition is decidable without a real shell, so
-    `elif`/any other `if <cond>` leaves both its branches in — credited, not
+    a non-literal `if`/`elif` leaves both its branches in — credited, not
     proven reachable, but never wrongly dropped either. `if`/`then`/`else`/
     `elif`/`fi` are markers, but Bash allows a real command glued onto the
     SAME segment (`if true; then python3 x.py; fi`) -- peel the keyword and
@@ -337,7 +422,13 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
     own `fi` pops ITS frame and not the outer one -- skipping the dispatch
     while dead left a later sibling command read as reachable again
     (measured: keweichen, 2026-09-17, both the never-pushed-frame and the
-    reachable-sibling-after-a-dead-nested-if shapes)."""
+    reachable-sibling-after-a-dead-nested-if shapes). `taken` tracks whether
+    an EARLIER arm in the current if/elif/else chain already consumed the
+    branch (True), definitely hasn't yet (False), or is undecidable
+    ("unknown") -- once True, every later elif/else is dead regardless of
+    ITS OWN condition; a non-literal arm poisons `taken` to "unknown" for
+    the rest of the chain rather than guessing (round 24: `elif`/`else`
+    following a taken arm was still credited, keweichen + qingyun-wu)."""
     out, stack, pending = [], [], list(segments)
     while pending:
         seg = pending.pop(0)
@@ -346,19 +437,40 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
         rest = toks[1] if len(toks) > 1 else ""
         if head == "if":
             parent_drop = stack[-1]["drop"] if stack else False
-            kind = _if_head(seg)
-            stack.append({"kind": kind, "drop": parent_drop or kind == "false"})
+            kind = _eval_condition(seg)
+            drop = parent_drop or kind == "false"
+            if parent_drop:
+                taken = False
+            elif kind == "true":
+                taken = True
+            elif kind == "other":
+                taken = "unknown"
+            else:
+                taken = False
+            stack.append({"drop": drop, "taken": taken})
             continue
         if head == "elif" and stack:
-            stack[-1] = {"kind": "other", "drop": stack[-2]["drop"] if len(stack) > 1 else False}
+            parent_drop = stack[-2]["drop"] if len(stack) > 1 else False
+            taken_in = stack[-1]["taken"]
+            kind = _eval_condition(seg)
+            drop = parent_drop or taken_in is True or kind == "false"
+            if taken_in is True or taken_in == "unknown":
+                taken_out = taken_in
+            elif kind == "true":
+                taken_out = True
+            elif kind == "other":
+                taken_out = "unknown"
+            else:
+                taken_out = False
+            stack[-1] = {"drop": drop, "taken": taken_out}
             continue
         if head == "then" and stack:
             if rest:
                 pending.insert(0, rest)
             continue
         if head == "else" and stack:
-            frame, parent_drop = stack[-1], (stack[-2]["drop"] if len(stack) > 1 else False)
-            frame["drop"] = True if frame["kind"] == "true" else parent_drop
+            parent_drop = stack[-2]["drop"] if len(stack) > 1 else False
+            stack[-1]["drop"] = parent_drop or stack[-1]["taken"] is True
             if rest:
                 pending.insert(0, rest)
             continue
@@ -371,7 +483,7 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
 
 
 def _segments(line: str):
-    return _filter_dead_branches(_raw_segments(line))
+    return _filter_dead_branches(_raw_segments(_mask_if_conditions(line)))
 
 
 def _split_unquoted_braces(val: list, qmask: list) -> "list | None":
@@ -789,9 +901,9 @@ def _raw_segments(line: str):
                 want = "true" if pending_op == "&&" else "false"
                 runs = chain_status == want
                 maybe = not runs and chain_status == "unknown"
-            # A pipe stage other than a lone command runs in a SUBSHELL, so
-            # its `set` never reaches the parent shell -- keweichen round 12.
-            pipe_scoped = pending_op == "|" or sep == "|"
+            # A pipe stage or a backgrounded job both run in a SUBSHELL, so
+            # `set` inside either never reaches the parent shell (round 24).
+            pipe_scoped = pending_op == "|" or sep == "|" or sep == "&"
             pf = _sets_pipefail(text)
             if pf == "fatal":
                 # A real Bash parse error: this segment never actually runs
