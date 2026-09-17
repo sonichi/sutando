@@ -311,6 +311,12 @@ jobs:
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
+          # A zero-file discovery is never legitimate on this repo; treat it as
+          # the runner never reaching the discovery call, not an empty suite.
+          if [ "$N" -eq 0 ]; then
+            echo "::error::discover-python-tests.sh found 0 files — refusing rather than silently passing an empty suite"
+            exit 1
+          fi
           # Per-file cap: without it one hung suite burns the job budget and
           # the job is CANCELED mid-suite.
 

@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -43,6 +44,35 @@ def _shell_text(runner: Path) -> str:
         import json
         return json.loads(runner.read_text()).get("scripts", {}).get("test:py", "")
     return runner.read_text()
+
+
+def _extract_step_run_block(yml_text: str, step_name: str) -> str:
+    """The literal shell CI executes for one `- name: <step_name>` step.
+
+    Line-indent tracking, not a YAML parser: a block scalar (`run: |`) ends at
+    the first line back at or above the `run:` key's own indent.
+    """
+    lines = yml_text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == f"- name: {step_name}":
+            break
+    else:
+        raise AssertionError(f"step {step_name!r} not found in workflow")
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip().startswith("run:"):
+            run_indent = len(lines[j]) - len(lines[j].lstrip(" "))
+            break
+    else:
+        raise AssertionError(f"no run: block after step {step_name!r}")
+    body = []
+    for line in lines[j + 1:]:
+        if line.strip() == "":
+            body.append("")
+            continue
+        if len(line) - len(line.lstrip(" ")) <= run_indent:
+            break
+        body.append(line)
+    return textwrap.dedent("\n".join(body))
 
 
 class TestDiscoveryHasOneOwner(unittest.TestCase):
@@ -136,6 +166,32 @@ class TestDiscoveryHasOneOwner(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0,
                             "helper exited 0 with no tests discovered — silently green")
         self.assertEqual(r.stdout.strip(), "", "helper emitted a list while refusing")
+
+    def test_ci_step_fails_closed_when_the_helper_never_actually_runs(self):
+        """The gap the test above's own docstring names but never pins: the
+        helper failing closed does not help when the CONSUMER never reaches it
+        (a `false &&`/`if false` guard, a moved call). Executes the CI step's
+        actual shell against a discover script that produces nothing, exactly
+        the shape a classification false-positive would let through — proving
+        the step itself refuses, independent of the helper's own behaviour.
+        """
+        yml = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+        body = _extract_step_run_block(yml, "Run Python standalone tests")
+        self.assertIn('"$N" -eq 0', body,
+                      "the step no longer guards a zero-file discovery")
+        with tempfile.TemporaryDirectory() as td:
+            scripts = Path(td) / "scripts"
+            scripts.mkdir()
+            # Stands in for a discovery call that never reaches the real
+            # script (dead branch, moved call) rather than for the real
+            # script's own already-tested empty-list refusal.
+            (scripts / "discover-python-tests.sh").write_text("#!/bin/sh\nexit 0\n")
+            (scripts / "discover-python-tests.sh").chmod(0o755)
+            r = subprocess.run(["bash", "-c", body], cwd=td,
+                               capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0,
+                            "the step exited 0 with zero files discovered — silently green")
+        self.assertIn("found 0 files", r.stdout + r.stderr)
 
     def test_the_helper_is_order_and_comment_proof_by_construction(self):
         """The property the parser could never hold: there is nothing to parse."""
