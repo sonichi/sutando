@@ -349,6 +349,27 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
 
+    def test_a_quoted_bang_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 15: a SHELL-quoted `'!'` is a literal command
+        name (Bash: 127), not the negation reserved word."""
+        wf = "steps:\n  - run: \"'!' python3 packages/x/test_dead.py\"\n"
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_set_scanning_stop_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 15: `set` ends its own option scanning at the
+        first non-option word, pinned through the consumer path."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set -o pipefail positional +o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

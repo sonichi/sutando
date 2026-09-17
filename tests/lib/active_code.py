@@ -83,18 +83,25 @@ def _command_tokens(seg: str) -> list[str]:
     fails — peeling it here would wrongly credit `cmd` as invoked. `!`
     negates the reported STATUS only; the command after it still runs
     (keweichen round 13, confirmed by direct execution: `! python3 x.py`
-    really executes python3 on both Bash 3.2 and 5.2)."""
+    really executes python3 on both Bash 3.2 and 5.2) -- but ONLY the raw,
+    unquoted, unescaped reserved word in the pipeline's own leading position:
+    `'!' cmd`, `\\! cmd`, `env ! cmd` and `X=1 ! cmd` all try to RUN a
+    program literally named `!` and fail with 127 on both Bash 3.2 and 5.2
+    (keweichen round 15) -- shlex already erased the quoting/escaping by the
+    time tokens exist, so this checks the untokenized text first."""
+    stripped = seg.lstrip()
+    leading_bang = stripped == "!" or stripped[:2] in ("! ", "!\t")
     import shlex
     try:
         toks = shlex.split(seg)
     except ValueError:
         toks = seg.split()
+    if leading_bang and toks and toks[0] == "!" and len(toks) > 1:
+        toks = toks[1:]
     changed = True
     while changed and toks:
         changed = False
         if _IDENT_RE.match(toks[0]):
-            toks = toks[1:]; changed = True
-        elif toks[0] == "!" and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -288,9 +295,10 @@ def _segments(line: str):
     return _filter_dead_branches(_raw_segments(line))
 
 
-def _sets_pipefail(text: str) -> "bool | None":
-    """The pipefail state a `set` invocation leaves ON, or None when `text`
-    is not `set`, or is `set` with no pipefail-relevant toggle at all.
+def _sets_pipefail(text: str) -> "bool | str | None":
+    """The pipefail state a `set` invocation leaves ON, "unknown" when a
+    toggle's value cannot be resolved statically, or None when `text` is
+    not `set`, or is `set` with nothing pipefail-relevant at all.
 
     `o` anywhere in a `-`/`+` short-opt cluster ALWAYS consumes the next
     whole token as its value, regardless of the cluster's other letters --
@@ -298,10 +306,18 @@ def _sets_pipefail(text: str) -> "bool | None":
     and `set -euo pipefail` both enable it exactly like `-o`/`-eo` do, so
     scanning for a trailing `o` (round 11's regex) missed the leading-`o`
     form. Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
-    re-evaluates each left to right -- so the LAST one found wins. `--`
-    ends option scanning (`set -- +o pipefail` sets $1/$2, not a toggle),
-    and a quoted value (`set -o 'pipefail'`) is the same value shell-quoted
-    -- both keweichen round 13, confirmed by direct execution."""
+    re-evaluates each left to right -- so the LAST one found wins.
+
+    Scanning stops at `--` OR at the first token that isn't `-`/`+`-shaped
+    at all (`set -o pipefail positional +o pipefail` leaves it ON: Bash's
+    own `set` ends option processing there too, so the trailing `+o
+    pipefail` is just $2/$3) -- and a quoted value (`set -o 'pipefail'`) is
+    the same value shell-quoted -- keweichen rounds 13/15, confirmed by
+    direct execution. A value containing `$`/backtick may resolve to
+    "pipefail" at runtime and we cannot know without a real shell (`OPT=
+    pipefail; set -o "$OPT"` really enables it) -- "unknown" propagates
+    that honestly rather than silently asserting the toggle did nothing."""
+    import re
     import shlex
     try:
         toks = shlex.split(text)
@@ -312,16 +328,19 @@ def _sets_pipefail(text: str) -> "bool | None":
     result, i = None, 1
     while i < len(toks):
         tok = toks[i]
-        if tok == "--":
+        if tok == "--" or not tok or tok[0] not in "-+":
             break
-        if len(tok) > 1 and tok[0] in "-+" and not tok.startswith("--") and "o" in tok[1:]:
+        if len(tok) > 1 and not tok.startswith("--") and "o" in tok[1:]:
             i += 1
             if i < len(toks):
-                if toks[i] == "pipefail":
+                val = toks[i]
+                if val == "pipefail":
                     result = tok[0] == "-"
+                elif re.search(r"[$`]", val):
+                    result = "unknown"
                 i += 1
-        else:
-            i += 1
+            continue
+        i += 1
     return result
 
 

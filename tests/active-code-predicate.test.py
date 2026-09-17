@@ -457,6 +457,46 @@ class PipefailIsNotABareRegex(unittest.TestCase):
             program_python_args("! python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_a_quoted_bang_is_a_literal_command_name_not_negation(self):
+        """`'!' python3 x.py`: Bash 3.2 and 5.2 both try to run a program
+        literally named `!` and return 127 -- python3 never launches.
+        Round-14's peel matched on the shlex-tokenized `!` regardless of
+        quoting, since shlex already erases it -- keweichen round 15."""
+        self.assertEqual(program_python_args("'!' python3 packages/x/dead.py"), [])
+
+    def test_an_escaped_bang_is_also_a_literal_command_name(self):
+        self.assertEqual(program_python_args(r"\! python3 packages/x/dead.py"), [])
+
+    def test_bang_after_env_is_envs_argument_not_negation(self):
+        """`env ! python3 x.py`: `!` is not the pipeline's own leading
+        token here -- `env` tries to run a program named `!` and fails."""
+        self.assertEqual(program_python_args("env ! python3 packages/x/dead.py"), [])
+
+    def test_bang_after_an_assignment_prefix_is_also_not_negation(self):
+        self.assertEqual(program_python_args("X=1 ! python3 packages/x/dead.py"), [])
+
+    def test_set_option_scanning_stops_at_the_first_non_option_word(self):
+        """`set -o pipefail positional +o pipefail`: Bash's own `set` ends
+        option processing at the first non-`-`/`+` word, so the trailing
+        `+o pipefail` is just $2/$3, not a second toggle -- keweichen
+        round 15, confirmed by direct execution: pipefail stays ON."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set -o pipefail positional +o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_an_unresolved_set_o_value_makes_pipefail_state_unknown(self):
+        """`OPT=pipefail; set -o "$OPT"`: Bash really resolves $OPT and
+        enables pipefail -- confirmed by direct execution -- but a static
+        read cannot know that, so this must land on the SAFE side (refuse
+        credit) via genuine uncertainty, not by silently asserting the
+        toggle did nothing."""
+        self.assertEqual(
+            program_python_args(
+                'OPT=pipefail\nset -o "$OPT"\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
