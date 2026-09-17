@@ -355,6 +355,67 @@ class PipeIsNotAHardReset(unittest.TestCase):
                 "set -eo pipefail; true\nfalse | true && python3 packages/x/dead.py"), [])
 
 
+class PipefailIsNotABareRegex(unittest.TestCase):
+    """keweichen round 12: the round-11 `_sets_pipefail` regex missed real
+    Bash `set` semantics on four axes -- all confirmed by direct bash
+    execution first, none of these guessed from documentation."""
+
+    def test_o_anywhere_in_the_cluster_still_takes_the_next_word(self):
+        """`-oe pipefail`: Bash's `-o` consumes the NEXT ARGV WORD as its
+        value no matter where `o` sits in a combined short-opt cluster --
+        round 11's regex required `o` to be the cluster's LAST letter."""
+        self.assertEqual(
+            program_python_args(
+                "set -oe pipefail\nfalse | true && python3 packages/x/dead.py"), [])
+
+    def test_multiple_toggles_apply_in_argv_order_last_one_wins(self):
+        """`set +o pipefail -o pipefail`: Bash re-evaluates left to right, so
+        this ENDS enabled -- checking `+o` unconditionally before `-o`
+        (round 11) always returned disabled regardless of what followed."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail -o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_pipe_stage_set_runs_in_a_subshell_and_never_reaches_the_parent(self):
+        """A `set` that is itself part of a multi-stage pipe (`set +o
+        pipefail | cat`) executes in a subshell; Bash's OWN prior `set -o
+        pipefail` in the parent shell is unaffected."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\nset +o pipefail | cat\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_an_undecidable_gate_makes_pipefail_state_unknown_not_silently_kept(self):
+        """`python3 -c 'pass' && set -o pipefail`: whether the toggle runs is
+        undecidable here (the LHS isn't a literal), so pipefail's state must
+        become genuinely UNKNOWN going forward, not silently stay at its old
+        value -- Bash really does reach the toggle (python3 -c 'pass' always
+        succeeds), so the safe, honest answer here still ends up refusing
+        credit rather than confidently crediting it."""
+        self.assertEqual(
+            program_python_args(
+                "python3 -c 'pass' && set -o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_leading_bang_negates_the_whole_pipelines_result(self):
+        """`! false | true`: Bash's pipefail-adjusted pipe exit is `false`'s
+        (1), and a leading `!` negates the PIPELINE's result (0), so `&&`
+        DOES run the RHS -- child false-orphan regression, same round: the
+        parent (pre-round-11) correctly named it; round 11 dropped it."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n! false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_bang_without_pipefail_still_negates(self):
+        """Same negation, no pipefail: pipe exit is `true`'s (0), `!` negates
+        to failure (1), so `&&` must NOT run -- pins the control the
+        pipefail case above is not a universal credit."""
+        self.assertEqual(
+            program_python_args("! false | true && python3 packages/x/dead.py"), [])
+
+
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
     `-c`/`-m` is the script's OWN argv, not something python loads."""

@@ -284,18 +284,31 @@ def _segments(line: str):
 
 
 def _sets_pipefail(text: str) -> "bool | None":
-    """True/False when `text` is a `set` invocation toggling pipefail (any
-    combined short-opt cluster ending in an `o` that takes `pipefail`, e.g.
-    `-o`/`-eo`/`-euo`; `+o` disables), else None -- not pipefail-relevant."""
+    """The pipefail state a `set` invocation leaves ON, or None when `text`
+    is not `set`, or is `set` with no pipefail-relevant toggle at all.
+
+    `o` anywhere in a `-`/`+` short-opt cluster ALWAYS consumes the next
+    whole token as its value, regardless of the cluster's other letters --
+    keweichen round 12, confirmed by direct execution: `set -oe pipefail`
+    and `set -euo pipefail` both enable it exactly like `-o`/`-eo` do, so
+    scanning for a trailing `o` (round 11's regex) missed the leading-`o`
+    form. Multiple `-o`/`+o pipefail` toggles apply in argv order -- Bash
+    re-evaluates each left to right -- so the LAST one found wins."""
     toks = text.split()
     if not toks or toks[0] != "set":
         return None
-    rest = " ".join(toks[1:])
-    if re.search(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail(?:\s|$)", rest):
-        return False
-    if re.search(r"(?:^|\s)-[A-Za-z]*o\s+pipefail(?:\s|$)", rest):
-        return True
-    return None
+    result, i = None, 1
+    while i < len(toks):
+        tok = toks[i]
+        if len(tok) > 1 and tok[0] in "-+" and not tok.startswith("--") and "o" in tok[1:]:
+            i += 1
+            if i < len(toks):
+                if toks[i] == "pipefail":
+                    result = tok[0] == "-"
+                i += 1
+        else:
+            i += 1
+    return result
 
 
 def _raw_segments(line: str):
@@ -345,26 +358,68 @@ def _raw_segments(line: str):
     last_runs = True
     pipe_group = []
     pipe_entered = True
+    pipe_negate = False
     pipefail_on = False
 
     def transition(sep):
         nonlocal cur, chain_status, pending_op, last_runs
-        nonlocal pipe_group, pipe_entered, pipefail_on
+        nonlocal pipe_group, pipe_entered, pipe_negate, pipefail_on
+
+        _FLIP = {"true": "false", "false": "true", "unknown": "unknown"}
+
+        def pipe_status():
+            """The pipe's own resulting status, given tri-state `pipefail_on`
+            ("unknown" = a `set ...pipefail` MIGHT have run -- undecidable
+            reachability propagates to undecidable pipefail, never to a
+            silently-kept old value, keweichen round 12). When the on- and
+            off-pipefail answers happen to agree, that agreement still counts.
+            A leading `!` negates the WHOLE pipeline's result, not any one
+            stage's reachability -- everything still runs the same."""
+            if not pipe_group:
+                return "unknown"
+            off = pipe_group[-1]
+            if "false" in pipe_group:
+                on = "false"
+            elif all(x == "true" for x in pipe_group):
+                on = "true"
+            else:
+                on = "unknown"
+            if pipefail_on is True:
+                status = on
+            elif pipefail_on is False:
+                status = off
+            else:
+                status = off if off == on else "unknown"
+            return _FLIP[status] if pipe_negate else status
+
         s = "".join(cur)
         cur = []
         text = s.strip()
         if text:
+            if pending_op != "|" and (text == "!" or text.startswith("! ")):
+                pipe_negate = True
+                text = text[1:].strip()
+            elif pending_op != "|":
+                pipe_negate = False
             if pending_op is None:
-                runs = True
+                runs, maybe = True, False
             elif pending_op == "|":
-                runs = last_runs
+                runs, maybe = last_runs, False
             else:
-                runs = chain_status == ("true" if pending_op == "&&" else "false")
+                want = "true" if pending_op == "&&" else "false"
+                runs = chain_status == want
+                maybe = not runs and chain_status == "unknown"
             if runs:
                 out.append(s)
-                pf = _sets_pipefail(text)
-                if pf is not None:
+            # A pipe stage other than a lone command runs in a SUBSHELL, so
+            # its `set` never reaches the parent shell -- keweichen round 12.
+            pipe_scoped = pending_op == "|" or sep == "|"
+            pf = _sets_pipefail(text)
+            if pf is not None and not pipe_scoped:
+                if runs:
                     pipefail_on = pf
+                elif maybe:
+                    pipefail_on = "unknown"
             last_runs = runs
             shape = text if (runs and text in ("true", "false")) else "unknown"
             if pending_op == "|":
@@ -375,17 +430,10 @@ def _raw_segments(line: str):
         if sep == "|":
             pending_op = "|"
             return
-        if pipe_entered and pipe_group:
-            if pipefail_on and "false" in pipe_group:
-                chain_status = "false"
-            elif pipefail_on and all(x == "true" for x in pipe_group):
-                chain_status = "true"
-            elif not pipefail_on:
-                chain_status = pipe_group[-1]
-            else:
-                chain_status = "unknown"
-        # else: the pipe never ran, or there was none -- chain_status (the
-        # gate's own already-known status) passes through unchanged.
+        if pipe_entered:
+            chain_status = pipe_status()
+        # else: the pipe never ran -- chain_status (the gate's own
+        # already-known status) passes through unchanged.
         pipe_group = []
         if sep in ("&&", "||"):
             pending_op = sep
