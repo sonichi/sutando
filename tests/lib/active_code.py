@@ -134,7 +134,8 @@ def _segment_python_arg(seg: str):
     while i < len(rest) and rest[i].startswith("-") and rest[i] not in ("-", "--"):
         if _consumes_script(rest[i]):
             return None  # no script operand exists in this shape
-        i += 1
+        # -W/-X take a separate value token; skip it too, not the script.
+        i += 2 if rest[i] in ("-W", "-X") else 1
     if i < len(rest) and rest[i].endswith(".py"):
         return rest[i]
     return None
@@ -202,13 +203,16 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
     Only a literal constant condition is decidable without a real shell, so
     `elif`/any other `if <cond>` leaves both its branches in — credited, not
     proven reachable, but never wrongly dropped either. `if`/`then`/`else`/
-    `elif`/`fi` are markers here, one whole segment each; a single-line form
-    that glues one onto a real command (`if false; then python3 x.py; fi`)
-    already fails `_segment_python_arg`'s command-position check upstream, so
-    it is not (falsely) credited either way — nothing left for this to do."""
+    `elif`/`fi` are markers, but Bash allows a real command glued onto the
+    SAME segment (`if true; then python3 x.py; fi`) -- peel the keyword and
+    keep analyzing the remainder under the branch's own drop state, rather
+    than discarding the whole segment (measured false negative: qingyun-wu +
+    keweichen, 2026-09-17, both `then` and `else` glued forms)."""
     out, stack = [], []
     for seg in segments:
-        head = seg.split()[0] if seg.split() else ""
+        toks = seg.split(maxsplit=1)
+        head = toks[0] if toks else ""
+        rest = toks[1] if len(toks) > 1 else ""
         if head == "if":
             parent_drop = stack[-1]["drop"] if stack else False
             kind = _if_head(seg)
@@ -218,10 +222,14 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
             stack[-1] = {"kind": "other", "drop": stack[-2]["drop"] if len(stack) > 1 else False}
             continue
         if head == "then" and stack:
+            if rest and not stack[-1]["drop"]:
+                out.append(rest)
             continue
         if head == "else" and stack:
             frame, parent_drop = stack[-1], (stack[-2]["drop"] if len(stack) > 1 else False)
             frame["drop"] = True if frame["kind"] == "true" else parent_drop
+            if rest and not frame["drop"]:
+                out.append(rest)
             continue
         if head == "fi" and stack:
             stack.pop()

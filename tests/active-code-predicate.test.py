@@ -167,12 +167,34 @@ class DeadBranches(unittest.TestCase):
             "  python3 packages/x/test_outer_live.py\nfi\n"),
             ["packages/x/test_outer_live.py"])
 
-    def test_glued_single_line_form_was_already_safe_before_this_fix(self):
-        """`if false; then cmd; fi` on one line already fails the command-
-        position check upstream (`then` sits before `python3`), so this pins
-        the pre-existing behaviour rather than this fix's own new code."""
+    def test_glued_single_line_dead_form_is_not_named(self):
         self.assertEqual(program_python_args(
             "if false; then python3 packages/x/test_dead.py; fi\n"), [])
+
+
+class GluedBranchCommand(unittest.TestCase):
+    """qingyun-wu's + keweichen's blocking finding on round 2 of #4202: a
+    real command glued onto the SAME segment as `then`/`else` was dropped
+    outright instead of analyzed, so `if true; then python3 x.py; fi` read
+    as uninvoked though Bash runs it."""
+
+    def test_glued_then_on_a_live_branch_is_named(self):
+        self.assertEqual(program_python_args(
+            "if true; then python3 packages/x/test_live.py; fi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_glued_else_on_a_live_branch_is_named(self):
+        self.assertEqual(program_python_args(
+            "if false; then :; else python3 packages/x/test_live.py; fi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_glued_then_on_a_dead_branch_is_still_not_named(self):
+        self.assertEqual(program_python_args(
+            "if false; then python3 packages/x/test_dead.py; fi\n"), [])
+
+    def test_glued_else_on_a_dead_branch_is_still_not_named(self):
+        self.assertEqual(program_python_args(
+            "if true; then :; else python3 packages/x/test_dead.py; fi\n"), [])
 
 
 class MultiLinePrograms(unittest.TestCase):
@@ -231,6 +253,17 @@ class PythonArgsScriptOperand(unittest.TestCase):
         self.assertEqual(
             python_args("python3 x/test_real.py --fixture x/data.py"),
             ["x/test_real.py"])
+
+    def test_dash_w_takes_a_separate_value_and_a_script_still_follows(self):
+        """keweichen's [P2]: -W's value isn't the flag itself, so the loop
+        must skip it rather than stop and misread it as the script."""
+        self.assertEqual(python_args("python3 -W ignore packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
+    def test_dash_x_value_looking_like_a_dot_py_is_not_the_script(self):
+        """The value itself must not be credited even when it ends in .py —
+        `-c pass` means no script ever loads."""
+        self.assertEqual(python_args("python3 -X packages/x/test_x.py -c pass"), [])
 
 
 if __name__ == "__main__":
