@@ -613,6 +613,74 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "false | true && python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_an_empty_quoted_word_ends_sets_own_option_scanning(self):
+        """`set "" +o pipefail`: Bash preserves `""` as the first
+        positional argument, which ends `set`'s option scanning before
+        `+o pipefail` is ever reached -- confirmed by direct execution:
+        pipefail (already on) stays on, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                'set "" +o pipefail\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_the_inverse_empty_quoted_word_also_ends_scanning(self):
+        """Control for the case above, the opposite direction: pipefail
+        starts off, `set "" -o pipefail` never reaches `-o`, so it stays
+        off -- confirmed by direct execution: dead.py runs."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                'set "" -o pipefail\n'
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_interactive_comments_is_a_recognized_set_o_name(self):
+        """`set +o interactive-comments -o pipefail`: interactive-comments
+        is a real, valid `set -o` name on both installed shells --
+        confirmed by direct execution: it does not abort the invocation,
+        so the later `-o pipefail` is reached and enables it."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                "set +o interactive-comments -o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_brace_expansion_is_one_argv_word_per_candidate_not_one_word_with_many_readings(self):
+        """`set +o {errexit,pipefail}`: Bash brace-expands this into TWO
+        argv words, `errexit` and `pipefail` -- `+o` consumes only the
+        first (`errexit`); the bare `pipefail` next to it, with no
+        leading `-`/`+`, ends `set`'s own option scanning like any other
+        positional word -- confirmed by direct execution: pipefail
+        (already on) stays on, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set +o {errexit,pipefail}\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_brace_expansion_is_quote_scoped_per_delimiter_not_per_whole_word(self):
+        """`set -o "p"ipe{fail,foo}`: only the leading `p` is quoted, the
+        `{fail,foo}` that follows is entirely unquoted, so Bash still
+        brace-expands it -- confirmed by direct execution: pipefail goes
+        on, dead.py never runs. A whole-word `any_quoted` flag would
+        wrongly suppress this because SOME part of the word was quoted."""
+        self.assertEqual(
+            program_python_args(
+                'set -o "p"ipe{fail,foo}\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_redirection_is_consumed_by_the_shell_and_never_reaches_argv(self):
+        """`set -o >/dev/null pipefail`: Bash strips the redirection
+        before invoking `set`, which then sees only `-o pipefail` --
+        confirmed by direct execution: pipefail goes on, dead.py never
+        runs. Treating `>/dev/null` as `-o`'s literal value would misread
+        it as an unrecognized option name and abort instead."""
+        self.assertEqual(
+            program_python_args(
+                "set -o >/dev/null pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

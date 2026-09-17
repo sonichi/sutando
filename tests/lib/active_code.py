@@ -295,28 +295,80 @@ def _segments(line: str):
     return _filter_dead_branches(_raw_segments(line))
 
 
+def _split_unquoted_braces(val: list, qmask: list) -> "list | None":
+    """One-level Bash brace expansion of an accumulated word, honouring
+    PER-CHARACTER quote state rather than a whole-word flag -- round 18:
+    `"p"ipe{fail,foo}` splits its quoting across the word (only the `p` is
+    quoted) and Bash still expands the wholly-unquoted `{fail,foo}` that
+    follows, which a whole-word `any_quoted` gate wrongly suppressed.
+    Returns None (stays one literal word) when there is no unquoted
+    `{a,b,...}` group -- no braces, a quoted delimiter, or `{x}` with no
+    unquoted comma is not brace syntax at all."""
+    n = len(val)
+    for i in range(n):
+        if val[i] != "{" or qmask[i]:
+            continue
+        j = i + 1
+        close = -1
+        while j < n:
+            if val[j] == "{" and not qmask[j]:
+                break  # nested brace -- not handled, try the next '{'
+            if val[j] == "}" and not qmask[j]:
+                close = j
+                break
+            j += 1
+        if close == -1:
+            continue
+        parts, start, found_comma = [], i + 1, False
+        for k in range(i + 1, close):
+            if val[k] == "," and not qmask[k]:
+                parts.append(val[start:k])
+                start = k + 1
+                found_comma = True
+        parts.append(val[start:close])
+        if not found_comma:
+            continue
+        pre, post = val[:i], val[close + 1:]
+        return ["".join(pre + part + post) for part in parts]
+    return None
+
+
 def _shell_words(text: str):
     """`text` as (value, expandable, any_quoted) triples. `expandable` is
     True iff the word carries a `$`/backtick that occurs unquoted or inside
     double quotes without an escaping backslash. `any_quoted` is True iff
-    ANY part of the word was inside quotes at all -- brace expansion is
-    suppressed by quoting entirely (confirmed by direct execution: both
-    `'pipe{fail,foo}'` and the double-quoted form stay the literal,
-    rejected string), so a value carrying no `$` still needs this to gate
-    it. Adjacent quoted/unquoted spans concatenate into ONE word (Bash's
-    own split-quoting rule, e.g. `'$'OPT` is one word). Exists because
-    shlex.split() erases exactly the quoting distinction -- `'$OPT'`,
-    `\\$OPT`, `"$OPT"` and bare `$OPT` all become the identical resolved
-    token, though only the last two are ever expanded by Bash (keweichen
-    rounds 15-17, confirmed by direct execution)."""
-    words, val, expandable, any_quoted = [], [], False, False
+    ANY part of the word was inside quotes at all. Adjacent quoted/unquoted
+    spans concatenate into ONE word (Bash's own split-quoting rule, e.g.
+    `'$'OPT` is one word). Exists because shlex.split() erases exactly the
+    quoting distinction -- `'$OPT'`, `\\$OPT`, `"$OPT"` and bare `$OPT` all
+    become the identical resolved token, though only the last two are ever
+    expanded by Bash (keweichen rounds 15-17, confirmed by direct
+    execution).
+
+    A redirection (`[fd]>target`, `[fd]<target`, and their `>>`/`<&`/`<&`
+    variants) is consumed by the shell and never reaches argv at all
+    (round 18: `set -o >/dev/null pipefail` -- Bash removes the redirect
+    before invoking `set`, which then sees only `-o pipefail`); a digit
+    run immediately before the operator is its fd prefix, also consumed,
+    while any other preceding text is a real word and gets flushed first.
+
+    Brace expansion runs per accumulated word at flush time, tracked via a
+    per-character quoted mask (round 18, `_split_unquoted_braces`) -- a
+    whole-word `any_quoted` flag cannot tell a quoted delimiter from a
+    quoted character elsewhere in the same split-quoted word."""
+    words, val, qmask, expandable, any_quoted = [], [], [], False, False
     quote, i, n = None, 0, len(text)
 
     def flush():
-        nonlocal val, expandable, any_quoted
-        if val:
-            words.append(("".join(val), expandable, any_quoted))
-        val, expandable, any_quoted = [], False, False
+        nonlocal val, qmask, expandable, any_quoted
+        if val or any_quoted:
+            cands = _split_unquoted_braces(val, qmask)
+            if cands is None:
+                words.append(("".join(val), expandable, any_quoted))
+            else:
+                for c in cands:
+                    words.append((c, expandable, any_quoted))
+        val, qmask, expandable, any_quoted = [], [], False, False
 
     while i < n:
         ch = text[i]
@@ -325,7 +377,7 @@ def _shell_words(text: str):
             if ch == "'":
                 quote = None
             else:
-                val.append(ch)
+                val.append(ch); qmask.append(True)
             i += 1
         elif quote == '"':
             any_quoted = True
@@ -333,50 +385,60 @@ def _shell_words(text: str):
                 quote = None
                 i += 1
             elif ch == "\\" and i + 1 < n and text[i + 1] in "\"\\$`":
-                val.append(text[i + 1]); i += 2  # escaped -- literal, not expandable
+                val.append(text[i + 1]); qmask.append(True); i += 2  # escaped -- literal, not expandable
             else:
                 if ch in "$`":
                     expandable = True
-                val.append(ch); i += 1
+                val.append(ch); qmask.append(True); i += 1
         elif ch in " \t\n":
             flush(); i += 1
+        elif ch in "<>":
+            if val and not all(c.isdigit() for c in val):
+                flush()  # real word before the operator -- its own argv word
+            else:
+                val, qmask = [], []  # fd-prefix digits (or nothing) -- part of the redirect
+            i += 1
+            if i < n and text[i] in (ch, "&"):
+                i += 1
+            while i < n and text[i] in " \t":
+                i += 1
+            while i < n and text[i] not in " \t\n":  # consume the target, quote-aware, discarded
+                if text[i] == "'":
+                    i += 1
+                    while i < n and text[i] != "'":
+                        i += 1
+                    i += 1
+                elif text[i] == '"':
+                    i += 1
+                    while i < n and text[i] != '"':
+                        i += 2 if text[i] == "\\" and i + 1 < n else 1
+                    i += 1
+                elif text[i] == "\\" and i + 1 < n:
+                    i += 2
+                else:
+                    i += 1
         elif ch == "'":
             quote = "'"; i += 1
         elif ch == '"':
             quote = '"'; i += 1
         elif ch == "\\" and i + 1 < n:
-            val.append(text[i + 1]); i += 2  # unquoted escape -- literal
+            val.append(text[i + 1]); qmask.append(True); i += 2  # unquoted escape -- literal
         else:
             if ch in "$`":
                 expandable = True
-            val.append(ch); i += 1
+            val.append(ch); qmask.append(False); i += 1
     flush()
     return words
 
 
-_BRACE_RE = __import__("re").compile(r"^([^{}]*)\{([^{}]*)\}([^{}]*)$")
-
-
-def _brace_candidates(raw_word: str) -> list:
-    """One-level Bash brace expansion of a BARE (unquoted) word -- `Bash
-    quoting suppresses it entirely, confirmed by direct execution: `set -o
-    'pipe{fail,foo}'` and the double-quoted form both stay the literal,
-    rejected string, never expanding. `{x}` with no comma is not brace
-    syntax at all and stays literal too."""
-    m = _BRACE_RE.match(raw_word)
-    if not m or "," not in m.group(2):
-        return [raw_word]
-    pre, mid, post = m.groups()
-    return [pre + part + post for part in mid.split(",")]
-
-
 # Bash's own `set -o`/`+o` names (3.2 ∪ 5.x); an unrecognized value ABORTS
-# the whole `set` before a later `-o`/`+o` in it is ever reached (round 17).
+# the whole `set` (round 17). A name missing from THIS list aborts too -- confirmed inverted for `interactive-comments` (round 18).
 _SET_O_NAMES = frozenset((
     "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace",
-    "hashall", "histexpand", "history", "ignoreeof", "keyword", "monitor",
-    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd",
-    "physical", "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+    "hashall", "histexpand", "history", "ignoreeof", "interactive-comments",
+    "keyword", "monitor", "noclobber", "noexec", "noglob", "nolog", "notify",
+    "nounset", "onecmd", "physical", "pipefail", "posix", "privileged",
+    "verbose", "vi", "xtrace",
 ))
 
 
@@ -405,8 +467,14 @@ def _sets_pipefail(text: str) -> "bool | str | None":
     `-o` actually consumed (round 17: `set -o "$OPT" '$OPT'` enables
     pipefail from the FIRST, expandable occurrence; a substring check for
     a literal copy of "$OPT" anywhere in the command found the SECOND one
-    and wrongly called the whole thing literal). Bare brace expansion
-    (`set -o pipe{fail,foo}`) is also resolved, since Bash performs it."""
+    and wrongly called the whole thing literal). Brace expansion is
+    resolved by `_shell_words()` itself, one argv word per candidate (round
+    18: `set +o {errexit,pipefail}` only ever hands `+o` the FIRST expanded
+    word -- `pipefail` next to it is a separate, unflagged word that ends
+    `set`'s own option scanning like any bare positional, so pipefail
+    stays ON here, not off). An empty word (`set "" +o pipefail`) is a
+    real positional argument too, not the absence of one -- it ends
+    scanning exactly like a non-empty one would (round 18)."""
     words = _shell_words(text)
     if not words or words[0][0] != "set":
         return None
@@ -428,15 +496,8 @@ def _sets_pipefail(text: str) -> "bool | str | None":
                     result = "unknown"
                 elif vval == "pipefail":
                     result = val[0] == "-"
-                else:
-                    candidates = _brace_candidates(vval) if not vquoted else [vval]
-                    for cand in candidates:
-                        if cand == "pipefail":
-                            result = val[0] == "-"
-                            break
-                    else:
-                        if vval not in _SET_O_NAMES:
-                            break  # unrecognized name -- Bash aborts here
+                elif vval not in _SET_O_NAMES:
+                    break  # unrecognized name -- Bash aborts here
                 i += 1
             continue
         i += 1
