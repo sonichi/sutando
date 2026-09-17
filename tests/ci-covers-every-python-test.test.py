@@ -66,25 +66,34 @@ def _run_bodies(text: str) -> list[str]:
     Dedented per YAML block-scalar rules, per BLOCK (round 24, keweichen):
     real CI strips each block's own common indentation before Bash ever
     sees the script, so a line-exact check (e.g. a heredoc terminator)
-    must see the SAME text CI would run, not the raw source indentation."""
-    out, indent, block = [], None, []
+    must see the SAME text CI would run, not the raw source indentation.
+    An EXPLICIT indentation indicator (`|2`, `>3`, ...) overrides the
+    auto-detected common indent entirely (round 25, keweichen): it strips
+    exactly `key_column + N` from every line, deliberately preserving any
+    extra source indentation as literal content -- `min(indents)` cannot
+    express that, since it always strips the block's OWN minimum."""
+    out, indent, indicator, block = [], None, None, []
 
     def _flush():
-        indents = [len(ln) - len(ln.lstrip()) for ln in block if ln.strip()]
-        cut = min(indents) if indents else 0
+        cut = indent + indicator if indicator is not None else None
+        if cut is None:
+            indents = [len(ln) - len(ln.lstrip()) for ln in block if ln.strip()]
+            cut = min(indents) if indents else 0
         out.extend(ln[cut:] for ln in block)
         block.clear()
 
     for ln in text.splitlines():
         stripped = ln.strip()
-        m = re.match(r"-?\s*run:\s*\|?-?\s*(.*)$", stripped)
+        m = re.match(r"-?\s*run:\s*([|>])?([+-]?)(\d*)([+-]?)\s*(.*)$", stripped)
         if m and re.search(r"(^|\s)run:", stripped):
             _flush()
             # The KEY's column, not the line's: a `- ` list marker sits left of
             # it, so a sibling key would otherwise read as a continuation line.
             indent = ln.index("run:")
-            if m.group(1):
-                out.append(_yaml_scalar(m.group(1)))
+            digits = m.group(3)
+            indicator = int(digits) if digits else None
+            if m.group(5):
+                out.append(_yaml_scalar(m.group(5)))
             continue
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
@@ -741,6 +750,65 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_explicit_yaml_indentation_indicator_is_honored_not_auto_dedented(self):
+        """keweichen round 25: `|2` deliberately keeps 2 leading spaces on
+        every content line -- `min(indents)` cannot express that, since it
+        always strips a block's own minimum. A bare `EOF` terminator then
+        never matches the still-indented delimiter, so the heredoc never
+        closes and the trailing command never runs -- confirmed by direct
+        execution against the real YAML-decoded script."""
+        wf = ("steps:\n  - run: |2\n"
+              "        : <<'EOF'\n"
+              "        ignored\n"
+              "        EOF\n"
+              "        python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_heredoc_nested_in_arithmetic_command_substitution_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 25: a real heredoc inside a `$(...)` nested
+        within `$((...))` arithmetic must still be recognized as one."""
+        wf = ("steps:\n  - run: |\n"
+              "      x=$(( $(cat <<EOF >/dev/null\n"
+              "      python3 packages/x/test_body.py\n"
+              "      EOF\n"
+              "      echo 1\n"
+              "      ) ))\n"
+              "      python3 packages/x/test_live.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_body.py", "packages/x/test_live.py"},
+                       set(), _named_in(wf)),
+            ["packages/x/test_body.py"])
+
+    def test_if_as_plain_argument_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 25: `printf if` is not a branch opener -- the
+        `||` after it must not be masked."""
+        wf = ("steps:\n  - run: |\n"
+              "      false && printf if || python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_unknown_then_guaranteed_true_elif_proves_else_dead_through_the_consumer_path(self):
+        """keweichen round 25: a trailing `else` after an undecidable `if`
+        and a guaranteed-true `elif` is provably dead either way."""
+        wf = ("steps:\n  - run: |\n"
+              '      if [ "$X" = y ]; then\n'
+              "        python3 packages/x/test_if.py\n"
+              "      elif true; then\n"
+              "        python3 packages/x/test_elif.py\n"
+              "      else\n"
+              "        python3 packages/x/test_else.py\n"
+              "      fi\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_if.py", "packages/x/test_elif.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_if.py", "packages/x/test_elif.py",
+                        "packages/x/test_else.py"}, set(), _named_in(wf)),
+            ["packages/x/test_else.py"])
 
 
 if __name__ == "__main__":

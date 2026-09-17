@@ -202,11 +202,22 @@ def _heredoc_delimiters(line: str):
     line already carries the fatal verdict via `_shell_words`. `<<<`
     (here-string) is a different operator with no body and is skipped.
     `<<` inside `((...))`/`$((...))` arithmetic is a left-shift, not a
-    redirect at all (round 24: `x=$((1 << 2))` was misread as one) --
-    tracked via the depth `((` opened at, single non-nested span only."""
+    redirect (round 24: `x=$((1 << 2))` was misread as one) -- but a
+    NESTED `$(...)` command substitution re-enters a real command
+    context even while still lexically inside the arithmetic's parens
+    (round 25, keweichen: a heredoc inside `$(( $(cmd <<EOF ...) ))` was
+    wrongly suppressed too), so a stack tracks each open group's KIND
+    (`arith`/`cmdsub`/plain grouping `(`) and only the nearest kind that
+    isn't a plain grouping paren decides whether `<<` is a shift."""
     out, i, n, quote = [], 0, len(line), None
-    arith_depth = None
-    depth = 0
+    stack = []
+
+    def in_arith():
+        for kind, _ in reversed(stack):
+            if kind != "paren":
+                return kind == "arith"
+        return False
+
     while i < n:
         ch = line[i]
         if quote:
@@ -220,18 +231,25 @@ def _heredoc_delimiters(line: str):
             quote = ch; i += 1; continue
         if ch == "\\" and i + 1 < n:
             i += 2; continue
-        if ch == "(" and i + 1 < n and line[i + 1] == "(":
-            if arith_depth is None:
-                arith_depth = depth
-            depth += 2; i += 2; continue
-        if ch == "(":
-            depth += 1; i += 1; continue
-        if ch == ")":
-            depth -= 1; i += 1
-            if arith_depth is not None and depth <= arith_depth:
-                arith_depth = None
+        if ch == "$" and i + 1 < n and line[i + 1] == "(":
+            if i + 2 < n and line[i + 2] == "(":
+                stack.append(["arith", 2]); i += 3
+            else:
+                stack.append(["cmdsub", 1]); i += 2
             continue
-        if arith_depth is not None and ch == "<" and i + 1 < n and line[i + 1] == "<":
+        if ch == "(":
+            if i + 1 < n and line[i + 1] == "(":
+                stack.append(["arith", 2]); i += 2
+            else:
+                stack.append(["paren", 1]); i += 1
+            continue
+        if ch == ")":
+            if stack:
+                stack[-1][1] -= 1
+                if stack[-1][1] <= 0:
+                    stack.pop()
+            i += 1; continue
+        if in_arith() and ch == "<" and i + 1 < n and line[i + 1] == "<":
             i += 2; continue
         if ch == "<" and i + 1 < n and line[i + 1] == "<":
             if i + 2 < n and line[i + 2] == "<":
@@ -349,9 +367,14 @@ def _mask_if_conditions(text: str) -> str:
     `if true && false; then ...` was split at the `&&`, corrupting the
     single word `_eval_condition()` needs to see). Restored there, not at
     the character-scan level, so `_raw_segments` never sees a real one.
-    Single-span, non-nested: a condition containing its own nested `if`
-    is not handled (unreported, out of scope)."""
+    `if`/`elif`/`then` only count in COMMAND position -- right after a
+    separator (`;`/`&`/`|`/`&&`/`||`/newline/start) or another keyword
+    that itself opens one (`then`/`else`/`do`) -- never as an ordinary
+    ARGUMENT (round 25, keweichen: `printf if` isn't an `if` statement,
+    but masked the `||` after it anyway). Single-span, non-nested: a
+    condition containing its own nested `if` is not handled (out of scope)."""
     out, i, n, quote, masking = [], 0, len(text), None, False
+    at_cmd_start = True
     while i < n:
         ch = text[i]
         if quote:
@@ -360,23 +383,32 @@ def _mask_if_conditions(text: str) -> str:
                 quote = None
             i += 1; continue
         if ch in "'\"":
-            quote = ch; out.append(ch); i += 1; continue
+            quote = ch; out.append(ch); i += 1; at_cmd_start = False; continue
         if ch == "\\" and i + 1 < n:
-            out.append(ch); out.append(text[i + 1]); i += 2; continue
+            out.append(ch); out.append(text[i + 1]); i += 2; at_cmd_start = False; continue
         if masking and ch in "&|" and i + 1 < n and text[i + 1] == ch:
-            out.append(_MASK_AND if ch == "&" else _MASK_OR); i += 2; continue
+            out.append(_MASK_AND if ch == "&" else _MASK_OR); i += 2; at_cmd_start = True; continue
+        if ch in ";\n" or (ch in "&|" and (i + 1 >= n or text[i + 1] != ch)):
+            out.append(ch); i += 1; at_cmd_start = True; continue
+        if ch in " \t":
+            out.append(ch); i += 1; continue
         if ch.isalpha() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
             j = i
             while j < n and (text[j].isalnum() or text[j] == "_"):
                 j += 1
             word = text[i:j]
             at_boundary = j >= n or not (text[j].isalnum() or text[j] == "_")
-            if at_boundary and word in ("if", "elif"):
-                masking = True
-            elif at_boundary and word == "then":
-                masking = False
+            was_cmd_start = at_cmd_start
+            if at_boundary and was_cmd_start and word in ("if", "elif"):
+                masking = True; at_cmd_start = True
+            elif at_boundary and was_cmd_start and word == "then":
+                masking = False; at_cmd_start = True
+            elif at_boundary and was_cmd_start and word in ("else", "do"):
+                at_cmd_start = True
+            else:
+                at_cmd_start = False
             out.append(word); i = j; continue
-        out.append(ch); i += 1
+        out.append(ch); i += 1; at_cmd_start = False
     return "".join(out)
 
 
@@ -433,10 +465,25 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
     an EARLIER arm in the current if/elif/else chain already consumed the
     branch (True), definitely hasn't yet (False), or is undecidable
     ("unknown") -- once True, every later elif/else is dead regardless of
-    ITS OWN condition; a non-literal arm poisons `taken` to "unknown" for
-    the rest of the chain rather than guessing (round 24: `elif`/`else`
-    following a taken arm was still credited, keweichen + qingyun-wu)."""
+    ITS OWN condition. A non-literal arm poisons `taken` to "unknown", but
+    an "unknown" arm followed by a GUARANTEED-true one still forces `taken`
+    to True from there on: either the earlier arm consumed the branch, or
+    it didn't and this one -- proven to run whenever reached -- surely did
+    (round 25, keweichen: `elif true` after an undecidable `if` left a
+    provably-dead trailing `else` still credited, since "unknown" used to
+    propagate forever instead of resolving once a later arm is certain)."""
     out, stack, pending = [], [], list(segments)
+
+    def _chain_transition(parent_drop, taken_in, kind):
+        drop = parent_drop or taken_in is True or kind == "false"
+        if taken_in is True or kind == "true":
+            taken_out = True
+        elif taken_in == "unknown" or kind == "other":
+            taken_out = "unknown"
+        else:
+            taken_out = False
+        return drop, taken_out
+
     while pending:
         seg = pending.pop(0)
         toks = seg.split(maxsplit=1)
@@ -444,32 +491,13 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
         rest = toks[1] if len(toks) > 1 else ""
         if head == "if":
             parent_drop = stack[-1]["drop"] if stack else False
-            kind = _eval_condition(seg)
-            drop = parent_drop or kind == "false"
-            if parent_drop:
-                taken = False
-            elif kind == "true":
-                taken = True
-            elif kind == "other":
-                taken = "unknown"
-            else:
-                taken = False
+            drop, taken = _chain_transition(parent_drop, False, _eval_condition(seg))
             stack.append({"drop": drop, "taken": taken})
             continue
         if head == "elif" and stack:
             parent_drop = stack[-2]["drop"] if len(stack) > 1 else False
-            taken_in = stack[-1]["taken"]
-            kind = _eval_condition(seg)
-            drop = parent_drop or taken_in is True or kind == "false"
-            if taken_in is True or taken_in == "unknown":
-                taken_out = taken_in
-            elif kind == "true":
-                taken_out = True
-            elif kind == "other":
-                taken_out = "unknown"
-            else:
-                taken_out = False
-            stack[-1] = {"drop": drop, "taken": taken_out}
+            drop, taken = _chain_transition(parent_drop, stack[-1]["taken"], _eval_condition(seg))
+            stack[-1] = {"drop": drop, "taken": taken}
             continue
         if head == "then" and stack:
             if rest:

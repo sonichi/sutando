@@ -228,6 +228,19 @@ class DeadBranches(unittest.TestCase):
             "elif true; then\n  python3 packages/x/elif.py\nfi\n"),
             ["packages/x/if.py", "packages/x/elif.py"])
 
+    def test_an_unknown_arm_followed_by_a_guaranteed_true_one_proves_else_dead(self):
+        """keweichen round 25: unlike the case above (no `else`), a
+        trailing `else` here is provably dead either way -- either the
+        undecidable `if` already ran, or it didn't and the guaranteed-true
+        `elif` surely did. Confirmed by direct execution: only elif_ran
+        prints. 'unknown' must resolve to True once a later arm is
+        certain, not propagate forever."""
+        self.assertEqual(program_python_args(
+            'if [ "$X" = y ]; then\n  python3 packages/x/if.py\n'
+            "elif true; then\n  python3 packages/x/elif.py\n"
+            "else\n  python3 packages/x/else.py\nfi\n"),
+            ["packages/x/if.py", "packages/x/elif.py"])
+
 
 class GluedBranchCommand(unittest.TestCase):
     """qingyun-wu's + keweichen's blocking finding on round 2 of #4202: a
@@ -983,6 +996,31 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "set +o pipefail\n"
                 "set {+u}<(echo o) -o pipefail\n"
                 "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_a_heredoc_nested_inside_arithmetic_command_substitution_still_runs(self):
+        """keweichen round 25: `$(( $(cmd <<EOF ...) ))` -- the nested
+        `$(...)` re-enters a real command context, so its own heredoc is
+        genuine (`body.py` is data, never invoked) and the outer
+        arithmetic's `<<` suppression must not swallow it too. Confirmed
+        by direct execution: only live.py runs."""
+        self.assertEqual(
+            program_python_args(
+                "x=$(( $(cat <<EOF >/dev/null\n"
+                "python3 packages/x/body.py\n"
+                "EOF\n"
+                "echo 1\n"
+                ") ))\n"
+                "python3 packages/x/live.py\n"),
+            ["packages/x/live.py"])
+
+    def test_if_as_a_plain_argument_is_not_a_branch_opener(self):
+        """keweichen round 25: `printf if` -- `if` is ordinary argv here,
+        not a command-position keyword, so the `||` after it must not be
+        masked. Confirmed by direct execution: dead.py runs."""
+        self.assertEqual(
+            program_python_args(
+                "false && printf if || python3 packages/x/dead.py\n"),
             ["packages/x/dead.py"])
 
 
