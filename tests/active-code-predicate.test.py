@@ -226,6 +226,28 @@ class DeadBranches(unittest.TestCase):
             "else\n  python3 packages/x/else.py\nfi\n"),
             ["packages/x/then.py"])
 
+    def test_double_negation_on_one_operand_toggles_twice(self):
+        """keweichen round 29: `! ! true` is valid on Bash 5.2/5.3 (confirmed
+        live) and toggles twice back to true -- a round-28 fix consumed only
+        ONE `!` per operand on the claim that a second is always a syntax
+        error, which held on this host's Bash 3.2.57 but not on 5.3.20."""
+        self.assertEqual(program_python_args(
+            "if ! ! true; then\n  python3 packages/x/test_live.py\n"
+            "else\n  python3 packages/x/test_dead.py\nfi\n"),
+            ["packages/x/test_live.py"])
+        self.assertEqual(program_python_args(
+            "if ! ! false; then\n  python3 packages/x/test_dead.py\n"
+            "else\n  python3 packages/x/test_live.py\nfi\n"),
+            ["packages/x/test_live.py"])
+
+    def test_triple_negation_toggles_an_odd_number_of_times(self):
+        """Confirmed live on Bash 5.3.20: `! ! ! true` is false (odd count
+        of `!` toggles an odd number of times, same as one `!`)."""
+        self.assertEqual(program_python_args(
+            "if ! ! ! true; then\n  python3 packages/x/test_dead.py\n"
+            "else\n  python3 packages/x/test_live.py\nfi\n"),
+            ["packages/x/test_live.py"])
+
     def test_a_taken_if_arm_drops_every_later_elif(self):
         """qingyun-wu round 24: once `if true` is taken, the following
         `elif true` never runs regardless of ITS OWN condition -- confirmed

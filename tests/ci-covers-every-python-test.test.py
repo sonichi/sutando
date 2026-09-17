@@ -48,13 +48,50 @@ def _uncommented(text: str) -> str:
     return active_text(text)
 
 
+_YAML_DQUOTE_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v",
+    "f": "\f", "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/",
+    "\\": "\\", "N": "", "_": " ", "L": " ", "P": " ",
+}
+
+
+def _yaml_dquote_unescape(body: str) -> str:
+    """Decode YAML double-quoted scalar escapes (spec 5.7) -- `\\n` is a
+    REAL newline, not two characters, so a folded-looking one-liner can
+    actually be a multi-line shell script (round 29, keweichen: `"echo a
+    \\npython3 x.py"` decodes to two lines, and Bash runs the second)."""
+    out, i, n = [], 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch); i += 1; continue
+        esc = body[i + 1]
+        if esc in _YAML_DQUOTE_ESCAPES:
+            out.append(_YAML_DQUOTE_ESCAPES[esc]); i += 2; continue
+        for prefix, width in (("x", 4), ("u", 6), ("U", 10)):
+            if esc == prefix and i + 1 + width <= n:
+                try:
+                    out.append(chr(int(body[i + 2:i + width], 16)))
+                    i += width
+                    break
+                except ValueError:
+                    pass
+        else:
+            out.append(ch); out.append(esc); i += 2
+    return "".join(out)
+
+
 def _yaml_scalar(value: str) -> str:
     """A wholly YAML-quoted `run:` value, unwrapped.
 
     The quotes are YAML's, not the shell's; leaving them makes the shell-quote
-    blanking swallow a real invocation."""
+    blanking swallow a real invocation. A DOUBLE-quoted scalar's backslash
+    escapes are decoded too -- see `_yaml_dquote_unescape`. Single-quoted
+    YAML scalars have no backslash-escape mechanism at all (unchanged)."""
     v = value.strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" and v[0] not in v[1:-1]:
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return _yaml_dquote_unescape(v[1:-1])
+    if len(v) >= 2 and v[0] == v[-1] == "'" and "'" not in v[1:-1]:
         return v[1:-1]
     return value
 
@@ -847,6 +884,30 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
               "      echo inert\n"
               "      python3 packages/x/test_live.py\n")
         self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+
+    def test_double_quoted_scalar_newline_escape_is_a_real_line_break(self):
+        """keweichen round 29: a double-quoted YAML scalar's `\\n` decodes
+        to a REAL newline (confirmed against real PyYAML), so this is a
+        two-line shell script -- confirmed by direct execution that Bash
+        runs the second line. `_yaml_scalar()` used to only strip the outer
+        quotes, leaving a literal backslash-n that names nothing."""
+        wf = 'steps:\n  - run: "echo setup\\npython3 packages/x/test_live.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
+    def test_double_quoted_scalar_other_escapes_decode_too(self):
+        """A tab escape and an escaped inner quote both decode per the
+        real YAML double-quote spec -- confirmed against PyYAML."""
+        wf = 'steps:\n  - run: "python3\\tpackages/x/test_live.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+
+    def test_single_quoted_scalar_has_no_backslash_escapes(self):
+        """Control: single-quoted YAML has no backslash-escape mechanism at
+        all -- a literal backslash-n stays two characters, naming nothing
+        on this one (unfolded, unescaped) line."""
+        wf = "steps:\n  - run: 'echo setup\\npython3 packages/x/test_live.py'\n"
+        self.assertEqual(_named_in(wf), set())
 
     def test_heredoc_nested_in_arithmetic_command_substitution_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 25: a real heredoc inside a `$(...)` nested

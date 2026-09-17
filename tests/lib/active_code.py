@@ -418,13 +418,15 @@ def _eval_condition(seg: str) -> str:
     left to right the way a real Bash AND-OR list decides its exit status
     (round 24: `true && false; then` used to see only `true`, since
     `_raw_segments` split at the `&&` before this ever saw the `false`).
-    A literal operand may carry one leading `!` (round 28, qingyun-wu):
-    Bash's unary `!` negates a pipeline's own exit status -- `if ! true`
-    used to be unrecognized ('other'), crediting both arms of a branch
-    Bash only ever takes one side of. A SECOND `!` on the same operand is
-    not valid Bash grammar (confirmed: `! ! true` is a syntax error), so
-    only one is consumed; two separately-negated operands either side of
-    a `&&`/`||` (`! true && ! false`) each get their own, confirmed live."""
+    A literal operand may carry leading `!` (round 28, qingyun-wu; round 29,
+    keweichen): Bash's unary `!` negates a pipeline's own exit status --
+    `if ! true` used to be unrecognized ('other'), crediting both arms of a
+    branch Bash only ever takes one side of. A round-28 fix consumed only
+    ONE `!` per operand on the claim that a second is a syntax error --
+    that held on this host's Bash 3.2.57 but NOT on Bash 5.3.20 (confirmed
+    live on both): `! ! true` there is valid and toggles twice, so the
+    scanner must model the general case (each `!` toggles) rather than a
+    single host's shell version."""
     toks = seg.replace(_MASK_AND, " && ").replace(_MASK_OR, " || ").split()
     if len(toks) < 2:
         return "other"
@@ -436,8 +438,9 @@ def _eval_condition(seg: str) -> str:
             if pending_op is not None:
                 return "other"
             pending_op = t; i += 1; continue
-        negate = rest[i] == "!"
-        if negate:
+        negate = False
+        while i < n and rest[i] == "!":
+            negate = not negate
             i += 1
         if i >= n:
             return "other"
