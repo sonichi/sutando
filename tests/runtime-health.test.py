@@ -103,6 +103,16 @@ os.utime(_alive, None)
 check("_tmux_socket: accepts the same record once it is fresh",
       rh._tmux_socket() == "/tmp/stale.sock")
 
+# A clock step leaves a future-dated record; a one-sided age test reads that as
+# fresh forever, so the bound has to hold on both sides.
+os.utime(_alive, (time.time() + 10000, time.time() + 10000))
+check("_tmux_socket: refuses a future-dated .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, (time.time() + 1, time.time() + 1))
+check("_tmux_socket: tolerates small clock skew",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
 _prev_env = os.environ.get("SUTANDO_TMUX_SOCKET")
 os.environ["SUTANDO_TMUX_SOCKET"] = "/tmp/explicit.sock"
 check("_tmux_socket: an explicit SUTANDO_TMUX_SOCKET wins over the record",

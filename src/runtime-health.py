@@ -55,9 +55,10 @@ def _tmux_socket():
         if host:
             repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             alive = os.path.join(_resolve_workspace(repo), "state", "cores", f"{host}.alive")
-            # A crashed core leaves its record behind; trusting a stale one would pin
-            # the probe to a dead socket, which is the failure this resolver removes.
-            if (time.time() - os.path.getmtime(alive)) > HEARTBEAT_STALE_SECONDS:
+            # Bounded BOTH ways: a crashed core leaves a stale record, and a clock step
+            # leaves a future-dated one that a one-sided test accepts forever.
+            age = time.time() - os.path.getmtime(alive)
+            if age >= HEARTBEAT_STALE_SECONDS or age < -HEARTBEAT_FUTURE_TOLERANCE_SECONDS:
                 return TMUX_SOCKET
             with open(alive, "r", encoding="utf-8") as fh:
                 sock = (json.load(fh) or {}).get("socket")
@@ -80,6 +81,11 @@ STALE_STATUS_SECONDS = 90
 # by a SEPARATE process (src/core_heartbeat.py); >90s means it stopped beating.
 # Matches the documented staleness threshold every other reader of that file uses.
 HEARTBEAT_STALE_SECONDS = 90
+
+# Bounded from below too: a far-future .alive has a NEGATIVE age, which every
+# one-sided `age >= max` test reads as fresh. A tolerance, not zero, so an atomic
+# rewrite between a caller's now-snapshot and its stat is not discarded.
+HEARTBEAT_FUTURE_TOLERANCE_SECONDS = 5
 
 # ── Severity layer (design: docs/design-core-health-verdict.md) ──────────────
 # One authoritative, severity-tagged verdict every consumer reads, so "report
