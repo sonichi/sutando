@@ -114,8 +114,30 @@ class CreatedUnrostered(Exception):
         self.worker_id = worker_id
 
 
+def adopt(workspace, worker_id: str, *, socket=None) -> "dict | None":
+    """A worker an interrupted run already made, if it is whole: rostered live
+    AND its tmux session exists. None when nothing was made; `CreatedUnrostered`
+    when an identity exists without a live session (left for a human)."""
+    exists = sw.wi.worker_dir(workspace, worker_id).exists()
+    roster = pr.load_roster(workspace) or {}
+    row = (roster.get("workers") or {}).get(worker_id)
+    state, _detail = sw.session_probe(sw.wi.tmux_session_name(worker_id),
+                                      socket or sw.default_socket())
+    if row and row.get("state") == "live" and state == "exists":
+        return {"worker_id": worker_id, "roster_version": roster.get("version"),
+                "advertisement": "published",
+                "delivery_dir": str(sw.pd.deliveries_dir(workspace, worker_id)),
+                "tmux": {"socket": socket or sw.default_socket(),
+                         "session_name": sw.wi.tmux_session_name(worker_id)}}
+    if exists or row:
+        raise CreatedUnrostered(worker_id, RuntimeError(
+            f"identity={'yes' if exists else 'no'} roster={'yes' if row else 'no'} "
+            f"tmux={state}: a half-made worker; not adopting"))
+    return None
+
+
 def create(workspace, repo, *, label: str = "", room=None, runtime=None,
-           folder: str = "", socket=None) -> dict:
+           folder: str = "", socket=None, worker_id=None) -> dict:
     """The whole command as one call, for a caller that already holds the intent.
 
     Refusals raise before anything is made. After the spawn, a compile failure
@@ -125,7 +147,7 @@ def create(workspace, repo, *, label: str = "", room=None, runtime=None,
     preflight(workspace, repo, room)
     rt = sw.resolve_runtime(repo, runtime or None)
     made = sw.spawn(workspace, repo, runtime=rt, cwd=folder, socket=socket or None,
-                    label=label)
+                    label=label, worker_id=worker_id)
     advertisement = "published"
     try:
         roster = compile_with(workspace, made["worker_id"], label, room,

@@ -509,9 +509,10 @@ class TestApplyAdd(TestApply):
         super().setUp()
         self.calls = []
 
-        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="", socket=None):
+        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="",
+                        socket=None, worker_id=None):
             self.calls.append(label)
-            return {"worker_id": self.NEW, "delivery_dir": "d", "tmux": {}, "roster_version": 9,
+            return {"worker_id": worker_id or self.NEW, "delivery_dir": "d", "tmux": {}, "roster_version": 9,
                     "advertisement": "published", "unrostered_records": []}
         real = wpc.cw.create
         wpc.cw.create = fake_create
@@ -520,15 +521,20 @@ class TestApplyAdd(TestApply):
     def test_add_with_a_repo_creates_and_records_the_worker(self):
         out = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
         self.assertEqual(out["action"], "add")
-        self.assertEqual(out["worker_id"], self.NEW)
+        self.assertEqual(out["worker_id"], wpc.add_worker_id("task-add-9"))
         log = json.loads(wpc.applied_path(self.ws).read_text())
-        self.assertEqual(log["applied"]["task-add-9"]["worker_id"], self.NEW)
+        self.assertEqual(log["adds"]["task-add-9"]["worker_id"], out["worker_id"])
+        self.assertEqual(log["adds"]["task-add-9"]["state"], "created")
         self.assertEqual(self.calls, [""])
 
-    def test_add_replays_as_skipped(self):
-        wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
+    def test_add_replays_from_the_record_without_creating(self):
+        first = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
         out = wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")
-        self.assertEqual(out["action"], "skipped")
+        self.assertEqual((out["action"], out.get("replayed")), ("add", True))
+        self.assertEqual(out["worker_id"], first["worker_id"])
+        self.assertEqual(len(self.calls), 1)
+        wpc.mark_add_published(self.ws, "task-add-9")
+        self.assertEqual(wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-9", repo="/r")["action"], "skipped")
         self.assertEqual(len(self.calls), 1)
 
     def test_add_without_a_task_id_is_refused_by_the_gate(self):
@@ -542,8 +548,8 @@ class TestApplyAdd(TestApply):
         wpc.cw.create = refuse
         with self.assertRaises(wpc.AddRefused):
             wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add-10", repo="/r")
-        self.assertFalse(wpc.applied_path(self.ws).exists()
-                         and "task-add-10" in json.loads(wpc.applied_path(self.ws).read_text()).get("applied", {}))
+        # The intent stays durable so a later run can adopt; nothing is marked created.
+        self.assertEqual(wpc.add_state(self.ws, "task-add-10")["state"], "creating")
 
 
 class TestAuthorizedCommand(unittest.TestCase):

@@ -72,14 +72,27 @@ class TestAddRunsAtTheEdge(Base):
         self.add = str(p)
         self.calls = []
 
-        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="", socket=None):
-            self.calls.append({"repo": repo, "label": label, "runtime": runtime})
-            return {"worker_id": self.NEW, "delivery_dir": str(self.ws / "deliveries" / self.NEW),
-                    "tmux": {"socket": "/tmp/s", "session_name": "sutando-w-b"},
+        self.made = {}   # worker_id -> made dict: what the fake spawn left behind
+
+        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="",
+                        socket=None, worker_id=None):
+            self.calls.append({"repo": repo, "label": label, "runtime": runtime, "worker_id": worker_id})
+            wid = worker_id or self.NEW
+            made = {"worker_id": wid, "delivery_dir": str(self.ws / "deliveries" / wid),
+                    "tmux": {"socket": "/tmp/s", "session_name": f"sutando-w-{wid[:6]}"},
                     "roster_version": 2, "advertisement": "published", "unrostered_records": []}
+            self.made[wid] = made
+            return made
+
+        def fake_adopt(workspace, worker_id, *, socket=None):
+            # Whole if the fake spawn made it; nothing if it never ran.
+            return self.made.get(worker_id)
         self._real = wpc.cw.create
+        self._real_adopt = wpc.cw.adopt
         wpc.cw.create = fake_create
+        wpc.cw.adopt = fake_adopt
         self.addCleanup(lambda: setattr(wpc.cw, "create", self._real))
+        self.addCleanup(lambda: setattr(wpc.cw, "adopt", self._real_adopt))
 
     def run_handler(self, *extra):
         return h.main(["--task-file", self.add, "--workspace", str(self.ws),
@@ -88,9 +101,12 @@ class TestAddRunsAtTheEdge(Base):
 
     def ledger(self):
         try:
-            return json.loads(wpc.applied_path(self.ws).read_text()).get("applied") or {}
+            return json.loads(wpc.applied_path(self.ws).read_text()).get("adds") or {}
         except FileNotFoundError:
             return {}
+
+    def results(self):
+        return sorted(p.name for p in (self.ws / "results").glob("task-add-1*.txt"))
 
     def test_the_probe_claims_without_creating(self):
         self.assertEqual(self.run_handler("--probe"), 0)
@@ -101,12 +117,14 @@ class TestAddRunsAtTheEdge(Base):
     def test_the_run_creates_records_replies_and_keeps_the_core_out(self):
         self.assertEqual(self.run_handler(), 0)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0], {"repo": "/repo/x", "label": "scribe", "runtime": "claude"})
+        wid = wpc.add_worker_id("task-add-1")
+        self.assertEqual(self.calls[0], {"repo": "/repo/x", "label": "scribe", "runtime": "claude",
+                                         "worker_id": wid})
         body = (self.ws / "results" / "task-add-1.txt").read_text()
-        self.assertIn(self.NEW, body)
+        self.assertIn(wid, body)
         self.assertIn("scribe", body)
-        self.assertEqual(self.ledger()["task-add-1"]["worker_id"], self.NEW)
-        self.assertEqual(self.ledger()["task-add-1"]["action"], "add")
+        self.assertEqual(self.ledger()["task-add-1"]["worker_id"], wid)
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "published")
 
     def test_a_second_run_is_a_replay_and_creates_nothing(self):
         self.run_handler()
@@ -124,7 +142,8 @@ class TestAddRunsAtTheEdge(Base):
         wpc.cw.create = refuse
         self.assertEqual(self.run_handler(), h.DECLINE)
         self.assertFalse((self.ws / "results" / "task-add-1.txt").exists())
-        self.assertNotIn("task-add-1", self.ledger())
+        # The intent is durable (so a later run can still adopt), but nothing was made.
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "creating")
 
     def test_without_a_repo_the_run_declines_to_the_core(self):
         rc = h.main(["--task-file", self.add, "--workspace", str(self.ws),
@@ -142,6 +161,75 @@ class TestAddRunsAtTheEdge(Base):
         self.run_handler()
         self.assertIn("advertisement could not be written",
                       (self.ws / "results" / "task-add-1.txt").read_text())
+
+
+    # --- the two crash boundaries Codex named, plus the one after the reply --------
+
+    def test_crash_after_create_before_record_replays_to_one_worker(self):
+        real = wpc._write_add_state
+        def die_on_created(workspace, task_id, rec):
+            if rec.get("state") == "created":
+                raise OSError(5, "simulated crash after the spawn")
+            return real(workspace, task_id, rec)
+        wpc._write_add_state = die_on_created
+        try:
+            rc1 = self.run_handler()
+        finally:
+            wpc._write_add_state = real
+        self.assertEqual(rc1, h.DECLINE, "a crashed run must not report success")
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "creating")
+        self.assertEqual(len(self.calls), 1, "the worker WAS spawned before the crash")
+        self.assertEqual(self.results(), [])
+        # The retained task is re-run by the startup sweep.
+        self.assertEqual(self.run_handler(), 0)
+        self.assertEqual(len(self.calls), 1, "the replay created a SECOND worker")
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "published")
+        self.assertEqual(self.results(), ["task-add-1.txt"])
+        self.assertIn(wpc.add_worker_id("task-add-1"), (self.ws / "results" / "task-add-1.txt").read_text())
+
+    def test_crash_after_record_before_reply_restores_the_reply(self):
+        real = h._write_result
+        h._write_result = lambda rd, tid, body: (_ for _ in ()).throw(OSError(5, "simulated crash before the reply"))
+        try:
+            rc1 = self.run_handler()
+        finally:
+            h._write_result = real
+        self.assertNotEqual(rc1, 0)
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "created")
+        self.assertEqual(self.results(), [])
+        self.assertEqual(self.run_handler(), 0)
+        self.assertEqual(len(self.calls), 1, "the replay created a second worker")
+        self.assertEqual(self.results(), ["task-add-1.txt"])
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "published")
+
+    def test_crash_after_reply_before_mark_writes_no_second_reply(self):
+        real = wpc.mark_add_published
+        wpc.mark_add_published = lambda ws, tid: (_ for _ in ()).throw(OSError(5, "simulated crash after the reply"))
+        try:
+            rc1 = self.run_handler()
+        finally:
+            wpc.mark_add_published = real
+        self.assertNotEqual(rc1, 0)
+        self.assertEqual(self.results(), ["task-add-1.txt"])
+        first = (self.ws / "results" / "task-add-1.txt").read_bytes()
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "created")
+        self.assertEqual(self.run_handler(), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.results(), ["task-add-1.txt"])
+        self.assertEqual((self.ws / "results" / "task-add-1.txt").read_bytes(), first,
+                         "the replay rewrote a reply that was already out")
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "published")
+
+    def test_a_half_made_worker_is_left_for_the_core_not_adopted(self):
+        wid = wpc.add_worker_id("task-add-1")
+        wpc._write_add_state(self.ws, "task-add-1", {"state": "creating", "worker_id": wid, "label": "scribe"})
+        def half(workspace, worker_id, *, socket=None):
+            raise wpc.cw.CreatedUnrostered(worker_id, RuntimeError("identity=yes roster=no tmux=absent"))
+        wpc.cw.adopt = half
+        self.assertEqual(self.run_handler(), h.DECLINE)
+        self.assertEqual(self.calls, [], "a half-made worker must not be re-created over")
+        self.assertEqual(self.results(), [])
+        self.assertEqual(self.ledger()["task-add-1"]["state"], "creating")
 
 
 class TestPickerReplayAcrossRestart(Base):

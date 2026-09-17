@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import re
 import sys
@@ -360,22 +361,74 @@ class AddRefused(RuntimeError):
     """`add` could not create a worker here; the live core keeps the task."""
 
 
-def _apply_add(workspace, cmd: dict, *, task_id, results_dir, repo, runtime) -> dict:
-    # One critical section for gate, creation and record: the startup sweep
-    # re-runs a retained task, and an ungated second run is a second worker.
+ADDS_KEY = "adds"
+_ADD_FIELDS = ("worker_id", "label", "roster_version", "advertisement", "delivery_dir", "tmux")
+
+
+def add_worker_id(task_id) -> str:
+    """The worker a picker task creates has an id derived from the task, so a
+    run interrupted after the spawn can find what it made instead of making another."""
+    return hashlib.sha256(f"worker-add:{task_id}".encode()).hexdigest()[:32]
+
+
+def add_state(workspace, task_id) -> "dict | None":
+    return (_read_applied(workspace).get(ADDS_KEY) or {}).get(str(task_id))
+
+
+def _write_add_state(workspace, task_id, rec: dict) -> None:
+    log = _read_applied(workspace)
+    log.setdefault(ADDS_KEY, {})[str(task_id)] = rec
+    pr._write_atomic(applied_path(workspace), log)
+
+
+def mark_add_published(workspace, task_id) -> None:
+    """The reply is on disk: a replay now has nothing left to restore."""
     with _applied_locked(workspace):
-        reason = replay_reason(workspace, cmd, task_id, results_dir)
-        if reason:
-            return {"action": "skipped", "room": None, "reason": reason}
-        try:
-            made = cw.create(workspace, repo, label=cmd.get("label") or "", runtime=runtime)
-        except (cw.Refused, cw.sw.SpawnRefused, cw.CreatedUnrostered) as e:
-            raise AddRefused(str(e)) from e
-        _record_applied(workspace, {**cmd, "worker_id": made["worker_id"]}, task_id)
-    return {"action": "add", "room": None, "worker_id": made["worker_id"],
-            "label": cmd.get("label") or "",
-            "roster_version": made["roster_version"], "advertisement": made["advertisement"],
-            "delivery_dir": str(made.get("delivery_dir") or ""), "tmux": made.get("tmux") or {}}
+        rec = add_state(workspace, task_id)
+        if rec and rec.get("state") != "published":
+            _write_add_state(workspace, task_id, {**rec, "state": "published"})
+
+
+def _apply_add(workspace, cmd: dict, *, task_id, results_dir, repo, runtime) -> dict:
+    # creating → created → published, each durable before the next step, so a
+    # crash at any boundary replays to at most one worker and one reply.
+    if not task_id:
+        return {"action": "skipped", "room": None,
+                "reason": "no task id, so this command cannot be replay-gated"}
+    with _applied_locked(workspace):
+        rec = add_state(workspace, task_id)
+        state = (rec or {}).get("state")
+        if state == "published":
+            return {"action": "skipped", "room": None, "reason": "add already published"}
+        if state == "created":
+            return {"action": "add", "room": None, "replayed": True,
+                    **{k: rec.get(k) for k in _ADD_FIELDS}}
+        wid = add_worker_id(task_id)
+        label = cmd.get("label") or ""
+        made = None
+        if rec is None:
+            rd = _results_dir(workspace, results_dir)
+            found = ltp.find_result(rd, str(task_id))
+            if found is not None and read_ready_result(found) is not None:
+                return {"action": "skipped", "room": None,
+                        "reason": f"a completed result already exists for this task ({found.name})"}
+            _write_add_state(workspace, task_id,
+                             {"state": "creating", "worker_id": wid, "label": label})
+        else:  # "creating": the spawn may or may not have happened
+            try:
+                made = cw.adopt(workspace, wid)
+            except cw.CreatedUnrostered as e:
+                raise AddRefused(str(e)) from e
+        if made is None:
+            try:
+                made = cw.create(workspace, repo, label=label, runtime=runtime, worker_id=wid)
+            except (cw.Refused, cw.sw.SpawnRefused, cw.CreatedUnrostered) as e:
+                raise AddRefused(str(e)) from e
+        rec2 = {"state": "created", "worker_id": made["worker_id"], "label": label,
+                "roster_version": made["roster_version"], "advertisement": made["advertisement"],
+                "delivery_dir": str(made.get("delivery_dir") or ""), "tmux": made.get("tmux") or {}}
+        _write_add_state(workspace, task_id, rec2)
+    return {"action": "add", "room": None, **{k: rec2[k] for k in _ADD_FIELDS}}
 
 
 def apply(workspace, cmd: dict, *, task_id=None, results_dir=None,

@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
 import worker_picker_commands as wpc  # noqa: E402
@@ -143,14 +144,32 @@ def apply_picker(workspace, task_file, results_dir=None, *, repo=None, runtime=N
             return {"action": "add", "room": None, "deferred": True}
         out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
                         results_dir=results_dir, repo=repo, runtime=runtime) if cmd else None
-    except (pr.RosterError, OSError, ValueError, wpc.AddRefused) as e:
+    except wpc.AddRefused as e:
+        # The record says what was or was not made; a human finishes it.
+        print(f"pool_route_handler: add not applied: {e}", file=sys.stderr)
+        return {"action": "add", "room": None, "refused": True}
+    except (pr.RosterError, OSError, ValueError) as e:
         print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
         return None
     if out and out.get("action") == "add" and not out.get("deferred"):
+        stem = Path(task_file).stem
         rd = wpc._results_dir(workspace, results_dir)
-        _write_result(rd, Path(task_file).stem, _add_reply(out))
-        print(f"pool_route_handler: created worker {out['worker_id']} "
-              f"(roster v{out['roster_version']}); replied", file=sys.stderr)
+        try:
+            found = ltp.find_result(rd, stem)
+            body = read_ready_result(found) if found is not None else None
+            # A reply that already names the worker is out; anything else (none, or
+            # a generic failure notice) still owes the owner the worker's id.
+            if body is None or out["worker_id"] not in body:
+                _write_result(rd, stem, _add_reply(out))
+            wpc.mark_add_published(workspace, stem)
+        except OSError as e:
+            # The record is durable: the next run of this retained task restores it.
+            print(f"pool_route_handler: worker {out['worker_id']} exists but its reply "
+                  f"could not be published: {e}", file=sys.stderr)
+            return {**out, "publish_failed": True}
+        print(f"pool_route_handler: worker {out['worker_id']} "
+              f"(roster v{out['roster_version']}) {'restored' if out.get('replayed') else 'created'}; "
+              f"replied", file=sys.stderr)
         return out
     if out and out.get("action") == "skipped":
         print(f"pool_route_handler: picker command for {out['room']} not replayed: "
@@ -186,10 +205,12 @@ def main(argv=None) -> int:
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         picked = apply_picker(ws, args.task_file, args.results_dir, repo=args.repo,
                               runtime=args.runtime, probe=args.probe)
-        if picked and picked.get("room") is None and \
-                picked.get("action") in ("add", "skipped"):
-            # An add handled here, or one already handled: the core must not add again.
-            return 0
+        if picked and picked.get("room") is None and picked.get("action") in ("add", "skipped"):
+            # Refused → the core; unpublished → keep it from the core, fail loudly;
+            # handled (now or earlier) → never reaches the core a second time.
+            if picked.get("refused"):
+                return DECLINE
+            return MUST_HANDLE if picked.get("publish_failed") else 0
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:

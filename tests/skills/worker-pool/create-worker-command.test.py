@@ -47,7 +47,7 @@ class Base(unittest.TestCase):
         self.spawned = []
 
         def fake_spawn(workspace, repo, **kw):
-            wid = f"{len(self.spawned):032x}"
+            wid = kw.get("worker_id") or f"{len(self.spawned):032x}"
             self.spawned.append(wid)
             (Path(workspace) / "deliveries" / wid).mkdir(parents=True)
             (Path(workspace) / "state" / "workers" / wid).mkdir(parents=True)
@@ -262,6 +262,36 @@ class TestCreateIsTheCommandAsOneCall(Base):
         with self.assertRaises(cw.Refused):
             cw.create(str(self.ws), str(REPO), label="x")
         self.assertEqual(self.spawned, [])
+
+
+class TestAdoptFindsWhatAnInterruptedRunMade(Base):
+    def _probe(self, state):
+        real = sw.session_probe
+        sw.session_probe = lambda name, socket=None, runner=None: (state, "")
+        self.addCleanup(lambda: setattr(sw, "session_probe", real))
+
+    def test_create_uses_the_callers_worker_id(self):
+        out = cw.create(str(self.ws), str(REPO), label="x", worker_id="f" * 32)
+        self.assertEqual(out["worker_id"], "f" * 32)
+
+    def test_nothing_made_is_none(self):
+        self._probe("absent")
+        self.assertIsNone(cw.adopt(str(self.ws), "e" * 32))
+
+    def test_a_whole_worker_is_adopted(self):
+        made = cw.create(str(self.ws), str(REPO), label="x", worker_id="d" * 32)
+        self._probe("exists")
+        got = cw.adopt(str(self.ws), "d" * 32)
+        self.assertEqual(got["worker_id"], made["worker_id"])
+        self.assertEqual(got["roster_version"], made["roster_version"])
+        self.assertEqual(got["tmux"]["session_name"], sw.wi.tmux_session_name("d" * 32))
+
+    def test_a_rostered_worker_without_a_session_is_not_adopted(self):
+        cw.create(str(self.ws), str(REPO), label="x", worker_id="c" * 32)
+        self._probe("absent")
+        with self.assertRaises(cw.CreatedUnrostered) as c:
+            cw.adopt(str(self.ws), "c" * 32)
+        self.assertIn("half-made", str(c.exception))
 
 
 class TestARefusalNamesTheRetainedWorker(Base):

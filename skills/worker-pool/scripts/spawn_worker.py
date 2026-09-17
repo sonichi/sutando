@@ -209,7 +209,7 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
 
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
-          require_sentinel: bool = True, resume: str = "") -> dict:
+          require_sentinel: bool = True, resume: str = "", worker_id=None) -> dict:
     """Create the four parts, in an order where a failure leaves less behind.
 
     Identity first (a record with no process is inert), then the delivery folder,
@@ -235,7 +235,8 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
     # minting leaves a worker nothing in the roster knows about.
-    worker_id = resumed_id or wi.new_worker_id()
+    # A caller-named id lets a replay find what an interrupted run made.
+    worker_id = resumed_id or worker_id or wi.new_worker_id()
     # The ROSTER owns labels (worker_identity records lineage, not naming), so a
     # resume reads the owner's chosen name from there rather than re-deriving it.
     if resumed_id and not label:
