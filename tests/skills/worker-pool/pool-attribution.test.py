@@ -53,5 +53,12 @@ class AttributionStore(unittest.TestCase):
         self.assertIsNone(a.worker_for_task(self.ws, "task-2"))
 
 
+    def test_empty_task_id_is_not_attributed(self):
+        """No id, no attribution — and never a guess."""
+        with tempfile.TemporaryDirectory() as ws:
+            self.assertIsNone(a.worker_for_task(ws, ""))
+            self.assertFalse(a.record(ws, "", W))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO = Path(__file__).resolve().parent.parent
 _SRC = _REPO / "src" / "remote-gateway-bridge.py"
@@ -156,6 +157,23 @@ class AssignmentAttribution(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         (d / tid).write_text("core")
         self.assertEqual(self.mod._assigned_worker(tid), "")
+
+    def test_unreadable_record_is_refused(self):
+        """An OSError from the stat is NO READING, not "never assigned" — the
+        distinction fail-closed depends on, so it is exercised, not asserted."""
+        tid = "task-3344556677889900"
+        self._assign(tid, W1)
+        with mock.patch.object(self.mod.os, "lstat",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.mod._assigned_worker(tid), "")
+
+    def test_unreadable_content_is_refused(self):
+        """Same for a record that stats fine and cannot be read."""
+        tid = "task-4455667788990011"
+        self._assign(tid, W1)
+        with mock.patch.object(Path, "read_text",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.mod._assigned_worker(tid), "")
 
     def test_traversal_is_refused(self):
         self.assertEqual(self.mod._assigned_worker("../../etc/passwd"), "")
