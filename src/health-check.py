@@ -6825,16 +6825,18 @@ def check_gateway_bridge() -> "dict | None":
     if not configured:
         return None
     try:
-        gw = subprocess.run(
-            # remote-relay-bridge.py is a shipped compat stub running the same
-            # client, so an instance under the old name is a real duplicate.
-            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+        # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
+        # apart. The relay name is a compat stub, so it is a real duplicate.
+        pids, probe_ok = probe_pids(r"remote-(gateway|relay)-bridge\.py$")
     except Exception:
-        pids = []
+        pids, probe_ok = [], False
     if not pids:
+        if not probe_ok:
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": "process probe failed — gateway bridge state unknown",
+            }
         return {
             "name": "gateway-bridge",
             "status": "warn",
