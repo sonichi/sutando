@@ -196,6 +196,18 @@ class GluedBranchCommand(unittest.TestCase):
         self.assertEqual(program_python_args(
             "if true; then :; else python3 packages/x/test_dead.py; fi\n"), [])
 
+    def test_a_nested_if_glued_to_the_outer_then_is_not_named(self):
+        """keweichen's round-3 finding on #4202: the outer `then`'s glued
+        remainder can itself be a whole `if` statement, whose own dead
+        branch must still be dropped, not credited as a plain command."""
+        self.assertEqual(program_python_args(
+            "if true; then if false; then python3 packages/x/test_dead.py; fi; fi\n"), [])
+
+    def test_a_nested_ifs_else_glued_to_the_outer_then_is_named(self):
+        self.assertEqual(program_python_args(
+            "if true; then if false; then python3 packages/x/dead.py; "
+            "else python3 packages/x/live.py; fi; fi\n"), ["packages/x/live.py"])
+
 
 class MultiLinePrograms(unittest.TestCase):
     """keweichen's third [P2] on #4202: the AND-OR state `_segments()` tracks
@@ -264,6 +276,15 @@ class PythonArgsScriptOperand(unittest.TestCase):
         """The value itself must not be credited even when it ends in .py —
         `-c pass` means no script ever loads."""
         self.assertEqual(python_args("python3 -X packages/x/test_x.py -c pass"), [])
+
+    def test_an_attached_dash_w_value_is_still_skipped_as_one_token(self):
+        """keweichen's round-3 finding: an ATTACHED -W/-X value (`-Wmodule`)
+        must not be misread as a `-c`/`-m` cluster just because the value
+        happens to contain the letter c or m."""
+        self.assertEqual(python_args("python3 -Wmodule packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -Xtracemalloc packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
 
 
 if __name__ == "__main__":

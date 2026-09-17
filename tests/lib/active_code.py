@@ -111,6 +111,8 @@ def _consumes_script(tok: str) -> bool:
     if not tok.startswith("-") or tok.startswith("--") or tok == "-":
         return False
     for ch in tok[1:]:
+        if ch in "WX":
+            return False  # owns an attached value, not a cluster continuation
         if ch in "cm":
             return True
         if not ch.isalpha():
@@ -207,9 +209,14 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
     SAME segment (`if true; then python3 x.py; fi`) -- peel the keyword and
     keep analyzing the remainder under the branch's own drop state, rather
     than discarding the whole segment (measured false negative: qingyun-wu +
-    keweichen, 2026-09-17, both `then` and `else` glued forms)."""
-    out, stack = [], []
-    for seg in segments:
+    keweichen, 2026-09-17, both `then` and `else` glued forms). A glued
+    remainder can itself open a NESTED `if` on the same split ('then if
+    false; ...') -- re-dispatch it through this same loop rather than
+    crediting it as a plain command, or the nested branch's own drop state
+    is never computed (measured: keweichen, 2026-09-17)."""
+    out, stack, pending = [], [], list(segments)
+    while pending:
+        seg = pending.pop(0)
         toks = seg.split(maxsplit=1)
         head = toks[0] if toks else ""
         rest = toks[1] if len(toks) > 1 else ""
@@ -223,13 +230,13 @@ def _filter_dead_branches(segments: list[str]) -> list[str]:
             continue
         if head == "then" and stack:
             if rest and not stack[-1]["drop"]:
-                out.append(rest)
+                pending.insert(0, rest)
             continue
         if head == "else" and stack:
             frame, parent_drop = stack[-1], (stack[-2]["drop"] if len(stack) > 1 else False)
             frame["drop"] = True if frame["kind"] == "true" else parent_drop
             if rest and not frame["drop"]:
-                out.append(rest)
+                pending.insert(0, rest)
             continue
         if head == "fi" and stack:
             stack.pop()
