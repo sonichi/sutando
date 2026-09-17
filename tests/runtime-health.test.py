@@ -53,9 +53,8 @@ WORKING_PANE = """\
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
 
-# 1b) _tmux_socket(): the probe must read the socket the core LAUNCHED on, not the
-#     import-time default. The launcher overrides SUTANDO_TMUX_SOCKET and a detached
-#     probe does not inherit it, so guessing reports a live core as offline.
+# 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
+#     import-time default reports a live core as offline. Prefer the recorded socket.
 _sock_tmp = tempfile.mkdtemp()
 _cores = os.path.join(_sock_tmp, "state", "cores")
 os.makedirs(_cores, exist_ok=True)
