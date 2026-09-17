@@ -679,6 +679,7 @@ class TestHeartbeatCli(unittest.TestCase):
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         self.assertEqual(data["schema_version"], 4)
 
+    @unittest.skipIf(os.name == "nt", "POSIX signal handoff")
     def test_stop_leaves_a_peer_workspaces_writer_running(self):
         # Two cores on one host, one checkout, two workspaces: --stop from A ends A's recorded writer and
         # never B's, whose record lives beside B's .alive. The control runs --stop from B and ends it.
