@@ -529,6 +529,12 @@ mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
 PID_FILE="$(sentinel_path_for "$STATE_DIR")"
+# An empty path is not a place to record this watcher, and an unrecorded
+# watcher is one no signaller may stop: refuse by name, not at the write.
+if [ -z "$PID_FILE" ]; then
+  echo "watch-tasks-stream: could not resolve the sentinel path under $STATE_DIR; refusing to start unrecorded" >&2
+  exit 1
+fi
 # The record a signaller checks this process against. A bare pid proves nothing:
 # a dead watcher's number is reissued and the next holder answers identically.
 WATCHER_INSTANCE="$(sentinel_instance_from_path "$PID_FILE")"
