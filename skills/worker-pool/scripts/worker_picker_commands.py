@@ -355,8 +355,8 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
 
 
 def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | None":
-    """Apply a parsed pin or unpin AND publish it: binding, roster and the
-    advertisement in one call, so the new binding is on the wire without
+    """Apply a parsed pin or unpin: binding, roster and (through the roster's
+    own writer) the advertisement, so the new binding is on the wire without
     waiting for another task. `add` is create_worker's and returns None.
 
     `task_id` is required for a pin or unpin: without it the call cannot be
@@ -381,9 +381,9 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
             roster = pr.bind_room(workspace, cmd["room"], workers[0])
         else:
             roster = pr.unbind_room(workspace, cmd["room"])
-        path = pa.write_advertisement(workspace)
-        # Recorded only once the mutation and its publication both landed, so a
-        # failure leaves no ledger entry to suppress the retry.
+        # bind/unbind end in a compile, and the compile publishes; a publish
+        # failure raises out of them, so nothing below records a half-applied pin.
+        path = pa.advertisement_path(workspace)
         _record_applied(workspace, cmd, task_id)
     return {"action": action, "room": cmd["room"], "roster_version": roster.get("version"),
             "advertisement": str(path)}

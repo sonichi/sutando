@@ -8298,6 +8298,40 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
     return out
 
 
+def check_pool_advertisement() -> dict:
+    """The picker follows the roster only through the advertisement the bridge
+    sends; a roster version that file does not carry is a pin nobody was told."""
+    name = "pool-advertisement"
+    roster_p = WORKSPACE_DIR / "state" / "roster.json"
+    ad_p = WORKSPACE_DIR / "state" / "pool-advertisement.json"
+    if not roster_p.exists():
+        return {"name": name, "status": "ok", "detail": "no pool roster"}
+    try:
+        roster = json.loads(roster_p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn", "detail": f"roster.json unreadable: {e}"}
+    rv = roster.get("version")
+    rooms = len(roster.get("bindings") or {})
+    repair = "python3 skills/worker-pool/scripts/pool_advertise.py --write"
+    try:
+        ad = json.loads(ad_p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"name": name, "status": "warn",
+                "detail": f"roster v{rv} ({rooms} binding(s)) has no advertisement — "
+                          f"the picker was never told; repair: {repair}"}
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn",
+                "detail": f"pool-advertisement.json unreadable: {e}; repair: {repair}"}
+    workers = ad.get("workers") if isinstance(ad, dict) else None
+    av = workers.get("roster_version") if isinstance(workers, dict) else None
+    if av != rv:
+        return {"name": name, "status": "warn",
+                "detail": f"binding unpublished: advertisement carries roster v{av}, "
+                          f"roster is v{rv} ({rooms} binding(s)); repair: {repair}"}
+    return {"name": name, "status": "ok",
+            "detail": f"advertisement matches roster v{rv} ({rooms} binding(s))"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -12981,6 +13015,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_pool_advertisement())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
