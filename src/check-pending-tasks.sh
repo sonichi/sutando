@@ -20,11 +20,9 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO_DIR/scripts/git-binary.sh"
 GIT_BIN="$(resolve_git)"
 if [ -n "$GIT_BIN" ]; then
-  # Both identity probes must walk the FULL ancestor chain and speak English:
-  # a caller-inherited GIT_CEILING_DIRECTORIES truncates discovery early and
-  # a translated locale renames the diagnostic line 52 matches on -- either
-  # one alone can turn a real, still-ours directory into a false "absent".
-  GIT_PROBE_ENV="env -u GIT_CEILING_DIRECTORIES LC_ALL=C LANGUAGE=C"
+  # A caller-inherited ceiling, repository override, or locale can each turn
+  # a real, still-ours directory into a false "different repo" or "absent".
+  GIT_PROBE_ENV="env -u GIT_CEILING_DIRECTORIES -u GIT_DIR -u GIT_COMMON_DIR LC_ALL=C LANGUAGE=C"
   # --path-format=absolute (git >= 2.31): a plain rev-parse, run from a
   # different cwd, can print a path relative to <dir> instead of to the caller.
   CWD_COMMON_DIR="$($GIT_PROBE_ENV "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"

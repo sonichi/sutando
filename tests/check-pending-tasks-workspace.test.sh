@@ -540,10 +540,8 @@ else
 fi
 rm -rf "$OUTER_REPO"
 
-# 12e. Same no-own-.git subdir as case 12, but the CALLER'S environment
-# already carries a GIT_CEILING_DIRECTORIES that stops discovery exactly at
-# the outer repo -- both probes then answer "not a git repository" like a
-# genuinely different repo would, though this child IS still ours.
+# 12e. Same no-own-.git subdir as case 12, but a caller-inherited ceiling
+# makes both probes answer "not a git repository" though this child IS ours.
 OUTER_REPO="$(mktemp -d)"
 _git_fixture_repo "$OUTER_REPO"
 NESTED_REPO="$OUTER_REPO/child"
@@ -571,9 +569,8 @@ else
 fi
 rm -rf "$OUTER_REPO"
 
-# 12f. A genuinely non-Git bundle in a foreign Git cwd (case 9's fixture),
-# but git's diagnostic is TRANSLATED for the caller's locale -- the guest
-# carve-out must not go blind just because the caller isn't LC_ALL=C.
+# 12f. Case 9's fixture, but git's diagnostic is TRANSLATED for the caller's
+# locale -- the guest carve-out must not go blind over a non-C LC_ALL.
 LOC_BUNDLE="$(mktemp -d)"
 mkdir -p "$LOC_BUNDLE/src" "$LOC_BUNDLE/scripts" "$LOC_BUNDLE/workspace/tasks" "$LOC_BUNDLE/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$LOC_BUNDLE/src/"
@@ -608,14 +605,43 @@ if [ -z "$("$TEST_GIT" -C "$LOC_FOREIGN" rev-parse --path-format=absolute --git-
   bad "translated not-a-repo diagnostic -> guest carve-out still applies" \
     "fixture bug: LOC_FOREIGN has no resolvable git identity, this case tests nothing"
 else
+  LOC_ERRFILE="$(mktemp)"
   LOC_OUT="$(cd "$LOC_FOREIGN" && LC_ALL=fr_FR.UTF-8 PATH="$LOC_STUBDIR:$PATH" \
-    bash "$LOC_BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+    bash "$LOC_BUNDLE/src/$(basename "$HOOK")" 2>"$LOC_ERRFILE")"
   case "$LOC_OUT" in
     '{}') ok "translated not-a-repo diagnostic -> guest carve-out still applies" ;;
-    *) bad "translated not-a-repo diagnostic -> guest carve-out still applies" "got: ${LOC_OUT:0:160}" ;;
+    *) bad "translated not-a-repo diagnostic -> guest carve-out still applies" \
+      "got stdout: ${LOC_OUT:0:160}; stderr: $(cat "$LOC_ERRFILE" | head -c 160)" ;;
   esac
+  rm -f "$LOC_ERRFILE"
 fi
 rm -rf "$LOC_BUNDLE" "$LOC_FOREIGN" "$LOC_STUBDIR"
+
+# 12g/12h. A foreign repo whose caller inherited GIT_DIR/GIT_COMMON_DIR
+# pointed at THIS repo -- either alone must not answer with our identity.
+printf 'id: probe\ntask: git-dir-env-inheritance\n' > "$WS/tasks/$PROBE"
+THIS_COMMON_DIR="$("$TEST_GIT" -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+GDE_REPO="$(mktemp -d)"
+_git_fixture_repo "$GDE_REPO"
+if [ -z "$THIS_COMMON_DIR" ]; then
+  bad "inherited GIT_DIR -> still a guest, not blocked" \
+    "fixture bug: could not resolve this repo's own common dir"
+  bad "inherited GIT_COMMON_DIR -> still a guest, not blocked" \
+    "fixture bug: could not resolve this repo's own common dir"
+else
+  GDE_OUT="$(cd "$GDE_REPO" && GIT_DIR="$THIS_COMMON_DIR" bash "$HOOK" 2>&1)"
+  case "$GDE_OUT" in
+    '{}') ok "inherited GIT_DIR -> still a guest, not blocked" ;;
+    *) bad "inherited GIT_DIR -> still a guest, not blocked" "got: ${GDE_OUT:0:160}" ;;
+  esac
+  GCDE_OUT="$(cd "$GDE_REPO" && GIT_COMMON_DIR="$THIS_COMMON_DIR" bash "$HOOK" 2>&1)"
+  case "$GCDE_OUT" in
+    '{}') ok "inherited GIT_COMMON_DIR -> still a guest, not blocked" ;;
+    *) bad "inherited GIT_COMMON_DIR -> still a guest, not blocked" "got: ${GCDE_OUT:0:160}" ;;
+  esac
+fi
+rm -rf "$GDE_REPO"
+rm -f "$WS/tasks/$PROBE"
 
 # 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
 # -- `-e` alone would misread a broken checkout as an intentional bundle.
