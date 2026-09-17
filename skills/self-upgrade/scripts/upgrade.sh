@@ -125,8 +125,10 @@ fi
 : > "$LOG" || { echo "self-upgrade: cannot write restart log: $LOG" >&2; exit 2; }
 : > "$DONE_MARKER" || { echo "self-upgrade: cannot write completion marker: $DONE_MARKER" >&2; exit 2; }
 CORE_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# An upgrade exists to put every service on new code, so it asks for the host-wide scope
+# explicitly; the default core scope stops only this instance's own watcher and heartbeat.
 printf -v RESTART_COMMAND \
-  'export SUTANDO_TMUX_SOCKET=%q SUTANDO_TMUX_SESSION=%q; cd %q && bash %q >> %q 2>&1; rc=$?; printf "%%s\n" "$$" > %q; printf "self-upgrade: restart exit=%%s\n" "$rc" >> %q; exec sleep 2147483647' \
+  'export SUTANDO_TMUX_SOCKET=%q SUTANDO_TMUX_SESSION=%q; cd %q && bash %q --scope all >> %q 2>&1; rc=$?; printf "%%s\n" "$$" > %q; printf "self-upgrade: restart exit=%%s\n" "$rc" >> %q; exec sleep 2147483647' \
   "$TMUX_SOCKET" "$CORE_SESSION" "$REPO" "$REPO/src/restart.sh" "$LOG" "$DONE_MARKER" "$LOG"
 "$TMUX_BIN" -S "$TMUX_SOCKET" new-session -d -s "$SERVICE_SESSION" "$RESTART_COMMAND" ||
   { echo "self-upgrade: durable restart handoff failed" >&2; exit 2; }
