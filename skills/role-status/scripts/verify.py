@@ -36,9 +36,10 @@ stdout carries
 whenever the evidence was readable (rows as submitted, distinct actors among the
 verified rows); with no --out the verified JSON array follows it.
 
-Exit 0: verified JSON written.  1: refused on coverage, nothing written.
-2: cannot answer (unreadable input, structured evidence unreadable/ambiguous,
-no event ownership resolvable, judgment is not a JSON array, --out unwritable).
+Exit 0: verified JSON written (UTF-8, whatever the locale).  1: refused on
+coverage, nothing written.  2: cannot answer (unreadable input, structured
+evidence unreadable/ambiguous, no event ownership resolvable, judgment is not a
+JSON array, result not serializable, --out unwritable).
 This script never writes into results/ and knows nothing about result markers.
 """
 import argparse
@@ -229,12 +230,12 @@ def verify_rows(rows: list, known_actors: Set[str], known_events: Set[str],
     return verified
 
 
-def write_atomic(path: str, payload: str) -> None:
+def write_atomic(path: str, data: bytes) -> None:
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(prefix=".role-status-verify.", dir=d)
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -322,15 +323,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write((judgment_error if judgment_error and outcome.stats else outcome.reason) + "\n")
         return outcome.rc
 
-    payload = json.dumps(outcome.verified, indent=2, ensure_ascii=False) + "\n"
+    try:
+        data = (json.dumps(outcome.verified, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as e:
+        sys.stderr.write("cannot answer: result not serializable: %s\n" % e)
+        return EXIT_CANNOT
     if args.out:
         try:
-            write_atomic(args.out, payload)
+            write_atomic(args.out, data)
         except OSError as e:
             sys.stderr.write("cannot answer: --out unwritable: %s\n" % e)
             return EXIT_CANNOT
     else:
-        sys.stdout.write(payload)
+        # Bytes, so the array survives an ASCII stdout; a redirected StringIO has no buffer.
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is None:
+            sys.stdout.write(data.decode("utf-8"))
+        else:
+            sys.stdout.flush()
+            buf.write(data)
+            buf.flush()
     return EXIT_OK
 
 

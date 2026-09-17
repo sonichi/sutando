@@ -18,6 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 SKILL = REPO / "skills" / "role-status"
 PUBLISH = SKILL / "scripts" / "publish.py"
+PUBLISH_SH = SKILL / "scripts" / "publish.sh"
 
 _spec = importlib.util.spec_from_file_location("role_status_publish", PUBLISH)
 pub = importlib.util.module_from_spec(_spec)
@@ -72,6 +73,10 @@ def run(task_text, judgment_text, *extra, workspace=True, subprocess_smoke=False
         return rc, so, se, (out.read_text() if out.is_file() else None), names
 
 
+def claim_of(ws, task_name="task-role-status-v1-0000-a2.txt"):
+    return ws / "state" / "role-status" / "claims" / Path(task_name).stem
+
+
 # (1) a full judgment is published: [no-send] first line, verified array, nothing else in results/
 rc, so, se, result, names = run(TASK, FULL)
 check(rc == 0, "publish: exit 0")
@@ -81,6 +86,21 @@ check(names == ["task-role-status-v1-0000-a2.txt"], "publish: no stray temp file
 check(so.splitlines()[0] == "rows=2 distinct_actors=2 actors=2 actors_with_events=2 min_rows=1"
       and so.splitlines()[1].startswith("published "), "publish: stats line then the published path")
 check(se == "", "publish: stderr silent")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(FULL))
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc = pub.main([str(task), str(j), "--workspace", str(ws)])
+    check(rc == 0 and claim_of(ws).is_file()
+          and claim_of(ws).read_text() == str(ws / "results" / "task-role-status-v1-0000-a2.txt") + "\n",
+          "publish: the claim state/role-status/claims/<task-id> is created and names the result path")
+    check(sorted(p.name for p in (ws / "state" / "role-status" / "claims").iterdir()) == ["task-role-status-v1-0000-a2"],
+          "publish: exactly one claim file, no temp file beside it")
 
 # the same through the real entry point
 rc, so, se, result, names = run(TASK, FULL, subprocess_smoke=True)
@@ -123,9 +143,9 @@ with tempfile.TemporaryDirectory() as td:
     so_buf, se_buf = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
-    check(rc == 2 and "result already published" in se_buf.getvalue()
+    check(rc == 2 and "result already published: " in se_buf.getvalue()
           and (ws / "results" / "task-role-status-v1-0000-a2.txt").read_text() == "[no-send]\n[]\n",
-          "a result already published is never overwritten: exit 2")
+          "a result already published (no claim on file) is never overwritten: exit 2")
 # results/ unwritable: a regular file sits where the directory should be
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td)
@@ -161,8 +181,12 @@ with tempfile.TemporaryDirectory() as td:
             rc = pub.main([str(task), str(j)])
     finally:
         pub.resolve_workspace = real
-    check(rc == 0 and seen == [1] and (ws / "results" / "task-role-status-v1-0000-a1.txt").is_file(),
-          "without --workspace the result lands under resolve_workspace()")
+    check(rc == 0 and seen == [1] and (ws / "results" / "task-role-status-v1-0000-a1.txt").is_file()
+          and claim_of(ws, "task-role-status-v1-0000-a1.txt").is_file(),
+          "without --workspace the result and the claim land under resolve_workspace()")
+check(pub.claim_path(Path("/w"), "/x/tasks/task-role-status-v1-0000-a3.txt")
+      == Path("/w") / "state" / "role-status" / "claims" / "task-role-status-v1-0000-a3",
+      "claim_path: <workspace>/state/role-status/claims/<task-file-stem>")
 
 # (7) delegation pin: every decision is verify.verify's; publish only acts on its outcome
 calls = []
@@ -199,8 +223,11 @@ skill_md = (SKILL / "SKILL.md").read_text()
 fm = re.match(r"---\n(.*?)\n---\n", skill_md, re.S)
 check(fm is not None and re.search(r"^name: role-status$", fm.group(1), re.M)
       and re.search(r"^description: \S", fm.group(1), re.M), "SKILL.md frontmatter: name + description")
-check("python3 skills/role-status/scripts/publish.py <task-file> <judgment.json>" in skill_md,
-      "SKILL.md names the publish.py invocation")
+check("bash skills/role-status/scripts/publish.sh <task-file> <judgment.json>" in skill_md,
+      "SKILL.md names the publish.sh invocation")
+check(not re.search(r"(^|[\s`(])python3\s", skill_md, re.M), "SKILL.md invokes no bare python3")
+check("state/role-status/claims/<task-id>" in skill_md and "never removed" in skill_md
+      and "by hand" in skill_md, "SKILL.md names the claim path, its retention and hand removal")
 check(all(re.search(r"^\s*- `%s` — " % code, skill_md, re.M) for code in ("0", "1", "2")),
       "SKILL.md lists the three exit codes")
 check("tasks/task-role-status-v1-" in skill_md and "[no-send]" in skill_md
@@ -208,7 +235,7 @@ check("tasks/task-role-status-v1-" in skill_md and "[no-send]" in skill_md
 check("bare JSON array" in skill_md.replace("**", ""), "SKILL.md asks the delegate for a bare JSON array")
 
 # (9) exclusive publication: two publishers past every check race at the writer's
-# commit point (os.link); exactly one wins, the loser never touches the result.
+# commit point (the O_EXCL claim); exactly one wins, the loser never touches the result.
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td) / "ws"
     (ws / "tasks").mkdir(parents=True)
@@ -231,18 +258,21 @@ with tempfile.TemporaryDirectory() as td:
         go("b", j2)
     check([rcs["a"], rcs["b"]] == [0, 2] and out.read_text().endswith(json.dumps(FULL, indent=2) + "\n"),
           "sequential control: rcs [0, 2], the first payload stays")
+    check("cannot answer: result already published (claim %s)" % claim_of(ws) in se_buf.getvalue(),
+          "sequential control: the loser is refused on the claim, which names its path")
     out.unlink()
+    claim_of(ws).unlink()
     rcs.clear()
 
     barrier = threading.Barrier(2, timeout=10)
-    real_link = os.link
+    real_claim = pub.claim_exclusive
 
-    def link_after_barrier(src, dst, *a, **k):
-        barrier.wait()                      # both temp files written, neither linked yet
-        return real_link(src, dst, *a, **k)
+    def claim_after_barrier(path, note):
+        barrier.wait()                      # both temp files written, neither claimed yet
+        return real_claim(path, note)
 
     so_buf, se_buf = io.StringIO(), io.StringIO()
-    os.link = link_after_barrier
+    pub.claim_exclusive = claim_after_barrier
     try:
         with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
             threads = [threading.Thread(target=go, args=("a", j1)), threading.Thread(target=go, args=("b", j2))]
@@ -251,7 +281,7 @@ with tempfile.TemporaryDirectory() as td:
             for th in threads:
                 th.join()
     finally:
-        os.link = real_link
+        pub.claim_exclusive = real_claim
     winners = [n for n, rc in rcs.items() if rc == 0]
     check(sorted(rcs.values()) == [0, 2], "raced: exactly one rc 0 and one rc 2 (%r)" % rcs)
     check(len(winners) == 1 and out.read_text()
@@ -262,19 +292,170 @@ with tempfile.TemporaryDirectory() as td:
           "raced: one `published` line, one `result already published` refusal")
     check(sorted(p.name for p in (ws / "results").iterdir()) == ["task-role-status-v1-0000-a2.txt"],
           "raced: no stray temp file left in results/")
-# the writer itself: an existing target is never replaced, the temp file never lingers
+# the writer itself: an existing claim or target is never replaced, the temp file never lingers
 with tempfile.TemporaryDirectory() as td:
     target = Path(td) / "r.txt"
     target.write_text("first")
-    check(pub.create_exclusive(str(target), "second") is False and target.read_text() == "first"
-          and sorted(p.name for p in Path(td).iterdir()) == ["r.txt"],
-          "create_exclusive on an existing target: False, content kept, no temp file")
-    check(pub.create_exclusive(str(Path(td) / "n.txt"), "new") is True
-          and (Path(td) / "n.txt").read_text() == "new"
-          and sorted(p.name for p in Path(td).iterdir()) == ["n.txt", "r.txt"],
-          "create_exclusive on a fresh target: True, written, no temp file")
+    c1, c2 = str(Path(td) / "c1"), str(Path(td) / "c2")
+    check(pub.create_exclusive(str(target), b"second", c1) == "exists" and target.read_text() == "first"
+          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "r.txt"],
+          "create_exclusive on an existing target: 'exists', content kept, no temp file")
+    check(pub.create_exclusive(str(Path(td) / "n.txt"), b"new", c2) == "published"
+          and (Path(td) / "n.txt").read_bytes() == b"new"
+          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "c2", "n.txt", "r.txt"],
+          "create_exclusive on a fresh target: 'published', written, no temp file")
+    check(pub.create_exclusive(str(Path(td) / "m.txt"), b"m", c2) == "claimed"
+          and not (Path(td) / "m.txt").exists()
+          and sorted(p.name for p in Path(td).iterdir()) == ["c1", "c2", "n.txt", "r.txt"],
+          "create_exclusive under an existing claim: 'claimed', the target is never created")
 check("write_atomic" not in src and "os.replace" not in src,
       "publish.py's production write is the exclusive one, never a replace")
+
+# (10) the claim outlives the result: after the [no-send] consumer's archive rename
+# (task-bridge archiveFile) a second publisher is still refused, the archive untouched.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j1, j2 = Path(td) / "j1.json", Path(td) / "j2.json"
+    j1.write_text(json.dumps(FULL))
+    j2.write_text(json.dumps(FULL[::-1]))
+    live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    archived = ws / "results" / "archive" / "2026-09" / "task-role-status-v1-0000-a2.txt"
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc1 = pub.main([str(task), str(j1), "--workspace", str(ws)])
+        archived.parent.mkdir(parents=True)
+        os.rename(str(live), str(archived))          # the consumer's archive step
+        rc2 = pub.main([str(task), str(j2), "--workspace", str(ws)])
+    first = "[no-send]\n" + json.dumps(FULL, indent=2, ensure_ascii=False) + "\n"
+    check([rc1, rc2] == [0, 2], "archive interleave: rcs [0, 2] (%r)" % [rc1, rc2])
+    check("cannot answer: result already published (claim %s)" % claim_of(ws) in se_buf.getvalue(),
+          "archive interleave: the second publisher is refused on the claim")
+    check(archived.read_text() == first and not live.exists()
+          and sorted(p.name for p in (ws / "results").iterdir()) == ["archive"],
+          "archive interleave: archived payload unchanged, no new live result, no temp file")
+    check(so_buf.getvalue().count("published ") == 1, "archive interleave: exactly one `published` line")
+    # (c) a fresh task id with no claim publishes beside it
+    task3 = ws / "tasks" / "task-role-status-v1-0000-a3.txt"
+    task3.write_text(TASK)
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc3 = pub.main([str(task3), str(j2), "--workspace", str(ws)])
+    check(rc3 == 0 and (ws / "results" / "task-role-status-v1-0000-a3.txt").is_file()
+          and claim_of(ws, "task-role-status-v1-0000-a3.txt").is_file(),
+          "a fresh task id with no claim publishes; the a2 claim does not bar a3")
+# (d) a stale claim with no result anywhere still refuses: the claim is the record of
+# truth (the result may have been archived or removed); recovery is removing it by hand.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(FULL))
+    claim_of(ws).parent.mkdir(parents=True)
+    claim_of(ws).write_text("stale\n")
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc = pub.main([str(task), str(j), "--workspace", str(ws)])
+    check(rc == 2 and "result already published (claim " in se_buf.getvalue()
+          and sorted(p.name for p in (ws / "results").iterdir()) == [],
+          "a stale claim with no result anywhere: exit 2, nothing written (results/ empty, no temp file)")
+    check(claim_of(ws).read_text() == "stale\n", "a stale claim is left exactly as found")
+    claim_of(ws).unlink()                            # the documented hand recovery
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc = pub.main([str(task), str(j), "--workspace", str(ws)])
+    check(rc == 0 and (ws / "results" / "task-role-status-v1-0000-a2.txt").is_file(),
+          "positive control: with the claim removed by hand the same publish lands")
+
+# (11) UTF-8 output whatever the locale: a verifier-accepted non-ASCII subject_id and
+# row detail survive LC_ALL=C PYTHONUTF8=0 through the real entry point.
+C_ENV = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+C_ENV.update({"LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0"})
+UNI = [{"actor_id": ALICE, "working_event_ids": [], "detail": "détail — 工作中",
+        "blocked_items": [{"subject_id": "sujet:é✓", "evidence_event_ids": [E_A], "reason_code": "waiting_for_review"}]},
+       {"actor_id": BOB, "working_event_ids": [E_B], "blocked_items": []}]
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(UNI))
+    p = subprocess.run([sys.executable, str(PUBLISH), str(task), str(j), "--workspace", str(ws)],
+                       capture_output=True, env=C_ENV)
+    out = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    check(p.returncode == 0 and out.is_file() and "Traceback" not in p.stderr.decode("utf-8", "replace"),
+          "LC_ALL=C: a non-ASCII subject_id publishes, rc 0, no traceback (stderr=%r)" % p.stderr[:200])
+    body = out.read_bytes().decode("utf-8")
+    check(json.loads(body.split("\n", 1)[1]) == UNI, "LC_ALL=C: the result decodes as UTF-8 with every character intact")
+    check("sujet:é✓".encode("utf-8") in out.read_bytes(), "LC_ALL=C: the bytes on disk are UTF-8, not escapes")
+# a verified array that cannot be encoded: a lone surrogate the JSON parser accepts
+# (`"\ud800"`) is exit 2, nothing written -- no result, no claim.
+rc, so, se, result, names = run(TASK, '[{"actor_id": "%s", "working_event_ids": ["%s"], "blocked_items": [], "detail": "\\ud800"}]' % (ALICE, E_A))
+check(rc == 2 and "cannot answer: result not serializable" in se and result is None and names == [],
+      "unencodable verified array: exit 2 `result not serializable`, nothing written")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text('[{"actor_id": "%s", "working_event_ids": ["%s"], "blocked_items": [], "detail": "\\ud800"}]' % (ALICE, E_A))
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        rc = pub.main([str(task), str(j), "--workspace", str(ws)])
+    check(rc == 2 and not (ws / "state").exists() and not (ws / "results").exists(),
+          "unencodable verified array: no claim and no results/ created")
+check("fdopen(fd, \"w\")" not in src and 'fdopen(fd, "wb")' in src,
+      "publish.py writes bytes it encoded as UTF-8 itself, never a locale-default text writer")
+
+# (12) the launcher: publish.sh runs publish.py through scripts/python-binary.sh's
+# resolve_python, never through a bare PATH python3.
+check(PUBLISH_SH.is_file() and os.access(str(PUBLISH_SH), os.X_OK), "publish.sh exists and is executable")
+sh_src = PUBLISH_SH.read_text()
+check("python-binary.sh" in sh_src and "require_python" in sh_src and 'exec "$_py"' in sh_src
+      and not re.search(r'exec\s+(?!"\$_py")', sh_src) and not re.search(r"/\S*bin/python", sh_src),
+      "publish.sh sources the resolver and execs only its answer; no interpreter path is hardcoded")
+with tempfile.TemporaryDirectory() as td:
+    stub_dir = Path(td) / "bin"
+    stub_dir.mkdir()
+    marker = Path(td) / "stub-ran"
+    stub = stub_dir / "python3"
+    stub.write_text("#!/bin/sh\necho stub >> '%s'\nexit 1\n" % marker)
+    stub.chmod(0o755)
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(FULL))
+    base_env = {k: v for k, v in os.environ.items() if k not in ("SUTANDO_PY", "PYTHONPATH")}
+    # control: with SUTANDO_PY unset the resolver WOULD hand this PATH the stub
+    probe = subprocess.run(["/bin/bash", "-c", ". '%s/scripts/python-binary.sh'; resolve_python '%s'" % (REPO, REPO)],
+                           capture_output=True, text=True, env={**base_env, "PATH": str(stub_dir)})
+    check(probe.stdout.strip() == str(stub) and not marker.exists(),
+          "control: on this PATH resolve_python names the stub (without executing it)")
+    p = subprocess.run(["/bin/bash", str(PUBLISH_SH), str(task), str(j), "--workspace", str(ws)],
+                       capture_output=True, text=True,
+                       env={**base_env, "PATH": str(stub_dir), "SUTANDO_PY": sys.executable})
+    check(p.returncode == 0 and (ws / "results" / "task-role-status-v1-0000-a2.txt").is_file()
+          and "published " in p.stdout, "publish.sh: publishes through the resolved interpreter (rc 0)")
+    check(not marker.exists(), "publish.sh: the PATH python3 stub never executed")
+    # negative: nothing resolves -> exit 2 with the message, nothing written
+    (ws / "results" / "task-role-status-v1-0000-a2.txt").unlink()
+    claim_of(ws).unlink()
+    empty = Path(td) / "empty"
+    empty.mkdir()
+    p = subprocess.run(["/bin/bash", str(PUBLISH_SH), str(task), str(j), "--workspace", str(ws)],
+                       capture_output=True, text=True, env={**base_env, "PATH": str(empty)})
+    check(p.returncode == 2 and "no runnable python3" in p.stderr and "nothing published" in p.stderr,
+          "publish.sh with no resolvable interpreter: exit 2 with the message (stderr=%r)" % p.stderr[:300])
+    check(not (ws / "results" / "task-role-status-v1-0000-a2.txt").exists() and not claim_of(ws).exists()
+          and not marker.exists(), "publish.sh with no resolvable interpreter: nothing written, no stub run")
 
 print()
 print("checks: %d" % CHECKS)

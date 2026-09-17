@@ -6,17 +6,21 @@
 
 Reads the task file and the judgment (a leading `[no-send]` line the model may
 have added is dropped), verifies the judgment in-process through `verify.py`,
-and on success writes `[no-send]\\n<verified JSON array>\\n` to
+and on success writes `[no-send]\\n<verified JSON array>\\n` (UTF-8) to
 `<workspace>/results/<task-file-stem>.txt` -- create-if-absent: a temp file in
 results/ is hard-linked to the result name, which fails when the name exists,
-so a drain never sees a half-written result and two publishers never both win.
+so a drain never sees a half-written result. Before that link the publisher
+takes a durable per-task claim, `<workspace>/state/role-status/claims/<task-id>`,
+created O_EXCL and never removed: the consumer moves the result into
+results/archive/, so the result name alone cannot bar a second publisher.
 The stats line goes to stdout; every strip/refusal line goes to stderr, as
 verify.py prints them.
 
 Exit 0: published.  1: refused on coverage, nothing written -- re-judge with an
 explicit coverage instruction.  2: cannot answer (unreadable task file or
 judgment, unreadable/ambiguous structured evidence, no event ownership
-resolvable, a result already published, results/ unwritable), nothing written.
+resolvable, result not serializable, a result already published -- claim or
+result name present, results/ or the claim dir unwritable), nothing written.
 This script emits the `[no-send]` first line but never parses result markers.
 """
 import argparse
@@ -39,19 +43,38 @@ def result_path(workspace: Path, task_file: str) -> Path:
     return workspace / "results" / (Path(task_file).stem + ".txt")
 
 
-def create_exclusive(path: str, payload: str) -> bool:
-    """Publish payload at path only if nothing is there: link(2) refuses an existing
-    target, so racing publishers get exactly one winner. False = target already existed."""
+def claim_path(workspace: Path, task_file: str) -> Path:
+    """The one durable record that <task-id> was published; results/ is not, since
+    the consumer moves the result into results/archive/."""
+    return workspace / "state" / "role-status" / "claims" / Path(task_file).stem
+
+
+def claim_exclusive(path: str, note: str) -> bool:
+    """O_EXCL create: racing publishers get exactly one claim. False = already claimed."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(note.encode("utf-8"))
+    return True
+
+
+def create_exclusive(path: str, data: bytes, claim: str) -> str:
+    """Stage data beside path, take the claim, then link(2) it in -- link refuses an
+    existing target. Returns "published", "claimed" or "exists"; never replaces."""
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(prefix=".role-status-publish.", dir=d)
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if not claim_exclusive(claim, path + "\n"):
+            return "claimed"
         try:
             os.link(tmp, path)
         except FileExistsError:
-            return False
-        return True
+            return "exists"
+        return "published"
     finally:
         try:
             os.unlink(tmp)
@@ -87,16 +110,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write(outcome.reason + "\n")
         return outcome.rc
 
+    try:
+        data = ("[no-send]\n" + json.dumps(outcome.verified, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as e:
+        sys.stderr.write("cannot answer: result not serializable: %s\n" % e)
+        return EXIT_CANNOT
+
     workspace = Path(args.workspace) if args.workspace else resolve_workspace()
     out = result_path(workspace, args.task_file)
-    payload = "[no-send]\n" + json.dumps(outcome.verified, indent=2, ensure_ascii=False) + "\n"
+    claim = claim_path(workspace, args.task_file)
     try:
         os.makedirs(str(out.parent), exist_ok=True)
-        published = create_exclusive(str(out), payload)
+        os.makedirs(str(claim.parent), exist_ok=True)
+        state = create_exclusive(str(out), data, str(claim))
     except OSError as e:
         sys.stderr.write("cannot answer: results/ unwritable: %s\n" % e)
         return EXIT_CANNOT
-    if not published:
+    if state == "claimed":
+        sys.stderr.write("cannot answer: result already published (claim %s)\n" % claim)
+        return EXIT_CANNOT
+    if state == "exists":
         sys.stderr.write("cannot answer: result already published: %s\n" % out)
         return EXIT_CANNOT
     print("published %s" % out)

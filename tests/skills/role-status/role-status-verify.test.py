@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -490,6 +491,50 @@ check(rc == 0 and json.loads(written) == [row(BOB2, [E_OTHER], [])]
       and f"strip row[1] {BOB2} working_event_ids: {E_SAME!r} ambiguous ownership" in se
       and stats_line(so) == "rows=2 distinct_actors=1 actors=2 actors_with_events=2 min_rows=1",
       "structured: the shared id is stripped for both, bob's own other event keeps his row")
+
+# UTF-8 output whatever the locale: a non-ASCII subject_id and row detail the verifier
+# accepts survive LC_ALL=C PYTHONUTF8=0 through the real entry point, --out and stdout.
+C_ENV = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+C_ENV.update({"LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0"})
+UNI = [{"actor_id": ALICE, "working_event_ids": [E_A1], "detail": "détail — 工作中",
+        "blocked_items": [{"subject_id": "sujet:é✓", "evidence_event_ids": [E_A2], "reason_code": "waiting_for_review"}]},
+       row(BOB, [E_B1], []), row(CAROL, [E_C1], [])]
+with tempfile.TemporaryDirectory() as td:
+    task = Path(td) / "task-role-status-v1-0000-a1.txt"
+    task.write_text(TASK_BLOCKS)
+    jpath = Path(td) / "judgment.json"
+    jpath.write_text(json.dumps(UNI))
+    outp = Path(td) / "verified.json"
+    p = subprocess.run([sys.executable, str(SCRIPT), str(task), str(jpath), "--out", str(outp)],
+                       capture_output=True, env=C_ENV)
+    check(p.returncode == 0 and outp.is_file() and b"Traceback" not in p.stderr,
+          "LC_ALL=C --out: rc 0, no traceback (stderr=%r)" % p.stderr[:200])
+    check(outp.is_file() and json.loads(outp.read_bytes().decode("utf-8")) == UNI
+          and "sujet:é✓".encode("utf-8") in outp.read_bytes(),
+          "LC_ALL=C --out: the file is UTF-8 with every character intact")
+    p = subprocess.run([sys.executable, str(SCRIPT), str(task), str(jpath)], capture_output=True, env=C_ENV)
+    check(p.returncode == 0 and json.loads(p.stdout.decode("utf-8").split("\n", 1)[1]) == UNI,
+          "LC_ALL=C stdout: rc 0, the array on stdout is UTF-8 with every character intact")
+    # an array that cannot be encoded (a lone surrogate the JSON parser accepts) is exit 2
+    jpath.write_text('[{"actor_id": "%s", "working_event_ids": ["%s"], "blocked_items": [], "detail": "\\ud800"}]' % (ALICE, E_A1))
+    outp.unlink()
+    p = subprocess.run([sys.executable, str(SCRIPT), str(task), str(jpath), "--out", str(outp), "--min-coverage", "0.3"],
+                       capture_output=True, text=True)
+    check(p.returncode == 2 and "cannot answer: result not serializable" in p.stderr and not outp.exists()
+          and sorted(q.name for q in Path(td).iterdir()) == ["judgment.json", "task-role-status-v1-0000-a1.txt"],
+          "unencodable verified array: exit 2 `result not serializable`, --out not written, no temp file")
+rc, so, se, _ = run(TASK_BLOCKS, '[{"actor_id": "%s", "working_event_ids": ["%s"], "blocked_items": [], "detail": "\\ud800"}]' % (ALICE, E_A1),
+                    "--min-coverage", "0.3")
+check(rc == 2 and "cannot answer: result not serializable" in se and so.count("\n") == 1,
+      "unencodable verified array in-process: exit 2, only the stats line on stdout")
+with tempfile.TemporaryDirectory() as td:
+    target = Path(td) / "v.json"
+    rsv.write_atomic(str(target), "é✓\n".encode("utf-8"))
+    check(target.read_bytes() == "é✓\n".encode("utf-8") and sorted(q.name for q in Path(td).iterdir()) == ["v.json"],
+          "write_atomic takes the UTF-8 bytes as given, no temp file left")
+vsrc = SCRIPT.read_text()
+check('fdopen(fd, "w")' not in vsrc and 'fdopen(fd, "wb")' in vsrc,
+      "verify.py writes bytes it encoded as UTF-8 itself, never a locale-default text writer")
 
 print()
 print("checks: %d" % CHECKS)

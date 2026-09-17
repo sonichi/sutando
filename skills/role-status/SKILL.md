@@ -19,20 +19,32 @@ for one actor of nine — the verifier strips the first two and refuses the thir
    writes a **bare JSON array** to a scratch file, e.g.
    `<workspace>/state/role-status/<task-id>.judgment.json` — no prose, no
    markers. A leading `[no-send]` line is tolerated and dropped.
-2. **Publish through the skill, never by hand:**
+2. **Publish through the skill's launcher, never by hand and never through a
+   bare `python3`** (a PATH `python3` may be the macOS CLT stub; the launcher
+   sources `scripts/python-binary.sh` and execs the interpreter
+   `resolve_python` returns, or exits 2 with `no runnable python3` when none
+   resolves — nothing published):
 
    ```bash
-   python3 skills/role-status/scripts/publish.py <task-file> <judgment.json>
+   bash skills/role-status/scripts/publish.sh <task-file> <judgment.json>
    ```
 
    `<task-file>` is the attempt file that **still exists** under `tasks/`
    (`-a1`, `-a2`, `-a3` …). The producer withdraws an attempt and reissues the
    next one; a result written against a withdrawn attempt is never claimed, so
    re-list `tasks/` right before publishing.
-3. **The result** is `[no-send]` followed by the verified JSON array, written
-   create-if-absent (temp file in `results/` + hard link, which fails when the
-   name exists) to `<workspace>/results/<task-id>.txt`. Nothing else is
-   written; the bridge archives the task without a user-visible reply.
+3. **The result** is `[no-send]` followed by the verified JSON array (UTF-8,
+   whatever the locale), written create-if-absent (temp file in `results/` +
+   hard link, which fails when the name exists) to
+   `<workspace>/results/<task-id>.txt`. Before that link the publisher takes a
+   **durable claim**, `<workspace>/state/role-status/claims/<task-id>`
+   (created `O_EXCL`; its body is the result path). The bridge moves the
+   result into `results/archive/`, so the result name alone would let a second
+   publisher through; the claim is the record of truth and is **never removed
+   by the publisher or the consumer** — it is a few bytes per task and the
+   archive already keeps the result. If a publish must genuinely be redone,
+   the owner removes that claim file by hand; there is no force flag. Nothing
+   else is written; the bridge archives the task without a user-visible reply.
 4. **Exit codes:**
    - `0` — published.
    - `1` — refused on coverage: fewer distinct verified actors than
@@ -41,17 +53,21 @@ for one actor of nine — the verifier strips the first two and refuses the thir
      event; N actors are listed") and publish again.
    - `2` — cannot answer: unreadable task or judgment, malformed or duplicated
      `EVIDENCE_JSON`, event ids present but none resolvable to an owner
-     (`cannot answer: no event ownership resolvable`), a result already
-     published (`cannot answer: result already published`). **Nothing
-     written**, any existing result untouched. Do not retry the model;
-     surface the task to the owner.
+     (`cannot answer: no event ownership resolvable`), a verified array that
+     cannot be encoded (`cannot answer: result not serializable`), a result
+     already published — the claim exists (`cannot answer: result already
+     published (claim <path>)`, also when the result was since archived or is
+     missing) or the result name exists. **Nothing written**, any existing
+     result and claim untouched. Do not retry the model; surface the task to
+     the owner.
 
 `publish.py` delegates every judgment decision to `scripts/verify.py`
 (`verify.verify(task_text, judgment, min_coverage)`); the verifier remains
-usable on its own for inspection:
+usable on its own for inspection, through the same resolver:
 
 ```bash
-python3 skills/role-status/scripts/verify.py <task-file> <judgment.json> [--out <verified.json>] [--min-coverage 0.5]
+. scripts/python-binary.sh
+"$(resolve_python .)" skills/role-status/scripts/verify.py <task-file> <judgment.json> [--out <verified.json>] [--min-coverage 0.5]
 ```
 
 ## What the verifier enforces
