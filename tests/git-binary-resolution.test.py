@@ -287,6 +287,22 @@ class SameFileHelper(unittest.TestCase):
             "an unreadable candidate must be treated as the stub, not as a verified non-stub",
         )
 
+    def test_a_reference_side_error_other_than_absence_also_fails_closed(self):
+        """Round 18 (keweichen, reviewing #4323 at 73d230c91): only genuine
+        absence proves SYSTEM_GIT cannot be matched. A `PermissionError`/EIO/
+        etc. on the REFERENCE side is unknown, not proof of absence, and must
+        fail the same direction as an unreadable candidate.
+        """
+        def two_stage(path):
+            if path == git_binary.SYSTEM_GIT:
+                raise PermissionError(f"simulated reference-side denial: {path}")
+            return os.stat_result((0,) * 10)
+
+        self.assertTrue(
+            git_binary._same_file("/some/candidate", git_binary.SYSTEM_GIT, stat=two_stage),
+            "a non-absence error on SYSTEM_GIT must not clear every candidate as safe",
+        )
+
 
 class PathCandidates(unittest.TestCase):
     def test_returns_every_executable_in_path_order(self):
