@@ -567,84 +567,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
-    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
-    /// fail-opened on any argv merely mentioning the substring (review #4269,
-    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
-    /// boundary check (`watcherLineMatches`) to keep correct, not two.
+    /// The sole liveness probe: the shared ownership policy confirms THIS
+    /// install's core watcher by its own sentinel record, so a peer worker's
+    /// watcher cannot stand in for a missing core one. rc 0 alive, 1 not, else unknown.
     func watcherProcessSeen() -> Bool? {
-        let ps = Process()
-        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        // pid,command (not bare command): excluding OUR OWN pid needs it, since
-        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
-        ps.arguments = ["-axo", "pid,command"]
-        let psPipe = Pipe()
-        ps.standardOutput = psPipe
-        ps.standardError = FileHandle.nullDevice
-        do { try ps.run() } catch { return nil }
-        ps.waitUntilExit()
-        // A failed ps must read as unknown -- an empty listing from a
-        // non-zero exit is not a clean "no match" (the sysmond-unreachable
-        // case this whole probe exists to not misread as "dead", #4269).
-        if ps.terminationStatus != 0 {
-            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+        guard let r = runShellStatus("/bin/bash", [repoRoot + "/src/watcher_identity.sh", "core-alive"]) else {
             return nil
         }
-        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let selfPID = ProcessInfo.processInfo.processIdentifier
-        // A definite match short-circuits alive; an undecidable line must not
-        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
-        var sawUndecidable = false
-        for line in listing.split(separator: "\n") {
-            switch watcherLineMatches(line, excluding: selfPID) {
-            case .some(true): return true
-            case .none: sawUndecidable = true
-            case .some(false): continue
-            }
+        let why = (r.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        switch r.status {
+        case 0: return true
+        case 1:
+            logToFile("checkWatcher: core watcher not confirmed — \(why)")
+            return false
+        default:
+            logToFile("checkWatcher: core watcher liveness unknown (rc=\(r.status)) — \(why)")
+            return nil
         }
-        return sawUndecidable ? nil : false
-    }
-
-    /// True when `s` contains the watcher script's name at a path/whitespace
-    /// boundary on both sides.
-    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
-        let marker = "watch-tasks-stream.sh"
-        var searchRange = s.startIndex..<s.endIndex
-        while let r = s.range(of: marker, range: searchRange) {
-            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
-            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
-            if before && after { return true }
-            searchRange = r.upperBound..<s.endIndex
-        }
-        return false
-    }
-
-    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
-    /// returning `nil` rather than `false` when extra tokens make that undecidable.
-    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
-        let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
-        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
-        let command = trimmed[trimmed.index(after: spaceIdx)...]
-        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count >= 2 else { return false }
-        guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
-        guard !parts[1].hasPrefix("-") else { return false }
-        // A match here is definite only at exactly 2 tokens -- more tokens could
-        // be a real pathname continuing past a space, so that's undecidable.
-        if matchesWatcherScriptAtBoundary(parts[1]) {
-            return parts.count == 2 ? true : nil
-        }
-        if parts.count == 2 { return false }
-        // A spaced script path is indistinguishable from a script plus arguments.
-        return matchesWatcherScriptAtBoundary(command) ? nil : false
     }
 
     func checkWatcher() {
         switch watcherProcessSeen() {
         case .some(true): return  // watcher alive
         case .none:
-            logToFile("checkWatcher: ps could not answer — not alerting on an unknown")
+            logToFile("checkWatcher: the policy could not answer — not alerting on an unknown")
             return
         case .some(false): break
         }
@@ -824,6 +770,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// or non-zero exit. Used by refreshContextualChips for `gh` / `gws` /
     /// other CLI shell-outs that are mechanical and need no LLM judgment.
     func runShell(_ path: String, _ args: [String]) -> String? {
+        guard let r = runShellStatus(path, args), r.status == 0 else { return nil }
+        return r.output
+    }
+
+    /// runShell with the exit status kept: a non-zero exit is an answer for
+    /// some callers (checkWatcher), not a failure. nil = could not launch.
+    func runShellStatus(_ path: String, _ args: [String]) -> (status: Int32, output: String?)? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
@@ -844,8 +797,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // errData is intentionally read to drain the pipe (avoid SIGPIPE)
         // even though we don't surface it on success.
         _ = errPipe.fileHandleForReading.readDataToEndOfFile()
-        if proc.terminationStatus != 0 { return nil }
-        return String(data: outData, encoding: .utf8)
+        return (proc.terminationStatus, String(data: outData, encoding: .utf8))
     }
 
     /// True if Claude Code in the sutando-core tmux pane has any running

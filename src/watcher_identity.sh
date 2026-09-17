@@ -18,6 +18,13 @@
 #   the one watcher_confirm_owner just confirmed) — a successor's record, even
 #   one wearing the same pid, stays. rc 0 stopped, 1 the signal failed, 2 still
 #   alive — on 1 and 2 the sentinel stays, so a retry can still name the watcher.
+# watcher_core_alive
+#   Is THIS install's core watcher confirmed alive? The identity this process's
+#   environment states (the default core when unset), through the same sequence.
+#   rc 0 alive (`pid N` on stdout), 1 not (why on stdout), 2 unknown — unknown
+#   is never "not alive": a re-arm on it would start a duplicate consumer.
+#   Executed (`watcher_identity.sh core-alive`), this is the desktop watchdog's
+#   probe, so a peer worker's watcher cannot stand in for a missing core one.
 
 _wi_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=watcher_sentinel.sh
@@ -64,6 +71,11 @@ watcher_confirm_owner() {
   if vector="$(pops_argv_vector "$pid")" && [ -n "$vector" ]; then
     vec_opt=(--argv-vector "$vector")
   fi
+  # Neither read answered: a denied `ps` is not "not a watcher".
+  if [ -z "$argv" ] && [ -z "$vector" ]; then
+    WATCHER_OWNER_REASON="argv: pid $pid's argv is UNMEASURABLE (ps answered nothing and no argv vector could be read) — an unprovable owner is a refusal"
+    return 1
+  fi
   if ! WATCHER_OWNER_REASON="$("$py" "$_wi_here/watcher_identity.py" runs-watcher \
                   --pid "$pid" --argv "$argv" ${vec_opt[@]+"${vec_opt[@]}"} \
                   --code-path "$rec_code" 2>&1)"; then
@@ -103,3 +115,39 @@ watcher_stop_owned() {
   sentinel_release_incarnation "$sentinel" "$pid" "$inc" || true
   return 0
 }
+
+watcher_core_alive() {
+  local ws sentinel
+  # The same resolution restart.sh uses, so the app and a stop name one file.
+  ws="$(bash "$_wi_here/../scripts/sutando-config.sh" workspace 2>/dev/null)"
+  if [ -z "$ws" ]; then
+    echo "workspace unresolved — the core's sentinel cannot be named"
+    return 2
+  fi
+  if ! sentinel="$(sentinel_path_for "$ws/state" 2>/dev/null)" || [ -z "$sentinel" ]; then
+    echo "could not resolve the core watcher sentinel under $ws/state"
+    return 2
+  fi
+  if [ ! -f "$sentinel" ]; then
+    echo "no core watcher record at $sentinel"
+    return 1
+  fi
+  if watcher_confirm_owner "$sentinel" "$(sentinel_instance_from_path "$sentinel")" \
+       "$ws" "$_wi_here/watch-tasks-stream.sh"; then
+    echo "pid $WATCHER_OWNER_PID"
+    return 0
+  fi
+  echo "$WATCHER_OWNER_REASON"
+  case "$WATCHER_OWNER_REASON" in
+    *UNMEASURABLE*|*"no runnable python3"*) return 2 ;;
+  esac
+  return 1
+}
+
+# Executed, not sourced: the desktop watchdog's probe.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    core-alive) watcher_core_alive; exit $? ;;
+    *) echo "usage: watcher_identity.sh core-alive" >&2; exit 64 ;;
+  esac
+fi
