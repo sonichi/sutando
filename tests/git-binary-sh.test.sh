@@ -214,11 +214,21 @@ rc14=$?
 check "a late resolved-candidate stat failure still refuses, not a stale bare compare" "$rc14" "0"
 
 # --- 15. structural pin: the classifier must never fall back to a bare
-# `-ef` -- that reintroduces exactly the collapsed unknown-vs-distinct bug.
-if grep -q -- '-ef' scripts/git-binary.sh; then
-  bad "the classifier must not use -ef anywhere" "found -ef in scripts/git-binary.sh"
+# `-ef` -- only rc=1 (no match) passes; rc=2 (e.g. a missing file) must not read as "confirmed absent" either.
+grep -q -- '-ef' "$REPO/scripts/git-binary.sh"
+grep_rc=$?
+case "$grep_rc" in
+  1) ok "the classifier compares captured dev+ino values, never a fresh -ef" ;;
+  0) bad "the classifier must not use -ef anywhere" "found -ef in $REPO/scripts/git-binary.sh" ;;
+  *) bad "the classifier must not use -ef anywhere" "grep itself failed (rc=$grep_rc) -- inconclusive, not a pass" ;;
+esac
+
+# --- 15b. structural pin: the identity probe must force the C locale, so a
+# non-English ENOENT message on a real GNU host cannot slip past the match.
+if grep -q 'LC_ALL=C.*stat' "$REPO/scripts/git-binary.sh"; then
+  ok "the stat probe forces LC_ALL=C ahead of the ENOENT text match"
 else
-  ok "the classifier compares captured dev+ino values, never a fresh -ef"
+  bad "the stat probe forces LC_ALL=C ahead of the ENOENT text match" "not found"
 fi
 
 # --- 16. the platform-to-flag mapping is a PURE function, real per spelling

@@ -42,7 +42,9 @@ _sutando_git_stat_id() {
 	# Absolute, like the stat call below: several callers deliberately run
 	# under a PATH with no /usr/bin, where a bare `uname` would not resolve.
 	_flag="$(_sutando_git_stat_flag "$(/usr/bin/uname -s 2>/dev/null)")"
-	_out="$(/usr/bin/stat "$_flag" '%d %i' "$1" 2>&1)"
+	# LC_ALL=C: the ENOENT-text match below depends on stat's error string
+	# being English, which a non-English locale would otherwise break.
+	_out="$(LC_ALL=C /usr/bin/stat "$_flag" '%d %i' "$1" 2>&1)"
 	_rc=$?
 	[ "$_rc" -eq 0 ] && printf '%s\n' "$_out" && return 0
 	case "$_out" in
