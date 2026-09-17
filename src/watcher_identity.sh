@@ -28,7 +28,8 @@ fi
 
 watcher_confirm_owner() {
   local sentinel="$1" want_instance="${2:-}" want_workspace="${3:-}" code_path="${4:-}"
-  local py owner pid rec_code argv inc_file wrote_rc=0
+  local py owner pid rec_code argv vector inc_file wrote_rc=0
+  local -a vec_opt=()
   WATCHER_OWNER_PID=""; WATCHER_OWNER_REASON=""
   # shellcheck source=../scripts/python-binary.sh
   . "$_wi_here/../scripts/python-binary.sh" 2>/dev/null || true
@@ -55,8 +56,14 @@ watcher_confirm_owner() {
   # The process half: the EXECUTED script, never containment. `python3 -c pass
   # /x/watch-tasks-stream.sh` carries that path as data and must not confirm.
   argv="$(pops_argv "$pid")"
+  # The kernel's argv LIST when readable: the flattened string cannot split
+  # `bash <script> <tasks-dir>`, the notifier's and the Monitor's real launch.
+  if vector="$(pops_argv_vector "$pid")" && [ -n "$vector" ]; then
+    vec_opt=(--argv-vector "$vector")
+  fi
   if ! WATCHER_OWNER_REASON="$("$py" "$_wi_here/watcher_identity.py" runs-watcher \
-                  --pid "$pid" --argv "$argv" --code-path "$rec_code" 2>&1)"; then
+                  --pid "$pid" --argv "$argv" ${vec_opt[@]+"${vec_opt[@]}"} \
+                  --code-path "$rec_code" 2>&1)"; then
     return 1
   fi
   # The age half; errexit-safe, since a bare call would abort the caller on

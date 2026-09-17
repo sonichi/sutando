@@ -24,6 +24,9 @@ re-implements either side, so a divergence between them is what fails.
      `int(...read_text...)` is how this defect got in)
   G) the shared ownership policy reads the same record, and refuses the inputs
      a containment check accepted
+  H) the argv VECTOR reader (src/proc_argv.py) returns the kernel's boundaries
+     for a live `/bin/bash <script> <tasks-dir>` — the notifier's launch — and
+     the policy CLI confirms that vector where the flattened text is unprovable
 
 Run: python3 tests/watcher-sentinel-record-readers.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -31,11 +34,14 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -213,11 +219,13 @@ def _run_task_watcher_check(hc, ws: Path, pid_text: str, argv: str) -> dict:
     (state / "cores").mkdir(parents=True, exist_ok=True)
     (state / "cores" / f"{hc._host_label()}.alive").write_text("{}")
     (state / "watch-tasks-stream.pid").write_text(pid_text)
-    saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees, hc._ps_snapshot,
-             hc._pid_parent, hc._pid_instance_id, hc._pid_actor_id)
+    saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._proc_argv_vector, hc._watcher_trees,
+             hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id, hc._pid_actor_id)
     try:
         hc.WORKSPACE_DIR = ws
         hc._proc_argv = lambda pid: argv
+        # The pid is fabricated: a host process wearing it must not be read.
+        hc._proc_argv_vector = lambda pid: None
         hc._watcher_trees = lambda *a, **k: {}
         hc._ps_snapshot = lambda *a, **k: ""
         hc._pid_parent = lambda pid, ps=None: None
@@ -225,8 +233,8 @@ def _run_task_watcher_check(hc, ws: Path, pid_text: str, argv: str) -> dict:
         hc._pid_actor_id = lambda pid: ""
         return hc.check_task_watcher()
     finally:
-        (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees, hc._ps_snapshot,
-         hc._pid_parent, hc._pid_instance_id, hc._pid_actor_id) = saved
+        (hc.WORKSPACE_DIR, hc._proc_argv, hc._proc_argv_vector, hc._watcher_trees,
+         hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id, hc._pid_actor_id) = saved
 
 
 def case_health_check(state: Path, box: Path) -> None:
@@ -423,6 +431,18 @@ def case_ownership_policy(state: Path) -> None:
           wi.executed_script("", ["/bin/bash", code, "--flag"]) == code)
     check("runs_code_path refuses an empty code_path",
           wi.runs_code_path(f"bash {code}", "") is False)
+    # The real launches carry an operand (`/bin/bash <script> <tasks-dir>`):
+    # only the vector names the executed slot; the same text flattened cannot.
+    check("the notifier form's vector confirms",
+          wi.is_watcher_argv("", ["/bin/bash", code, "/x/ws/tasks"]) is True)
+    check("  ...and the Monitor form's vector confirms",
+          wi.is_watcher_argv("", ["bash", code, "/x/ws/tasks"]) is True)
+    check("  ...while the SAME text flattened is UNPROVABLE",
+          wi.is_watcher_argv(f"/bin/bash {code} /x/ws/tasks") is None)
+    check("  ...and a vector whose one operand is that spaced path is NOT our watcher",
+          wi.is_watcher_argv("", ["/bin/bash", f"{code} /x/ws/tasks"]) is False)
+    check("the notifier form's vector runs this checkout's code_path",
+          wi.runs_code_path("", code, ["/bin/bash", code, "/x/ws/tasks"]) is True)
 
     check("a shell running some other script alone is not our watcher",
           wi.is_watcher_argv("/bin/bash /x/other.sh") is False)
@@ -486,6 +506,77 @@ def case_ownership_policy(state: Path) -> None:
     check("CLI runs-watcher refuses the DATA argument",
           wi.main(["runs-watcher", "--pid", "4242", "--argv", f"python3 -c pass {code}",
                    "--code-path", code]) == 1)
+    flat = f"/bin/bash {code} /x/ws/tasks"
+    check("CLI runs-watcher REFUSES the notifier form from the flattened text alone",
+          wi.main(["runs-watcher", "--pid", "4242", "--argv", flat,
+                   "--code-path", code]) == 1)
+    check("  ...and CONFIRMS it from the argv vector the seam read",
+          wi.main(["runs-watcher", "--pid", "4242", "--argv", flat, "--argv-vector",
+                   json.dumps(["/bin/bash", code, "/x/ws/tasks"]),
+                   "--code-path", code]) == 0)
+    check("  ...refuses a vector naming ONE spaced script path for the same text",
+          wi.main(["runs-watcher", "--pid", "4242", "--argv", flat, "--argv-vector",
+                   json.dumps(["/bin/bash", f"{code} /x/ws/tasks"]),
+                   "--code-path", code]) == 1)
+    check("  ...refuses the DATA argument as a vector too",
+          wi.main(["runs-watcher", "--pid", "4242", "--argv", f"python3 -c pass {code}",
+                   "--argv-vector", json.dumps(["python3", "-c", "pass", code]),
+                   "--code-path", code]) == 1)
+    for label, bad in (("malformed JSON", "not json"), ("a JSON non-list", '"x"'),
+                       ("a list with a non-string", '["/bin/bash", 1]')):
+        check(f"  ...and refuses {label} as a vector rather than falling back",
+              wi.main(["runs-watcher", "--pid", "4242", "--argv", f"/bin/bash {code}",
+                       "--argv-vector", bad, "--code-path", code]) == 1)
+
+
+# --- H: the vector reader, against a REAL process ----------------------------
+
+def case_argv_vector_reader(box: Path) -> None:
+    """src/proc_argv.py reads the kernel's argv boundaries; a fake proves nothing
+    about KERN_PROCARGS2 or /proc, so the reader runs against a live sleeper."""
+    import proc_argv
+
+    script = box / "watch-tasks-stream.sh"
+    script.write_text("#!/usr/bin/env bash\nwhile :; do /bin/sleep 0.2; done\n")
+    script.chmod(0o755)
+    tasks = box / "ws" / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    argv = ["/bin/bash", str(script), str(tasks)]           # the notifier's launch
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 3
+        got = None
+        while time.monotonic() < deadline:
+            got = proc_argv.argv_vector(proc.pid)
+            if got and len(got) == 3:
+                break
+            time.sleep(0.05)
+        check("argv_vector reads the notifier launch of a live process as a LIST",
+              got == argv, f"got {got!r}")
+        cli = subprocess.run([sys.executable, str(REPO / "src" / "proc_argv.py"), str(proc.pid)],
+                             capture_output=True, text=True)
+        check("  ...and the CLI prints that list as JSON, rc 0",
+              cli.returncode == 0 and json.loads(cli.stdout or "null") == argv,
+              f"rc={cli.returncode} out={cli.stdout!r} err={cli.stderr[:120]!r}")
+        flat = subprocess.run(["ps", "-p", str(proc.pid), "-o", "args="],
+                              capture_output=True, text=True).stdout.strip()
+        check("  ...where the flattened ps text carries the operand (not vacuous)",
+              flat.endswith(f"{script} {tasks}"), f"ps said {flat!r}")
+    finally:
+        proc.kill()
+        proc.wait()
+    me = proc_argv.argv_vector(os.getpid())
+    check("argv_vector reads this interpreter's own argv",
+          me is not None and me[1:] == sys.argv, f"got {me!r} vs {sys.argv!r}")
+    check("a dead pid reads None, never a partial list",
+          proc_argv.argv_vector(proc.pid) is None)
+    cli = subprocess.run([sys.executable, str(REPO / "src" / "proc_argv.py"), str(proc.pid)],
+                         capture_output=True, text=True)
+    check("  ...and the CLI prints nothing and fails for it",
+          cli.returncode == 1 and cli.stdout == "", f"rc={cli.returncode} out={cli.stdout!r}")
+    cli = subprocess.run([sys.executable, str(REPO / "src" / "proc_argv.py"), "nope"],
+                         capture_output=True, text=True)
+    check("a non-pid argument is a usage error, rc 2", cli.returncode == 2)
 
 
 def main() -> int:
@@ -499,6 +590,7 @@ def main() -> int:
         case_health_check(state, box)
         case_no_private_parser()
         case_ownership_policy(state)
+        case_argv_vector_reader(box)
 
     print()
     if FAILURES:

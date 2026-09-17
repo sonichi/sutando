@@ -35,12 +35,16 @@ CLI, for the shell bridge:
   watcher_identity.py owner-pid --sentinel P --instance I --workspace W
                                 --incarnation-file F --code-path C
                                                         -> "<pid>\t<code_path>"
-  watcher_identity.py runs-watcher --pid N --argv A --code-path C
-Both exit 0 on confirmation, or print the reason and exit 1.
+  watcher_identity.py runs-watcher --pid N --argv A [--argv-vector J] --code-path C
+Both exit 0 on confirmation, or print the reason and exit 1. J is the JSON argv
+LIST src/process-ops.sh read for N (`pops_argv_vector`); when the seam could
+not read one, only the flattened A is judged, and an operand after the script
+then stays unprovable — the adapter never splits the text itself.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -178,6 +182,20 @@ def confirm_record(sentinel, want_instance: str, want_workspace: str,
     return pid, rec["code_path"]
 
 
+def parse_vector(pid: int, encoded: str) -> "list[str]":
+    """The JSON argv list the seam printed for `pid`, or Refused: a vector the
+    adapter could not hand over intact proves nothing, and is not split from text."""
+    try:
+        vector = json.loads(encoded)
+    except ValueError as exc:
+        raise Refused(f"argv: pid {pid}'s argv vector is unreadable ({exc}) — an "
+                      f"unprovable identity is a refusal") from None
+    if not isinstance(vector, list) or not all(isinstance(a, str) for a in vector):
+        raise Refused(f"argv: pid {pid}'s argv vector is not a list of strings — an "
+                      f"unprovable identity is a refusal")
+    return vector
+
+
 def confirm_process(pid: int, argv: str, code_path: str,
                     vector: "list[str] | None" = None) -> None:
     """Raise Refused unless the live process is EXECUTING our watcher script."""
@@ -203,6 +221,7 @@ def main(argv_in: "list[str] | None" = None) -> int:
     r = sub.add_parser("runs-watcher")
     r.add_argument("--pid", type=int, required=True)
     r.add_argument("--argv", default="")
+    r.add_argument("--argv-vector", default=None, help="JSON list, the authoritative argv")
     r.add_argument("--code-path", required=True)
     args = ap.parse_args(argv_in)
     try:
@@ -212,7 +231,10 @@ def main(argv_in: "list[str] | None" = None) -> int:
                                             args.code_path)
             print(f"{pid}\t{code_path}")
         else:
-            confirm_process(args.pid, args.argv, args.code_path)
+            vector = None
+            if args.argv_vector is not None:
+                vector = parse_vector(args.pid, args.argv_vector)
+            confirm_process(args.pid, args.argv, args.code_path, vector)
     except Refused as exc:
         print(str(exc))
         return 1

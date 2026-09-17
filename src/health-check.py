@@ -65,6 +65,7 @@ from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, read_sentinel_record, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import watcher_identity  # noqa: E402
+import proc_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
@@ -8576,41 +8577,8 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
 
 def _proc_argv_vector(pid: int) -> "list[str] | None":
     """Real argv of `pid` as a LIST, or None when no authoritative read exists.
-
-    A flattened argv cannot separate an operand containing a space from two
-    operands, so the executed script is not recoverable from it by any rule.
-    """
-    try:  # linux: NUL-delimited, authoritative
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        if raw:
-            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
-    except Exception:  # noqa: BLE001 -- not linux, or gone
-        pass
-    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-        size = ctypes.c_size_t(262144)
-        buf = ctypes.create_string_buffer(size.value)
-        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None
-        data = buf.raw[:size.value]
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        parts = data[4:].split(b"\0")
-        i = 0
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += 1                                   # the exec path
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        out = []
-        while i < len(parts) and len(out) < argc:
-            out.append(parts[i].decode("utf8", "replace"))
-            i += 1
-        return out or None
-    except Exception:  # noqa: BLE001 -- probe failure must not fail the check
-        return None
+    One reader for the reporter and the signaller: src/proc_argv.py."""
+    return proc_argv.argv_vector(pid)
 
 
 def _proc_argv(pid: int) -> str:

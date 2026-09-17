@@ -254,6 +254,52 @@ case "$out9" in *"reaped"*) bad "survived TERM: the output does NOT say reaped" 
   *) bad "survived TERM: the output says the watcher is still alive" "got: $out9" ;; esac
 kill "$own9" 2>/dev/null
 
+# --- case 10: the Codex notifier's exact launch, `/bin/bash <script> <tasks-dir>`
+# The operand after the script is what a flattened `ps` string cannot split; the
+# seam's vector read is the real one here (KERN_PROCARGS2 / /proc), not a fake.
+mkdir -p "$TMP/case10/tasks"
+own10="$(spawn_notifier_watcher "$CODE" "$TMP/case10/tasks")"; SPAWNED="$SPAWNED $own10"
+case "$(pops_argv "$own10")" in *"$CODE $TMP/case10/tasks"*) ok "notifier form: the flattened argv carries the operand (the case is not vacuous)" ;;
+  *) bad "notifier form: the flattened argv carries the operand" "got: $(pops_argv "$own10")" ;; esac
+want10="$("$PY_BIN" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' /bin/bash "$CODE" "$TMP/case10/tasks")"
+got10="$(pops_argv_vector "$own10")"; rc10=$?
+if [ "$rc10" -eq 0 ] && [ "$got10" = "$want10" ]; then
+  ok "notifier form: the real seam reads the kernel's argv LIST for a live process"
+else
+  bad "notifier form: the real seam reads the kernel's argv LIST" "rc=$rc10 got=$got10 want=$want10"
+fi
+f10="$TMP/case10/watch-tasks-stream.pid"
+record "$f10" "$own10" "$CODE" "$TMP/case10"
+out10="$(reap_stale_task_watcher "$f10" 2>&1)"
+wait "$own10" 2>/dev/null
+kill -0 "$own10" 2>/dev/null && bad "notifier form: the watcher is signalled" "still running ($out10)" \
+                             || ok "notifier form: the watcher is signalled"
+[ ! -e "$f10" ] && ok "notifier form: the sentinel is released" \
+                || bad "notifier form: the sentinel is released" "still present ($out10)"
+case "$out10" in *"reaped stale"*) ok "notifier form: the reap is reported" ;;
+  *) bad "notifier form: the reap is reported" "got: $out10" ;; esac
+
+# --- case 11: the core Monitor's launch, `bash <script> <tasks-dir>` ----------
+mkdir -p "$TMP/case11/tasks"
+own11="$(spawn "$CODE" "$TMP/case11/tasks")"
+f11="$TMP/case11/watch-tasks-stream.pid"
+record "$f11" "$own11" "$CODE" "$TMP/case11"
+out11="$(reap_stale_task_watcher "$f11" 2>&1)"
+wait "$own11" 2>/dev/null
+kill -0 "$own11" 2>/dev/null && bad "Monitor form: the watcher is signalled" "still running ($out11)" \
+                             || ok "Monitor form: the watcher is signalled"
+[ ! -e "$f11" ] && ok "Monitor form: the sentinel is released" \
+                || bad "Monitor form: the sentinel is released" "still present ($out11)"
+
+# --- case 12: the vector reader on a pid that is gone -> nothing, rc 1 --------
+gone="$(dead_pid)"
+if out12="$(pops_argv_vector "$gone")"; then
+  bad "dead pid: the vector reader fails, rather than inventing a list" "rc 0, printed: $out12"
+else
+  [ -z "$out12" ] && ok "dead pid: the vector reader prints nothing and fails" \
+                  || bad "dead pid: the vector reader prints nothing" "printed: $out12"
+fi
+
 fi  # have_fn
 
 # --- wiring: startup.sh must delegate, and reap only THIS instance -------------

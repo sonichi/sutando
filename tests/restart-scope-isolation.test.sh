@@ -43,6 +43,13 @@ chmod +x "$SB/src/startup.sh" "$SB/scripts/sutando-config.sh" "$SB/bin/"*
 
 STATE="$SB/workspace/state"
 CODE="$SB/src/watch-tasks-stream.sh"
+TASKS="$SB/workspace/tasks"
+
+jvec() {   # jvec <argv...> -> the JSON list the seam prints for a pid
+  local a s='[' sep=''
+  for a; do a="${a//\\/\\\\}"; a="${a//\"/\\\"}"; s="$s$sep\"$a\""; sep=','; done
+  printf '%s]' "$s"
+}
 
 sentinel_for() {                # sentinel_for <instance-or-empty>
   ( . "$SB/src/watcher_sentinel.sh"; sentinel_path_for "$STATE" "$1" )
@@ -81,7 +88,8 @@ run() {                         # run <args...> -> $OUT, $RC, call log in $LOG
   ( cd "$SB" && PATH="$SB/bin:$PATH" env \
       SUTANDO_PROCESS_OPS="$FAKE" POPS_LOG="$LOG" \
       POPS_ALIVE_PIDS="$CORE_PID $W1_PID $W2_PID" \
-      "POPS_ARGV_$CORE_PID=${CORE_ARGV:-/bin/bash $CODE}" \
+      "POPS_ARGV_$CORE_PID=${CORE_ARGV:-/bin/bash $CODE $TASKS}" \
+      "POPS_ARGVV_$CORE_PID=${CORE_ARGVV-$(jvec /bin/bash "$CODE" "$TASKS")}" \
       "POPS_ARGV_$W1_PID=/bin/bash $CODE" \
       "POPS_ARGV_$W2_PID=/bin/bash $CODE" \
       "POPS_ELAPSED_$CORE_PID=${CORE_ELAPSED-10:00}" \
@@ -170,6 +178,7 @@ refuses "another checkout's code_path" "code_path: .*this checkout runs"
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
 sed -i.bak "s|code_path=.*|code_path=$SB/foreign/src/watch-tasks-stream.sh|" "$CORE_SENT"
 CORE_ARGV="/bin/bash $SB/foreign/src/watch-tasks-stream.sh" \
+CORE_ARGVV="$(jvec /bin/bash "$SB/foreign/src/watch-tasks-stream.sh")" \
   refuses "a self-consistent FOREIGN checkout's watcher" "code_path: .*this checkout runs"
 
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
@@ -195,11 +204,16 @@ done
 # The misleading DATA argument: kewei's probe. The path is carried as an operand
 # of an interpreter that is not running it, and containment alone confirmed it.
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
-CORE_ARGV="python3 -c pass $CODE" refuses "a watcher path passed as DATA" "argv: pid $CORE_PID is not a live watch-tasks-stream"
+CORE_ARGV="python3 -c pass $CODE" CORE_ARGVV="$(jvec python3 -c pass "$CODE")" \
+  refuses "a watcher path passed as DATA" "argv: pid $CORE_PID is not a live watch-tasks-stream"
+arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
+CORE_ARGV="python3 -c pass $CODE" CORE_ARGVV="" \
+  refuses "a watcher path passed as DATA, flat string only" "argv: pid $CORE_PID is not a live watch-tasks-stream"
 
 # Two tokens, a shell, and the script name — but a DIFFERENT script is executed.
 arm; stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
-CORE_ARGV="/bin/bash $SB/src/other.sh $CODE" refuses "a shell running some OTHER script" "argv:"
+CORE_ARGV="/bin/bash $SB/src/other.sh $CODE" CORE_ARGVV="$(jvec /bin/bash "$SB/src/other.sh" "$CODE")" \
+  refuses "a shell running some OTHER script" "argv:"
 
 # The stale/reissued process, through the shared age policy: a pid that started
 # AFTER the sentinel was stamped cannot be the process that stamped it.
@@ -217,6 +231,33 @@ arm
 restart --stop-only; out="$OUT"
 [ "$RC" = 0 ] && [ "$(signalled)" = "$CORE_PID" ]
 ck "(c) CONTROL: a fully correct record IS confirmed and signalled" $?
+
+# ===================================== (f) argv boundaries come from the kernel
+# The notifier launches `/bin/bash <script> <tasks-dir>` and the Monitor `bash
+# <script> <tasks-dir>`: an operand follows the script in every real launch, and
+# the flattened `ps` text cannot say where the script's path ends. The seam's
+# argv LIST can. Without one, the operand-bearing text stays unprovable — the
+# adapter never splits it into a guess.
+confirms() {                    # confirms <label>
+  restart --stop-only; out="$OUT"
+  [ "$RC" = 0 ] && [ "$(signalled)" = "$CORE_PID" ]; ck "(f) $1 — confirmed and signalled" $?
+  note "signalled: [$(signalled)]  rc=$RC"
+  grep -q "^argv_vector $CORE_PID\$" "$LOG"; ck "(f) $1 — the vector was asked of the seam" $?
+}
+arm; confirms "the notifier form /bin/bash <script> <tasks-dir>"
+arm; CORE_ARGV="bash $CODE $TASKS" CORE_ARGVV="$(jvec bash "$CODE" "$TASKS")" \
+  confirms "the Monitor form bash <script> <tasks-dir>"
+
+arm; CORE_ARGVV="" refuses "an operand-bearing flat argv with NO vector" "unprovable identity"
+arm; CORE_ARGV="/bin/bash $CODE" CORE_ARGVV="" \
+  confirms "CONTROL: the no-operand flat argv with NO vector still confirms"
+
+# The SAME flat text as the notifier form; the vector says it is ONE spaced
+# script path, so the executed script is not ours and nothing was split.
+arm; CORE_ARGVV="$(jvec /bin/bash "$CODE $TASKS")" \
+  refuses "a spaced script path that flattens like script + operand" "is not a live watch-tasks-stream"
+arm; CORE_ARGVV="not json" \
+  refuses "a vector the seam could not hand over intact" "argv vector"
 
 # ============================================ (c2) the stop must actually stop
 # The sentinel is the only record of a watcher that is still running. Releasing

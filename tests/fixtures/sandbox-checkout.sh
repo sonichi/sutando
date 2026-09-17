@@ -5,7 +5,9 @@
 # watcher" is the sleeper and any other path is a foreign checkout's.
 #
 #   make_sandbox_checkout <sandbox-dir> <real-repo>
-#   spawn_sandbox_watcher <script>   -> pid, on its own, argv "bash <script>"
+#   spawn_sandbox_watcher <script> [operand...] -> pid, argv "bash <script> ..."
+#   spawn_notifier_watcher <script> <tasks-dir> -> pid, the Codex notifier's exact
+#                                    launch, argv "/bin/bash <script> <tasks-dir>"
 make_sandbox_checkout() {
   local sb="$1" real="$2" e
   mkdir -p "$sb/src"
@@ -28,8 +30,17 @@ write_sandbox_watcher() {
 # stdout/stderr redirected: a caller wraps this in $( ), and a child inheriting
 # that pipe would hold the substitution open for its whole life.
 spawn_sandbox_watcher() {
-  local script="$1" pid
-  bash "$script" >/dev/null 2>&1 & pid=$!
+  local script="$1"; shift
+  _spawn_sandbox_as bash "$script" "$@"
+}
+
+spawn_notifier_watcher() {
+  _spawn_sandbox_as /bin/bash "$1" "$2"
+}
+
+_spawn_sandbox_as() {
+  local pid
+  "$@" >/dev/null 2>&1 & pid=$!
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     ps -p "$pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break
     sleep 0.1

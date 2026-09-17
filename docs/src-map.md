@@ -129,6 +129,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
+- **`proc_argv.py`** — The argv of one pid as a LIST — the authoritative form of a process identity.
 - **`process-ops.sh`** — The ONE seam through which restart.sh touches a process.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).

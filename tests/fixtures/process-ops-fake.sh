@@ -6,6 +6,7 @@
 # POPS_LOG           every call, one per line, in order
 # POPS_ALIVE_PIDS    space-delimited pids that answer pops_alive
 # POPS_ARGV_<pid>    the argv pops_argv reports for that pid
+# POPS_ARGVV_<pid>   the JSON argv LIST pops_argv_vector prints (unset/empty = unreadable, rc 1)
 # POPS_ELAPSED_<pid> the `ps -o etime=` string for that pid (unset = unreadable)
 # POPS_SIGNAL_RC     rc pops_signal returns (default 0 = delivered)
 # POPS_SIGNAL_SURVIVORS  pids that keep answering pops_alive after a signal
@@ -23,6 +24,8 @@ pops_signal()          { _pops_rec "signal $1 ${2:-TERM}"
 pops_alive()           { _pops_rec "alive $1"
                          case " ${POPS_ALIVE_PIDS:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 pops_argv()            { _pops_rec "argv $1"; eval "printf '%s' \"\${POPS_ARGV_$1:-}\""; }
+pops_argv_vector()     { _pops_rec "argv_vector $1"; local v; eval "v=\"\${POPS_ARGVV_$1:-}\""
+                         [ -n "$v" ] || return 1; printf '%s' "$v"; }
 pops_elapsed()         { _pops_rec "elapsed $1"; eval "printf '%s' \"\${POPS_ELAPSED_$1:-}\""; }
 pops_grace_tick()      { _pops_rec "grace_tick"; }
 pops_pattern_kill()    { _pops_rec "pattern_kill $1"; }

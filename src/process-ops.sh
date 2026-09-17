@@ -30,6 +30,19 @@ pops_alive() { kill -0 "$1" 2>/dev/null; }
 # The full argv of one pid, empty when it cannot be read.
 pops_argv() { ps -p "$1" -o args= 2>/dev/null; }
 
+_pops_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The argv of one pid as a JSON LIST, boundaries as the kernel kept them: rc 1
+# and nothing when unreadable, so a caller falls back to the flattened string.
+pops_argv_vector() {
+  local py
+  if ! command -v resolve_python >/dev/null 2>&1; then
+    # shellcheck source=../scripts/python-binary.sh
+    . "$_pops_here/../scripts/python-binary.sh" 2>/dev/null || return 1
+  fi
+  py="$(resolve_python "$_pops_here/.." 2>/dev/null)" && [ -n "$py" ] || return 1
+  "$py" "$_pops_here/proc_argv.py" "$1"
+}
+
 # Elapsed run time of one pid, `ps` format ([[DD-]HH:]MM:SS), empty when unread.
 # src/watcher_sentinel.sh: a process younger than the sentinel did not write it.
 pops_elapsed() { ps -p "$1" -o etime= 2>/dev/null; }

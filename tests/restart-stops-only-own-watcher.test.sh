@@ -31,11 +31,11 @@ trap cleanup EXIT
 # only sandbox files. Everything the watcher-sentinel resolution needs is real;
 # everything that would touch the host (startup, shutdown, heartbeat, pkill,
 # pgrep, launchctl, the workspace lookup) is absent or stubbed.
-mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state" "$SB/peer" "$SB/foreign/src"
+mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state" "$SB/workspace/tasks" "$SB/peer" "$SB/foreign/src"
 cp "$REPO/src/restart.sh" "$SB/src/restart.sh"
 cp "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
 cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
-cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$SB/src/"
+cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$REPO/src/proc_argv.py" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 
@@ -59,8 +59,11 @@ printf '#!/bin/sh\nexit 0\n' > "$SB/bin/sleep"
 
 # A decoy whose argv carries the watcher's own name. /bin/sleep by absolute path
 # so the stubbed `sleep` on PATH cannot turn this into a busy loop. "Own" runs
-# the sandbox CHECKOUT's script, as the real watcher does; the others do not.
+# the sandbox CHECKOUT's script exactly as the Codex notifier launches the real
+# watcher — `/bin/bash <script> <tasks-dir>`, an operand after the script; the
+# others do not run it at all.
 OWN_CODE="$SB/src/watch-tasks-stream.sh"
+TASKS="$SB/workspace/tasks"
 for d in src peer foreign/src; do
   cat > "$SB/$d/watch-tasks-stream.sh" <<'DEC'
 #!/bin/bash
@@ -70,7 +73,7 @@ done
 chmod +x "$SB/src/startup.sh" "$SB/scripts/sutando-config.sh" "$SB/bin/"* \
          "$SB"/*/watch-tasks-stream.sh "$SB/foreign/src/watch-tasks-stream.sh"
 
-bash "$OWN_CODE"  & OWN_PID=$!
+/bin/bash "$OWN_CODE" "$TASKS" & OWN_PID=$!
 bash "$SB/peer/watch-tasks-stream.sh" & PEER_PID=$!
 DECOYS="$OWN_PID $PEER_PID"
 disown "$OWN_PID" "$PEER_PID" 2>/dev/null   # job-control "Terminated" notices are not output
@@ -91,6 +94,9 @@ stamp "$OWN_PID" "$OWN_CODE"
 
 alive() { kill -0 "$1" 2>/dev/null; }
 alive "$OWN_PID" && alive "$PEER_PID"; ck "both decoy watchers are running before the restart" $?
+# Not vacuous: the flattened text really carries the operand the policy cannot split.
+case "$(ps -p "$OWN_PID" -o args= 2>/dev/null)" in *"$OWN_CODE $TASKS"*) ck "own watcher's flattened argv is the notifier form (operand after the script)" 0 ;;
+  *) ck "own watcher's flattened argv is the notifier form (operand after the script)" 1 ;; esac
 
 out="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
 
@@ -125,6 +131,20 @@ stop_n=$(grep -n "watcher stop: signalling this core's watcher" <<<"$out" | head
 warn_n=$(grep -n "task watcher STOPPED"              <<<"$out" | head -1 | cut -d: -f1)
 [ -n "$stop_n" ] && [ -n "$warn_n" ] && [ "$warn_n" -gt "$stop_n" ]
 ck "the warning follows the stop, not precedes it" $?
+
+# --- the core Monitor form: `bash <script> <tasks-dir>` -----------------------
+# The other real launch shape: a PATH shell in argv[0] and the same operand.
+mkdir -p "$SB/workspace/tasks"
+bash "$OWN_CODE" "$TASKS" & MON_PID=$!
+DECOYS="$DECOYS $MON_PID"
+disown "$MON_PID" 2>/dev/null
+stamp "$MON_PID" "$OWN_CODE" inc-mon
+outm="$( cd "$SB" && PATH="$SB/bin:$PATH" bash "$SB/src/restart.sh" 2>/dev/null )"
+for _ in $(seq 1 40); do alive "$MON_PID" || break; /bin/sleep 0.1; done
+! alive "$MON_PID"; ck "a watcher launched as bash <script> <tasks-dir> (the Monitor form) was stopped" $?
+grep -q "watcher stop: signalling this core's watcher (pid $MON_PID)" <<<"$outm"
+ck "and the run named that pid" $?
+[ ! -e "$SENTINEL" ]; ck "and released its sentinel" $?
 
 # --- reissued pid ------------------------------------------------------------
 # A sentinel naming a live process that is NOT a watcher must not authorise a

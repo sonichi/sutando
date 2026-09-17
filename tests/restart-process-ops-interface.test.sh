@@ -28,7 +28,7 @@ scan() {
 [ -r "$OPS" ]; ck "src/process-ops.sh exists and is readable" $?
 
 # The interface the owner declared, plus the two inspection calls ownership needs.
-for fn in pops_signal pops_alive pops_argv pops_elapsed pops_grace_tick \
+for fn in pops_signal pops_alive pops_argv pops_argv_vector pops_elapsed pops_grace_tick \
           pops_pattern_kill pops_pattern_running \
           pops_name_running pops_launchctl pops_tmux pops_port_listening; do
   grep -q "^$fn()" "$OPS"; ck "process-ops.sh exposes $fn" $?
@@ -63,7 +63,7 @@ out="$(POPS_LOG="$LOG" SUTANDO_PROCESS_OPS="$REPO/tests/fixtures/process-ops-fak
 grep -q '^pattern_kill nothing-real$' "$LOG"; ck "SUTANDO_PROCESS_OPS routes calls to the fake" $?
 # Every name the interface declares must exist in the fake too: one the fake
 # omits falls through to `command not found`, not to the real implementation.
-for fn in pops_signal pops_alive pops_argv pops_elapsed pops_grace_tick \
+for fn in pops_signal pops_alive pops_argv pops_argv_vector pops_elapsed pops_grace_tick \
           pops_pattern_kill pops_pattern_running \
           pops_name_running pops_launchctl pops_tmux pops_port_listening; do
   grep -q "^$fn()" "$REPO/tests/fixtures/process-ops-fake.sh"; ck "the fake implements $fn" $?
