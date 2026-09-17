@@ -245,6 +245,16 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_q_and_x_do_not_false_orphan_through_the_consumer_path(self):
+        """keweichen's round-9 ask: pin q/x as unchanged-neighbor controls
+        so a future table edit that drops them again fails here too, not
+        just in the direct python_args() tests."""
+        for flag in ("-q", "-x"):
+            wf = f"steps:\n  - run: python3 {flag} packages/x/test_real.py\n"
+            self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+            self.assertEqual(
+                orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

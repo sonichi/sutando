@@ -109,7 +109,7 @@ _HASH_PYCS_VALUES = frozenset(("always", "default", "never"))
 _TERMINAL_CHARS = frozenset("hV?")
 _SCRIPT_CHARS = frozenset("cm")
 _VALUE_CHARS = frozenset("WX")
-_VALUELESS_CHARS = frozenset("bBdEiIORsStuv")
+_VALUELESS_CHARS = frozenset("bBdEiIOqRsStuvx")
 
 
 def _option_kind(tok: str):

@@ -389,6 +389,31 @@ class PythonArgsOptionContract(unittest.TestCase):
                 python_args(f"python3 --check-hash-based-pycs {value} packages/x/test_real.py"),
                 ["packages/x/test_real.py"])
 
+    def test_q_and_x_are_unchanged_neighbors_of_the_round_8_edit_and_still_reach_the_script(self):
+        """keweichen's round-9 finding: rewriting _VALUELESS_CHARS to add
+        R/t and drop P also silently dropped q and x, which round 7 already
+        had right. Confirmed by direct execution on both this host's python3
+        and the 3.9 floor with a 2-line fixture (a 1-line one hides -x's
+        effect: it skips line 1, so a 1-line script prints nothing either way)."""
+        self.assertEqual(python_args("python3 -q packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -x packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -uq packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+        self.assertEqual(python_args("python3 -ux packages/x/test_real.py"),
+                          ["packages/x/test_real.py"])
+
+    def test_dash_p_is_a_stated_conservative_policy_not_a_claim_of_exactness(self):
+        """-P is valid on 3.11+ and this repo's ci.yml runs an unpinned,
+        likely-newer stock interpreter -- but python39-compat.yml pins
+        exactly 3.9, and one table covers every workflow file regardless of
+        which interpreter a given job actually uses. Refusing -P is the
+        deliberate, version-NEUTRAL choice (never claim a script ran when
+        any interpreter this repo tests would refuse it), not a claim that
+        the table models -P's real cross-version behavior exactly."""
+        self.assertEqual(python_args("python3 -P packages/x/test_real.py"), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
