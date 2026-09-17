@@ -72,6 +72,25 @@ class TestProbe(Base):
         self.assertEqual(c["status"], "ok")
         self.assertIn("v4", c["detail"])
 
+    def test_unreadable_roster_warns(self):
+        (self.ws / "state" / "roster.json").write_text("{not json")
+        c = hc.check_pool_advertisement()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("roster.json unreadable", c["detail"])
+
+    def test_an_advertisement_without_a_workers_body_reads_as_unpublished(self):
+        self.roster(2)
+        (self.ws / "state" / "pool-advertisement.json").write_text(json.dumps({"ts": 1, "report": {}}))
+        c = hc.check_pool_advertisement()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("binding unpublished", c["detail"])
+        self.assertIn("vNone", c["detail"])
+
+    def test_the_repair_hint_names_no_skill_path(self):
+        self.roster(3)
+        c = hc.check_pool_advertisement()
+        self.assertNotIn("skills/", c["detail"])
+
     def test_unreadable_advertisement_warns(self):
         self.roster(2)
         (self.ws / "state" / "pool-advertisement.json").write_text("{not json")

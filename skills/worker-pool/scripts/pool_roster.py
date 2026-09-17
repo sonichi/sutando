@@ -276,6 +276,8 @@ def _publish(workspace, roster: dict) -> None:
         pa.write_advertisement(workspace)
     except OSError as e:
         raise PublishError(roster, e) from e
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.

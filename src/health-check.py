@@ -8312,7 +8312,7 @@ def check_pool_advertisement() -> dict:
         return {"name": name, "status": "warn", "detail": f"roster.json unreadable: {e}"}
     rv = roster.get("version")
     rooms = len(roster.get("bindings") or {})
-    repair = "python3 skills/worker-pool/scripts/pool_advertise.py --write"
+    repair = "re-publish the pool advertisement from the roster"
     try:
         ad = json.loads(ad_p.read_text(encoding="utf-8"))
     except FileNotFoundError:
