@@ -681,6 +681,45 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "set -o >/dev/null pipefail\n"
                 "false | true && python3 packages/x/dead.py"), [])
 
+    def test_a_redirect_to_an_empty_target_aborts_the_whole_command(self):
+        """`set +o >"" pipefail`: Bash rejects an empty redirect target
+        before the command ever runs -- confirmed by direct execution:
+        `set` never executes, pipefail (already on) stays on, dead.py
+        never runs. Modeling every redirect as a successfully-stripped
+        no-op would wrongly apply `+o pipefail` and credit dead.py."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                'set +o >"" pipefail\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_an_escaped_digit_before_a_redirect_is_a_real_word_not_an_fd_prefix(self):
+        r"""`set \2>/dev/null +o pipefail`: the escaped `2` is a real argv
+        word (Bash: `set 2 +o pipefail`), which ends `set`'s own option
+        scanning before `+o pipefail` is ever reached -- confirmed by
+        direct execution: pipefail (already on) stays on, dead.py never
+        runs. A value-only digit check can't tell a bare fd number from an
+        escaped one."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set \\2>/dev/null +o pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_process_substitution_is_not_a_redirect(self):
+        """`set -o <(true) pipefail`: Bash substitutes a literal
+        `/dev/fd/N` argv word, which is an unrecognized `-o` name and
+        aborts the whole invocation -- confirmed by direct execution:
+        pipefail (already off) stays off, dead.py runs. Mistaking this
+        for a real redirect would discard it and wrongly enable pipefail
+        from the `pipefail` word next to it."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                "set -o <(true) pipefail\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

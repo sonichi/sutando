@@ -466,6 +466,44 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_an_empty_redirect_target_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 19: a redirect to an empty target aborts the
+        whole command before it runs -- it is not a successfully-stripped
+        no-op."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              '      set +o >"" pipefail\n'
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_an_escaped_fd_digit_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 19: an escaped digit before a redirect is a
+        real argv word, not a bare fd prefix."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set \\2>/dev/null +o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_process_substitution_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 19: process substitution is a literal argv
+        word, never a redirect, so it must not be silently discarded --
+        here it makes `-o` abort on an unrecognized name, leaving
+        pipefail off and the later script genuinely reachable."""
+        wf = ("steps:\n  - run: |\n"
+              "      set +o pipefail\n"
+              "      set -o <(true) pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

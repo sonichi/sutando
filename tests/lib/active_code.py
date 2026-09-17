@@ -348,9 +348,16 @@ def _shell_words(text: str):
     A redirection (`[fd]>target`, `[fd]<target`, and their `>>`/`<&`/`<&`
     variants) is consumed by the shell and never reaches argv at all
     (round 18: `set -o >/dev/null pipefail` -- Bash removes the redirect
-    before invoking `set`, which then sees only `-o pipefail`); a digit
-    run immediately before the operator is its fd prefix, also consumed,
-    while any other preceding text is a real word and gets flushed first.
+    before invoking `set`, which then sees only `-o pipefail`); a BARE
+    (unquoted, unescaped) digit run immediately before the operator is its
+    fd prefix, also consumed, while any other preceding text is a real word
+    and gets flushed first (round 19: an escaped/quoted digit is a real
+    argv word instead, since it can never be part of a live fd number). A
+    target that resolves to the empty string aborts the WHOLE command
+    before it runs at all -- this function returns None, not a word list
+    with a gap in it (round 19: `set +o >"" pipefail` never reaches `set`).
+    `<(cmd)`/`>(cmd)` process substitution is not a redirect at all and is
+    left as a literal argv word (round 19).
 
     Brace expansion runs per accumulated word at flush time, tracked via a
     per-character quoted mask (round 18, `_split_unquoted_braces`) -- a
@@ -392,31 +399,62 @@ def _shell_words(text: str):
                 val.append(ch); qmask.append(True); i += 1
         elif ch in " \t\n":
             flush(); i += 1
+        elif ch in "<>" and i + 1 < n and text[i + 1] == "(":
+            # Process substitution, not a redirect (see docstring) -- copy the
+            # paren-balanced, quote-aware span in as literal text.
+            start = i; i += 2; depth = 1; pq = None
+            while i < n and depth > 0:
+                c2 = text[i]
+                if pq:
+                    if c2 == pq:
+                        pq = None
+                    elif pq == '"' and c2 == "\\" and i + 1 < n:
+                        i += 1
+                elif c2 in "'\"":
+                    pq = c2
+                elif c2 == "(":
+                    depth += 1
+                elif c2 == ")":
+                    depth -= 1
+                i += 1
+            val.extend(text[start:i]); qmask.extend([False] * (i - start))
         elif ch in "<>":
-            if val and not all(c.isdigit() for c in val):
+            # An fd prefix must be BARE -- an escaped/quoted digit is a real
+            # argv word instead (see docstring).
+            is_bare_fd_or_nothing = (not val) or (
+                all(c.isdigit() for c in val) and not any(qmask))
+            if not is_bare_fd_or_nothing:
                 flush()  # real word before the operator -- its own argv word
             else:
-                val, qmask = [], []  # fd-prefix digits (or nothing) -- part of the redirect
+                val, qmask = [], []  # bare fd-prefix digits (or nothing) -- part of the redirect
             i += 1
             if i < n and text[i] in (ch, "&"):
                 i += 1
             while i < n and text[i] in " \t":
                 i += 1
-            while i < n and text[i] not in " \t\n":  # consume the target, quote-aware, discarded
+            target = []
+            while i < n and text[i] not in " \t\n":  # consume the target, quote-aware
                 if text[i] == "'":
                     i += 1
                     while i < n and text[i] != "'":
-                        i += 1
+                        target.append(text[i]); i += 1
                     i += 1
                 elif text[i] == '"':
                     i += 1
                     while i < n and text[i] != '"':
-                        i += 2 if text[i] == "\\" and i + 1 < n else 1
+                        if text[i] == "\\" and i + 1 < n:
+                            target.append(text[i + 1]); i += 2
+                        else:
+                            target.append(text[i]); i += 1
                     i += 1
                 elif text[i] == "\\" and i + 1 < n:
-                    i += 2
+                    target.append(text[i + 1]); i += 2
                 else:
-                    i += 1
+                    target.append(text[i]); i += 1
+            if not target:
+                # An empty redirect target aborts the WHOLE command before
+                # it runs (see docstring) -- so does this function.
+                return None
         elif ch == "'":
             quote = "'"; i += 1
         elif ch == '"':
