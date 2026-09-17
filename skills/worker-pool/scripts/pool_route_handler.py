@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -100,35 +98,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
-def _write_result(results_dir, task_id: str, body: str) -> Path:
-    """Whole-or-not: the drain claims a result the moment its name appears."""
-    rd = Path(results_dir)
-    rd.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{task_id}.", dir=rd)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    out = rd / f"{task_id}.txt"
-    os.replace(tmp, out)
-    return out
-
-
-def _add_reply(out: dict) -> str:
-    wid = out["worker_id"]
-    tmux = out.get("tmux") or {}
-    lines = [f"Worker created: {out.get('label') or wid[:8]} ({wid})",
-             f"  inbox     {out.get('delivery_dir') or '(unknown)'}",
-             f"  tmux      {tmux.get('socket', '?')} / {tmux.get('session_name', '?')}",
-             f"  roster    v{out.get('roster_version')}"]
-    if out.get("advertisement") == "unpublished":
-        lines.append("  NOTE: the picker's advertisement could not be written; it will "
-                     "show this worker after the next successful publish.")
-    lines.append("Pin a room to it from the picker; until then it receives only work "
-                 "addressed to it by id.")
-    return "\n".join(lines) + "\n"
-
-
-def apply_picker(workspace, task_file, results_dir=None, *, repo=None, runtime=None,
-                 probe=False) -> "dict | None":
+def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     """A pin is live the moment it arrives: applied and published here, at the
     edge, so the bridge ships the new binding without waiting for another
     task. Runs on the probe as well: the watcher probes once and, on DECLINE,
@@ -138,20 +108,11 @@ def apply_picker(workspace, task_file, results_dir=None, *, repo=None, runtime=N
     Idempotent; a failure is reported, never fatal."""
     try:
         cmd = wpc.authorized_command(task_file, workspace)
-        if cmd and cmd.get("action") == "add" and probe:
-            # A spawn is not a probe-safe act: claim the task now, create on the run.
-            return {"action": "add", "room": None, "deferred": True}
         out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
-                        results_dir=results_dir, repo=repo, runtime=runtime) if cmd else None
-    except (pr.RosterError, OSError, ValueError, wpc.AddRefused) as e:
+                        results_dir=results_dir) if cmd else None
+    except (pr.RosterError, OSError, ValueError) as e:
         print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
         return None
-    if out and out.get("action") == "add" and not out.get("deferred"):
-        rd = wpc._results_dir(workspace, results_dir)
-        _write_result(rd, Path(task_file).stem, _add_reply(out))
-        print(f"pool_route_handler: created worker {out['worker_id']} "
-              f"(roster v{out['roster_version']}); replied", file=sys.stderr)
-        return out
     if out and out.get("action") == "skipped":
         print(f"pool_route_handler: picker command for {out['room']} not replayed: "
               f"{out['reason']}", file=sys.stderr)
@@ -169,9 +130,8 @@ def main(argv=None) -> int:
     # The watcher passes its RESOLVED results dir; the replay gate reads it, so
     # it is a real argument here rather than one parsed and thrown away.
     p.add_argument("--results-dir", default=None)
-    # `add` spawns from the checkout the watcher named, in the runtime it runs.
-    p.add_argument("--runtime", default=None)
-    p.add_argument("--repo", default=None)
+    for ignored in ("--runtime", "--repo"):
+        p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
@@ -184,12 +144,7 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
-        picked = apply_picker(ws, args.task_file, args.results_dir, repo=args.repo,
-                              runtime=args.runtime, probe=args.probe)
-        if picked and picked.get("room") is None and \
-                picked.get("action") in ("add", "skipped"):
-            # An add handled here, or one already handled: the core must not add again.
-            return 0
+        apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:

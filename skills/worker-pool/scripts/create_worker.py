@@ -105,40 +105,6 @@ def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> d
     return pr.register_worker(workspace, worker_id, label, room, runtime=runtime)
 
 
-class CreatedUnrostered(Exception):
-    """The worker exists but the roster does not name it, so nothing routes to it."""
-
-    def __init__(self, worker_id: str, cause: Exception):
-        super().__init__(f"worker {worker_id} was created, but the roster could not "
-                         f"be compiled: {cause}")
-        self.worker_id = worker_id
-
-
-def create(workspace, repo, *, label: str = "", room=None, runtime=None,
-           folder: str = "", socket=None) -> dict:
-    """The whole command as one call, for a caller that already holds the intent.
-
-    Refusals raise before anything is made. After the spawn, a compile failure
-    raises `CreatedUnrostered` naming the worker; a publish failure returns the
-    worker with `advertisement: "unpublished"`, because it IS routable by then.
-    """
-    preflight(workspace, repo, room)
-    rt = sw.resolve_runtime(repo, runtime or None)
-    made = sw.spawn(workspace, repo, runtime=rt, cwd=folder, socket=socket or None,
-                    label=label)
-    advertisement = "published"
-    try:
-        roster = compile_with(workspace, made["worker_id"], label, room,
-                              runtime=made.get("runtime"))
-    except pr.PublishError as e:
-        roster, advertisement = e.roster, "unpublished"
-    except (pr.RosterError, OSError) as e:
-        raise CreatedUnrostered(made["worker_id"], e) from e
-    return {**made, "roster_version": roster["version"], "room": room,
-            "advertisement": advertisement,
-            "unrostered_records": unrostered(workspace, roster.get("workers") or {})}
-
-
 def report(made: dict, roster: dict, room, orphans: list) -> str:
     # Read through .get: spawn()'s contract is these keys, but a partial
     # report beats a KeyError when a caller upstream reshapes its extras.
