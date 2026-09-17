@@ -11,7 +11,9 @@ working-state e2e would need a live core, which CI doesn't have.
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -50,6 +52,44 @@ WORKING_PANE = """\
 """
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
+
+# 1b) _tmux_socket(): the probe must read the socket the core LAUNCHED on, not the
+#     import-time default. The launcher overrides SUTANDO_TMUX_SOCKET and a detached
+#     probe does not inherit it, so guessing reports a live core as offline.
+_sock_tmp = tempfile.mkdtemp()
+_cores = os.path.join(_sock_tmp, "state", "cores")
+os.makedirs(_cores, exist_ok=True)
+_host = rh._host_label_safe() or "testhost"
+_alive = os.path.join(_cores, _host + ".alive")
+_orig_resolve, _orig_host = rh._resolve_workspace, rh._host_label_safe
+rh._resolve_workspace = lambda repo: _sock_tmp
+rh._host_label_safe = lambda: _host
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/run/real.sock"}, _fh)
+check("_tmux_socket: prefers the socket the heartbeat recorded",
+      rh._tmux_socket() == "/run/real.sock")
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"session": "sutando-core"}, _fh)
+check("_tmux_socket: falls back when .alive carries no socket",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    _fh.write("{not json")
+check("_tmux_socket: falls back on an unreadable .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.remove(_alive)
+check("_tmux_socket: falls back when .alive is absent",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: ""
+check("_tmux_socket: falls back when the host label is unknown",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._resolve_workspace, rh._host_label_safe = _orig_resolve, _orig_host
+shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
 env = dict(os.environ)
@@ -153,7 +193,6 @@ d = _derive_with(core=False, pane="", status="running")
 check("derive: no core -> offline", d["health"] == "offline" and d["authenticated"] is None)
 
 # 5) _core_status reads the status field from a fixture core-status.json.
-import tempfile
 T = tempfile.mkdtemp()
 os.makedirs(os.path.join(T, "state"))
 with open(os.path.join(T, "state", "core-status.json"), "w") as f:
