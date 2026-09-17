@@ -245,14 +245,16 @@ def _promote(winner: dict, local: dict) -> dict:
 
 
 def _rows_equal(a, b) -> bool:
-    """Row equality, but type-sensitive for BOOL_FIELDS.
+    """Row equality, but type-sensitive for BOOL_FIELDS and NUMERIC_ROUTE_FIELDS.
 
-    Python's `==` treats `0 == False` and `1 == True`, so a malformed local
-    `allowlisted: 0` and a real peer `allowlisted: False` compared as THE SAME
-    ROW -- the collision branch below (which is where the bool-aware
-    `states_field` promotion logic lives) was never entered, so the peer's
-    real refusal was silently kept only because it happened to look identical
-    to the malformed placeholder (keweichen, #4047 review).
+    Python's `==` treats `0 == False`, `1 == True` and `42.0 == 42`, so a
+    malformed value and a differently-typed real one compare as THE SAME ROW
+    -- the collision branch below (where the type-aware promotion logic
+    lives) is never entered, and `_names_route()` treats a float/bool numeric
+    route value as invalid while equality just saw them as identical to a
+    valid int. Exact `type()` match for NUMERIC_ROUTE_FIELDS mirrors that
+    classifier's own int-not-bool rule; BOOL_FIELDS keeps its own narrower
+    check since `0`/`False` there are never route values (keweichen, #4047).
     """
     if not (isinstance(a, dict) and isinstance(b, dict)):
         return a == b
@@ -261,6 +263,8 @@ def _rows_equal(a, b) -> bool:
     for k, av in a.items():
         bv = b[k]
         if k in BOOL_FIELDS and isinstance(av, bool) != isinstance(bv, bool):
+            return False
+        if k in NUMERIC_ROUTE_FIELDS and type(av) is not type(bv):
             return False
         if av != bv:
             return False
