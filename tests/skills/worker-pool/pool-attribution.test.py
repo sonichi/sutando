@@ -5,7 +5,9 @@ The bridge cannot import this skill, so the contract that matters is the PATH.
 These fixtures go through `attribution_path()` itself, so if the writer's
 convention moves, this fails instead of the bridge silently losing attribution.
 """
-import sys, tempfile, unittest
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "skills" / "worker-pool" / "scripts"))
