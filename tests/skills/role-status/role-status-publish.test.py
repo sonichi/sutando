@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -122,9 +123,9 @@ with tempfile.TemporaryDirectory() as td:
     so_buf, se_buf = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
-    check(rc == 2 and "result already present" in se_buf.getvalue()
+    check(rc == 2 and "result already published" in se_buf.getvalue()
           and (ws / "results" / "task-role-status-v1-0000-a2.txt").read_text() == "[no-send]\n[]\n",
-          "a result already present is never overwritten: exit 2")
+          "a result already published is never overwritten: exit 2")
 # results/ unwritable: a regular file sits where the directory should be
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td)
@@ -205,6 +206,75 @@ check(all(re.search(r"^\s*- `%s` — " % code, skill_md, re.M) for code in ("0",
 check("tasks/task-role-status-v1-" in skill_md and "[no-send]" in skill_md
       and "results/<task-id>.txt" in skill_md, "SKILL.md names the task pattern, the [no-send] result and its path")
 check("bare JSON array" in skill_md.replace("**", ""), "SKILL.md asks the delegate for a bare JSON array")
+
+# (9) exclusive publication: two publishers past every check race at the writer's
+# commit point (os.link); exactly one wins, the loser never touches the result.
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"
+    task.write_text(TASK)
+    j1, j2 = Path(td) / "j1.json", Path(td) / "j2.json"
+    j1.write_text(json.dumps(FULL))
+    j2.write_text(json.dumps(FULL[::-1]))       # distinct payload per racer: names the winner
+    out = ws / "results" / "task-role-status-v1-0000-a2.txt"
+    payload_of = {"a": FULL, "b": FULL[::-1]}
+    rcs = {}
+
+    def go(name, j):
+        rcs[name] = pub.main([str(task), str(j), "--workspace", str(ws)])
+
+    # sequential control: the second publish finds the first one's result
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+        go("a", j1)
+        go("b", j2)
+    check([rcs["a"], rcs["b"]] == [0, 2] and out.read_text().endswith(json.dumps(FULL, indent=2) + "\n"),
+          "sequential control: rcs [0, 2], the first payload stays")
+    out.unlink()
+    rcs.clear()
+
+    barrier = threading.Barrier(2, timeout=10)
+    real_link = os.link
+
+    def link_after_barrier(src, dst, *a, **k):
+        barrier.wait()                      # both temp files written, neither linked yet
+        return real_link(src, dst, *a, **k)
+
+    so_buf, se_buf = io.StringIO(), io.StringIO()
+    os.link = link_after_barrier
+    try:
+        with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+            threads = [threading.Thread(target=go, args=("a", j1)), threading.Thread(target=go, args=("b", j2))]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+    finally:
+        os.link = real_link
+    winners = [n for n, rc in rcs.items() if rc == 0]
+    check(sorted(rcs.values()) == [0, 2], "raced: exactly one rc 0 and one rc 2 (%r)" % rcs)
+    check(len(winners) == 1 and out.read_text()
+          == "[no-send]\n" + json.dumps(payload_of[winners[0]], indent=2, ensure_ascii=False) + "\n",
+          "raced: the result is the winner's payload, untouched by the loser")
+    check(so_buf.getvalue().count("published ") == 1
+          and se_buf.getvalue().count("cannot answer: result already published") == 1,
+          "raced: one `published` line, one `result already published` refusal")
+    check(sorted(p.name for p in (ws / "results").iterdir()) == ["task-role-status-v1-0000-a2.txt"],
+          "raced: no stray temp file left in results/")
+# the writer itself: an existing target is never replaced, the temp file never lingers
+with tempfile.TemporaryDirectory() as td:
+    target = Path(td) / "r.txt"
+    target.write_text("first")
+    check(pub.create_exclusive(str(target), "second") is False and target.read_text() == "first"
+          and sorted(p.name for p in Path(td).iterdir()) == ["r.txt"],
+          "create_exclusive on an existing target: False, content kept, no temp file")
+    check(pub.create_exclusive(str(Path(td) / "n.txt"), "new") is True
+          and (Path(td) / "n.txt").read_text() == "new"
+          and sorted(p.name for p in Path(td).iterdir()) == ["n.txt", "r.txt"],
+          "create_exclusive on a fresh target: True, written, no temp file")
+check("write_atomic" not in src and "os.replace" not in src,
+      "publish.py's production write is the exclusive one, never a replace")
 
 print()
 print("checks: %d" % CHECKS)

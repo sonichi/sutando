@@ -7,13 +7,15 @@
 Reads the task file and the judgment (a leading `[no-send]` line the model may
 have added is dropped), verifies the judgment in-process through `verify.py`,
 and on success writes `[no-send]\\n<verified JSON array>\\n` to
-`<workspace>/results/<task-file-stem>.txt` -- via a temp file in results/ and
-os.replace, so a drain never sees a half-written result. The stats line goes to
-stdout; every strip/refusal line goes to stderr, as verify.py prints them.
+`<workspace>/results/<task-file-stem>.txt` -- create-if-absent: a temp file in
+results/ is hard-linked to the result name, which fails when the name exists,
+so a drain never sees a half-written result and two publishers never both win.
+The stats line goes to stdout; every strip/refusal line goes to stderr, as
+verify.py prints them.
 
 Exit 0: published.  1: refused on coverage, nothing written -- re-judge with an
 explicit coverage instruction.  2: cannot answer (unreadable task file or
-judgment, unreadable/ambiguous structured evidence, a result already present,
+judgment, unreadable/ambiguous structured evidence, a result already published,
 results/ unwritable), nothing written.
 This script emits the `[no-send]` first line but never parses result markers.
 """
@@ -21,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -34,6 +37,26 @@ EXIT_OK, EXIT_REFUSED, EXIT_CANNOT = verify.EXIT_OK, verify.EXIT_REFUSED, verify
 
 def result_path(workspace: Path, task_file: str) -> Path:
     return workspace / "results" / (Path(task_file).stem + ".txt")
+
+
+def create_exclusive(path: str, payload: str) -> bool:
+    """Publish payload at path only if nothing is there: link(2) refuses an existing
+    target, so racing publishers get exactly one winner. False = target already existed."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".role-status-publish.", dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -66,15 +89,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     workspace = Path(args.workspace) if args.workspace else resolve_workspace()
     out = result_path(workspace, args.task_file)
-    if out.exists():
-        sys.stderr.write("cannot answer: result already present: %s\n" % out)
-        return EXIT_CANNOT
     payload = "[no-send]\n" + json.dumps(outcome.verified, indent=2, ensure_ascii=False) + "\n"
     try:
         os.makedirs(str(out.parent), exist_ok=True)
-        verify.write_atomic(str(out), payload)
+        published = create_exclusive(str(out), payload)
     except OSError as e:
         sys.stderr.write("cannot answer: results/ unwritable: %s\n" % e)
+        return EXIT_CANNOT
+    if not published:
+        sys.stderr.write("cannot answer: result already published: %s\n" % out)
         return EXIT_CANNOT
     print("published %s" % out)
     return EXIT_OK

@@ -377,6 +377,102 @@ check(rc == 0 and json.loads(written) == five and se == ""
       and stats_line(so) == "rows=5 distinct_actors=5 actors=9 actors_with_events=9 min_rows=5",
       "positive control: five distinct rows for 9 actors: accepted, distinct_actors=5")
 
+# Whole-token identities (the reviewer's extended-actor mutation): an id touching
+# another id character on either side is a different token, never this id.
+TWO_OWNERS = ("id: t\ntask: go\n\n"
+              f"event {E_X} by {ALICE}\ndetail: shipping\n\n"
+              f"event {E_B1} by {BOB2}\ndetail: rebasing\n")
+rc, so, se, written = run(TWO_OWNERS, [row(ALICE, [E_X], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_X], [])] and se == ""
+      and stats_line(so) == "rows=1 distinct_actors=1 actors=2 actors_with_events=2 min_rows=1",
+      "token-control: alice's exact token owns her event, 1 of 2 clears the floor")
+rc, so, se, written = run(TWO_OWNERS.replace(ALICE, ALICE + "x"), [row(ALICE, [E_X], [])], out=True)
+check(rc == 1 and written is None and f"drop row[0]: actor_id {ALICE!r} not in task file" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=1 actors_with_events=1 min_rows=1",
+      "extended-actor: `ag2.spacex` in the evidence is not alice; her row drops, refused")
+# the reviewer's exact shape (single-actor control + prose-only bob): nobody owns
+# anything, so the floor is 0 and the answer is the empty array -- never alice's row
+rc, so, se, written = run(BLOCK_CONTROL.replace(ALICE, ALICE + "x"), [row(ALICE, [E_X], [])], out=True)
+check(rc == 0 and json.loads(written) == [] and f"drop row[0]: actor_id {ALICE!r} not in task file" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=1 actors_with_events=0 min_rows=0",
+      "extended-actor on the single-actor control: row dropped, empty array, distinct_actors=0")
+rc, so, se, written = run(TWO_OWNERS.replace(E_B1, E_B1 + "x"), [row(BOB2, [E_B1], [])], out=True)
+check(rc == 1 and written is None and f"strip row[0] {BOB2} working_event_ids: {E_B1!r} not in task file" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=2 min_rows=1",
+      "extended-event: `...-3333x` in the evidence is not `...-3333`; the citation is stripped, refused")
+rc, so, se, written = run(TWO_OWNERS.replace(E_B1, E_B1 + "x"), [row(BOB2, [E_B1 + "x"], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(BOB2, [E_B1 + "x"], [])] and se == "",
+      "extended-event positive: citing the whole extended token passes")
+# glued on the left, or two ids glued by an alphabet character: no whole token at all
+rc, so, se, written = run(TWO_OWNERS.replace(ALICE, "x" + ALICE), [row(ALICE, [E_X], [])], out=True)
+check(rc == 1 and written is None and f"drop row[0]: actor_id {ALICE!r} not in task file" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=1 actors_with_events=1 min_rows=1",
+      "prefixed-actor: `xag2space:@alice…` is not alice; her row drops, refused")
+rc, so, se, written = run(TWO_OWNERS.replace(E_X, "x" + E_X), [row(ALICE, [E_X], [])], out=True)
+check(rc == 1 and written is None and f"strip row[0] {ALICE} working_event_ids: {E_X!r} not in task file" in se,
+      "prefixed-event: `xag2space-message:$eventA` is not $eventA; the citation is stripped, refused")
+GLUED = f"id: t\ntask: go\n\nevent {E_X}:{E_B1} by {ALICE}\ndetail: shipping\n\nevent {E_A2} by {BOB2}\n"
+rc, so, se, written = run(GLUED, [row(ALICE, [E_X, E_B1], [])], out=True)
+check(rc == 1 and written is None and f"{E_X!r} not in task file" in se and f"{E_B1!r} not in task file" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=1 min_rows=1",
+      "glued events `$eventA:ag2space-message:$bbbb…`: neither half is a token, both citations stripped")
+rc, so, se, written = run(GLUED.replace(f"{E_X}:{E_B1}", f"{E_X} {E_B1}"), [row(ALICE, [E_X, E_B1], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_X, E_B1], [])] and se == "",
+      "glued-events positive: the same two ids separated by a space are both owned")
+# a truncated citation never equals a whole token on the structured path either
+rc, so, se, _ = run(TASK_JSON.replace(E_A1, E_A1 + "x"), [row(ALICE, [E_A1], []), row(BOB, [E_B1], [])])
+check(rc == 0 and [r["actor_id"] for r in verified_of(so)] == [BOB]
+      and f"strip row[0] {ALICE} working_event_ids: {E_A1!r} not in task file" in se,
+      "EVIDENCE_JSON extended-event: the truncated citation is stripped, alice's row drops")
+rc, so, se, _ = run(TASK_JSON.replace(E_A1, E_A1 + "x"), [row(ALICE, [E_A1 + "x"], []), row(BOB, [E_B1], [])])
+check(rc == 0 and len(verified_of(so)) == 2 and se == "",
+      "EVIDENCE_JSON extended-event positive: the whole token is owned and passes")
+# punctuation outside the id alphabet (quotes, commas, brackets, parens, whitespace)
+# still delimits a token
+PUNCT = ("id: t\ntask: go\n\n"
+         f'event "{E_X}", by ({ALICE}).\n\n'
+         f"event [{E_B1}]; by <{BOB2}>\n")
+rc, so, se, written = run(PUNCT, [row(ALICE, [E_X], []), row(BOB2, [E_B1], [])], "--min-coverage", "1.0", out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_X], []), row(BOB2, [E_B1], [])] and se == ""
+      and stats_line(so) == "rows=2 distinct_actors=2 actors=2 actors_with_events=2 min_rows=2",
+      "punctuation-delimited ids are whole tokens: both rows pass at full coverage")
+
+# Structured multi-claimant (the reviewer's $same mutation): one event id under
+# two actor_ids is owned by nobody; both claimants still set the floor.
+E_SAME = "ag2space-message:$same"
+E_OTHER = "ag2space-message:$other"
+def structured(*pairs):
+    return ("id: t\ntask: go\n\nEVIDENCE_JSON:\n"
+            + json.dumps({"events": [{"actor_id": a, "id": e, "detail": "x"} for a, e in pairs]}) + "\n")
+SHARED = structured((ALICE, E_SAME), (BOB2, E_SAME))
+rc, so, se, written = run(SHARED, [row(ALICE, [E_SAME], []), row(BOB2, [E_SAME], [])], "--min-coverage", "1.0", out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=2 distinct_actors=0 actors=2 actors_with_events=2 min_rows=2",
+      "structured two-claimant at full coverage: both rows drop, floor still 2, refused")
+check(f"strip row[0] {ALICE} working_event_ids: {E_SAME!r} ambiguous ownership" in se
+      and f"strip row[1] {BOB2} working_event_ids: {E_SAME!r} ambiguous ownership" in se
+      and f"drop row[0] {ALICE}: no verifiable event ids left" in se
+      and f"drop row[1] {BOB2}: no verifiable event ids left" in se,
+      "structured two-claimant: each citation stripped as ambiguous ownership, each row dropped")
+rc, so, se, written = run(SHARED, [row(ALICE, [E_SAME], []), row(BOB2, [E_SAME], [])], out=True)
+check(rc == 1 and written is None and "min_rows=1" in stats_line(so),
+      "structured two-claimant at the default floor: still refused (ambiguity never lowers the floor)")
+# same-owner positive controls
+rc, so, se, written = run(structured((ALICE, E_SAME), (ALICE, E_OTHER)), [row(ALICE, [E_SAME, E_OTHER], [])], "--min-coverage", "1.0", out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_SAME, E_OTHER], [])] and se == "",
+      "structured positive: one actor with two events cites both")
+rc, so, se, written = run(structured((ALICE, E_SAME), (BOB2, E_OTHER)),
+                          [row(ALICE, [E_SAME], []), row(BOB2, [E_OTHER], [])], "--min-coverage", "1.0", out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_SAME], []), row(BOB2, [E_OTHER], [])] and se == "",
+      "structured positive: two actors with distinct events pass at full coverage")
+# ambiguity strips only the shared id: a claimant's own other event still counts
+rc, so, se, written = run(structured((ALICE, E_SAME), (BOB2, E_SAME), (BOB2, E_OTHER)),
+                          [row(ALICE, [E_SAME], []), row(BOB2, [E_SAME, E_OTHER], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(BOB2, [E_OTHER], [])]
+      and f"strip row[1] {BOB2} working_event_ids: {E_SAME!r} ambiguous ownership" in se
+      and stats_line(so) == "rows=2 distinct_actors=1 actors=2 actors_with_events=2 min_rows=1",
+      "structured: the shared id is stripped for both, bob's own other event keeps his row")
+
 print()
 print("checks: %d" % CHECKS)
 if failures:

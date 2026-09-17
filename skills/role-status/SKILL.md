@@ -30,9 +30,9 @@ for one actor of nine — the verifier strips the first two and refuses the thir
    next one; a result written against a withdrawn attempt is never claimed, so
    re-list `tasks/` right before publishing.
 3. **The result** is `[no-send]` followed by the verified JSON array, written
-   atomically (temp file in `results/` + rename) to
-   `<workspace>/results/<task-id>.txt`. Nothing else is written; the bridge
-   archives the task without a user-visible reply.
+   create-if-absent (temp file in `results/` + hard link, which fails when the
+   name exists) to `<workspace>/results/<task-id>.txt`. Nothing else is
+   written; the bridge archives the task without a user-visible reply.
 4. **Exit codes:**
    - `0` — published.
    - `1` — refused on coverage: fewer distinct verified actors than
@@ -40,8 +40,9 @@ for one actor of nine — the verifier strips the first two and refuses the thir
      with an explicit coverage instruction ("answer for every actor that has an
      event; N actors are listed") and publish again.
    - `2` — cannot answer: unreadable task or judgment, malformed or duplicated
-     `EVIDENCE_JSON`, a result already present. **Nothing written.** Do not
-     retry the model; surface the task to the owner.
+     `EVIDENCE_JSON`, a result already published (`cannot answer: result
+     already published`). **Nothing written**, the existing result untouched.
+     Do not retry the model; surface the task to the owner.
 
 `publish.py` delegates every judgment decision to `scripts/verify.py`
 (`verify.verify(task_text, judgment, min_coverage)`); the verifier remains
@@ -60,7 +61,10 @@ python3 skills/role-status/scripts/verify.py <task-file> <judgment.json> [--out 
   another actor's `detail` owns nothing. A file with no marker falls back to
   blank-line blocks, where an id is owned only when its block names exactly one
   actor — a multi-actor block is ambiguous, its ids are owned by nobody, and its
-  actors still count toward the floor.
+  actors still count toward the floor. On either path an event id claimed by
+  more than one actor is ambiguous the same way. Ids are whole tokens: an id
+  touching another id character on either side (`…:ag2.spacex`, `$abcd` inside
+  `$abcde`) is a different token and never matches.
 - **Coverage.** `distinct verified actors ≥ ceil(min_coverage × actors_with_events)`,
   else refused. Duplicate rows for one actor count once.
 - **Fail closed.** A malformed marked object or two marker lines is exit 2,
