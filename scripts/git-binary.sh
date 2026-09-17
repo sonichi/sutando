@@ -27,11 +27,25 @@ _sutando_git_realpath() {
 	printf '%s/%s' "$_rdir" "${_target##*/}"
 }
 
-# A real stat (its own inode, never the CLT stub group), not `[ -e ]`: only
-# it tells ENOENT apart from any other failure. Exit: 0 exists, 1 absent, 2 unknown.
-_sutando_git_stat_state() {
-	_err="$(/usr/bin/stat -f '%p' "$1" 2>&1 >/dev/null)" && return 0
-	case "$_err" in
+# Pure: BSD/GNU stat spell the format-string flag differently for $1's
+# `uname -s`. Split out so the branch is testable without faking a kernel.
+_sutando_git_stat_flag() {
+	case "$1" in
+		Darwin) printf -- '-f' ;;
+		*) printf -- '-c' ;;
+	esac
+}
+
+# A real stat (never `[ -e ]`): prints "<dev> <ino>" so a later compare needs
+# no race-prone syscall of its own. Exit: 0 exists, 1 absent, 2 unknown.
+_sutando_git_stat_id() {
+	# Absolute, like the stat call below: several callers deliberately run
+	# under a PATH with no /usr/bin, where a bare `uname` would not resolve.
+	_flag="$(_sutando_git_stat_flag "$(/usr/bin/uname -s 2>/dev/null)")"
+	_out="$(/usr/bin/stat "$_flag" '%d %i' "$1" 2>&1)"
+	_rc=$?
+	[ "$_rc" -eq 0 ] && printf '%s\n' "$_out" && return 0
+	case "$_out" in
 		*'No such file or directory'*) return 1 ;;
 		*) return 2 ;;
 	esac
@@ -40,21 +54,19 @@ _sutando_git_stat_state() {
 # True when $1's REAL target is the system git, OR unverified either way --
 # only a positive distinct-identity check, or the reference proven absent, may clear it.
 _sutando_git_is_system_stub() {
-	_sutando_git_stat_state "$1" || return 0
+	_sutando_git_stat_id "$1" >/dev/null || return 0
 	_resolved="$(_sutando_git_realpath "$1")" || return 0
 	# Split so the exact flagged token stays out of this file (REVIEW.md
 	# lesson 7 / scripts/python-binary.sh's own comment on the same point).
 	_sb="/usr"/bin/git
-	_sutando_git_stat_state "$_sb"; _sb_state=$?
-	case "$_sb_state" in
+	_sb_id="$(_sutando_git_stat_id "$_sb")"; _sb_rc=$?
+	case "$_sb_rc" in
 		1) return 1 ;;
 		0) ;;
 		*) return 0 ;;
 	esac
-	_sutando_git_stat_state "$_resolved" || return 0
-	# -ef compares filesystem identity (device+inode): realpath above does
-	# not case-fold, so a case-insensitive-volume alias missed `=` alone.
-	[ "$_resolved" -ef "$_sb" ]
+	_resolved_id="$(_sutando_git_stat_id "$_resolved")" || return 0
+	[ "$_resolved_id" = "$_sb_id" ]
 }
 
 # Echo a runnable git, or NOTHING. Never echoes the stub unless the developer
