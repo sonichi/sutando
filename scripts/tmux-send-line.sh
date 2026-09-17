@@ -29,8 +29,10 @@ exec 9>"$LOCK"
 # Claude a grey ghost suggestion -- while typed text is unstyled, so the pane is always
 # read with -e and any styled run after the glyph is dropped before deciding "pending".
 # A failed capture or parse is UNKNOWN, never "empty": refuse rather than send.
-CAP="$("$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
-PENDING="$(printf '%s\n' "$CAP" | "$PY" -c 'import sys,re
+# One capture+parse, reused for the initial read and Codex's post-delay recheck below.
+_pending() {
+  local cap; cap="$("$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null)" || return 7
+  printf '%s\n' "$cap" | "$PY" -c 'import sys,re
 rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
 SGR=re.compile(r"\x1b\[[0-9;]*m")
 # dim (2) or a grey 256-colour foreground (38;5;2xx), up to the reset/normal-intensity
@@ -44,12 +46,23 @@ for l in sys.stdin.read().splitlines():
     r=SGR.sub("",GHOST.sub("",l[idx+len(glyph):]))
     if r[:1] in (" ", "\u00a0"): r=r[1:]
     last=r.rstrip()
-print(last)' "$RUNTIME")" || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
+print(last)' "$RUNTIME"
+}
+PENDING="$(_pending)"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: capture or prompt parse failed — not sending" >&2; exit 7; }
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
 "$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
 # Codex reads an Enter within 120ms of a typed burst as a pasted newline (PASTE_ENTER_SUPPRESS_WINDOW), not a submit.
 [ "$RUNTIME" = codex ] && sleep 0.25
+# The lock excludes cooperating senders, not operator keystrokes: a picker or dialog
+# can appear in the pane during Codex's delay. Re-read and only Enter if the composer
+# still shows exactly the payload THIS invocation staged; otherwise abort without Enter.
+if [ "$RUNTIME" = codex ]; then
+  RECHECK="$(_pending)"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: capture or prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
+  if [ "$RECHECK" != "$LINE" ]; then echo "tmux-send-line: pane changed during the paste-burst delay (composer now '${RECHECK:0:60}', expected '$LINE') — Enter withheld" >&2; exit 5; fi
+fi
 "$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
 echo "sent '$LINE' to $SESSION"
