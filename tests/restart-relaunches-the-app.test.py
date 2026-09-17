@@ -28,10 +28,10 @@ class RestartRelaunchesTheApp(unittest.TestCase):
 
     def test_liveness_uses_pgrep_x_not_dash_f(self):
         """-f self-matches the checking shell and reports a false positive."""
-        self.assertIn("pgrep -x Sutando", self.text)
+        self.assertIn("pops_name_running Sutando", self.text)
         self.assertNotRegex(
-            self.text, r'pgrep -f ["\']?[^"\'\n]*src/Sutando/Sutando',
-            "app liveness must not use pgrep -f — it matches this script's argv")
+            self.text, r'pops_pattern_running ["\']?[^"\'\n]*src/Sutando/Sutando',
+            "app liveness must not match on argv — -f matches this script's own")
 
     def test_the_launch_is_reachable_before_the_terminal_exec(self):
         """A block after `exec` greps as present and never runs.
@@ -48,7 +48,7 @@ class RestartRelaunchesTheApp(unittest.TestCase):
     def test_guarded_against_double_launch(self):
         """Two app instances mean two checkWatcher timers re-arming one watcher."""
         head = self.text[:self.text.index('nohup "$APP_BIN"')]
-        self.assertIn("pgrep -x Sutando", head,
+        self.assertIn("pops_name_running Sutando", head,
                       "the launch is not preceded by an already-running guard")
 
     def test_missing_binary_skips_instead_of_failing(self):
@@ -97,7 +97,7 @@ class RestartRelaunchesTheApp(unittest.TestCase):
         """CONTROL: if restart.sh stops killing the app, this fix is moot and the
         test should say so rather than passing for a stale reason."""
         self.assertRegex(RESTART.read_text(),
-                         r'pkill -f "src/Sutando/Sutando"',
+                         r'pops_pattern_kill "src/Sutando/Sutando"',
                          "restart.sh no longer pkills the app — re-evaluate #2810")
 
     def test_both_edited_scripts_are_syntactically_valid(self):

@@ -118,6 +118,48 @@ def test_pidfile_malformed_unknown():
     assert "unreadable" in detail
 
 
+def test_pidfile_claim_cannot_manufacture_pid():
+    # `broken\npid=12345\n`: the parser owns `pid`; a claim line under a
+    # malformed line 1 used to land the string "12345" and reach pid_alive.
+    p = _tmp("broken\npid=12345\n")
+    seen = []
+    status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: seen.append(pid) or True)
+    assert status == "unknown", (status, detail)
+    assert "no pid on line 1" in detail
+    assert seen == [], f"pid_alive was asked about a manufactured pid: {seen}"
+
+
+def test_pidfile_invalid_utf8_is_unknown_not_a_raise():
+    # A strict read ahead of the tolerant reader raised UnicodeDecodeError and
+    # aborted the whole status refresh on one corrupt byte.
+    p = _tmp(); p.write_bytes(b"\xff\n")
+    status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: True)
+    assert status == "unknown", (status, detail)
+    assert "unreadable" in detail
+    # Same byte in a claim line: line 1 is still a pid, and nothing raises.
+    p.write_bytes(b"4242\ninstance=\xff\n")
+    status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: pid == 4242)
+    assert status == "running", (status, detail)
+
+
+def test_pidfile_oversized_pid_unknown():
+    # int() refuses >4300 digits (ValueError) and pid_t is 32-bit: both are
+    # corruption, not a pid to ask os.kill about.
+    for raw in ("9" * 5000, "2147483648"):
+        p = _tmp(raw + "\n")
+        status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: True)
+        assert status == "unknown", (raw[:12], status, detail)
+        assert "out-of-range" in detail
+
+
+def test_pidfile_record_control_reads_its_pid():
+    # CONTROL for the three above: a well-formed record still reads line 1.
+    p = _tmp("4242\ninstance=\ncode_path=/x/src/watch-tasks-stream.sh\npid=1\n")
+    status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: pid == 4242)
+    assert status == "running", (status, detail)
+    assert "4242" in detail
+
+
 def test_port_running():
     status, detail, _ = ss.probe_port(8080, connect=lambda port: True)
     assert status == "running"

@@ -127,7 +127,7 @@ check "cleanup() body is extractable (else every ordering check below is vacuous
 
 line_of() { printf '%s\n' "$cleanup_code" | grep -n -- "$1" | head -1 | cut -d: -f1; }
 sent=$(line_of 'shutting-down')
-rel=$(line_of 'sentinel_release_if_owner')
+rel=$(line_of 'sentinel_release_incarnation')
 kil=$(line_of 'kill -TERM')
 fbk=$(line_of 'fallback_outstanding_handlers')
 
@@ -139,7 +139,7 @@ for pair in "sentinel:$sent" "release:$rel" "kill:$kil" "fallback:$fbk"; do
 done
 
 if [ -n "$sent" ] && [ -n "$rel" ] && [ -n "$kil" ] && [ -n "$fbk" ]; then
-    check "the shutting-down sentinel precedes sentinel_release_if_owner" \
+    check "the shutting-down sentinel precedes sentinel_release_incarnation" \
           "yes" "$([ "$sent" -lt "$rel" ] && echo yes || echo no)"
     check "...precedes the first kill" \
           "yes" "$([ "$sent" -lt "$kil" ] && echo yes || echo no)"

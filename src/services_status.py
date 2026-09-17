@@ -149,22 +149,36 @@ def probe_watcher_sentinels(state_dir: Path, pid_alive
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
-    """A `<name>.pid` file holding a single PID: running if `pid_alive(pid)`.
-    Missing/empty file → offline. Malformed → unknown. `pid_alive` is injected
-    (real: os.kill(pid, 0)) so the branch logic is testable without a process."""
-    try:
-        if not path.exists():
-            return ("offline", "no pidfile", None)
-        raw = path.read_text().strip()
-        if not raw:
+    """A `<name>.pid` sentinel: running if `pid_alive(pid)`. Missing/empty file →
+    offline. Malformed → unknown. `pid_alive` is injected (real: os.kill(pid, 0))
+    so the branch logic is testable without a process.
+
+    The pid comes from the shared reader, never a private `int()` of the file:
+    the watcher sentinel is a RECORD whose pid is line 1, and a whole-file
+    `int()` read every recorded watcher as `unknown` (0 and negatives too — they
+    name a process GROUP to os.kill, which succeeds and reads falsely running).
+    """
+    from util_paths import read_sentinel_record
+    # No private decode ahead of the reader: a strict read raised on one bad
+    # byte, so a corrupt sentinel aborted the whole status refresh.
+    rec = read_sentinel_record(path)
+    if "pid_line" not in rec:
+        try:
+            if not path.exists():
+                return ("offline", "no pidfile", None)
+        except OSError:
+            pass
+        return ("unknown", "unreadable pidfile", None)
+    pid, head = rec.get("pid"), rec["pid_line"]
+    if pid is None:
+        if not head and len(rec) == 1:
             return ("offline", "empty pidfile", None)
-        pid = int(raw)
-    except (OSError, ValueError) as e:
-        return ("unknown", f"unreadable pidfile: {e}", None)
-    if pid <= 0:
-        # os.kill(0, 0) / negative pids signal the process GROUP, which succeeds
-        # and would read as falsely "running" — a 0/negative pidfile is corrupt.
-        return ("unknown", f"non-positive pid {pid} in pidfile", None)
+        digits = head[1:] if head[:1] == "-" else head
+        if head.isascii() and digits.isdigit():
+            if head[:1] == "-" or not digits.strip("0"):
+                return ("unknown", f"non-positive pid {head} in pidfile", None)
+            return ("unknown", f"out-of-range pid {head[:40]} in pidfile", None)
+        return ("unknown", f"unreadable pidfile: no pid on line 1 ({head[:40]!r})", None)
     if pid_alive(pid):
         return ("running", f"pid {pid}", None)
     return ("offline", f"pid {pid} dead", None)

@@ -30,7 +30,7 @@ services, and lets startup recreate the managed task notifier.
 ### Step 1 — Pull + durable restart handoff (mechanical)
 
 Run the helper. It aborts safely on a dirty tree or a non-fast-forward, pulls
-`--ff-only`, and launches `src/restart.sh` in the persistent
+`--ff-only`, and launches `src/restart.sh --scope all` in the persistent
 **`sutando-services` tmux session**:
 
 ```bash

@@ -529,9 +529,54 @@ mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
 PID_FILE="$(sentinel_path_for "$STATE_DIR")"
-# In place, never write-elsewhere-then-mv: mv preserves mtime, and
-# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
+# An empty path is not a place to record this watcher, and an unrecorded
+# watcher is one no signaller may stop: refuse by name, not at the write.
+if [ -z "$PID_FILE" ]; then
+  echo "watch-tasks-stream: could not resolve the sentinel path under $STATE_DIR; refusing to start unrecorded" >&2
+  exit 1
+fi
+# The record a signaller checks this process against. A bare pid proves nothing:
+# a dead watcher's number is reissued and the next holder answers identically.
+WATCHER_INSTANCE="$(sentinel_instance_from_path "$PID_FILE")"
+# Per START, not per pid: two starts of one instance may not be distinguishable
+# by pid alone during the handover, and this always is. Shape owned by the writer.
+WATCHER_INCARNATION="$(sentinel_new_incarnation "$$")"
+WATCHER_CODE_PATH="$__SCRIPT_DIR/$(basename "$0")"
+# Through the resolver: a bare `git` is the Xcode-CLT stub on a clean Mac.
+WATCHER_VERSION="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/git_binary.py" short-head "$__REPO_ROOT" 2>/dev/null || true)"
+[ -n "$WATCHER_VERSION" ] || WATCHER_VERSION="unknown"
+# BEFORE the record is published, since a start that died mid-publish is what
+# this log is read for. Never `>>`: that open blocks on a reader-less FIFO.
+mkdir -p "$WORKSPACE_DIR/logs" 2>/dev/null || true
+"$SUTANDO_PY_BIN" "$__SCRIPT_DIR/diagnostic_append.py" "$WORKSPACE_DIR/logs/watcher-starts.log" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${WATCHER_INSTANCE:--} $WATCHER_INCARNATION $$ $WATCHER_CODE_PATH $WATCHER_VERSION $PID_FILE" \
+  2>/dev/null || true
+# Under the lock so a peer's cleanup cannot claim this record mid-publish. A
+# failed write is fatal: an unrecorded watcher is one no signaller may stop.
+if ! sentinel_lock_acquire "$PID_FILE"; then
+  echo "watch-tasks-stream: could not take $(sentinel_lock_path "$PID_FILE"); refusing to start unrecorded" >&2
+  exit 1
+fi
+if ! sentinel_write_record "$PID_FILE" "$$" "$WATCHER_INSTANCE" "$WATCHER_INCARNATION" \
+       "$WATCHER_CODE_PATH" "$WATCHER_VERSION" "$WORKSPACE_DIR"; then
+  sentinel_lock_release "$PID_FILE"
+  echo "watch-tasks-stream: could not write the sentinel record at $PID_FILE" >&2
+  exit 1
+fi
+sentinel_lock_release "$PID_FILE"
+# The intake gates, from the path owner that keyed this record: this instance's
+# (a core-scope stop) and the workspace-wide one (--scope all). Never spelled here.
+SHUTDOWN_GATE="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/util_paths.py" shutdown-gate "$STATE_DIR")" || {
+  echo "watch-tasks-stream: could not resolve the shutdown gate under $STATE_DIR" >&2
+  exit 1
+}
+INSTANCE_GATE="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/util_paths.py" instance-shutdown-gate "$STATE_DIR")" || {
+  echo "watch-tasks-stream: could not resolve this instance's shutdown gate under $STATE_DIR" >&2
+  exit 1
+}
+intake_gated() {
+  [ -f "$SHUTDOWN_GATE" ] || [ -f "$INSTANCE_GATE" ]
+}
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -727,7 +772,9 @@ cleanup() {
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
-  sentinel_release_if_owner "$PID_FILE" "$$"
+  # The incarnation is what protects the MARKER: it holds no pid, so without it
+  # a dying duplicate erases the proof a live successor is stoppable.
+  sentinel_release_incarnation "$PID_FILE" "$$" "${WATCHER_INCARNATION:-}" || true
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
@@ -756,11 +803,33 @@ trap 'cleanup; exit 0' HUP INT TERM
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap. Install cleanup first so an immediately exiting fswatch cannot
 # kill a just-started provider before its durable fallback receipt is emitted.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  dispatch_task "$f"
-done
-shopt -u nullglob
+#
+# The same hold the event loop applies: a watcher re-armed while its gate is
+# still set (--stop-only, a restart mid all-scope stop) must not dispatch the
+# backlog into a shutdown. fswatch is not running yet, so after a hold the
+# directory is globbed AGAIN — a task that landed during the hold has no event
+# to replay it and would otherwise be lost.
+sweep_pending_tasks() {
+  local f seen="" found
+  shopt -s nullglob
+  while :; do
+    found=0
+    for f in "$TASKS_DIR"/*.txt; do
+      case "$seen" in *"|$f|"*) continue ;; esac
+      seen="$seen|$f|"
+      found=1
+      if intake_gated; then
+        echo "watch-tasks-stream: intake gated (shutdown in progress); holding $(basename "$f") until the gate lifts" >&2
+        while intake_gated; do sleep 0.5; done
+      fi
+      [ -f "$f" ] || continue
+      dispatch_task "$f"
+    done
+    [ "$found" -eq 1 ] || break
+  done
+  shopt -u nullglob
+}
+sweep_pending_tasks
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -810,11 +879,13 @@ while IFS= read -r path; do
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
-        # emitting one mid-shutdown would orphan it.
-        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-          continue
+        # Graceful-shutdown gate: HOLD a task while either gate is set. fswatch does
+        # not replay, so a dropped event is a lost task if this watcher survives.
+        if intake_gated; then
+          echo "watch-tasks-stream: intake gated (shutdown in progress); holding $(basename "$path") until the gate lifts" >&2
+          while intake_gated; do sleep 0.5; done
         fi
+        [ -f "$path" ] || continue
         dispatch_task "$path"
       fi
       ;;

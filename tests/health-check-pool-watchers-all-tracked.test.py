@@ -232,24 +232,35 @@ class PoolHost(unittest.TestCase):
         environment, so a repair could stamp a different instance's file than
         the one the check found missing."""
         import tempfile
+        import time
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "watch-tasks-stream-worker-9.pid"
+            # The marker the live watcher exposes beside its record: the repair
+            # takes its incarnation from there, and refuses without one.
+            (Path(td) / "watch-tasks-stream-worker-9.incarnation").write_text(
+                f"{int(time.time())}-4242-7\n")
             # WORKSPACE_DIR is pinned inside the tempdir so a regression that
             # re-derives the ambient path cannot reach a real workspace.
-            saved = (hc._proc_argv, hc._is_watcher_argv, hc.WORKSPACE_DIR)
+            saved = (hc._proc_argv, hc._proc_argv_vector, hc._is_watcher_argv, hc.WORKSPACE_DIR)
             try:
                 hc._proc_argv = lambda pid: WATCHER_ARGV
+                hc._proc_argv_vector = lambda pid: None   # a fabricated pid never reads the host
                 hc._is_watcher_argv = lambda argv, pid=None: True
                 hc.WORKSPACE_DIR = Path(td) / "ws"
                 out = hc.fix_task_watcher_sentinel(
                     {"_sentinel_restamp_pid": "4242",
                      "_sentinel_restamp_path": str(target)})
             finally:
-                (hc._proc_argv, hc._is_watcher_argv, hc.WORKSPACE_DIR) = saved
+                (hc._proc_argv, hc._proc_argv_vector, hc._is_watcher_argv, hc.WORKSPACE_DIR) = saved
             self.assertTrue(target.exists(), out)
             self.assertFalse((Path(td) / "ws").exists(),
                              "the repair touched the ambient workspace")
-            self.assertEqual(target.read_text().strip(), "4242")
+            rec = hc.read_sentinel_record(target)
+            self.assertEqual(rec.get("pid"), 4242, target.read_text())
+            # The FULL record, in the writer's grammar: the key the path encodes
+            # is the instance the strict owner will compare against.
+            self.assertEqual(rec.get("instance"), "worker-9", target.read_text())
+            self.assertTrue(rec.get("incarnation", "").split("-")[1:2] == ["4242"], target.read_text())
 
     def test_the_repair_refuses_when_the_check_named_no_path(self):
         out = hc.fix_task_watcher_sentinel({"_sentinel_restamp_pid": "4242"})

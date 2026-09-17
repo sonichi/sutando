@@ -4,8 +4,8 @@
 # reap_stale_task_watcher() resolves sentinel ownership through this helper, so
 # the dependency is declared here rather than left to each caller's source order
 # — a consumer that sourced only this file got `command not found` at reap time.
-# shellcheck source=watcher_sentinel.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher_sentinel.sh"
+# shellcheck source=watcher_identity.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher_identity.sh"
 
 # Resolve the selected core before startup touches runtime-specific credentials.
 # The normal .env load happens later in configure_startup_runtime(); use a
@@ -333,102 +333,57 @@ reap_wedged_voice_agent() {
   return 0
 }
 
-# A pid alone cannot say WHICH watcher it names: the OS reissues the numbers of
-# exited processes, so a live watcher can wear a dead predecessor's pid and match
-# both the value in the sentinel and the `ps` argv check. Ownership is resolved by
-# src/watcher_sentinel.sh, which asks the OS whether the process is old enough to
-# have written the file. Nothing here decides ownership locally.
-
-# Echo the classifier's verdict when the answer is usable, rc 1 otherwise, so
-# noise and an unusable answer fail closed alike.
-_reaper_watcher_verdict() {
-  local _pid="$1" _py="$2" _repo="$3" _out _rc=0
-  # -S -I stops a sitecustomize or PYTHONPATH hook printing a verdict-shaped line;
-  # the exact two-line frame refuses any contamination that still arrives.
-  _out="$("$_py" -S -I "$_repo/src/watcher_identity.py" "$_pid" 2>/dev/null)" || _rc=$?
-  [ "$_rc" -eq 0 ] || return 1
-  [ "$(printf '%s\n' "$_out" | grep -c '')" -eq 2 ] || return 1
-  case "$(printf '%s' "$_out" | head -1)" in
-    watcher)     printf 'watcher' ;;
-    not-watcher) printf 'not-watcher' ;;
-    dead)        printf 'dead' ;;
-    *)           return 1 ;;
-  esac
-  return 0
-}
-
+# Ownership is the shared src/watcher_identity.sh sequence restart.sh also runs;
+# the sentinel is released only for a pid that is GONE, or a stop that was confirmed.
 reap_stale_task_watcher() {
-  local pid_file="$1" stale_pid
+  local pid_file="$1" stale_pid stale_inc rc=0 rel_rc=0
   [ -f "$pid_file" ] || return 0
-  stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
-
-  # Identity is src/watcher_identity.py's to decide, never a local argv test.
-  local _wi_repo _wi_py _wi_verdict _wi_rc=0
-  _wi_repo="$(sutando_repo_root)"
-  # shellcheck source=../scripts/python-binary.sh
-  source "$_wi_repo/scripts/python-binary.sh"
-  _wi_py="$(require_python "$_wi_repo" "classify the task watcher")" || _wi_py=""
-  if [ -z "$stale_pid" ] || [ -z "$_wi_py" ]; then
-    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (no interpreter); leaving the sentinel alone"
+  # LINE 1, through the one shared reader. `cat` fed the whole sentinel to
+  # `ps -p`, which answers "Invalid process id" for every identity record.
+  stale_pid="$(sentinel_pid_in "$pid_file" 2>/dev/null || true)"
+  if [ -z "$stale_pid" ]; then
+    echo "  ⚠ $pid_file names no readable pid on line 1; leaving it alone"
     return 0
   fi
-  # Only a successful helper carrying one exact frame is a verdict; everything
-  # else, `unknown` included, leaves the record untouched.
-  _wi_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _wi_rc=$?
-  if [ "$_wi_rc" -ne 0 ] || [ -z "$_wi_verdict" ]; then
-    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher; leaving the sentinel alone"
+  # The incarnation of the record INSPECTED: the release compares it under the
+  # lock, so a successor published meanwhile — same pid or not — is refused.
+  stale_inc="$(sentinel_field_in "$pid_file" incarnation 2>/dev/null || true)"
+
+  if ! pops_alive "$stale_pid"; then
+    # `kill -0` also fails for a pid this user may not signal: `ps` still lists
+    # it, and a `ps` that cannot answer (denied, absent) must not read as "gone".
+    local ps_err ps_out
+    ps_err="$(mktemp)"
+    ps_out="$(ps -p "$stale_pid" -o args= 2>"$ps_err")" || true
+    if [ -s "$ps_err" ] || [ -n "$ps_out" ]; then
+      echo "  ⚠ pid $stale_pid is not signallable from here and ps says: ${ps_out:-$(head -1 "$ps_err")}; leaving the sentinel alone"
+      rm -f "$ps_err"
+      return 0
+    fi
+    rm -f "$ps_err"
+    sentinel_release_incarnation "$pid_file" "$stale_pid" "$stale_inc" || rel_rc=$?
+    case "$rel_rc" in
+      0) ;;
+      1) echo "  ⚠ watch-tasks-stream sentinel changed under the reap — a live watcher owns it, leaving it in place" ;;
+      *) echo "  ⚠ watch-tasks-stream sentinel names dead pid $stale_pid but could not be released (rc $rel_rc); leaving it in place" ;;
+    esac
     return 0
   fi
 
-  if [ "$_wi_verdict" = "watcher" ]; then
-    # A watcher younger than the sentinel is on a reissued pid, not its owner.
-    # errexit-safe: a bare call here would terminate startup.sh (set -e) on rc 1/2.
-    local owned_rc=0
-    sentinel_pid_wrote_file "$stale_pid" "$pid_file" || owned_rc=$?
-    if [ "$owned_rc" -eq 1 ]; then
-      echo "  ⚠ pid $stale_pid is a watcher but started AFTER this sentinel — reissued pid, not its owner; leaving both alone"
-      return 0
-    fi
-    if [ "$owned_rc" -ne 0 ]; then
-      # Unmeasurable ownership is not permission. Killing here reaped a live drain.
-      echo "  ⚠ pid $stale_pid is a watcher but its ownership of the sentinel is UNMEASURABLE; leaving both alone"
-      return 0
-    fi
-    # Releasing the sentinel while the watcher still runs strands it untracked,
-    # so escalate like the voice takeover above and confirm death before release.
-    local _reap_rc=0 _reap_i
-    kill "$stale_pid" 2>/dev/null || _reap_rc=$?
-    for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$stale_pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 "$stale_pid" 2>/dev/null; then
-      # `kill -0` proves A process exists, not the one inspected, and the wait above
-      # is long enough for an exited watcher's pid to be reused — re-prove before KILL.
-      local _re_verdict _re_owned=0
-      _re_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _re_verdict=""
-      sentinel_pid_wrote_file "$stale_pid" "$pid_file" || _re_owned=$?
-      if [ "$_re_verdict" != "watcher" ] || [ "$_re_owned" -ne 0 ]; then
-        echo "  ⚠ pid $stale_pid no longer proves to be this sentinel's watcher — not escalating to KILL; leaving both alone"
-        return 0
-      fi
-      kill -KILL "$stale_pid" 2>/dev/null || _reap_rc=$?
-      for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
-        kill -0 "$stale_pid" 2>/dev/null || break
-        sleep 0.1
-      done
-    fi
-    if kill -0 "$stale_pid" 2>/dev/null; then
-      echo "  ⚠ pid $stale_pid survived TERM and KILL (last signal rc $_reap_rc) — leaving its sentinel in place so the live watcher stays tracked"
-      return 0
-    fi
-    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $stale_pid)"
+  # <workspace>/state/ is restart.sh's derivation too; the script is THIS
+  # checkout's, so a foreign checkout sharing the workspace is refused.
+  local _state_dir="${pid_file%/*}"
+  if ! watcher_confirm_owner "$pid_file" "$(sentinel_instance_from_path "$pid_file")" \
+         "${_state_dir%/state}" "$(sutando_repo_root)/src/$WATCHER_SENTINEL_STEM.sh"; then
+    echo "  ⚠ $WATCHER_OWNER_REASON; leaving both alone"
+    return 0
   fi
-
-  sentinel_release_if_owner "$pid_file" "$stale_pid"
-  if [ -f "$pid_file" ]; then
-    echo "  ⚠ watch-tasks-stream sentinel changed under the reap — a live watcher owns it, leaving it in place"
-  fi
+  watcher_stop_owned "$pid_file" "$WATCHER_OWNER_PID" "$WATCHER_OWNER_INCARNATION" || rc=$?
+  case "$rc" in
+    0) echo "  ✓ reaped stale watch-tasks-stream watcher (pid $WATCHER_OWNER_PID)" ;;
+    1) echo "  ⚠ SIGNAL FAILED for pid $WATCHER_OWNER_PID — $pid_file left in place so a retry can still name it" ;;
+    *) echo "  ⚠ pid $WATCHER_OWNER_PID is STILL ALIVE after TERM — $pid_file left in place" ;;
+  esac
   return 0
 }
 

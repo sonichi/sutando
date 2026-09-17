@@ -68,6 +68,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
+- **`diagnostic_append.py`** — Append one line to an optional diagnostic log without ever blocking the caller.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
@@ -137,6 +138,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
+- **`proc_argv.py`** — The argv of one pid as a LIST — the authoritative form of a process identity.
+- **`process-ops.sh`** — The ONE seam through which restart.sh touches a process.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
@@ -152,7 +155,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
 - **`repo_root.sh`** — Resolve the DURABLE repo that supplies the running `src/` code.
-- **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
+- **`restart.sh`** — Sutando restart — stops the services in the declared SCOPE, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
@@ -185,7 +188,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
-- **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
+- **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --scope all --stop-only)
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
@@ -240,7 +243,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
 - **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
-- **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
+- **`watcher_identity.py`** — Watcher identity and ownership — the ONE policy every signaller and reporter asks.
+- **`watcher_identity.sh`** — Watcher ownership, shell half — the ONE sequence restart.sh and the startup reaper both run before signalling a pid, and the ONE stop that follows it.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
