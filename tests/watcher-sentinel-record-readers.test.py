@@ -565,9 +565,11 @@ def case_argv_vector_reader(box: Path) -> None:
     finally:
         proc.kill()
         proc.wait()
+    # A wrapper (`python3 -m coverage run ... <test>`) precedes sys.argv in the kernel's
+    # vector, so the invariant is the suffix; the exact-list case is the Popen above.
     me = proc_argv.argv_vector(os.getpid())
-    check("argv_vector reads this interpreter's own argv",
-          me is not None and me[1:] == sys.argv, f"got {me!r} vs {sys.argv!r}")
+    check("argv_vector reads this interpreter's own argv (kernel vector ends with sys.argv)",
+          bool(me) and me[-len(sys.argv):] == sys.argv, f"got {me!r} vs {sys.argv!r}")
     check("a dead pid reads None, never a partial list",
           proc_argv.argv_vector(proc.pid) is None)
     cli = subprocess.run([sys.executable, str(REPO / "src" / "proc_argv.py"), str(proc.pid)],
