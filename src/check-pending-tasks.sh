@@ -30,9 +30,10 @@ TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
 
-# Worker-pool awareness (sonichi/sutando#4281, #4338). The router
-# (skills/worker-pool/scripts/pool_route_handler.py) delegates a task by
-# writing a SENTINEL into deliveries/<recipient>/<task-id>{.txt,.accepted,
+# Worker-pool awareness (sonichi/sutando#4281, #4338). An optional router,
+# injected at the adapter edge (never named here — see
+# docs/architecture-boundaries.md "Optional adapter capabilities"), delegates
+# a task by writing a SENTINEL into deliveries/<recipient>/<task-id>{.txt,.accepted,
 # .claimed} — the payload itself never leaves tasks/, by design (the
 # recipient reads it from there via the inbox resolver). Two different
 # sessions read this state, and each asks a different question:
