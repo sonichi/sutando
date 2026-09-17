@@ -232,14 +232,21 @@ else
   bad "the stat probe forces LC_ALL=C on the executable line, not just a comment" "not found"
 fi
 
-# Negative control on a mutated COPY: strip LC_ALL=C from the executable
-# line, keep the comment -- the anchored pattern must now refuse.
-lab15b=$(mktemp -d)
-sed 's|_out="\$(LC_ALL=C /usr/bin/stat|_out="$(/usr/bin/stat|' "$REPO/scripts/git-binary.sh" > "$lab15b/mutated.sh"
-if grep -qE "$_locale_pin" "$lab15b/mutated.sh"; then
-  bad "the anchored pin must refuse once LC_ALL=C is stripped from the real command" "matched the comment-only mutation"
-else
-  ok "the anchored pin correctly refuses on the comment-only mutation (proves it isn't a comment match)"
+# Negative control on a mutated COPY: strip LC_ALL=C, keep the comment.
+# Check the setup succeeded, then classify grep's rc as case 15 does above.
+lab15b=$(mktemp -d) && [ -d "$lab15b" ] || bad "the LC_ALL=C negative control could set up its lab dir" "mktemp -d failed"
+if [ -d "$lab15b" ]; then
+  if sed 's|_out="\$(LC_ALL=C /usr/bin/stat|_out="$(/usr/bin/stat|' "$REPO/scripts/git-binary.sh" > "$lab15b/mutated.sh" && [ -s "$lab15b/mutated.sh" ]; then
+    grep -qE "$_locale_pin" "$lab15b/mutated.sh"
+    grep_rc=$?
+    case "$grep_rc" in
+      1) ok "the anchored pin correctly refuses on the comment-only mutation (proves it isn't a comment match)" ;;
+      0) bad "the anchored pin must refuse once LC_ALL=C is stripped from the real command" "matched the comment-only mutation" ;;
+      *) bad "the anchored pin must refuse once LC_ALL=C is stripped from the real command" "grep itself failed (rc=$grep_rc) -- inconclusive, not a pass" ;;
+    esac
+  else
+    bad "the LC_ALL=C negative control could build its mutated copy" "sed produced no/empty output"
+  fi
 fi
 
 # --- 16. the platform-to-flag mapping is a PURE function, real per spelling
