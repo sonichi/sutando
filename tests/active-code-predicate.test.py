@@ -298,6 +298,63 @@ class LiteralConstantAndOrChains(unittest.TestCase):
             ["packages/x/live.py"])
 
 
+class PipeIsNotAHardReset(unittest.TestCase):
+    """keweichen round 11: a lone `|` is one syntactic unit with its guard,
+    not an independently-reachable list -- all confirmed by direct bash
+    execution (see the class-level cases in ci-covers-every-python-test for
+    the exact commands and their real exit codes/output)."""
+
+    def test_a_gated_pipe_credits_neither_stage(self):
+        """`false && printf x | python3 dead.py`: Bash runs only `false`
+        (exit 1); the old code treated the lone `|` as a hard reset and
+        credited dead.py as freshly reachable."""
+        self.assertEqual(
+            program_python_args("false && printf x | python3 packages/x/dead.py"), [])
+
+    def test_the_skipped_pipes_own_status_still_feeds_the_next_or(self):
+        """Same LHS, now followed by `|| python3 live.py`: Bash prints only
+        "LIVE" (the false&&(pipe) compound's exit is false's, so || runs) --
+        dead.py must stay uncredited and live.py must gain it."""
+        self.assertEqual(
+            program_python_args(
+                "false && printf x | python3 packages/x/dead.py "
+                "|| python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+
+    def test_an_ungated_pipe_still_credits_its_last_stage(self):
+        """No guard at all: both real-world use (`echo x | python3 t.py`)
+        and the round-10 controls must keep working."""
+        self.assertEqual(
+            program_python_args("echo x | python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+
+    def test_pipefail_makes_a_later_and_and_see_the_pipes_real_failure(self):
+        """Child regression, same round: with `set -o pipefail` active,
+        `false | true && python3 dead.py` really exits 1 (pipefail reports
+        the pipe's rightmost KNOWN failure, `false`'s, not `true`'s 0) and
+        dead.py never runs -- confirmed by direct execution; the code had
+        started crediting it."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\nfalse | true && python3 packages/x/dead.py"), [])
+
+    def test_without_pipefail_the_same_pipe_credits_the_and_and(self):
+        """Same pipe, no `set -o pipefail`: Bash's pipe exit is `true`'s (0),
+        so `&&` DOES run dead.py -- confirmed by direct execution. Pins the
+        control the pipefail case above is not a universal refusal."""
+        self.assertEqual(
+            program_python_args("false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_pipefail_survives_a_semicolon_and_a_combined_short_opt_form(self):
+        """`set -eo pipefail` (combined short opts) turns it on just as
+        `-o pipefail` does, and it stays on across a `;` -- real `set`
+        semantics are script-scoped, not per-statement."""
+        self.assertEqual(
+            program_python_args(
+                "set -eo pipefail; true\nfalse | true && python3 packages/x/dead.py"), [])
+
+
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
     `-c`/`-m` is the script's OWN argv, not something python loads."""

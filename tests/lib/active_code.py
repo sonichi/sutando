@@ -283,6 +283,21 @@ def _segments(line: str):
     return _filter_dead_branches(_raw_segments(line))
 
 
+def _sets_pipefail(text: str) -> "bool | None":
+    """True/False when `text` is a `set` invocation toggling pipefail (any
+    combined short-opt cluster ending in an `o` that takes `pipefail`, e.g.
+    `-o`/`-eo`/`-euo`; `+o` disables), else None -- not pipefail-relevant."""
+    toks = text.split()
+    if not toks or toks[0] != "set":
+        return None
+    rest = " ".join(toks[1:])
+    if re.search(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail(?:\s|$)", rest):
+        return False
+    if re.search(r"(?:^|\s)-[A-Za-z]*o\s+pipefail(?:\s|$)", rest):
+        return True
+    return None
+
+
 def _raw_segments(line: str):
     """Split into AND-OR lists on UNCONDITIONAL separators, keeping each
     list's FIRST command and, when decidable, the ones after it too.
@@ -297,9 +312,24 @@ def _raw_segments(line: str):
     is undecidable, every later one in the same list is too, until a hard
     reset (measured false negative: `true && python3 x.py` never credited
     x.py at all -- qingyun-wu + keweichen, the one gap named and deferred
-    through every earlier round of this file). `;`, a lone `&` (background),
-    and a lone `|` (pipe) don't gate on exit status, so each command they
-    separate is its own independently-scanned, freshly-reachable list.
+    through every earlier round of this file). `;` and a lone `&`
+    (background) don't gate on exit status, so each command they separate
+    is its own independently-scanned, freshly-reachable list.
+
+    A lone `|` (pipe) is NOT one of those hard resets: `cmd1 | cmd2` is one
+    syntactic unit, so a `&&`/`||` gating cmd1 gates the whole pipe, not just
+    its first stage (measured false positive, keweichen round 11: `false &&
+    printf x | python3 dead.py` used to credit dead.py, because the pipe was
+    treated as freshly-reachable the moment the guard's own segment ended).
+    Each stage still runs once the pipe is entered, and the pipe's own
+    resulting status feeds the NEXT `&&`/`||`: without `pipefail` that's the
+    LAST stage's status; with it active (a reached `set -o/-eo/-euo
+    pipefail`, sticky for the rest of the program), any known-failing stage
+    wins over a later success (measured child regression, same round: `set
+    -o pipefail; false | true && python3 dead.py` started crediting dead.py,
+    though Bash's pipefail-adjusted exit is `false`'s and dead.py never
+    runs). A pipe the guard skipped entirely contributes nothing of its own;
+    the gate's already-known status passes through unchanged.
 
     Inside single quotes nothing is special, backslash included: `'a\\'`
     is a 2-char literal, not an escaped, still-open quote.
@@ -307,25 +337,63 @@ def _raw_segments(line: str):
     Multi-line input is one program: an unquoted newline ends an open command
     the way `;` does, but a line that ended right after `&&`/`||` leaves the
     next line's command under that guard, and backslash-newline joins."""
+    # Named above: &&/|| gate on pending_op/chain_status; the open pipe on
+    # last_runs/pipe_group/pipe_entered; pipefail_on is the sticky `set` toggle.
     out, cur, quote, i = [], [], None, 0
-    pending_op = None      # "&&" / "||" gating the segment about to flush, or None (fresh)
-    chain_status = None    # known status ("true"/"false"/"unknown") of the list so far
+    pending_op = None
+    chain_status = None
+    last_runs = True
+    pipe_group = []
+    pipe_entered = True
+    pipefail_on = False
 
-    def flush():
-        nonlocal cur, chain_status, pending_op
+    def transition(sep):
+        nonlocal cur, chain_status, pending_op, last_runs
+        nonlocal pipe_group, pipe_entered, pipefail_on
         s = "".join(cur)
         cur = []
         text = s.strip()
-        if not text:
+        if text:
+            if pending_op is None:
+                runs = True
+            elif pending_op == "|":
+                runs = last_runs
+            else:
+                runs = chain_status == ("true" if pending_op == "&&" else "false")
+            if runs:
+                out.append(s)
+                pf = _sets_pipefail(text)
+                if pf is not None:
+                    pipefail_on = pf
+            last_runs = runs
+            shape = text if (runs and text in ("true", "false")) else "unknown"
+            if pending_op == "|":
+                pipe_group.append(shape)
+            else:
+                pipe_group = [shape]
+                pipe_entered = runs
+        if sep == "|":
+            pending_op = "|"
             return
-        if pending_op is None:
-            runs = True
-        else:
-            runs = chain_status == ("true" if pending_op == "&&" else "false")
-        if runs:
-            out.append(s)
-            chain_status = text if text in ("true", "false") else "unknown"
-        pending_op = None
+        if pipe_entered and pipe_group:
+            if pipefail_on and "false" in pipe_group:
+                chain_status = "false"
+            elif pipefail_on and all(x == "true" for x in pipe_group):
+                chain_status = "true"
+            elif not pipefail_on:
+                chain_status = pipe_group[-1]
+            else:
+                chain_status = "unknown"
+        # else: the pipe never ran, or there was none -- chain_status (the
+        # gate's own already-known status) passes through unchanged.
+        pipe_group = []
+        if sep in ("&&", "||"):
+            pending_op = sep
+        else:                       # ";", "&", or end-of-input: a fresh list starts
+            chain_status = None
+            last_runs = True
+            pipe_entered = True
+            pending_op = None
 
     while i < len(line):
         ch = line[i]
@@ -336,7 +404,7 @@ def _raw_segments(line: str):
             cur.append(ch); cur.append(line[i + 1]); i += 2; continue
         if ch == "\n" and not quote:
             if "".join(cur).strip():
-                flush(); chain_status = None
+                transition(";")
             i += 1; continue
         if quote:
             cur.append(ch)
@@ -346,9 +414,9 @@ def _raw_segments(line: str):
         if ch in "'\"":
             quote = ch; cur.append(ch); i += 1; continue
         if ch in "&|" and nxt == ch:
-            flush(); pending_op = ch + ch; i += 2; continue
+            transition(ch + ch); i += 2; continue
         if ch in ";|&":
-            flush(); chain_status = None; i += 1; continue
+            transition(ch); i += 1; continue
         cur.append(ch); i += 1
-    flush()
+    transition(None)
     return [s for s in out if s.strip()]

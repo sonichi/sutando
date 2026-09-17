@@ -278,6 +278,28 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_a_gated_pipe_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen's round-11 finding, pinned through _named_in()/orphans_in():
+        a lone `|` used to reset reachability, so a guard's dead pipe still
+        credited its script through this exact path."""
+        wf = ("steps:\n  - run: false && printf x | "
+              "python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_pipefail_does_not_false_orphan_through_the_consumer_path(self):
+        """Same round's child regression: `set -o pipefail` makes a later
+        `&&` see the pipe's real failure, pinned through the consumer path."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
