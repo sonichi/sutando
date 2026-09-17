@@ -47,6 +47,103 @@ class Base(unittest.TestCase):
         return str(p)
 
 
+class TestAddRunsAtTheEdge(Base):
+    """An owner's `add` is created by the handler on its run, never on the probe,
+    and never twice: the probe claims the task (rc 0) so the watcher queues the
+    run; the run creates, records the task in the ledger, writes the reply and
+    returns 0 so the live core never sees it; a re-run is a replay and creates
+    nothing; a refusal falls back to the live core with nothing recorded.
+    """
+    ADD = ("Add a new worker to the pool (worker picker '+' button): grow the installed core "
+           "pool by one via scripts/install-core-pool.sh, then confirm the new worker's id back "
+           "to the owner. Preferred label for the new worker: scribe.")
+    NEW = "b" * 32
+
+    def setUp(self):
+        super().setUp()
+        (self.ws / "results" / "archive").mkdir(parents=True, exist_ok=True)
+        self.roster(bindings={})
+        import task_envelope as te
+        p = self.ws / "tasks" / "task-add-1.txt"
+        raw = (f"id: task-add-1\nreceiving_instance: @me:ag2.space\n"
+               f"task: {self.ADD}\nsource: ag2space\nwire_source: worker-picker\n"
+               f"channel_id: !room:x\nuser_id: @q:b\naccess_tier: owner\n")
+        p.write_text(te.stamp_text(raw, self.ws))
+        self.add = str(p)
+        self.calls = []
+
+        def fake_create(workspace, repo, *, label="", room=None, runtime=None, folder="", socket=None):
+            self.calls.append({"repo": repo, "label": label, "runtime": runtime})
+            return {"worker_id": self.NEW, "delivery_dir": str(self.ws / "deliveries" / self.NEW),
+                    "tmux": {"socket": "/tmp/s", "session_name": "sutando-w-b"},
+                    "roster_version": 2, "advertisement": "published", "unrostered_records": []}
+        self._real = wpc.cw.create
+        wpc.cw.create = fake_create
+        self.addCleanup(lambda: setattr(wpc.cw, "create", self._real))
+
+    def run_handler(self, *extra):
+        return h.main(["--task-file", self.add, "--workspace", str(self.ws),
+                       "--results-dir", str(self.ws / "results"), "--repo", "/repo/x",
+                       "--runtime", "claude", *extra])
+
+    def ledger(self):
+        try:
+            return json.loads(wpc.applied_path(self.ws).read_text()).get("applied") or {}
+        except FileNotFoundError:
+            return {}
+
+    def test_the_probe_claims_without_creating(self):
+        self.assertEqual(self.run_handler("--probe"), 0)
+        self.assertEqual(self.calls, [], "the probe spawned a worker")
+        self.assertFalse((self.ws / "results" / "task-add-1.txt").exists())
+        self.assertNotIn("task-add-1", self.ledger())
+
+    def test_the_run_creates_records_replies_and_keeps_the_core_out(self):
+        self.assertEqual(self.run_handler(), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0], {"repo": "/repo/x", "label": "scribe", "runtime": "claude"})
+        body = (self.ws / "results" / "task-add-1.txt").read_text()
+        self.assertIn(self.NEW, body)
+        self.assertIn("scribe", body)
+        self.assertEqual(self.ledger()["task-add-1"]["worker_id"], self.NEW)
+        self.assertEqual(self.ledger()["task-add-1"]["action"], "add")
+
+    def test_a_second_run_is_a_replay_and_creates_nothing(self):
+        self.run_handler()
+        self.assertEqual(self.run_handler(), 0, "a replay must still keep the core out")
+        self.assertEqual(len(self.calls), 1, "the replay created a second worker")
+
+    def test_an_archived_result_alone_blocks_the_create(self):
+        (self.ws / "results" / "archive" / "task-add-1.txt").write_text("done\n")
+        self.assertEqual(self.run_handler(), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_refusal_falls_back_to_the_live_core_with_nothing_recorded(self):
+        def refuse(workspace, repo, **kw):
+            raise wpc.cw.Refused("no tmux here")
+        wpc.cw.create = refuse
+        self.assertEqual(self.run_handler(), h.DECLINE)
+        self.assertFalse((self.ws / "results" / "task-add-1.txt").exists())
+        self.assertNotIn("task-add-1", self.ledger())
+
+    def test_without_a_repo_the_run_declines_to_the_core(self):
+        rc = h.main(["--task-file", self.add, "--workspace", str(self.ws),
+                     "--results-dir", str(self.ws / "results")])
+        self.assertEqual(rc, h.DECLINE)
+        self.assertEqual(self.calls, [])
+
+    def test_an_unpublished_advertisement_is_named_in_the_reply(self):
+        real = wpc.cw.create
+
+        def unpublished(*a, **k):
+            out = real(*a, **k)
+            return {**out, "advertisement": "unpublished"}
+        wpc.cw.create = unpublished
+        self.run_handler()
+        self.assertIn("advertisement could not be written",
+                      (self.ws / "results" / "task-add-1.txt").read_text())
+
+
 class TestPickerReplayAcrossRestart(Base):
     """A completed picker command must not be reapplied by the startup sweep.
 
