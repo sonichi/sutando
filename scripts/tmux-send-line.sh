@@ -23,24 +23,27 @@ PY="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" python-
 LOCK="${TMPDIR:-/tmp}/tmux-send-line.$(printf '%s' "$SOCK:$SESSION" | "$PY" -c 'import sys,hashlib;print(hashlib.sha1(sys.stdin.read().encode()).hexdigest()[:12])').lock"
 exec 9>"$LOCK"
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
-# The current prompt is the LAST line starting with the runtime's glyph (Claude ❯,
-# Codex ›; scrollback holds old ones); its input is what follows the glyph and one
-# optional space/nbsp. Codex draws a DIM placeholder hint on the empty composer, so
-# its pane is read with -e and dim-wrapped text is dropped before deciding "pending".
+# The current prompt is the LAST line starting with the runtime's glyph (Claude \u276f,
+# Codex \u203a; scrollback holds old ones); its input is what follows the glyph and one
+# optional space/nbsp. Both CLIs draw hints in the composer -- Codex a DIM placeholder,
+# Claude a grey ghost suggestion -- while typed text is unstyled, so the pane is always
+# read with -e and any styled run after the glyph is dropped before deciding "pending".
 # A failed capture or parse is UNKNOWN, never "empty": refuse rather than send.
-CAPFLAGS="-p"; [ "$RUNTIME" = codex ] && CAPFLAGS="-e -p"
-CAP="$("$TMUX" -S "$SOCK" capture-pane $CAPFLAGS -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
+CAP="$("$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
 PENDING="$(printf '%s\n' "$CAP" | "$PY" -c 'import sys,re
 rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
-SGR=re.compile(r"\x1b\[[0-9;]*m"); DIM=re.compile(r"\x1b\[2m.*?\x1b\[0m")
+SGR=re.compile(r"\x1b\[[0-9;]*m")
+# dim (2) or a grey 256-colour foreground (38;5;2xx), up to the reset/normal-intensity
+# code that ends it -- both CLIs use styled runs for placeholder/ghost text only.
+GHOST=re.compile(r"\x1b\[(?:2|38;5;2[0-9]{2})m.*?(?=\x1b\[(?:0|22|39)m|$)")
 last=""
 for l in sys.stdin.read().splitlines():
-    if rt=="codex": l=DIM.sub("",l)
-    s=SGR.sub("",l).lstrip(" \t")
-    if s.startswith(glyph):
-        r=s[1:]
-        if r[:1] in (" ", "\u00a0"): r=r[1:]
-        last=r.rstrip()
+    plain=SGR.sub("",l).lstrip(" \t")
+    if not plain.startswith(glyph): continue
+    idx=l.find(glyph)
+    r=SGR.sub("",GHOST.sub("",l[idx+len(glyph):]))
+    if r[:1] in (" ", "\u00a0"): r=r[1:]
+    last=r.rstrip()
 print(last)' "$RUNTIME")" || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi

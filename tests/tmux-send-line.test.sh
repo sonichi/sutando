@@ -37,7 +37,7 @@ rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m \033[2mImprove documentation in @filename
 rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m half typed\n' run probe x --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "half typed" "$T/err" && ok "C2 codex: typed text after › → 5, quoted, nothing sent" || fail "C2 codex pending" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven previous-generation model\n' run probe x --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "C3 codex: an open picker's selected › row reads as pending → 5" || fail "C3 codex picker" "rc=$rc"
 rc=$(TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 0 ] && ok "C4 codex: a Claude ❯ line is not the Codex prompt (the runtime picks the glyph)" || fail "C4 glyph is per-runtime" "rc=$rc"
-rc=$(run probe hello --socket "$T/s.sock"); grep -q -- "capture-pane -p -t probe" "$TMUX_LOG" && ! grep -q -- "capture-pane -e" "$TMUX_LOG" && ok "C5 claude (default): capture unchanged, no -e" || fail "C5 claude capture unchanged" "$(cat "$TMUX_LOG")"
+rc=$(run probe hello --socket "$T/s.sock"); grep -q -- "capture-pane -e -p -t probe" "$TMUX_LOG" && ok "C5 claude: pane is read WITH escapes too (ghost text is styled)" || fail "C5" "$(cat "$TMUX_LOG")"
 # the delay between the literal line and Enter: a PATH-shimmed `sleep` logs its argument in sequence with the
 # tmux calls instead of sleeping, so the check reads the script's own pause, not process-launch latency
 cat > "$T/bin/sleep" <<'SH'
@@ -51,6 +51,10 @@ rc=$(run probe hello --socket "$T/s.sock" --runtime codex); SEQ="$(seq)"
 rc=$(run probe hello --socket "$T/s.sock"); SEQ="$(seq)"
 [ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|send-keys -t probe Enter|" ] && ok "C8 claude (default): no sleep between the literal line and Enter (the no-delay control)" || fail "C8 claude no delay" "rc=$rc seq=$SEQ"
 rm -f "$T/bin/sleep"
+
+rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39m\n' run probe hello --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "C9 claude: the live idle prompt (grey glyph + nbsp + reset, captured 2026-09-17) is empty" || fail "C9" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39m\033[38;5;246mmerge 4269\033[39m\n' run probe hello --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "C10 claude: a grey ghost suggestion is not pending text (the 02:22Z refusal)" || fail "C10" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39mmerge\033[38;5;246m 4269\033[39m\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && grep -q "pending text (merge)" "$T/err" && ! grep -q send-keys "$TMUX_LOG" && ok "C11 claude: typed text survives, only the ghost completion is dropped" || fail "C11" "rc=$rc $(cat "$T/err")"
 rc=$(run probe x --socket "$T/s.sock" --runtime bogus); [ "$rc" = 2 ] && ! grep -q -- "capture-pane\|send-keys" "$TMUX_LOG" && ok "C6 unknown --runtime → 2 before any tmux call" || fail "C6 bogus runtime" "rc=$rc"
 # the runtime is chosen by --runtime only: an ambient RUNTIME variable (callers that pass no flag inherit whatever
 # the environment holds) must not switch the glyph, or a Claude draft reads as empty and gets written into
