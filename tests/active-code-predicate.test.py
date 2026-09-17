@@ -944,6 +944,47 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_a_blank_heredoc_terminator_is_not_stripped_before_it_is_seen(self):
+        """keweichen round 25: `: <<''` (empty quoted delimiter) terminates
+        at the first BLANK line -- confirmed by direct execution: dead.py
+        runs. The old pipeline ran comment/blank-line dropping BEFORE
+        heredoc-body stripping, so the blank terminator line was already
+        gone by the time the heredoc scan looked for it, and everything
+        after was wrongly swallowed as an unterminated body."""
+        self.assertEqual(
+            program_python_args(
+                ": <<''\n"
+                "\n"
+                "python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_a_quoted_hash_heredoc_terminator_is_not_read_as_a_comment(self):
+        """A terminator line that's literally `#` is heredoc DATA, never a
+        real Bash comment -- confirmed by direct execution: dead.py runs.
+        The old pipeline's separate comment-stripping pass treated it as
+        a whole-line comment and dropped it before the heredoc scan ever
+        saw it, for the same reason as the blank-terminator case above."""
+        self.assertEqual(
+            program_python_args(
+                ": <<'#'\n"
+                "#\n"
+                "python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
+    def test_process_substitution_glued_to_a_non_splitting_brace_stays_literal(self):
+        """keweichen round 25: `{+u}` has no comma anywhere in it, so it
+        stays ONE literal word (never splits) -- confirmed by direct
+        execution: pipefail (already off) stays off, dead.py runs. The
+        round-23 fix peeked past ANY leading `{` regardless of whether the
+        group would actually split, wrongly marking this word expandable
+        and poisoning a case the parser's own scan-stop already handled."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                "set {+u}<(echo o) -o pipefail\n"
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

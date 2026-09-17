@@ -708,6 +708,40 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
 
+    def test_blank_heredoc_terminator_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 25: a blank terminator (empty quoted delimiter)
+        must survive comment/blank-line filtering, since it IS the
+        heredoc's own data, not incidental whitespace to drop."""
+        wf = ("steps:\n  - run: |\n"
+              "      : <<''\n"
+              "\n"
+              "      python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_hash_heredoc_terminator_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 25: a terminator line that's literally `#` is
+        heredoc data, not a real Bash comment to strip."""
+        wf = ("steps:\n  - run: |\n"
+              "      : <<'#'\n"
+              "      #\n"
+              "      python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
+    def test_non_splitting_brace_process_substitution_does_not_false_green_through_the_consumer_path(self):
+        """keweichen round 25: `{+u}` has no comma, stays one literal word
+        -- must not be treated as if it will split."""
+        wf = ("steps:\n  - run: |\n"
+              "      set +o pipefail\n"
+              "      set {+u}<(echo o) -o pipefail\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

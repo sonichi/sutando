@@ -275,12 +275,19 @@ def _strip_heredoc_bodies(text: str) -> str:
     command text -- drop them (and their terminator) before any
     command-position scan sees them (round 23: a body line that merely
     LOOKS like a command, e.g. `set -o pipefail <<`, was scanned as one,
-    including into the whole-program fatal halt it happened to resemble)."""
+    including into the whole-program fatal halt it happened to resemble).
+    Comment-stripping and blank-line dropping happen HERE, on code lines
+    only, rather than by a separate `active_text()` pre-pass -- doing
+    that first destroys a blank or `#`-shaped heredoc TERMINATOR before
+    this scan ever sees it (round 25, keweichen: heredoc recognition and
+    comment/blank filtering need one lexical owner, not two in sequence)."""
     lines = text.split("\n")
     out, i = [], 0
     while i < len(lines):
-        out.append(lines[i])
-        for delim, strip_tabs in _heredoc_delimiters(lines[i]):
+        code = _strip_comment(lines[i])
+        if code.strip():
+            out.append(code)
+        for delim, strip_tabs in _heredoc_delimiters(code):
             i += 1
             while i < len(lines):
                 probe = lines[i].lstrip("\t") if strip_tabs else lines[i]
@@ -298,7 +305,7 @@ def program_invokes(text: str, name: str) -> bool:
     the lines one at a time credited that command (measured: both real
     consumers did, and Bash returned 0 with the planted test never run)."""
     return any(_segment_invokes(seg, name)
-               for seg in _segments(_strip_heredoc_bodies(active_text(text))))
+               for seg in _segments(_strip_heredoc_bodies(text)))
 
 
 def python_args(line: str) -> list[str]:
@@ -324,7 +331,7 @@ def python_args(line: str) -> list[str]:
 def program_python_args(text: str) -> list[str]:
     """python_args() over a WHOLE program; see program_invokes()."""
     out = []
-    for seg in _segments(_strip_heredoc_bodies(active_text(text))):
+    for seg in _segments(_strip_heredoc_bodies(text)):
         a = _segment_python_arg(seg)
         if a:
             out.append(a)
@@ -524,6 +531,47 @@ def _split_unquoted_braces(val: list, qmask: list) -> "list | None":
     return None
 
 
+def _brace_has_split_comma(val, qmask, text, i, n):
+    """Does the brace group `val[0]=='{'` opened before position `i` hold
+    an unquoted comma anywhere before its matching unquoted `}` -- checked
+    on both sides of `i` (already-accumulated `val`, then a forward scan
+    of `text`), since `_split_unquoted_braces` needs one ANYWHERE in the
+    group, not only before the current scan position (round 25)."""
+    depth = 1
+    for k in range(1, len(val)):
+        if qmask[k]:
+            continue
+        if val[k] == "{":
+            depth += 1
+        elif val[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return False
+        elif val[k] == "," and depth == 1:
+            return True
+    quote, j = None, i
+    while j < n:
+        ch = text[j]
+        if quote:
+            if ch == quote:
+                quote = None
+            j += 1; continue
+        if ch in "'\"":
+            quote = ch; j += 1; continue
+        if ch == "\\" and j + 1 < n:
+            j += 2; continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return False
+        elif ch == "," and depth == 1:
+            return True
+        j += 1
+    return False
+
+
 def _shell_words(text: str):
     """`text` as (value, expandable, any_quoted) triples. `expandable` is
     True iff the word carries a `$`/backtick that occurs unquoted or inside
@@ -620,8 +668,9 @@ def _shell_words(text: str):
             flush(); i += 1
         elif ch in "<>" and i + 1 < n and text[i + 1] == "(":
             # Process substitution (see docstring) -- peek past a leading
-            # unquoted `{` (not split yet) to the real flag-shape check.
-            _skip = 1 if val and val[0] == "{" and not qmask[0] else 0
+            # `{` ONLY when its group will actually split (round 25).
+            _skip = 1 if (val and val[0] == "{" and not qmask[0]
+                          and _brace_has_split_comma(val, qmask, text, i, n)) else 0
             if len(val) > _skip and val[_skip] in "-+":
                 expandable = True
             start = i; i += 2; depth = 1; pq = None
