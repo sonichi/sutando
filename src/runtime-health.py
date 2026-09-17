@@ -82,9 +82,8 @@ STALE_STATUS_SECONDS = 90
 # Matches the documented staleness threshold every other reader of that file uses.
 HEARTBEAT_STALE_SECONDS = 90
 
-# Bounded from below too: a far-future .alive has a NEGATIVE age, which every
-# one-sided `age >= max` test reads as fresh. A tolerance, not zero, so an atomic
-# rewrite between a caller's now-snapshot and its stat is not discarded.
+# A far-future .alive has a NEGATIVE age, which a one-sided `age >= max` test reads
+# as fresh. A tolerance, not zero, so an atomic rewrite mid-stat is not discarded.
 HEARTBEAT_FUTURE_TOLERANCE_SECONDS = 5
 
 # ── Severity layer (design: docs/design-core-health-verdict.md) ──────────────
