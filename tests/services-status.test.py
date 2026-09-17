@@ -212,7 +212,8 @@ def test_service_registry_full_desktop_set():
                      "discord-bridge", "slack-bridge", "telegram-bridge"):
         assert expected in ids, expected
     for s in reg:
-        assert s["probe"][0] in ("alive_file", "pidfile", "port", "process", "gateway")
+        assert s["probe"][0] in ("alive_file", "pidfile", "port", "process",
+                                 "gateway", "watcher_sentinels")
     # a full build over the real registry must not raise and covers every kind
     payload = ss.build_payload(reg, 1.0, pid_alive=lambda p: False,
                                connect=lambda p: False, pgrep=lambda pat: [])
@@ -387,6 +388,48 @@ def test_registry_gateway_uses_the_sidecar_probe():
     assert spec["probe"][0] == "gateway", spec["probe"]
     assert spec["probe"][1] == ss.GATEWAY_STATUS_PATH
 
+
+
+def test_watcher_row_aggregates_every_instance_sentinel():
+    """Reporting the FIRST sentinel answers about one instance, and is wrong in
+    both directions on a pool: a dead historic pid beside a live worker read
+    `offline`, and a live historic pid beside a dead worker read `running`."""
+    import tempfile
+    two = {"watch-tasks-stream.pid": "100", "watch-tasks-stream-worker-1.pid": "200"}
+
+    def probe(files, alive):
+        td = Path(tempfile.mkdtemp())
+        for n, txt in files.items():
+            (td / n).write_text(txt)
+        return ss.probe_watcher_sentinels(td, lambda pid: pid in alive)[:2]
+
+    assert probe(two, {200})[0] == "degraded"
+    assert probe(two, {100})[0] == "degraded"
+
+    # An unmixed set, and a single-instance host, keep their exact verdicts.
+    assert probe(two, {100, 200})[0] == "running"
+    assert probe(two, set())[0] == "offline"
+    assert probe({"watch-tasks-stream.pid": "100"}, {100})[0] == "running"
+    assert probe({"watch-tasks-stream.pid": "100"}, set())[0] == "offline"
+    assert probe({}, set()) == ("offline", "no pidfile")
+    # `unknown` outranks `offline` when nothing is up: an unreadable sentinel
+    # is a question, and "offline" would answer it.
+    assert probe({"watch-tasks-stream.pid": "xx"}, set())[0] == "unknown"
+    mixed_unreadable = {"watch-tasks-stream.pid": "xx", "watch-tasks-stream-w.pid": "200"}
+    assert probe(mixed_unreadable, set())[0] == "unknown"
+    assert probe(mixed_unreadable, {200})[0] == "degraded"
+
+
+def test_the_degraded_detail_names_which_instance_is_down():
+    """A row saying only "1 of 2 up" sends the reader to guess which."""
+    import tempfile
+    td = Path(tempfile.mkdtemp())
+    (td / "watch-tasks-stream.pid").write_text("100")
+    (td / "watch-tasks-stream-worker-1.pid").write_text("200")
+    status, detail, _ = ss.probe_watcher_sentinels(td, lambda pid: pid == 200)
+    assert status == "degraded"
+    assert "watch-tasks-stream.pid" in detail
+    assert "100" in detail and "200" in detail
 
 if __name__ == "__main__":
     # Minimal assert-runner so the file is self-executing without pytest too.

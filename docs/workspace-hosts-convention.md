@@ -98,6 +98,7 @@ Per-host **config that should survive a rebuild** (the backup hole):
 | crons | `crons/<hostname>.json` (#1716) | `hosts/<hostname>/crons.json` — **wired** in `schedule-crons/SKILL.md` (self-heals from the interim/legacy path) |
 | build_log.md | machine-<host>/ (per-host) | `hosts/<hostname>/build_log.md` — F1 per-host decision; migrator (#1721) emits it; *loop write-side still emits workspace-root, relocation deferred* |
 | pending-questions.md | machine-local (per-host) | `hosts/<hostname>/pending-questions.md` — reader wired via `personal_path` (#1718) + migrator (#1721) |
+| health-checks-extra.json | (did not exist — a host-specific probe meant editing `run_all_checks` in shared repo code) | `hosts/<hostname>/health-checks-extra.json` — **wired** in `src/health-check.py` (`check_user_defined`); opt-in, absent on a host that declares none |
 
 ### Wiring status (implemented vs deferred)
 
@@ -105,7 +106,8 @@ The `hosts/<hostname>/` paths above are the **target** layout. The table is the
 intent; not every component writes there yet. As of #1716–#1721:
 
 - **Wired going-forward:** `crons.json` (read+write, `schedule-crons/SKILL.md`),
-  `pending-questions.md` (read via `personal_path`, #1718).
+  `pending-questions.md` (read via `personal_path`, #1718),
+  `health-checks-extra.json` (read by `src/health-check.py`).
 - **Migrator one-time copy only:** `PERSONAL_CLAUDE.md`, `stand-identity.json`,
   `tab-aliases.json`, channel `access.json`, `settings.json`, and `build_log.md`'s
   loop-writer. `--migrate-from-legacy` (#1721) copies these into

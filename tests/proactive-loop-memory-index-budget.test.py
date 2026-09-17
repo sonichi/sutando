@@ -137,6 +137,44 @@ with tempfile.TemporaryDirectory() as d:
     hc.write_text("raise RuntimeError('broken')\n")
     check("a health-check.py that raises on import -> None", mib._health_check(pathlib.Path(d)) is None)
 
+# --- a row whose slug has no file behind it is a CREATE. Rows are verbatim from the
+# two real indexes, which disagree: MEMORY-archive.md keeps `.md`, MEMORY.md omits it.
+with tempfile.TemporaryDirectory() as d:
+    mem = pathlib.Path(d)
+    idx = mem / "MEMORY.md"
+    idx.write_text("# Memory Index\n")
+    (mem / "feedback_email_inbox.md").write_text("body\n")
+    (mem / "feedback_run_review_preflight_before_pr_review.md").write_text("body\n")
+
+    def run(addition):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mib.main(["--repo", str(REPO), "--index", str(idx), "--adding", addition])
+        return rc, buf.getvalue()
+
+    # verbatim MEMORY-archive.md shape — target CARRIES .md
+    rc, out = run("- [feedback_email_inbox](feedback_email_inbox.md) — a real row")
+    check("an archive-shaped row (target ends in .md) whose file exists stays silent",
+          "CREATES A NEW MEMORY FILE" not in out, f"rc={rc} out={out[-160:]}")
+
+    # verbatim MEMORY.md shape — target OMITS .md
+    rc, out = run("[preflight](feedback_run_review_preflight_before_pr_review)")
+    check("a MEMORY.md-shaped row (target omits .md) whose file exists stays silent",
+          "CREATES A NEW MEMORY FILE" not in out, f"rc={rc}")
+
+    # the create, in both shapes
+    for shape, label in [("[new](feedback_no_such_memory_file)", "bare"),
+                         ("- [new](feedback_no_such_memory_file.md) — x", "dotted")]:
+        rc, out = run(shape)
+        check(f"a {label} row with NO file behind it warns that it is a CREATE",
+              "CREATES A NEW MEMORY FILE" in out and "feedback_no_such_memory_file" in out, f"rc={rc}")
+
+    check("the create warning does not BLOCK — it stays advisory (rc unchanged)", rc == 0, f"rc={rc}")
+
+    rc, out = run("")
+    check("--adding '' is a read-only budget check and warns about nothing",
+          "CREATES A NEW MEMORY FILE" not in out, f"rc={rc}")
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

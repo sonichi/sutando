@@ -2,22 +2,6 @@
  "note": "Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.",
  "tools": [
   {
-   "name": "brightness",
-   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Brightness level 0-100"
-   }
-  },
-  {
-   "name": "brightness",
-   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Brightness level 0-100"
-   }
-  },
-  {
    "name": "call_contact",
    "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
@@ -105,7 +89,7 @@
   },
   {
    "name": "clipboard",
-   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant.",
+   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant. Cross-platform (macOS pbcopy/pbpaste, Windows PowerShell Get-Clipboard/Set-Clipboard).",
    "execution": "inline",
    "params": {
     "action": "\"read\" to get clipboard contents, \"write\" to set them",
@@ -114,7 +98,7 @@
   },
   {
    "name": "clipboard",
-   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant.",
+   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant. Cross-platform (macOS pbcopy/pbpaste, Windows PowerShell Get-Clipboard/Set-Clipboard).",
    "execution": "inline",
    "params": {
     "action": "\"read\" to get clipboard contents, \"write\" to set them",
@@ -213,7 +197,7 @@
   },
   {
    "name": "open_file",
-   "description": "Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).",
+   "description": "Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.",
    "execution": "inline",
    "params": {
     "app": "Optional app name (e.g. \"Sublime Text\", \"VS Code\", \"TablePlus\") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.",
@@ -223,7 +207,7 @@
   },
   {
    "name": "open_file",
-   "description": "Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).",
+   "description": "Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.",
    "execution": "inline",
    "params": {
     "app": "Optional app name (e.g. \"Sublime Text\", \"VS Code\", \"TablePlus\") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.",
@@ -288,26 +272,6 @@
    }
   },
   {
-   "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
-   "execution": "inline",
-   "params": {
-    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
-    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
-    "modifiers": "Modifier keys"
-   }
-  },
-  {
-   "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
-   "execution": "inline",
-   "params": {
-    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
-    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
-    "modifiers": "Modifier keys"
-   }
-  },
-  {
    "name": "query_active_artifact",
    "description": "Search the currently-loaded artifact (see set_active_artifact) for content matching a query. Use for any follow-up question about the same document: sections, keywords, line references. Fast — in-process, no task-bridge round-trip. Returns a relevant excerpt with line range. Error if no artifact is loaded.",
    "execution": "inline",
@@ -533,7 +497,7 @@
   },
   {
    "name": "switch_app",
-   "description": "Switch to (activate) a macOS application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
+   "description": "Switch to (activate) a macOS or Windows application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
    "execution": "inline",
    "params": {
     "app": "Application name (e.g. \"Google Chrome\", \"Slack\", \"Terminal\", \"Finder\")"
@@ -541,7 +505,7 @@
   },
   {
    "name": "switch_app",
-   "description": "Switch to (activate) a macOS application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
+   "description": "Switch to (activate) a macOS or Windows application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
    "execution": "inline",
    "params": {
     "app": "Application name (e.g. \"Google Chrome\", \"Slack\", \"Terminal\", \"Finder\")"
@@ -577,62 +541,6 @@
    "execution": "inline",
    "params": {
     "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
-   }
-  },
-  {
-   "name": "toggle_tasks",
-   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
-   "execution": "inline",
-   "params": {
-    "action": "\"collapse\" to hide task results, \"expand\" to show them",
-    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
-   }
-  },
-  {
-   "name": "toggle_tasks",
-   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
-   "execution": "inline",
-   "params": {
-    "action": "\"collapse\" to hide task results, \"expand\" to show them",
-    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
-   }
-  },
-  {
-   "name": "type_text",
-   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
-   "execution": "inline",
-   "params": {
-    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
-    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
-    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
-   }
-  },
-  {
-   "name": "type_text",
-   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
-   "execution": "inline",
-   "params": {
-    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
-    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
-    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
-   }
-  },
-  {
-   "name": "volume",
-   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Volume level 0-100. Omit to mute/unmute.",
-    "mute": "true to mute, false to unmute"
-   }
-  },
-  {
-   "name": "volume",
-   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
-   "execution": "inline",
-   "params": {
-    "level": "Volume level 0-100. Omit to mute/unmute.",
-    "mute": "true to mute, false to unmute"
    }
   },
   {
@@ -646,7 +554,7 @@
    }
   }
  ],
- "instructions_hash_fixed_env": "c75044993561fe13bf95f8d8d0bc9b1269074b7260abf797dc67ca1dcc5c7cd4",
+ "instructions_hash_fixed_env": "4bfd0db86de348a3cd2be8b1acf85952a50d63f1a06c157f001ddc6cb83eb7f5",
  "meeting_greeting": "[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says \"Sutando\" or \"hey Sutando\" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no \"silent\", no sounds. You are an invisible note-taker until called upon.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
   "tool_table": "e6d53e7a98b6c0f052148b6bae6096eab4e5768fb8187be8d03deee179023e78"

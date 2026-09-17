@@ -11,7 +11,9 @@ working-state e2e would need a live core, which CI doesn't have.
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -50,6 +52,80 @@ WORKING_PANE = """\
 """
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
+
+# 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
+#     import-time default reports a live core as offline. Prefer the recorded socket.
+_sock_tmp = tempfile.mkdtemp()
+_cores = os.path.join(_sock_tmp, "state", "cores")
+os.makedirs(_cores, exist_ok=True)
+_host = rh._host_label_safe() or "testhost"
+_alive = os.path.join(_cores, _host + ".alive")
+_orig_resolve, _orig_host = rh._resolve_workspace, rh._host_label_safe
+rh._resolve_workspace = lambda repo: _sock_tmp
+rh._host_label_safe = lambda: _host
+# The record is only consulted when no explicit socket was given, so these cases
+# must run with the variable clear however the suite happened to be launched.
+_env_before = os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/run/real.sock"}, _fh)
+check("_tmux_socket: prefers the socket the heartbeat recorded",
+      rh._tmux_socket() == "/run/real.sock")
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"session": "sutando-core"}, _fh)
+check("_tmux_socket: falls back when .alive carries no socket",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    _fh.write("{not json")
+check("_tmux_socket: falls back on an unreadable .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.remove(_alive)
+check("_tmux_socket: falls back when .alive is absent",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: ""
+check("_tmux_socket: falls back when the host label is unknown",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: _host
+# A crashed core leaves its .alive behind; trusting it would pin the probe to a
+# dead socket, which is the failure this resolver exists to remove.
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/tmp/stale.sock"}, _fh)
+os.utime(_alive, (time.time() - 10000, time.time() - 10000))
+check("_tmux_socket: refuses a stale .alive record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, None)
+check("_tmux_socket: accepts the same record once it is fresh",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+# A clock step leaves a future-dated record; a one-sided age test reads that as
+# fresh forever, so the bound has to hold on both sides.
+os.utime(_alive, (time.time() + 10000, time.time() + 10000))
+check("_tmux_socket: refuses a future-dated .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, (time.time() + 1, time.time() + 1))
+check("_tmux_socket: tolerates small clock skew",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+_prev_env = os.environ.get("SUTANDO_TMUX_SOCKET")
+os.environ["SUTANDO_TMUX_SOCKET"] = "/tmp/explicit.sock"
+check("_tmux_socket: an explicit SUTANDO_TMUX_SOCKET wins over the record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+if _prev_env is None:
+    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+else:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _prev_env
+
+rh._resolve_workspace, rh._host_label_safe = _orig_resolve, _orig_host
+if _env_before is not None:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _env_before
+shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 2b) Incidental mentions must NOT fire: the phrase is three common words, so an
 #      unanchored match escalated a healthy core. Anchor = line start, or /login nearby.
@@ -170,7 +246,6 @@ d = _derive_with(core=False, pane="", status="running")
 check("derive: no core -> offline", d["health"] == "offline" and d["authenticated"] is None)
 
 # 5) _core_status reads the status field from a fixture core-status.json.
-import tempfile
 T = tempfile.mkdtemp()
 os.makedirs(os.path.join(T, "state"))
 with open(os.path.join(T, "state", "core-status.json"), "w") as f:
@@ -199,7 +274,11 @@ check("_core_status: non-numeric ts -> (status, None)", rh._core_status(Tt) == (
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
 #    _pane_text/main uncovered. Point at a socket with no session → offline, and
 #    call each real helper directly (they degrade to empty/false, never crash).
+# _core_running() resolves via _tmux_socket(), not the bare TMUX_SOCKET constant --
+# on a live fresh-heartbeat host that finds the REAL socket, so mock the function too.
+_orig_tmux_socket = rh._tmux_socket
 _orig_socket = rh.TMUX_SOCKET
+rh._tmux_socket = lambda: "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 try:
     check("real _core_running: false on bogus socket", rh._core_running() is False)
@@ -229,6 +308,7 @@ try:
     check("real main() ran without error", True)
 finally:
     rh.TMUX_SOCKET = _orig_socket
+    rh._tmux_socket = _orig_tmux_socket
 
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a
@@ -268,16 +348,21 @@ finally:
     rh._resolve_workspace = _ow
 
 # 7) The tri-state process probe has ONE owner: _core_running delegates to
-#    tmux_probe.has_session with this module's socket/session and its 8s budget.
+#    tmux_probe.has_session with _tmux_socket()'s result (not the bare
+#    constant -- same reason as section 6) plus this module's session/budget.
 _seen = {}
 _oh = rh._tmux_has_session
+_ot = rh._tmux_socket
+_injected_sock = "/tmp/rh-delegation-check-%d.sock" % os.getpid()
 rh._tmux_has_session = lambda sock, sess, timeout=None: _seen.update(sock=sock, sess=sess, timeout=timeout)
+rh._tmux_socket = lambda: _injected_sock
 try:
-    check("_core_running: delegates to tmux_probe.has_session(TMUX_SOCKET, SESSION, timeout=8)",
+    check("_core_running: delegates to tmux_probe.has_session(_tmux_socket(), SESSION, timeout=8)",
           rh._core_running() is None
-          and _seen == {"sock": rh.TMUX_SOCKET, "sess": rh.SESSION, "timeout": 8})
+          and _seen == {"sock": _injected_sock, "sess": rh.SESSION, "timeout": 8})
 finally:
     rh._tmux_has_session = _oh
+    rh._tmux_socket = _ot
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

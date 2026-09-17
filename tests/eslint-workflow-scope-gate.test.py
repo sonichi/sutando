@@ -13,6 +13,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "eslint.yml"
 TEXT = WORKFLOW.read_text()
+BASH = shutil.which("bash")
+if os.name == "nt" and (git := shutil.which("git")):
+    git_bash = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+    if git_bash.is_file():
+        BASH = str(git_bash)
 
 failures = []
 checks_run = 0
@@ -47,21 +52,20 @@ def run_gate(script, changed, event="pull_request"):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         gh = tmp / "gh"
-        if changed is None:
-            gh.write_text("#!/bin/sh\nexit 1\n")
-        else:
-            gh.write_text("#!/bin/sh\ncat <<'EOF'\n" + changed + "\nEOF\n")
+        with gh.open("w", encoding="utf-8", newline="\n") as stub:
+            stub.write("#!/bin/sh\nexit 1\n" if changed is None
+                       else "#!/bin/sh\ncat <<'EOF'\n" + changed + "\nEOF\n")
         gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
         out = tmp / "gh_output"
         out.touch()
         env = dict(os.environ)
-        env["PATH"] = f"{tmp}:{env['PATH']}"
+        env["PATH"] = f"{tmp}{os.pathsep}{env['PATH']}"
         env["GITHUB_OUTPUT"] = str(out)
         env["PR"] = "1"
         env["GH_TOKEN"] = "stub"
         subprocess.run(
-            ["bash", "-c", script.replace("${{ github.event_name }}", event)],
-            env=env, capture_output=True, text=True, timeout=30,
+            [BASH, "-c", script.replace("${{ github.event_name }}", event)],
+            env=env, capture_output=True, text=True, timeout=30, check=True,
         )
         return out.read_text().strip()
 
@@ -72,7 +76,7 @@ check("workflow carries no `paths:` filter (required check must always report)",
 check("every npm step is gated on the scope output",
       TEXT.count("if: steps.scope.outputs.run == 'true'") == 3)
 
-if shutil.which("bash"):
+if BASH:
     script = scope_script()
     check("the extracted script is the gate itself",
           "GITHUB_OUTPUT" in script and "gh pr diff" in script and "run=false" in script)

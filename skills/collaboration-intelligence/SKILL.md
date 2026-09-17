@@ -135,7 +135,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 6. Update the record idempotently. Preserve contradictory evidence; do not silently overwrite it.
 7. Use the map to choose the smallest useful collaboration set. Prefer the responsible agent; cc its owner or relevant human when accountability, approval, ambiguity, or risk requires it.
 8. Report material changes: unfamiliar participants, ownership changes, conflicting identity claims, stale room purpose, or newly inferred sensitive relationships.
-9. **PR notification contract (owner rule 2026-08-23): every PR create or update ends with reviewers NOTIFIED, addressed to each reviewer's Sutando Stand.** A GitHub review request alone is not notification — the review-request queue is where PRs stall. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Roster field `identity_caveat` (optional, per entry): free text printed to stderr by `resolve()` before any target is built.** Populate it when one GitHub login covers more than one agent — the login is then not a discriminator in EITHER direction (a PR authored under it reads as the wrong agent; comments by one read as not-theirs). Say which discriminator IS reliable, e.g. the commit author email or a shepherd doc. It never refuses a target: a shared login is a reason to check WHICH person you mean, not a reason to skip them. **Population is per-host** — the roster is host-local and uncarved from the vault, so a caveat set on one machine is absent on every other, and the print is inert until someone fills the field in. Pinned by `tests/notify-reviewers-human-shapes.test.py`. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/data/collaboration-intelligence/reviewer-stands.json`) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
+9. **PR notification contract (owner rule 2026-08-23): every PR create or update ends with reviewers NOTIFIED, addressed to each reviewer's Sutando Stand.** A GitHub review request alone is not notification — the review-request queue is where PRs stall. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Roster field `identity_caveat` (optional, per entry): free text printed to stderr by `resolve()` before any target is built.** Populate it when one GitHub login covers more than one agent — the login is then not a discriminator in EITHER direction (a PR authored under it reads as the wrong agent; comments by one read as not-theirs). Say which discriminator IS reliable, e.g. the commit author email or a shepherd doc. It never refuses a target: a shared login is a reason to check WHICH person you mean, not a reason to skip them. **Population is per-host** — the roster is host-local and uncarved from the vault, so a caveat set on one machine is absent on every other, and the print is inert until someone fills the field in. Pinned by `tests/notify-reviewers-human-shapes.test.py`. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-stands.json`, unioned across hosts — see **Where the map is stored** for the precedence rule) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
 
 ## Quick lookup index
 
@@ -158,19 +158,38 @@ record: a miss means "consult the full store," not "does not exist." Shape in
 
 ## Where the map is stored
 
-Under Sutando, the map is per-user state, so it lives under the **workspace**, never in the code checkout:
+Under Sutando, the map is per-user state, so it lives under the **workspace**, never in the code checkout — and the roster is under `hosts/<label>/`, one subtree per machine:
 
 ```
+<workspace>/hosts/<host-label>/data/collaboration-intelligence/
+  reviewer-stands.json  # THE roster the readers load
+
 <workspace>/data/collaboration-intelligence/
   quick-lookup.yaml     # the bounded hot set (see above)
+  reviewer-stands.json  # LEGACY location. Still read. Do not write here.
   ...                   # the full record, per references/schema.md
 ```
+
+`<host-label>` is `bash scripts/sutando-config.sh host-label`. `scripts/roster_union.py` globs
+`hosts/*/data/collaboration-intelligence/reviewer-stands.json` and unions every peer host's roster,
+so **an absent flat file is normal, not a missing store.** `lookup.py` distinguishes the two in its
+own output: `MAP EMPTY at <dir>` means no store loaded, `QUERY 'x' -> 0 hit(s)` means it loaded and
+matched nothing. Read that line before concluding anything about the store.
+
+**Enumeration order is not consumer precedence, and on a legacy host they are opposites.**
+`host_rosters()` lists the per-host rosters first and the flat file last, but both readers then
+REORDER that list to put their own selected file first — `lookup.load_roster()` (`lookup.py:62-65`)
+and `notify_reviewers.roster_paths()` (`notify_reviewers.py:98-102`), the latter selecting the flat
+path whenever this host has not migrated (`roster_path()`, `:74-78`). So on an unmigrated host **a
+stale flat-file row WINS a key collision against a peer host's row.** Read the flat file's rows as
+authoritative-until-migrated rather than as a fallback, and do not infer precedence from the order
+`host_rosters()` returns.
 
 Resolve `<workspace>` with `bash scripts/sutando-config.sh workspace` — never hardcode a path and never use a bare relative path, because the process CWD is the repo, not the workspace.
 
 **The store belongs to the running core's workspace, not to whichever checkout the process happens to sit in.** That resolver answers per-checkout, so on a machine with more than one (an installed engine plus a developer-mode clone) the same command returns two different roots. An agent invoked from the second one writes a *second, divergent* map, and nothing reports a conflict: each store is internally consistent and neither knows the other exists. Resolve against the core that owns the session, and if you cannot establish which core that is, say so rather than writing into the checkout you were launched from.
 
-**`data/` is not in the default vault sync include set** (`notes/`, `talks/`, `hosts/` are), so the map is per-host by default and will not follow the user to another machine. That is the safe default — a collaboration map is host-local observation, not a document — but it should be a stated choice. A user who wants it to travel adds `data/collaboration-intelligence/` to `vault.sync.include`.
+**Two different things are called "per-host" here; keep them apart.** The roster's *location* is per-host (`hosts/<label>/…`, above). Separately, the rest of `data/` is not in the default vault sync include set (`notes/`, `talks/`, `hosts/` are), so **that** part of the map is per-host in the sense of not syncing — same flat path, one copy per machine — and will not follow the user to another machine. That is the safe default — a collaboration map is host-local observation, not a document — but it should be a stated choice. A user who wants it to travel adds `data/collaboration-intelligence/` to `vault.sync.include`.
 
 **Why this location and not the checkout.** The engine tree is REPLACED on app update; anything written there is destroyed without warning. A skill whose whole purpose is a *durable* map is the worst possible thing to lose that way, and the loss is silent — the next run finds no store, builds a task-local view, and reports "persistence unavailable" as if that were normal.
 
