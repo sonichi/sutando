@@ -306,6 +306,19 @@ _is_installer_path_shape() {
   esac
 }
 
+# Additionally: is $1 free of shell expansion/glob syntax? Only meaningful on
+# an ISOLATED path token (never on a full command tail, which legitimately
+# carries an unexpanded "$TRANSCRIPT_PATH" argument by design) -- shq()/
+# shlex.quote() never emit $, `, *, ?, or ~ inside the path they quote, so a
+# path token that does is an operator's own unexpanded/glob prefix, not ours.
+_is_installer_path_literal() {
+  case "$1" in
+    '$HOME/Desktop/sutando'*) return 0 ;;
+    *'$'*|*'`'*|*'*'*|*'?'*|*'~'*) return 1 ;;
+  esac
+  return 0
+}
+
 # Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard
 # exactly (both Q's identical); anything else, including a near-miss, is rc 1.
 _skill_hook_guard_path() {
@@ -339,11 +352,16 @@ candidate_is_owned() {
   fi
   # Only a skill-declared entry may wear this guard shape (its CMD_WORD is
   # "[", not a repo path, so the argv[1] logic below can't judge a built-in).
+  # MARKER is now "skills/<name>/<relative-command>" (src/skill_hooks.py), not
+  # a bare basename -- match it as a SUFFIX, not a substring, so a foreign
+  # command that merely mentions the same filename (e.g. "/tmp/x/hook.sh" vs
+  # our "skills/testhook/hook.sh") cannot satisfy it. A relocated checkout's
+  # stale entry still matches: only the ROOT before "skills/" changed.
   local guard_path
   if [ "$HOOK_IS_SKILL_CUR" = "1" ] \
      && guard_path="$(_skill_hook_guard_path "$cand" "${HOOK_PRIOR_CUR%% *}")"; then
     case "$guard_path" in
-      *"$MARKER"*) _is_installer_path_shape "$guard_path" && return 0 ;;
+      *"$MARKER") _is_installer_path_shape "$guard_path" && return 0 ;;
     esac
     return 1
   fi
@@ -360,7 +378,10 @@ candidate_is_owned() {
   if [ "$tokenize_rc" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -ge 2 ] \
      && [ "${TOKENIZE_RESULT[0]}" = "$CMD_WORD" ]; then
     case "${TOKENIZE_RESULT[1]}" in
-      *"$MARKER"*) _is_installer_path_shape "${TOKENIZE_RESULT[1]}" || return 1 ;;  # bucket: clean argv[1] match
+      *"$MARKER"*)                                        # bucket: clean argv[1] match
+        _is_installer_path_shape "${TOKENIZE_RESULT[1]}" || return 1
+        _is_installer_path_literal "${TOKENIZE_RESULT[1]}" || return 1
+        ;;
       *)                                                  # bucket B
         # Collapse doubled slashes (mktemp -d can produce them; REPO_DIR is
         # normalized) via a plain variable -- `${v//\/\//\/}` doesn't unescape on its replacement side.
@@ -371,12 +392,8 @@ candidate_is_owned() {
     case "${after:0:1}" in ' '|'-') return 1 ;; esac      # bucket A
     _is_installer_path_shape "$after" || return 1
   fi
-  # Mirror CMD_TAIL's own derivation onto the candidate — text after the
-  # marker, with one leading close-quote stripped if present — then compare
-  # by EXACT equality (no glob involved). A candidate whose repo-path
-  # argument is quoted has a closing quote sitting right after the marker
-  # that a plain `*"$MARKER$CMD_TAIL"` suffix check does not expect, since
-  # CMD_TAIL was computed with that same quote already stripped off ours.
+  # Mirror CMD_TAIL's own derivation onto the candidate (text after the
+  # marker, one leading close-quote stripped) and compare by EXACT equality.
   local cand_tail
   cand_tail="${cand#*"$MARKER"}"
   cand_tail="${cand_tail#[\"\']}"

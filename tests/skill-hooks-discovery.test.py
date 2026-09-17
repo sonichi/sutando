@@ -37,7 +37,9 @@ class SkillHookDiscovery(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         event, token, cmd, prior = rows[0]
         self.assertEqual(event, "PreToolUse")
-        self.assertEqual(token, "g.py")
+        # Full suffix, not the bare basename -- a basename alone would let an
+        # unrelated command sharing a skill's filename match the sweep too.
+        self.assertEqual(token, "skills/demo/hooks/g.py")
         # The runner still has to be the one the suffix selects; it just no longer
         # leads the command, because an existence guard runs first.
         self.assertIn("exec python3 ", cmd)
@@ -110,7 +112,7 @@ class SkillHookDiscovery(unittest.TestCase):
         (self.repo / "skills" / "broken" / "manifest.json").write_text("{not json")
         self._skill("good", {"name": "good", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]})
-        self.assertEqual([r[1] for r in discover(self.repo)], ["g.py"])
+        self.assertEqual([r[1] for r in discover(self.repo)], ["skills/good/hooks/g.py"])
 
     def test_malformed_hook_entries_are_skipped_not_raised(self):
         self._skill("demo", {"name": "demo", "hooks": [
