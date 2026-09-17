@@ -22,6 +22,13 @@ Covers:
   i) _proc_argv swallows a probe failure rather than failing the health check
   r) supervised watcher + absent sentinel exposes the pid --fix can re-stamp
   s) --fix re-stamps it and the RE-RUN check reports ok (no restart needed)
+  s2) the re-stamp is the FULL record the watcher writes, through the same
+     writer — and the strict owner (watcher_confirm_owner) then accepts it and
+     a production stop (watcher_stop_owned) signals and releases it
+  s3) a watcher exposing no incarnation marker of its own is NOT re-stamped:
+     the record could not be confirmed, so the fixer says restart instead
+  s4) ...nor one whose live marker was written by a different pid
+  s5) a watcher executing ANOTHER checkout's script is not re-stamped
   t) --fix refuses to stamp a pid that is no longer the watcher (PID reuse)
   t2) ...including a process that merely MENTIONS the script (an observer, a
      `ps | grep`) — the fixer uses the file's exact predicate, not a substring
@@ -36,6 +43,7 @@ Covers:
   v) a check with no repairable pid is declined, not stamped with junk
   w) an unwritable state dir is reported, never raised into the caller
   w2) ...including when it is the exclusive create, not the mkdir, that fails
+  w3) ...and a writer that exits non-zero, or cannot be spawned, is reported with why
   x) `--fix` actually REACHES the repair (warn never enters `issues`)
   y) under `--json` the repair line stays off stdout, so JSON still parses
   y2) ...and the repair pass's own `_`-prefixed keys stay out of the payload
@@ -50,6 +58,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import os
 import sys
 import tempfile
@@ -105,11 +114,14 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
+                # The flat argv IS the fixture; a real vector read for a
+                # fabricated pid would come from the host's process table.
+                hc._proc_argv_vector = lambda pid: None
             hc._watcher_trees = lambda *a, **k: (trees or {})
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
@@ -121,26 +133,44 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
+
+
+MARKER_NAME = "watch-tasks-stream.incarnation"
+FAKE_SEAM = REPO / "tests" / "fixtures" / "process-ops-fake.sh"
+IDENTITY_SH = REPO / "src" / "watcher_identity.sh"
+WATCHER_CODE = REPO / "src" / "watch-tasks-stream.sh"
+
+
+def own_incarnation(pid: str) -> str:
+    """The shape the watcher's writer stamps: `<epoch>-<pid>-<random>`."""
+    return f"{int(time.time())}-{pid}-4242"
 
 
 @contextlib.contextmanager
 def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
-                       argv: str = "bash src/watch-tasks-stream.sh"):
+                       argv: str = "bash src/watch-tasks-stream.sh",
+                       marker: "str | None" = "own"):
     """A workspace the caller can INSPECT after the check — `run_check` deletes
     its tempdir, so the repair cases (which assert on a written file) need this.
 
     Patches the probes into the ONE state `--fix` repairs: a single watcher
-    tree whose parent is a live session (not init), i.e. supervised.
+    tree whose parent is a live session (not init), i.e. supervised. `marker`
+    is the incarnation marker the live watcher exposes beside its sentinel:
+    "own" = written by `pid`, None = absent, any other string = verbatim.
     """
     with tempfile.TemporaryDirectory() as td:
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
+        if marker is not None:
+            (ws / "state" / MARKER_NAME).write_text(
+                (own_incarnation(pid) if marker == "own" else marker) + "\n")
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = lambda p: argv
+            hc._proc_argv_vector = lambda p: None
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda p, ps=None: "500"
@@ -150,7 +180,47 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
+
+
+def sentinel_lines(ws: Path) -> list[str]:
+    f = ws / "state" / "watch-tasks-stream.pid"
+    return f.read_text().splitlines() if f.exists() else ["<ABSENT>"]
+
+
+def strict_owner(ws: Path) -> tuple[int, str]:
+    """`watcher_identity.py owner-pid` — the record half of the production stop."""
+    state = ws / "state"
+    r = subprocess.run([sys.executable, str(REPO / "src" / "watcher_identity.py"), "owner-pid",
+                        "--sentinel", str(state / "watch-tasks-stream.pid"), "--instance", "",
+                        "--workspace", os.path.realpath(ws),
+                        "--incarnation-file", str(state / MARKER_NAME),
+                        "--code-path", str(WATCHER_CODE)],
+                       capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def production_stop(ws: Path, pid: str, argv: str) -> tuple[str, str]:
+    """The restart core-scope sequence — confirm, then stop — over the injected
+    process seam, so nothing on the host is signalled. Returns (stdout, ops log)."""
+    log = ws / "ops.log"
+    argvv = json.dumps(argv.split())
+    env = dict(os.environ, SUTANDO_PROCESS_OPS=str(FAKE_SEAM), POPS_LOG=str(log),
+               POPS_ALIVE_PIDS=pid, SUTANDO_WATCHER_STOP_TICKS="3",
+               **{f"POPS_ARGV_{pid}": argv, f"POPS_ARGVV_{pid}": argvv,
+                  f"POPS_ELAPSED_{pid}": "10:00"})
+    script = f"""
+. "{FAKE_SEAM}"
+. "{IDENTITY_SH}"
+if watcher_confirm_owner "{ws / 'state' / 'watch-tasks-stream.pid'}" "" "{os.path.realpath(ws)}" "{WATCHER_CODE}"; then
+  echo "confirm rc=0 pid=$WATCHER_OWNER_PID"
+  watcher_stop_owned "{ws / 'state' / 'watch-tasks-stream.pid'}" "$WATCHER_OWNER_PID"; echo "stop rc=$?"
+else
+  echo "confirm rc=1 reason=$WATCHER_OWNER_REASON"
+fi
+"""
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    return (r.stdout + r.stderr).strip(), (log.read_text() if log.exists() else "")
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -172,9 +242,9 @@ def case_s_fix_restamps_and_recheck_is_ok() -> list[str]:
         buf = io.StringIO()
         hc.apply_task_watcher_sentinel_fix(checks, stream=buf)
         sentinel = ws / "state" / "watch-tasks-stream.pid"
-        if not sentinel.exists() or sentinel.read_text().strip() != "7100":
-            fails.append("s) --fix must write the live watcher's pid, got "
-                         f"{sentinel.read_text().strip() if sentinel.exists() else '<ABSENT>'}")
+        if not sentinel.exists() or sentinel_lines(ws)[0].strip() != "7100":
+            fails.append("s) --fix must write the live watcher's pid on line 1, got "
+                         f"{sentinel_lines(ws)}")
         # The check dict must carry the POST-fix state, re-measured.
         if checks[0]["status"] != "ok":
             fails.append(f"s) re-run check should be ok, got {checks[0]}")
@@ -182,6 +252,78 @@ def case_s_fix_restamps_and_recheck_is_ok() -> list[str]:
             fails.append("s) the repaired check still advertises a repair")
         if "re-stamped" not in buf.getvalue():
             fails.append(f"s) the repair should be reported, got {buf.getvalue()!r}")
+    return fails
+
+
+def case_s2_restamp_is_the_full_record_the_stop_accepts() -> list[str]:
+    """A repair that only a health probe can read is not a repair: the record
+    must be the shape `watcher_confirm_owner` confirms, or the next restart
+    cannot stop this watcher and a re-arm duplicates consumers."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        msg = hc.fix_task_watcher_sentinel(check)
+        if "re-stamped" not in msg:
+            return [f"s2) the repair did not happen: {msg!r}"]
+        rec = hc.read_sentinel_record(ws / "state" / "watch-tasks-stream.pid")
+        marker = (ws / "state" / MARKER_NAME).read_text().strip()
+        want = {"instance": "", "incarnation": marker, "code_path": str(WATCHER_CODE),
+                "workspace": os.path.realpath(ws)}
+        for k, v in want.items():
+            if rec.get(k) != v:
+                fails.append(f"s2) record field {k}={rec.get(k)!r}, expected {v!r}")
+        if rec.get("pid") != 7100:
+            fails.append(f"s2) record pid {rec.get('pid')!r}, expected 7100")
+        if not rec.get("version") or not rec.get("started_at"):
+            fails.append(f"s2) record lacks version/started_at: {rec!r}")
+        rc, out = strict_owner(ws)
+        if rc != 0 or not out.startswith("7100\t"):
+            fails.append(f"s2) the strict owner refused the repaired record: rc={rc} {out!r}")
+        stop_out, log = production_stop(ws, "7100", "bash src/watch-tasks-stream.sh")
+        if "confirm rc=0 pid=7100" not in stop_out or "stop rc=0" not in stop_out:
+            fails.append(f"s2) the production stop did not confirm+stop: {stop_out!r}")
+        if "signal 7100 TERM" not in log:
+            fails.append(f"s2) no TERM reached pid 7100 through the seam: {log!r}")
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append("s2) the stop did not release the repaired sentinel")
+    return fails
+
+
+def case_s3_no_live_marker_means_no_restamp() -> list[str]:
+    """Without the marker the watcher exposes, no incarnation can be derived
+    from the live process; a placeholder would be a record no stop confirms."""
+    fails = []
+    with supervised_watcher(marker=None) as ws:
+        check = hc.check_task_watcher()
+        msg = hc.fix_task_watcher_sentinel(check)
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append(f"s3) stamped without a marker: {sentinel_lines(ws)}")
+        if "restart the watcher" not in msg or "marker" not in msg:
+            fails.append(f"s3) should refuse and name the remedy, got {msg!r}")
+    return fails
+
+
+def case_s4_a_marker_of_another_pid_is_not_this_watchers() -> list[str]:
+    fails = []
+    with supervised_watcher(marker=own_incarnation("6000")) as ws:
+        check = hc.check_task_watcher()
+        msg = hc.fix_task_watcher_sentinel(check)
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append(f"s4) stamped with pid 6000's marker: {sentinel_lines(ws)}")
+        if "restart the watcher" not in msg:
+            fails.append(f"s4) should refuse, got {msg!r}")
+    return fails
+
+
+def case_s5_another_checkouts_watcher_is_not_restamped() -> list[str]:
+    fails = []
+    with supervised_watcher(argv="bash /elsewhere/src/watch-tasks-stream.sh") as ws:
+        check = hc.check_task_watcher()
+        msg = hc.fix_task_watcher_sentinel(check)
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append(f"s5) stamped a foreign checkout's watcher: {sentinel_lines(ws)}")
+        if "not this checkout" not in msg:
+            fails.append(f"s5) should refuse, got {msg!r}")
     return fails
 
 
@@ -417,6 +559,38 @@ def case_w2_unwritable_state_dir_is_reported() -> list[str]:
                          "covers nothing if the sentinel was written")
         if "could not write" not in msg:
             fails.append(f"w2) should report the write failure, got {msg!r}")
+    return fails
+
+
+def case_w3_a_writer_failure_is_reported_with_its_reason() -> list[str]:
+    """The writer is a subprocess; its non-zero exit and stderr must reach the
+    operator as text, and a writer that cannot be spawned is the same class."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        with tempfile.TemporaryDirectory() as fake_repo:
+            (Path(fake_repo) / "src").mkdir()
+            (Path(fake_repo) / "src" / "watcher_sentinel.sh").write_text(
+                "#!/bin/bash\necho 'disk on fire' >&2\nexit 7\n")
+            (Path(fake_repo) / "src" / "watch-tasks-stream.sh").write_text("#!/bin/bash\n")
+            saved = hc.REPO_DIR
+            hc.REPO_DIR = Path(fake_repo)
+            try:
+                msg = hc.fix_task_watcher_sentinel(check)
+            finally:
+                hc.REPO_DIR = saved
+        if "could not write" not in msg or "disk on fire" not in msg:
+            fails.append(f"w3) should carry the writer's stderr, got {msg!r}")
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append("w3) a failed writer left a sentinel behind")
+        real_run = hc.subprocess.run
+        hc.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no bash"))
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        finally:
+            hc.subprocess.run = real_run
+        if "could not write" not in msg or "no bash" not in msg:
+            fails.append(f"w3) an unspawnable writer should be reported, got {msg!r}")
     return fails
 
 
@@ -888,6 +1062,10 @@ def main() -> int:
         ("q", case_q_trees_swallows_probe_failure),
         ("r", case_r_supervised_watcher_exposes_restamp_pid),
         ("s", case_s_fix_restamps_and_recheck_is_ok),
+        ("s2", case_s2_restamp_is_the_full_record_the_stop_accepts),
+        ("s3", case_s3_no_live_marker_means_no_restamp),
+        ("s4", case_s4_a_marker_of_another_pid_is_not_this_watchers),
+        ("s5", case_s5_another_checkouts_watcher_is_not_restamped),
         ("t", case_t_fix_refuses_a_recycled_pid),
         ("t2", case_t2_an_impostor_that_merely_mentions_the_script_is_refused),
         ("t3", case_t3_an_impostor_appearing_mid_write_is_withdrawn),
@@ -899,6 +1077,7 @@ def main() -> int:
         ("v", case_v_fix_declines_without_a_pid),
         ("w", case_w_fix_reports_a_write_failure),
         ("w2", case_w2_unwritable_state_dir_is_reported),
+        ("w3", case_w3_a_writer_failure_is_reported_with_its_reason),
         ("x", case_x_fix_is_reachable_from_main),
         ("y", case_y_json_repair_line_goes_to_stderr),
         ("y2", case_y2_private_keys_stay_out_of_the_json_payload),

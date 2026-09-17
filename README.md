@@ -233,20 +233,20 @@ bash src/verify-setup.sh
 - `npm install` failed? Make sure Node.js 22+ is installed: `node --version`
 - Gemini 429 errors? Your shell may have a stale `GEMINI_API_KEY` overriding `.env` — run `unset GEMINI_API_KEY` then restart
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
-- Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
+- Something broke? Run `bash src/restart.sh --scope all` — this kills all services and restarts fresh. (Bare `bash src/restart.sh` is `--scope core`: it restarts only this instance's own task watcher and heartbeat writer, leaving the bridges, dashboard, web client and app running — the safe default on a host with pool workers.)
 - Sutando acting confused, contradicting itself, or giving stale answers after a long session? Restart the selected core CLI session to reset its context.
 - **Still stuck?** [Join the official Discord](https://discord.gg/uZHWXXmrCS) — real humans and community-run agents answer support questions there.
-- Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
+- Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh --scope all` to relaunch all services.
 
 **Shutting down:**
 ```bash
-bash src/restart.sh    # stops all services (voice agent, web client, API, bridges, etc.)
+bash src/restart.sh --scope all --stop-only    # stops all services (voice agent, web client, API, bridges, etc.); `bash src/stop.sh` is the same
 pkill -x Sutando # stop the menu bar app
 ```
-Exiting `startup.sh` alone does NOT stop background services. Always use `restart.sh` (or `kill-all.sh` if available) to cleanly shut everything down.
+Exiting `startup.sh` alone does NOT stop background services. Always use `restart.sh --scope all --stop-only` (or `stop.sh`) to cleanly shut everything down.
 
 **Uninstalling:**
-1. Stop all services: `bash src/restart.sh && pkill -x Sutando`
+1. Stop all services: `bash src/restart.sh --scope all --stop-only && pkill -x Sutando`
 2. Remove the repo: `rm -rf ~/Desktop/sutando` (or wherever you cloned it)
 3. Remove config: `rm -rf $CLAUDE_CONFIG_DIR/projects/*sutando*`
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo

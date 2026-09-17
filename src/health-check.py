@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
+from git_binary import short_head  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, read_sentinel_record, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
@@ -3626,7 +3627,7 @@ def fix_launchd(label: str) -> str:
             f"{label} is not launchd-managed on this host (no {plist.name} in "
             f"~/Library/LaunchAgents — that plist comes from Sutando.app's installer). "
             f"startup.sh launches this service directly instead, so --fix cannot "
-            f"restart it. Remedy: bash src/restart.sh"
+            f"restart it. Remedy: bash src/restart.sh --scope all"
         )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
@@ -9486,6 +9487,15 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
                       "or running; none leaked and none past its own execution contract"}
 
 
+def _watcher_code_path_for(argv: str, vector) -> "str | None":
+    """This checkout's watcher script when the process EXECUTES it, else None —
+    the signaller's own predicate, so a record names only what a stop confirms."""
+    code = str(REPO_DIR / "src" / "watch-tasks-stream.sh")
+    if watcher_identity.runs_code_path(argv, code, vector):
+        return code
+    return None
+
+
 def fix_task_watcher_sentinel(check: dict) -> str:
     """Re-stamp the PID sentinel for a supervised watcher that lost it (--fix).
 
@@ -9493,6 +9503,13 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     watcher whose session still owns it, so naming it restores Stop-hook
     cleanup and probe tracking. The alternative the warning offers is a
     restart, which strands tasks/ mid-drain.
+
+    The record goes through the ONE writer, `src/watcher_sentinel.sh stamp`: a
+    pid-only file is a shape the strict owner refuses, so a stop could never
+    signal the watcher this repaired. Every field is derived from the live
+    process — instance from the target the check resolved, code_path from the
+    executed argv, incarnation from the marker the watcher exposes — and a
+    field that cannot be derived is a refusal, never a placeholder.
     """
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
@@ -9505,23 +9522,40 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
-    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
+    argv = _proc_argv(int(pid))
+    if _is_watcher_argv(argv, int(pid)) is not True:
         return f"pid {pid} is no longer the watcher — not re-stamped"
+    code_path = _watcher_code_path_for(argv, _proc_argv_vector(int(pid)))
+    if code_path is None:
+        return (f"pid {pid} runs a watcher that is not this checkout's "
+                f"({REPO_DIR / 'src' / 'watch-tasks-stream.sh'}) — not re-stamped; a record "
+                f"naming it would authorise the wrong stop")
     try:
         # Separate try: mkdir raises FileExistsError when state/ is a plain
         # file, which is a write failure, not a competing claim.
         pid_file.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return f"could not write {pid_file}: {e}"
+    # The workspace as the watcher records it: the physical path of the tree
+    # the sentinel lives in, which is what the signaller compares against.
+    workspace = os.path.realpath(pid_file.parent.parent)
     try:
-        # Exclusive create, not exists()-then-write: only the OS can arbitrate
-        # against a watcher claiming the sentinel in the same instant.
-        with open(pid_file, "x") as fh:
-            fh.write(f"{pid}\n")
-    except FileExistsError:
-        return "a watcher re-claimed the sentinel — left its file alone"
-    except OSError as e:
+        res = subprocess.run(["bash", str(REPO_DIR / "src" / "watcher_sentinel.sh"), "stamp",
+                              str(pid_file), pid, code_path, short_head(str(REPO_DIR)), workspace],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
         return f"could not write {pid_file}: {e}"
+    if res.returncode == 3:
+        return "a watcher re-claimed the sentinel — left its file alone"
+    if res.returncode == 5:
+        return (f"pid {pid} exposes no live incarnation marker of its own beside {pid_file} — "
+                f"cannot write a record a stop could confirm; restart the watcher instead")
+    if res.returncode == 4:
+        return f"could not write {pid_file}: the sentinel lock could not be taken"
+    if res.returncode != 0:
+        why = res.stderr.strip() or f"writer exited {res.returncode}"
+        return f"could not write {pid_file}: {why}"
+    incarnation = res.stdout.strip()
     # The probe above was a snapshot taken BEFORE publication; retract our own
     # stamp if it went stale mid-write.
     if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
@@ -9529,8 +9563,9 @@ def fix_task_watcher_sentinel(check: dict) -> str:
             # Read-then-unlink, NOT arbitrated the way the write above is:
             # POSIX has no conditional unlink, so a claim landing here is lost.
             rec = read_sentinel_record(pid_file)
-            # The shared reader: a strict decode raised past `except OSError`.
-            if rec.get("pid_line") == pid and set(rec) <= {"pid", "pid_line"}:
+            # Ours = the pid AND the incarnation we just recorded; a re-claim
+            # by another watcher carries its own.
+            if rec.get("pid") == int(pid) and rec.get("incarnation") == incarnation:
                 pid_file.unlink()
         except OSError as e:
             # Reporting a withdrawal that did not happen is the same class of
@@ -9538,7 +9573,8 @@ def fix_task_watcher_sentinel(check: dict) -> str:
             return (f"pid {pid} stopped being the watcher mid-write and the "
                     f"stamp could not be withdrawn: {e}")
         return f"pid {pid} stopped being the watcher mid-write — sentinel withdrawn"
-    return f"re-stamped the sentinel for live watcher pid {pid}"
+    return (f"re-stamped the sentinel for live watcher pid {pid} "
+            f"(full record: incarnation {incarnation}, {code_path})")
 
 
 def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:

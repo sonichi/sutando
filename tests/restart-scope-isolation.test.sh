@@ -26,6 +26,9 @@ mkdir -p "$SB/src" "$SB/scripts" "$SB/bin" "$SB/workspace/state"
 cp "$REPO/src/restart.sh" "$REPO/src/watcher_sentinel.sh" "$REPO/src/process-ops.sh" "$SB/src/"
 cp "$REPO/src/util_paths.py" "$REPO/src/sutando_config.py" "$SB/src/"
 cp "$REPO/src/watcher_identity.py" "$REPO/src/watcher_identity.sh" "$SB/src/"
+# The REAL shutdown helper: which gate a scope marks is shared state every
+# watcher on the workspace reads, so it must be observable here, not stubbed.
+cp "$REPO/src/shutdown.py" "$REPO/src/workspace_default.py" "$SB/src/"
 cp -R "$REPO/src/runtime-api" "$SB/src/runtime-api"
 cp "$REPO/scripts/python-binary.sh" "$SB/scripts/python-binary.sh"
 printf '#!/bin/sh\necho "STUB-STARTUP-REACHED"\n' > "$SB/src/startup.sh"
@@ -80,8 +83,26 @@ key_of() { local b; b="$(basename "$1")"; b="${b#watch-tasks-stream}"; b="${b%.p
 CORE_KEY="$(key_of "$CORE_SENT")"; W1_KEY="$(key_of "$W1_SENT")"; W2_KEY="$(key_of "$W2_SENT")"
 
 CORE_PID=9101; W1_PID=9102; W2_PID=9103
+
+# The intake gates, from the one path owner: the workspace-wide one and each
+# instance's own. A scope's mark must land on exactly the gate its scope names.
+gate_for() {                    # gate_for <instance-or-empty> -> instance gate path
+  "$REPO_PY" "$SB/src/util_paths.py" instance-shutdown-gate "$STATE" ${1:+"$1"}
+}
+REPO_PY="$(. "$REPO/scripts/python-binary.sh"; resolve_python "$REPO")"
+WS_GATE="$("$REPO_PY" "$SB/src/util_paths.py" shutdown-gate "$STATE")"
+CORE_GATE="$(gate_for '')"; W1_GATE="$(gate_for worker-1)"; W2_GATE="$(gate_for worker-2)"
+[ -n "$WS_GATE" ] && [ -n "$CORE_GATE" ] && [ "$CORE_GATE" != "$WS_GATE" ] \
+  && [ "$W1_GATE" != "$CORE_GATE" ] && [ "$W2_GATE" != "$W1_GATE" ]
+ck "the shared gate and the three instance gates are four distinct files (harness is sound)" $?
+note "ws=$(basename "$WS_GATE")  core=$(basename "$CORE_GATE")  w1=$(basename "$W1_GATE")"
+[ "$(dirname "$CORE_GATE")" = "$(dirname "$CORE_SENT")" ]
+ck "an instance gate sits beside that instance's watcher record" $?
+gates_present() { for g in "$WS_GATE" "$CORE_GATE" "$W1_GATE" "$W2_GATE"; do [ -f "$g" ] && basename "$g"; done | tr '\n' ' ' | sed 's/ $//'; }
+clear_gates() { rm -f "$WS_GATE" "$CORE_GATE" "$W1_GATE" "$W2_GATE"; }
 arm() {                         # arm: all three watchers live and well-formed
   rm -f "$STATE"/watch-tasks-stream*.pid "$STATE"/watch-tasks-stream*.incarnation
+  clear_gates
   stamp "$CORE_SENT" "$CORE_PID" "$CORE_KEY" inc-core
   stamp "$W1_SENT"   "$W1_PID"   "$W1_KEY"   inc-w1
   stamp "$W2_SENT"   "$W2_PID"   "$W2_KEY"   inc-w2
@@ -366,6 +387,45 @@ arm; restart --rebuild-app --stop-only; out="$OUT"
 grep -q "implies --scope all" <<<"$out"; ck "(e) --rebuild-app says it widened the scope" $?
 grep -q '^pattern_kill src/Sutando/Sutando$' "$LOG"
 ck "(e) --rebuild-app DOES stop the app it is about to replace" $?
+
+# ================================================= (g) the intake gate a scope marks
+# fswatch does not replay, so a gate a watcher does not own costs it the event: the core
+# scope marks ONLY its own instance's gate; the workspace-wide gate is reserved for `all`.
+arm; restart --stop-only; out="$OUT"
+[ "$(gates_present)" = "$(basename "$CORE_GATE")" ]
+ck "(g) core --stop-only marks EXACTLY the core's instance gate, and leaves it set" $?
+note "gates present: [$(gates_present)]"
+[ ! -f "$WS_GATE" ]; ck "(g) ...and never the workspace-wide gate" $?
+[ ! -f "$W1_GATE" ] && [ ! -f "$W2_GATE" ]; ck "(g) ...so both workers' intake stays open" $?
+grep -q "marking the instance gate (scope core)" <<<"$out"; ck "(g) and says which gate it marked" $?
+
+arm; restart; out="$OUT"
+[ -z "$(gates_present)" ]; ck "(g) a plain core restart clears its instance gate before startup" $?
+note "gates present after restart: [$(gates_present)]"
+grep -q "STUB-STARTUP-REACHED" <<<"$out"; ck "(g) ...and reaches startup.sh" $?
+
+arm; restart --scope all --stop-only; out="$OUT"
+[ "$(gates_present)" = "$(basename "$WS_GATE")" ]
+ck "(g) --scope all --stop-only marks EXACTLY the workspace-wide gate (every watcher defers)" $?
+note "gates present: [$(gates_present)]"
+arm; restart --scope all; out="$OUT"
+[ -z "$(gates_present)" ]; ck "(g) --scope all clears the workspace-wide gate before startup" $?
+
+# The control: a mark re-pointed at the shared gate under core scope IS visible
+# here, so the empty worker gates above are the scoping, not a blind instrument.
+sed 's|^  \[ "$SCOPE" = "all" \] && printf .workspace. \|\| printf .instance.$|  printf "workspace"|' \
+    "$SB/src/restart.sh" > "$SB/src/restart-perturbed-g.sh"
+grep -q '^  printf "workspace"$' "$SB/src/restart-perturbed-g.sh"
+ck "(g) CONTROL: the perturbation applied (control is not vacuous)" $?
+arm; run bash "$SB/src/restart-perturbed-g.sh" --stop-only
+[ "$(gates_present)" = "$(basename "$WS_GATE")" ]
+ck "(g) CONTROL: a core scope that marks the shared gate IS caught by this harness" $?
+
+# A worker's gate is keyed like its record: the core's mark can never resolve to it.
+arm; restart --stop-only
+[ "$(cat "$CORE_GATE" 2>/dev/null | grep -c '"reason"')" = "1" ]
+ck "(g) the instance gate carries the reason record shutdown.py writes" $?
+clear_gates
 
 # src/stop.sh promises "all services"; the default core scope is not that.
 grep -q -- '--scope all' "$REPO/src/stop.sh"; ck "(e) src/stop.sh asks for the scope it promises" $?

@@ -140,6 +140,34 @@ sentinel_lock_release() {
   rmdir "$lock" 2>/dev/null || true
 }
 
+# An incarnation names one START of one pid: `<epoch>-<pid>-<random>`. The pid
+# inside is what lets a repair prove the live marker was written by that pid.
+sentinel_new_incarnation() {   # <pid>
+  printf '%s-%s-%s%s' "$(date +%s)" "$1" "${RANDOM:-0}" "${RANDOM:-0}"
+}
+
+# The pid an incarnation embeds, or empty when it is not of that shape.
+sentinel_incarnation_pid() {   # <incarnation>
+  local inc="$1" rest
+  rest="${inc#*-}"
+  [ "$rest" != "$inc" ] || return 1
+  rest="${rest%%-*}"
+  case "$rest" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$rest"
+}
+
+# The ONE record grammar. Both writers print through here; a second spelling is
+# a second shape the strict reader will refuse.
+_sentinel_record_body() {   # <pid> <instance> <inc> <code> <ver> <ws>
+  printf '%s\n' "$1"
+  printf 'instance=%s\n' "$2"
+  printf 'incarnation=%s\n' "$3"
+  printf 'code_path=%s\n' "$4"
+  printf 'version=%s\n' "$5"
+  printf 'started_at=%s\n' "$(date +%s)"
+  printf 'workspace=%s\n' "$6"
+}
+
 # Temp+rename both files, marker first: a reader must never find a record whose
 # code_path or marker has not landed, and would refuse a watcher that IS ours.
 sentinel_write_record() {   # <pid_file> <pid> <instance> <inc> <code> <ver> <ws>
@@ -147,19 +175,39 @@ sentinel_write_record() {   # <pid_file> <pid> <instance> <inc> <code> <ver> <ws
   inc_file="$(sentinel_incarnation_path "$pid_file")"
   tmp="$(mktemp "${pid_file}.new.XXXXXX")" || return 1
   inc_tmp="$(mktemp "${inc_file}.new.XXXXXX")" || { rm -f "$tmp"; return 1; }
-  {
-    printf '%s\n' "$2"
-    printf 'instance=%s\n' "$3"
-    printf 'incarnation=%s\n' "$4"
-    printf 'code_path=%s\n' "$5"
-    printf 'version=%s\n' "$6"
-    printf 'started_at=%s\n' "$(date +%s)"
-    printf 'workspace=%s\n' "$7"
-  } > "$tmp" || { rm -f "$tmp" "$inc_tmp"; return 1; }
+  _sentinel_record_body "$2" "$3" "$4" "$5" "$6" "$7" > "$tmp" || { rm -f "$tmp" "$inc_tmp"; return 1; }
   printf '%s\n' "$4" > "$inc_tmp" || { rm -f "$tmp" "$inc_tmp"; return 1; }
   mv -f "$inc_tmp" "$inc_file" || { rm -f "$tmp" "$inc_tmp"; return 1; }
   mv -f "$tmp" "$pid_file" || { rm -f "$tmp"; return 1; }
   return 0
+}
+
+# Repair writer (health-check --fix): same grammar and lock; link(2) publishes, so an existing record wins.
+# rc 0 written (stdout = the incarnation, taken from the live marker only when it embeds <pid>), 1 write failed, 3 exists, 4 no lock, 5 no marker of <pid>.
+sentinel_stamp_absent() {   # <pid_file> <pid> <code> <ver> <ws>
+  local pid_file="$1" pid="$2" marker inc inc_pid instance tmp rc=1
+  marker="$(sentinel_incarnation_path "$pid_file")"
+  instance="$(sentinel_instance_from_path "$pid_file")"
+  sentinel_lock_acquire "$pid_file" || return 4
+  if [ -e "$pid_file" ]; then
+    sentinel_lock_release "$pid_file"; return 3
+  fi
+  inc="$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]' || true)"
+  inc_pid="$(sentinel_incarnation_pid "$inc" 2>/dev/null || true)"
+  if [ -z "$inc" ] || [ "$inc_pid" != "$pid" ]; then
+    sentinel_lock_release "$pid_file"; return 5
+  fi
+  if tmp="$(mktemp "${pid_file}.new.XXXXXX")" \
+     && _sentinel_record_body "$pid" "$instance" "$inc" "$3" "$4" "$5" > "$tmp"; then
+    if ln "$tmp" "$pid_file" 2>/dev/null; then
+      rc=0; printf '%s\n' "$inc"
+    elif [ -e "$pid_file" ]; then
+      rc=3
+    fi
+  fi
+  [ -n "${tmp:-}" ] && rm -f "$tmp"
+  sentinel_lock_release "$pid_file"
+  return "$rc"
 }
 
 # cleanup()'s release, under the lock a start takes. The marker holds no pid, so
@@ -315,3 +363,11 @@ sentinel_release_if_owner() {
   [ -e "$claim" ] && rm -f "$claim"
   return 0
 }
+
+# Executed, not sourced: the repair path stamps through THIS file's writer.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    stamp) shift; sentinel_stamp_absent "$@"; exit $? ;;
+    *) echo "usage: watcher_sentinel.sh stamp <pid_file> <pid> <code_path> <version> <workspace>" >&2; exit 2 ;;
+  esac
+fi

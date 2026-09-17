@@ -430,9 +430,9 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # The record a signaller checks this process against. A bare pid proves nothing:
 # a dead watcher's number is reissued and the next holder answers identically.
 WATCHER_INSTANCE="$(sentinel_instance_from_path "$PID_FILE")"
-# Opaque and per START, not per pid: two starts of one instance may not be
-# distinguishable by pid alone during the handover, and this always is.
-WATCHER_INCARNATION="$(date +%s)-$$-${RANDOM:-0}${RANDOM:-0}"
+# Per START, not per pid: two starts of one instance may not be distinguishable
+# by pid alone during the handover, and this always is. Shape owned by the writer.
+WATCHER_INCARNATION="$(sentinel_new_incarnation "$$")"
 WATCHER_CODE_PATH="$__SCRIPT_DIR/$(basename "$0")"
 # Through the resolver: a bare `git` is the Xcode-CLT stub on a clean Mac.
 WATCHER_VERSION="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/git_binary.py" short-head "$__REPO_ROOT" 2>/dev/null || true)"
@@ -456,6 +456,19 @@ if ! sentinel_write_record "$PID_FILE" "$$" "$WATCHER_INSTANCE" "$WATCHER_INCARN
   exit 1
 fi
 sentinel_lock_release "$PID_FILE"
+# The intake gates, from the path owner that keyed this record: this instance's
+# (a core-scope stop) and the workspace-wide one (--scope all). Never spelled here.
+SHUTDOWN_GATE="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/util_paths.py" shutdown-gate "$STATE_DIR")" || {
+  echo "watch-tasks-stream: could not resolve the shutdown gate under $STATE_DIR" >&2
+  exit 1
+}
+INSTANCE_GATE="$("$SUTANDO_PY_BIN" "$__SCRIPT_DIR/util_paths.py" instance-shutdown-gate "$STATE_DIR")" || {
+  echo "watch-tasks-stream: could not resolve this instance's shutdown gate under $STATE_DIR" >&2
+  exit 1
+}
+intake_gated() {
+  [ -f "$SHUTDOWN_GATE" ] || [ -f "$INSTANCE_GATE" ]
+}
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -732,11 +745,13 @@ while IFS= read -r path; do
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
-        # emitting one mid-shutdown would orphan it.
-        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-          continue
+        # Graceful-shutdown gate: HOLD a task while either gate is set. fswatch does
+        # not replay, so a dropped event is a lost task if this watcher survives.
+        if intake_gated; then
+          echo "watch-tasks-stream: intake gated (shutdown in progress); holding $(basename "$path") until the gate lifts" >&2
+          while intake_gated; do sleep 0.5; done
         fi
+        [ -f "$path" ] || continue
         dispatch_task "$path"
       fi
       ;;

@@ -282,6 +282,46 @@ class TheFallbackReceiptIsScopedLikeTheSentinel(unittest.TestCase):
         self.assertIn(key, up.watcher_sentinel_path(self.d).name)
 
 
+class TheIntakeGatesAreKeyedLikeTheRecord(unittest.TestCase):
+    """A core-scope stop gates only its own instance, so the instance gate must
+    resolve from the SAME identity as the watcher record and sit beside it;
+    the workspace-wide gate is one fixed name. Both spelled here only."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            os.environ.pop(k, None)
+
+    def test_the_workspace_gate_is_the_historic_shutdown_sentinel(self):
+        self.assertEqual(up.shutdown_gate_path(self.d), self.d / "shutdown.sentinel")
+
+    def test_the_default_instance_gate_sits_beside_the_bare_record(self):
+        rec = up.watcher_sentinel_path(self.d)
+        gate = up.instance_shutdown_gate_path(self.d)
+        self.assertEqual(gate.parent, rec.parent)
+        self.assertEqual(gate.name, rec.name[:-len(".pid")] + ".shutdown.sentinel")
+        self.assertNotEqual(gate, up.shutdown_gate_path(self.d))
+
+    def test_a_named_instance_gate_carries_the_records_key(self):
+        rec = up.watcher_sentinel_path(self.d, instance="worker-7")
+        gate = up.instance_shutdown_gate_path(self.d, instance="worker-7")
+        self.assertEqual(gate.name, rec.name[:-len(".pid")] + ".shutdown.sentinel")
+        self.assertNotEqual(gate, up.instance_shutdown_gate_path(self.d))
+
+    def test_the_cli_answers_both_gates_from_one_owner(self):
+        for sub, want in (("shutdown-gate", up.shutdown_gate_path(self.d)),
+                          ("instance-shutdown-gate", up.instance_shutdown_gate_path(self.d))):
+            out = subprocess.run([sys.executable, str(ROOT / "src" / "util_paths.py"),
+                                  sub, str(self.d)], capture_output=True, text=True, check=True)
+            self.assertEqual(out.stdout.strip(), str(want), sub)
+        out = subprocess.run([sys.executable, str(ROOT / "src" / "util_paths.py"),
+                              "instance-shutdown-gate", str(self.d), "worker-7"],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(),
+                         str(up.instance_shutdown_gate_path(self.d, instance="worker-7")))
+
+
 class AnUnavailableEncoderIsNotADefaultInstance(unittest.TestCase):
     """`_runtime_identity` returns None on both import failures. Covering it
     through the public helper only exercises the caller, not these branches."""

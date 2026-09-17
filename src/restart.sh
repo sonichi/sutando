@@ -72,13 +72,20 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   . "$REPO/scripts/python-binary.sh"
   PY_BIN="$(resolve_python "$REPO")"
 fi
+# The gate a scope marks is the gate its own watcher consults: `all` the
+# workspace-wide one, `core` this instance's, so a peer worker's intake stays open.
+_shutdown_gate() {
+  [ "$SCOPE" = "all" ] && printf 'workspace' || printf 'instance'
+}
 _shutdown_state() {
+  local gate
   if [ -z "$PY_BIN" ]; then
     echo "restart.sh: no runnable python3 — shutdown sentinel NOT $1" >&2
     return 1
   fi
-  "$PY_BIN" "$REPO/src/shutdown.py" "$@" >/dev/null || {
-    echo "restart.sh: shutdown.py $1 failed — sentinel state is NOT $1" >&2
+  gate="$(_shutdown_gate)"
+  "$PY_BIN" "$REPO/src/shutdown.py" "$@" --gate "$gate" ${_WS:+--state-dir "$_WS/state"} >/dev/null || {
+    echo "restart.sh: shutdown.py $1 ($gate gate) failed — sentinel state is NOT $1" >&2
     return 1
   }
 }
@@ -154,8 +161,10 @@ if [ "$SCOPE" = "worker" ]; then
 fi
 
 echo "Stopping Sutando services (scope: $SCOPE)..."
+_resolve_workspace
 # Marked before killing so the intake gate holds new tasks while services stop.
 # --stop-only leaves it set: that IS the core's clean-exit signal.
+echo "  intake gate: marking the $(_shutdown_gate) gate (scope $SCOPE)"
 _shutdown_state mark "restart.sh${ARGS_GIVEN:+ $ARGS_GIVEN}" || true
 # Voice-agent stop goes through the GUARDED lock takeover, never a broad
 # `pkill -f voice-agent` (voice-reliability plan amendment U2): the old blind
@@ -183,7 +192,6 @@ else
 fi
 # Deliberate restart: the launchd bridge wrappers treat an exit inside this
 # window as ours, not a crash, so the owner is not alerted for every restart.
-_resolve_workspace
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 # The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
 # startup.sh only starts one when none is running, and an old writer keeps its old schema.

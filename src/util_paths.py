@@ -564,6 +564,23 @@ def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
     return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
 
 
+# The workspace-wide intake gate: `--scope all` marks it and every watcher
+# under the state dir consults it. Spelled here and nowhere else.
+SHUTDOWN_GATE_NAME = "shutdown.sentinel"
+
+
+def shutdown_gate_path(state_dir) -> Path:
+    """The intake gate EVERY watcher under `state_dir` consults."""
+    return Path(state_dir) / SHUTDOWN_GATE_NAME
+
+
+def instance_shutdown_gate_path(state_dir, instance=None, agent=None) -> Path:
+    """The intake gate for ONE instance, beside its watcher record and keyed
+    the same way, so a core-scope stop never gates a peer worker's intake."""
+    sentinel = watcher_sentinel_path(state_dir, instance, agent)
+    return sentinel.with_name(sentinel.name[:-len(".pid")] + ".shutdown.sentinel")
+
+
 def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     """Where THIS instance records "my optional handler declined this task".
 
@@ -666,9 +683,17 @@ if __name__ == "__main__":
         print(_val)
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "shutdown-gate":
+        print(shutdown_gate_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "instance-shutdown-gate":
+        # Same identity resolution as `watcher-sentinel`: the gate a watcher
+        # consults is keyed exactly like the record it writes.
+        print(instance_shutdown_gate_path(sys.argv[2],
+                                          instance=(sys.argv[3] if len(sys.argv) > 3 else None)))
     else:
         print("usage: util_paths.py {watcher-sentinel <state-dir> [instance]"
               "|sentinel-pid <sentinel>|sentinel-field <sentinel> <key>"
-              "|handler-fallbacks-dir <state-dir>}",
+              "|handler-fallbacks-dir <state-dir>|shutdown-gate <state-dir>"
+              "|instance-shutdown-gate <state-dir> [instance]}",
               file=sys.stderr)
         raise SystemExit(2)
