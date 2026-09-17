@@ -52,9 +52,17 @@ def _same_file(path_a: str, path_b: str, stat: Callable[[str], object] = os.stat
     `os.path.realpath` does not case-fold on a case-insensitive volume, so a
     string compare against `SYSTEM_GIT` misses an alternate-case alias of the
     shim (e.g. `/USR/BIN/GIT`). A stat-identity check is unaffected by case.
+
+    The two stat calls fail closed in opposite directions on purpose: `path_a`
+    (the candidate) unreadable means its identity is UNKNOWN, so treat it as
+    the stub rather than hand back an unverified binary; `path_b` (SYSTEM_GIT)
+    unreadable means the shim itself is absent, so nothing can be it.
     """
     try:
         stat_a = stat(path_a)
+    except OSError:
+        return True
+    try:
         stat_b = stat(path_b)
     except OSError:
         return False

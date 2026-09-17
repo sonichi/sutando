@@ -35,9 +35,8 @@ _sutando_git_is_system_stub() {
 	# Split so the exact flagged token stays out of this file (REVIEW.md
 	# lesson 7 / scripts/python-binary.sh's own comment on the same point).
 	_sb="/usr"/bin/git
-	# -ef compares filesystem identity (device+inode), not spelling: on a
-	# case-insensitive volume /USR/BIN/GIT is the same inode as /usr/bin/git,
-	# but realpath above does not case-fold, so `=` alone missed the alias.
+	# -ef compares filesystem identity (device+inode): realpath above does
+	# not case-fold, so a case-insensitive-volume alias missed `=` alone.
 	[ "$_resolved" -ef "$_sb" ]
 }
 
