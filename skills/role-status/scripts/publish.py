@@ -15,8 +15,8 @@ verify.py prints them.
 
 Exit 0: published.  1: refused on coverage, nothing written -- re-judge with an
 explicit coverage instruction.  2: cannot answer (unreadable task file or
-judgment, unreadable/ambiguous structured evidence, a result already published,
-results/ unwritable), nothing written.
+judgment, unreadable/ambiguous structured evidence, no event ownership
+resolvable, a result already published, results/ unwritable), nothing written.
 This script emits the `[no-send]` first line but never parses result markers.
 """
 import argparse

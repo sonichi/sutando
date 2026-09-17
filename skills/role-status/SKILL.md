@@ -40,9 +40,11 @@ for one actor of nine — the verifier strips the first two and refuses the thir
      with an explicit coverage instruction ("answer for every actor that has an
      event; N actors are listed") and publish again.
    - `2` — cannot answer: unreadable task or judgment, malformed or duplicated
-     `EVIDENCE_JSON`, a result already published (`cannot answer: result
-     already published`). **Nothing written**, the existing result untouched.
-     Do not retry the model; surface the task to the owner.
+     `EVIDENCE_JSON`, event ids present but none resolvable to an owner
+     (`cannot answer: no event ownership resolvable`), a result already
+     published (`cannot answer: result already published`). **Nothing
+     written**, any existing result untouched. Do not retry the model;
+     surface the task to the owner.
 
 `publish.py` delegates every judgment decision to `scripts/verify.py`
 (`verify.verify(task_text, judgment, min_coverage)`); the verifier remains
@@ -66,7 +68,9 @@ python3 skills/role-status/scripts/verify.py <task-file> <judgment.json> [--out 
   touching another id character on either side (`…:ag2.spacex`, `$abcd` inside
   `$abcde`) is a different token and never matches.
 - **Coverage.** `distinct verified actors ≥ ceil(min_coverage × actors_with_events)`,
-  else refused. Duplicate rows for one actor count once.
+  else refused. Duplicate rows for one actor count once. A file with event ids
+  none of which resolves to an owner is exit 2, never an empty `[]` publish;
+  only a file with no event ids at all (nobody working) answers `[]`.
 - **Fail closed.** A malformed marked object or two marker lines is exit 2,
   never the block fallback and never a zero floor.
 

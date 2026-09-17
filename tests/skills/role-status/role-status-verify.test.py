@@ -33,7 +33,6 @@ E_B1 = "ag2space-message:$bbbb_BBBB-3333"
 E_C1 = "ag2space-message:$cccc/CCCC+4444="
 FAKE = "ag2space-message:$zzzz-not-in-file"
 STRANGER = "ag2space:@stranger:ag2.space"
-NOT_OWNED_A1 = f"strip row[0] {ALICE} working_event_ids: {E_A1!r} not owned by actor"
 
 # Block-shaped evidence: 4 actors named, 3 own an event id, dave is prose only.
 TASK_BLOCKS = f"""id: task-role-status-v1-0000-a1
@@ -206,12 +205,31 @@ check(rc == 0 and [r["actor_id"] for r in verified_of(so)] == [BOB, CAROL],
       "non-object row and a row whose fields are the wrong shape are dropped")
 check("drop row[0]: not an object" in se and "blocked_items[0]: not an object" in se,
       "malformed row and blocked item reported on stderr")
-# no `task:` header: the file carries no evidence, so nothing is owned and the
-# floor is 0 -- a row citing a real-looking id is still stripped, not trusted
-rc, so, se, _ = run("id: t\nsource: x\n" + f"event {E_A1} by {ALICE}\n", [row(ALICE, [E_A1], [])])
-check(rc == 0 and verified_of(so) == [] and NOT_OWNED_A1 in se
+# no `task:` header: the file names an event id but carries no evidence that
+# owns it -- cannot answer, never an empty publish for a file that has events
+rc, so, se, written = run("id: t\nsource: x\n" + f"event {E_A1} by {ALICE}\n", [row(ALICE, [E_A1], [])], out=True)
+check(rc == 2 and written is None and "cannot answer: no event ownership resolvable" in se
       and stats_line(so) == "rows=1 distinct_actors=0 actors=0 actors_with_events=0 min_rows=0",
-      "no task: header: no evidence, the citation is stripped, empty array with floor 0")
+      "no task: header: an event id nobody owns is cannot answer, exit 2, nothing written")
+# no event ids at all (nobody working): the empty array on a zero floor is the answer
+NO_EVENTS = f"id: t\ntask: go\n\nnote: {ALICE} and {BOB} posted nothing today.\n"
+rc, so, se, written = run(NO_EVENTS, [], out=True)
+check(rc == 0 and json.loads(written) == [] and se == ""
+      and stats_line(so) == "rows=0 distinct_actors=0 actors=2 actors_with_events=0 min_rows=0",
+      "no event ids at all: [] on a zero floor, exit 0")
+rc, so, se, written = run(NO_EVENTS, [row(ALICE, [FAKE], [])], out=True)
+check(rc == 0 and json.loads(written) == [] and FAKE in se and "drop row[0]" in se,
+      "no event ids at all: a row citing a fabricated id is dropped, [] still the answer")
+# structured events present but none with a valid id: cannot answer as well
+rc, so, se, written = run("id: t\ntask: go\n\nEVIDENCE_JSON:\n"
+                          + json.dumps({"events": [{"actor_id": ALICE, "id": "not-an-event-id"}]}) + "\n",
+                          [], out=True)
+check(rc == 2 and written is None and "no event ownership resolvable" in se
+      and stats_line(so) == "rows=0 distinct_actors=0 actors=1 actors_with_events=0 min_rows=0",
+      "EVIDENCE_JSON with event records but no resolvable id: exit 2, nothing written")
+rc, so, se, written = run("id: t\ntask: go\n\nEVIDENCE_JSON:\n" + json.dumps({"events": []}) + "\n", [], out=True)
+check(rc == 0 and json.loads(written) == [] and "min_rows=0" in stats_line(so),
+      "EVIDENCE_JSON with an empty events list: [] on a zero floor, exit 0")
 
 # blocked_items carry evidence ids too: fabricated ones are stripped, an item
 # with no evidence left goes, and a blocked-only row still counts as a row.
@@ -390,12 +408,12 @@ rc, so, se, written = run(TWO_OWNERS.replace(ALICE, ALICE + "x"), [row(ALICE, [E
 check(rc == 1 and written is None and f"drop row[0]: actor_id {ALICE!r} not in task file" in se
       and stats_line(so) == "rows=1 distinct_actors=0 actors=1 actors_with_events=1 min_rows=1",
       "extended-actor: `ag2.spacex` in the evidence is not alice; her row drops, refused")
-# the reviewer's exact shape (single-actor control + prose-only bob): nobody owns
-# anything, so the floor is 0 and the answer is the empty array -- never alice's row
+# the reviewer's exact shape (single-actor control + prose-only bob): the file has
+# an event id that nobody resolvable owns -- cannot answer, never an empty publish
 rc, so, se, written = run(BLOCK_CONTROL.replace(ALICE, ALICE + "x"), [row(ALICE, [E_X], [])], out=True)
-check(rc == 0 and json.loads(written) == [] and f"drop row[0]: actor_id {ALICE!r} not in task file" in se
+check(rc == 2 and written is None and "cannot answer: no event ownership resolvable" in se
       and stats_line(so) == "rows=1 distinct_actors=0 actors=1 actors_with_events=0 min_rows=0",
-      "extended-actor on the single-actor control: row dropped, empty array, distinct_actors=0")
+      "extended-actor on the single-actor control: exit 2, nothing written")
 rc, so, se, written = run(TWO_OWNERS.replace(E_B1, E_B1 + "x"), [row(BOB2, [E_B1], [])], out=True)
 check(rc == 1 and written is None and f"strip row[0] {BOB2} working_event_ids: {E_B1!r} not in task file" in se
       and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=2 min_rows=1",

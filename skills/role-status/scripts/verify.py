@@ -14,7 +14,9 @@ Two checks, in order:
               blocked_items defaults to [].
   coverage    the file's actors that own at least one event set the floor:
               distinct verified actors < ceil(min_coverage * actors_with_events)
-              is refused.
+              is refused. A file that carries event ids none of which resolves
+              to an owner is "cannot answer" -- never an empty publish; only a
+              file with no event ids at all answers [] on a zero floor.
 
 Ids are whole tokens (`ag2space:@<name>:ag2.space`, `ag2space-message:$<id>`):
 an id counts only when no character of the id alphabet touches either end, so a
@@ -36,7 +38,7 @@ verified rows); with no --out the verified JSON array follows it.
 
 Exit 0: verified JSON written.  1: refused on coverage, nothing written.
 2: cannot answer (unreadable input, structured evidence unreadable/ambiguous,
-judgment is not a JSON array, --out unwritable).
+no event ownership resolvable, judgment is not a JSON array, --out unwritable).
 This script never writes into results/ and knows nothing about result markers.
 """
 import argparse
@@ -102,18 +104,20 @@ Ownership = Dict[str, Set[str]]
 
 class Evidence(NamedTuple):
     """actors: every id named in the evidence; ownership: actor -> ids it unambiguously
-    owns; ambiguous_ids: ids nobody may cite; ambiguous_actors: set the floor, own nothing."""
+    owns; ambiguous_ids: ids nobody may cite; ambiguous_actors: set the floor, own nothing;
+    has_events: the evidence carries at least one event record or id."""
     actors: Set[str]
     ownership: Ownership
     ambiguous_ids: Set[str]
     ambiguous_actors: Set[str]
+    has_events: bool
 
     def with_events(self) -> Set[str]:
         return {a for a, ids in self.ownership.items() if ids} | self.ambiguous_actors
 
 
-def resolve_claims(evidence: str, claims: Dict[str, Set[str]],
-                   ambiguous_ids: Set[str], ambiguous_actors: Set[str]) -> Evidence:
+def resolve_claims(evidence: str, claims: Dict[str, Set[str]], ambiguous_ids: Set[str],
+                   ambiguous_actors: Set[str], has_events: bool) -> Evidence:
     """An id with exactly one claimant is owned; with several it is ambiguous and
     every claimant still sets the floor. One rule for both evidence shapes."""
     owned: Ownership = {}
@@ -123,7 +127,7 @@ def resolve_claims(evidence: str, claims: Dict[str, Set[str]],
             ambiguous_actors.update(claimants)
         else:
             owned.setdefault(next(iter(claimants)), set()).add(eid)
-    return Evidence(set(ACTOR_RE.findall(evidence)), owned, ambiguous_ids, ambiguous_actors)
+    return Evidence(set(ACTOR_RE.findall(evidence)), owned, ambiguous_ids, ambiguous_actors, has_events)
 
 
 def owned_events_by_block(evidence: str) -> Evidence:
@@ -143,7 +147,8 @@ def owned_events_by_block(evidence: str) -> Evidence:
             continue
         for eid in events:
             claims.setdefault(eid, set()).add(next(iter(actors)))
-    return resolve_claims(evidence, claims, ambiguous_ids, ambiguous_actors)
+    return resolve_claims(evidence, claims, ambiguous_ids, ambiguous_actors,
+                          EVENT_RE.search(evidence) is not None)
 
 
 def count_actors(evidence: str) -> Evidence:
@@ -157,7 +162,7 @@ def count_actors(evidence: str) -> Evidence:
         if isinstance(actor, str) and isinstance(eid, str) \
                 and ACTOR_RE.fullmatch(actor) and EVENT_RE.fullmatch(eid):
             claims.setdefault(eid, set()).add(actor)
-    return resolve_claims(evidence, claims, set(), set())
+    return resolve_claims(evidence, claims, set(), set(), bool(events))
 
 
 def _owned_ids(values, known: Set[str], owned: Set[str], ambiguous: Set[str],
@@ -264,9 +269,14 @@ def verify(task_text: str, judgment: object, min_coverage: float = 0.5) -> Outco
         return ("rows=%d distinct_actors=%d actors=%d actors_with_events=%d min_rows=%d"
                 % (rows, distinct, len(ev.actors), len(with_events), min_rows))
 
+    rows = len(judgment) if isinstance(judgment, list) else 0
+    known_events = set(EVENT_RE.findall(task_text))
+    if not with_events and (ev.has_events or known_events):
+        return Outcome(EXIT_CANNOT, None, stats(rows, 0),
+                       "cannot answer: no event ownership resolvable")
     if not isinstance(judgment, list):
         return Outcome(EXIT_CANNOT, None, stats(0, 0), "cannot answer: judgment is not a JSON array")
-    verified = verify_rows(judgment, set(ACTOR_RE.findall(task_text)), set(EVENT_RE.findall(task_text)),
+    verified = verify_rows(judgment, set(ACTOR_RE.findall(task_text)), known_events,
                            ev.ownership, ev.ambiguous_ids)
     distinct = len({r["actor_id"] for r in verified})
     if distinct < min_rows:
