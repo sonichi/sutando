@@ -360,9 +360,16 @@ def _shell_words(text: str):
     its source text, so this returns the literal string `"unknown"`
     instead of a list in that case (round 20: `>"$EMPTY"` is exactly as
     fatal as `>""` once $EMPTY expands, and looks nothing like it
-    statically). `<<`/`<<-` heredocs are exempt from the empty-target rule
-    entirely -- an empty delimiter is ordinary, valid heredoc syntax, not
-    a failed open (round 20: `<<""` is not `<""`). `<(cmd)`/`>(cmd)`
+    statically) -- BUT only when the command so far is `set` (round 21:
+    `printf x >"$OUT"` isn't, and an uncertain redirect on any OTHER
+    command must not poison the caller's result before the command name
+    is even known). `<<`/`<<-` heredocs are exempt from the empty-target
+    rule entirely -- an empty DELIMITER WORD is ordinary, valid heredoc
+    syntax, not a failed open (round 20: `<<""` is not `<""`) -- but NO
+    delimiter word at all (round 21: `<<` at end of line) is still a
+    syntax error and returns None, the same "word started, not merely
+    non-empty" distinction round 18 needed for empty argv words.
+    `<(cmd)`/`>(cmd)`
     process substitution is not a redirect at all; its word is marked
     expandable rather than copied in literally, since the real `/dev/fd/N`
     text is unknowable and a literal copy can smuggle an option-shaped
@@ -449,7 +456,7 @@ def _shell_words(text: str):
                 i += 1  # `<<-` strips leading tabs from the body; irrelevant to the delimiter itself
             while i < n and text[i] in " \t":
                 i += 1
-            target, target_expandable = [], False
+            target, target_expandable, target_start = [], False, i
             while i < n and text[i] not in " \t\n":  # consume the target, quote-aware
                 if text[i] == "'":
                     i += 1
@@ -473,10 +480,14 @@ def _shell_words(text: str):
                         target_expandable = True
                     target.append(text[i]); i += 1
             if is_heredoc:
-                pass  # any delimiter, including empty, is valid heredoc syntax (round 20)
+                if i == target_start:
+                    # NO delimiter word at all (not `<<""`) is a syntax error (see docstring).
+                    return None
+                # else: any delimiter WORD, including an empty one, is valid heredoc syntax (round 20)
             elif target_expandable:
-                # The target's RUNTIME value decides success, not its source text (see docstring).
-                return "unknown"
+                # Only `set` can change pipefail -- gate on the command name (see docstring).
+                if words and words[0][0] == "set":
+                    return "unknown"
             elif not target:
                 # An empty redirect target aborts the WHOLE command before
                 # it runs (see docstring) -- so does this function.

@@ -545,6 +545,30 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_a_delimiter_less_heredoc_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 21: `<<` with no delimiter word at all is a
+        Bash syntax error, distinct from the valid `<<""`."""
+        wf = ("steps:\n  - run: |\n"
+              "      set -o pipefail\n"
+              "      set +o pipefail <<\n"
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+    def test_non_set_expandable_redirect_does_not_false_orphan_through_the_consumer_path(self):
+        """keweichen round 21: an uncertain redirect on a non-`set`
+        command must not poison the pipefail model."""
+        wf = ("steps:\n  - run: |\n"
+              "      OUT=/dev/null\n"
+              "      set +o pipefail\n"
+              '      printf x >"$OUT"\n'
+              "      false | true && python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), {"packages/x/test_dead.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

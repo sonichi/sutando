@@ -766,6 +766,34 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 'set +o >"$EMPTY" pipefail\n'
                 "false | true && python3 packages/x/dead.py"), [])
 
+    def test_a_heredoc_with_no_delimiter_word_at_all_is_a_syntax_error(self):
+        """`set +o pipefail <<` with nothing after the operator: Bash
+        reports a syntax error and never runs anything -- confirmed by
+        direct execution (rc=2). Distinct from `<<""` (a delimiter word
+        IS present, just empty, and is valid) -- this line has NO
+        delimiter word at all, so it never executes and pipefail
+        (already on) stays on, dead.py never runs."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set +o pipefail <<\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_an_expandable_redirect_on_a_non_set_command_does_not_poison_pipefail(self):
+        """`printf x >"$OUT"`: only `set` can change pipefail -- confirmed
+        by direct execution: printf's own redirect uncertainty is
+        irrelevant, pipefail (already off) stays off, dead.py runs.
+        Returning "unknown" before checking the command name would wrongly
+        treat every command with an uncertain redirect as pipefail-
+        relevant, not just `set`."""
+        self.assertEqual(
+            program_python_args(
+                "OUT=/dev/null\n"
+                "set +o pipefail\n"
+                'printf x >"$OUT"\n'
+                "false | true && python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
