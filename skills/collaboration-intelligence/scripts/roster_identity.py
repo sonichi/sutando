@@ -181,12 +181,14 @@ def canonical_shape_failure(rec) -> "dict | None":
            "reason": reason}
     if path is not None:
         out.update(path_fields(path_split(path)))
-    ids = _snowflake_list(rec.get("arbitrated_ids"))
+    has_ids_key = "arbitrated_ids" in rec
+    raw_ids = rec.get("arbitrated_ids")
+    ids = _snowflake_list(raw_ids)
     if ids:
         out["arbitrated_ids"] = sorted(set(ids))
-    elif rec.get("arbitrated_ids"):
-        # Present but unusable: a refusal whose ids cannot be read is still a
-        # refusal (schema), so it blocks rather than degrading to a diagnostic.
+    elif has_ids_key and raw_ids != []:
+        # Present-but-unusable ("", null, {}, 0, false) blocks; only a
+        # missing key or a valid [] degrades to no-identity-fact.
         out["kind"] = INVALID_KIND
     st = rec.get("arbitrated_states")
     st = [st] if isinstance(st, str) else st

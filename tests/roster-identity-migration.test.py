@@ -1344,6 +1344,21 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [HUMAN], err)
         self.assertEqual(rc, 5, err)
 
+    def test_a_falsey_but_present_arbitrated_ids_is_invalid_not_absent(self):
+        # A present-but-unusable value must block like a malformed one, not
+        # vanish like a missing key (keweichen, #3537, 2026-09-17T03:26:52Z).
+        base = {"path": "p", "kind": "str", "reason": "r"}
+        for falsey in ("", None, {}, 0, False):
+            rec = dict(base, arbitrated_ids=falsey)
+            out = ri.canonical_shape_failure(rec)
+            self.assertEqual(out["kind"], ri.INVALID_KIND,
+                              f"arbitrated_ids={falsey!r} must block, not vanish")
+        # Controls: missing key / valid [] stay the ordinary no-fact shape.
+        missing = ri.canonical_shape_failure(dict(base))
+        self.assertNotEqual(missing["kind"], ri.INVALID_KIND)
+        empty_list = ri.canonical_shape_failure(dict(base, arbitrated_ids=[]))
+        self.assertNotEqual(empty_list["kind"], ri.INVALID_KIND)
+
     def test_a_non_dict_carried_record_does_not_crash_the_run(self):
         # Corrupt carried state is not evidence that no refusal existed, so
         # rc 0 is wrong here however the malformed container degrades.
