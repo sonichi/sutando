@@ -56,7 +56,7 @@ def discover(repo_dir: Path) -> list[tuple[str, str, str, str]]:
             prior = f"{runner} {q}"
             # skills/<name>/<relative-command>, not the bare basename -- a
             # basename alone lets an unrelated command sharing that filename match.
-            rel = target.relative_to(manifest.parent.resolve())
+            rel = target.relative_to(manifest.parent.resolve()).as_posix()
             marker = f"skills/{manifest.parent.name}/{rel}"
             out.append((event, marker, f"[ -f {q} ] || exit 0; exec {prior}", prior))
     return out
