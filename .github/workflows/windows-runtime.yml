@@ -204,6 +204,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'health-check-memory-dir-override.test.py failed' }
           python tests/core-heartbeat.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'core-heartbeat.test.py failed' }
+          python tests/core-lineage-concurrent-writers.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'core-lineage-concurrent-writers.test.py failed' }
           python tests/cli-wedge.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'cli-wedge.test.py failed' }
           python tests/cli-wedge-health-probe.test.py

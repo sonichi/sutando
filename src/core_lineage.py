@@ -17,7 +17,6 @@ fabricated id would later resume the wrong conversation.
 """
 from __future__ import annotations
 
-import fcntl
 import contextlib
 import json
 import os
@@ -26,6 +25,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
+from file_lock import lock_fd, unlock_fd
 
 __all__ = ["lineage_dir", "sessions", "runs", "current", "record_run",
            "transcript_path_for"]
@@ -79,7 +80,7 @@ def _appending(path: Path):
         deadline = time.monotonic() + _LOCK_WAIT_S
         while True:
             try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_fd(fh.fileno(), blocking=False)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -88,7 +89,7 @@ def _appending(path: Path):
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            unlock_fd(fh.fileno())
 
 
 def sessions(workspace, host: str) -> list:
