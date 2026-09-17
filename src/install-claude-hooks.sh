@@ -174,7 +174,8 @@ fi
 # Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
 # `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
 HOOK_PRIOR=()
-for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
+HOOK_IS_SKILL=()
+for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); HOOK_IS_SKILL+=("0"); done
 
 # Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
 # NUL-framed (-d '') because two of the four fields embed the repo path.
@@ -183,6 +184,7 @@ while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
   [ -n "${_ev:-}" ] || continue
   HOOKS+=("$_ev|$_tok|$_cmd")
   HOOK_PRIOR+=("$_prior")
+  HOOK_IS_SKILL+=("1")
 done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
 
 # Deprecated hooks to uninstall on re-run. Each line: "<event>|<mode>|<pattern>".
@@ -278,12 +280,8 @@ tokenize_argv() {
   return 0
 }
 
-# Ownership test for HOOKS[$1]: sets EVENT/MARKER/CMD/CMD_WORD/CMD_TAIL/
-# HOOK_PRIOR_CUR, returns 1 when the entry embeds no repo path (nothing safe
-# to shape-match against — see Phase 0's comment on this exact tradeoff).
-# ONE owner for this test: Phase 0 and Phase 3 both migrate hooks WE wrote,
-# and a second hand-rolled copy is exactly how Phase 3 shipped the
-# bare-substring bug this function replaces.
+# Ownership test for HOOKS[$1]; returns 1 when the entry embeds no repo path
+# to shape-match against. Single owner: Phase 0 and Phase 3 both use this.
 owned_hook_shape() {
   local i="$1" entry rest
   entry="${HOOKS[$i]}"
@@ -300,6 +298,7 @@ owned_hook_shape() {
   CMD_TAIL="${CMD#*"$MARKER"}"
   CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
   HOOK_PRIOR_CUR="${HOOK_PRIOR[$i]:-}"
+  HOOK_IS_SKILL_CUR="${HOOK_IS_SKILL[$i]:-0}"
   return 0
 }
 
@@ -313,10 +312,10 @@ _is_installer_path_shape() {
 }
 
 # Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard exactly
-# (Q identical in both slots, RUNNER one of the two it emits) and prints the
+# (Q identical in both slots; RUNNER must equal $2 when given) and prints the
 # unquoted, un-tokenized Q. Anything else — including a near-miss — is rc 1.
 _skill_hook_guard_path() {
-  local cand="$1" mid=' ] || exit 0; exec '
+  local cand="$1" want_runner="${2:-}" mid=' ] || exit 0; exec '
   case "$cand" in '[ -f '*"$mid"*) ;; *) return 1 ;; esac
   local rest="${cand#'[ -f '}" guard tail runner exec_arg
   guard="${rest%%"$mid"*}"
@@ -324,6 +323,7 @@ _skill_hook_guard_path() {
   runner="${tail%% *}"
   exec_arg="${tail#* }"
   case "$runner" in bash|python3) ;; *) return 1 ;; esac
+  [ -z "$want_runner" ] || [ "$runner" = "$want_runner" ] || return 1
   [ "$guard" = "$exec_arg" ] || return 1
   tokenize_argv "$guard" || return 1
   [ "$TOKENIZE_HAS_OPERATOR" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -eq 1 ] || return 1
@@ -343,12 +343,11 @@ candidate_is_owned() {
   if [ -n "$HOOK_PRIOR_CUR" ] && [ "$cand" = "$HOOK_PRIOR_CUR" ]; then
     return 0
   fi
-  # src/skill_hooks.py's guard shape (`[ -f Q ] || exit 0; exec RUNNER Q`) is
-  # legitimately ours despite its unquoted `||`/`;`, and its CMD_WORD is "["
-  # — not a repo path — so the argv[1]-marker logic below can't judge it.
-  # Recognize the complete shape here and decide from the guarded path alone.
+  # Only a skill-declared entry may wear this guard shape (its CMD_WORD is
+  # "[", not a repo path, so the argv[1] logic below can't judge a built-in).
   local guard_path
-  if guard_path="$(_skill_hook_guard_path "$cand")"; then
+  if [ "$HOOK_IS_SKILL_CUR" = "1" ] \
+     && guard_path="$(_skill_hook_guard_path "$cand" "${HOOK_PRIOR_CUR%% *}")"; then
     case "$guard_path" in
       *"$MARKER"*) _is_installer_path_shape "$guard_path" && return 0 ;;
     esac
@@ -369,14 +368,8 @@ candidate_is_owned() {
     case "${TOKENIZE_RESULT[1]}" in
       *"$MARKER"*) _is_installer_path_shape "${TOKENIZE_RESULT[1]}" || return 1 ;;  # bucket: clean argv[1] match
       *)                                                  # bucket B
-        # Collapse doubled slashes before comparing: mktemp -d can hand back
-        # a path containing "//", and this clone's OWN resolved $REPO_DIR
-        # (via `cd ... && pwd`) always normalizes that away — a candidate
-        # built from the raw (un-normalized) path is still ours, just
-        # spelled with an extra slash. (`${v//\/\//\/}` looks right but
-        # isn't: bash does not unescape `\/` on the REPLACEMENT side of
-        # `${var//pat/rep}`, only in the pattern, so that form inserts a
-        # literal backslash — route the "/" through a plain variable.)
+        # Collapse doubled slashes (mktemp -d can produce them; REPO_DIR is
+        # normalized) via a plain variable -- `${v//\/\//\/}` doesn't unescape on its replacement side.
         local _sl=/
         case "${after//${_sl}${_sl}/${_sl}}" in "${REPO_DIR_TEXT//${_sl}${_sl}/${_sl}}"*) ;; *) return 1 ;; esac ;;
     esac
@@ -397,13 +390,8 @@ candidate_is_owned() {
   return 0
 }
 
-# Remove, from $1's .hooks[$2], every hook whose .command EXACTLY matches one
-# of the strings in the caller's TO_REMOVE array (populated via
-# candidate_is_owned()). No wildcard at the removal step either — the
-# ownership DECISION already happened in bash against real argv boundaries;
-# jq -R/-s builds the removal set as properly-escaped JSON strings, so an
-# arbitrary command (quotes, backslashes, anything) is compared as literal
-# data, never as a pattern.
+# Remove, from $1's .hooks[$2], every hook whose .command EXACTLY matches a
+# TO_REMOVE entry -- jq builds the set as escaped JSON strings, never a pattern.
 remove_exact_commands() {
   local settings_file="$1" event="$2" remove_json
   [ "${#TO_REMOVE[@]}" -gt 0 ] || return 0
