@@ -59,6 +59,7 @@ rc=$(TMUX_PANE_TEXT_AFTER='› hello\n' run probe hello --socket "$T/s.sock" --r
 # --- TOCTOU: the pane can change during Codex's 250ms delay before Enter (keweichen, 03:13Z) ---
 rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m \033[2mAsk Codex to do anything\033[0m\n' TMUX_PANE_TEXT_AFTER='  Select Model and Effort\n› 4. gpt-5.5 (current)\n' run probe hello --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 5 ] && grep -q "pane changed during the paste-burst delay" "$T/err" && ! grep -q "send-keys -t probe Enter" "$TMUX_LOG" && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "C12 codex: a picker appearing during the delay withholds Enter (composer no longer shows the staged line)" || fail "C12" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m \033[2mAsk Codex to do anything\033[0m\n' TMUX_PANE_TEXT_AFTER='› hello\n' run probe hello --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "C13 codex CONTROL: composer still shows the staged line after the delay — Enter proceeds" || fail "C13" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m \033[2mAsk Codex to do anything\033[0m\n' TMUX_PANE_TEXT_AFTER='› hello\nLogin successful. Press Enter to continue…\n' run probe hello --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ! grep -q "send-keys -t probe Enter" "$TMUX_LOG" && ok "C14 codex: a stale matching prompt line with a NEW gate below it still withholds Enter (keweichen/qingyun-wu, 04:40-04:44Z)" || fail "C14" "rc=$rc $(cat "$T/err")"
 rc=$(run probe hello --socket "$T/s.sock"); SEQ="$(seq)"
 [ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|send-keys -t probe Enter|" ] && ok "C8 claude (default): no sleep between the literal line and Enter (the no-delay control)" || fail "C8 claude no delay" "rc=$rc seq=$SEQ"
 rm -f "$T/bin/sleep"
@@ -109,6 +110,12 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
   tmux -S "$SOCKW" new-session -d -s probe 'printf "\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m"; sleep 0.3; printf "\r\033[2K  Select Model and Effort\r\n\xe2\x80\xba 4. gpt-5.5 (current)"; sleep 30'; sleep 0.05
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
   [ "$rc" = 5 ] && grep -q "pane changed during the paste-burst delay" "$T/err" && ok "R8 real tmux + real timing: a picker appearing mid-delay withholds Enter (the live 03:13Z finding)" || fail "R8 real TOCTOU" "rc=$rc $(cat "$T/err")"
+  tmux -S "$SOCKW" kill-server 2>/dev/null
+  # Real tmux, real timing: the composer keeps showing the SAME typed line (stale, matching
+  # the staged payload) but a gate appears BELOW it 300ms in -- must still withhold Enter.
+  tmux -S "$SOCKW" new-session -d -s probe 'printf "\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m"; sleep 0.3; printf "\r\033[2K\xe2\x80\xba hello\r\nLogin successful. Press Enter to continueâ¦"; sleep 30'; sleep 0.05
+  rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
+  [ "$rc" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ok "R9 real tmux: a stale matching prompt with a NEW gate below it withholds Enter (keweichen/qingyun-wu live repro)" || fail "R9 real stale-gate" "rc=$rc $(cat "$T/err")"
   tmux -S "$SOCKW" kill-server 2>/dev/null
 else
   echo "  skip real-tmux leg: no real tmux on this host"

@@ -30,9 +30,12 @@ exec 9>"$LOCK"
 # read with -e and any styled run after the glyph is dropped before deciding "pending".
 # A failed capture or parse is UNKNOWN, never "empty": refuse rather than send.
 # One capture+parse, reused for the initial read and Codex's post-delay recheck below.
+_capture() {
+  "$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null
+}
+# The parsed text at the current prompt line (as before), from an ALREADY-captured pane.
 _pending() {
-  local cap; cap="$("$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null)" || return 7
-  printf '%s\n' "$cap" | "$PY" -c 'import sys,re
+  printf '%s\n' "$1" | "$PY" -c 'import sys,re
 rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
 SGR=re.compile(r"\x1b\[[0-9;]*m")
 # dim (2) or a grey 256-colour foreground (38;5;2xx), up to the reset/normal-intensity
@@ -48,8 +51,23 @@ for l in sys.stdin.read().splitlines():
     last=r.rstrip()
 print(last)' "$RUNTIME"
 }
-PENDING="$(_pending)"; RC=$?
-[ $RC -eq 0 ] || { echo "tmux-send-line: capture or prompt parse failed — not sending" >&2; exit 7; }
+# Everything BELOW the current prompt line, stripped of colour -- a fingerprint of what the
+# rest of the pane shows. A stale prompt line matching the staged payload proves nothing if
+# a gate/dialog has appeared beneath it; unchanged AFTER content is what proves it is live.
+_after() {
+  printf '%s\n' "$1" | "$PY" -c 'import sys,re
+rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
+SGR=re.compile(r"\x1b\[[0-9;]*m")
+lines=sys.stdin.read().splitlines()
+last_i=-1
+for i,l in enumerate(lines):
+    if SGR.sub("",l).lstrip(" \t").startswith(glyph): last_i=i
+print("\n".join(SGR.sub("",x).strip() for x in lines[last_i+1:]) if last_i>=0 else "")' "$RUNTIME"
+}
+CAP="$(_capture)"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: capture failed — prompt unknown, not sending" >&2; exit 7; }
+PENDING="$(_pending "$CAP")"
+AFTER_BASELINE="$(_after "$CAP")"
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
@@ -60,9 +78,14 @@ if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carr
 # can appear in the pane during Codex's delay. Re-read and only Enter if the composer
 # still shows exactly the payload THIS invocation staged; otherwise abort without Enter.
 if [ "$RUNTIME" = codex ]; then
-  RECHECK="$(_pending)"; RC=$?
-  [ $RC -eq 0 ] || { echo "tmux-send-line: capture or prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
+  RECAP="$(_capture)"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: capture failed during the delay — Enter withheld" >&2; exit 7; }
+  RECHECK="$(_pending "$RECAP")"
   if [ "$RECHECK" != "$LINE" ]; then echo "tmux-send-line: pane changed during the paste-burst delay (composer now '${RECHECK:0:60}', expected '$LINE') — Enter withheld" >&2; exit 5; fi
+  # A matching prompt LINE is not proof the composer is still live: it can be a stale line
+  # from before a gate/dialog appeared beneath it. Nothing may have changed below it either.
+  AFTER_NOW="$(_after "$RECAP")"
+  if [ "$AFTER_NOW" != "$AFTER_BASELINE" ]; then echo "tmux-send-line: pane state changed below the prompt during the delay (was '${AFTER_BASELINE:0:60}', now '${AFTER_NOW:0:60}') — Enter withheld" >&2; exit 5; fi
 fi
 "$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
 echo "sent '$LINE' to $SESSION"
