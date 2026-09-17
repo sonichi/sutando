@@ -254,5 +254,36 @@ check "own-host deletion preserves peer state" \
         refs/heads/host/local-host/guard1:hosts/peer-host/state.json
 
 echo
+echo "Test 6: PULL-only path never commits a foreign-host deletion either"
+# Every test above drives --push-only; _refuse_foreign_host_deletions only
+# inspects the STAGED diff, and _commit_local_pre_pull (--pull-only's own
+# pre-fetch commit) can COMMIT the untrack before that guard ever runs --
+# by push time the deletion is already in HEAD, so nothing is left staged
+# to catch (#4309 round 11, keweichen).
+setup_fixture "pull-guard"
+printf '%s\n' '!my/operator/rule' \
+    >> "$FIXTURE_WS/.git/info/exclude"
+set +e
+out="$(
+    env "${SYNC_ENV[@]}" bash "$SYNC" \
+        --vault-url "$FIXTURE_VAULT" --pull-only 2>&1
+)"
+rc=$?
+set -e
+check "pull-only itself still succeeds (nothing to fetch/merge)" test "$rc" -eq 0
+check "THE POINT: peer file is still tracked after the pre-pull commit" \
+    git -C "$FIXTURE_WS" ls-files --error-unmatch \
+        hosts/peer-host/state.json
+del_commits="$(git -C "$FIXTURE_WS" log --all --diff-filter=D --name-only \
+    --format='' -- hosts/peer-host/state.json)"
+if [ -z "$del_commits" ]; then
+    echo "OK: THE POINT: no commit on this branch ever removed the peer file"
+    pass=$((pass + 1))
+else
+    echo "FAIL: THE POINT: no commit on this branch ever removed the peer file"
+    fail=$((fail + 1))
+fi
+
+echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
 exit "$fail"

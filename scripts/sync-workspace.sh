@@ -533,10 +533,8 @@ _hard_deny_lines() {
     echo "*.ppk"
     echo "*.keystore"
     echo "*.jks"
-    # Claude Code transcript archive: the PreCompact archiver writes full
-    # conversation JSONL under logs/conversations/ — the default carrier set
-    # never names it, but nothing stopped a broadened vault.sync.include
-    # (e.g. "logs/") from carrying it.
+    # The PreCompact archiver writes full transcripts under logs/conversations/;
+    # a broadened vault.sync.include (e.g. "logs/") could otherwise carry them.
     echo "logs/conversations/"
     echo "logs/conversations/**"
 }
@@ -823,32 +821,61 @@ _refuse_staged_secrets() {
 # peer's durable state. In-place foreign-file modifications are outside this
 # guard's #2391 deletion scope. The existing explicit force switch remains the
 # operator escape hatch for intentional recovery.
+_is_foreign_host_path() {  # $1 = repo-relative path; true iff under another host's hosts/<label>/ subtree
+    local path="$1" relative path_host own_host
+    own_host="$(_host)"
+    case "$path" in
+        hosts/*/*)
+            relative="${path#hosts/}"
+            path_host="${relative%%/*}"
+            [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 _refuse_foreign_host_deletions() {
     [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
 
-    local own_host foreign_hits=0 path relative path_host first_path=""
-    own_host="$(_host)"
+    local foreign_hits=0 path first_path=""
     while IFS= read -r -d '' path; do
-        case "$path" in
-            hosts/*/*)
-                relative="${path#hosts/}"
-                path_host="${relative%%/*}"
-                if [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]; then
-                    foreign_hits=$((foreign_hits + 1))
-                    [ -z "$first_path" ] && first_path="$path"
-                fi
-                ;;
-        esac
+        if _is_foreign_host_path "$path"; then
+            foreign_hits=$((foreign_hits + 1))
+            [ -z "$first_path" ] && first_path="$path"
+        fi
     done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
 
     if [ "$foreign_hits" -eq 0 ]; then
         return 0
     fi
 
-    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$own_host"
-    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$own_host' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
+    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$(_host)"
+    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$(_host)' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
     git reset -q
     return 1
+}
+
+# Pre-pull half of the same policy (#4309 round 11, keweichen): carrier-set
+# enforcement untracks any newly-excluded path with no notion of whose
+# subtree it's in, and _commit_local_pre_pull COMMITS that untrack directly
+# -- _refuse_foreign_host_deletions only inspects the STAGED diff, and by
+# push time the deletion is already in HEAD, so nothing is left staged to
+# refuse. Unstage (not abort) each foreign-host hit here: a local pre-pull
+# commit should never remove a peer's subtree, but the caller's own
+# legitimate edits alongside it still deserve to land.
+_unstage_foreign_host_deletions_pre_pull() {
+    [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
+    local path hits=0
+    while IFS= read -r -d '' path; do
+        if _is_foreign_host_path "$path"; then
+            git reset -q HEAD -- "$path" 2>/dev/null || true
+            hits=$((hits + 1))
+        fi
+    done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
+    if [ "$hits" -gt 0 ]; then
+        log "_unstage_foreign_host_deletions_pre_pull: kept $hits foreign host file(s) tracked (carrier-set enforcement tried to untrack them)"
+        echo "sync-workspace: kept $hits foreign host file(s) tracked before commit -- only their own host may remove them from hosts/<label>/" >&2
+    fi
 }
 
 # Snapshot the per-host config from the canonical Claude config dir into
@@ -1282,6 +1309,7 @@ _migrate_flat_anchor() {
 _commit_local_pre_pull() {
     _enforce_carrier_set_pre 2>/dev/null || true
     git add --ignore-removal . 2>/dev/null || true
+    _unstage_foreign_host_deletions_pre_pull 2>/dev/null || true
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
             && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"
