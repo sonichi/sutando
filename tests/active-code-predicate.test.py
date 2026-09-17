@@ -720,6 +720,52 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "false | true && python3 packages/x/dead.py"),
             ["packages/x/dead.py"])
 
+    def test_an_empty_heredoc_delimiter_is_valid_not_a_failed_redirect(self):
+        """`set -o <<"" pipefail`: an empty here-doc delimiter is ordinary,
+        valid Bash syntax (it just matches the very next blank line) --
+        NOT a failed empty-filename redirect, so the `-o pipefail` on the
+        SAME line still takes effect. Confirmed by direct execution:
+        pipefail (starting off) turns on, dead.py never runs. Starting
+        from off (not on) makes this discriminating -- treating `<<` like
+        a failed `<`/`>` returns "unchanged" (None), which off-by-luck
+        matches "on" only when the prior state already happened to be on."""
+        self.assertEqual(
+            program_python_args(
+                "set +o pipefail\n"
+                'set -o <<"" pipefail\n'
+                "\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_process_substitution_glued_to_a_flag_cluster_is_unknown(self):
+        """`set +u<(echo o) pipefail`: Bash expands this to `+u/dev/fd/N`,
+        rejects the `/` as an invalid option and aborts, retaining
+        pipefail -- confirmed by direct execution: dead.py never runs.
+        Copying the substitution's literal text (`echo o`) into the word
+        used to leak an `o` into the cluster scan, wrongly matching a
+        real `+o` and crediting dead.py from the `pipefail` word after
+        it -- the standalone case above (no glued prefix) is unaffected
+        and still correctly aborts as an unrecognized literal name."""
+        self.assertEqual(
+            program_python_args(
+                "set -o pipefail\n"
+                "set +u<(echo o) pipefail\n"
+                "false | true && python3 packages/x/dead.py"), [])
+
+    def test_a_redirect_target_behind_a_variable_is_unknown_not_assumed_nonempty(self):
+        """`set +o >"$EMPTY" pipefail` with EMPTY unset: the target's
+        RUNTIME value decides whether the redirect succeeds, not its
+        source text -- confirmed by direct execution: Bash rejects the
+        expanded-empty filename exactly like a literal `>""` would,
+        pipefail (already on) stays on, dead.py never runs. A target
+        carrying `$`/backtick can't be judged empty-or-not from its
+        source characters alone."""
+        self.assertEqual(
+            program_python_args(
+                "EMPTY=\n"
+                "set -o pipefail\n"
+                'set +o >"$EMPTY" pipefail\n'
+                "false | true && python3 packages/x/dead.py"), [])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to

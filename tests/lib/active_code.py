@@ -353,11 +353,21 @@ def _shell_words(text: str):
     fd prefix, also consumed, while any other preceding text is a real word
     and gets flushed first (round 19: an escaped/quoted digit is a real
     argv word instead, since it can never be part of a live fd number). A
-    target that resolves to the empty string aborts the WHOLE command
-    before it runs at all -- this function returns None, not a word list
-    with a gap in it (round 19: `set +o >"" pipefail` never reaches `set`).
-    `<(cmd)`/`>(cmd)` process substitution is not a redirect at all and is
-    left as a literal argv word (round 19).
+    STATICALLY (source-text) empty target aborts the WHOLE command before
+    it runs at all -- this function returns None, not a word list with a
+    gap in it (round 19: `set +o >"" pipefail` never reaches `set`) -- but
+    a target carrying `$`/backtick decides success at RUNTIME, not from
+    its source text, so this returns the literal string `"unknown"`
+    instead of a list in that case (round 20: `>"$EMPTY"` is exactly as
+    fatal as `>""` once $EMPTY expands, and looks nothing like it
+    statically). `<<`/`<<-` heredocs are exempt from the empty-target rule
+    entirely -- an empty delimiter is ordinary, valid heredoc syntax, not
+    a failed open (round 20: `<<""` is not `<""`). `<(cmd)`/`>(cmd)`
+    process substitution is not a redirect at all; its word is marked
+    expandable rather than copied in literally, since the real `/dev/fd/N`
+    text is unknowable and a literal copy can smuggle an option-shaped
+    character (`o`) into a cluster scan that never should have seen it
+    (round 20: `<(echo o)`'s inner `o` was mistaken for a real `+o`).
 
     Brace expansion runs per accumulated word at flush time, tracked via a
     per-character quoted mask (round 18, `_split_unquoted_braces`) -- a
@@ -400,8 +410,10 @@ def _shell_words(text: str):
         elif ch in " \t\n":
             flush(); i += 1
         elif ch in "<>" and i + 1 < n and text[i + 1] == "(":
-            # Process substitution, not a redirect (see docstring) -- copy the
-            # paren-balanced, quote-aware span in as literal text.
+            # Process substitution (see docstring) -- glued to prior flag
+            # text in the same word, mark expandable; standing alone stays literal (safe as-is).
+            if val:
+                expandable = True
             start = i; i += 2; depth = 1; pq = None
             while i < n and depth > 0:
                 c2 = text[i]
@@ -417,7 +429,7 @@ def _shell_words(text: str):
                 elif c2 == ")":
                     depth -= 1
                 i += 1
-            val.extend(text[start:i]); qmask.extend([False] * (i - start))
+            val.extend(text[start:i]); qmask.extend([True] * (i - start))
         elif ch in "<>":
             # An fd prefix must be BARE -- an escaped/quoted digit is a real
             # argv word instead (see docstring).
@@ -428,11 +440,16 @@ def _shell_words(text: str):
             else:
                 val, qmask = [], []  # bare fd-prefix digits (or nothing) -- part of the redirect
             i += 1
-            if i < n and text[i] in (ch, "&"):
+            is_heredoc = False
+            if i < n and text[i] == ch:
+                is_heredoc = ch == "<"; i += 1
+            elif i < n and text[i] == "&":
                 i += 1
+            if is_heredoc and i < n and text[i] == "-":
+                i += 1  # `<<-` strips leading tabs from the body; irrelevant to the delimiter itself
             while i < n and text[i] in " \t":
                 i += 1
-            target = []
+            target, target_expandable = [], False
             while i < n and text[i] not in " \t\n":  # consume the target, quote-aware
                 if text[i] == "'":
                     i += 1
@@ -445,13 +462,22 @@ def _shell_words(text: str):
                         if text[i] == "\\" and i + 1 < n:
                             target.append(text[i + 1]); i += 2
                         else:
+                            if text[i] in "$`":
+                                target_expandable = True
                             target.append(text[i]); i += 1
                     i += 1
                 elif text[i] == "\\" and i + 1 < n:
                     target.append(text[i + 1]); i += 2
                 else:
+                    if text[i] in "$`":
+                        target_expandable = True
                     target.append(text[i]); i += 1
-            if not target:
+            if is_heredoc:
+                pass  # any delimiter, including empty, is valid heredoc syntax (round 20)
+            elif target_expandable:
+                # The target's RUNTIME value decides success, not its source text (see docstring).
+                return "unknown"
+            elif not target:
                 # An empty redirect target aborts the WHOLE command before
                 # it runs (see docstring) -- so does this function.
                 return None
@@ -512,8 +538,16 @@ def _sets_pipefail(text: str) -> "bool | str | None":
     `set`'s own option scanning like any bare positional, so pipefail
     stays ON here, not off). An empty word (`set "" +o pipefail`) is a
     real positional argument too, not the absence of one -- it ends
-    scanning exactly like a non-empty one would (round 18)."""
+    scanning exactly like a non-empty one would (round 18). A redirect
+    whose TARGET's runtime value (not its source text) decides success
+    -- one carrying `$`/backtick -- makes the whole line's effect on
+    pipefail unknowable too, and `_shell_words()` signals that by
+    returning the literal string `"unknown"` rather than a word list
+    (round 20: `>"$EMPTY"` looks non-empty lexically and is empty at
+    runtime, same failure as a literal `>""`, just not visible here)."""
     words = _shell_words(text)
+    if words == "unknown":
+        return "unknown"
     if not words or words[0][0] != "set":
         return None
     result, i = None, 1
