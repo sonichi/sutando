@@ -177,7 +177,7 @@ lab13=$(mktemp -d)
 touch "$lab13/git"
 bash -c "
   . '$REPO/scripts/git-binary.sh'
-  _sutando_git_stat_state() { [ \"\$1\" = /usr/bin/git ] && return 2; return 0; }
+  _sutando_git_stat_id() { [ \"\$1\" = /usr/bin/git ] && return 2; return 0; }
   _sutando_git_is_system_stub '$lab13/git'
 "
 rc13=$?
@@ -187,11 +187,58 @@ check "a reference-side non-absence failure must not clear the candidate as veri
 # "not the stub" -- proves the mock and the branching both discriminate.
 bash -c "
   . '$REPO/scripts/git-binary.sh'
-  _sutando_git_stat_state() { [ \"\$1\" = /usr/bin/git ] && return 1; return 0; }
+  _sutando_git_stat_id() { [ \"\$1\" = /usr/bin/git ] && return 1; return 0; }
   _sutando_git_is_system_stub '$lab13/git'
 "
 rc13b=$?
 check "...while a genuinely absent reference still resolves to not-the-stub" "$rc13b" "1"
+
+# --- 14. the final compare must use values already captured, not a fresh
+# stat -- turning unknown right after the reference checked out must refuse.
+lab14=$(mktemp -d)
+touch "$lab14/git"
+bash -c "
+  . '$REPO/scripts/git-binary.sh'
+  _calls=0
+  _sutando_git_stat_id() {
+    if [ \"\$1\" = /usr/bin/git ]; then echo '1 1'; return 0; fi
+    _calls=\$((_calls + 1))
+    # First call is the candidate's OWN preflight (must succeed to reach
+    # this far); second is the post-reference recheck on \$_resolved.
+    if [ \"\$_calls\" -eq 1 ]; then echo '2 2'; return 0; fi
+    return 2
+  }
+  _sutando_git_is_system_stub '$lab14/git'
+"
+rc14=$?
+check "a late resolved-candidate stat failure still refuses, not a stale bare compare" "$rc14" "0"
+
+# --- 15. structural pin: the classifier must never fall back to a bare
+# `-ef` -- that reintroduces exactly the collapsed unknown-vs-distinct bug.
+if grep -q -- '-ef' scripts/git-binary.sh; then
+  bad "the classifier must not use -ef anywhere" "found -ef in scripts/git-binary.sh"
+else
+  ok "the classifier compares captured dev+ino values, never a fresh -ef"
+fi
+
+# --- 16. the platform-to-flag mapping is a PURE function, real per spelling
+# -- pinned directly (no need to fake the kernel to exercise the branch).
+flag_darwin=$(bash -c ". '$REPO/scripts/git-binary.sh'; _sutando_git_stat_flag Darwin")
+check "Darwin maps to BSD stat's -f" "$flag_darwin" "-f"
+flag_linux=$(bash -c ". '$REPO/scripts/git-binary.sh'; _sutando_git_stat_flag Linux")
+check "any non-Darwin (e.g. Linux, as real CI hardware reports) maps to GNU stat's -c" "$flag_linux" "-c"
+
+# --- 17. end to end, this real host's OWN kernel and stat agree: a genuinely
+# existing file resolves via the flag _sutando_git_stat_flag actually picked.
+real_git_path="$(command -v git || echo /usr/bin/git)"
+out17=$(bash -c ". '$REPO/scripts/git-binary.sh'; _sutando_git_stat_id '$real_git_path'")
+rc17=$?
+check "the real kernel's own stat flag succeeds on a genuinely existing file" "$rc17" "0"
+if [ -z "$out17" ]; then
+  bad "the successful call prints dev+ino, not nothing" "empty output"
+else
+  ok "the successful call prints dev+ino"
+fi
 
 if [ "$fail" -eq 0 ]; then echo "PASS ($pass/$((pass+fail)))"; else echo "FAIL ($fail failed)"; fi
 exit "$fail"
