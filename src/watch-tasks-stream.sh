@@ -477,9 +477,16 @@ dispatch_task() {
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
+    # The answer is the completion signal on the agent path, where no handler
+    # runs to settle the record — without this a worker agent never gets a flag.
+    settle_worker_record "$filename"
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
+  # Lay the claim BEFORE the work is visible, so a result the drain sees always
+  # has attribution beside it. A no-op off a worker: record_worker_done returns
+  # early unless the spawner injected the instance id and the writer.
+  record_worker_done "$filename" pending "$WORKSPACE_DIR" || true
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
