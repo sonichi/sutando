@@ -463,6 +463,10 @@ def _raw_segments(line: str):
             quote = ch; cur.append(ch); i += 1; continue
         if ch in "&|" and nxt == ch:
             transition(ch + ch); i += 2; continue
+        if ch == "|" and nxt == "&":
+            # `|&` is `2>&1 |` -- same reachability as a lone `|`, confirmed
+            # on Bash 5.2.32 (keweichen); this host's 3.2.57 can't run it.
+            transition("|"); i += 2; continue
         if ch in ";|&":
             transition(ch); i += 1; continue
         cur.append(ch); i += 1

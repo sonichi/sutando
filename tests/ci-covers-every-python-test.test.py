@@ -320,6 +320,16 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
 
+    def test_amp_pipe_does_not_false_orphan_through_the_consumer_path(self):
+        """`|&` was parsed as `|` then a hard-reset `&`, undoing the outer
+        guard -- confirmed on Bash 5.2.32 (keweichen), pinned here."""
+        wf = ("steps:\n  - run: false && printf x |& "
+              "python3 packages/x/test_dead.py\n")
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

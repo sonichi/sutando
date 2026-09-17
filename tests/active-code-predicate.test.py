@@ -415,6 +415,23 @@ class PipefailIsNotABareRegex(unittest.TestCase):
         self.assertEqual(
             program_python_args("! false | true && python3 packages/x/dead.py"), [])
 
+    def test_amp_pipe_is_reachability_equivalent_to_a_lone_pipe(self):
+        """`|&` (`2>&1 |`) was parsed as `|` then a hard-reset lone `&`, so a
+        guard's dead stage became freshly reachable -- confirmed on Bash
+        5.2.32 by keweichen (this repo's workflows target ubuntu-latest,
+        Bash 4+): `false && printf x |& python3 dead.py` never launches
+        Python. This host's own bash (3.2.57) can't run `|&` at all, so this
+        pins the reported transcript rather than a local repro."""
+        self.assertEqual(
+            program_python_args("false && printf x |& python3 packages/x/dead.py"), [])
+
+    def test_amp_pipe_still_credits_when_the_guard_is_true(self):
+        """Control for the same construct: an unguarded/true-gated `|&`
+        still launches both stages."""
+        self.assertEqual(
+            program_python_args("true && printf x |& python3 packages/x/dead.py"),
+            ["packages/x/dead.py"])
+
 
 class PythonArgsScriptOperand(unittest.TestCase):
     """keweichen's second repro on the same [P2]: a `.py`-looking argument to
