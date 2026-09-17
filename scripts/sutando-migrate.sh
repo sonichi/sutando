@@ -1854,15 +1854,20 @@ commit_main() {
                 # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
-                    if ! bash "$_primary_installer"; then
-                        local _hb_rc=$?
+                    # `local _hb_rc=$?` after a bare failing command would abort here under
+                    # `set -e` before the assignment ever ran -- `|| _hb_rc=$?` keeps the
+                    # statement itself successful so errexit never fires.
+                    local _hb_rc=0
+                    bash "$_primary_installer" || _hb_rc=$?
+                    if [ "$_hb_rc" -ne 0 ]; then
                         echo "  hook install: primary installer failed (rc=$_hb_rc) — re-run manually: bash src/install-claude-hooks.sh" >&2
                         _hook_bridge_failed=1
                     fi
                 else
                     echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh (primary installer not found at expected path) ..."
-                    if ! bash "$_hook_helper" install "$_new_settings" --with-catchup-hook; then
-                        local _hb_rc=$?
+                    local _hb_rc=0
+                    bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || _hb_rc=$?
+                    if [ "$_hb_rc" -ne 0 ]; then
                         echo "  hook install: failed (rc=$_hb_rc) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
                         _hook_bridge_failed=1
                     fi
@@ -1870,7 +1875,11 @@ commit_main() {
                 # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
                 bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
             else
-                echo "  hook bridge: skipped (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+                # A required destination that cannot be resolved is a bridge
+                # failure too -- hooks silently never install, same as the
+                # installer itself failing.
+                echo "  hook bridge: FAILED (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+                _hook_bridge_failed=1
             fi
         else
             echo "  hook bridge: skipped (scripts/sutando-config-hooks.sh not found at expected path; run manually after migrate)"
@@ -1982,13 +1991,8 @@ commit_main() {
         echo "  Two-phase pattern keeps the (b)-style reader-fallback bridge intact during transition."
     fi
 
-    # A failed hook bridge leaves the core without its Stop/PreCompact/SessionEnd
-    # protections; unlike the Claude-memory import above, this is not "safe to
-    # retry manually later" by default -- startup.sh's auto-migration writes its
-    # completion sentinel from THIS function's exit status alone, so a lenient
-    # return here would mark migration complete with no usable core hooks. Leave
-    # a durable marker (for an operator who doesn't inspect exit codes) and fail
-    # the commit so the caller's `if ... --commit; then` takes the failure branch.
+    # A failed hook bridge must fail the whole commit -- startup.sh's sentinel
+    # comes from THIS function's exit status alone (see _hook_bridge_failed above).
     if [ "$_hook_bridge_failed" = "1" ]; then
         mkdir -p "$DEST_REAL/state" 2>/dev/null
         printf 'hook_bridge_failed_at=%s\nretry=bash src/install-claude-hooks.sh\n' \

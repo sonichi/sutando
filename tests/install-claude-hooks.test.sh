@@ -1007,6 +1007,53 @@ ok "our own SessionEnd hook is still installed alongside it" \
    "$([ "$(echo "$KS_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
 rm -rf "$KROOT"
 
+# --- 18. #4309 review round 13 (keweichen, 2026-09-17), 2 more exact repros.
+# PoC #1: the skill-guard branch matched a suffix but never ran the literal-
+# char check -- an operator's own guard with an unexpanded $-bearing path that
+# HAPPENS to end in the exact discovered-skill suffix still got swept.
+# PoC #2: the built-in-bucket literal check covered $/`/*\/?/~ but not bracket
+# glob syntax -- an operator path like "/tmp/[o]perator/..." still got swept.
+K2ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r13.XXXXXX")"
+K2REPO="$K2ROOT/repo"
+mkdir -p "$K2REPO/src" "$K2REPO/.claude" "$K2REPO/workspace/.claude-sutando" \
+         "$K2REPO/skills/discoveredskill"
+cp "$INSTALLER" "$K2REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$K2REPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$K2REPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$K2REPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$K2REPO/skills/discoveredskill/hook.sh"
+chmod +x "$K2REPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$K2REPO/workspace/.claude-sutando/settings.json"
+export K2_SETTINGS="$K2REPO/workspace/.claude-sutando/settings.json"
+python3 - << 'PY'
+import json, os
+p = os.environ['K2_SETTINGS']
+json.dump({"hooks": {
+    "PreToolUse": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": '[ -f "/tmp/${OPERATOR_ROOT}/skills/discoveredskill/hook.sh" ] || exit 0; '
+                    'exec bash "/tmp/${OPERATOR_ROOT}/skills/discoveredskill/hook.sh"'},
+    ]}],
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": 'bash /tmp/[o]perator/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$K2REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K2P_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K2_SETTINGS")"
+K2S_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K2_SETTINGS")"
+ok "round 13 PoC #1: skill-guard operator command with unexpanded var + exact suffix survives" \
+   "$(echo "$K2P_SURV" | grep -qF 'OPERATOR_ROOT' && echo 0 || echo 1)"
+ok "round 13: our own discovered-skill hook still installed alongside PoC #1" \
+   "$([ "$(echo "$K2P_SURV" | grep -c 'discoveredskill/hook.sh')" = 2 ] && echo 0 || echo 1)"
+ok "round 13 PoC #2: bracket-glob operator path survives" \
+   "$(echo "$K2S_SURV" | grep -qF '[o]perator' && echo 0 || echo 1)"
+ok "round 13: our own SessionEnd hook still installed alongside PoC #2" \
+   "$([ "$(echo "$K2S_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$K2ROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
