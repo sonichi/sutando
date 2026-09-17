@@ -204,8 +204,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Generated from local_task_protocol.KNOWN_HEADER_KEYS — a hand-counted
-// mirror here drifted key by key, most recently at 41 -> 42.
+// Generated from local_task_protocol.KNOWN_HEADER_KEYS -- regenerate via gen-header-keys.py.
 const _CONF_HEADER_RE = new RegExp(`^(?:${HEADER_KEY_ALTERNATION})\\s*:`, 'i');
 const _CONF_FENCE_RE = /^={3,}/;
 // Fold every str.splitlines() separator to '\n' so the guard's line-set
