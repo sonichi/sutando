@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -28,7 +29,7 @@ REPO = Path(__file__).resolve().parents[1]
 WRITERS = 8
 
 _CHILD = r'''
-import sys, contextlib
+import sys, os, time, contextlib
 sys.path.insert(0, {src!r})
 import core_lineage
 if {neuter!r}:
@@ -37,20 +38,38 @@ if {neuter!r}:
         path.parent.mkdir(parents=True, exist_ok=True)
         yield
     core_lineage._appending = _no_lock
-core_lineage.record_run({ws!r}, "h", sys.argv[1], runtime="test")
+sid = sys.argv[1]
+gate = {gate!r}
+# Rendezvous: announce readiness, then spin until the parent opens the gate.
+# Without this, Windows process-startup cost staggers the children enough that
+# they never overlap — the workload stops contending and the negative control
+# below correctly reports that the positive test proves nothing.
+open(os.path.join(gate, "ready-" + sid), "w").close()
+while not os.path.exists(os.path.join(gate, "go")):
+    time.sleep(0.005)
+core_lineage.record_run({ws!r}, "h", sid, runtime="test")
 '''
 
 
 def _run(workspace: str, neuter: bool) -> tuple[list, list]:
     src = str(REPO / "src")
-    prog = _CHILD.format(src=src, ws=workspace, neuter=neuter)
-    procs = [subprocess.Popen([sys.executable, "-c", prog, f"session-{i:02d}"])
-             for i in range(WRITERS)]
+    gate = os.path.join(workspace, "_gate")
+    os.makedirs(gate, exist_ok=True)
+    prog = _CHILD.format(src=src, ws=workspace, neuter=neuter, gate=gate)
+    ids = [f"session-{i:02d}" for i in range(WRITERS)]
+    procs = [subprocess.Popen([sys.executable, "-c", prog, sid]) for sid in ids]
+    deadline = time.monotonic() + 60
+    while len([n for n in os.listdir(gate) if n.startswith("ready-")]) < WRITERS:
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
+    open(os.path.join(gate, "go"), "w").close()
     for p in procs:
         p.wait()
-    sys.path.insert(0, str(REPO / "src"))
+    sys.path.insert(0, src)
     import core_lineage
     base = core_lineage.lineage_dir(workspace, "h")
+
     def _rows(name, key):
         f = base / name
         if not f.exists():
