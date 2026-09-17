@@ -149,5 +149,23 @@ else
   ok "the stub candidate is never executed to decide (classifier + dev-tools probe both confirmed invoked, resolver confirmed empty)"
 fi
 
+# --- 11. a CASE-VARIANT spelling of the real system stub must not bypass the
+# guard -- `realpath` does not case-fold, only device+inode identity does
+# (keweichen, reviewing #4323 at b281d71f3). Skipped on a case-sensitive
+# filesystem, where no such alias exists to test.
+if [ -f "/USR/BIN/git" ]; then
+  lab11=$(mktemp -d)
+  printf '#!/bin/sh\nexit 2\n' > "$lab11/xcode-select"; chmod +x "$lab11/xcode-select"
+  out=$(OSTYPE=darwin25 PATH="$lab11:/USR/BIN:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+  check "a case-variant PATH spelling of the system stub still refuses without dev tools" "$out" ""
+
+  printf '#!/bin/sh\nexit 0\n' > "$lab11/xcode-select"
+  out=$(OSTYPE=darwin25 PATH="$lab11:/USR/BIN:/bin" /bin/bash -c ". '$REPO/scripts/git-binary.sh'; resolve_git")
+  if [ -n "$out" ]; then ok "...and is usable once dev tools ARE present"
+  else bad "...and is usable once dev tools ARE present" "got empty"; fi
+else
+  echo "  skip case-variant-alias test (host filesystem is case-sensitive)"
+fi
+
 if [ "$fail" -eq 0 ]; then echo "PASS ($pass/$((pass+fail)))"; else echo "FAIL ($fail failed)"; fi
 exit "$fail"
