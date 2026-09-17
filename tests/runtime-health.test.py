@@ -63,6 +63,9 @@ _alive = os.path.join(_cores, _host + ".alive")
 _orig_resolve, _orig_host = rh._resolve_workspace, rh._host_label_safe
 rh._resolve_workspace = lambda repo: _sock_tmp
 rh._host_label_safe = lambda: _host
+# The record is only consulted when no explicit socket was given, so these cases
+# must run with the variable clear however the suite happened to be launched.
+_env_before = os.environ.pop("SUTANDO_TMUX_SOCKET", None)
 
 with open(_alive, "w", encoding="utf-8") as _fh:
     json.dump({"socket": "/run/real.sock"}, _fh)
@@ -87,7 +90,31 @@ rh._host_label_safe = lambda: ""
 check("_tmux_socket: falls back when the host label is unknown",
       rh._tmux_socket() == rh.TMUX_SOCKET)
 
+rh._host_label_safe = lambda: _host
+# A crashed core leaves its .alive behind; trusting it would pin the probe to a
+# dead socket, which is the failure this resolver exists to remove.
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/tmp/stale.sock"}, _fh)
+os.utime(_alive, (time.time() - 10000, time.time() - 10000))
+check("_tmux_socket: refuses a stale .alive record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, None)
+check("_tmux_socket: accepts the same record once it is fresh",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+_prev_env = os.environ.get("SUTANDO_TMUX_SOCKET")
+os.environ["SUTANDO_TMUX_SOCKET"] = "/tmp/explicit.sock"
+check("_tmux_socket: an explicit SUTANDO_TMUX_SOCKET wins over the record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+if _prev_env is None:
+    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+else:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _prev_env
+
 rh._resolve_workspace, rh._host_label_safe = _orig_resolve, _orig_host
+if _env_before is not None:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _env_before
 shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.

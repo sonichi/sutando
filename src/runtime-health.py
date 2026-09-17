@@ -47,12 +47,18 @@ def _tmux_socket():
     <app-support>/run/tmux.sock), and a detached probe does not inherit it — so the
     module-level default above targets a socket that does not exist and a live core
     reads as offline. core_heartbeat records the real one in its own environment;
-    prefer that, and fall back only when it is absent."""
+    prefer that when it is fresh. An explicit SUTANDO_TMUX_SOCKET always wins."""
+    if os.environ.get("SUTANDO_TMUX_SOCKET"):
+        return TMUX_SOCKET
     try:
         host = _host_label_safe()
         if host:
             repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             alive = os.path.join(_resolve_workspace(repo), "state", "cores", f"{host}.alive")
+            # A crashed core leaves its record behind; trusting a stale one would pin
+            # the probe to a dead socket, which is the failure this resolver removes.
+            if (time.time() - os.path.getmtime(alive)) > HEARTBEAT_STALE_SECONDS:
+                return TMUX_SOCKET
             with open(alive, "r", encoding="utf-8") as fh:
                 sock = (json.load(fh) or {}).get("socket")
             if isinstance(sock, str) and sock:
