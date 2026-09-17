@@ -16,7 +16,8 @@ Two phases under flock(2): the claim is created EMPTY (in progress) and holds
 the lock until the result links, then its body becomes the result path
 (committed, permanent). A failure before commit removes the claim, so the task
 is retryable; an empty claim found unlocked is abandoned (a crash) and is
-recovered: committed against a result found live or archived, else reused.
+recovered: committed against a result found live or archived (the exact-id
+lookup `src/local_task_protocol.py` owns, every archive layout), else reused.
 The stats line goes to stdout; every strip/refusal line goes to stderr, as
 verify.py prints them.
 
@@ -30,7 +31,6 @@ This script emits the `[no-send]` first line but never parses result markers.
 """
 import argparse
 import fcntl
-import glob
 import json
 import os
 import sys
@@ -41,6 +41,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 import verify  # noqa: E402
+import local_task_protocol  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 EXIT_OK, EXIT_REFUSED, EXIT_CANNOT = verify.EXIT_OK, verify.EXIT_REFUSED, verify.EXIT_CANNOT
@@ -86,13 +87,9 @@ def claim_commit(fd: int, note: str) -> Optional[str]:
 
 
 def find_result(workspace: Path, task_file: str) -> Optional[Path]:
-    """The live result, else the consumer's archive copy (results/archive/<ym>/<id>*.txt)."""
-    live = result_path(workspace, task_file)
-    if live.is_file():
-        return live
-    stem = Path(task_file).stem
-    hits = sorted(glob.glob(str(workspace / "results" / "archive" / "*" / (glob.escape(stem) + "*.txt"))))
-    return Path(hits[0]) if hits else None
+    """The live result, else the consumers' archive copy -- the shared exact-id lookup,
+    so a longer id sharing this stem (a1 vs a10) is never this task's result."""
+    return local_task_protocol.find_result(workspace / "results", Path(task_file).stem)
 
 
 def link_exclusive(path: str, data: bytes) -> bool:

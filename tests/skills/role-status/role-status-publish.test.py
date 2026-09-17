@@ -470,11 +470,61 @@ with tempfile.TemporaryDirectory() as td:
           "an empty claim with the result in the archive: exit 2, nothing written, archive untouched")
     check(claim_of(ws).read_text() == str(archived) + "\n", "the abandoned claim is committed naming the archived result")
     # an archive copy carrying an epoch suffix is found too
-    archived.rename(archived.with_name("task-role-status-v1-0000-a2.1758130000.txt"))
+    archived.rename(archived.with_name("task-role-status-v1-0000-a2-1758130000.txt"))
     claim_of(ws).write_text("")
     rc, so, se = publish_in(ws, task, j)
-    check(rc == 2 and "recovered from " in se and "a2.1758130000.txt" in se and not live.exists(),
-          "an archive copy with an epoch suffix is found by the recovery")
+    check(rc == 2 and "recovered from " in se and "a2-1758130000.txt" in se and not live.exists(),
+          "an archive copy with the consumers' `<id>-<epoch>` suffix is found by the recovery")
+# (c2) the recovery lookup is an exact match owned by src/local_task_protocol.py:
+# attempt a1's abandoned claim must never bind to the distinct task a10's result.
+A1 = "task-role-status-v1-0000-a1.txt"
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    task = ws / "tasks" / A1
+    task.write_text(TASK.replace("-a2", "-a1"))
+    j = Path(td) / "j.json"
+    j.write_text(json.dumps(FULL))
+    live = ws / "results" / "task-role-status-v1-0000-a1.txt"
+    month = ws / "results" / "archive" / "2026-09"
+    month.mkdir(parents=True)
+    (month / "task-role-status-v1-0000-a10.txt").write_text("[no-send]\n[]\n")
+    (ws / "results" / "archive" / "task-role-status-v1-0000-a10-1758130000.txt").write_text("[no-send]\n[]\n")
+    claim_of(ws, A1).parent.mkdir(parents=True)
+    claim_of(ws, A1).touch()
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 0 and live.is_file() and "recovered from" not in se,
+          "a1/a10 mutation: a foreign-only archive (a10 monthly + a10-<epoch> flat) does not recover a1; a1 publishes (rc 0), stderr=%r" % se[:160])
+    check(claim_of(ws, A1).is_file() and claim_of(ws, A1).read_text() == str(live) + "\n",
+          "a1/a10 mutation: a1's claim commits to a1's own result")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 2 and "result already published (claim %s)" % claim_of(ws, A1) in se and "a10" not in se
+          and "a10" not in claim_of(ws, A1).read_text(),
+          "a1/a10 mutation: the retry names a1's own committed claim, whose body never names a10")
+    # positive control: the exact a1 archive beside the same a10 files IS recovered
+    if live.exists():
+        live.unlink()
+    claim_of(ws, A1).write_text("")
+    exact = month / "task-role-status-v1-0000-a1.txt"
+    exact.write_text("[no-send]\n[]\n")
+    rc, so, se = publish_in(ws, task, j)
+    check(rc == 2 and "recovered from %s" % exact in se and not live.exists()
+          and claim_of(ws, A1).read_text() == str(exact) + "\n",
+          "positive control: the exact a1 archive beside a10's is recovered and committed")
+# the lookup is delegated to the shared owner (live dir first, then every archive layout)
+_ltp = getattr(pub, "local_task_protocol", None)
+calls = []
+if _ltp is not None:
+    _real_find = _ltp.find_result
+    _ltp.find_result = lambda results_dir, task_id: calls.append((Path(results_dir), task_id)) or None
+    try:
+        found = pub.find_result(Path("/ws"), "/ws/tasks/task-role-status-v1-0000-a1.txt")
+    finally:
+        _ltp.find_result = _real_find
+check(_ltp is not None and found is None and calls == [(Path("/ws/results"), "task-role-status-v1-0000-a1")],
+      "publish.find_result delegates to local_task_protocol.find_result(<workspace>/results, <task-id>)")
+check("glob" not in src.split("def find_result")[1].split("\ndef ")[0] and "import glob" not in src,
+      "publish.py keeps no private archive glob")
 # another publisher holds the claim: refused without touching it
 with tempfile.TemporaryDirectory() as td:
     ws, task, j = fresh_ws(td)

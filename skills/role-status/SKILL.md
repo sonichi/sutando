@@ -55,7 +55,9 @@ for one actor of nine — the verifier strips the first two and refuses the thir
      retryable; the exit reports the actual error.
    - **abandoned** — an empty claim found unlocked is a crash between creation
      and commit (the kernel releases the lock with the process). The retry
-     recovers it: if a result exists live or under `results/archive/*/`, the
+     recovers it: if a result exists live or archived (the exact-id lookup
+     `src/local_task_protocol.py` owns, across every archive layout -- a
+     longer id sharing the stem, `a1` vs `a10`, is never a match), the
      claim is committed with that path and the retry exits 2
      `… already published (claim <path>) -- recovered from <result>`;
      otherwise the empty claim is reused and the publish proceeds.
