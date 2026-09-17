@@ -219,6 +219,51 @@ class TestUnrosteredRecordsAreReportedNotAdopted(Base):
         self.assertEqual(kept["state"], "recovering")
 
 
+class TestCreateIsTheCommandAsOneCall(Base):
+    """`create()` is what the route handler calls on a picker `add`: the same
+    preflight → runtime → spawn → compile as the CLI, with failures typed so the
+    caller can name them rather than parse stderr."""
+
+    def test_create_spawns_compiles_and_publishes(self):
+        out = cw.create(str(self.ws), str(REPO), label="scribe")
+        self.assertEqual(out["worker_id"], self.spawned[0])
+        self.assertEqual(out["advertisement"], "published")
+        self.assertIsNone(out["room"])
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        self.assertEqual(out["roster_version"], roster["version"])
+        self.assertEqual(roster["workers"][out["worker_id"]]["label"], "scribe")
+        self.assertTrue((self.ws / "state" / "pool-advertisement.json").exists())
+        self.assertEqual(out["unrostered_records"], [])
+
+    def test_create_with_a_room_binds_it(self):
+        out = cw.create(str(self.ws), str(REPO), label="r", room=ROOM)
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        self.assertEqual(roster["bindings"][ROOM], out["worker_id"])
+
+    def test_a_publish_failure_returns_the_worker_as_unpublished(self):
+        real = cw.pa.write_advertisement
+        cw.pa.write_advertisement = lambda ws, now=None: (_ for _ in ()).throw(OSError(28, "No space left"))
+        self.addCleanup(lambda: setattr(cw.pa, "write_advertisement", real))
+        out = cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(out["advertisement"], "unpublished")
+        self.assertIn(out["worker_id"], json.loads((self.ws / "state" / "roster.json").read_text())["workers"])
+
+    def test_a_compile_failure_after_the_spawn_names_the_worker(self):
+        real = cw.compile_with
+        cw.compile_with = lambda *a, **k: (_ for _ in ()).throw(pr.RosterError("bad roster"))
+        self.addCleanup(lambda: setattr(cw, "compile_with", real))
+        with self.assertRaises(cw.CreatedUnrostered) as c:
+            cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(c.exception.worker_id, self.spawned[0])
+        self.assertIn("could not be compiled", str(c.exception))
+
+    def test_a_preflight_refusal_creates_nothing(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = "deadbeef"
+        with self.assertRaises(cw.Refused):
+            cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(self.spawned, [])
+
+
 class TestARefusalNamesTheRetainedWorker(Base):
     """A launcher failure must not claim a clean refusal while a record and a
     delivery dir it just minted stay on disk, unrostered and unnamed."""
