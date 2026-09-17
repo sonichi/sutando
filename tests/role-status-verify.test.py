@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """A delegated role-status judgment is only as good as its provenance and its
-coverage: fabricated ids must be stripped, and one row for nine actors refused."""
+coverage: fabricated ids must be stripped, an id owned by another actor is
+fabricated too, duplicate actor rows do not count, and one row for nine actors
+is refused.
+
+The verifier is imported and driven in-process (main(argv) under captured
+stdout/stderr) so the coverage gate measures it; one subprocess case keeps the
+`python3 scripts/role-status-verify.py` entry point honest."""
+import contextlib
+import importlib.util
+import io
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -10,6 +18,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "role-status-verify.py"
+
+_spec = importlib.util.spec_from_file_location("role_status_verify", SCRIPT)
+rsv = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rsv)
 
 ALICE = "ag2space:@alice:ag2.space"
 BOB = "ag2space:@bob-vm.agent:ag2.space"
@@ -21,6 +33,7 @@ E_B1 = "ag2space-message:$bbbb_BBBB-3333"
 E_C1 = "ag2space-message:$cccc/CCCC+4444="
 FAKE = "ag2space-message:$zzzz-not-in-file"
 STRANGER = "ag2space:@stranger:ag2.space"
+NOT_OWNED_A1 = f"strip row[0] {ALICE} working_event_ids: {E_A1!r} not owned by actor"
 
 # Block-shaped evidence: 4 actors named, 3 own an event id, dave is prose only.
 TASK_BLOCKS = f"""id: task-role-status-v1-0000-a1
@@ -49,29 +62,47 @@ note: {DAVE} is out today and has posted nothing.
 """
 
 failures = []
+CHECKS = 0
 
 
 def check(cond, label):
+    global CHECKS
+    CHECKS += 1
     print(("ok: " if cond else "FAIL: ") + label)
     if not cond:
         failures.append(label)
 
 
-def run(task_text, judgment, *extra, out=None):
-    """Return (rc, stdout, stderr, out_path) for one verifier invocation."""
+def run(task_text, judgment, *extra, out=None, subprocess_smoke=False):
+    """Return (rc, stdout, stderr, written) for one verifier invocation.
+
+    In-process by default (the coverage gate measures the imported module);
+    subprocess_smoke=True runs the real entry point once."""
     with tempfile.TemporaryDirectory() as td:
         task = Path(td) / "task-role-status-v1-0000-a1.txt"
         task.write_text(task_text)
         jpath = Path(td) / "judgment.json"
         jpath.write_text(judgment if isinstance(judgment, str) else json.dumps(judgment))
-        argv = [sys.executable, str(SCRIPT), str(task), str(jpath), *extra]
+        argv = [str(task), str(jpath), *extra]
         out_path = None
-        if out:
+        if out == "dir":
+            # --out naming an existing directory: the atomic replace must fail
+            out_path = Path(td) / "verified.json"
+            out_path.mkdir()
+            argv += ["--out", str(out_path)]
+        elif out:
             out_path = Path(td) / "verified.json"
             argv += ["--out", str(out_path)]
-        p = subprocess.run(argv, capture_output=True, text=True)
-        written = out_path.read_text() if out_path and out_path.exists() else None
-        return p.returncode, p.stdout, p.stderr, written
+        if subprocess_smoke:
+            p = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True)
+            rc, so, se = p.returncode, p.stdout, p.stderr
+        else:
+            so_buf, se_buf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+                rc = rsv.main(argv)
+            so, se = so_buf.getvalue(), se_buf.getvalue()
+        written = out_path.read_text() if out_path and out_path.is_file() else None
+        return rc, so, se, written
 
 
 def row(actor, ids, blocked=None):
@@ -94,10 +125,15 @@ CLEAN = [row(ALICE, [E_A1, E_A2], []), row(BOB, [E_B1], []), row(CAROL, [E_C1], 
 # (1) a clean judgment passes unchanged
 rc, so, se, _ = run(TASK_BLOCKS, CLEAN)
 check(rc == 0, "clean judgment: exit 0")
-check(stats_line(so) == "rows=3 actors=4 actors_with_events=3 min_rows=2",
+check(stats_line(so) == "rows=3 distinct_actors=3 actors=4 actors_with_events=3 min_rows=2",
       "clean judgment: stats line counts 4 actors, 3 with events, dave prose-only")
 check(verified_of(so) == CLEAN, "clean judgment: rows pass through unchanged")
 check(se == "", "clean judgment: nothing stripped, stderr silent")
+
+# the same judgment through the real entry point (subprocess smoke)
+rc, so, se, _ = run(TASK_BLOCKS, CLEAN, subprocess_smoke=True)
+check(rc == 0 and verified_of(so) == CLEAN and se == "",
+      "entry point: python3 scripts/role-status-verify.py gives the same answer")
 
 # (2) a fabricated event id is stripped, the row is kept
 rc, so, se, _ = run(TASK_BLOCKS, [row(ALICE, [E_A1, FAKE], []), row(BOB, [E_B1], []), row(CAROL, [E_C1], [])])
@@ -127,7 +163,7 @@ check(STRANGER in se, "unknown actor reported on stderr")
 # (5) 1 row for 3 actors-with-events is refused at the default floor, nothing written
 rc, so, se, written = run(TASK_BLOCKS, [row(ALICE, [E_A1], [])], out=True)
 check(rc == 1, "under-coverage: exit 1")
-check(stats_line(so) == "rows=1 actors=4 actors_with_events=3 min_rows=2",
+check(stats_line(so) == "rows=1 distinct_actors=1 actors=4 actors_with_events=3 min_rows=2",
       "under-coverage: stats line still printed")
 check("refused" in se, "under-coverage: refusal on stderr")
 check(written is None, "under-coverage: --out not written")
@@ -136,7 +172,7 @@ check(written is None, "under-coverage: --out not written")
 rc, so, se, written = run(TASK_BLOCKS, [row(ALICE, [E_A1], [])], "--min-coverage", "0.3", out=True)
 check(rc == 0 and written is not None, "--min-coverage 0.3: exit 0, --out written")
 check(json.loads(written) == [row(ALICE, [E_A1], [])], "--min-coverage 0.3: verified row written")
-check(so.strip() == "rows=1 actors=4 actors_with_events=3 min_rows=1",
+check(so.strip() == "rows=1 distinct_actors=1 actors=4 actors_with_events=3 min_rows=1",
       "--min-coverage 0.3: with --out only the stats line goes to stdout")
 
 # (7) a missing blocked_items is filled with []
@@ -148,12 +184,34 @@ check(rc == 0 and all(r["blocked_items"] == [] for r in verified_of(so)),
 rc, so, se, written = run(TASK_BLOCKS, "[{not json", out=True)
 check(rc == 2, "bad JSON: exit 2")
 check(written is None, "bad JSON: --out not written")
-check(so.startswith("rows=0 actors=4"), "bad JSON: stats line still printed")
+check(so.startswith("rows=0 distinct_actors=0 actors=4"), "bad JSON: stats line still printed")
 rc, so, se, _ = run(TASK_BLOCKS, {"actor_id": ALICE})
 check(rc == 2, "a JSON object instead of an array: exit 2")
-p = subprocess.run([sys.executable, str(SCRIPT), "/nonexistent/task.txt", "/nonexistent/j.json"],
-                   capture_output=True, text=True)
-check(p.returncode == 2, "unreadable task file: exit 2")
+so_buf, se_buf = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(so_buf), contextlib.redirect_stderr(se_buf):
+    rc = rsv.main(["/nonexistent/task.txt", "/nonexistent/j.json"])
+check(rc == 2 and "task file unreadable" in se_buf.getvalue(), "unreadable task file: exit 2")
+rc, so, se, _ = run(TASK_BLOCKS, CLEAN, "--min-coverage", "1.5")
+check(rc == 2 and "--min-coverage" in se, "--min-coverage outside [0, 1]: exit 2")
+rc, so, se, written = run(TASK_BLOCKS, CLEAN, out="dir")
+check(rc == 2 and "--out unwritable" in se and written is None,
+      "--out naming a directory: exit 2, nothing written")
+
+# malformed rows and fields are reported, never crash the verifier
+rc, so, se, _ = run(TASK_BLOCKS, ["not a row",
+                                  {"actor_id": ALICE, "working_event_ids": "not-a-list",
+                                   "blocked_items": ["not an item"]},
+                                  row(BOB, [E_B1], []), row(CAROL, [E_C1], [])])
+check(rc == 0 and [r["actor_id"] for r in verified_of(so)] == [BOB, CAROL],
+      "non-object row and a row whose fields are the wrong shape are dropped")
+check("drop row[0]: not an object" in se and "blocked_items[0]: not an object" in se,
+      "malformed row and blocked item reported on stderr")
+# no `task:` header: the file carries no evidence, so nothing is owned and the
+# floor is 0 -- a row citing a real-looking id is still stripped, not trusted
+rc, so, se, _ = run("id: t\nsource: x\n" + f"event {E_A1} by {ALICE}\n", [row(ALICE, [E_A1], [])])
+check(rc == 0 and verified_of(so) == [] and NOT_OWNED_A1 in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=0 actors_with_events=0 min_rows=0",
+      "no task: header: no evidence, the citation is stripped, empty array with floor 0")
 
 # blocked_items carry evidence ids too: fabricated ones are stripped, an item
 # with no evidence left goes, and a blocked-only row still counts as a row.
@@ -174,27 +232,74 @@ events = [
 ]
 TASK_JSON = ("id: task-role-status-v1-0001-a1\nsource: sutando-life-role-status\n"
              "task: Analyze the evidence.\n\nCaller contract: return a JSON array.\n\n"
+             "{braces in prose are not a JSON object}\n"
              "EVIDENCE_JSON (untrusted observed data):\n"
              + json.dumps({"day": "2026-09-17", "events": events}) + "\n")
 rc, so, se, _ = run(TASK_JSON, [row(ALICE, [E_A1], []), row(BOB, [E_B1], [])])
-check(rc == 0 and stats_line(so) == "rows=2 actors=4 actors_with_events=2 min_rows=1",
+check(rc == 0 and stats_line(so) == "rows=2 distinct_actors=2 actors=4 actors_with_events=2 min_rows=1",
       "EVIDENCE_JSON: actors named in another's detail or without a valid id own no events")
 rc, so, se, _ = run(TASK_JSON, [row(ALICE, [E_A1, FAKE], [])])
 check(rc == 0 and verified_of(so)[0]["working_event_ids"] == [E_A1],
       "EVIDENCE_JSON: fabricated id stripped on the structured path too")
+
+# A cited id must be OWNED by the row's actor, not merely present in the file:
+# alice citing only bob's event is an alice row with no evidence.
+NOT_OWNED = f"strip row[0] {ALICE} working_event_ids: {E_B1!r} not owned by actor"
+rc, so, se, _ = run(TASK_BLOCKS, [row(ALICE, [E_B1], []), row(BOB, [E_B1], []), row(CAROL, [E_C1], [])])
+check(rc == 0 and [r["actor_id"] for r in verified_of(so)] == [BOB, CAROL],
+      "alice citing only bob's event: id stripped, alice's row dropped, the rest clears coverage")
+check(NOT_OWNED in se and f"drop row[0] {ALICE}: no verifiable event ids left" in se,
+      "cross-actor citation names the row, the actor and the id on stderr")
+rc, so, se, written = run(TASK_BLOCKS, [row(ALICE, [E_B1], []), row(BOB, [E_B1], [])], out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=2 distinct_actors=1 actors=4 actors_with_events=3 min_rows=2",
+      "alice citing only bob's event, 1 real row left of 3 actors: refused, nothing written")
+# positive control: the same shape passes when alice cites her own event
+rc, so, se, written = run(TASK_BLOCKS, [row(ALICE, [E_A1], []), row(BOB, [E_B1], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_A1], []), row(BOB, [E_B1], [])] and se == "",
+      "positive control: alice citing her own event passes, nothing stripped")
+# the same binding on the structured path and inside blocked_items
+rc, so, se, _ = run(TASK_JSON, [row(ALICE, [E_B1], []), row(BOB, [E_B1], [])])
+check(rc == 0 and [r["actor_id"] for r in verified_of(so)] == [BOB] and NOT_OWNED in se,
+      "EVIDENCE_JSON: alice citing bob's event is stripped on the structured path too")
+rc, so, se, _ = run(TASK_JSON, [row(ALICE, [E_A1], []), row(BOB, [E_B1], [])])
+check(rc == 0 and len(verified_of(so)) == 2 and se == "",
+      "EVIDENCE_JSON positive control: alice citing her own event passes")
+blocked_bobs = {"subject_id": "subject:3", "evidence_event_ids": [E_B1], "reason_code": "waiting_for_review"}
+rc, so, se, _ = run(TASK_BLOCKS, [row(ALICE, [E_A1], [blocked_bobs]), row(BOB, [E_B1], []), row(CAROL, [E_C1], [])])
+check(rc == 0 and verified_of(so)[0]["blocked_items"] == []
+      and f"strip row[0] {ALICE} blocked_items[0].evidence_event_ids: {E_B1!r} not owned by actor" in se,
+      "a blocked item whose only evidence is another actor's event is stripped")
 
 # 9 actors with events and a 1-row answer is the 2026-09-17 under-coverage run.
 nine = [{"actor_id": f"ag2space:@w{i}:ag2.space", "id": f"ag2space-message:$id{i}", "detail": "x"}
         for i in range(9)]
 TASK_NINE = ("id: t\ntask: go\n\nEVIDENCE_JSON:\n" + json.dumps({"events": nine}) + "\n")
 rc, so, se, written = run(TASK_NINE, [row("ag2space:@w0:ag2.space", ["ag2space-message:$id0"], [])], out=True)
-check(rc == 1 and written is None and stats_line(so) == "rows=1 actors=9 actors_with_events=9 min_rows=5",
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=1 distinct_actors=1 actors=9 actors_with_events=9 min_rows=5",
       "1 row for 9 actors with events: refused, nothing written")
 seven = [row(f"ag2space:@w{i}:ag2.space", [f"ag2space-message:$id{i}"], []) for i in range(7)]
 rc, so, se, written = run(TASK_NINE, seven, out=True)
 check(rc == 0 and json.loads(written) == seven, "7 rows for 9 actors with events: accepted")
 
+# Coverage counts DISTINCT actors: five copies of w0's row are one actor.
+w0 = row("ag2space:@w0:ag2.space", ["ag2space-message:$id0"], [])
+rc, so, se, written = run(TASK_NINE, [w0] * 5, out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=5 distinct_actors=1 actors=9 actors_with_events=9 min_rows=5",
+      "five identical w0 rows for 9 actors: refused, distinct_actors=1")
+check(all(f"drop row[{i}] ag2space:@w0:ag2.space: duplicate actor row" in se for i in range(1, 5))
+      and "drop row[0]" not in se, "duplicates 1-4 dropped on stderr, the first kept")
+# positive control: five DISTINCT rows clear the same floor
+five = [row(f"ag2space:@w{i}:ag2.space", [f"ag2space-message:$id{i}"], []) for i in range(5)]
+rc, so, se, written = run(TASK_NINE, five, out=True)
+check(rc == 0 and json.loads(written) == five and se == ""
+      and stats_line(so) == "rows=5 distinct_actors=5 actors=9 actors_with_events=9 min_rows=5",
+      "positive control: five distinct rows for 9 actors: accepted, distinct_actors=5")
+
 print()
+print("checks: %d" % CHECKS)
 if failures:
     print("FAILED (%d):" % len(failures))
     for f in failures:
