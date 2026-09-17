@@ -12,8 +12,9 @@ results/ is hard-linked to the result name, which fails when the name exists,
 so a drain never sees a half-written result. The consumer moves the result into
 results/archive/, so the result name alone cannot bar a second publisher: a
 durable claim, `<workspace>/state/role-status/claims/<task-id>`, is the record.
-Two phases under flock(2): the claim is created EMPTY (in progress) and holds
-the lock until the result links, then its body becomes the result path
+Two phases under an exclusive lock (`src/file_lock.py`: POSIX flock, Windows
+msvcrt): the claim is created EMPTY (in progress) and holds the lock until the
+result links, then its body becomes the result path
 (committed, permanent). A failure before commit removes the claim, so the task
 is retryable; an empty claim found unlocked is abandoned (a crash) and is
 recovered: committed against a result found live or archived (the exact-id
@@ -30,7 +31,6 @@ the claim dir unwritable), nothing written.
 This script emits the `[no-send]` first line but never parses result markers.
 """
 import argparse
-import fcntl
 import json
 import os
 import sys
@@ -40,9 +40,10 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
-import verify  # noqa: E402
-import local_task_protocol  # noqa: E402
-from workspace_default import resolve_workspace  # noqa: E402
+import verify
+import local_task_protocol
+from file_lock import try_lock_fd, unlock_fd
+from workspace_default import resolve_workspace
 
 EXIT_OK, EXIT_REFUSED, EXIT_CANNOT = verify.EXIT_OK, verify.EXIT_REFUSED, verify.EXIT_CANNOT
 
@@ -61,9 +62,7 @@ def claim_open(path: str) -> Optional[int]:
     """Create-if-absent (never truncate) and lock the claim; the lock outlives nothing
     but this process, so an unlocked empty claim is a crash. None = held by another."""
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    if not try_lock_fd(fd):
         os.close(fd)
         return None
     return fd
@@ -191,7 +190,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 os.unlink(str(claim))
             except OSError:
                 pass
-        os.close(fd)
+        try:
+            unlock_fd(fd)
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":

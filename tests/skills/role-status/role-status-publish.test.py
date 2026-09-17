@@ -556,6 +556,85 @@ with tempfile.TemporaryDirectory() as td:
     check(rc == 2 and "recovered from %s" % live in se and claim_of(ws).read_text() == str(live) + "\n",
           "the retry recovers: exit 2, the claim committed against the live result")
 
+# (10c) no `fcntl`, as on Windows: a fake `msvcrt` with real in-process lock semantics
+# drives the claim state machine. Windows filesystem semantics are NOT exercised here.
+NOFCNTL = r"""
+import contextlib, errno, importlib.util, io, json, os, sys, types
+from pathlib import Path
+sys.modules["fcntl"] = None
+m = types.ModuleType("msvcrt"); m.LK_NBLCK, m.LK_LOCK, m.LK_UNLCK = 2, 1, 0
+held = {}
+def locking(fd, mode, n):
+    st = os.fstat(fd); key = (st.st_dev, st.st_ino)
+    if mode == m.LK_UNLCK:
+        held.pop(key, None); return
+    if key in held and held[key] != fd:
+        raise OSError(errno.EACCES, "Permission denied")
+    held[key] = fd
+m.locking = locking
+sys.modules["msvcrt"] = m
+spec = importlib.util.spec_from_file_location("role_status_publish_nofcntl", sys.argv[1])
+pub = importlib.util.module_from_spec(spec); spec.loader.exec_module(pub)
+import file_lock
+assert file_lock.fcntl is None and file_lock.msvcrt is m, "the shared lock did not take the msvcrt path"
+ws = Path(sys.argv[2]); task = ws / "tasks" / "task-role-status-v1-0000-a2.txt"; j = ws / "j.json"
+claim = ws / "state" / "role-status" / "claims" / "task-role-status-v1-0000-a2"
+live = ws / "results" / "task-role-status-v1-0000-a2.txt"
+def run(*argv):
+    so, se = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+        try:
+            rc = pub.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return [rc, so.getvalue(), se.getvalue()]
+def state():
+    return [live.is_file(), claim.read_text() if claim.is_file() else None, sorted(p.name for p in (ws / "results").iterdir()) if (ws / "results").is_dir() else []]
+out = {"argparse": run()}
+out["publish"] = run(str(task), str(j), "--workspace", str(ws)) + state()
+out["committed"] = run(str(task), str(j), "--workspace", str(ws)) + state()
+live.unlink(); claim.unlink()
+real_link = os.link
+def link_denied(src, dst, *a, **k):
+    os.link = real_link
+    raise PermissionError(13, "Permission denied", dst)
+os.link = link_denied
+out["rollback"] = run(str(task), str(j), "--workspace", str(ws)) + state()
+os.link = real_link
+holder = pub.claim_open(str(claim))
+out["held"] = run(str(task), str(j), "--workspace", str(ws)) + state()
+file_lock.unlock_fd(holder); os.close(holder)
+out["abandoned"] = run(str(task), str(j), "--workspace", str(ws)) + state()
+print(json.dumps(out))
+"""
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td) / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "tasks" / "task-role-status-v1-0000-a2.txt").write_text(TASK)
+    (ws / "j.json").write_text(json.dumps(FULL))
+    live = str(ws / "results" / "task-role-status-v1-0000-a2.txt")
+    claim = str(claim_of(ws))
+    p = subprocess.run([sys.executable, "-c", NOFCNTL, str(PUBLISH), str(ws)], capture_output=True, text=True, timeout=60)
+    o = json.loads(p.stdout) if p.returncode == 0 and p.stdout.startswith("{") else {}
+    check(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
+          "no fcntl: the publisher imports and runs on the msvcrt lock backend (rc=%s stderr=%r)" % (p.returncode, p.stderr[-300:]))
+    check(bool(o) and o["argparse"][0] == 2 and "usage:" in o["argparse"][2], "no fcntl: argument parsing runs (missing args -> usage, exit 2)")
+    check(bool(o) and o["publish"][:1] == [0] and "published " in o["publish"][1] and o["publish"][3] and o["publish"][4] == live + "\n"
+          and o["publish"][5] == ["task-role-status-v1-0000-a2.txt"],
+          "no fcntl: a publish lands rc 0, the result linked, the claim committed to it, no temp file")
+    check(bool(o) and o["committed"][0] == 2 and "result already published (claim %s)" % claim in o["committed"][2],
+          "no fcntl: a committed claim refuses the second publish (exit 2)")
+    check(bool(o) and o["rollback"][0] == 2 and "results/ unwritable: [Errno 13]" in o["rollback"][2] and not o["rollback"][3]
+          and o["rollback"][4] is None and o["rollback"][5] == [],
+          "no fcntl: a failed link rolls the claim back, nothing written")
+    check(bool(o) and o["held"][0] == 2 and "publication in progress (claim %s)" % claim in o["held"][2]
+          and o["held"][4] == "" and not o["held"][3],
+          "no fcntl: a claim held through msvcrt contention exits 2 `publication in progress`, the claim left empty")
+    check(bool(o) and o["abandoned"][0] == 0 and o["abandoned"][3] and o["abandoned"][4] == live + "\n",
+          "no fcntl: once released, the empty claim is reused and the publish commits it")
+check("import fcntl" not in src and "from file_lock import" in src,
+      "publish.py takes its lock from src/file_lock.py, never fcntl directly")
+
 # (11) UTF-8 output whatever the locale: a verifier-accepted non-ASCII subject_id and
 # row detail survive LC_ALL=C PYTHONUTF8=0 through the real entry point.
 C_ENV = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}

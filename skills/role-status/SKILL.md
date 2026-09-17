@@ -40,8 +40,9 @@ for one actor of nine — the verifier strips the first two and refuses the thir
    `results/archive/`, so the result name alone would let a second publisher
    through; the record of truth is a **durable claim**,
    `<workspace>/state/role-status/claims/<task-id>`, in two phases:
-   - **in progress** — created empty (create-if-absent) and `flock`ed by the
-     publisher until the result has linked; a second publisher meeting the
+   - **in progress** — created empty (create-if-absent) and exclusively locked
+     (`src/file_lock.py`: POSIX `flock`, Windows `msvcrt`) by the publisher
+     until the result has linked; a second publisher meeting the
      lock exits 2 `cannot answer: publication in progress (claim <path>)`.
    - **committed** — after the link the body becomes the result path (one
      write under the lock). A committed claim is permanent — **never removed
