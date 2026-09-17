@@ -270,23 +270,42 @@ serves_routing_intake() {
   [ "$TASKS_DIR_ABS" = "$__core_tasks" ]
 }
 
+# The capability, never a skill: whichever installed skill declares
+# SUTANDO_TASK_EVENT_HANDLER_SCRIPT in its manifest provides the router.
+HANDLER_CAPABILITY="SUTANDO_TASK_EVENT_HANDLER_SCRIPT"
+
 # A watcher without the routing handler answers every bound room from this
 # core, silently; refuse unless the declaration is empty or the operator opts in.
 if serves_routing_intake &&
    { [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; }; then
   if [ "${SUTANDO_ALLOW_UNROUTED_BINDINGS:-}" != "1" ]; then
     if ! reason="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/pool_bindings_declared.py" "$WORKSPACE_DIR/state")"; then
-      if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-        why="SUTANDO_TASK_EVENT_HANDLER is set but not executable: $SUTANDO_TASK_EVENT_HANDLER"
-      else
-        why="SUTANDO_TASK_EVENT_HANDLER is unset"
+      # Nothing sets the handler durably -- no launcher does, and the documented
+      # arming path passes no env -- so a declared worker means this core is
+      # meant to route: arm the provider the manifests name. An env value the
+      # caller set is never replaced, which is the precedence MANIFEST.md states.
+      provided=""
+      if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+        provided="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/skill_manifest_capability.py" \
+                    "$__REPO_ROOT" "$HANDLER_CAPABILITY" 2>/dev/null)" || provided=""
       fi
-      echo "watch-tasks-stream: REFUSING to start: $reason; $why." >&2
-      echo "  Bound rooms would be answered by this core instead of their workers." >&2
-      echo "  Fix: export SUTANDO_TASK_EVENT_HANDLER=<your pool route handler: pool_route_handler.py," >&2
-      echo "  from the checkout that carries the pool>, then start the watcher again; or set" >&2
-      echo "  SUTANDO_ALLOW_UNROUTED_BINDINGS=1 to run without routing on purpose." >&2
-      exit 78
+      if [ -n "$provided" ] && [ -f "$provided" ] && [ -x "$provided" ]; then
+        SUTANDO_TASK_EVENT_HANDLER="$provided"
+        export SUTANDO_TASK_EVENT_HANDLER
+        echo "watch-tasks-stream: $reason; SUTANDO_TASK_EVENT_HANDLER was unset — routing through $SUTANDO_TASK_EVENT_HANDLER (declared as $HANDLER_CAPABILITY)." >&2
+      else
+        if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+          why="SUTANDO_TASK_EVENT_HANDLER is set but not executable: $SUTANDO_TASK_EVENT_HANDLER"
+        else
+          why="SUTANDO_TASK_EVENT_HANDLER is unset and no installed skill provides $HANDLER_CAPABILITY"
+        fi
+        echo "watch-tasks-stream: REFUSING to start: $reason; $why." >&2
+        echo "  Bound rooms would be answered by this core instead of their workers." >&2
+        echo "  Fix: install a skill whose manifest declares $HANDLER_CAPABILITY, or export" >&2
+        echo "  SUTANDO_TASK_EVENT_HANDLER=<an executable task-event handler> and start the" >&2
+        echo "  watcher again; or set SUTANDO_ALLOW_UNROUTED_BINDINGS=1 to run unrouted on purpose." >&2
+        exit 78
+      fi
     fi
   fi
 fi
