@@ -10,7 +10,26 @@ The canonical entry point for a fresh Sutando session. Bundles every action that
 
 **Usage**: `/startup`
 
-ARGUMENTS: $ARGUMENTS (currently unused — reserved for future per-instance overrides)
+ARGUMENTS: $ARGUMENTS — `--worker` selects the worker bootstrap below; empty is the canonical core.
+
+## Worker mode (`/startup --worker`)
+
+A pool worker is an instance, not the canonical core. It shares the host's workspace but owns exactly one thing: the watcher on its own delivery folder. **When `$ARGUMENTS` contains `--worker`, run ONLY the sequence in this section and none of the steps below it** — no orphan check (the core owns `tasks/`), no cron registration (a second registrant duplicates every scheduled fire), no ceremony gate (it stamps the core's `schedule-crons-stamp.json`), and no `/startup complete` line.
+
+1. Ask whether this instance's own watcher is already live. **The core's step 1.5 gate is the wrong question here** — it is satisfied by *any* watcher tree on the host, and the core's own always satisfies it, so a worker that consults it never starts the watcher it exists to run:
+
+   ```bash
+   "${SUTANDO_PY:?the launcher forwards the resolved interpreter}" "$SUTANDO_WORKER_BOOTSTRAP"
+   ```
+
+   The gate belongs to the optional `worker-pool` skill, not to this one, so it is **named by the spawner in the session's env** and never spelled as a path here — a core install without that skill must still boot. If `$SUTANDO_WORKER_BOOTSTRAP` is unset or names no file, treat it as `unknown`: say so and start nothing.
+
+   It answers about THIS instance's sentinel (`util_paths.watcher_sentinel_path`, the same file the watcher stamps) in the assigned workspace — read from the `SUTANDO_WORKSPACE_DIR` variable the spawner sets and the watcher honours, so gate and watcher can never inspect two trees — and prints one word: `start`, `skip`, or `unknown`.
+
+2. On `start` only, start the streaming watcher via the `Monitor` tool — `command: 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'`, `persistent: true`. Both are absolute and come from the launcher, because this session's cwd is the spawner's `--cwd` and need not be the repo — a relative `src/watch-tasks-stream.sh` exits 127 there. If `$SUTANDO_WATCHER_CMD` is unset you were not launched as a worker: stop and say so rather than guessing a path.
+
+3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>`; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
+
 
 ## What this replaces
 
@@ -45,20 +64,46 @@ Note: this step runs BEFORE step 2 so that the watcher (started by step 2's down
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
-- Reading `skills/schedule-crons/crons.json`
+- Reading `<workspace>/hosts/<hostname>/crons.json` (`<hostname>` = `bash scripts/sutando-config.sh host-label`) — the canonical per-host config.
+  **Not `skills/schedule-crons/crons.json`.** That path is git-ignored and installer-managed: `src/init.sh` seeds it from `crons.example.json` when it is absent and leaves it untouched when it is present. So the in-checkout copy holds whatever the host last left there — shipped sample jobs, or a stale legacy schedule — and nothing keeps it in step with the per-host file. `skills/schedule-crons/SKILL.md` records the move; `/startup` was never updated to match, so registering from the in-checkout copy silently replaces the host's real schedule with legacy state.
 - Starting the streaming task watcher via the `Monitor` tool (`bash src/watch-tasks-stream.sh`, persistent, description `"Streaming task watcher"`) — **first**, before any cron is registered (2026-08-24: moved ahead of registration so a task arriving during the registration loop isn't queued unprocessed; see `skills/schedule-crons/SKILL.md` step 1.5 for the measured impact)
 - Calling `CronCreate` for each entry that isn't already scheduled
+- Invoke the skill rather than hand-rolling `CronCreate` from this list: `/schedule-crons` also writes
+  `<workspace>/hosts/<hostname>/schedule-crons-stamp.json`, which health-check's `session-crons` probe reads —
+  a hand-rolled registration leaves that probe reporting the crons as never registered.
 - Ensuring a fallback `/proactive-loop` cron exists at `*/10 * * * *` if `crons.json` doesn't include one (post-#954 belt-and-suspenders)
 
-### Step 3 — Confirm
+### Step 2.5 — Re-arm connector waits
 
-Emit a one-line summary so the operator (or main session's first turn) sees what fired:
-
-```
-/startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
+```bash
+python3 skills/connect-apps/scripts/connectors.py rearm
 ```
 
-The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+Restarts the background waiter of every connect-apps wait that is still pending (an app the owner was asked to connect before this session started), so their request is still answered once they sign in. Idempotent: a wait whose waiter is alive is left alone. Skip silently if `skills/connect-apps/` is absent; a non-zero exit is reported, never retried.
+
+### Step 3 — Verify, then confirm
+
+**Run the ceremony gate BEFORE claiming completion.** It is health-check's `session-crons` probe
+— the same stamp-vs-session-boundary test the desktop app's ceremony-health uses to decide whether
+to re-send `/startup` — so the agent sees the app's criterion at the one moment it can act on it:
+
+```bash
+python3 skills/startup/scripts/verify-ceremony.py    # rc 0 = stamped this boot; rc 1 = NOT complete
+```
+
+- **rc 0** → emit the one-line summary so the operator (or main session's first turn) sees what fired:
+
+  ```
+  /startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
+  ```
+
+  The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+- **rc 1** → do NOT print `/startup complete`. Print the gate's output verbatim, invoke `/schedule-crons`
+  (the only writer of `hosts/<hostname>/schedule-crons-stamp.json`), and re-run the gate. A hand-rolled
+  `CronCreate` passes every cheap check — `CronList` looks perfect and the cron fires — and still fails
+  this one, which is exactly why the app kept re-sending `/startup` to a session that believed it was
+  done (135 sends across four episodes, the longest 25 h, stamp unchanged in every one).
+- **rc 2** → the probe could not run; say so and do not claim completion.
 
 ## Sequence diagram
 
@@ -74,6 +119,8 @@ session start
     │                               ├─► step 2-3 (register crons.json entries)
     │                               ├─► step 4 (proactive-loop fallback if missing)
     │                               └─► step 6 (confirm what was scheduled)
+    │
+    ├─► step 2.5: connect-apps rearm ──► restarts waiters of pending connector waits
     │
     └─► step 3: emit summary
 ```

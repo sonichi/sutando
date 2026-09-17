@@ -71,6 +71,31 @@ class ArchiveLookupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assertIsNone(find_archived_result(Path(td), "../../etc/passwd"))
 
+    def test_longer_task_id_is_not_this_tasks_result(self):
+        """`<id>-*` also matches a LONGER id's archive file; returning it
+        attributes another task's content to this one."""
+        with tempfile.TemporaryDirectory() as td:
+            arc = Path(td) / "archive"
+            arc.mkdir()
+            (arc / f"{HOLDER}-longer-1785976425.txt").write_text("OTHER TASK")
+            self.assertIsNone(find_archived_result(Path(td), HOLDER))
+
+    def test_genuine_epoch_suffix_is_still_this_tasks_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            arc = Path(td) / "archive"
+            arc.mkdir()
+            (arc / f"{HOLDER}-longer-1785976425.txt").write_text("OTHER TASK")
+            (arc / f"{HOLDER}-1785976425.txt").write_text("MINE")
+            self.assertEqual(
+                find_archived_result(Path(td), HOLDER).read_text(), "MINE")
+
+    def test_non_numeric_suffix_is_not_an_epoch_stamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            arc = Path(td) / "archive"
+            arc.mkdir()
+            (arc / f"{HOLDER}-draft.txt").write_text("NOT AN EPOCH")
+            self.assertIsNone(find_archived_result(Path(td), HOLDER))
+
 
 class DeadEndTest(unittest.TestCase):
     """The reported failure, end to end over the two helpers."""

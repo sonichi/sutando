@@ -13,7 +13,6 @@ Run: python3 tests/health-check-bridge-log-content.test.py
 """
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -44,6 +43,20 @@ startup_only = [
 ]
 result = hc.bridge_log_content_status("slack-bridge", "ok", startup_only)
 check("startup hint with no events after it → warns", result is not None and result[0] == "warn")
+
+# ── slack-bridge: the remedy RANKS causes, it does not assert one (#3230) ──────
+# slack_state injected: uninjected resolves the host's access.json, so CI differs.
+_enrolled = hc.bridge_log_content_status("slack-bridge", "ok", startup_only,
+                                         slack_state="enrolled")
+msg = _enrolled[1] if _enrolled else ""
+check("remedy states what was measured, not a presumed cause",
+      "since this bridge started" in msg, msg)
+check("remedy offers the benign restart explanation first",
+      "restarted" in msg, msg)
+check("remedy still names the config cause as the conditional one",
+      "Event Subscriptions" in msg, msg)
+check("remedy does not read as a bare config imperative",
+      not msg.startswith("connected but events not arriving — enable"), msg)
 
 # ── slack-bridge: startup hint followed by real activity → false positive fixed ──
 
@@ -97,23 +110,11 @@ check("discord healthy log → no override", result8 is None)
 # them no-op safely, which is what we want here) and points WORKSPACE_DIR /
 # claude_home_path at a temp tree so the log content is fully controlled.
 
-_orig_subprocess_run = subprocess.run
-
-
-def _fake_pgrep_slack(cmd, *args, **kwargs):
-    if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "/usr/bin/pgrep" and "slack-bridge" in cmd[2]:
-        class _Result:
-            returncode = 0
-            stdout = "999999\n"
-        return _Result()
-    return _orig_subprocess_run(cmd, *args, **kwargs)
-
-
 def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
     with tempfile.TemporaryDirectory() as tmpws, tempfile.TemporaryDirectory() as tmphome:
         tmpws = Path(tmpws)
         (tmpws / "logs").mkdir(parents=True)
-        (tmpws / "logs" / "slack-bridge.log").write_text(log_contents)
+        (tmpws / "logs" / "slack-bridge.log").write_text(log_contents, encoding="utf-8")
         channel_dir = Path(tmphome) / "channels" / "slack"
         channel_dir.mkdir(parents=True)
         (channel_dir / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
@@ -130,7 +131,7 @@ def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
 
         with patch.object(hc, "WORKSPACE_DIR", tmpws), \
              patch.object(hc, "claude_home_path", side_effect=_fake_chp), \
-             patch.object(subprocess, "run", side_effect=_fake_pgrep_slack):
+             patch.object(hc, "probe_pids", return_value=(["999999"], True)):
             checks = hc.run_all_checks()
         return next((c for c in checks if c["name"] == "slack-bridge"), None)
 

@@ -2,7 +2,8 @@
 // that dispatched the task. One predicate for both narrowed both.
 
 // All three are ONE `skip` kind in parse_markers(); grammar mirrors it.
-export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]+\])/i;
+// `*` not `+`: `[deduped:]` and `[deduped: ]` both parse (result_markers.py:119).
+export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]*\])/i;
 
 // Pool cores prepend `**[core: N]**` + optional `_(...)_`; parse_markers peels
 // it before any marker scan (result_markers.py:135), so this must too.

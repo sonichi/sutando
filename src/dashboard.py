@@ -15,6 +15,7 @@ from __future__ import annotations
 
 
 import http.server
+import html
 import json
 import os
 import re
@@ -34,9 +35,12 @@ from urllib.parse import urlparse
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 import dashboard_schedules  # noqa: E402
+import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -171,14 +175,23 @@ def get_quota_status() -> dict:
     try:
         data = json.loads(quota_file.read_text())
         headers = data.get("headers", {})
-        # Parse reset timestamps
-        reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
-        reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
-        if reset_5h:
-            data["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).strftime("%H:%M %b %d")
-        if reset_7d:
-            data["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).strftime("%H:%M %b %d")
+        # Parse reset timestamps PER WINDOW: one malformed value degrades
+        # its own tile to unknown, never the sibling or the whole panel.
+        for w in ("5h", "7d"):
+            raw = headers.get(f"anthropic-ratelimit-unified-{w}-reset", "")
+            try:
+                data[f"reset_{w}"] = datetime.fromtimestamp(int(raw)).strftime("%H:%M %b %d")
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         data.update(_quota_freshness(data, quota_file))
+        # Feed the history the chart reads; value-dedup'd, so the 15s refresh
+        # costs nothing while quota stands still. Never let it break the panel.
+        try:
+            quota_projection.record_sample(
+                data, WORKSPACE_DIR / "state" / "quota-history.jsonl",
+                datetime.now().timestamp())
+        except OSError:
+            pass
         return data
     except Exception:
         return {"available": True}
@@ -188,6 +201,23 @@ def get_quota_status() -> dict:
 # the 6h "down" threshold the comm-sweep freshness probe already uses, so the
 # fleet has one staleness vocabulary rather than a per-panel invention.
 QUOTA_STALE_HOURS = 6.0
+
+
+def quota_chart_response() -> tuple[int, bytes]:
+    """The /api/quota-chart decision: (status, body).
+
+    Serializes BEFORE returning a status so a strict-JSON failure surfaces as
+    a 500, never a 200 with an empty body. `live` is the same observation the
+    quota tile renders, so the chart cannot publish a current point the tile
+    contradicts.
+    """
+    try:
+        payload = quota_projection.chart_payload(
+            WORKSPACE_DIR / "state" / "quota-history.jsonl",
+            datetime.now().timestamp(), live=get_quota_status())
+        return 200, json.dumps(payload, allow_nan=False).encode()
+    except ValueError:
+        return 500, b'{"error": "non-finite value in chart payload"}'
 
 
 def _quota_freshness(data: dict, quota_file) -> dict:
@@ -217,6 +247,24 @@ def _quota_freshness(data: dict, quota_file) -> dict:
 
 
 
+_QUOTA_MODEL_MAX_LEN = 64
+
+
+def _quota_model_label(quota: dict) -> str:
+    """The model last seen consuming quota, from the proxy's `last_request`.
+
+    Read from what the proxy observed on the wire, not from a launch-time
+    marker: /model switches mid-session, and a stamped model would go stale.
+    """
+    lr = quota.get("last_request")
+    model = lr.get("model") if isinstance(lr, dict) else None
+    if not isinstance(model, str) or not model.strip():
+        return "model —"
+    # The value comes from a request body any local caller can send: escape
+    # at the sink and cap it, so the tile cannot carry markup or a novel.
+    return html.escape(model.strip()[:_QUOTA_MODEL_MAX_LEN])
+
+
 def _quota_has_data(quota: dict) -> bool:
     """Whether a reading actually exists, as opposed to defaulting to zero.
 
@@ -231,6 +279,31 @@ def _quota_has_data(quota: dict) -> bool:
 # Glyph is a THREE-way split, not two: no reading -> "—", a reading the API
 # refused -> "✗", a good reading -> "✓". Collapsing the last two hides a real
 # rate-limit behind a check.
+
+
+def _quota_tile_pct(quota: dict, window: str) -> str:
+    """One tile's percentage, or an em dash for unknown.
+
+    Per-window on purpose: a missing, non-finite, negative or unparseable
+    value degrades ITS tile to unknown; the sibling window still renders.
+    """
+    import math as _math
+    raw = quota.get(f"utilization_{window}")
+    if raw in (None, "", 0):
+        raw = (quota.get("headers") or {}).get(
+            f"anthropic-ratelimit-unified-{window}-utilization")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if not _math.isfinite(v) or v < 0:
+        return "—"
+    pct = v * 100.0
+    # The module leaves utilization unbounded; THIS consumer's clamp is the
+    # triple-digit cap, so a huge finite value can never overflow int().
+    if pct > 999:
+        return "999%+"
+    return f"{int(pct)}%"
 
 
 def _quota_age_label(quota: dict) -> str:
@@ -253,16 +326,19 @@ def _quota_age_label(quota: dict) -> str:
     return f"{int(age*60)}m ago"
 
 def get_system_stats() -> dict:
-    import os
-    st = os.statvfs("/")
-    free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+    import shutil
+    free_gb = shutil.disk_usage(WORKSPACE_DIR).free / (1024 ** 3)
 
-    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
-    battery_m = re.search(r'(\d+)%', result.stdout)
+    try:
+        result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+        battery_output = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        battery_output = ""
+    battery_m = re.search(r'(\d+)%', battery_output)
     if battery_m:
         battery = f"{battery_m.group(1)}%"
         # \b keeps "discharging" (battery power) from substring-matching "charging".
-        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+        charging = bool(re.search(r'\bcharging\b', battery_output.lower())) or "ac power" in battery_output.lower()
     else:
         # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
         # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
@@ -536,6 +612,56 @@ def get_schedules() -> list[dict]:
     return out
 
 
+# Sparklines for the two quota stat cells: current window vs even-pace
+# diagonal. Plain string, NOT an f-string — the inline JS is brace-heavy.
+_QUOTA_SPARK_JS = """<script>
+(async()=>{try{
+const d=await (await fetch('/api/quota-chart')).json();
+for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
+  const svg=document.getElementById(el);if(!svg)continue;
+  const segs=d.windows[k].segments.filter(s=>s.current);
+  if(!segs.length)continue;
+  const s=segs[segs.length-1],W=160,H=60,X=f=>f*W,Y=u=>H-Math.min(u,1.2)/1.2*H;
+  // ring meter: fill = usage, tick = even pace; red once usage passes the tick
+  const ring=document.getElementById(el.replace('qs-','qr-'));
+  if(ring){
+    const lastP=s.points[s.points.length-1],uRaw=lastP.y,pc=lastP.x;
+    // Same degradation as _quota_tile_pct, so both render paths agree:
+    // unusable -> em dash, huge -> 999%+. Unguarded this printed Infinity%.
+    const ok=Number.isFinite(uRaw)&&uRaw>=0,u=ok?uRaw:0;
+    const label=!ok?'\u2014':(uRaw*100>999?'999%+':Math.trunc(uRaw*100)+'%');
+    const C=22,R=17,TAU=2*Math.PI,a0=-TAU/4;
+    const arc=(frac,color,w)=>{
+      const a1=a0+frac*TAU,large=frac>0.5?1:0;
+      return `<path d="M ${C+R*Math.cos(a0)} ${C+R*Math.sin(a0)} A ${R} ${R} 0 ${large} 1 ${C+R*Math.cos(a1)} ${C+R*Math.sin(a1)}" fill="none" stroke="${color}" stroke-width="${w}"/>`;};
+    let ro=`<circle cx="${C}" cy="${C}" r="${R}" fill="none" stroke="#2a2a45" stroke-width="5"/>`;
+    ro+=arc(Math.min(u,1),u>pc?'#e94560':'#4ecca3',5);
+    const ta=a0+pc*TAU;
+    ro+=`<line x1="${C+(R-4)*Math.cos(ta)}" y1="${C+(R-4)*Math.sin(ta)}" x2="${C+(R+4)*Math.cos(ta)}" y2="${C+(R+4)*Math.sin(ta)}" stroke="#8888aa" stroke-width="1.5"/>`;
+    ro+=`<text x="${C}" y="${C+3.5}" text-anchor="middle" fill="#e8e8f0" font-size="10" font-weight="600">${label}</text>`;
+    ring.innerHTML=ro;
+  }
+  let out=`<line x1="0" y1="${Y(0)}" x2="${W}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,2"/>`;
+  const stroke=(p,q,over)=>{out+=`<line x1="${X(p.x)}" y1="${Y(p.y)}" x2="${X(q.x)}" y2="${Y(q.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.5"/>`;};
+  for(let j=1;j<s.points.length;j++){
+    const a=s.points[j-1],b=s.points[j];
+    const d0=a.y-a.x,d1=b.y-b.x;
+    if((d0>0)!==(d1>0)&&d0!==d1){
+      const f=d0/(d0-d1),c={x:a.x+f*(b.x-a.x),y:a.y+f*(b.y-a.y)};
+      stroke(a,c,d0>0);stroke(c,b,d1>0);
+    }else{
+      stroke(a,b,(d0+d1)/2>0);
+    }
+  }
+  const last=s.points[s.points.length-1];
+  out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;
+  if(s.projected_end!==undefined)
+    out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="2,2"/>`;
+  svg.innerHTML=out;
+}}catch(e){}})();
+</script>"""
+
+
 def render_dashboard() -> str:
     health = get_health()
     activity = get_activity(5)
@@ -571,10 +697,10 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
-</div></div>""")
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:#8fa3c8">{_quota_model_label(stats["quota"])}</span><br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+</div>""" + _QUOTA_SPARK_JS + """</div>""")
 
     # Services (ports + daemons only)
     services = [c for c in health if "port" in c.get("detail", "") or "running" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
@@ -629,8 +755,11 @@ def render_dashboard() -> str:
     # Keyboard shortcuts
     # Match both the dev-built binary (`<repo>/src/Sutando/Sutando`) and the
     # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
-    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
+    sutando_pids, probe_ok = probe_pids("(Sutando|MacOS)/Sutando", timeout=3.0)
+    sutando_running = bool(sutando_pids)
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
+    if not probe_ok:
+        shortcut_status = "Sutando app status unavailable"
     # Shortcuts come from <workspace>/state/hotkeys.json (published by the
     # Sutando app from its resolved config — single source of truth). Only the
     # human descriptions are local UI copy, keyed by the stable action name.
@@ -858,6 +987,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif urlparse(self.path).path == "/api/quota-chart":
+            code, body = quota_chart_response()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
         elif urlparse(self.path).path == "/json":
             data = {
                 "score": get_score(),
@@ -1001,7 +1136,7 @@ if __name__ == "__main__":
     # A wildcard bind ALSO requires `DASHBOARD_ALLOWED_HOSTS` (comma-separated
     # host[:port] the UI is reached by) or every mutation 403s: with 0.0.0.0
     # there is no host to infer, so the DNS-rebinding gate cannot fail open.
-    bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
+    bind = config_get("DASHBOARD_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client held a connection without completing a request — every later
     # request (and the dashboard UI) hung on a port that still looked open

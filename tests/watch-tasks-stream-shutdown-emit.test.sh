@@ -37,9 +37,9 @@ silent=$(grep -cE "printf 'TASK_FILE: %s\\\\n' \"\\\$filename\"( >&9)? \|\| true
 check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
 check "both shutdown call sites go through the shutdown emitter" \
-      "2" "$(grep -cE '^\s+emit_task_file "\$filename"' "$WATCHER" || true)"
+      "2" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 check "the handler-fallback site goes through its own emitter" \
-      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$filename"' "$WATCHER" || true)"
+      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 
 # The call sites above are worthless if the definitions never load. There is no
 # `set -e` here, so a missing function is rc=127 and NON-FATAL: the watcher would
@@ -146,6 +146,65 @@ if [ -n "$sent" ] && [ -n "$rel" ] && [ -n "$kil" ] && [ -n "$fbk" ]; then
     check "...precedes the handler-fallback sweep" \
           "yes" "$([ "$sent" -lt "$fbk" ] && echo yes || echo no)"
 fi
+
+# Real shutdown recovery: the structural checks above accept any plain `"$var"`,
+# so only an end-to-end TERM proves recovery names the payload, not the sentinel.
+RTMP="$(mktemp -d)"
+RWS="$RTMP/ws"; RINBOX="$RWS/deliveries/w-test"
+mkdir -p "$RWS/tasks" "$RINBOX" "$RWS/results"
+RPAYLOAD="$RWS/tasks/task-probe1.txt"
+printf 'id: task-probe1\naccess_tier: owner\ntask: resolve me\n' > "$RPAYLOAD"
+: > "$RINBOX/task-probe1.txt"          # the sentinel: zero bytes, by design
+
+RRESOLVER="$RTMP/resolver.sh"
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$RPAYLOAD" > "$RRESOLVER"; chmod +x "$RRESOLVER"
+
+# Accepts the probe, then the real run only sleeps, so the task is still
+# RUNNING when TERM lands: that forces the shutdown path, not the failure one.
+RHANDLER="$RTMP/handler.sh"
+cat > "$RHANDLER" << 'HEOF'
+#!/bin/sh
+for a in "$@"; do [ "$a" = "--probe" ] && exit 0; done
+sleep 30
+HEOF
+chmod +x "$RHANDLER"
+
+run_shutdown_sweep() {  # $1 = 1 to set SUTANDO_INBOX_RESOLVER, 0 to leave it unset
+    local with_resolver="$1" outfile="$RTMP/sweep-$1.out" pid i resolver_env=""
+    [ "$with_resolver" -eq 1 ] && resolver_env="$RRESOLVER"
+    : > "$outfile"
+    set -m
+    SUTANDO_INBOX_RESOLVER="$resolver_env" SUTANDO_WORKSPACE_DIR="$RWS" \
+      SUTANDO_RESULTS_DIR="$RWS/results" SUTANDO_INSTANCE="w-test-$1" \
+      SUTANDO_TASK_EVENT_HANDLER="$RHANDLER" TMPDIR="$RTMP" \
+      bash "$WATCHER" "$RINBOX" > "$outfile" 2>"$RTMP/sweep-$1.err" &
+    pid=$!
+    set +m
+    # Wait for the handler to be RUNNING, not merely probed: TERM landing
+    # before the marker moves leaves the sweep legitimately nothing to recover.
+    for i in $(seq 1 60); do
+        [ -n "$(ls "$RTMP"/sutando-task-dispatch.*/running/ 2>/dev/null)" ] && break
+        sleep 0.1
+    done
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    grep 'TASK_FILE:' "$outfile" 2>/dev/null | tail -1
+}
+
+line_with_resolver="$(run_shutdown_sweep 1)"
+echo "  shutdown recovery, resolver configured: ${line_with_resolver:-<nothing>}"
+check "a resolver-configured shutdown recovery names the RESOLVED payload, not the sentinel" \
+      "TASK_FILE: $RPAYLOAD" "$line_with_resolver"
+
+# Control: no resolver must announce the bare basename. Without it, asserting
+# "not the bare sentinel" would pass even if resolution never engaged.
+: > "$RINBOX/task-probe1.txt"
+line_no_resolver="$(run_shutdown_sweep 0)"
+echo "  shutdown recovery, no resolver:          ${line_no_resolver:-<nothing>}"
+check "...and with no resolver configured, the control still names the bare basename" \
+      "TASK_FILE: task-probe1.txt" "$line_no_resolver"
+
+rm -rf "$RTMP"
 
 if [ "$fail" -ne 0 ]; then
     echo "Results: FAILED"; exit 1

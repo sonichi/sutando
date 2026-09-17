@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# sutando — friendly front door to the local Sutando Server (runtime API v0).
+#   sutando serve                 start the server daemon (foreground)
+#   sutando stand [id|--json]     who this Stand is (canonical identity surface)
+#   sutando status|info|owner|allowlist          identity group shortcuts
+#   sutando task submit "text" | task status <id> | ...
+#   sutando agent list | agent status <id>
+# Everything else passes through to the full runtime CLI unchanged.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Bare `python3` is the CLT stub on clean Macs and the WRONG interpreter on
+# bundled installs (vendored 3.12 vs system 3.14) — resolve the cascade once.
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+if [ -z "$PY" ]; then
+  echo "sutando: no runnable python3 (install Xcode CLT or the app bundle)" >&2
+  exit 1
+fi
+case "${1:-help}" in
+  serve)
+    shift
+    exec "$PY" "$REPO/src/runtime-api/server.py" "$@" ;;
+  chat|watch|submit|results|get-result)
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" task "$@" ;;
+  info|status|owner|allowlist|stand)
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" sutando "$@" ;;
+  health|details)
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" runtime "$@" ;;
+  list)
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" instance list ;;
+  start)
+    shift
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" instance start "$@" ;;
+  tui)
+    exec "$PY" "$REPO/src/runtime-cli/tui.py" ;;
+  attach)
+    shift
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" instance attach "$@" ;;
+  open)
+    shift
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" instance open "$@" ;;
+  help|-h|--help)
+    sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  *)
+    exec "$PY" "$REPO/src/runtime-cli/sutando-runtime.py" "$@" ;;
+esac

@@ -22,12 +22,17 @@ Mirrors Sutando's existing `tasks/` and `results/` convention:
 
 ```
 workspace/relay/
-├── relay-{epoch_seconds}.md     # pending relay notes (drained into session-state.md, then archived)
+├── relay-{YYYYMMDD}T{HHMMSS}Z.md  # pending relay notes (drained into session-state.md, then archived)
 └── processed/
-    └── relay-{epoch_seconds}.md # already drained; kept for audit
+    └── relay-{YYYYMMDD}T{HHMMSS}Z.md # already drained; kept for audit
 ```
 
-- **File naming:** `relay-{epoch}.md` — sortable + greppable, matches the `task-{epoch}.txt` shape.
+- **File naming:** `relay-$(date -u +%Y%m%dT%H%M%SZ).md` — UTC ISO basic form, e.g.
+  `relay-20260904T030402Z.md`. **Do not use the epoch form.** `session-handoff.sh` drains with
+  `find ... -name 'relay-*.md' | sort`, which is LEXICOGRAPHIC: every `relay-17…`/`relay-18…`
+  epoch name sorts before every `relay-2026…` ISO name regardless of when it was written, so a
+  single epoch-named note lands out of order among ISO ones. This file documented the epoch form
+  while every note written since 2026-08-30 used ISO; the doc was the stale half.
 - **Multiple files allowed:** `/relay` always creates a NEW file by default. `--append` appends to the LATEST unprocessed `relay-*.md` instead of creating a new one.
 - **Consumption:** `src/session-handoff.sh` reads ALL unprocessed `relay-*.md` files in sorted order, appends them to `session-state.md` under `## Relay Notes (from prior sessions)`, then `mv`s each one to `processed/` — but only after confirming its `### <basename>` header landed in the written file, so an interrupt cannot retire an uncaptured note.
 - **Cleanup:** kept indefinitely on local disk. Tiny files (~200-500 bytes each); a year of relay notes is < 1 MB. Sync via the workspace-sync engine (`scripts/sync-workspace.sh`) for fleet visibility — the legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0.
@@ -48,7 +53,7 @@ Don't write things that are already in the structured snapshot (recent commits, 
 1. Resolve `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"`.
 2. `mkdir -p "$WORKSPACE/relay" "$WORKSPACE/relay/processed"` (idempotent).
 3. **If `--append`:** find the latest unprocessed file via `ls -t "$WORKSPACE/relay/"relay-*.md 2>/dev/null | head -1`. If none, fall through to new-file mode. If found, append to it (with a `---` separator + timestamp header).
-4. **Otherwise (new file):** generate filename `relay-$(date +%s).md` under `$WORKSPACE/relay/`.
+4. **Otherwise (new file):** generate filename `relay-$(date -u +%Y%m%dT%H%M%SZ).md` under `$WORKSPACE/relay/` — UTC ISO basic form, never `$(date +%s)`; see File naming above for why the drain's lexicographic sort makes the two unmixable.
 5. Write a narrative note (markdown formatting) as described above.
 6. Save to the resolved path.
 7. Print "Relay note written to <path>" with the absolute path. Mention briefly what's in it.
@@ -77,4 +82,4 @@ If the session was genuinely uneventful (read-only, no decisions, no in-flight w
 
 ## Where it lives
 
-`workspace/relay/relay-{epoch}.md` (pending) + `workspace/relay/processed/relay-{epoch}.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.
+`workspace/relay/relay-{YYYYMMDD}T{HHMMSS}Z.md` (pending) + `workspace/relay/processed/relay-{YYYYMMDD}T{HHMMSS}Z.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.

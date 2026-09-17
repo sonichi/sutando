@@ -236,6 +236,67 @@ class TestSendSlack(unittest.TestCase):
             self.mod.send_slack("D123", "update", thread_ts="1234.56")
         self.assertEqual(captured.get("thread_ts"), "1234.56")
 
+    def _captured_payload(self, message):
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured.update(payload)
+            return True
+
+        with patch.object(self.mod, "_token", return_value="xoxb-fake"), \
+             patch.object(self.mod, "_post", side_effect=fake_post):
+            self.mod.send_slack("D123", message)
+        return captured
+
+    def test_single_link_note_keeps_its_preview(self):
+        # The preview IS the value when a note carries exactly one link.
+        captured = self._captured_payload("see https://example.com/a")
+        self.assertIs(captured.get("unfurl_links"), True)
+        self.assertIs(captured.get("unfurl_media"), True)
+
+    def test_link_dense_note_suppresses_unfurling(self):
+        # Two or more links would arrive as a stack of preview cards.
+        captured = self._captured_payload(
+            "see https://example.com/a and https://example.com/b")
+        self.assertIs(captured.get("unfurl_links"), False)
+        self.assertIs(captured.get("unfurl_media"), False)
+
+
+class TestUnfurlFallback(unittest.TestCase):
+    """notify.py reaches the shared threshold through a core-tree import.
+
+    The skill must still run where that tree is absent, and it must degrade to
+    suppression rather than to unfurling everything.
+    """
+
+    def test_missing_core_module_degrades_to_suppression(self):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def blocked(name, *args, **kwargs):
+            if name == "policy.egress.unfurl":
+                raise ImportError("core tree unavailable (test)")
+            return real_import(name, *args, **kwargs)
+
+        saved = {k: v for k, v in sys.modules.items() if k.startswith("policy")}
+        for k in saved:
+            del sys.modules[k]
+        try:
+            with patch.object(builtins, "__import__", side_effect=blocked):
+                mod = _load()
+            # Constant by design: with no threshold available, never unfurl.
+            self.assertIs(mod._should_unfurl("no links at all"), False)
+            self.assertIs(mod._should_unfurl("one https://example.com/a link"), False)
+        finally:
+            sys.modules.update(saved)
+
+    def test_control_the_real_import_does_not_fall_back(self):
+        # Without the block, the same load must reach the real predicate — so
+        # the test above cannot pass merely because _load() always degrades.
+        mod = _load()
+        self.assertIs(mod._should_unfurl("one https://example.com/a link"), True)
+
 
 class TestSendDiscord(unittest.TestCase):
     """send_discord routes through the shared src/channels/discord/client.py

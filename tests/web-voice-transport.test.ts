@@ -285,14 +285,38 @@ class FakeAudioContext {
 	/** Optional gate awaited inside resume() — lets tests park an attempt
 	 *  inside the exact `await` R10 fences. */
 	static resumeHook: (() => Promise<void>) | null = null;
+	/** When set, the options form throws like a browser that rejects the rate
+	 *  (NotSupportedError); the no-arg form still succeeds. */
+	static rejectOptions = false;
+	/** Throw from the Nth no-arg construction (1-based) once — the capture
+	 *  context is the 1st, the playback fallback the 2nd. */
+	static failNoArgAt: number | null = null;
+	static noArgCount = 0;
 
 	state: string;
-	sampleRate = 48000;
+	/** Honours the requested rate; the no-arg form is a 48 kHz device clock. */
+	sampleRate: number;
 	currentTime = 0;
 	destination = {};
 	bufferSourcesStarted = 0;
+	/** Constructor options as received (undefined for the no-arg form). */
+	options: { sampleRate?: number } | undefined;
 
-	constructor() {
+	constructor(options?: { sampleRate?: number }) {
+		if (options !== undefined && FakeAudioContext.rejectOptions) {
+			const e = new Error('rate not supported');
+			e.name = 'NotSupportedError';
+			throw e;
+		}
+		if (options === undefined) {
+			FakeAudioContext.noArgCount++;
+			if (FakeAudioContext.failNoArgAt === FakeAudioContext.noArgCount) {
+				FakeAudioContext.failNoArgAt = null;
+				throw new Error('no audio device');
+			}
+		}
+		this.options = options;
+		this.sampleRate = options?.sampleRate ?? 48000;
 		this.state = FakeAudioContext.nextState;
 		FakeAudioContext.nextState = 'running';
 		FakeAudioContext.created.push(this);
@@ -465,6 +489,9 @@ beforeEach(() => {
 	FakeAudioContext.created = [];
 	FakeAudioContext.nextState = 'running';
 	FakeAudioContext.resumeHook = null;
+	FakeAudioContext.rejectOptions = false;
+	FakeAudioContext.failNoArgAt = null;
+	FakeAudioContext.noArgCount = 0;
 	gumImpl = async () => new FakeMediaStream();
 	enumImpl = async () => [];
 	mediaDevicesListeners.length = 0;
@@ -1432,7 +1459,7 @@ describe('P7 D7.1 ledger counters', () => {
 	it('scheduled/ended/cancelled split: barge-in cancellations never count as completion', async () => {
 		const h = harness();
 		const s = await goLive(h);
-		const ctx = FakeAudioContext.created[0];
+		const ctx = FakeAudioContext.created[1]; // playback context (created after capture)
 		s.binary(new Int16Array([1000, -1000, 500, -500]).buffer);
 		s.binary(new Int16Array([1000, -1000]).buffer);
 		s.binary(new Int16Array([500]).buffer);
@@ -2308,6 +2335,160 @@ describe('P7 codex round-1 fixes', () => {
 		);
 		assert.equal(st.deviceEventsDropped, 0);
 		assert.equal(st.recoveryEventsDropped, 0);
+		h.t.disconnect();
+	});
+});
+
+describe('playback runs on a dedicated AudioContext at the stream rate', () => {
+	const mismatchLines = (lines: Array<[string, string | undefined]>) =>
+		lines.filter(([msg, kind]) => kind === 'warn' && /differs from stream rate/.test(msg));
+
+	it('connect() creates the capture context (no options) first, then the playback context at 24 kHz', async () => {
+		const h = harness();
+		await goLive(h);
+		assert.equal(FakeAudioContext.created.length, 2, 'capture + playback');
+		assert.equal(FakeAudioContext.created[0].options, undefined, 'capture context stays at the device rate');
+		assert.deepEqual(FakeAudioContext.created[1].options, { sampleRate: 24000 });
+		assert.equal(FakeAudioContext.created[1].sampleRate, 24000);
+		h.t.disconnect();
+	});
+
+	it('the playback context follows opts.outputRate', async () => {
+		const h = harness({ outputRate: 16000 });
+		await goLive(h);
+		assert.equal(FakeAudioContext.created[0].options, undefined);
+		assert.deepEqual(FakeAudioContext.created[1].options, { sampleRate: 16000 });
+		h.t.disconnect();
+	});
+
+	it('rate honoured: chunks are scheduled on the playback context and no mismatch line is emitted', async () => {
+		const lines: Array<[string, string | undefined]> = [];
+		const h = harness({ onDebug: (msg, kind) => lines.push([msg, kind]) });
+		const s = await goLive(h);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(FakeAudioContext.created[1].bufferSourcesStarted, 2, 'scheduled on the playback context');
+		assert.equal(FakeAudioContext.created[0].bufferSourcesStarted, 0, 'nothing scheduled on the capture context');
+		assert.equal(mismatchLines(lines).length, 0);
+		h.t.disconnect();
+	});
+
+	it('rejected rate: no-arg fallback, one NotSupportedError warn, live, and ONE mismatch line across two chunks', async () => {
+		FakeAudioContext.rejectOptions = true;
+		const lines: Array<[string, string | undefined]> = [];
+		const h = harness({ onDebug: (msg, kind) => lines.push([msg, kind]) });
+		const s = await goLive(h);
+		assert.equal(FakeAudioContext.created.length, 2, 'capture + fallback playback');
+		assert.equal(FakeAudioContext.created[1].options, undefined, 'fell back to the device rate');
+		assert.equal(FakeAudioContext.created[1].sampleRate, 48000);
+		const rejected = lines.filter(([msg, kind]) => kind === 'warn' && /NotSupportedError/.test(msg) && /24000/.test(msg));
+		assert.equal(rejected.length, 1, 'the fallback is visible in the debug trace, once');
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(mismatchLines(lines).length, 1, 'exactly one mismatch line across two chunks');
+		assert.equal(FakeAudioContext.created[1].bufferSourcesStarted, 2, 'playback itself is unchanged');
+		h.t.disconnect();
+	});
+
+	it('disconnect() closes the playback context along with the capture context', async () => {
+		const h = harness();
+		await goLive(h);
+		const [capture, playback] = FakeAudioContext.created;
+		await h.t.disconnect();
+		assert.equal(capture.state, 'closed');
+		assert.equal(playback.state, 'closed');
+		assert.equal((h.t as any).playbackCtx, null);
+	});
+
+	it('a suspended playback context is resumed by the next chunk', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const playback = FakeAudioContext.created[1];
+		playback.state = 'suspended';
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(playback.state, 'running');
+		assert.equal(playback.bufferSourcesStarted, 1);
+		h.t.disconnect();
+	});
+
+	it('a closed playback context is recreated by the next chunk, still at the stream rate', async () => {
+		const lines: Array<[string, string | undefined]> = [];
+		const h = harness({ onDebug: (msg, kind) => lines.push([msg, kind]) });
+		const s = await goLive(h);
+		FakeAudioContext.created[1].close();
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(FakeAudioContext.created.length, 3, 'a fresh playback context');
+		assert.deepEqual(FakeAudioContext.created[2].options, { sampleRate: 24000 });
+		assert.equal(FakeAudioContext.created[2].bufferSourcesStarted, 1);
+		assert.equal(mismatchLines(lines).length, 0);
+		h.t.disconnect();
+	});
+
+	it('session.config with a new output rate retires the playback context; the next chunk plays at the new rate', async () => {
+		const lines: Array<[string, string | undefined]> = [];
+		const analysers: unknown[] = [];
+		const h = harness({ onDebug: (msg, kind) => lines.push([msg, kind]), onAnalyser: (n) => analysers.push(n) });
+		const s = await goLive(h);
+		const first = FakeAudioContext.created[1];
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(first.bufferSourcesStarted, 2, 'two chunks draining on the 24 kHz context');
+		assert.equal(analysers.length, 1);
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 48000 } });
+		assert.equal(first.state, 'closed', 'the 24 kHz context is retired');
+		assert.equal((h.t as any).activeSources.length, 0, 'draining sources are flushed before the close');
+		assert.equal((h.t as any).chunksCancelled, 2);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(FakeAudioContext.created.length, 3);
+		assert.deepEqual(FakeAudioContext.created[2].options, { sampleRate: 48000 });
+		assert.equal(FakeAudioContext.created[2].bufferSourcesStarted, 1);
+		assert.equal(analysers.length, 2, 'the surface gets an analyser on the new context');
+		assert.notEqual(analysers[0], analysers[1]);
+		assert.equal(mismatchLines(lines).length, 0, 'no interpolation at the renegotiated rate');
+		h.t.disconnect();
+	});
+
+	it('stats report the playback clock, not the capture clock', async () => {
+		const h = harness();
+		await goLive(h);
+		const [capture, playback] = FakeAudioContext.created;
+		capture.currentTime = 5;
+		playback.currentTime = 1.5;
+		const st = (h.t as any).buildStats(0);
+		assert.equal(st.ctxTimeMs, 1500, 'the clock that proves playback is the playback context clock');
+		assert.equal(st.ctxState, 'running', 'ctxState stays the capture context');
+		h.t.disconnect();
+	});
+
+	it('session.config without an outputSampleRate keeps the playback context', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000 } });
+		assert.equal(FakeAudioContext.created.length, 2);
+		assert.equal(FakeAudioContext.created[1].state, 'running');
+		h.t.disconnect();
+	});
+
+	it('connect() survives a playback context that cannot be created; the next chunk retries', async () => {
+		FakeAudioContext.rejectOptions = true;
+		FakeAudioContext.failNoArgAt = 2; // 1st no-arg = capture, 2nd = the playback fallback
+		const h = harness();
+		const s = await goLive(h);
+		assert.equal(FakeAudioContext.created.length, 1, 'only the capture context exists');
+		assert.equal((h.t as any).playbackCtx, null);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(FakeAudioContext.created.length, 2, 'playChunk retried the creation');
+		assert.equal(FakeAudioContext.created[1].options, undefined);
+		assert.equal(FakeAudioContext.created[1].bufferSourcesStarted, 1);
+		h.t.disconnect();
+	});
+
+	it('session.config confirming the same output rate keeps the playback context', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(FakeAudioContext.created.length, 2);
+		assert.equal(FakeAudioContext.created[1].state, 'running');
 		h.t.disconnect();
 	});
 });

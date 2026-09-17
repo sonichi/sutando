@@ -29,8 +29,8 @@ lower-precedence candidate.
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
-| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
-| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | Default room id to deliver `results/proactive-*.txt` nudges to (`POST /v1/room` op:message, claim-by-rename, archive on success). Unset → read from this instance's `channels/<dir>/.env`; still unset → proactive files are not scanned. Exported as empty → stays empty, which is how a named secondary gateway keeps nudges on the primary. Deliberately explicit — never auto-learned from task channel_ids, since a nudge may be owner-private. Result-body markers are honored via the shared parser (`result_markers.parse_markers`): a `[channel: !room:server]` first line redirects that one nudge, `[dm-only]` suppresses any redirect (nudge stays here), skip markers archive silently, and a foreign `[channel:]` destination (Discord/Slack id) leaves the file to its own bridge. |
+| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
+| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
@@ -67,6 +67,16 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
+`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
+already serialized as a string; the bridge writes it as JSON either way. Both
+are written as trusted pre-body headers, because `worker_picker_commands.py`
+reads them with the parser that stops at `task:`. A command the reader cannot
+honour — an unknown verb, args that are not an object, or arguments that do not
+fit the verb — is refused by name rather than resolved from the sentence, and
+the room always comes from `channel_id`, never from `picker_args`. A broker
+that sends no `picker_command` keeps the prose fallback.
+
 An AG2 Space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
@@ -79,12 +89,23 @@ room-specific provider session.
 Claim/acknowledge a task so the server stops redelivering it.
 
 ```
-body: { "id": "task-123" }
+body: { "id": "task-123", "durable": true }
 ```
 
 The client acks each task as it is accepted. A server with at-least-once
 delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
+
+`durable: true` is sent only once the task file, its media sidecar and the
+in-flight set are all fsync'd, so the task survives a crash of this host. When a
+fresh queue write, its media sidecar, the in-flight set or the pending-ack
+ledger does not commit, the client withholds the ack entirely rather than
+claiming a task it could still lose. The flag is merely absent — a plain ack the
+server should treat as "stop redelivering" and nothing more — when a redelivered
+task is already queued and its durability could not be repaired. Acks that do
+not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
+retires the retry for good, while a bare no-route 404/405 keeps the
+endpoint-unsupported cooldown.
 
 ### `POST /v1/results`
 
@@ -113,6 +134,52 @@ body: {
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
+### `POST /v1/workers` *(optional)*
+
+The worker pool this gateway fronts, pushed when the local advertisement's
+content changes and re-sent every 600 s so a relay that restarted with an empty
+copy heals without an operator. Sent only when the gateway finds a readable
+advertisement; a gateway with no pool never calls it.
+
+```
+body: {
+  "roster_version": <int>,           // monotonic per publisher
+  "live_cores": ["<worker id>", …],  // ids currently serving
+  "dead_cores": ["<worker id>", …],
+  "bindings": { "<room id>": "<worker id>" },  // rooms the owner pinned
+  "ts": <unix seconds>               // when the publisher compiled it
+}
+success: 2xx, body ignored
+```
+
+### `PUT /v1/agents/<mxid>/profile` *(optional)*
+
+The instance's identity card, pushed on the same change signal and cadence as
+the workers snapshot, from the same single read, so the two can never describe
+different revisions. `<mxid>` is percent-encoded as one path segment.
+
+```
+body: {
+  "display": { "name": "<display name>" },
+  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
+             // label always; runtime when the publisher knows it
+}
+success: 2xx, body ignored
+```
+
+The broker REPLACES the profile document, so the gateway sends this only from
+an advertisement it could read in full.
+
+**Unsupported is not an error.** A relay that does not implement either route
+answers `404`, `405` or `501`; the gateway logs once and stops trying for an
+hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
+Neither call can fail the task loop: both are handed to a background thread
+AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
+a slow push is still in flight and an optional push never delays an
+owner-approved publication. A push still running when the next beat arrives is
+left to finish; that beat's push is skipped, not queued.
+
 ## Media markers (optional)
 
 Instead of raw bytes, a gateway may hand the task body a media marker:
@@ -139,6 +206,18 @@ Credential routing is by parsed exact origin, never string matching:
 
 Authenticated fetches refuse redirects (a 3xx is a failure), so a
 gateway-controlled URL can never bounce a bearer to another host.
+
+Outbound `[file: …]` markers upload through `POST /v1/rooms/<room>/media`. A
+task the server marked with a `signal` object instead uploads against its own
+lease, `POST /v1/tasks/<id>/media` with `{ "ordinal": 0..9, "filename":
+"<name>", "content_b64": "…" }`, where `<id>` is the id the result is delivered
+under and `ordinal` is the marker's position in the body. The client records
+that mode in `state/remote-task-media[.<instance>].json` before the task is
+queued, so it survives a restart. `409` (content conflicts with an upload the
+server already recorded) and `423` (encrypted room) are reported in-band and
+never retried; a network failure or any 5xx defers the whole result, and the
+retry re-offers the same id, ordinal and bytes so the server can resume rather
+than store a second copy.
 
 ## Delivery + idempotency
 

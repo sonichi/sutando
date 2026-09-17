@@ -30,11 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from channel_env_containment import channel_env_is_contained  # noqa: E402
-from channel_token import token_from_env_file  # noqa: E402
+from channel_token import RELAY_TOKEN_VARS, token_from_env_file  # noqa: E402
 
-# Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
-# AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
-TOKEN_VARS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+# Owned by channel_token, which also keys its relay-peel on it: two copies of
+# this list would let the cleaner and the resolver disagree about what a relay is.
+TOKEN_VARS = RELAY_TOKEN_VARS
 
 
 def candidates(channel_dir: Path) -> list[Path]:

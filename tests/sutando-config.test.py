@@ -33,6 +33,8 @@ from sutando_config import (  # noqa: E402
     _expand_vars,
     _reset_cache_for_tests,
     _strip_comments,
+    config_get,
+    config_get_env_first,
     detect_env_workspace_in_dotenv,
     load_config,
     find_core_config_dir,
@@ -700,6 +702,119 @@ class TestSutandoConfig(unittest.TestCase):
         self.assertEqual(out["list"][0], "/tmp/repo/a")
         self.assertEqual(out["list"][1]["k"], "/tmp/repo/b")
         self.assertEqual(out["scalar_int"], 42)  # non-string passthrough
+
+
+class TestConfigGet(unittest.TestCase):
+    """Tests for config_get() — issue #1724 config-vs-secrets split."""
+
+    def setUp(self):
+        _reset_cache_for_tests()
+        self._orig_env = os.environ.copy()
+
+    def tearDown(self):
+        _reset_cache_for_tests()
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+
+    def _make_repo(self, cfg: dict = None, local: dict = None) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "sutando.config.json").write_text(
+            json.dumps(cfg or {}), encoding="utf-8"
+        )
+        if local is not None:
+            (tmp / "sutando.config.local.json").write_text(
+                json.dumps(local), encoding="utf-8"
+            )
+        return tmp
+
+    def test_reads_from_env_stanza_in_local(self):
+        repo = self._make_repo(local={"env": {"MY_KEY": "from_config"}})
+        os.environ.pop("MY_KEY", None)
+        self.assertEqual(config_get("MY_KEY", repo_root=repo), "from_config")
+
+    def test_config_wins_over_os_environ(self):
+        repo = self._make_repo(local={"env": {"MY_KEY": "from_config"}})
+        os.environ["MY_KEY"] = "from_env"
+        self.assertEqual(config_get("MY_KEY", repo_root=repo), "from_config")
+
+    def test_falls_back_to_os_environ_with_warning(self):
+        repo = self._make_repo()
+        os.environ["MY_KEY"] = "from_env_only"
+        import io
+        buf = io.StringIO()
+        import unittest.mock as mock
+        with mock.patch("sys.stderr", buf):
+            val = config_get("MY_KEY", repo_root=repo)
+        self.assertEqual(val, "from_env_only")
+        self.assertIn("MY_KEY", buf.getvalue())
+        self.assertIn("legacy", buf.getvalue())
+
+    def test_warning_fires_only_once_per_key(self):
+        repo = self._make_repo()
+        os.environ["MY_KEY"] = "v"
+        import io
+        import unittest.mock as mock
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            config_get("MY_KEY", repo_root=repo)
+            config_get("MY_KEY", repo_root=repo)
+        # The warning contains "legacy" — count occurrences of that sentinel word
+        # to assert the warning fired exactly once (not twice).
+        self.assertEqual(buf.getvalue().count("legacy"), 1)
+
+    def test_returns_default_when_key_absent_everywhere(self):
+        repo = self._make_repo()
+        os.environ.pop("ABSENT_KEY", None)
+        self.assertIsNone(config_get("ABSENT_KEY", repo_root=repo))
+        self.assertEqual(config_get("ABSENT_KEY", default="d", repo_root=repo), "d")
+
+    def test_env_stanza_value_coerced_to_str(self):
+        repo = self._make_repo(local={"env": {"PORT": 8080}})
+        val = config_get("PORT", repo_root=repo)
+        self.assertIsInstance(val, str)
+        self.assertEqual(val, "8080")
+
+    def test_env_stanza_tracked_defaults_merged_by_local(self):
+        repo = self._make_repo(
+            cfg={"env": {"A": "base"}},
+            local={"env": {"B": "override"}},
+        )
+        self.assertEqual(config_get("A", repo_root=repo), "base")
+        self.assertEqual(config_get("B", repo_root=repo), "override")
+
+
+class TestConfigGetEnvFirst(TestConfigGet):
+    """Escape hatches invert the precedence: os.environ must beat the config file.
+
+    An operator sets these on the process to override a broken or stale config,
+    so a config value winning would disable the override they reached for."""
+
+    HATCHES = ("SUTANDO_DM_OWNER_ID", "SUTANDO_MEMORY_DIR", "CLAUDE_HOME")
+
+    def test_process_env_beats_a_conflicting_config_stanza(self):
+        for key in self.HATCHES:
+            repo = self._make_repo(local={"env": {key: "from_config"}})
+            os.environ[key] = "from_env"
+            self.assertEqual(
+                config_get_env_first(key, repo_root=repo), "from_env",
+                f"{key}: a stale config value must not beat the escape hatch",
+            )
+
+    def test_config_still_read_when_the_env_is_unset(self):
+        # The exception must not break migration: with nothing on the process,
+        # the config stanza is still the source.
+        for key in self.HATCHES:
+            repo = self._make_repo(local={"env": {key: "from_config"}})
+            os.environ.pop(key, None)
+            self.assertEqual(
+                config_get_env_first(key, repo_root=repo), "from_config", key,
+            )
+
+    def test_ordinary_keys_keep_config_first(self):
+        # Guards the fix against over-reaching into the default policy.
+        repo = self._make_repo(local={"env": {"MY_KEY": "from_config"}})
+        os.environ["MY_KEY"] = "from_env"
+        self.assertEqual(config_get("MY_KEY", repo_root=repo), "from_config")
 
 
 class TestNullBlockIsAbsent(unittest.TestCase):

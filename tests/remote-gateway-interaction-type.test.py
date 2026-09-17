@@ -32,8 +32,9 @@ rgb.ARCHIVE_RESULTS_DIR = tmp / "results" / "archive"
 
 
 def _headers(task):
-    tid = rgb._write_task(task)
-    assert tid, f"_write_task rejected {task!r}"
+    written = rgb._write_task(task)
+    assert written, f"_write_task rejected {task!r}"
+    tid = written[0]
     body = (rgb.TASKS_DIR / f"{tid}.txt").read_text()
     # This serializer emits `task:` mid-file (field order = _TASK_FIELDS; every
     # header is newline-stripped by _one_line, access_tier last) — so parse all

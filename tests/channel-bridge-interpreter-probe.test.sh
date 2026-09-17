@@ -1,10 +1,13 @@
 #!/bin/bash
 # The wrapper's interpreter probe must measure the INTERPRETER, not the network.
-# A network-based probe reports "no usable Python interpreter" on an outage and
+# A network-based probe reports an interpreter fault on an outage and
 # exit 1s on a fast loop -- the launchd deferral state the wrapper exists to avoid.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# The wrapper's interpreter-diagnosis marker, defined ONCE: three checks below
+# key on it, and one asserts its ABSENCE, which silently passes if it drifts.
+DIAG="no python3 can 'import"
 WRAPPER="$REPO/src/launchd/channel-bridge-wrapper.sh"
 [ -f "$WRAPPER" ] || { echo "SKIP: wrapper not found"; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not found"; exit 0; }
@@ -56,18 +59,18 @@ echo "1. probe is load-bearing: an interpreter that fails every check must gate"
 : > "$TMP/argv.log"
 MODE=all-fail TELEGRAM_BOT_TOKEN=x PATH="$TMP/bin:$PATH" \
   _bound 20 "$TMP/out1" bash "$WRAPPER" telegram; rc=$?
-if grep -q 'no usable Python interpreter' "$TMP/out1" && [ "$rc" = 1 ]; then
+if grep -qF "$DIAG" "$TMP/out1" && [ "$rc" = 1 ]; then
   say ok "wrapper exits 1 with the interpreter diagnosis when python3 truly fails"
 else
-  say FAIL "expected exit 1 + 'no usable Python interpreter', got rc=$rc: $(tail -1 "$TMP/out1")"
+  say FAIL "expected exit 1 + the interpreter diagnosis, got rc=$rc: $(tail -1 "$TMP/out1")"
 fi
 
 echo "2. REGRESSION: a network outage must NOT be reported as a missing interpreter"
 : > "$TMP/argv.log"
 MODE=no-network TELEGRAM_BOT_TOKEN=x PATH="$TMP/bin:$PATH" \
   _bound 20 "$TMP/out2" bash "$WRAPPER" telegram; rc2=$?
-if grep -q 'no usable Python interpreter' "$TMP/out2"; then
-  say FAIL "network-only failure was reported as 'no usable Python interpreter' (rc=$rc2) — probe is measuring the network"
+if grep -qF "$DIAG" "$TMP/out2"; then
+  say FAIL "network-only failure was reported as an interpreter fault (rc=$rc2) — probe is measuring the network"
 else
   say ok "network-only failure does not produce the interpreter diagnosis"
 fi
@@ -140,10 +143,10 @@ if [ -x /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ]; then
     _bound 20 "$TMP/out6" bash "$WRAPPER" telegram; rc6=$?
   if [ -s "$TMP/argv.log" ]; then
     say FAIL "something was logged to the shadow-python argv log during case 6 (should be untouched)"
-  elif grep -q 'no usable Python interpreter' "$TMP/out6" && [ "$rc6" = 1 ]; then
+  elif grep -qF "$DIAG" "$TMP/out6" && [ "$rc6" = 1 ]; then
     say ok "resolve_python() refused the real /usr/bin/python3 with no CLT; wrapper never invoked it for probe or gate"
   else
-    say FAIL "expected exit 1 + 'no usable Python interpreter' with a faked no-CLT signal, got rc=$rc6: $(tail -1 "$TMP/out6")"
+    say FAIL "expected exit 1 + the interpreter diagnosis with a faked no-CLT signal, got rc=$rc6: $(tail -1 "$TMP/out6")"
   fi
 else
   say ok "SKIP: no real /usr/bin/python3 on this platform — case 6 is macOS-only"

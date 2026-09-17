@@ -248,8 +248,14 @@ def main() -> int:
         f.write_text(_json.dumps(body))
         return f
     now = _time.time()
-    check("_gateway_serving: fresh + connected → True",
-          hc._gateway_serving(_sc({"connected": True, "ts": now}), now) is True)
+    # `connected` alone is not serving: the real writer stamps last_ok_ts on
+    # every connected write, so a pair without it never comes from that path.
+    check("_gateway_serving: fresh + connected + last_ok_ts → True",
+          hc._gateway_serving(_sc({"connected": True, "ts": now,
+                                   "last_ok_ts": now - 5}), now) is True)
+    check("_gateway_serving: connected but NEVER polled → False",
+          hc._gateway_serving(_sc({"connected": True, "ts": now,
+                                   "last_ok_ts": None}), now) is False)
     check("_gateway_serving: fresh + disconnected → False",
           hc._gateway_serving(_sc({"connected": False, "ts": now}), now) is False)
     check("_gateway_serving: stale → None (no opinion)",

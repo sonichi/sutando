@@ -270,3 +270,15 @@ Treat these as defaults, not truth:
 | Explicit identity / ownership | 180 days |
 
 Explicit end dates and newer contradictory evidence override these windows.
+
+## Roster refusal keys
+
+`allowlisted` (bool | null) — whether a mention to this Stand has been observed to
+trigger it. `false` REFUSES the send. **It records an observation, not a cause**:
+nothing in the tree sets it after a detected bounce, so no message may claim one.
+`null`/absent means never observed — send, then record.
+
+`refusal_basis` / `note` (string) — the entry's own words for why it refuses, printed
+verbatim by `notify_reviewers.resolve()`. Required whenever a blank `stand`/`room` is
+DELIBERATE: without it the refusal reads as missing data and the obvious repair —
+populating the fields — silently overrides it (#3468). `refusal_basis` wins over `note`.

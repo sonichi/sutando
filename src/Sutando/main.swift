@@ -83,6 +83,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // modePresenterMenuItem} requests the switch via state/voice-mode.request
     // (for active/meeting) or POST :7877/presenter/on (for presenter).
     var voiceMode: String = "active"
+    var modelSubmenu: NSMenu?
     weak var modeActiveMenuItem: NSMenuItem?
     weak var modeMeetingMenuItem: NSMenuItem?
     weak var modePresenterMenuItem: NSMenuItem?
@@ -343,6 +344,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.submenu = pauseSubmenu
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
+        // Model submenu — items are read from skills/model-switch/manifest.json on every
+        // open, so the choices change with the skill and never need an app rebuild.
+        let modelSubmenu = NSMenu()
+        modelSubmenu.delegate = self
+        self.modelSubmenu = modelSubmenu
+        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
+        modelItem.submenu = modelSubmenu
+        menu.addItem(modelItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
@@ -585,23 +594,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Skip when "watcher" is already queued in the CLI input buffer.
-        // claude-code queues keystrokes during a turn and processes them
-        // when the turn ends. cliIsWorking() catches fresh (<60s) tool
-        // children, but a long-running tool (>60s) returns false here —
-        // the next watcher tick would then double-send "watcher", so the
-        // CLI processes "watcher\nwatcher" serially and spawns watcher
-        // twice. Capture-pane the bottom of the pane and skip if
-        // "watcher" appears near the prompt area.
-        if watcherKeystrokesQueued() {
-            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
-            return
-        }
-
+        // One sender for lines typed into the core pane: scripts/tmux-send-line.sh
+        // owns has-session, the current-prompt read and the queued-word skip.
         // (Removed 120s inner throttle 2026-05-14: now strictly dead code under
         // the 300s outer Timer cadence — two consecutive ticks are always 300s
         // apart, so the throttle never gated. Flood-protection is now solely
-        // the watcherKeystrokesQueued() check above + the Timer interval.)
+        // the shared sender's queued-word skip + the Timer interval.)
 
         // If the core CLI is running inside the `sutando-core` tmux session
         // (launch via src/agent/start-cli.sh), send the word `watcher` to
@@ -610,7 +608,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // — so the watcher's stdout routes through the task-notification
         // pipe correctly. Any externally-started watcher (nohup etc.)
         // has stdout → /dev/null and is useless.
-        if tmuxSendKeys(session: "sutando-core", keys: "watcher") {
+        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
+        if rc == 6 {
+            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
+            return
+        }
+        if rc == 0 {
             notify("Sutando", "Task watcher down — sent 'watcher' to sutando-core tmux")
             logToFile("watcher dead; tmux send-keys to sutando-core")
             return
@@ -866,100 +869,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Send keystrokes to a tmux pane. Returns true if the session exists
-    /// and send-keys succeeded. False otherwise — caller should fall back
-    /// to a macOS notification.
-    func tmuxSendKeys(session: String, keys: String) -> Bool {
-        // Find tmux binary: Homebrew on Apple Silicon, /usr/local on Intel.
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        // Check session exists: `tmux has-session -t <name>` exits 0 if alive.
-        let has = Process()
-        has.executableURL = URL(fileURLWithPath: tmuxPath)
-        has.arguments = ["-S", sutandoTmuxSocket, "has-session", "-t", session]
-        has.standardOutput = FileHandle.nullDevice
-        has.standardError = FileHandle.nullDevice
-        do { try has.run() } catch { return false }
-        has.waitUntilExit()
-        if has.terminationStatus != 0 { return false }
-
-        // Session exists — send keys + Enter.
-        let send = Process()
-        send.executableURL = URL(fileURLWithPath: tmuxPath)
-        send.arguments = ["-S", sutandoTmuxSocket, "send-keys", "-t", session, keys, "Enter"]
-        send.standardOutput = FileHandle.nullDevice
-        send.standardError = FileHandle.nullDevice
-        do { try send.run() } catch { return false }
-        send.waitUntilExit()
-        return send.terminationStatus == 0
-    }
-
-    /// Detect whether the word "watcher" is already typed at claude-code's
-    /// CURRENT prompt line in the sutando-core pane. Only the current prompt
-    /// (the bottom-most `❯ ` line) indicates queued input — past prompts in
-    /// scrollback don't.
-    ///
-    /// History of this function:
-    /// - PR #553: matched `\bwatcher\b` across bottom 5 lines → over-fired
-    ///   on prose like "Ensure the watcher is running" in tool output.
-    /// - PR #557: filtered to lines starting with `❯ `. But `capture-pane
-    ///   -S -3` returns the visible pane PLUS scrollback (≠ "last 3 lines"),
-    ///   so old prompts like `❯ why is watcher reminder not sent?` were
-    ///   still treated as queued input → still over-fired.
-    /// - This PR: walk all lines, remember the LAST `❯ ` line seen (the
-    ///   current prompt), check only that one.
-    ///
-    /// Returns false on any tmux failure so a missing tmux doesn't suppress
-    /// alerts.
-    func watcherKeystrokesQueued() -> Bool {
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        let cap = Process()
-        cap.executableURL = URL(fileURLWithPath: tmuxPath)
-        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p"]
-        let pipe = Pipe()
-        cap.standardOutput = pipe
-        cap.standardError = FileHandle.nullDevice
-        do { try cap.run() } catch { return false }
-        cap.waitUntilExit()
-        if cap.terminationStatus != 0 { return false }
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Find the LAST line starting with "❯" — that's the current prompt.
-        // Past prompts in scrollback don't represent queued input.
-        //
-        // Match "❯" without requiring a trailing space: an EMPTY prompt is
-        // rendered as `❯ ` (prompt + space), but `trimmingCharacters` strips
-        // the trailing space → we'd miss the empty prompt and fall back to
-        // an earlier prompt-with-text in scrollback. Bug from PR #559 that
-        // caused continuous "queued in pane — skipping send" even on empty
-        // prompt. Fix: trim only LEADING whitespace; check `❯` prefix; the
-        // input portion is whatever follows.
-        var lastPromptInput: String? = nil
-        for line in out.split(separator: "\n") {
-            // Trim only leading whitespace (not trailing) so empty prompt
-            // `❯ ` is preserved as `❯ ` (prompt + space + nothing).
-            let leading = line.drop(while: { $0 == " " || $0 == "\t" })
-            if leading.hasPrefix("❯") {
-                // Drop the prompt char + any single space that follows it.
-                var rest = leading.dropFirst()  // drop "❯"
-                if rest.hasPrefix(" ") { rest = rest.dropFirst() }  // drop one space if present
-                lastPromptInput = String(rest)
-            }
-        }
-        guard let input = lastPromptInput else { return false }
-        return input.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
+    /// Type one line into a core pane through the shared sender
+    /// (`scripts/tmux-send-line.sh`), which owns the session check, the
+    /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
+    /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
+    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
+        if let w = skipIfQueued { args += ["--skip-if-queued", w] }
+        proc.arguments = args
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return 4 }
+        proc.waitUntilExit()
+        return proc.terminationStatus
     }
 
     /// Return the avatar image, badged per composite mode:
@@ -2628,6 +2552,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                       failVerb: "Core stop")
     }
 
+    /// Switch the core's model via scripts/switch-model.sh --confirm: the click is the
+    /// owner's instruction, and the script records only after the CLI accepts.
+    @objc func switchModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        notify("Sutando", "Switching core to \(sender.title)…")
+        runCoreAction(script: repoRoot + "/scripts/switch-model.sh",
+                      args: [model, "--confirm", "--session", "sutando-core", "--socket", sutandoTmuxSocket],
+                      okMessage: "Core switched to \(sender.title) — accepted by the CLI and saved as its default.",
+                      failVerb: "Model switch to \(sender.title)")
+    }
+
     /// Shared runner for core start/stop scripts: detached bash, stderr
     /// surfaced via notify on failure (same contract as restartCore).
     private func runCoreAction(script: String, args: [String],
@@ -2796,3 +2731,72 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory) // menu bar only, no dock icon
 app.run()
+
+extension AppDelegate: NSMenuDelegate {
+    static let modelChoicesManifest = "/skills/model-switch/manifest.json"
+    static let modelChoicesKey = "MODEL_SWITCH_CHOICES"
+
+    /// `id=Title;id=Title…` from the manifest's config block; nil when unreadable or empty.
+    func modelChoices() -> [(title: String, id: String)]? {
+        guard let data = FileManager.default.contents(atPath: repoRoot + AppDelegate.modelChoicesManifest),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cfg = root["config"] as? [String: Any],
+              let raw = cfg[AppDelegate.modelChoicesKey] as? String else { return nil }
+        let pairs = raw.split(separator: ";").compactMap { entry -> (title: String, id: String)? in
+            guard let eq = entry.firstIndex(of: "=") else { return nil }
+            let id = entry[..<eq].trimmingCharacters(in: .whitespaces)
+            let title = entry[entry.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            return (id.isEmpty || title.isEmpty) ? nil : (title: title, id: id)
+        }
+        return pairs.isEmpty ? nil : pairs
+    }
+
+    /// The model the switch script last recorded as accepted (state/model-switch.json).
+    func recordedModel() -> String? {
+        guard let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return root["model"] as? String
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === modelSubmenu else { return }
+        menu.removeAllItems()
+        let current = recordedModel()
+        if let choices = modelChoices() {
+            for c in choices {
+                let it = NSMenuItem(title: c.title, action: #selector(switchModel(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = c.id
+                it.state = (c.id == current) ? .on : .off
+                menu.addItem(it)
+            }
+        } else {
+            let it = NSMenuItem(title: "Choices unreadable: skills/model-switch/manifest.json", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let other = NSMenuItem(title: "Other model…", action: #selector(switchOtherModel), keyEquivalent: "")
+        other.target = self
+        menu.addItem(other)
+    }
+
+    /// Any id the owner types; the script still refuses one the CLI does not accept.
+    @objc func switchOtherModel() {
+        let alert = NSAlert()
+        alert.messageText = "Switch the core to which model?"
+        alert.informativeText = "An alias (opus, sonnet, fable) or a full id (claude-fable-5-1[1m]). The switch is recorded only after the CLI accepts it."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "model id"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Switch")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let model = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !model.isEmpty else { return }
+        let it = NSMenuItem(title: model, action: nil, keyEquivalent: "")
+        it.representedObject = model
+        switchModel(it)
+    }
+}

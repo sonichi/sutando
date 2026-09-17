@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Tests for skills/startup/scripts/verify-ceremony.py — the /startup step-3 gate.
+
+The failure it closes: cron registration done by hand (`CronCreate` from the crons.json list)
+passes every cheap check and never writes `schedule-crons-stamp.json`, so the desktop app's
+ceremony-health reads the session as never-completed and re-sends `/startup` every 10 minutes,
+indefinitely. The gate runs the same stamp-vs-session-boundary probe in-session so `/startup`
+cannot claim completion while the app would still call it diverged.
+
+Black-box: drives the real CLI in a subprocess. `SUTANDO_HOST_LABEL` makes the fixture host read
+as local, which is what lets the session boundary resolve from `state/session-starts.log`.
+"""
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+GATE = REPO / "skills" / "startup" / "scripts" / "verify-ceremony.py"
+HOST = "gate-test-host"
+ENTRIES = [{"name": "main-loop", "cron": "*/15 * * * *", "prompt_skill": "proactive-loop"}]
+
+# Subprocess coverage is opt-in in this repo (see runtime-cli-surface.test.py): under the
+# gate, run the child through `coverage run` so the repo-path arms measure the real file.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+
+
+def _workspace(root: Path, *, started_at: float, stamp_ts: float | None) -> Path:
+    ws = root / "workspace"
+    cfg = ws / "hosts" / HOST / "crons.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps(ENTRIES))
+    state = ws / "state"
+    state.mkdir()
+    (state / "session-starts.log").write_text(
+        json.dumps({"host": HOST, "session_started_at": started_at}) + "\n"
+    )
+    if stamp_ts is not None:
+        (cfg.parent / "schedule-crons-stamp.json").write_text(
+            json.dumps({"ts": stamp_ts, "registered": 1, "config_total": 1})
+        )
+    return ws
+
+
+def _run(ws: Path) -> subprocess.CompletedProcess:
+    env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
+    return subprocess.run(
+        PYBASE + [str(GATE), "--workspace", str(ws), "--host-label", HOST],
+        capture_output=True, text=True, env=env, timeout=60, cwd=REPO,
+    )
+
+
+class VerifyCeremonyGate(unittest.TestCase):
+    def test_stale_stamp_refuses_completion(self):
+        """The hand-rolled-registration case: stamp predates this session's launch."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=900_000.0)
+            r = _run(ws)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("predates this session", r.stderr)
+            self.assertIn("NOT complete", r.stderr)
+            self.assertIn("/schedule-crons", r.stderr)
+            self.assertNotIn("ok", r.stdout)
+
+    def test_no_stamp_refuses_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=None)
+            r = _run(ws)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("never stamped", r.stderr)
+
+    def test_fresh_stamp_passes(self):
+        """Stamp written after the boundary — /schedule-crons completed this boot."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
+            r = _run(ws)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("verify-ceremony: ok", r.stdout)
+
+    def test_stamp_write_flips_the_verdict(self):
+        """One workspace, both verdicts: proves the gate reads the stamp, not a constant."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=900_000.0)
+            self.assertEqual(_run(ws).returncode, 1)
+            (ws / "hosts" / HOST / "schedule-crons-stamp.json").write_text(
+                json.dumps({"ts": 1_000_300.0, "registered": 1, "config_total": 1})
+            )
+            self.assertEqual(_run(ws).returncode, 0)
+
+    def test_missing_probe_is_rc2_not_rc1(self):
+        """Copy-deployed tree: the script exists, src/health-check.py does not. Must be rc 2
+        ("cannot answer"), never rc 1 — rc 1 tells the agent to run /schedule-crons and retry,
+        which can never fix an unimportable probe and re-creates the re-send loop."""
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "copy"
+            dst = tree / "skills" / "startup" / "scripts" / "verify-ceremony.py"
+            dst.parent.mkdir(parents=True)
+            dst.write_text(GATE.read_text())
+            (tree / "src").mkdir()  # src/ present, health-check.py absent — the reviewer's second case
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
+            r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
+                               capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
+            self.assertIn("probe unavailable", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_probe_that_raises_at_import_is_rc2(self):
+        """The other half of the fix: the probe file EXISTS but fails to import. Must be rc 2,
+        no traceback — the same "cannot answer" verdict as a missing file."""
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "copy"
+            dst = tree / "skills" / "startup" / "scripts" / "verify-ceremony.py"
+            dst.parent.mkdir(parents=True)
+            dst.write_text(GATE.read_text())
+            (tree / "src").mkdir()
+            (tree / "src" / "health-check.py").write_text('raise RuntimeError("boom at import")\n')
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
+            r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
+                               capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
+            self.assertIn("probe unavailable", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+
+def _load_gate_module():
+    """Import the gate from its REPO path so coverage attributes the run to the real file —
+    the subprocess arms above copy it to a temp tree, which measures nothing in-repo."""
+    spec = importlib.util.spec_from_file_location("verify_ceremony", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class VerifyCeremonyGateInProcess(unittest.TestCase):
+    def _main_with_repo(self, repo: Path) -> tuple[int, str]:
+        mod = _load_gate_module()
+        mod.REPO = repo
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = mod.main(["--workspace", str(repo / "ws"), "--host-label", HOST])
+        return rc, err.getvalue()
+
+    def test_missing_probe_rc2_in_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("probe unavailable", err)
+
+    def test_raising_probe_rc2_in_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text('raise RuntimeError("boom at import")\n')
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("probe unavailable", err)
+            self.assertNotIn("Traceback", err)
+
+    def test_probe_exiting_at_import_is_rc2_in_process(self):
+        """`except SystemExit: pass` then no probe attribute → None → rc 2."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text("raise SystemExit(0)\n")
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+
+    def test_unloadable_spec_is_rc2_in_process(self):
+        """spec_from_file_location → None (unknown suffix) is guarded too; force it."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text("x = 1\n")
+            mod = _load_gate_module(); mod.REPO = repo
+            with mock.patch.object(mod.importlib.util, "spec_from_file_location", return_value=None):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = mod.main(["--workspace", str(repo / "ws"), "--host-label", HOST])
+            self.assertEqual(rc, 2, err.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

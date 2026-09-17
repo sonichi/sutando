@@ -21,22 +21,28 @@ sys.path.insert(0, str(REPO / "src"))
 import local_task_protocol as ltp  # noqa: E402
 
 
+def _stamp_pattern(key: str) -> "re.Pattern":
+    """The write signatures a producer actually emits. Split out so the shapes
+    can be tested against fixtures instead of only against the live tree."""
+    return re.compile(
+        rf"""["']{key}["']\s*[:=]\s*f?["']([a-z_]+)["']"""
+        rf"""|{key}:\s*([a-z_]+)\\n"""
+        rf"""|{key}:\s*([a-z_]+)`""")
+
+
 def _grep_stamped_values(key: str) -> set:
     """Every literal value producers stamp for `key:` across live writer
     code, Python AND TypeScript (the TS bridges are live stampers too).
 
     Write signatures only — quoted-key assignment ("access_tier":
-    "ambient"), header-line writes inside string literals ("access_tier:
-    ambient\\n" or backtick-terminated `access_tier: owner`), and unquoted
-    object-literal keys with quoted values (access_tier: 'owner'). Prose in
-    comments, `key: Type` annotations, and `.key === 'x'` comparisons match
+    "ambient") and header-line writes inside string literals ("access_tier:
+    ambient\\n" or backtick-terminated `access_tier: owner`). Prose in
+    comments, `key: Type` annotations, `.key === 'x'` comparisons, a
+    third-party call's options object ({ priority: 'high' }) and a struct
+    that merely carries the field (observability's Actor descriptor) match
     none of these, which is what keeps this a producer census rather than a
     word search."""
-    pat = re.compile(
-        rf"""["']{key}["']\s*[:=]\s*f?["']([a-z_]+)["']"""
-        rf"""|{key}:\s*([a-z_]+)\\n"""
-        rf"""|{key}:\s*([a-z_]+)`"""
-        rf"""|(?<![.\w"'`]){key}\s*:\s*['"]([a-z_]+)['"]""")
+    pat = _stamp_pattern(key)
     found = set()
     roots = [REPO / "src", REPO / "skills", REPO / "packages"]
     for root in roots:
@@ -51,6 +57,45 @@ def _grep_stamped_values(key: str) -> set:
                 for m in pat.finditer(text):
                     found.add(next(g for g in m.groups() if g))
     return found - {None}
+
+
+class TestStampPatternMatchesProducersOnly(unittest.TestCase):
+    """The census must count task-header writes and nothing that merely looks
+    like one. A third-party call's options object is the shape that slipped."""
+
+    def _found(self, text, key="priority"):
+        return {next(g for g in m.groups() if g)
+                for m in _stamp_pattern(key).finditer(text)}
+
+    def test_a_third_party_options_object_is_not_a_stamp(self):
+        # bodhi's notifyBackground takes priority?: 'normal' | 'high'. Counting
+        # it made the model look wrong when the dependency was simply obeyed.
+        text = ("session.notifyBackground(\n"
+                "  `A delegated task just finished. ...`,\n"
+                "  { priority: 'high' });\n")
+        self.assertEqual(self._found(text), set())
+
+    def test_a_struct_that_carries_the_field_is_not_a_stamp(self):
+        # src/observability/** builds Actor descriptors with access_tier, under
+        # its own AccessTier vocabulary ('owner'|'team'|'public'|'unknown').
+        text = ("const ACTOR = { user_id: 'core', channel: 'claude-code',\n"
+                "                access_tier: 'owner' as AccessTier, tenant_id: null };\n")
+        self.assertEqual(self._found(text, key="access_tier"), set())
+
+    def test_a_header_line_write_IS_a_stamp(self):
+        self.assertEqual(self._found('f"priority: urgent\\n"'), {"urgent"})
+
+    def test_a_backtick_header_write_IS_a_stamp(self):
+        self.assertEqual(self._found("`priority: low`"), {"low"})
+
+    def test_a_quoted_key_assignment_IS_a_stamp(self):
+        self.assertEqual(self._found("""{"priority": "normal"}"""), {"normal"})
+
+    def test_the_same_holds_for_access_tier(self):
+        self.assertEqual(self._found("route(msg, { access_tier: 'owner' })",
+                                     key="access_tier"), set())
+        self.assertEqual(self._found('f"access_tier: team\\n"',
+                                     key="access_tier"), {"team"})
 
 
 class TestVocabularyCoversLiveProducers(unittest.TestCase):

@@ -119,6 +119,9 @@ def _run_real_script(tmp, *args, mutate=None):
     if mutate is not None:
         src = mutate(src)
     (scripts / "read-quota.py").write_text(src)
+    (scripts / "quota_availability.py").write_text(
+        (REPO / "skills" / "quota-tracker" / "scripts" / "quota_availability.py").read_text()
+    )
     (tmp / "src" / "workspace_default.py").write_text(
         "from pathlib import Path\n"
         "def status_read_path(name):\n"
@@ -175,10 +178,15 @@ def test_control_reverted_call_site_fails_the_two_tests_above():
     """Control: with the call site back on the broken expression --gate must exit
     1, or the two call-site tests are not gating the defect at all."""
     def revert(src):
-        old = ('available = resolve_available(status, data.get("available"))'
-               ' and routed')
+        old = ('decision = availability_decision(\n'
+               '        data,\n'
+               '        base_url=os.environ.get("ANTHROPIC_BASE_URL"),\n'
+               '        stale=stale,\n'
+               '    )')
         assert old in src, "call site moved; update this control, do not delete it"
-        return src.replace(old, 'available = status == "allowed" and routed', 1)
+        broken = ('decision = {"routed": True, "available": status == "allowed", '
+                  '"unavailable_reason": None}')
+        return src.replace(old, broken, 1)
 
     with tempfile.TemporaryDirectory() as d:
         r = _run_real_script(Path(d), "--gate", mutate=revert)

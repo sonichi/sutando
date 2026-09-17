@@ -10,6 +10,7 @@
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -99,6 +100,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
+	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -294,6 +296,11 @@ export function _taskOrigin(taskId: string): TaskOrigin | null {
 	};
 }
 
+/** Id prefix minted by `submit_signal_room_task` (src/signal_room_tasks.py).
+ * Task-bridge delivers NO Signal Room result: the room daemon polls agent-api
+ * `GET /result/{id}` for its own. Kept in sync with the Python writer. */
+export const SIGNAL_TASK_PREFIX = 'task-signal-';
+
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
@@ -311,6 +318,9 @@ export function _taskOrigin(taskId: string): TaskOrigin | null {
  * Exported for unit testing — the watcher's setInterval body is otherwise
  * awkward to exercise in isolation. */
 export function _shouldFallthrough(file: string): boolean {
+	// Signal Room results belong to the room daemon's `/result` poll, not to
+	// voice. See SIGNAL_TASK_PREFIX and the dedicated branch in the watcher.
+	if (file.startsWith(SIGNAL_TASK_PREFIX)) return false;
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
 
@@ -397,8 +407,10 @@ export const workTool: ToolDefinition = {
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
+		// Skipped on Windows: shells out to /bin/sh + bash + invokes a .sh skill
+		// that isn't ported yet. The slow file-bridge path below still works.
 		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
-		if (concatMatch) {
+		if (concatMatch && process.platform !== 'win32') {
 			try {
 				const { execFileSync } = await import('node:child_process');
 				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
@@ -414,13 +426,30 @@ export const workTool: ToolDefinition = {
 			} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
 		}
 
-		// Check if the watcher (Claude Code brain) is running
+		// Check if the watcher (Claude Code brain) is running. The historic probe
+		// uses `pgrep -f watch-tasks` (POSIX only). On Windows we fall back to a
+		// PID-file sentinel written by src/watch-tasks-stream.ps1.
 		let watcherOnline = false;
 		try {
-			const { execFileSync } = await import('node:child_process');
-			// execFileSync argv array — no shell interpolation (fixes #1451)
-			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-			watcherOnline = !!watcherRunning;
+			if (process.platform === 'win32') {
+				const { existsSync, readFileSync } = await import('node:fs');
+				const pidFile = join(REPO_DIR, 'state', 'watch-tasks-stream.pid');
+				if (existsSync(pidFile)) {
+					const pid = parseInt(readFileSync(pidFile, 'utf-8').trim());
+					if (pid > 0) {
+						try {
+							// `process.kill(pid, 0)` is a liveness probe (signal 0); throws if process is gone.
+							process.kill(pid, 0);
+							watcherOnline = true;
+						} catch {}
+					}
+				}
+			} else {
+				const { execFileSync } = await import('node:child_process');
+				// execFileSync argv array — no shell interpolation (fixes #1451)
+				const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+				watcherOnline = !!watcherRunning;
+			}
 		} catch {
 			// pgrep returns exit code 1 if no match
 		}
@@ -614,7 +643,7 @@ export function getRecentConversation(count = 10): string {
 }
 
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
-const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
+const NOTE_VIEWING_FILE = join(tmpdir(), 'sutando-note-viewing.json');
 
 /** Mirrors `_ID_STATE` in task_archive.py. The instance label is interpolated
  *  with re.escape, so it is opaque — never assume `core-<digits>`. */
@@ -901,8 +930,8 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 				if (!result) continue;
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
-				// Was a third private copy that drifted: no /i, and `[^\]]*` accepted
-				// an empty `[deduped:]` Python rejects. One predicate now.
+				// Shared predicate, not a local regex: this grammar must stay identical to
+				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
@@ -1092,6 +1121,32 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}, 5_000);
 					continue;
 				}
+				// Signal Room: the room daemon polls agent-api `GET /result/{id}`, so
+				// task-bridge owns no delivery here. Falling through would speak
+				// untrusted room speech into the owner's private call, and the
+				// `foreignOrigin` path below would leave the files for a bridge that
+				// does not exist. Register the owner-visible Task row, then archive —
+				// `/result` falls back to find_archived_result, so a later poll by the
+				// daemon still finds the body.
+				if (taskId.startsWith(SIGNAL_TASK_PREFIX)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} is a Signal Room task; room daemon polls /result — archiving without voice`);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					try {
+						fetch('http://localhost:7843/task-done', {
+							method: 'POST',
+							headers: _apiHeaders(),
+							body: JSON.stringify({ taskId, result }),
+						}).catch(() => {});
+					} catch {}
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 10_000);
+					continue;
+				}
 				// Voice client offline → forward voice-task results to Discord DM
 				// via a proactive-result-*.txt file (poll_proactive in
 				// discord-bridge.py picks it up and DMs the owner). Skips files
@@ -1222,7 +1277,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			// unusual exceptions (not ENOENT) so a real file-system
 			// problem is observable, while still containing the throw.
 			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code && code !== 'ENOENT') {
+			if (code !== 'ENOENT') {
 				console.error(`${ts()} [TaskBridge] result-scan threw (non-fatal):`, err);
 			}
 		}

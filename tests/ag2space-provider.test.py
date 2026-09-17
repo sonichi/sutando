@@ -183,7 +183,9 @@ def main() -> int:
         # still-scripted {"ok": True} is never consumed.
         res = core.deliver_one("task-X", ENVELOPE)
         check("at the ceiling the item is PARKED, not retried forever",
-              res.status is DrainStatus.NOT_CLAIMED)
+              res.status is DrainStatus.TERMINAL)
+        check("and the ceiling is not reported as contention",
+              res.status is not DrainStatus.NOT_CLAIMED)
         check("a parked item refuses re-publish (operator holds it)",
               core.backend.publish("task-X", ENVELOPE) is False)
 

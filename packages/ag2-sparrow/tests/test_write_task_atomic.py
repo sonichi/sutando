@@ -9,6 +9,7 @@ import os
 import importlib
 import shlex
 import sys
+import json
 import pathlib
 import tempfile
 
@@ -41,13 +42,14 @@ def test_write_task_publishes_atomically_and_completely():
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
         m = _load(base)
-        tid = m._write_task(_task())
+        tid, durable = m._write_task(_task())
         dest = m.TASKS_DIR / f"{tid}.txt"
         assert tid == "task-1784500000000"
+        assert durable, "a committed queue write must be ackable as durable"
         assert dest.exists(), "task file must be published"
         # No temp sidecar left behind — the tmp+rename must have completed.
-        assert not (dest.with_suffix(".txt.tmp")).exists()
-        # The watcher globs task-*.txt; the tmp name (…​.txt.tmp) must not match it.
+        assert not list(m.TASKS_DIR.glob(f"{tid}.txt.*.tmp"))
+        # The watcher globs task-*.txt; the staged name (.txt.<pid>.<uuid>.tmp) must not match.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
@@ -74,21 +76,17 @@ def test_write_task_never_leaves_partial_file_on_publish_crash():
         m = _load(base)
         tid = "task-1784500000001"
         dest = m.TASKS_DIR / f"{tid}.txt"
-        orig_rename = pathlib.Path.rename
+        orig_replace = m.os.replace
 
-        def boom(self, target):
+        def boom(src, target):
             raise OSError("simulated crash at publish")
 
-        pathlib.Path.rename = boom
+        m.os.replace = boom
         try:
-            raised = False
-            try:
-                m._write_task(_task(tid))
-            except OSError:
-                raised = True
-            assert raised, "a failed publish must surface, not silently succeed"
+            assert m._write_task(_task(tid)) is None, (
+                "a failed publish must report failure, not a queued task")
         finally:
-            pathlib.Path.rename = orig_rename
+            m.os.replace = orig_replace
         # The watcher-visible .txt must NOT exist — only nothing or a .tmp sidecar.
         assert not dest.exists(), "partial task must never be visible to the watcher"
         print("PASS test_write_task_never_leaves_partial_file_on_publish_crash")
@@ -101,14 +99,14 @@ def test_write_task_is_idempotent_under_redelivery():
         base = pathlib.Path(d)
         m = _load(base)
         t = _task("task-1784500000002")
-        tid1 = m._write_task(t)
+        tid1, _ = m._write_task(t)
         first = (m.TASKS_DIR / f"{tid1}.txt").read_text()
         # Redeliver the SAME id with a DIFFERENT body: the guard must skip the
         # rewrite entirely (return the id, leave the queued file byte-for-byte).
         # A modified body proves the guard fired — an identical body could pass
         # even with no guard at all.
         redelivered = dict(t, task="[AG2Space qingyun] TAMPERED redelivery body")
-        tid2 = m._write_task(redelivered)
+        tid2, _ = m._write_task(redelivered)
         assert tid1 == tid2
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [m.TASKS_DIR / f"{tid1}.txt"]
         # Untouched — the original queued content wins, not the redelivery.
@@ -129,7 +127,7 @@ def test_write_task_does_not_reexecute_a_completed_task():
         arch = m.TASKS_DIR / "archive"
         arch.mkdir(parents=True, exist_ok=True)
         (arch / f"{tid}.txt").write_text(f"id: {tid}\ntask: handled earlier\n")
-        assert m._write_task(_task(tid)) == tid
+        assert m._write_task(_task(tid)) == (tid, True)
         # NOT re-queued — nothing live for the watcher to execute a second time.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == []
         rfile = m.RESULTS_DIR / f"{tid}.txt"
@@ -142,7 +140,7 @@ def test_write_task_does_not_reexecute_a_completed_task():
         tid = "task-1784500000011"
         m.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         (m.ARCHIVE_RESULTS_DIR / f"{tid}-1784500000999.txt").write_text("earlier reply\n")
-        assert m._write_task(_task(tid)) == tid
+        assert m._write_task(_task(tid)) == (tid, True)
         assert list(m.TASKS_DIR.glob("task-*.txt")) == []
         rfile = m.RESULTS_DIR / f"{tid}.txt"
         assert rfile.exists() and rfile.read_text().startswith("[no-send]")
@@ -168,7 +166,7 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         malicious_chan = "!room'; touch /tmp/ag2sparrow_pwned; #"
         t = _task("task-1784500000020")
         t["channel_id"] = malicious_chan
-        tid = m._write_task(t)
+        tid, _ = m._write_task(t)
         body = (m.TASKS_DIR / f"{tid}.txt").read_text()
         context_line = next(ln for ln in body.splitlines() if "room_ops.py read" in ln)
         context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]
@@ -181,6 +179,96 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
 
 
+def test_a_present_but_unusable_picker_stamp_is_written_as_refused():
+    """kewei on #4216: `picker_command: null` is PRESENT and unusable. Dropping
+    it let the reader fall through to the legacy prose sentence and act on an
+    intent nobody stamped; docs/remote-gateway-protocol.md says an unusable
+    stamp is refused. Absent stays absent; present-null and present-empty both
+    reach the reader as the refused stamp."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        sentence = "Add a new worker to the pool (worker picker '+' button): grow the pool."
+
+        def body(tid, **extra):
+            t = {**_task(tid), "task": sentence, "source": "worker-picker", **extra}
+            assert m._write_task(t) is not None, "the writer refused the task itself"
+            return (pathlib.Path(d) / "tasks" / f"{tid}.txt").read_text()
+
+        absent = body("task-1784500000001")
+        assert "picker_command:" not in absent, "an absent stamp must not be invented"
+
+        for tid, value, label in (("task-1784500000002", None, "null"),
+                                  ("task-1784500000003", "", "empty")):
+            text = body(tid, picker_command=value)
+            assert "picker_command: \n" in text or text.rstrip().endswith("picker_command:"), (
+                f"a present-{label} stamp must be written as the refused stamp, got: "
+                f"{[l for l in text.splitlines() if l.startswith('picker_command')]}")
+
+        # And the reader agrees: the refused stamp is not an action.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "wpc", pathlib.Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts/worker_picker_commands.py")
+        if spec and spec.loader and spec.origin and pathlib.Path(spec.origin).exists():
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
+            wpc = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(wpc)
+            refused = wpc.parse({"source": "worker-picker", "channel_id": "!r:x",
+                                 "picker_command": ""}, sentence)
+            assert refused is None or refused.get("action") != "add", (
+                f"the refused stamp still produced an action: {refused}")
+        print("PASS test_a_present_but_unusable_picker_stamp_is_written_as_refused")
+
+
+def test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp():
+    """A present-but-unusable `picker_args` must reach the reader as a stamp it
+    can refuse by name. Dropping it turned `picker_command: add` plus
+    `picker_args: null` into a valid argument-less add, which
+    docs/remote-gateway-protocol.md refuses: args that are not an object are
+    refused by name, never resolved from the sentence.
+
+    The reader half is NOT asserted here: worker_picker_commands.py does not
+    exist at this head or on main, so a reader assertion would be a block that
+    silently skips and reads as proof. The writer is what this PR owns.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        sentence = "Add a new worker to the pool (worker picker '+' button): grow the pool."
+
+        def emitted(tid, **extra):
+            t = {**_task(tid), "task": sentence, "source": "worker-picker", **extra}
+            assert m._write_task(t) is not None, "the writer refused the task itself"
+            text = (pathlib.Path(d) / "tasks" / f"{tid}.txt").read_text()
+            return [l for l in text.splitlines() if l.startswith("picker_args")]
+
+        # Absent stays absent: the writer must not invent a stamp nobody sent.
+        assert emitted("task-1784600000001") == [], "an absent picker_args was invented"
+
+        # Every PRESENT value is preserved, so the reader can refuse it by name.
+        cases = (
+            ("task-1784600000002", None, "picker_args:"),
+            ("task-1784600000003", "", "picker_args:"),
+            ("task-1784600000004", " ", "picker_args:"),
+            ("task-1784600000005", "null", "picker_args: null"),
+        )
+        for tid, value, want in cases:
+            got = emitted(tid, picker_args=value)
+            assert len(got) == 1, f"present {value!r} emitted {got} — a present stamp must be kept"
+            assert got[0].rstrip() == want.rstrip(), f"present {value!r} -> {got[0]!r}, want {want!r}"
+            # The Python repr of None must never reach the wire as a value.
+            assert got[0].strip() != "picker_args: None", f"{value!r} leaked a Python repr"
+
+        # An object or array still round-trips as JSON the reader can parse; an
+        # array is not an object, so the READER refuses it — the writer preserves.
+        for tid, value in (("task-1784600000006", {"worker": "w1"}),
+                           ("task-1784600000007", ["w1"])):
+            got = emitted(tid, picker_args=value)
+            assert len(got) == 1, f"{value!r} emitted {got}"
+            payload = got[0].split(":", 1)[1].strip()
+            assert json.loads(payload) == value, f"{value!r} did not round-trip: {payload!r}"
+
+        print("PASS test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp")
+
+
 if __name__ == "__main__":
     test_write_task_publishes_atomically_and_completely()
     test_write_task_never_leaves_partial_file_on_publish_crash()
@@ -188,4 +276,6 @@ if __name__ == "__main__":
     test_write_task_does_not_reexecute_a_completed_task()
     test_write_task_drops_unsafe_and_idless()
     test_write_task_shell_quotes_channel_id_in_skill_instructions()
+    test_a_present_but_unusable_picker_stamp_is_written_as_refused()
+    test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp()
     print("ALL PASS test_write_task_atomic")

@@ -94,7 +94,7 @@ echo "$out" | grep -q "prep-ready" && say ok "prep-ready reason" || say FAIL "pr
 [ -f "$WS1/state/restart-ready.json" ] && say ok "ready sentinel written" || say FAIL "ready sentinel written"
 grep -q '"restart_id":"grp-' "$WS1/state/restart-ready.json" 2>/dev/null \
   && say ok "sentinel carries restart_id" || say FAIL "sentinel carries restart_id"
-echo "$out" | grep -q "no task-queue handoff" && say ok "direct invocation logged" || say FAIL "direct invocation logged"
+echo "$out" | grep -q "orchestrator-side" && say ok "orchestrator-side prep logged" || say FAIL "orchestrator-side prep logged"
 
 echo "2. busy core (fresh running status) → orchestrator WAITS, proceeds after idle flip"
 WS2="$TMP/ws2"; mkws "$WS2"
@@ -559,6 +559,133 @@ kill "$k18" 2>/dev/null || true; wait "$k18" 2>/dev/null || true
 grep -q "would exec" "$TMP/ws18.out" \
   && say ok "absent status = nothing running = proceed" \
   || say FAIL "absent status now blocks the restart — the empty-read fix over-reached"
+
+echo "19. the phase stream is PERSISTED to logs/graceful-restart.log (the app pipes stdout only into itself)"
+WS19="$TMP/ws19"; mkws "$WS19"
+out="$(GR_WS="$WS19" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"
+rid="$(printf '%s\n' "$out" | sed -n 's/^graceful-restart\[\(grp-[0-9]*-[0-9]*\)\].*/\1/p' | head -1)"
+LOG19="$WS19/logs/graceful-restart.log"
+[ -f "$LOG19" ] \
+  && say ok "log file created under the workspace" \
+  || say FAIL "no $LOG19 — the stream still lives only in the caller's pipe"
+[ -n "$rid" ] && grep -q "graceful-restart\[$rid\]: DRY-RUN — would exec" "$LOG19" 2>/dev/null \
+  && say ok "the decision line landed on disk, scoped to this run's RID ($rid)" \
+  || say FAIL "decision line for rid='$rid' missing from the log"
+grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z graceful-restart\[' "$LOG19" 2>/dev/null \
+  && say ok "persisted lines are UTC-timestamped" \
+  || say FAIL "persisted lines carry no timestamp"
+# stdout is a contract with main.swift's phase matcher: no timestamp may leak into it.
+if printf '%s\n' "$out" | grep -q '^graceful-restart\[' && ! printf '%s\n' "$out" | grep -q '^[0-9]\{4\}-[0-9]\{2\}-'; then
+  say ok "stdout shape unchanged (no timestamp prefix in the app's phase stream)"
+else
+  say FAIL "stdout shape changed — main.swift's restartPhaseMessage matcher may break"
+fi
+n_out="$(printf '%s\n' "$out" | grep -c '^graceful-restart\[')"
+n_log="$(grep -c "graceful-restart\[$rid\]" "$LOG19" 2>/dev/null || echo 0)"
+[ "$n_out" -gt 0 ] && [ "$n_out" = "$n_log" ] \
+  && say ok "every stdout phase line ($n_out) has a disk twin" \
+  || say FAIL "stdout has $n_out phase lines, disk has $n_log — one side is missing a line"
+GR_WS="$WS19" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run >/dev/null 2>&1
+grep -q "graceful-restart\[$rid\]" "$LOG19" \
+  && say ok "a later run APPENDS — the earlier run's trace survives" \
+  || say FAIL "the second run truncated the first run's trace"
+echo "20. a LIVE core is handed a drain TASK before the gate; it is retired before the exec"
+# Owner rule 2026-09-03: "a busy core may never read the task" justifies the .alive
+# fallback, not skipping the task. A real run (stub launcher) so the write is visible.
+WS20="$TMP/ws20"; mkws "$WS20"
+printf '{"status":"running","step":"x","ts":%s}\n' "$(date +%s)" > "$WS20/state/core-status.json"
+stub20="$TMP/stub20-start-cli.sh"
+cat > "$stub20" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$@" > "$STUB_ARGV_OUT"
+STUB
+chmod +x "$stub20"
+# A fake core: stays busy until the drain task appears, keeps a copy, then goes idle.
+( for _ in $(seq 1 40); do
+    f="$(ls "$WS20"/tasks/task-restart-prep-*.txt 2>/dev/null | head -1)"
+    if [ -n "$f" ]; then
+      cp "$f" "$TMP/ws20.task"
+      # The core-side half of the contract: answer the drain task in results/.
+      mkdir -p "$WS20/results"
+      printf 'nothing in flight (test)\n' > "$WS20/results/$(basename "$f")"
+      break
+    fi
+    touch "$WS20/state/cores/$HOST.alive"; sleep 0.5
+  done
+  printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS20/state/core-status.json" ) &
+core20=$!
+STUB_ARGV_OUT="$TMP/ws20.argv" GR_START_CLI="$stub20" GR_WS="$WS20" GR_SYNC_CMD="true" \
+  GR_POLL_S=1 bash "$GR" > "$TMP/ws20.out" 2>&1 || true
+wait "$core20" 2>/dev/null
+rid20="$(sed -n 's/^graceful-restart\[\(grp-[0-9]*-[0-9]*\)\].*/\1/p' "$TMP/ws20.out" | head -1)"
+[ -s "$TMP/ws20.task" ] \
+  && say ok "the core received a drain task while the gate was waiting" \
+  || say FAIL "no drain task reached the core (gate waited on status alone)"
+grep -q "^id: task-restart-prep-$rid20$" "$TMP/ws20.task" 2>/dev/null \
+  && say ok "task id is scoped to this run's RID ($rid20)" \
+  || say FAIL "task id not scoped to $rid20: $(head -1 "$TMP/ws20.task" 2>/dev/null)"
+grep -q "^priority: urgent$" "$TMP/ws20.task" 2>/dev/null && grep -q "^access_tier: owner$" "$TMP/ws20.task" 2>/dev/null \
+  && say ok "urgent + owner-tier, so the queue serves it first with full capability" \
+  || say FAIL "task headers wrong: $(grep -E '^(priority|access_tier):' "$TMP/ws20.task" 2>/dev/null | tr '\n' ' ')"
+grep -q "^task: RESTART_PREP: $rid20" "$TMP/ws20.task" 2>/dev/null && grep -q "task:.*core-status.sh idle" "$TMP/ws20.task" \
+  && say ok "the body tells the core the one action that opens the gate (status idle)" \
+  || say FAIL "task body does not carry the RESTART_PREP contract"
+grep -q "restart" "$TMP/ws20.argv" 2>/dev/null \
+  && say ok "and the restart proceeded once the core went idle" \
+  || say FAIL "the launcher stub was never exec'd"
+[ -f "$WS20/tasks/archive/task-restart-prep-$rid20.txt" ] && [ ! -f "$WS20/tasks/task-restart-prep-$rid20.txt" ] \
+  && say ok "the drain task was retired to tasks/archive/ before the exec (no orphan for the next boot)" \
+  || say FAIL "drain task not retired: live=$(ls "$WS20"/tasks/task-restart-prep-* 2>/dev/null) archive=$(ls "$WS20"/tasks/archive/ 2>/dev/null)"
+[ -f "$WS20/results/archive/task-restart-prep-$rid20.txt" ] && [ ! -f "$WS20/results/task-restart-prep-$rid20.txt" ] \
+  && grep -q "drain result: nothing in flight (test)" "$TMP/ws20.out" \
+  && say ok "the core's drain RESULT is logged and archived with the task (no bridge would ever collect it)" \
+  || say FAIL "drain result stranded: live=$(ls "$WS20"/results/task-restart-prep-* 2>/dev/null) archive=$(ls "$WS20"/results/archive/ 2>/dev/null) logged=$(grep -c 'drain result:' "$TMP/ws20.out")"
+
+WS20b="$TMP/ws20b"; mkws "$WS20b"; rm -f "$WS20b/state/cores/$HOST.alive"   # DEAD core
+STUB_ARGV_OUT="$TMP/ws20b.argv" GR_START_CLI="$stub20" GR_WS="$WS20b" GR_SYNC_CMD="true" \
+  GR_POLL_S=1 bash "$GR" > "$TMP/ws20b.out" 2>&1 || true
+[ -z "$(ls "$WS20b"/tasks/task-restart-prep-* "$WS20b"/tasks/archive/task-restart-prep-* 2>/dev/null)" ] \
+  && say ok "CONTROL: a DEAD core gets no drain task (nobody would read it)" \
+  || say FAIL "a drain task was written for a dead core"
+
+WS20c="$TMP/ws20c"; mkws "$WS20c"
+out20c="$(GR_WS="$WS20c" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"
+[ -z "$(ls "$WS20c"/tasks/task-restart-prep-* 2>/dev/null)" ] && echo "$out20c" | grep -q "would write the drain task" \
+  && say ok "CONTROL: a dry run names the task it would write and writes nothing (a rehearsal must not drain a live core)" \
+  || say FAIL "dry run wrote a task or did not say so"
+
+WS20d="$TMP/ws20d"; mkws "$WS20d"
+printf '{"status":"running","step":"x","ts":%s}\n' "$(date +%s)" > "$WS20d/state/core-status.json"
+( sleep 2; printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS20d/state/core-status.json" ) &
+flip20d=$!
+GR_WS="$WS20d" GR_SYNC_CMD="false" GR_POLL_S=1 bash "$GR" > "$TMP/ws20d.out" 2>&1; rc20d=$?
+wait "$flip20d" 2>/dev/null
+if [ "$rc20d" = 3 ] && [ -z "$(ls "$WS20d"/tasks/task-restart-prep-* 2>/dev/null)" ]; then
+  say ok "prep FAILURE (exit 3) still retires the drain task — the core is not left told to stay idle"
+else
+  say FAIL "exit $rc20d and live task(s): $(ls "$WS20d"/tasks/ 2>/dev/null | tr '\n' ' ')"
+fi
+
+echo "20e. everything cleanup_lock calls is DEFINED before the traps that call it are armed"
+# yixuan-ag2 on #3823: retire_prep_task was defined 60 lines after `trap cleanup_lock EXIT`,
+# so a TERM in that window exited 127 (command not found) instead of 143.
+def_line="$(grep -n '^retire_prep_task()' "$GR" | head -1 | cut -d: -f1)"
+trap_line="$(grep -n '^trap cleanup_lock EXIT' "$GR" | head -1 | cut -d: -f1)"
+pt_line="$(grep -n '^PREP_TASK=' "$GR" | head -1 | cut -d: -f1)"
+if [ -n "$def_line" ] && [ -n "$trap_line" ] && [ "$def_line" -lt "$trap_line" ] && [ "$pt_line" -lt "$trap_line" ]; then
+  say ok "retire_prep_task (line $def_line) and PREP_TASK (line $pt_line) precede the EXIT trap (line $trap_line)"
+else
+  say FAIL "ordering: retire_prep_task=$def_line PREP_TASK=$pt_line trap=$trap_line — a TERM before the definition exits 127"
+fi
+# behavioural control: a TERM delivered as early as bash allows still exits 143 and leaves no task behind
+WS20e="$TMP/ws20e"; mkws "$WS20e"
+printf '{"status":"running","step":"x","ts":%s}\n' "$(date +%s)" > "$WS20e/state/core-status.json"
+GR_WS="$WS20e" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" > "$TMP/ws20e.out" 2>&1 &
+gr20e=$!
+sleep 0.3; kill -TERM "$gr20e" 2>/dev/null; wait "$gr20e" 2>/dev/null; rc20e=$?
+[ "$rc20e" = 143 ] && ! grep -q "command not found" "$TMP/ws20e.out" \
+  && say ok "TERM 0.3s in -> exit 143, no 'command not found'" \
+  || say FAIL "early TERM -> exit $rc20e: $(grep -i 'not found' "$TMP/ws20e.out" | head -1)"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"

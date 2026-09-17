@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A `[channel:]` body implies a BRIDGE, and three adapters each re-derived it.
+r"""A `[channel:]` body implies a BRIDGE, and three adapters each re-derived it.
 
 The filename layer (`.to-<channel>`) already had one owner in proactive_routing.
 The BODY marker did not: slack-bridge and telegram-bridge each carried

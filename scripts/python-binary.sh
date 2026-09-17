@@ -26,8 +26,9 @@
 # ORDER (matches scripts/sutando-config.sh and src/agent/claude/cli/start-cli.sh):
 #   1. $SUTANDO_PY            — explicit override, set by the desktop launcher
 #   2. bundled relocatable    — <engine>/runtime/python/bin/python3
-#   3. PATH python3           — but ONLY if it is not the stub
-#   4. nothing                — caller must SKIP, never shell the stub
+#   3. Windows PATH candidates — python3 → py → python, functionally probed
+#   4. Unix PATH python3      — but on macOS ONLY if it is not the CLT stub
+#   5. nothing                — caller must SKIP, never shell the stub
 #
 # Usage:
 #   . "$REPO/scripts/python-binary.sh"
@@ -72,6 +73,25 @@ resolve_python() {
 		return 0
 	fi
 
+	_sutando_safe_path_python
+}
+
+# Echo every safe PATH interpreter in preference order, one per line.
+_sutando_safe_path_pythons() {
+	# Windows aliases are safe to probe; keep every runnable candidate so
+	# module-aware callers can continue past one that lacks their dependency.
+	case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
+		msys*|cygwin*|win32*|mingw*|MINGW*|MSYS*|CYGWIN*)
+			for _candidate in python3 py python; do
+				_candidate_path="$(command -v "$_candidate" 2>/dev/null)" || _candidate_path=""
+				if [ -n "$_candidate_path" ] && "$_candidate_path" -c "pass" >/dev/null 2>&1; then
+					printf '%s\n' "$_candidate_path"
+				fi
+			done
+			return 0
+			;;
+	esac
+
 	_path_py="$(command -v python3 2>/dev/null)" || _path_py=""
 	[ -n "$_path_py" ] || return 0
 
@@ -93,21 +113,69 @@ resolve_python() {
 		*) _is_mac=0 ;;
 	esac
 	if [ "$_is_mac" -ne 1 ]; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 		return 0
 	fi
 
 	# Homebrew / python.org / pyenv — a real interpreter, use it as-is with no
 	# toolchain requirement.
 	if ! _sutando_is_system_stub "$_path_py"; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 		return 0
 	fi
 
 	# It IS the system location. Only safe if the tools are actually installed.
 	if _sutando_developer_tools_installed; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 	fi
+	return 0
+}
+
+# Echo the first safe PATH interpreter, or NOTHING.
+_sutando_safe_path_python() {
+	while IFS= read -r _candidate_path; do
+		[ -n "$_candidate_path" ] || continue
+		printf '%s' "$_candidate_path"
+		return 0
+	done <<_SUTANDO_PYTHONS
+$(_sutando_safe_path_pythons)
+_SUTANDO_PYTHONS
+	return 0
+}
+
+# Echo a runnable python3 that can `import $2`, or NOTHING. Same candidate order
+# and same stub rules as resolve_python, but a candidate that cannot import the
+# module is SKIPPED rather than returned.
+#
+# resolve_python answers "which interpreter runs", which is a different question
+# from "which interpreter runs THIS". A bundled runtime without a channel's
+# third-party dep satisfies the first and fails the second, and a caller that
+# probes only the first answer concludes no interpreter exists while a usable
+# one sits further down the same list.
+#
+# $1 = repo root. $2 = module the caller needs (e.g. slack_bolt).
+resolve_python_for_module() {
+	_repo="${1:-.}"
+	_mod="${2:-}"
+	[ -n "$_mod" ] || { resolve_python "$_repo"; return 0; }
+
+	for _cand in "${SUTANDO_PY:-}" "$_repo/../runtime/python/bin/python3"; do
+		[ -n "$_cand" ] && [ -x "$_cand" ] || continue
+		if "$_cand" -c "import $_mod" >/dev/null 2>&1; then
+			printf '%s' "$_cand"
+			return 0
+		fi
+	done
+
+	while IFS= read -r _cand; do
+		[ -n "$_cand" ] || continue
+		if "$_cand" -c "import $_mod" >/dev/null 2>&1; then
+			printf '%s' "$_cand"
+			return 0
+		fi
+	done <<_SUTANDO_PYTHONS
+$(_sutando_safe_path_pythons)
+_SUTANDO_PYTHONS
 	return 0
 }
 
@@ -126,6 +194,8 @@ require_python() {
 	{
 		printf 'sutando: no runnable python3 — cannot %s\n' "${2:-continue}"
 		printf '  Tried: $SUTANDO_PY, %s/../runtime/python/bin/python3, then PATH.\n' "${1:-.}"
+		printf '  On Windows, install CPython from python.org so `py` or `python`\n'
+		printf '  runs; the Microsoft Store python3 alias is rejected.\n'
 		printf '  On macOS a PATH python3 is only used when the developer tools are\n'
 		printf '  installed, because the system python3 is otherwise the Xcode-CLT\n'
 		printf '  stub (one inode hardlinked across 78 names, incl. git and swiftc)\n'

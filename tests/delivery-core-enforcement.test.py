@@ -4,7 +4,9 @@ seam doc v0.2.1 riders):
 
 1. Cross-incarnation key identity — recovery/re-claim must not mint a new
    delivery idempotency key: the provider sees the SAME key from a second
-   incarnation (different worker/pid) as from the first.
+   incarnation (different worker/pid) as from the first. A DELIBERATE operator
+   requeue is the one sanctioned exception (contract rule 1 binds claim,
+   restart and migration; resend_epoch is the stated variation point).
 2. Static no-claim-material-in-key scan — AST over delivery_core: the
    idempotency_key function may reference only item_id + resend_epoch, and
    every provider.deliver call site passes a key derived from it.
@@ -92,7 +94,7 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
                 self.assertNotIn(material, provider.keys[0],
                                  "claim material leaked into the key")
 
-    def test_key_stable_across_park_and_redrive(self):
+    def test_operator_requeue_mints_a_new_key(self):
         with tempfile.TemporaryDirectory(prefix="enf-key2-") as td:
             backend = DesignAClaimBackend(Path(td), reclaim_ttl_s=0.0)
             backend.publish(ITEM, b"x")
@@ -110,8 +112,13 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
             self.assertTrue(p1.keys and p2.keys,
                             "neither provider was called — the comparison "
                             "below would pass on two empty lists")
-            self.assertEqual(p1.keys, p2.keys,
-                             "park -> re-drive changed the idempotency key")
+            self.assertNotEqual(
+                p1.keys, p2.keys,
+                "an operator requeue must present a NEW key: reusing the parked "
+                "attempt's key lets the provider dedupe the re-send away, which "
+                "is the silent non-delivery requeue exists to fix")
+            self.assertEqual(p1.keys, [f"{ITEM}#0"])
+            self.assertEqual(p2.keys, [f"{ITEM}#1"])
 
 
 class StaticKeyScan(unittest.TestCase):

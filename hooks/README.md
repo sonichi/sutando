@@ -155,7 +155,19 @@ denied); non-Gmail tools are a no-op, so it is safe under a broad matcher.
 Escape hatch: `SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES=1` lifts the guard (for
 if/when the connector's scopes are fixed upstream). Fail-OPEN on hook errors.
 
-### Deploy (per node)
+### Registration
+
+**Auto-registered** for every core session: `start-cli.sh` passes this hook to
+`src/agent/claude/cli/build-core-settings.mjs`, which registers it under
+`PreToolUse` with matcher `mcp__.*[Gg][Mm][Aa][Ii][Ll].*` in the `--settings`
+JSON. Nothing to install per node.
+
+The registration rides `--settings` rather than a written `settings.json`, so it
+survives an app update that replaces the engine tree (the failure mode issue
+#3221 describes for the `install-claude-hooks.sh` set).
+
+To register it in a non-core session (e.g. an interactive Claude Code), add the
+same `PreToolUse` entry to `~/.claude/settings.json` by hand:
 
 ```bash
 cp hooks/gmail-write-guard.py ~/.claude/hooks/
@@ -172,6 +184,76 @@ PY
 ```
 
 Test: `python3 tests/gmail-write-guard.test.py`.
+
+## `review-authority-guard.py`
+
+Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /
+`--request-changes` (and `--comment` under `hold`), or `gh api .../pulls/N/reviews`
+carrying `APPROVE` / `REQUEST_CHANGES` — while the owner's standing answer on
+review authority is unresolved. An APPROVE moves a merge gate, and merges are
+the owner's; verifying a change carefully is not authorization to vote on it.
+The mode lives in `<workspace>/state/authority.json`:
+An owner who ruled *verbally* has no file yet, so that ruling reads as `hold` until someone writes it — register the file on the node whose owner already answered.
+
+```json
+{"github_formal_review": "hold" | "findings-only" | "allow"}
+```
+
+A missing file means `findings-only`: the votes stay denied until the owner
+rules, while a COMMENTED review — which moves no gate and is the durable place
+a finding lives — stays possible. A file that is present but unreadable, or
+carries an unknown mode, means `hold` (a ruling was written and cannot be read,
+so the restrictive reading applies). Never gated: review dismissals (a
+reduction of standing), `gh pr comment`, `--comment` under `findings-only`, and
+every non-review command. Compound commands are split per segment so an earlier
+benign `gh` cannot shadow a later review; `bash -c "..."` / `sh -c` / `eval`
+wrappers are re-classified on their quoted command.
+
+Escape hatch: `SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1`. Fail-OPEN on hook errors.
+
+### Registration
+
+Not auto-registered. Deploy per node into `$CLAUDE_CONFIG_DIR` and add a
+`PreToolUse` entry with matcher `Bash`, the same way as the manual block under
+`gmail-write-guard.py` above (command: `python3 <deployed path>/review-authority-guard.py`).
+In-repo the hook resolves the workspace through `workspace_default.resolve_workspace`;
+a deployed copy searches upward for `state/authority.json`. Set
+`SUTANDO_HOOK_WORKSPACE=<workspace>` to pin it.
+
+Test: `python3 tests/review-authority-guard.test.py`.
+
+## `release-target-guard.py`
+
+DENIES `gh release create|edit` whose `--target` is an abbreviated commit SHA
+(7-39 hex characters). GitHub answers `Release.target_commitish is invalid` and
+creates nothing, so the release reads as cut at the moment it did not happen.
+A full 40-character SHA and a branch/tag name both pass.
+
+It exists because the rule is easy to know and useless to know: the value is not
+chosen, it is pasted from whatever printed last, and every tool prints the
+abbreviated form. Measured twice in fourteen hours on one host, with the
+correction written into the build log between the two occurrences.
+
+### Deploy (per node)
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/release-target-guard.py "$CFG/hooks/"
+```
+
+Register it under the `Bash` PreToolUse matcher exactly as the guards above do
+(same `shlex.quote` recipe — these paths routinely contain a space).
+
+Escape hatch: `SUTANDO_SKIP_RELEASE_TARGET_GUARD=1`. Fail-open on any internal
+error, like every guard here.
+
+Scope: it sees only literal text. `--target "$(git rev-parse --short HEAD)"`
+is allowed, because the value is unknowable before execution — and that is a
+very plausible way to produce this bug. The guard bounds pasted values, not
+computed ones.
+
+Tests: `python3 tests/release-target-guard.test.py`
 
 ## `result-file-marker-guard.py`
 
@@ -264,3 +346,91 @@ printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.tx
 ```
 
 Tests: `python3 tests/result-file-marker-guard.test.py`
+
+## `comment-signature-guard.py`
+
+Denies a `gh pr comment` / `gh issue comment` / `gh pr create` / `gh issue create`
+whose body carries no agent MXID. Attribution under a shared GitHub login rests on
+the body signature — the login cannot tell two agents apart and the commit email is
+many-to-one — and nothing enforced it.
+
+The check matches the **MXID**, never the surrounding prose: measured across three
+PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the newer
+`— name (@<mxid>)`, so a wording-keyed check sees 2 of 41.
+
+- `SUTANDO_AGENT_MXID` — the identity to require. **No default.** Unset means the
+  guard does not enforce and says so once on stderr, so a node cannot silently
+  inherit another agent's identity and deny every comment it writes.
+- `SUTANDO_ALLOW_UNSIGNED_COMMENT=1` — one-shot override.
+
+**Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
+the same login and is outside the subcommand set, as is a body read from stdin
+(`-F -`). Both are deliberate — the guard reads a body it can see.
+
+## `memory-index-guard.py`
+
+Denies an `Edit` or `Write` to `MEMORY.md` that would silently push an already-loading
+index row past the session read-budget cut — via
+`skills/proactive-loop/scripts/memory-index-budget.py`, for **any** caller, not only the
+skills whose own checklist remembers to chain step 7.5.
+
+Same architectural move as `gh-policy-gate.py`: enforcement moves from "a step I remember
+to chain" to the action itself. `context-source-guard.py` already proves file_path-based
+PreToolUse filtering works (live on this host, matched on `Read`); this hook matches on
+`Edit`/`Write` and checks whether `tool_input.file_path` ends in `MEMORY.md`.
+
+What counts as "the addition": an `Edit`'s `new_string` directly (skipped if it's not a
+growth over `old_string` — a shrink is never refused). A `Write` replaces the whole file,
+so there's no single addition in the tool input; the hook reads the file's current
+on-disk content (before the write happens) and diffs it against the incoming `content`,
+treating lines present in the new content but not the old as the addition. A `Write` to a
+path that doesn't exist yet treats the whole `content` as the addition.
+
+Fails open on uncertainty, denies only on a positive finding — same contract as
+`gh-policy-gate.py`.
+
+- `SUTANDO_ALLOW_UNGATED_MEMORY_WRITE=1` — one-shot override.
+
+**Not covered:** a memory file other than `MEMORY.md` itself (the index budget script's
+own target — other memory files have no load-order cap to violate), and an Edit/Write
+whose `file_path` cannot be read from `tool_input` at all.
+
+## `dedup-staging-guard.py`
+
+Denies a Bash `mv` that lands a `state/dedup-staging/<file>` result into `results/`
+without a `check-dedup-targets.py` call anywhere in the same command — for **any**
+caller, not only proactive-loop step 1's own checklist.
+
+Step 1 stages a grouped `[deduped: X]` reply and only promotes it via `S="$WORKSPACE/
+state/dedup-staging/<file>"` then `check-dedup-targets.py "$S" && mv -f "$S"
+"$WORKSPACE/results/<file>"` — the checker refuses (exit 1) a staged file whose dedup
+target resolves to nothing (`[no-send]` or absent), which would otherwise have the
+bridge tell the room "see task X" for an X that delivers nothing. That protection only
+holds if the `&&` chain is typed; a bare `mv` bypasses it. Same architectural move as
+`gh-policy-gate.py` and `memory-index-guard.py` above.
+
+**What counts as the match.** A PreToolUse hook sees the raw, unexpanded command text —
+`$S` is a literal variable reference, not a resolved path — so this hook does not track
+shell variables (out of scope, same call as `gh-policy-gate.py`'s docstring makes for
+not resolving `$(...)`). It matches literal substrings instead: an `mv` segment whose
+own arguments mention `results` (the destination is always written out literally, even
+when the source is `$S`), AND `dedup-staging` appearing anywhere in the command (usually
+an earlier `S=...` assignment, `;`-separated from the `mv`), AND no segment anywhere in
+the command invoking `check-dedup-targets.py`. `&&` splits into a separate `_shell_scan`
+segment from what precedes it — verified directly, not assumed — so the checker call and
+the `mv` it gates are almost always in *different* segments (unlike `gh-policy-gate.py`'s
+same-segment `gh` matches); the `dedup-staging`/checker checks are scanned across the
+whole command for this reason, while the `results` match stays scoped to the `mv`'s own
+segment.
+
+Fails open on uncertainty: a command mentioning only one of `dedup-staging` / `results`,
+or no `mv` at all, is allowed — same contract as the other two hooks above.
+
+- `SUTANDO_ALLOW_UNGATED_DEDUP_STAGING=1` — one-shot override.
+
+**Not covered:** a staging→promotion sequence split across multiple Bash tool calls
+(`S=...` in one call, the check+`mv` in a later one) — this hook only sees one command
+string at a time, the same scope limit the other two hooks accept. Deploy is the same
+per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
+(`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
+landing this hook's source.

@@ -84,7 +84,7 @@ export function hookMap(hook: ClaudeCodeHook, ctx: MapContext): MapResult {
 			events.push(ev('cc.hook.session_start', 'ok', { source: hook.source, model: hook.model }));
 			break;
 		case 'SessionEnd':
-			events.push(ev('cc.hook.session_end', 'ok', { end_reason: hook.end_reason }));
+			events.push(ev('cc.hook.session_end', 'ok', { end_reason: hook.reason }));
 			break;
 		case 'PreCompact':
 			events.push(ev('cc.hook.pre_compact', 'ok', { trigger: hook.trigger }));

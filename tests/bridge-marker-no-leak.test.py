@@ -59,7 +59,7 @@ def main() -> int:
         return fail("src/slack-bridge.py must call parse_markers(...) somewhere")
     # Specifically, the result-watcher's skip-detection block must call it,
     # not a hand-rolled startswith trio.
-    if 'startswith("[no-send]")' in sb_src and "parse_markers" not in sb_src:
+    if 'startswith("[no-send]")' in sb_src:
         return fail(
             "src/slack-bridge.py still has hand-rolled startswith — must route "
             "through parse_markers() per #873"

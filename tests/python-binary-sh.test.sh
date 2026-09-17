@@ -2,15 +2,17 @@
 # Contract test for scripts/python-binary.sh — the shell twin of
 # src/python-binary.ts and src/git_binary.py.
 #
-# The rule being pinned: NEVER execute a candidate to decide whether it is
-# usable. On a Mac without the Xcode Command Line Tools, /usr/bin/python3 is
-# Apple's stub (one inode hardlinked across 78 names); executing it raises a
+# The macOS rule being pinned: NEVER execute a candidate to decide whether it
+# is usable. On a Mac without the Xcode Command Line Tools, /usr/bin/python3
+# is Apple's stub (one inode hardlinked across 78 names); executing it raises a
 # modal install dialog BEFORE it can fail, so a probe like
 #
 #     "$candidate" -c "pass"
 #
 # is itself the bug. Only `xcode-select -p` is safe — /usr/bin/xcode-select is a
-# real binary, so asking it never prompts.
+# real binary, so asking it never prompts. Windows is intentionally different:
+# its Microsoft Store alias exits without a modal, so a functional probe is
+# required to reject it and fall through to `py` / `python`.
 #
 # Run: bash tests/python-binary-sh.test.sh
 # Exit: 0 = all pass, 1 = failure
@@ -113,6 +115,20 @@ else bad "a stubbed uname cannot flip the platform" "got empty — PATH spoofed 
 out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
 check "control: a real Mac with no CLT still refuses the stub" "$out" ""
 
+# --- 5d. Windows: reject Store alias and fall through to py -----------------
+winlab=$(mktemp -d)
+mkdir -p "$winlab/bin"
+printf '#!/bin/sh\necho probed >> "%s/store-probed"\nexit 49\n' "$winlab" > "$winlab/bin/python3"
+printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 0\nexit 1\n' > "$winlab/bin/py"
+chmod +x "$winlab/bin/python3" "$winlab/bin/py"
+out=$(OSTYPE=msys PATH="$winlab/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+check "Windows rejects Store python3 and selects the py launcher" "$out" "$winlab/bin/py"
+if [ -f "$winlab/store-probed" ]; then
+  ok "Windows functionally probes the Store alias before rejecting it"
+else
+  bad "Windows functionally probes the Store alias" "probe did not run"
+fi
+
 # --- 6. bundled runtime beats PATH ------------------------------------------
 lab4=$(mklab)
 mkdir -p "$lab4/engine/../runtime/python/bin"
@@ -121,6 +137,45 @@ chmod +x "$lab4/runtime/python/bin/python3"
 mkdir -p "$lab4/engine"
 out=$(PATH="$lab4/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$lab4/engine'")
 check "bundled <engine>/../runtime/python wins over PATH" "$out" "$lab4/engine/../runtime/python/bin/python3"
+
+# --- 6b. resolve_python_for_module skips a candidate lacking the module ------
+# The production failure this pins: a host whose BUNDLED runtime has no
+# slack_bolt. resolve_python returns it (it exists and runs), the caller's
+# import probe rejects it, and the wrapper concludes no interpreter exists —
+# while the PATH interpreter one step down the same list has the module. On a
+# real host that produced a 3-day launchd respawn loop with an inert restart
+# safety net.
+lab6=$(mklab)
+mkdir -p "$lab6/engine" "$lab6/runtime/python/bin"
+# Each fake interpreter imports exactly ONE module and refuses everything else.
+# An `exit 0` default would make any module name importable, which silently
+# turns the no-candidate case below into a pass — caught by that check failing.
+printf '#!/bin/sh\ncase "$*" in *bundledmod*) exit 0 ;; esac\nexit 1\n' > "$lab6/runtime/python/bin/python3"
+chmod +x "$lab6/runtime/python/bin/python3"
+printf '#!/bin/sh\ncase "$*" in *wantedmod*) exit 0 ;; esac\nexit 1\n' > "$lab6/bin/python3"
+chmod +x "$lab6/bin/python3"
+
+# Assert the function EXISTS before asserting what it returns. Without this the
+# "no candidate" check below passes when the function is merely absent (missing
+# -> empty output -> matches the expected empty), so a suite run against a tree
+# without the fix would report that case green.
+if PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; type resolve_python_for_module" >/dev/null 2>&1; then
+  ok "resolve_python_for_module is defined"
+else
+  bad "resolve_python_for_module is defined" "function missing — the checks below cannot be trusted"
+fi
+
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$lab6/engine'")
+check "control: resolve_python still returns the module-less bundled runtime" \
+      "$out" "$lab6/engine/../runtime/python/bin/python3"
+
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python_for_module '$lab6/engine' wantedmod")
+check "resolve_python_for_module skips it and finds the PATH interpreter" \
+      "$out" "$lab6/bin/python3"
+
+# No candidate has it -> empty, so the caller still reports rather than guessing.
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python_for_module '$lab6/engine' nosuchmod_anywhere")
+check "no candidate with the module -> empty (caller must report)" "$out" ""
 
 # --- 7. every caller that used to fall through to the bare name is routed ----
 for f in src/startup.sh scripts/sutando-config.sh src/agent/claude/cli/start-cli.sh; do
@@ -429,6 +484,24 @@ done < <(grep -nE 'for _p in .* python3; do' "$REPO/src/startup.sh" || true)
 if [ "$loops" -gt 0 ] && [ "$unguarded" -eq 0 ]; then
   ok "all $loops interpreter-probe loop(s) neutralise their bare python3 candidate"
 fi
+
+for test_shell in sh dash; do
+  command -v "$test_shell" >/dev/null 2>&1 || continue
+  out=$("$test_shell" -c '
+    . "$1/scripts/python-binary.sh" || exit
+    _sutando_safe_path_pythons() { printf "%s\n" "" "/tmp/python with spaces"; }
+    _sutando_safe_path_python
+  ' resolver "$REPO")
+  check "$test_shell can source and resolve a spaced candidate" "$out" "/tmp/python with spaces"
+  out=$("$test_shell" -c '
+    . "$1/scripts/python-binary.sh" || exit
+    _sutando_safe_path_pythons() { :; }
+    _sutando_safe_path_python
+    resolve_python_for_module /nonexistent sutando_missing_module
+    echo sourced-ok
+  ' resolver "$REPO")
+  check "$test_shell handles no candidates" "$out" "sourced-ok"
+done
 
 printf "\npassed=%d failed=%d\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -123,6 +123,35 @@ mod._send_reply("C0FAKECHAN", None, "just a short reply")
 check("slack: short body → one message", len(client.calls) == 1)
 check("slack: short body text intact", client.calls[0]["text"] == "just a short reply")
 
+# Suppression is conditional on link density and happens at the send: stripping
+# links from a digest would destroy the one thing it exists to deliver.
+check("slack: link-free body keeps unfurling on",
+      all(c.get("unfurl_links") is True for c in client.calls), repr(client.calls[:1]))
+
+client.calls.clear()
+mod._send_reply("C0FAKECHAN", None, "one link https://example.com/a here")
+check("slack: single-link body keeps its preview",
+      client.calls[0].get("unfurl_links") is True
+      and client.calls[0].get("unfurl_media") is True, repr(client.calls[:1]))
+
+client.calls.clear()
+mod._send_reply("C0FAKECHAN", None, "https://example.com/a and https://example.com/b")
+check("slack: link-dense body suppresses unfurling",
+      client.calls[0].get("unfurl_links") is False
+      and client.calls[0].get("unfurl_media") is False, repr(client.calls[:1]))
+
+# A digest chunked at 4000 chars must not unfurl piecewise: the flag is decided
+# on the whole body, so every chunk of a dense body carries the same False.
+client.calls.clear()
+mod._send_reply("C0FAKECHAN", None,
+                "https://example.com/a\n" + ("filler line\n" * 900) + "https://example.com/b\n")
+check("slack: dense body stays suppressed across every chunk",
+      len(client.calls) > 1 and all(c.get("unfurl_links") is False for c in client.calls),
+      f"chunks={len(client.calls)} flags={[c.get('unfurl_links') for c in client.calls]}")
+
+client.calls.clear()
+mod._send_reply("C0FAKECHAN", None, "just a short reply")
+
 # 3. thread_ts is threaded through to each chunk.
 client.calls.clear()
 mod._send_reply("C0FAKECHAN", "1699999999.000100", "line\n" * 2000)  # long, forces >1 chunk

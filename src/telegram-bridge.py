@@ -59,12 +59,13 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from sutando_config import config_get, config_get_env_first  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -486,21 +487,29 @@ def _render_progress_text(elapsed: float, task_id: str) -> str:
     return progress_stream.format_progress(step, elapsed)
 
 
-def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
-    """Route the shared dedup-recovery plan; returns a new task id to route."""
+def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
+    """Route the shared dedup-recovery plan.
+
+    Returns ``(new_task_id_to_route, disposition)`` where disposition is the
+    shared "archive"/"retain" -- an undelivered report must not retire the ask.
+    """
+    action, delivered, requeued = "defer", None, None
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
             f"task-{int(time.time() * 1000)}")
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
-            return payload
-        if action == "report":
-            send_reply(chat_id, payload, task_id=task_id)
+            requeued = payload
+        elif action == "report":
+            # send_reply already reports its own outcome; ignoring it archived
+            # a failed report as though the asker had been told.
+            delivered = bool((send_reply(chat_id, payload, task_id=task_id)
+                              or {}).get("ok"))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - never block the skip path
+    except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-    return None
+    return requeued, report_disposition(action, delivered)
 
 
 def _clear_progress(task_id: str) -> None:
@@ -1091,7 +1100,7 @@ def main():  # pragma: no cover
                         # file out of the `*.txt` glob every peer bridge polls.
                         # `_resolve_proactive_owner_id` orders allowFrom explicitly; a
                         # bare `next(iter(set))` picked a hash-slot, not the first user.
-                        env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
+                        env_override = (config_get_env_first("SUTANDO_DM_OWNER_ID", "") or "").strip()
                         try:
                             access_data = json.loads(ACCESS_FILE.read_text())
                         except Exception:
@@ -1161,9 +1170,13 @@ def main():  # pragma: no cover
                 if any(a.kind == "skip" for a in parsed.actions):
                     _sk = next(a for a in parsed.actions if a.kind == "skip")
                     if _sk.value == "deduped":
-                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        _rq, _disp = _dedup_recover(task_id, _sk.extra, chat_id)
                         if _rq:
                             pending_replies[_rq] = chat_id
+                        if _disp == "retain":
+                            print(f"  [dedup] report not delivered for {task_id} "
+                                  f"— keeping for retry", flush=True)
+                            continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)

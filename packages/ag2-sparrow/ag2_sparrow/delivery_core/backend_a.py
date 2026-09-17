@@ -79,6 +79,13 @@ class DesignAClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=incarnation)
 
+    def is_terminal(self, item_id: str) -> bool:
+        with outbox._item_lock(self.root, item_id):
+            if not outbox._item_path(self.root, item_id).exists():
+                return False
+            return outbox._read_item(
+                self.root, item_id).get("status") in self.TERMINAL
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
@@ -101,6 +108,10 @@ class DesignAClaimBackend:
                 if park_at_attempts is not None and attempts >= park_at_attempts:
                     outbox.park_item(self.root, item_id, "max-attempts")
             return outbox._release_locked(self.root, item_id, token.worker)
+
+    def resend_epoch(self, item_id: str) -> int:
+        """Operator re-send generation; 0 until a requeue bumps it."""
+        return outbox.resend_epoch_for(self.root, item_id)
 
     def attempts(self, item_id: str) -> int:
         return outbox.attempts_for(self.root, item_id)

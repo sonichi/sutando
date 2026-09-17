@@ -55,8 +55,9 @@ TAG = rgb.MEDIA_MARKER_TAG  # default "remote-media"
 
 
 def _write_and_parse(task):
-    tid = rgb._write_task(task)
-    assert tid, f"_write_task rejected {task!r}"
+    written = rgb._write_task(task)
+    assert written, f"_write_task rejected {task!r}"
+    tid = written[0]
     text = (rgb.TASKS_DIR / f"{tid}.txt").read_text()
     return text, ltp.parse_task_headers_trusted(text)
 
