@@ -48,10 +48,14 @@ mkhost hostU wsu
 
 # The file is tracked normally, before any exclude rule covers it.
 echo "public v1" > "$hostU_WS/notes/private-log.jsonl"
-runsync hostU wsu --push-only >/dev/null
-git -C "$hostU_WS" ls-files --error-unmatch notes/private-log.jsonl >/dev/null 2>&1 \
-  && ok "fixture: notes/private-log.jsonl is tracked" \
-  || bad "fixture: notes/private-log.jsonl never got tracked"
+PUSH_OUT="$(runsync hostU wsu --push-only)"; PUSH_RC=$?
+if ! git -C "$hostU_WS" ls-files --error-unmatch notes/private-log.jsonl >/dev/null 2>&1; then
+  bad "fixture: notes/private-log.jsonl never got tracked -- fixture bug, push-only rc=$PUSH_RC: ${PUSH_OUT:0:300}"
+  printf '\n%s: %d passed, %d failed\n' "sync pre-pull untrack-before-commit" "$pass" "$fail"
+  echo "FAIL — fixture never reached the state this test exists to exercise"
+  exit 1
+fi
+ok "fixture: notes/private-log.jsonl is tracked"
 
 # Exclude coverage now widens to deny it (a real config edit, e.g. a
 # transcript path getting added to vault.sync.exclude) -- then it is
