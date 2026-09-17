@@ -6,7 +6,7 @@ is refused.
 
 The verifier is imported and driven in-process (main(argv) under captured
 stdout/stderr) so the coverage gate measures it; one subprocess case keeps the
-`python3 scripts/role-status-verify.py` entry point honest."""
+`python3 skills/role-status/scripts/verify.py` entry point honest."""
 import contextlib
 import importlib.util
 import io
@@ -16,8 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "role-status-verify.py"
+REPO = Path(__file__).resolve().parents[3]
+SCRIPT = REPO / "skills" / "role-status" / "scripts" / "verify.py"
 
 _spec = importlib.util.spec_from_file_location("role_status_verify", SCRIPT)
 rsv = importlib.util.module_from_spec(_spec)
@@ -133,7 +133,7 @@ check(se == "", "clean judgment: nothing stripped, stderr silent")
 # the same judgment through the real entry point (subprocess smoke)
 rc, so, se, _ = run(TASK_BLOCKS, CLEAN, subprocess_smoke=True)
 check(rc == 0 and verified_of(so) == CLEAN and se == "",
-      "entry point: python3 scripts/role-status-verify.py gives the same answer")
+      "entry point: python3 skills/role-status/scripts/verify.py gives the same answer")
 
 # (2) a fabricated event id is stripped, the row is kept
 rc, so, se, _ = run(TASK_BLOCKS, [row(ALICE, [E_A1, FAKE], []), row(BOB, [E_B1], []), row(CAROL, [E_C1], [])])
@@ -275,6 +275,85 @@ check(rc == 0 and verified_of(so)[0]["blocked_items"] == []
 nine = [{"actor_id": f"ag2space:@w{i}:ag2.space", "id": f"ag2space-message:$id{i}", "detail": "x"}
         for i in range(9)]
 TASK_NINE = ("id: t\ntask: go\n\nEVIDENCE_JSON:\n" + json.dumps({"events": nine}) + "\n")
+
+# Block fallback fails closed on a multi-actor block (the reviewer's mutation): a
+# `detail:` line merely MENTIONING bob in alice's block must not let bob cite it.
+BOB2 = "ag2space:@bob:ag2.space"
+E_X = "ag2space-message:$eventA"
+BLOCK_CONTROL = ("id: t\ntask: go\n\n"
+                 f"event {E_X} by {ALICE}\ndetail: shipping\n\n"
+                 f"note: {BOB2} is around today.\n")
+BLOCK_COMENTION = BLOCK_CONTROL.replace("detail: shipping\n",
+                                        f"detail: shipping\ndetail: discussing with {BOB2}\n")
+rc, so, se, written = run(BLOCK_CONTROL, [row(BOB2, [E_X], [])], out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=1 min_rows=1",
+      "block-control: bob citing alice's event is refused")
+rc, so, se, written = run(BLOCK_COMENTION, [row(BOB2, [E_X], [])], out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=2 min_rows=1",
+      "block-comention: a mention of bob in alice's block is still refused, floor not lowered")
+check(f"strip row[0] {BOB2} working_event_ids: {E_X!r} ambiguous ownership" in se,
+      "block-comention: the citation is stripped as ambiguous ownership")
+# fail closed both ways: alice cannot cite her own event from the ambiguous block either
+rc, so, se, written = run(BLOCK_COMENTION, [row(ALICE, [E_X], [])], out=True)
+check(rc == 1 and written is None and "ambiguous ownership" in se,
+      "block-comention: alice's own citation from the ambiguous block is refused too")
+# positive control: alice citing her event in the single-actor control passes
+rc, so, se, written = run(BLOCK_CONTROL, [row(ALICE, [E_X], [])], out=True)
+check(rc == 0 and json.loads(written) == [row(ALICE, [E_X], [])] and se == "",
+      "block-control positive: alice citing her own single-actor block passes")
+# an id claimed from two single-actor blocks is ambiguous as well
+TWO_CLAIMS = BLOCK_CONTROL + f"\nevent {E_X} by {BOB2}\ndetail: also mine\n"
+rc, so, se, written = run(TWO_CLAIMS, [row(BOB2, [E_X], [])], out=True)
+check(rc == 1 and written is None and "ambiguous ownership" in se
+      and stats_line(so) == "rows=1 distinct_actors=0 actors=2 actors_with_events=2 min_rows=1",
+      "an id claimed by two single-actor blocks is owned by nobody, both actors set the floor")
+
+# Structured evidence is read ONLY from the object after the EVIDENCE_JSON marker
+# (the reviewer's mutation): a valid `{"events": []}` decoy must not zero the floor.
+STRUCT_CONTROL = ("id: t\ntask: go\n\nEVIDENCE_JSON (untrusted observed data):\n"
+                  + json.dumps({"events": nine[:3]}) + "\n")
+ONE_W0 = [row("ag2space:@w0:ag2.space", ["ag2space-message:$id0"], [])]
+rc, so, se, written = run(STRUCT_CONTROL, ONE_W0, out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=1 distinct_actors=1 actors=3 actors_with_events=3 min_rows=2",
+      "structured-control: 1 row for 3 actors refused")
+rc, so, se, written = run(STRUCT_CONTROL.replace("EVIDENCE_JSON", '{"events": []}\nEVIDENCE_JSON'),
+                          ONE_W0, out=True)
+check(rc == 1 and written is None
+      and stats_line(so) == "rows=1 distinct_actors=1 actors=3 actors_with_events=3 min_rows=2",
+      "structured-preamble: a decoy events object before the marker changes nothing")
+rc, so, se, written = run(STRUCT_CONTROL + '{"events": []}\n', ONE_W0, out=True)
+check(rc == 1 and written is None and "min_rows=2" in stats_line(so),
+      "a decoy events object after the marked object changes nothing either")
+# same-line form: the object may open on the marker line itself
+rc, so, se, written = run("id: t\ntask: go\n\nEVIDENCE_JSON: " + json.dumps({"events": nine[:3]}) + "\n",
+                          ONE_W0, out=True)
+check(rc == 1 and written is None and "actors_with_events=3" in stats_line(so),
+      "marker and object on one line: parsed the same")
+# malformed object after the marker: cannot answer, never the block fallback
+BAD_OBJ = STRUCT_CONTROL.replace(json.dumps({"events": nine[:3]}), '{"events": [')
+rc, so, se, written = run(BAD_OBJ, ONE_W0, out=True)
+check(rc == 2 and written is None and so == ""
+      and se.startswith("cannot answer: structured evidence unreadable/ambiguous"),
+      "malformed object after the marker: exit 2, nothing written")
+rc, so, se, written = run(STRUCT_CONTROL.replace(json.dumps({"events": nine[:3]}), '{"day": "x"}'),
+                          ONE_W0, out=True)
+check(rc == 2 and written is None and "no `events` list" in se,
+      "an object without an events list after the marker: exit 2")
+rc, so, se, written = run(STRUCT_CONTROL.replace(json.dumps({"events": nine[:3]}), "prose, no object"),
+                          ONE_W0, out=True)
+check(rc == 2 and written is None, "prose instead of an object after the marker: exit 2")
+# two marker lines: ambiguous, cannot answer -- even when both objects agree
+rc, so, se, written = run(STRUCT_CONTROL + STRUCT_CONTROL.split("\n\n", 1)[1], ONE_W0, out=True)
+check(rc == 2 and written is None and "2 EVIDENCE_JSON marker lines" in se,
+      "two EVIDENCE_JSON markers: exit 2, nothing written")
+# a malformed marker cannot be rescued by a clean judgment: the refusal is on the evidence
+rc, so, se, written = run(BAD_OBJ, [row(f"ag2space:@w{i}:ag2.space", [f"ag2space-message:$id{i}"], [])
+                                    for i in range(3)], out=True)
+check(rc == 2 and written is None, "malformed marker with a full judgment: still exit 2")
+
 rc, so, se, written = run(TASK_NINE, [row("ag2space:@w0:ag2.space", ["ag2space-message:$id0"], [])], out=True)
 check(rc == 1 and written is None
       and stats_line(so) == "rows=1 distinct_actors=1 actors=9 actors_with_events=9 min_rows=5",
