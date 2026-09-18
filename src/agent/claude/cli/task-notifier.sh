@@ -6,6 +6,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# The core's window in that session; a heal may place it off index 0.
+CORE_WINDOW="${SUTANDO_TMUX_WINDOW:-0}"
+# The pane itself when the launcher named it: an index can be reused, a pane id cannot.
+TARGET="${SUTANDO_TMUX_PANE:-$SESSION:$CORE_WINDOW}"
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
   TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
 else
@@ -164,7 +168,7 @@ pane_text_composer_is_empty() {
 
 core_pane_is_healthy() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$TARGET" 2>/dev/null)" || return 1
   pane_text_is_healthy "$pane"
 }
 
@@ -178,7 +182,8 @@ wait_for_core_healthy() {
   local started
   started="$(date +%s)"
   while ! core_is_healthy; do
-    if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
+    # The exact pane, not the session: a sibling window can outlive the core.
+    if ! tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" '#{pane_id}' >/dev/null 2>&1; then
       return 1
     fi
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
@@ -193,7 +198,7 @@ wait_for_core_healthy() {
 # the global option can move without it), never `show-options -g`. Empty on failure.
 pane_history_field() {
   local v
-  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$SESSION:0" "#{$1}" 2>/dev/null)"
+  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" "#{$1}" 2>/dev/null)"
   case "$v" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
 }
 
@@ -208,7 +213,7 @@ effective_scrollback_lines() {
 # Scrollback (-S), not just the visible screen: a wrapped prompt taller than
 # the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_raw() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 capture_tail() {
@@ -218,13 +223,13 @@ capture_tail() {
 # One read serves both baseline checks: the escapes (-e) tell the CLI's dim ghost
 # text from a typed draft, and the same capture stripped of them is the plain text.
 capture_raw_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 # The visible screen only: a banner is live when it is on screen, and an error
 # that scrolled off is history however small the pane.
 capture_view_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -t "$SESSION:0" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -t "$TARGET" 2>/dev/null
 }
 
 strip_sgr() {
@@ -326,7 +331,7 @@ deliver_prompt() {
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
     fi
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
     if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
@@ -350,7 +355,7 @@ deliver_prompt() {
     log_notifier "composer changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -375,7 +380,7 @@ deliver_prompt() {
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   done
 }
 

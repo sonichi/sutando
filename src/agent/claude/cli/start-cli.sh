@@ -54,6 +54,11 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# The external task notifier runs beside the core in its own tmux session,
+# under the runtime-agnostic supervisor (parameterised by SUTANDO_NOTIFIER_SCRIPT).
+WATCHER_SESSION="${SESSION}-watcher"
+NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
+NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 # A pool worker runs THIS launcher under its own session/instance env; the
 # owner-facing surfaces (remote control, Chrome) stay with the canonical core.
 WORKER_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
@@ -643,6 +648,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
   if tmux_session_exists || core_claude_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
@@ -732,6 +738,69 @@ apply_tmux_defaults() {
 # can never suppress this one. Socket only, not socket + out path: the desktop
 # launcher (launch-sutando.sh) starts the same watcher inside tmux with its own
 # workspace spelling for --out, and matching on that path let both run.
+watcher_session_exists() {
+  tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null
+}
+
+# The live core's own window and pane, read from the pane that runs it: a heal
+# may have placed it off index 0, and a plain rerun must not forget that.
+resolve_core_target() {
+  local pid row
+  CORE_PANE=""
+  for pid in $(core_claude_pids); do
+    row="$(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{window_index} #{pane_id} #{pane_pid}' 2>/dev/null \
+      | awk -v p="$pid" '$3 == p {print $1, $2; exit}')"
+    if [ -n "$row" ]; then
+      CORE_WINDOW="${row%% *}"
+      CORE_PANE="${row##* }"
+      return 0
+    fi
+  done
+  CORE_WINDOW="${CORE_WINDOW:-0}"
+}
+
+# Standby delivery path: pastes a queued task into the core pane only when the
+# pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
+ensure_task_notifier() {
+  local expected_version active_version version_files notifier_py
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the notifier serves the core alone
+  resolve_core_target
+  notifier_py="$(require_python "$REPO" "run the task notifier" 2>/dev/null || command -v python3)"
+  version_files=(
+    "$NOTIFIER_SUPERVISOR"
+    "$NOTIFIER_SCRIPT"
+    "$REPO/src/core-input-watch.py"
+    "$REPO/src/delivery/task_dispatch.py"
+  )
+  # The target window is part of the identity: a heal that lands the core on a
+  # new index must replace a watcher still aimed at the old one.
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')"
+  if watcher_session_exists; then
+    active_version="$(
+      tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
+        SUTANDO_NOTIFIER_VERSION 2>/dev/null \
+        | sed -n 's/^SUTANDO_NOTIFIER_VERSION=//p' || true
+    )"
+    [ "$active_version" = "$expected_version" ] && return 0
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  fi
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER_SCRIPT")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
+  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # The exact core window: a heal may land the core off index 0 beside a sibling.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")
+  [ -n "$CORE_PANE" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_PANE=$CORE_PANE")
+  # The launcher-resolved interpreter, never a bare name from the watcher's PATH.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_PY=$notifier_py")
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
+    "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
+}
+
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
   [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
@@ -784,6 +853,7 @@ ensure_core_monitor() {
 if tmux_core_session_running; then
   apply_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
+  ensure_task_notifier
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -833,10 +903,17 @@ if tmux_session_exists; then
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
   # (review-caught: attach/Console then shows the gateway, not the healed core).
   healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
-    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")"
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
+    || healed_idx=""
+  if [ -z "$healed_idx" ]; then
+    # No window at all: a watcher left from the dead core would type into a sibling.
+    echo "  ⚠ could not create a core window in $SESSION — no core is serving." >&2
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    exit 66
+  fi
   # Make the healed core the active window so attach/Console show it, not the
   # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
-  tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:$healed_idx" 2>/dev/null || true
   ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
   # child lives; poll before opening intake, same bound as the fresh-start path.
@@ -846,8 +923,12 @@ if tmux_session_exists; then
   done
   if tmux_core_session_running; then
     clear_shutdown_sentinel
+    CORE_WINDOW="$healed_idx"
+    ensure_task_notifier
   else
     echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    # A surviving sibling window keeps the session alive; a watcher would type into it.
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   fi
   if [ -t 1 ]; then
     echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
@@ -947,6 +1028,7 @@ if [ -t 1 ]; then
   fi
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  ensure_task_notifier   # the supervisor needs the core session to exist first
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
@@ -973,6 +1055,7 @@ else
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
+  ensure_task_notifier
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."
