@@ -423,6 +423,20 @@ class MainLoopWiringTest(FakeTmuxHarness):
     notifier via watch-tasks-stream.sh's real fswatch pipeline, unaided by
     --event. Everything else about dispatch is already covered above."""
 
+    def _wait_for_fswatch_attach(self, timeout=10):
+        # A fixed sleep guesses how long fswatch takes to attach; under load
+        # that guess can be too short and flakes a real bug-free run.
+        needle = str(self.tasks_dir)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            out = subprocess.run(
+                ["ps", "-axo", "command"], capture_output=True, text=True
+            ).stdout
+            if any("fswatch" in line and needle in line for line in out.splitlines()):
+                return True
+            time.sleep(0.1)
+        return False
+
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
@@ -436,7 +450,10 @@ class MainLoopWiringTest(FakeTmuxHarness):
             start_new_session=True,
         )
         try:
-            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.assertTrue(
+                self._wait_for_fswatch_attach(),
+                "fswatch never attached to the watched tasks dir",
+            )
             self.write_task("task-live.txt")
             deadline = time.time() + 20
             while time.time() < deadline:
