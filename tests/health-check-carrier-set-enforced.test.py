@@ -1001,6 +1001,37 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("check_carrier_set_enforced()", src,
                       "probe defined but never invoked from the run list")
 
+    def test_the_stale_message_names_the_dropped_match_not_only_the_entry(self):
+        """A glob entry resolves to several paths; the entry alone is not actionable.
+
+        Live case: `hosts/*/` had four matches — two carried host directories and two
+        stray FILES at hosts/ level. The message named only `hosts/*/`, which reads as
+        "the whole host subtree is unbacked" and sends the operator to
+        `--force-gitignore`, which cannot reach a file at that level.
+        """
+        spec = importlib.util.spec_from_file_location("hc_msg", SRC)
+        hc = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(hc)
+        except SystemExit:
+            pass
+        ws = Path("/tmp")
+        self.assertEqual(
+            hc._stale_with_culprits(["hosts/*/"], {"hosts/*/": ws / "hosts" / "current-track.md"}, ws),
+            "hosts/*/ -> hosts/current-track.md")
+        # An entry whose culprit IS the entry adds nothing — stays unadorned.
+        self.assertEqual(
+            hc._stale_with_culprits(["notes/"], {"notes/": ws / "notes"}, ws), "notes/")
+        # A missing culprit degrades to the entry rather than raising.
+        self.assertEqual(hc._stale_with_culprits(["build_log.md"], {}, ws), "build_log.md")
+        # The message must USE it: testing the helper alone left a revert to
+        # entry-only green.
+        src = SRC.read_text()
+        self.assertIn("_stale_with_culprits(stale, stale_culprit, workspace)", src,
+                      "the STILL GIT-IGNORED message no longer names the dropped match")
+        self.assertIn("stale_culprit[entry] = culprit", src,
+                      "nothing records which match git ignored")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
