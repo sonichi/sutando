@@ -150,7 +150,28 @@ case "$OUT" in
   '{}') ok "worker's block clears once its result is archived (not just present)" ;;
   *) bad "worker's block clears once its result is archived (not just present)" "got: ${OUT:0:160}" ;;
 esac
-rm -f "$WS/results/archive/$PROBE-1789600000.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
+rm -f "$WS/results/archive/$PROBE-1789600000.txt"
+record_delivery
+
+# 8. THE REAL ARCHIVE SHAPE (john-the-dev's #4339 review, 2026-09-17):
+#    src/task_archive.py:archive_file() never writes case 7's flat
+#    <id>-<ts>.txt shape — it writes into a LOCAL-calendar month bucket,
+#    results/archive/<YYYY-MM>/<id>.txt, no suffix. That is one directory
+#    deeper than case 7's fixture and case 7's old glob both assumed, so a
+#    worker whose result was archived by the real writer stayed blocked
+#    forever even though case 7 was green. The sentinel from case 5 is still
+#    sitting in deliveries/<worker>/, unchanged (mark_done has no production
+#    caller) — same stale-sentinel setup as case 7, real archive shape.
+MONTH="$("$PYBIN" -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m'))")"
+mkdir -p "$WS/results/archive/$MONTH"
+: > "$WS/results/archive/$MONTH/$PROBE.txt"
+record_delivery
+OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "worker's block clears once its result is archived in the real month-bucket shape" ;;
+  *) bad "worker's block clears once its result is archived in the real month-bucket shape" "got: ${OUT:0:160}" ;;
+esac
+rm -f "$WS/results/archive/$MONTH/$PROBE.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
 record_delivery
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
