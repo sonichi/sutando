@@ -356,6 +356,27 @@ candidate_is_owned() {
   if [ -n "$HOOK_PRIOR_CUR" ] && [ "$cand" = "$HOOK_PRIOR_CUR" ]; then
     return 0
   fi
+  # A RELOCATED runner-first prior -- byte equality above can't match it once
+  # moved; recognize it the same relocation-tolerant way the guard shape does.
+  if [ "$HOOK_IS_SKILL_CUR" = "1" ] && [ -n "$HOOK_PRIOR_CUR" ]; then
+    local prior_runner="${HOOK_PRIOR_CUR%% *}" prior_tok_rc=0
+    case "$cand" in
+      "$prior_runner "?*)
+        tokenize_argv "$cand" || prior_tok_rc=1
+        if [ "$prior_tok_rc" = 0 ] && [ "$TOKENIZE_HAS_OPERATOR" = 0 ] \
+           && [ "${#TOKENIZE_RESULT[@]}" -eq 2 ] \
+           && [ "${TOKENIZE_RESULT[0]}" = "$prior_runner" ]; then
+          case "${TOKENIZE_RESULT[1]}" in
+            *"$MARKER")
+              _is_installer_path_shape "${TOKENIZE_RESULT[1]}" \
+                && _is_installer_path_literal "${TOKENIZE_RESULT[1]}" "${TOKENIZE_UNSAFE[1]}" \
+                && return 0
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  fi
   # Only a skill-declared entry may wear this guard shape. MARKER matches as
   # a suffix, not a substring, so a shared basename alone can't satisfy it.
   local guard_out guard_path guard_unsafe
@@ -458,12 +479,8 @@ remove_exact_commands() {
 # Sweeping a *different clone's* entry is intended — that shape is
 # installer-generated, just not by this checkout.
 for i in "${!HOOKS[@]}"; do
-  # PHASE 0 ONLY APPLIES TO HOOKS THAT EMBED THE REPO PATH — see
-  # owned_hook_shape() above. The whole point of the sweep is migrating entries
-  # whose *path* is stale (a legacy $HOME/Desktop clone, an unquoted form,
-  # another checkout); a hook with no repo path has nothing that can go stale,
-  # so sweeping it can only ever destroy someone else's command. Reproduced on
-  # the transcript-archive hook (b21d2bf) before this skip existed.
+  # Only applies to hooks that EMBED THE REPO PATH — one with none has nothing
+  # that can go stale, so sweeping it can only ever destroy someone else's command.
   owned_hook_shape "$i" || continue
 
   CANDIDATES="$(jq -r --arg event "$EVENT" \

@@ -925,6 +925,45 @@ ok "relocated checkout: operator's own hook.sh-mentioning command still survives
    "$(echo "$SSURV" | grep -qF 'my-own-hook.sh' && echo 0 || echo 1)"
 rm -rf "$SROOT"
 
+# --- 15b. RELOCATED CHECKOUT, RUNNER-FIRST shape (no guard) -- the
+# intersection #15 and the runner-first migration test never covered.
+# #4309 review round 17 (keweichen): candidate_is_owned() recognized a
+# relocated GUARD-shaped skill hook (#15) and a same-checkout RUNNER-FIRST
+# skill hook, but not a runner-first skill hook left behind after a move --
+# byte equality against THIS checkout's own current path can't match it,
+# and the generic branch requires the guard's leading `[`, which a bare
+# `bash Q` command never has.
+T2ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks skill-relocated-runnerfirst.XXXXXX")"
+T2REPO="$T2ROOT/repo"
+mkdir -p "$T2REPO/src" "$T2REPO/.claude" "$T2REPO/workspace/.claude-sutando" \
+         "$T2REPO/skills/testhook"
+cp "$INSTALLER" "$T2REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$T2REPO/src/"
+echo '{}' > "$T2REPO/workspace/.claude-sutando/settings.json"
+cat > "$T2REPO/skills/testhook/manifest.json" <<'JSON'
+{"hooks": [{"event": "PreToolUse", "command": "hook.sh"}]}
+JSON
+printf '#!/bin/bash\ntrue\n' > "$T2REPO/skills/testhook/hook.sh"
+chmod +x "$T2REPO/skills/testhook/hook.sh"
+export T2_LEGACY="$T2REPO/.claude/settings.json" \
+       T2_OLDREPO="$T2ROOT/an old checkout path that no longer exists"
+python3 - <<'PY'
+import json, os, shlex
+p, old_repo = os.environ['T2_LEGACY'], os.environ['T2_OLDREPO']
+old_hook = f"{old_repo}/skills/testhook/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    # written by a PRIOR run, at the OLD path, in the RUNNER-FIRST (no
+    # guard) shape -- must be SWEPT after the checkout moved.
+    {"type": "command", "command": f"bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$T2REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+T2SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$T2_LEGACY")"
+ok "relocated checkout: pre-move SKILL hook (runner-first, no guard, OLD path baked in) is swept" \
+   "$(echo "$T2SURV" | grep -qF "old checkout path that no longer exists" && echo 1 || echo 0)"
+rm -rf "$T2ROOT"
+
 # --- 16. An OPERATOR'S OWN guard-shaped command around a BUILT-IN marker must
 # survive -- only a skill-declared entry may wear the skill_hooks.py guard
 # shape. #4309 review round 7 (keweichen, 2026-09-16): candidate_is_owned()

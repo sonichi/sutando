@@ -166,8 +166,15 @@ mkdir -p "$PC2/src/b/notes"; echo "content" > "$PC2/src/b/notes/keep.md"
 
 # Legacy settings already carry the real archiver shape this installer emits
 # (same command install-claude-hooks.sh writes -- verified against a live
-# run at round 16). This is the "already opted in" signal.
-_pc2_archive_cmd="bash '$PC2/repo/src/archive-transcript.sh' '$PC2/ws/logs/conversations/'"
+# run at round 16). This is the "already opted in" signal. Resolve each half
+# the SAME way the real script does: REPO_DIR via bash `cd .. && pwd`
+# (never /private-resolved), WORKSPACE_DIR via sutando-config.sh's own
+# Python resolver (which IS /private-resolved on macOS) -- using bash `pwd`
+# for both, as a naive fixture would, produces a command that could never
+# match a genuine prior write.
+_pc2_repo_real="$(cd "$PC2/repo" && pwd)"
+_pc2_ws_real="$(HOME="$PC2/home" bash "$PC2/repo/scripts/sutando-config.sh" workspace 2>/dev/null)"
+_pc2_archive_cmd="bash '$_pc2_repo_real/src/archive-transcript.sh' '$_pc2_ws_real/logs/conversations/'"
 printf '{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":%s}]}]}}\n' \
     "$(printf '%s' "$_pc2_archive_cmd" | jq -Rs .)" > "$PC2/home/.claude/settings.json"
 

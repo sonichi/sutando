@@ -73,6 +73,41 @@ check "THE POINT: a genuine prior opt-in survives migration" $? \
     "archiver hook was dropped -- migration reset an explicit prior consent"
 rm -rf "$PC2"
 
+# ── keweichen round 17, direction 1: a prior opt-in sitting ONLY at the
+# pre-move project-level location ($REPO/.claude/settings.json, never the
+# home-dir $_old_settings this file used to check) must survive migration.
+PC3="$(mktemp -d -t migrate-archive-legacy-project-XXXXXX)"
+new_fixture "$PC3"
+mkdir -p "$PC3/repo/.claude"
+WS3="$(HOME="$PC3/home" bash "$PC3/repo/scripts/sutando-config.sh" workspace 2>/dev/null)"
+printf '{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"bash %s %s"}]}]}}\n' \
+    "'$PC3/repo/src/archive-transcript.sh'" "'$WS3/logs/conversations/'" \
+    > "$PC3/repo/.claude/settings.json"
+run_migrate "$PC3"
+CCD3="$(HOME="$PC3/home" bash "$PC3/repo/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null)"
+archiver_present "$CCD3/settings.json"
+check "a legacy PROJECT-level opt-in ($REPO/.claude/settings.json) survives migration" $? \
+    "the project-level consent was invisible to the old check -- migration reset it to default-off"
+rm -rf "$PC3"
+
+# ── keweichen round 17, direction 2: a FOREIGN decoy (same script basename
+# and same "logs/conversations/" substring, wrong install's actual paths)
+# planted at a location the check DOES read must NOT be read as consent --
+# only THIS install's exact script+dest path counts, per the anchored fix.
+# (Confirmed this decoy shape is read as consent on the PRE-fix code below.)
+PC4="$(mktemp -d -t migrate-archive-foreign-decoy-XXXXXX)"
+new_fixture "$PC4"
+mkdir -p "$PC4/home/.claude"
+printf '{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"bash %s %s"}]}]}}\n' \
+    "'/some/other/checkout/src/archive-transcript.sh'" "'/some/other/workspace/logs/conversations/decoy/'" \
+    > "$PC4/home/.claude/settings.json"
+run_migrate "$PC4"
+CCD4="$(HOME="$PC4/home" bash "$PC4/repo/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null)"
+! archiver_present "$CCD4/settings.json"
+check "a foreign decoy (unrelated script/dest paths) is NOT read as consent" $? \
+    "the loose old pattern let an unrelated install's hook enable full-transcript copying"
+rm -rf "$PC4"
+
 echo
 if [ "$FAILURES" -ne 0 ]; then echo "FAILED ($FAILURES)"; exit 1; fi
 echo "All transcript-archive consent checks passed."
