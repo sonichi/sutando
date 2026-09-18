@@ -35,6 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+from channel_env_resolve import resolve_channel_env  # noqa: E402
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -201,23 +202,21 @@ def _core_running():
 def _gateway_configured():
     """Whether the ag2.space mobile gateway is provisioned on THIS host.
 
-    The gateway bridge only runs where a remote task token is configured (env or
-    channels/ag2space/.env). Returns True (configured), False (config readable,
-    no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    The gateway bridge only runs where a remote task token is configured (env,
+    or any contained file under channels/ag2space/). Returns True (configured),
+    False (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR).
     Mirrors health-check.check_gateway_bridge's detection."""
     if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
         return True
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
+    # Which file defines the token is content, not filename — delegated so this
+    # surface cannot disagree with startup or health-check about configuredness.
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
+        return resolve_channel_env(os.path.join(cfg, "channels"), "ag2space") is not None
     except OSError:
         return None
-    return False
 
 
 def _gateway_running():

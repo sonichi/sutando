@@ -53,10 +53,12 @@ def _pgrep(returncode, stdout):
     return _side_effect
 
 
-def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None,
-         locks=None, stale_age=None):
-    """Call check_gateway_bridge() with env, the channel-.env path, and the
-    pgrep result all controlled. env=None means the token vars are cleared.
+def _run(*, channels_dir=None, env=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False,
+         home_path_raises=False, serving=None, locks=None, stale_age=None):
+    """Call check_gateway_bridge() with env, the channels dir, and the
+    pgrep result all controlled. `channels_dir` is what claude_home_path
+    returns; which file under `<channels_dir>/ag2space/` holds the token is the
+    shared resolver's decision, exercised here rather than mocked away. env=None means the token vars are cleared.
     pgrep_raises=True makes subprocess.run raise (the except-branch path).
     `serving` pins the gateway-status sidecar verdict (None = no opinion) so no
     case depends on whether the host running the tests happens to have a live
@@ -74,7 +76,10 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     run_mock = (unittest.mock.Mock(side_effect=OSError("pgrep exploded"))
                 if pgrep_raises else unittest.mock.Mock(side_effect=_pgrep(pgrep_rc, pgrep_out)))
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
+         unittest.mock.patch.object(
+             hc, "claude_home_path",
+             **({"side_effect": OSError("cannot resolve the channels dir")}
+                if home_path_raises else {"return_value": channels_dir})), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
         with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving), \
              unittest.mock.patch.object(hc, "_gateway_status_stale_age_s",
@@ -83,8 +88,8 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
             return hc.check_gateway_bridge()
 
 
-def _configured(*, env=None, gw_env_path=None):
-    """Call _gateway_configured() directly, with env + the channel-.env path pinned.
+def _configured(*, env=None, channels_dir=None):
+    """Call _gateway_configured() directly, with env + the channels dir pinned.
 
     It is the single source of truth BOTH probes now consult (check_gateway_bridge
     here, check_core_supervisor for the gateway-down mapping). The core-supervisor
@@ -96,41 +101,41 @@ def _configured(*, env=None, gw_env_path=None):
             if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
     base.update(env)
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path):
+         unittest.mock.patch.object(hc, "claude_home_path", return_value=channels_dir):
         return hc._gateway_configured()
 
 
 def main() -> int:
     # 1) NOT configured (no env token, channel .env absent) → None
-    missing = Path(tempfile.gettempdir()) / "sutando-gw-nonexistent-xyz" / ".env"
-    r = _run(env={}, gw_env_path=missing)
+    missing = Path(tempfile.gettempdir()) / "sutando-gw-nonexistent-xyz"
+    r = _run(env={}, channels_dir=missing)
     check("not configured → None", r is None, f"got {r!r}")
 
     # 2) configured via env, one running process → ok
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0, pgrep_out="12345\n")
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=0, pgrep_out="12345\n")
     check("configured + running → ok", r is not None and r["status"] == "ok", f"got {r!r}")
     check("ok detail says running", r and "running" in r["detail"], f"got {r!r}")
 
     # 3) configured, zero processes → warn (down)
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=1, pgrep_out="")
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=1, pgrep_out="")
     check("configured + down → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("down detail names the impact", r and "will not be delivered" in r["detail"], f"got {r!r}")
 
     # 4) configured, duplicate processes → warn (pileup)
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0, pgrep_out="111\n222\n")
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=0, pgrep_out="111\n222\n")
     check("configured + duplicates → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("duplicate detail says multiple", r and "multiple processes" in r["detail"], f"got {r!r}")
 
     # A supported multi-instance host is not a pileup; only the role locks can
     # separate instances, so this case fails on any count-only rule.
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=0,
              pgrep_out="111\n222\n", serving=None,
              locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
     check("primary + named secondary → ok (not a pileup)",
           r is not None and r["status"] == "ok", f"got {r!r}")
 
     # 4a-ii) ... and the stale stub is still caught, because no role lock claims it.
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=0,
              pgrep_out="111\n999\n", locks={"gateway-bridge": "111"})
     check("unclaimed PID alongside a held lock → warn",
           r is not None and r["status"] == "warn", f"got {r!r}")
@@ -138,7 +143,7 @@ def main() -> int:
           r and "999" in r["detail"] and "no instance lock" in r["detail"], f"got {r!r}")
 
     # 4a-iii) Two locks, three processes: the extra is a same-role duplicate.
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_rc=0,
              pgrep_out="111\n222\n333\n",
              locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
     check("duplicate beyond the locked instances → warn",
@@ -199,27 +204,21 @@ def main() -> int:
           f"pattern {pattern!r} over-matched")
 
     # 5) configured via the channel .env file (not env var) → detected as ok
-    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-        f.write("# comment\nREMOTE_TASK_TOKEN=abc123\n")
-        env_file = Path(f.name)
-    try:
-        r = _run(env={}, gw_env_path=env_file, pgrep_rc=0, pgrep_out="999\n")
+    with tempfile.TemporaryDirectory() as _td5:
+        _chan5 = Path(_td5) / "channels" / "ag2space"
+        _chan5.mkdir(parents=True)
+        (_chan5 / ".env").write_text("# comment\nREMOTE_TASK_TOKEN=abc123\n")
+        r = _run(env={}, channels_dir=_chan5.parent, pgrep_rc=0, pgrep_out="999\n")
         check("configured via .env file → ok", r is not None and r["status"] == "ok", f"got {r!r}")
-    finally:
-        env_file.unlink(missing_ok=True)
 
     # 6) configured, but pgrep itself raises → treated as not-running (warn),
     #    covering the except branch.
-    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_raises=True)
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, channels_dir=missing, pgrep_raises=True)
     check("pgrep raises → warn (down)", r is not None and r["status"] == "warn", f"got {r!r}")
 
-    # 7) configured, but reading the channel .env raises OSError → treated as
-    #    not-configured (None), covering the config-read except branch. Use a
-    #    mock Path whose exists() is True but read_text() raises.
-    bad_env = unittest.mock.MagicMock()
-    bad_env.exists.return_value = True
-    bad_env.read_text.side_effect = OSError("cannot read .env")
-    r = _run(env={}, gw_env_path=bad_env)
+    # 7) configured, but resolving the channels dir raises OSError → treated as
+    #    not-configured (None), covering the config-read except branch.
+    r = _run(env={}, home_path_raises=True)
     check("config read raises → None", r is None, f"got {r!r}")
 
     # 6) sidecar precedence — a live PROCESS is not a serving CONNECTION.
@@ -294,39 +293,52 @@ def main() -> int:
 
     # --- _gateway_configured(): the shared predicate itself -----------------
     with _tf.TemporaryDirectory() as _td:
-        _gw = Path(_td) / "ag2space" / ".env"
+        _chan = Path(_td) / "channels"
+        _gw = _chan / "ag2space" / ".env"
+        _sibling = _chan / "ag2space" / "relay-client.env"
         _gw.parent.mkdir(parents=True, exist_ok=True)
-        _absent = Path(_td) / "nope" / ".env"
+        _absent = Path(_td) / "nope"
 
         check("_gateway_configured: REMOTE_TASK_TOKEN in env → True",
-              _configured(env={"REMOTE_TASK_TOKEN": "t"}, gw_env_path=_absent) is True)
+              _configured(env={"REMOTE_TASK_TOKEN": "t"}, channels_dir=_absent) is True)
         check("_gateway_configured: AG2_REMOTE_TOKEN in env → True",
-              _configured(env={"AG2_REMOTE_TOKEN": "t"}, gw_env_path=_absent) is True)
+              _configured(env={"AG2_REMOTE_TOKEN": "t"}, channels_dir=_absent) is True)
         check("_gateway_configured: no token, no file → False",
-              _configured(gw_env_path=_absent) is False)
+              _configured(channels_dir=_absent) is False)
 
         _gw.write_text("REMOTE_TASK_TOKEN=abc\n")
         check("_gateway_configured: token in the .env file → True",
-              _configured(gw_env_path=_gw) is True)
+              _configured(channels_dir=_chan) is True)
 
         _gw.write_text("OTHER=1\n")
         check("_gateway_configured: file with unrelated keys → False",
-              _configured(gw_env_path=_gw) is False)
+              _configured(channels_dir=_chan) is False)
 
         _gw.write_text("")
         check("_gateway_configured: empty file → False",
-              _configured(gw_env_path=_gw) is False)
+              _configured(channels_dir=_chan) is False)
 
         # startswith, not substring: a commented-out token is not configuration.
         _gw.write_text("#REMOTE_TASK_TOKEN=abc\n")
         check("_gateway_configured: token only in a COMMENT → False",
-              _configured(gw_env_path=_gw) is False)
+              _configured(channels_dir=_chan) is False)
+
+        # The filename defect: `.env` carries another channel's creds and the
+        # token sits in a sibling. Reading `.env` by name reports unconfigured,
+        # which suppresses this probe AND the gateway-down warn.
+        _gw.write_text("MATRIX_ACCESS_TOKEN=matrix-only\n")
+        _sibling.write_text("REMOTE_TASK_TOKEN=sibling-token\n")
+        check("_gateway_configured: token in a SIBLING env file → True",
+              _configured(channels_dir=_chan) is True)
+        _sibling.unlink()
+        check("_gateway_configured: sibling removed again → False",
+              _configured(channels_dir=_chan) is False)
 
         # A non-UTF-8 byte must NOT turn a configured host into an unconfigured
         # one: that would silence BOTH the bridge probe and the gateway-down warn.
         _gw.write_bytes(b"REMOTE_TASK_TOKEN=abc\n\xff\xfe not utf-8\n")
         check("_gateway_configured: token + invalid UTF-8 byte → still True",
-              _configured(gw_env_path=_gw) is True)
+              _configured(channels_dir=_chan) is True)
 
     # --- failure CLASSIFICATION (john-the-dev, review of 2328fbe9) ---------
     # The catch was `except Exception`, so ANY error became False = "no gateway

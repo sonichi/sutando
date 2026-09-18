@@ -105,8 +105,10 @@ def _clean_for(var: str, value: object) -> str:
 
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
+    # errors="replace", not strict: one non-UTF-8 byte would otherwise raise a
+    # ValueError past every caller's OSError guard and read the file as absent.
     try:
-        text = env_file.read_text()
+        text = env_file.read_text(errors="replace")
     except OSError:
         return ""
     for line in text.splitlines():
