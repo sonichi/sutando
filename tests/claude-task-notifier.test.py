@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -46,6 +47,8 @@ NOTIFIER = REPO / "src/agent/claude/cli/task-notifier.sh"
 # Leading "❯ " is the real composer line, empty = no unsent draft.
 IDLE_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 BUSY_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents"
+# The status row alone -- what a pane's LAST line becomes when a turn starts.
+BUSY_STATUS = BUSY_FOOTER.split("\n", 1)[1]
 # Same footer, but the composer carries an unsent owner draft.
 DRAFT_FOOTER = "❯ owner draft\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 TRUST_GATE_PANE = "\n".join([
@@ -60,11 +63,16 @@ class FakeTmuxHarness(unittest.TestCase):
     """Base: builds a stub `tmux` + isolated workspace for one test."""
 
     # Lines a non-`-S` capture-pane returns (the viewport height); a subclass
-    # narrows this to put the marker above it. `-S` always returns it all.
+    # narrows this to put the marker above it. `-S -N` returns N history rows + the viewport.
     PANE_HEIGHT = 500
-    # tmux's own history-limit, capping what `-S` can ever return; a subclass
-    # narrows this below CAPTURE_SCROLLBACK_LINES to make IT the real bound.
+    # The PANE's own #{history_limit} (fixed at creation); a subclass narrows it
+    # below CAPTURE_SCROLLBACK_LINES to make IT the real bound.
     HISTORY_LIMIT = 500
+    # What `show-options -g history-limit` reports -- the global default, which real
+    # tmux lets drift away from an existing pane's limit. None = same as the pane.
+    GLOBAL_HISTORY_LIMIT = None
+    # Columns at which a `-l` paste wraps onto new rows (0 = one row), like a real pane.
+    WRAP_COLS = 0
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -97,6 +105,13 @@ class FakeTmuxHarness(unittest.TestCase):
         # Consumed once, NOT swallowed: owner text lands on the SAME composer
         # line as our paste (unlike the separate-line flag above).
         self.interleaved_owner_flag = self.root / "interleaved-owner.flag"
+        # Every capture-pane increments this; the paste logs `CAPTURES@<n>`, so a
+        # test can aim a state flip at "the read before the paste" without hard-coding order.
+        self.capture_count = self.root / "capture-count.txt"
+        # Holds N: on the Nth capture the footer flips to BUSY (consumed once).
+        self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
+        # Holds a row of owner text that lands under our paste (consumed once).
+        self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -109,28 +124,71 @@ class FakeTmuxHarness(unittest.TestCase):
         # -l pastes append to pane.txt (simulating composer echo) unless
         # swallow-next-paste.flag is set (consumed once) — simulates a drop.
         script = self.bin / "tmux"
+        glob_limit = self.HISTORY_LIMIT if self.GLOBAL_HISTORY_LIMIT is None else self.GLOBAL_HISTORY_LIMIT
         script.write_text(f'''#!/bin/bash
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
+PANE="{self.pane_file}"
+# Typed rows land ABOVE the status footer, as in a real pane; the footer is
+# always the last row. A text is wrapped at WRAP_COLS like a real terminal.
+append_typed() {{
+  local text="$1" footer=""
+  if tail -n 1 "$PANE" | grep -q 'bypass permissions on'; then
+    footer="$(tail -n 1 "$PANE")"
+    sed -i '' -e '$d' "$PANE"
+  fi
+  # Text lands ON the bare composer row (a real pane types at the cursor).
+  if tail -n 1 "$PANE" | grep -Eq '^❯ *$'; then
+    sed -i '' -e '$d' "$PANE"; text="❯ $text"
+  fi
+  if [ "{self.WRAP_COLS}" -gt 0 ]; then
+    printf '%s\\n' "$text" | fold -w {self.WRAP_COLS} >> "$PANE"
+  else
+    printf '%s\\n' "$text" >> "$PANE"
+  fi
+  [ -n "$footer" ] && printf '%s\\n' "$footer" >> "$PANE"
+}}
+go_busy() {{ sed -i '' -e '$d' "$PANE"; printf '%s\\n' "{BUSY_STATUS}" >> "$PANE"; }}
+total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
+history_size() {{
+  local t; t="$(total_rows)"; local h=$(( t - {self.PANE_HEIGHT} ))
+  [ "$h" -lt 0 ] && h=0; [ "$h" -gt {self.HISTORY_LIMIT} ] && h={self.HISTORY_LIMIT}
+  echo "$h"
+}}
 case "$cmd" in
   has-session)
     [ -f "{self.session_flag}" ] && exit 0
     exit 1
     ;;
   capture-pane)
+    n=$(( $(cat "{self.capture_count}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{self.capture_count}"
+    # Consumed once: the pane goes BUSY on the Nth capture (a turn starting
+    # between the idle gate and the paste), modeled as the footer flipping.
+    if [ -f "{self.busy_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.busy_on_capture_flag}")" ]; then
+      rm -f "{self.busy_on_capture_flag}"; go_busy
+    fi
     scrollback=0
     for a in "$@"; do
       [ "$a" = -S ] && scrollback=1
     done
     if [ "$scrollback" = 1 ]; then
-      tail -n {self.HISTORY_LIMIT} "{self.pane_file}" 2>/dev/null
+      tail -n $(( {self.PANE_HEIGHT} + $(history_size) )) "$PANE" 2>/dev/null
     else
-      tail -n {self.PANE_HEIGHT} "{self.pane_file}" 2>/dev/null
+      tail -n {self.PANE_HEIGHT} "$PANE" 2>/dev/null
     fi
     exit 0
     ;;
   show-options)
-    printf 'history-limit %s\n' {self.HISTORY_LIMIT}
+    printf 'history-limit %s\\n' {glob_limit}
+    exit 0
+    ;;
+  display-message)
+    # -p -t TARGET '#{{history_limit}}' | '#{{history_size}}'
+    case "$*" in
+      *history_limit*) echo {self.HISTORY_LIMIT} ;;
+      *history_size*) history_size ;;
+      *) echo "" ;;
+    esac
     exit 0
     ;;
   send-keys)
@@ -139,20 +197,24 @@ case "$cmd" in
     if [ "${{1:-}}" = -l ]; then
       shift 2  # -l --
       text="$1"
-      printf 'TYPE %s\\n' "$text" >> "{self.sendkeys_log}"
+      printf 'CAPTURES@%s\\nTYPE %s\\n' "$(cat "{self.capture_count}" 2>/dev/null || echo 0)" "$text" >> "{self.sendkeys_log}"
       if [ -f "{self.swallow_always_flag}" ]; then
         :
       elif [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"
         if [ -f "{self.concurrent_draft_flag}" ]; then
           rm -f "{self.concurrent_draft_flag}"
-          printf '%s\\n' "owner is typing something else" >> "{self.pane_file}"
+          append_typed "owner is typing something else"
         fi
       elif [ -f "{self.interleaved_owner_flag}" ]; then
         rm -f "{self.interleaved_owner_flag}"
-        printf '%s OWNERTEXT\\n' "$text" >> "{self.pane_file}"
+        append_typed "$text OWNERTEXT"
       else
-        printf '%s\\n' "$text" >> "{self.pane_file}"
+        append_typed "$text"
+        # Consumed once: an owner row lands on its own line under our paste.
+        if [ -f "{self.extra_owner_row_flag}" ]; then
+          append_typed "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
+        fi
       fi
     else
       printf 'ENTER\\n' >> "{self.sendkeys_log}"
@@ -160,13 +222,13 @@ case "$cmd" in
       # does not vanish from the pane) — only opt-in when a test wants to
       # prove the confirm check doesn't misread that as still-staged.
       if [ -f "{self.busy_after_enter_flag}" ]; then
-        printf '%s\\n' "{BUSY_FOOTER}" >> "{self.pane_file}"
+        go_busy
       fi
       # Simulates the owner typing something new right after our C-m --
       # not busy, and not our own staged prompt either.
       if [ -f "{self.owner_types_after_enter_flag}" ]; then
         rm -f "{self.owner_types_after_enter_flag}"
-        printf '%s\\n' "owner is typing something else" >> "{self.pane_file}"
+        append_typed "owner is typing something else"
       fi
     fi
     exit 0
@@ -395,10 +457,15 @@ class EventDispatchTests(FakeTmuxHarness):
         result = self.run_event("task-k.txt")
         t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-k.txt")
-        self.assertEqual(type_calls, 2,
-                          "a stale marker plus an unrelated concurrent pane change must not "
-                          "satisfy staging -- the swallowed retype must still fire")
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("TYPE Sutando task ready: task-k.txt"), 1)
+        self.assertNotIn("ENTER", log,
+                         "a stale marker plus an unrelated concurrent pane change must not "
+                         "satisfy staging")
+        # The owner's draft now occupies the composer: the retype must refuse
+        # rather than type over it (failing closed beats a second paste).
+        self.assertIn("composer not empty",
+                      (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_composer_draft_blocks_typing(self):
         # An unsent owner draft in the composer must never be typed over,
@@ -451,11 +518,12 @@ class EventDispatchTests(FakeTmuxHarness):
         result = self.run_event("task-o.txt", timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.sendkeys_log_text()
-        self.assertEqual(log.count("TYPE Sutando task ready: task-o.txt"), 2,
-                          "a composer mixing our prompt with owner text must be retried once, "
-                          "not accepted as staged on the first pass")
+        self.assertEqual(log.count("TYPE Sutando task ready: task-o.txt"), 1,
+                          "the mix now occupies the composer; a retype would paste over owner text")
         self.assertNotIn("ENTER", log,
                           "Enter must never fire on a composer mixing our prompt with owner text")
+        self.assertIn("composer not empty",
+                      (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_never_staged_returns_fast_instead_of_waiting_the_full_timeout(self):
         # Enter never sent -> give up immediately, never wait out
@@ -535,6 +603,9 @@ class TallComposerScrollbackTests(FakeTmuxHarness):
     scrollback."""
 
     PANE_HEIGHT = 2
+    # Wrap the ~200-char prompt onto 25+ rows so a restored `| tail -20`
+    # after the capture also loses the marker -- the second cap must be dead too.
+    WRAP_COLS = 8
 
     def test_marker_scrolled_off_pane_top_is_still_found_via_scrollback(self):
         self.write_task("task-tall.txt")
@@ -571,6 +642,10 @@ class HistoryLimitBoundTests(FakeTmuxHarness):
 
     PANE_HEIGHT = 2
     HISTORY_LIMIT = 2
+    WRAP_COLS = 8
+    # The global option drifts above an existing pane's limit in real tmux; a
+    # detector keyed on it reads 2000, sees a 2-row capture, and stays silent.
+    GLOBAL_HISTORY_LIMIT = 2000
 
     def test_marker_past_historys_own_limit_is_reported_distinctly(self):
         self.write_task("task-past-limit.txt")
@@ -579,8 +654,65 @@ class HistoryLimitBoundTests(FakeTmuxHarness):
         self.assertNotIn("ENTER", self.sendkeys_log_text(),
                           "must fail closed -- tmux truly has no more history to give")
         log_text = (self.logs_dir / "claude-task-notifier.log").read_text()
-        self.assertIn("may exceed the capture window", log_text)
+        self.assertIn("may exceed the capture window", log_text,
+                      "the warning must key on the PANE's #{history_limit}, not the global")
         self.assertIn("history-limit", log_text)
+        self.assertIn("#{history_size}=2", log_text)
+
+
+class BusyBeforePasteTests(FakeTmuxHarness):
+    """A turn can start between the idle gate and the paste. The busy footer
+    already sits in the pane when the notifier records its baseline, so the
+    staged-vs-baseline diff and the pre-Enter equality check both pass and
+    Enter lands on a live turn. Calibrated, not hard-coded: a control run
+    records how many captures precede the paste (`CAPTURES@n` in the log),
+    then the real run flips the footer to BUSY on that very capture."""
+
+    def _captures_before_first_paste(self):
+        self.write_task("task-cal.txt")
+        # No result ever appears; a 1s completion timeout keeps the control short.
+        self.run_event("task-cal.txt", timeout=12,
+                       env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        m = re.search(r"CAPTURES@(\d+)", self.sendkeys_log_text())
+        self.assertIsNotNone(m, "control run never pasted; cannot calibrate")
+        return int(m.group(1))
+
+    def test_a_turn_starting_right_before_the_paste_blocks_both_keystrokes(self):
+        n = self._captures_before_first_paste()
+        # Fresh harness state for the real run, same fake, same read order.
+        self.sendkeys_log.write_text(""); self.capture_count.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        # CAPTURES@n is the count AT the paste; capture n is the baseline read,
+        # so the read immediately before it is the pre-paste busy check.
+        self.busy_on_capture_flag.write_text(str(n - 1))
+        self.write_task("task-race.txt")
+        result = self.run_event("task-race.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertNotIn("TYPE", log, "pasted into a pane that had just gone busy")
+        self.assertNotIn("ENTER", log, "sent Enter into a live turn")
+        self.assertIn("went busy before the paste",
+                      (self.logs_dir / "claude-task-notifier.log").read_text())
+
+
+class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
+    """An owner continuation row that happens to match a gate signature
+    ("permission to ...") lands under our paste. It is typed text: the
+    composer must compare UNEQUAL to the bare prompt and nothing may be
+    submitted -- a parser that drops rows for resembling UI text would
+    read the mix as exactly our prompt and press Enter over it."""
+
+    def test_mixed_composer_with_gate_like_owner_row_is_never_submitted(self):
+        self.extra_owner_row_flag.write_text("permission to continue")
+        self.write_task("task-mix.txt")
+        result = self.run_event("task-mix.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertIn("TYPE Sutando task ready: task-mix.txt", log)
+        self.assertNotIn("ENTER", log,
+                         "the owner's row was discarded and the mix passed as our prompt")
+        self.assertIn("permission to continue", self.pane_file.read_text(),
+                      "fixture precondition: the owner row is really in the pane")
 
 
 class MainLoopWiringTest(FakeTmuxHarness):

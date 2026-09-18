@@ -503,10 +503,36 @@ class TestComposerText(unittest.TestCase):
         pane = "❯ Sutando task rea\ndy: task-x.txt\n" + "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
         self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
 
-    def test_footer_interleaved_before_the_typed_row_is_stripped(self):
-        # The exact shape a naively-appending test stub produces: the footer
-        # line sits BETWEEN the bare ❯ marker and the later typed-text row.
-        pane = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\nSutando task ready: task-x.txt"
+    def test_trailing_status_rows_are_stripped(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_a_trailing_row_that_only_resembles_a_gate_is_kept(self):
+        # A gate never coexists with an editable composer; a row below the
+        # marker matching gate wording is what the owner typed last.
+        pane = "❯ Sutando task ready: task-x.txt\npermission to continue\n"
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_resembling_ui_text_is_kept_as_typed_text(self):
+        # An owner row matching a gate signature ("permission to ...") inside the
+        # composer is typed text: it must survive so the mix compares unequal.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "permission to continue\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_matching_the_idle_footer_words_is_kept(self):
+        pane = ("❯ notes for agents in prod\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "notes for agents in prod")
+
+    def test_interior_border_row_is_still_dropped(self):
+        pane = "❯ Sutando task rea\n──────────\ndy: task-x.txt\n" + \
+               "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
         self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
 
     def test_interleaved_owner_text_survives_in_the_result(self):

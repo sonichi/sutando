@@ -258,11 +258,13 @@ def _composer_is_empty(pane: str) -> bool:
 def _composer_text(pane: str) -> "str | None":
     """The composer's full typed content, dewrapped, or None with no ❯ line.
 
-    From the bottommost ❯ line to the end, dropping any footer/gate line
-    (`_IDLE`/`_SIGNATURES` never legitimately appear in typed text, whichever
-    side of the composer they render on) before joining wrapped rows with no
-    separator — a caller comparing this for exact equality must see only
-    what was actually typed, never the status bar around it.
+    From the bottommost ❯ line to the end. Only the status bar legitimately
+    renders below an editable composer (a gate replaces it, and the idle/busy
+    checks refuse before anyone compares text), so only TRAILING status rows
+    are stripped and the ❯ row itself never is. Every other row is typed text
+    — including one that merely resembles gate or footer wording; dropping it
+    would let a mixed composer compare equal to the bare prompt. Border rows
+    are structural anywhere. Wrapped rows are joined with no separator.
     """
     lines = [ln for ln in pane.splitlines() if ln.strip()]
     start = None
@@ -272,9 +274,10 @@ def _composer_text(pane: str) -> "str | None":
             break
     if start is None:
         return None
-    block = [ln for ln in lines[start:]
-              if not (_IDLE.search(ln) or _BORDER_LINE.match(ln)
-                      or any(rx.search(ln) for _, rx in _SIGNATURES))]
+    block = lines[start:]
+    while len(block) > 1 and (_IDLE.search(block[-1]) or _BORDER_LINE.match(block[-1])):
+        block.pop()
+    block = [ln for ln in block if not _BORDER_LINE.match(ln)]
     if not block:
         return ""
     block[0] = block[0].lstrip().lstrip("❯").lstrip()
