@@ -86,6 +86,30 @@ check(r2.returncode == 0, "the SAME task, once a worker holds it, exits 0 — no
 check("task-eee" not in r2.stdout, "and it is no longer reported as unanswered")
 check("held by worker-2" in r2.stderr, "but it is still visible on stderr, so a stuck holder is not hidden")
 
+# An unreadable deliveries/ is a THIRD answer, and must not share an exit code
+# with "the core owes a reply" — the caller cannot tell them apart.
+ws6 = _ws()
+_task(ws6, "task-fff")
+(ws6 / "deliveries" / "worker-3").mkdir()
+(ws6 / "deliveries" / "worker-3" / "task-fff.txt").write_text("", encoding="utf-8")
+import os as _os
+if _os.geteuid() == 0:
+    print("  skip root cannot be denied a read")
+else:
+    (ws6 / "deliveries").chmod(0o000)
+    try:
+        r3 = subprocess.run([sys.executable, str(ROOT / "scripts" / "unanswered-tasks.py"),
+                             "--workspace", str(ws6)], capture_output=True, text=True)
+    finally:
+        (ws6 / "deliveries").chmod(0o755)
+    check(r3.returncode == 2, "an unreadable deliveries/ exits 2 (cannot decide), never 1")
+    check("cannot decide" in r3.stderr, "and says so on stderr rather than raising a traceback")
+    check("Traceback" not in r3.stderr, "no traceback: the CLI owns its own failure mode")
+    # The same tree, readable, is the control that proves the 2 came from the mode bits.
+    r4 = subprocess.run([sys.executable, str(ROOT / "scripts" / "unanswered-tasks.py"),
+                         "--workspace", str(ws6)], capture_output=True, text=True)
+    check(r4.returncode == 0, "readable again, the held task is 0 — the 2 was the permission, not the tree")
+
 print("the two guards agree on the suffix set")
 hook = (ROOT / "src" / "check-pending-tasks.sh").read_text(encoding="utf-8")
 m = re.search(r"sentinel_task_id\(\)\s*\{(.*?)\n\}", hook, re.S)

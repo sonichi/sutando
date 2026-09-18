@@ -9,8 +9,14 @@ disagrees. Measured five times in one session, caught every time by re-listing
 by hand and never by recall.
 
 Exit 1 when a task older than --min-age-sec has no result AND no worker holds
-it, 0 otherwise. A task the router delegated is that worker's to answer, so
-counting it here reports the core as owing work it must not do.
+it, 0 otherwise, 2 when the answer cannot be decided. A task the router
+delegated is that worker's to answer, so counting it here reports the core as
+owing work it must not do.
+
+The third code exists because 1 and "cannot decide" must not share one: an
+unreadable deliveries/ says nothing about who holds a task, and reporting that
+as 1 is indistinguishable from "the core owes a reply" to the caller that
+chains `unanswered-tasks.py && core-status.sh idle`.
 """
 from __future__ import annotations
 
@@ -92,7 +98,14 @@ def main() -> int:
     ap.add_argument("--min-age-sec", type=float, default=120.0,
                     help="ignore tasks younger than this (default 120)")
     a = ap.parse_args()
-    rows = unanswered(Path(a.workspace), a.min_age_sec)
+    try:
+        rows = unanswered(Path(a.workspace), a.min_age_sec)
+    except OSError as exc:
+        # holder_of propagates rather than reading an unreadable deliveries/ as
+        # "nobody holds it"; the CLI turns that into its own cannot-answer code.
+        print(f"unanswered-tasks: cannot read deliveries/ ({exc}) — "
+              "cannot decide who holds these tasks", file=sys.stderr)
+        return 2
     if not rows:
         print("unanswered-tasks: none")
         return 0
