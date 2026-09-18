@@ -310,6 +310,7 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
+from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -3983,56 +3984,46 @@ def _result_worker(task_id: str) -> str:
 
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
-    done-flag. `task_id` is the result stem, which already carries the
-    `task-` prefix.
+    completion record. `task_id` is the result stem, prefix included.
 
     SUPERSEDED as the primary signal by _assigned_worker(): this infers the
     author from completion residue after the fact, which is exactly the
     fragility assignment-time provenance removes. Kept as the transition
     fallback in _result_worker() for tasks routed before that record existed.
 
-    Path convention (state/workers/<recipient>/done/<task_id>.{pending,flag})
-    is owned by the pool's own done_flag()/mark_done() writer, in an optional
-    local skill this standalone PyPI package cannot import or name (see
-    docs/architecture-boundaries.md, "Optional adapter capabilities"). Keep
-    the two in step by hand; tests/gateway-result-worker-attribution.test.py
-    builds its fixtures through that writer's own path function so a future
-    drift between the two fails a test instead of silently returning "".
-
-    BOTH stages count, and `.pending` is probed FIRST. The writer lays
-    `.pending` before the handler publishes, then creates `.flag` and only then
-    unlinks `.pending` — so at every instant at least one name exists. Probing
-    `.flag` first can observe neither when promotion lands between the two
-    probes (keweichen, #4306); pending-first cannot, because a present
-    `.pending` resolves immediately and an absent one means `.flag` is already
-    there.
+    The recipient grammar, the record layout, the stage order and the "is this
+    a record?" predicate all come from pool_record, which the pool's own
+    writer binds too — an optional local skill this standalone package can
+    neither import nor name (docs/architecture-boundaries.md, "Optional
+    adapter capabilities"). No second predicate lives here, so the reader
+    cannot accept state the writer would refuse.
 
     FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
-    with another worker's identity — so anything this cannot read or does not
-    recognise as the writer's own record shape (regular file, never a symlink
-    or directory) yields "" rather than a guess. `Path.glob` is deliberately
-    not used: it reports an unreadable subtree as absent, which would let one
-    unreadable claimant hand the answer to another.
+    with another worker's identity — so anything unreadable, or any record the
+    writer's own predicate would reject, yields "". Entries PROVEN not to be
+    recipients are skipped instead: a stray file beside the recipient folders
+    is not an unreadable claimant, and must not suppress valid attribution.
+    `Path.glob` is deliberately not used: it reports an unreadable subtree as
+    absent, which would let one unreadable claimant hand the answer to another.
     """
-    root = _STATE / "workers"
+    root = pool_record.workers_root(_STATE)
     try:
-        recipients = sorted(p.name for p in root.iterdir())
+        recipients = pool_record.iter_recipients(root)
     except FileNotFoundError:
         return ""
     except OSError:
         return ""  # unreadable root: no reading, not "nobody claimed it"
     claimants = set()
     for name in recipients:
-        # PENDING FIRST. The writer publishes `.flag` and only then unlinks
-        # `.pending`, so probing flag first can miss both across a promotion.
-        for stage in ("pending", "flag"):
+        for stage in pool_record.STAGES:
             try:
-                st = os.lstat(root / name / "done" / f"{task_id}.{stage}")
-            except FileNotFoundError:
-                continue
+                state = pool_record.read_record_state(
+                    pool_record.record_path(root, name, task_id, stage))
             except OSError:
                 return ""  # unreadable claim tree: abstain, never fall through
-            if not stat.S_ISREG(st.st_mode):
+            if state is pool_record.RecordState.ABSENT:
+                continue
+            if state is not pool_record.RecordState.PRESENT:
                 return ""  # malformed record the writer would itself refuse
             claimants.add(name)
             break

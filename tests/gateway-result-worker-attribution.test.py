@@ -10,12 +10,12 @@ the "- core-N" signature in the body: that line is for humans, and
 reformatting it must not silently change routing or attribution.
 
 The fixture writes through pool_delivery.done_flag() rather than
-hand-spelling the path: packages/ag2-sparrow is a standalone PyPI package
-and cannot import skills/worker-pool/ in production, so _worker_of()'s own
-path literal in remote_gateway_bridge.py is the only place the convention is
-re-stated — building the fixture from the real writer's path function is
-what makes a future drift between the two show up as a failing test instead
-of a silently-always-empty lookup (sonichi/sutando, 2026-09-16: _worker_of
+hand-spelling the path: packages/ag2-sparrow is a standalone PyPI package and
+cannot import skills/worker-pool/ in production, so both sides bind the same
+src/pool_record.py contract (bundled into the package) for the layout, the
+recipient grammar and the record predicate. Building the fixture from the real
+writer keeps a future drift showing up as a failing test instead of a
+silently-always-empty lookup (sonichi/sutando, 2026-09-16: _worker_of
 globbed "cores" while mark_done wrote "workers", so every result shipped
 with no worker_id and the six tests here never caught it, because the old
 _flag() fixture reimplemented the SAME wrong "cores" path instead of calling
@@ -39,7 +39,9 @@ _SRC = _REPO / "src" / "remote-gateway-bridge.py"
 _POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
 
 sys.path.insert(0, str(_POOL_SCRIPTS))
+sys.path.insert(0, str(_REPO / "src"))
 import pool_delivery  # noqa: E402
+import pool_record  # noqa: E402
 
 
 def _load():
@@ -198,9 +200,66 @@ class WorkerAttribution(unittest.TestCase):
         # Control first: without the fault the same fixture MUST resolve, or
         # the assertion below would pass for a fixture that never worked.
         self.assertEqual(self.mod._worker_of(tid), "worker-a")
-        with mock.patch.object(Path, "iterdir",
-                               side_effect=PermissionError("denied")):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the mode bits this case depends on")
+        root = pool_record.workers_root(self.mod._STATE)
+        mode = root.stat().st_mode
+        os.chmod(root, 0o000)
+        try:
             self.assertEqual(self.mod._worker_of(tid), "")
+        finally:
+            os.chmod(root, mode)
+
+    # --- the reader accepts only what the writer would itself write ------
+
+    def test_a_stray_root_entry_does_not_suppress_attribution(self):
+        """A non-directory beside the recipient folders is PROVEN not to be a
+        recipient, so it must be skipped — not read as an unreadable claimant
+        that suppresses the valid one next to it."""
+        tid = "task-strayrootentry001"
+        self._flag("worker-a", tid)
+        self.assertEqual(self.mod._worker_of(tid), "worker-a")   # control
+        root = pool_record.workers_root(self.mod._STATE)
+        for stray in (".DS_Store", "README.txt", "worker-b"):
+            (root / stray).write_text("")
+        self.assertEqual(self.mod._worker_of(tid), "worker-a")
+        self.assertEqual(self._doc(tid)["metadata"], {"worker_id": "worker-a"})
+
+    def test_a_name_the_writer_rejects_never_attributes(self):
+        """A recipient id mark_done() refuses with ValueError must not come
+        back out of the reader as structured worker metadata."""
+        tid = "task-badrecipientid001"
+        bad = "Worker-NOT-WRITABLE"
+        with self.assertRaises(ValueError):
+            pool_delivery.mark_done(Path(self.workspace), bad, tid, published=True)
+        d = pool_record.workers_root(self.mod._STATE) / bad / "done"
+        d.mkdir(parents=True)
+        (d / f"{tid}.flag").write_text("")
+        self.assertEqual(self.mod._worker_of(tid), "")
+        self.assertNotIn("metadata", self._doc(tid))
+        # Control: the same hand-built record under a name the writer accepts
+        # DOES resolve, so the assertion above is about the name, not the shape.
+        self._flag("worker-a", "task-goodrecipientid01")
+        self.assertEqual(self.mod._worker_of("task-goodrecipientid01"), "worker-a")
+
+    def test_a_record_the_writers_predicate_rejects_never_attributes(self):
+        """chmod-000: pool_delivery.is_done_flag() raises PermissionError on
+        it, so the reader must abstain rather than resolve a worker from a
+        record the writer's own predicate will not accept."""
+        tid = "task-unreadablerecord1"
+        flag = pool_delivery.mark_done(Path(self.workspace), "worker-a", tid,
+                                       published=True)
+        self.assertEqual(self.mod._worker_of(tid), "worker-a")   # control
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the mode bits this case depends on")
+        os.chmod(flag, 0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                pool_delivery.is_done_flag(flag)
+            self.assertEqual(self.mod._worker_of(tid), "")
+            self.assertNotIn("metadata", self._doc(tid))
+        finally:
+            os.chmod(flag, 0o600)
 
 
 
@@ -217,26 +276,27 @@ class PromotionBetweenProbes(unittest.TestCase):
 
     def test_promotion_between_probes_still_attributes(self):
         """Drives the REAL writer between the two probes, not a fake: the first
-        lstat runs, then mark_done(published=True) promotes, then the second."""
+        probe runs, then mark_done(published=True) promotes, then the second."""
         tid = "task-promotionrace0001"
         recipient = "core-7"
         pool_delivery.mark_done(Path(self.workspace), recipient, tid, published=False)
 
-        real_lstat = os.lstat
+        real_probe = self.mod.pool_record.read_record_state
         state = {"n": 0}
 
-        def racing_lstat(path, *a, **k):
+        def racing_probe(path, *a, **k):
             state["n"] += 1
             if state["n"] == 1:
                 # after the first probe resolves, let the writer promote
                 try:
-                    return real_lstat(path, *a, **k)
+                    return real_probe(path, *a, **k)
                 finally:
                     pool_delivery.mark_done(
                         Path(self.workspace), recipient, tid, published=True)
-            return real_lstat(path, *a, **k)
+            return real_probe(path, *a, **k)
 
-        with mock.patch.object(self.mod.os, "lstat", side_effect=racing_lstat):
+        with mock.patch.object(self.mod.pool_record, "read_record_state",
+                               side_effect=racing_probe):
             got = self.mod._worker_of(tid)
         flag = pool_delivery.done_flag(Path(self.workspace), recipient, tid)
         pend = pool_delivery.pending_flag(Path(self.workspace), recipient, tid)
