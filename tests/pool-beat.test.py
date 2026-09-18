@@ -8,7 +8,9 @@ host that never ran a beat writer and a worker that died are indistinguishable
 to a two-valued check, and reading the first as death would abandon every worker
 on the release that introduces beats.
 """
+import contextlib
 import importlib.util as u
+import io
 import os
 import pathlib
 import sys
@@ -91,7 +93,80 @@ check("a fresh beat does NOT read stale (rejects always-stale)", pb.classify(p, 
 check("absent does NOT read stale (rejects folding the two)",
       pb.classify(pathlib.Path(SB) / "nope.alive", NOW) == pb.STALE, False)
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (20 checks)")
+# --- the unreadable branch -----------------------------------------------
+
+# A symlink loop is the cheapest real OSError that is neither missing nor a
+# non-directory; unreadable must not read as absent.
+_a = pathlib.Path(SB) / "loop_a"
+_b = pathlib.Path(SB) / "loop_b"
+os.symlink(_b, _a)
+os.symlink(_a, _b)
+check("an unreadable beat is stale, never absent", pb.classify(_a, NOW), pb.STALE)
+
+# --- run_forever refreshes, it does not just create ----------------------
+
+class _Stop(Exception):
+    pass
+
+_slept = {"n": 0}
+_real_sleep = pb.time.sleep
+
+
+def _fake_sleep(_s):
+    _slept["n"] += 1
+    if _slept["n"] >= 2:
+        raise _Stop
+
+
+_rf = pathlib.Path(SB) / "state" / "workers" / "rf.alive"
+pb.time.sleep = _fake_sleep
+try:
+    pb.run_forever(_rf, 0.01)
+except _Stop:
+    pass
+finally:
+    pb.time.sleep = _real_sleep
+check("run_forever created the beat", _rf.exists(), True)
+check("run_forever kept refreshing (slept more than once)", _slept["n"] >= 2, True)
+
+# --- the CLI -------------------------------------------------------------
+
+check("--once writes one beat and returns 0",
+      pb.main(["--workspace", SB, "--kind", "worker", "--id", "m1", "--once"]), 0)
+check("...and the file is there",
+      (pathlib.Path(SB) / "state" / "workers" / "m1.alive").exists(), True)
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _rc = pb.main(["--workspace", SB, "--kind", "worker", "--id", "m1", "--read"])
+check("--read returns 0", _rc, 0)
+check("--read PRINTS the state of that same beat", _buf.getvalue().strip(), pb.LIVE)
+_delegated = {}
+_real_rf = pb.run_forever
+
+
+def _spy(path, interval):
+    _delegated["path"], _delegated["interval"] = path, interval
+    return 0
+
+
+pb.run_forever = _spy
+try:
+    _rc = pb.main(["--workspace", SB, "--kind", "worker", "--id", "m2", "--interval", "7"])
+finally:
+    pb.run_forever = _real_rf
+check("with neither --once nor --read the CLI runs the daemon", _rc, 0)
+check("...on the beat path it was asked for",
+      str(_delegated.get("path", "")).endswith("/state/workers/m2.alive"), True)
+check("...at the interval it was given", _delegated.get("interval"), 7.0)
+
+try:
+    pb.main(["--workspace", SB, "--kind", "nope", "--id", "m1", "--once"])
+    _bad = "accepted"
+except SystemExit:
+    _bad = "refused"
+check("the CLI refuses an unknown --kind", _bad, "refused")
+
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (32 checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)
